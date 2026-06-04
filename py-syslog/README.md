@@ -49,12 +49,23 @@ Point your devices' syslog forwarding at the Home Assistant host on
 
 ## Options
 
-| Option           | Type                                | Default | Meaning                                                           |
-| ---------------- | ----------------------------------- | ------- | ----------------------------------------------------------------- |
-| `listen_port`    | `port`                              | `5514`  | UDP port to bind on the host network.                             |
-| `retention_days` | `int(1,3650)`                       | `30`    | Days of gzipped archives to keep; older ones are pruned.          |
-| `log_level`      | `list(debug\|info\|warning\|error)` | `info`  | Diagnostic verbosity on stderr (does not affect stored data).     |
-| `sources`        | list of `{ip, site, host}`          | `[]`    | IP → (site, host) resolution table. A duplicate `ip` is rejected. |
+| Option           | Type                                | Default | Meaning                                                                                                                 |
+| ---------------- | ----------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `listen_port`    | `port`                              | `5514`  | UDP port to bind on the host network.                                                                                   |
+| `retention_days` | `int(1,3650)`                       | `30`    | Days of gzipped archives to keep; older ones are pruned.                                                                |
+| `log_level`      | `list(debug\|info\|warning\|error)` | `info`  | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below). |
+| `sources`        | list of `{ip, site, host}`          | `[]`    | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                       |
+
+> **`log_level` controls py-syslog's own logging, not the logs it collects.** It
+> sets the verbosity of py-syslog's _own_ operational diagnostics on stderr — the
+> periodic stats line, the unknown-source warning, and throttled write-error
+> warnings (the sense in which Python's `logging` uses "level"). It has **no
+> effect on the syslog you ingest**: every received datagram is written to
+> `/data/log` and echoed to the Log tab in full, regardless of its own syslog
+> severity. For example, `log_level: error` quiets py-syslog's own chatter but you
+> will still receive and store every `debug`-severity line a sender emits.
+> py-syslog does **not** currently filter, drop, or route ingested logs by
+> severity.
 
 `log_dir` (`/data/log`) and `log_file` (`syslog.log`) are **development
 override** keys recognized by the loader but deliberately **absent from the HA
