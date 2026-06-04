@@ -1,5 +1,5 @@
 name: Py-Syslog
-version: "1.0.1"
+version: "1.1.0"
 slug: py-syslog
 description: >-
   Durable UDP syslog collector. Receives RFC 3164/5424 datagrams, resolves each

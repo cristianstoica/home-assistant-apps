@@ -39,9 +39,9 @@ from types import FrameType
 
 from . import __version__, config, fixtures
 from .config import ConfigError
-from .models import Config, SourceMapping, WriterProtocol
+from .models import Config, SourceMapping, SyslogRecord, WriterProtocol
 from .parser import parse
-from .server import Counters, Server, process_datagram
+from .server import Counters, Server, process_datagram, trace_datagram
 from .resolver import Resolver
 
 # The protocol tags the parser may emit; the datagram corpus must stay inside
@@ -463,6 +463,7 @@ def _run_check(options_path: str, storage: bool, write_error: bool) -> int:
     if _resolved_config(options_path) is None:
         return 1
     ok = _check_datagrams()
+    ok = _check_trace() and ok
     ok = _check_warn_once() and ok
     ok = _check_internal_error() and ok
     ok = _check_invalid_options() and ok
@@ -524,18 +525,32 @@ def _check_write_error() -> bool:
     warn = _RecordingWarn()
     fixture = fixtures.DATAGRAMS[0]
 
+    # Capture the DEBUG trace around the FIRST call only: this is the only mode
+    # that reaches the WriteError branch, where the trace renders write=error.
+    logger = logging.getLogger("pysyslog")
+    trace_handler = _DebugRecordingHandler()
+    logger.addHandler(trace_handler)
+    prev_level = logger.level
     echo = io.StringIO()
-    with contextlib.redirect_stdout(echo):
-        process_datagram(
-            fixture.raw,
-            fixture.client_ip,
-            resolver=resolver,
-            writer=writer,
-            counters=counters,
-            clock=_pinned_clock,
-            warn=warn,
-        )
+    try:
+        logger.setLevel(logging.DEBUG)
+        with contextlib.redirect_stdout(echo):
+            process_datagram(
+                fixture.raw,
+                fixture.client_ip,
+                resolver=resolver,
+                writer=writer,
+                counters=counters,
+                clock=_pinned_clock,
+                warn=warn,
+            )
+    finally:
+        logger.removeHandler(trace_handler)
+        logger.setLevel(prev_level)
 
+    trace_reports_error = (
+        len(trace_handler.messages) == 1 and "write=error" in trace_handler.messages[0]
+    )
     warned_keyed_on_ip = len(warn.calls) == 1 and fixture.client_ip in warn.calls[0][0]
     ok = True
     checks: list[tuple[str, bool]] = [
@@ -547,6 +562,10 @@ def _check_write_error() -> bool:
         (
             f"throttled WARNING fired, keyed on client_ip ({fixture.client_ip})",
             warned_keyed_on_ip,
+        ),
+        (
+            "DEBUG trace fired exactly once and reported write=error",
+            trace_reports_error,
         ),
     ]
     for label, passed in checks:
@@ -596,6 +615,26 @@ class _RecordingHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.levelno >= logging.WARNING:
+            self.messages.append(record.getMessage())
+
+
+class _DebugRecordingHandler(logging.Handler):
+    """A logging handler that records DEBUG-and-up messages from `pysyslog`.
+
+    Sibling of `_RecordingHandler`, used to assert the consolidated DEBUG trace
+    `server.trace_datagram` emits. Stores ``record.getMessage()`` — the lazily
+    ``%``-formatted message body — so the oracle can pin the trace's
+    one-physical-line and ``write=`` outcome invariants. The body carries no
+    terminator (the live `StreamHandler` adds the trailing newline), so its
+    embedded-newline count must be zero.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno >= logging.DEBUG:
             self.messages.append(record.getMessage())
 
 
@@ -751,6 +790,174 @@ def _check_internal_error() -> bool:
         f"INTERNAL-ERROR CHECK {'PASSED' if ok else 'FAILED'}",
         file=sys.stderr,
     )
+    return ok
+
+
+# --- --check: DEBUG trace -----------------------------------------------------
+
+
+def _check_trace() -> bool:
+    """Assert the consolidated DEBUG trace contract `server.trace_datagram` owns.
+
+    Four layers, each restoring the module logger's level/handler in ``finally``
+    so a leaked DEBUG level or handler cannot corrupt later checks in the same
+    process:
+
+    * **info no-op (run first)** — at the default ``info`` level, a DEBUG handler
+      attached and one in-corpus datagram driven through `process_datagram` must
+      capture **zero** records (the logger's INFO level suppresses DEBUG
+      emission before any handler is reached).
+    * **DEBUG success path** — at ``logging.DEBUG`` the full corpus drives one
+      trace per datagram; every message is one physical line (no embedded
+      newline — the `StreamHandler`, not the message, owns the terminator) and
+      carries ``write=written``.
+    * **repr() neutralization (load-bearing)** — `trace_datagram` is called
+      directly with a hand-built `SyslogRecord` whose ``program`` and
+      ``sender_ts`` carry line breaks and C1 controls. No reachable datagram can
+      route a line break into those parser-cleaned fields, so this direct call —
+      bypassing the parser — is the only thing that pins the ``repr()`` guard:
+      the captured message must stay one physical line.
+
+    Returns ``True`` only if every layer holds.
+    """
+    logger = logging.getLogger("pysyslog")
+    sources = {
+        entry["ip"]: SourceMapping(
+            ip=entry["ip"], site=entry["site"], host=entry["host"]
+        )
+        for entry in fixtures.CHECK_SOURCES
+    }
+    resolver = Resolver(sources)
+    ok = True
+
+    # Layer 0 (run FIRST, at the default info level): the DEBUG trace is a true
+    # no-op below DEBUG. Drive one datagram with a DEBUG handler attached and
+    # assert zero records — the logger's INFO level suppresses DEBUG emission
+    # before any handler is reached.
+    info_handler = _DebugRecordingHandler()
+    logger.addHandler(info_handler)
+    prev_level = logger.level
+    try:
+        logger.setLevel(logging.INFO)
+        process_datagram(
+            fixtures.DATAGRAMS[0].raw,
+            fixtures.DATAGRAMS[0].client_ip,
+            resolver=resolver,
+            writer=_CaptureWriter(),
+            counters=Counters(),
+            clock=_pinned_clock,
+        )
+    finally:
+        logger.removeHandler(info_handler)
+        logger.setLevel(prev_level)
+    if not info_handler.messages:
+        print("PASS  trace: info-level emits no DEBUG trace", file=sys.stderr)
+    else:
+        ok = False
+        print(
+            f"FAIL  trace: info-level emitted {len(info_handler.messages)} "
+            "DEBUG record(s); expected 0",
+            file=sys.stderr,
+        )
+
+    # Layers 1+2 (success path): at DEBUG, the full corpus emits one trace per
+    # datagram; each is one physical line and reports write=written. The DEBUG
+    # handler also sees the resolver's own warn-once WARNING for the unknown-src
+    # fixture (WARNING >= DEBUG), so the trace records are isolated by their
+    # stable "datagram from " prefix — the trace's load-bearing identifier — to
+    # keep "one trace per datagram" counting traces, not incidental log noise.
+    handler = _DebugRecordingHandler()
+    logger.addHandler(handler)
+    prev_level = logger.level
+    try:
+        logger.setLevel(logging.DEBUG)
+        for fixture in fixtures.DATAGRAMS:
+            process_datagram(
+                fixture.raw,
+                fixture.client_ip,
+                resolver=resolver,
+                writer=_CaptureWriter(),
+                counters=Counters(),
+                clock=_pinned_clock,
+            )
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(prev_level)
+
+    traces = [msg for msg in handler.messages if msg.startswith("datagram from ")]
+    expected_count = len(fixtures.DATAGRAMS)
+    if len(traces) == expected_count:
+        print(
+            f"PASS  trace: one DEBUG trace per datagram ({expected_count})",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            f"FAIL  trace: captured {len(traces)} DEBUG trace(s), "
+            f"expected {expected_count}",
+            file=sys.stderr,
+        )
+    embedded = [msg for msg in traces if msg.count("\n") != 0]
+    if not embedded:
+        print("PASS  trace: every DEBUG trace is one physical line", file=sys.stderr)
+    else:
+        ok = False
+        print(
+            f"FAIL  trace: {len(embedded)} DEBUG trace(s) carry embedded "
+            f"newline(s); first: {embedded[0]!r}",
+            file=sys.stderr,
+        )
+    missing_outcome = [msg for msg in traces if "write=written" not in msg]
+    if not missing_outcome:
+        print("PASS  trace: every DEBUG trace reports write=written", file=sys.stderr)
+    else:
+        ok = False
+        print(
+            f"FAIL  trace: {len(missing_outcome)} DEBUG trace(s) lack "
+            f"'write=written'; first: {missing_outcome[0]!r}",
+            file=sys.stderr,
+        )
+
+    # Layer 3 (the load-bearing guard): pin repr() neutralization with a DIRECT
+    # trace_datagram call carrying a hostile program/sender_ts the parser would
+    # never produce. This bypasses the parser's upstream field-cleaning, so it is
+    # the only assertion that proves repr() — not the grammar — keeps the trace
+    # to one physical line.
+    hostile = SyslogRecord(
+        recv_ts=fixtures.PINNED_RECV_TS,
+        protocol="rfc3164",
+        priority_text="user.notice",
+        program="app\nINJECT\rcr ls ps\x85nel",
+        sender_ts="ts\nfake\x80c1",
+        message="body",
+        malformed=False,
+        raw="raw",
+    )
+    repr_handler = _DebugRecordingHandler()
+    logger.addHandler(repr_handler)
+    prev_level = logger.level
+    try:
+        logger.setLevel(logging.DEBUG)
+        trace_datagram("192.0.2.1", hostile, "home", "router1", "written")
+    finally:
+        logger.removeHandler(repr_handler)
+        logger.setLevel(prev_level)
+    if len(repr_handler.messages) == 1 and repr_handler.messages[0].count("\n") == 0:
+        print(
+            "PASS  trace: repr() neutralizes hostile program/sender_ts to one line",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        first_repr = repr_handler.messages[0] if repr_handler.messages else None
+        print(
+            "FAIL  trace: hostile program/sender_ts split the DEBUG line: "
+            f"records={len(repr_handler.messages)} first={first_repr!r}",
+            file=sys.stderr,
+        )
+
+    print(f"TRACE CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
     return ok
 
 

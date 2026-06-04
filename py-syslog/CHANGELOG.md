@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.0 — meaningful `log_level: debug` and config-page translations
+
+- `log_level: debug` is now meaningful: each received datagram emits a single
+  consolidated DEBUG trace on stderr surfacing its parse and resolution
+  decision (protocol, priority, program, sender_ts, resolved site/host,
+  malformed flag, and write outcome). Default stays `info`, so existing
+  deployments are byte-identical until someone opts into `debug` —
+  backward-compatible.
+- The trace renders sender-controlled `program` / `sender_ts` through
+  `repr()`, so embedded line breaks and C1 controls are escaped and the
+  diagnostics line is guaranteed a single physical line (same one-physical-line
+  contract the stored-line path enforces).
+- New `translations/en.yaml` gives the four Configuration-tab options friendly
+  labels and help text in the HA UI (e.g. `log_level` → "Diagnostics
+  verbosity", with help clarifying it does not filter the syslog collected from
+  configured sources).
+- The `--check` self-tests now assert the DEBUG trace contract directly:
+  info-level emits zero records, DEBUG emits one trace per datagram, every
+  trace is one physical line and reports `write=written`, and a direct
+  `trace_datagram` call with a hostile `program` / `sender_ts` is captured
+  as a single line — pinning the `repr()` neutralization the parser cannot
+  reach. The `--check --write-error` mode additionally asserts the trace
+  fires exactly once and reports `write=error` on the failure branch.
+
 ## 1.0.1 — escape C1 controls and Unicode line separators
 
 - `_escape` now also escapes C1 control characters (U+0080–U+009F, including
