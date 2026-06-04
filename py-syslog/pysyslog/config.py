@@ -101,6 +101,18 @@ def validate(options: dict[str, object]) -> Config:
     if listen_port < _MIN_PORT or listen_port > _MAX_PORT:
         raise ConfigError(f"listen_port: must be {_MIN_PORT}-{_MAX_PORT}")
 
+    # `listen_host` is required (no Python default): the HA schema in config.yaml
+    # supplies the bind-all (``0.0.0.0``) default so a deployed add-on always
+    # provides it at runtime. Keeping the default *out* of Python means no
+    # bind-all string literal can flow into the socket.bind sink — the
+    # py/bind-socket-all-network-interfaces invariant. The dev/--options path
+    # must supply it explicitly.
+    listen_host = options.get("listen_host")
+    if not isinstance(listen_host, str):
+        raise ConfigError("listen_host: must be a string")
+    if listen_host.strip() == "":
+        raise ConfigError("listen_host: must not be empty")
+
     retention_days = _require_int(options, "retention_days", 30)
     if retention_days < _MIN_RETENTION or retention_days > _MAX_RETENTION:
         raise ConfigError(f"retention_days: must be {_MIN_RETENTION}-{_MAX_RETENTION}")
@@ -115,6 +127,7 @@ def validate(options: dict[str, object]) -> Config:
 
     return Config(
         listen_port=listen_port,
+        listen_host=listen_host,
         retention_days=retention_days,
         log_level=log_level,
         sources=sources,

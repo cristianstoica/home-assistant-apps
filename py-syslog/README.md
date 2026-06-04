@@ -49,12 +49,13 @@ Point your devices' syslog forwarding at the Home Assistant host on
 
 ## Options
 
-| Option           | Type                                | Default | Meaning                                                                                                                 |
-| ---------------- | ----------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `listen_port`    | `port`                              | `5514`  | UDP port to bind on the host network.                                                                                   |
-| `retention_days` | `int(1,3650)`                       | `30`    | Days of gzipped archives to keep; older ones are pruned.                                                                |
-| `log_level`      | `list(debug\|info\|warning\|error)` | `info`  | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below). |
-| `sources`        | list of `{ip, site, host}`          | `[]`    | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                       |
+| Option           | Type                                | Default   | Meaning                                                                                                                 |
+| ---------------- | ----------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `listen_port`    | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                   |
+| `listen_host`    | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).      |
+| `retention_days` | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                |
+| `log_level`      | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below). |
+| `sources`        | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                       |
 
 > **`log_level` controls py-syslog's own logging, not the logs it collects.** It
 > sets the verbosity of py-syslog's _own_ operational diagnostics on stderr — the
@@ -86,6 +87,26 @@ run as root, so a privileged port (≤1024) binds fine.
 The authoritative "is the port free?" check is the add-on's own first start: it
 binds `listen_port` or exits fast with a clear `cannot bind` message — set a
 free port and restart.
+
+### Threat model and hardening
+
+- **Bind interface is operator-restrictable.** The default `listen_host`
+  (`0.0.0.0`) binds **all** interfaces, which is convenient on a trusted LAN.
+  Set `listen_host` to a specific host IP (e.g. `192.0.2.5`) to accept datagrams
+  on only that interface.
+- **UDP syslog is unauthenticated and source-spoofable.** There is no handshake
+  and no sender authentication; the source IP on a UDP datagram can be forged, so
+  any host that can reach the port can inject lines stamped as any sender —
+  including one mapped in `sources`. Stamped `site`/`host` reflect the **claimed**
+  source IP, not a verified identity.
+- **When exposing beyond a trusted LAN, restrict and firewall.** If you
+  port-forward or otherwise expose the port past a trusted network, restrict the
+  bind interface via `listen_host` **and** firewall the source (allow only known
+  sender addresses on the collector port, e.g. `203.0.113.0/24`). Do both:
+  restricting the bind interface alone does not authenticate senders.
+- **Roadmap caveat.** Driving Home Assistant automations or events from collected
+  logs would require a sender-trust mechanism first, since senders are currently
+  unauthenticated — a spoofed datagram must never be able to trigger an action.
 
 ## Viewing collected logs — two ways
 

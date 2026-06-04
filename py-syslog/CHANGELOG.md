@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0 — configurable `listen_host` (closes bind-all CodeQL finding)
+
+- New `listen_host` option selects the local interface/address the collector
+  binds. The default is `0.0.0.0` (binds all interfaces), so existing
+  deployments are byte-identical until someone overrides it — backward-
+  compatible. Set `listen_host` to a specific host IP to accept datagrams on
+  only that interface.
+- Closes the CodeQL finding `py/bind-socket-all-network-interfaces`
+  (CVE-2018-1281) on the previously-hardcoded `0.0.0.0` bind. The bind-all
+  string literal no longer exists anywhere on a code path that can reach
+  `socket.bind`: `_bind` reads `self._config.listen_host`, the default lives
+  exclusively in the HA schema (`config.yaml`), and `validate()` requires
+  `listen_host` (rejects missing / non-string / empty / whitespace-only) so
+  the dev/`--options` path must supply it explicitly. `--check` and the
+  invalid-options fixture base use the RFC 5737 documentation address
+  `192.0.2.10` so no Python source carries a bind-all literal.
+- README gains a "Threat model and hardening" section: bind-interface
+  restriction, UDP syslog being unauthenticated and source-spoofable, the
+  restrict-AND-firewall guidance for exposure beyond a trusted LAN, and a
+  roadmap caveat that driving HA automations from collected logs would need
+  sender-trust first. The `listen_host` row is added to the Options table.
+- `translations/en.yaml` adds a `listen_host` entry so the HA Configuration
+  tab labels it "Listen address" with help text that names the bind-all
+  default and points operators at the restrict-AND-firewall hardening.
+- `--check` adds a positive `listen-host` assertion that a configured bind
+  address round-trips into `Config.listen_host` unchanged, and the
+  invalid-options corpus pins all four rejection arms (missing / empty /
+  non-string / whitespace-only).
+
 ## 1.1.0 — meaningful `log_level: debug` and config-page translations
 
 - `log_level: debug` is now meaningful: each received datagram emits a single

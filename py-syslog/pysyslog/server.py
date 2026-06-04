@@ -246,10 +246,10 @@ class Server:
         self._stop.set()
 
     def _bind(self) -> socket.socket:
-        """Bind ``0.0.0.0:<listen_port>``; a bind failure is fatal (exit 1)."""
+        """Bind ``<listen_host>:<listen_port>``; a bind failure is fatal (exit 1)."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.bind(("0.0.0.0", self._config.listen_port))
+            sock.bind((self._config.listen_host, self._config.listen_port))
         except OSError as exc:
             sock.close()
             _log.error("cannot bind UDP :%d — %s", self._config.listen_port, exc)

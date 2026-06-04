@@ -26,10 +26,13 @@ class Config(NamedTuple):
     `log_dir` / `log_file` are dev-override keys (defaults ``/data/log`` /
     ``syslog.log``); they are absent from the HA schema, so a deployed add-on
     never sets them and the production storage path cannot be misconfigured.
-    `sources` is keyed by sender IP for O(1) resolution.
+    `listen_host` is the local bind address (``0.0.0.0`` = all interfaces);
+    its default lives only in the HA schema (``config.yaml``), never as a Python
+    literal. `sources` is keyed by sender IP for O(1) resolution.
     """
 
     listen_port: int
+    listen_host: str
     retention_days: int
     log_level: str
     sources: dict[str, SourceMapping]
