@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.1 — escape C1 controls and Unicode line separators
+
+- `_escape` now also escapes C1 control characters (U+0080–U+009F, including
+  NEL U+0085) as `\xNN` and the Unicode line/paragraph separators U+2028 and
+  U+2029 as `\uNNNN`. Previously these validly-decoded code points passed
+  through and could split a stored log line into multiple physical lines,
+  violating the one-datagram → one-physical-line contract (a log-line-injection
+  vector).
+- Added two regression fixtures: an isolated U+2028 / U+2029 / C1-edge fixture,
+  and a combined "all escape classes + legit UTF-8" fixture exercising the
+  `\\` self-escape and DEL (`\x7f`) arms alongside multi-byte UTF-8 that must
+  pass through verbatim.
+- `--check` now asserts that every rendered line is exactly one physical line
+  (one trailing newline, none embedded), pinning the contract directly so a
+  future expected_line that itself wrongly embedded a newline cannot pass.
+
 ## 1.0.0 — initial public release
 
 - Durable UDP syslog collector for Home Assistant (RFC 3164 / 5424).

@@ -191,6 +191,21 @@ def _check_datagrams() -> bool:
             print(f"  expected: {fixture.expected_line!r}", file=sys.stderr)
             print(f"  produced: {produced!r}", file=sys.stderr)
 
+        # Pin the headline contract directly: one datagram -> exactly one
+        # physical line (a single trailing newline, none embedded). This catches
+        # a future expected_line that itself wrongly embedded a newline, which
+        # blob equality above would silently accept.
+        if produced.count("\n") == 1 and produced.endswith("\n"):
+            print(f"PASS  [{fixture.tag}] one physical line", file=sys.stderr)
+        else:
+            ok = False
+            print(
+                f"FAIL  [{fixture.tag}] one physical line: "
+                f"newlines={produced.count(chr(10))} "
+                f"trailing={produced.endswith(chr(10))}",
+                file=sys.stderr,
+            )
+
         # Layer 2: the parse + resolve fields the line is composed from.
         record = parse(fixture.raw.decode("utf-8", "replace"), fixtures.PINNED_RECV_TS)
         if record.protocol == fixture.protocol:
