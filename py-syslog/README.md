@@ -19,7 +19,8 @@ add-on store.
 
 1. In Home Assistant, open **Settings → Add-ons → Add-on Store**.
 2. From the top-right **⋮** menu choose **Repositories**, paste
-   `https://github.com/cristianstoica/py-syslog`, click **Add**, then **Close**.
+   `https://github.com/cristianstoica/home-assistant-apps`, click **Add**, then
+   **Close**.
 3. The store refreshes — find the **Py-Syslog** card, open it, and click
    **Install**.
 4. On the **Configuration** tab, add your sender mappings (see below), then

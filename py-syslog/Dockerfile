@@ -1,19 +1,21 @@
-FROM python:3.13-alpine
+# https://developers.home-assistant.io/docs/apps/configuration#app-dockerfile
+ARG BUILD_FROM=ghcr.io/home-assistant/base-python:3.13-alpine3.23
+FROM ${BUILD_FROM}
 
-# HA add-on labels are required when not building via the official GitHub builder
-# action. Supervisor passes BUILD_VERSION (from config.yaml) and BUILD_ARCH; the
-# defaults keep a standalone `docker build` working off-HAOS.
-ARG BUILD_VERSION=dev
-ARG BUILD_ARCH=amd64
+# Unbuffered stdio so each stored line (stdout) and diagnostic (stderr) reaches
+# the HA add-on Log tab immediately — stdout is block-buffered without a TTY.
+# PYTHONPATH=/app lets `python3 -m pysyslog` find the package copied below.
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Copy s6-overlay service tree (run/finish for the py-syslog service).
+COPY rootfs /
+
+# Copy the Python collector package.
+COPY pysyslog/ /app/pysyslog/
+
 LABEL \
-  io.hass.version="${BUILD_VERSION}" \
-  io.hass.type="app" \
-  io.hass.arch="${BUILD_ARCH}"
-
-# Unbuffered stdio so the stdout echo (stored lines) and stderr diagnostics reach the HA
-# Log tab immediately — container stdout is block-buffered when stdout is not a TTY.
-ENV PYTHONUNBUFFERED=1
-
-WORKDIR /app
-COPY pysyslog/ ./pysyslog/
-CMD ["python3", "-m", "pysyslog"]
+    org.opencontainers.image.title="Home Assistant App: Py-Syslog" \
+    org.opencontainers.image.description="Durable UDP syslog collector for Home Assistant (RFC 3164/5424)." \
+    org.opencontainers.image.source="https://github.com/cristianstoica/home-assistant-apps" \
+    org.opencontainers.image.licenses="MIT"

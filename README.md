@@ -1,4 +1,17 @@
-# Py-Syslog — Home Assistant add-on
+# Home Assistant Apps
+
+A small collection of Home Assistant add-ons (apps) packaged for the
+Supervisor add-on store, with prebuilt multi-architecture images published to
+`ghcr.io`.
+
+[![Open your Home Assistant instance and show the add-on store with this repository pre-filled.](https://my.home-assistant.io/badges/supervisor_store.svg)](https://my.home-assistant.io/redirect/supervisor_store/?repository_url=https%3A%2F%2Fgithub.com%2Fcristianstoica%2Fhome-assistant-apps)
+
+## Apps
+
+### [Py-Syslog](./py-syslog)
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
 
 A durable, stdlib-only **UDP syslog collector** for Home Assistant. It receives
 RFC 3164 / 5424 datagrams, resolves each sender IP to a `site`/`host`, and
@@ -13,28 +26,15 @@ silently swallowed.
 > Container/Core have no add-on store.
 
 1. In Home Assistant: **Settings → Add-ons → Add-on Store → ⋮ → Repositories**.
-2. Add `https://github.com/cristianstoica/py-syslog` and close the dialog.
-3. Find **Py-Syslog** in the store and click **Install**.
-4. On the **Configuration** tab, add your sender mappings, then **Start**.
-
-## Configure
-
-Map each sender IP to a `(site, host)` stamped on every collected line:
-
-```yaml
-sources:
-  - { ip: 192.0.2.1, site: home, host: router1 }
-```
-
-Point your devices' syslog forwarding at the Home Assistant host on the
-configured `listen_port` (default UDP **5514**). A sender not listed in
-`sources` is still received and written, stamped `unknown`/`<ip>`.
-
-## More
-
-See the [add-on README](py-syslog/README.md) for options, networking rationale,
-rotation/retention/failure behavior, and the built-in `--check` self-validation.
+2. Add `https://github.com/cristianstoica/home-assistant-apps` and close the
+   dialog.
+3. Find the app you want (e.g. **Py-Syslog**) in the store and click
+   **Install**.
+4. On the **Configuration** tab, set options, then **Start**.
 
 ## License
 
 [MIT](LICENSE).
+
+[aarch64-shield]: https://img.shields.io/badge/aarch64-yes-green.svg
+[amd64-shield]: https://img.shields.io/badge/amd64-yes-green.svg
