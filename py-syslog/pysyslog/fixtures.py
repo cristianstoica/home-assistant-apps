@@ -188,6 +188,61 @@ DATAGRAMS: list[DatagramFixture] = [
             "app: [Jun  3 11:59:58] line1\\nline2\\twith tab\\x00end\n"
         ),
     ),
+    DatagramFixture(
+        name="C1 control + Unicode line-separator escaping contract",
+        client_ip=SOURCE_IP,
+        # UTF-8 for U+0080 (\xc2\x80), U+0085 NEL (\xc2\x85), U+009F (\xc2\x9f),
+        # U+2028 LINE SEPARATOR (\xe2\x80\xa8), U+2029 PARAGRAPH SEPARATOR
+        # (\xe2\x80\xa9) interleaved with printable chars so each escape is
+        # unambiguous. These are validly-decoded code points (not invalid bytes),
+        # so decode passes them through; the escaper, not decode, must neutralize
+        # them or the datagram splits into extra unstamped lines.
+        raw=(
+            b"<13>Jun  3 11:59:58 myhost app: "
+            b"a\xc2\x80b\xc2\x85c\xc2\x9fd\xe2\x80\xa8e\xe2\x80\xa9f"
+        ),
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        # C1 controls render as \xNN (two hex), U+2028/U+2029 as \uNNNN (four
+        # hex) -> one stamped physical line, no line-injection.
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 user.notice "
+            "app: [Jun  3 11:59:58] a\\x80b\\x85c\\x9fd\\u2028e\\u2029f\n"
+        ),
+    ),
+    DatagramFixture(
+        name="all escape classes + legit UTF-8 in one line",
+        client_ip=SOURCE_IP,
+        # One body mixing every escape class against legitimate multi-byte
+        # UTF-8, to prove the escaper neutralizes line-splitters without
+        # mangling real content. Body after "app: ":
+        #   x \ y \t z \r A \r\n B \x01 C \x7f D \xc2\x85(NEL) E ' ' F
+        #   then café-日本-🚀 (verbatim multi-byte UTF-8).
+        # \ exercises the \\ self-escape branch and \x7f exercises the DEL arm
+        # -- neither is hit by any other datagram fixture.
+        raw=(
+            b"<13>Jun  3 11:59:58 myhost app: "
+            b"x\\y\tz\rA\r\nB\x01C\x7fD\xc2\x85E F caf\xc3\xa9-"
+            b"\xe6\x97\xa5\xe6\x9c\xac-\xf0\x9f\x9a\x80"
+        ),
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        # Backslash -> \\, TAB -> \t, bare CR -> \r, CRLF -> \r\n, C0 0x01 ->
+        # \x01, DEL 0x7f -> \x7f, C1 NEL 0x85 -> \x85; the literal space and the
+        # café-日本-🚀 run pass through verbatim (space is not a splitter). One
+        # stamped physical line, no line-injection.
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 user.notice "
+            "app: [Jun  3 11:59:58] "
+            "x\\\\y\\tz\\rA\\r\\nB\\x01C\\x7fD\\x85E F café-日本-🚀\n"
+        ),
+    ),
 ]
 
 
@@ -244,16 +299,16 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
 
 
 # The expected aggregate counters after driving DATAGRAMS through the seam.
-# received = all 8; rfc3164 = 4 (incl. the unknown-src one); rfc5424 = 2;
-# unknown protocol = 2 malformed; malformed = 2; unknown source = 1; written = 8.
+# received = all 10; rfc3164 = 6 (incl. the unknown-src one); rfc5424 = 2;
+# unknown protocol = 2 malformed; malformed = 2; unknown source = 1; written = 10.
 EXPECTED_COUNTERS: dict[str, int] = {
-    "received": 8,
-    "rfc3164": 4,
+    "received": 10,
+    "rfc3164": 6,
     "rfc5424": 2,
     "unknown": 2,
     "malformed": 2,
     "unknown_source": 1,
-    "written": 8,
+    "written": 10,
     "write_errors": 0,
     "internal_errors": 0,
 }

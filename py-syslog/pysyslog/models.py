@@ -68,14 +68,22 @@ class WriterProtocol(Protocol):
 
 
 def _escape(text: str) -> str:
-    """Backslash-escape CR, LF, TAB, and C0 control chars so one datagram can
-    never split into extra, unstamped physical lines.
+    """Backslash-escape every code point that a downstream renderer, terminal, or
+    log viewer could treat as a line break, so one datagram can never split into
+    extra, unstamped physical lines.
 
     ``\\`` itself is escaped first (so the escape is unambiguous and
-    reversible for the common control chars), then the named controls, then any
-    remaining C0 control character (U+0000-U+001F, and U+007F DEL) as
-    ``\\xNN``. The decode step already mapped invalid bytes to U+FFFD, so the
-    input here is text; the output is single-line text, not byte-exact.
+    reversible for the common control chars), then the named controls, then:
+
+    * any remaining C0 control character (U+0000-U+001F, and U+007F DEL) and any
+      C1 control character (U+0080-U+009F, which includes U+0085 NEL — a hard
+      line break to several renderers) as ``\\xNN`` (two hex digits);
+    * U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR — Unicode line breaks
+      that exceed two hex digits — as ``\\uNNNN`` (four hex digits).
+
+    Everything else (printable text) passes through. The decode step already
+    mapped invalid bytes to U+FFFD, so the input here is text; the output is
+    single-line text, not byte-exact.
     """
     out: list[str] = []
     for ch in text:
@@ -88,8 +96,10 @@ def _escape(text: str) -> str:
             out.append("\\r")
         elif ch == "\t":
             out.append("\\t")
-        elif code < 0x20 or code == 0x7F:
+        elif code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
+        elif code in (0x2028, 0x2029):
+            out.append(f"\\u{code:04x}")
         else:
             out.append(ch)
     return "".join(out)
