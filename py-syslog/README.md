@@ -86,6 +86,17 @@ free port and restart.
    on stderr; both streams surface in the Log tab, the split just keeps the
    collected stream separable.
 
+> **"Failed to get … logs, Failed to fetch" in the Log tab.** Because this
+> collector is intentionally quiet, its Log-tab stream can sit idle for minutes.
+> Over a proxy or remote access (e.g. Home Assistant Cloud), an idle add-on log
+> stream is dropped by the proxy's read-timeout after a few minutes — a known
+> Home Assistant behavior ([home-assistant/addons#4149](https://github.com/home-assistant/addons/issues/4149))
+> that affects any add-on's Log tab (built-in ones included) and does **not**
+> occur on direct local access. It shows a one-off "Failed to fetch" toast;
+> **reload the page to re-subscribe.** It is a cosmetic quirk of the HA log
+> viewer, not a py-syslog failure — collection and the on-disk `/data/log` files
+> are unaffected.
+
 ## Rotation, retention, and failure behavior
 
 - **Daily UTC rotation.** At the first write after a UTC-day boundary the active
