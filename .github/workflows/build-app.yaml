@@ -42,14 +42,33 @@ jobs:
           APP_NAME: ${{ steps.info.outputs.name }}
           APP_DESCRIPTION: ${{ steps.info.outputs.description }}
           APP_URL: ${{ steps.info.outputs.url }}
+        # The home-assistant info helper emits values as JSON scalars (e.g.
+        # "1.0.0" with literal quotes for strings, null for missing fields),
+        # so we strip a single surrounding pair of double quotes from each
+        # string value before writing it back to the step output.
         run: |
-          echo "image_name=${IMAGE##*/}" >> "$GITHUB_OUTPUT"
-          echo "registry_prefix=${IMAGE%/*}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "name=${APP_NAME}" >> "$GITHUB_OUTPUT"
-          echo "description=${APP_DESCRIPTION}" >> "$GITHUB_OUTPUT"
-          if [[ -n "$APP_URL" && "$APP_URL" != "null" ]]; then
-            echo "url=${APP_URL}" >> "$GITHUB_OUTPUT"
+          strip_quotes() {
+            local v="$1"
+            if [[ "${v:0:1}" == "\"" && "${v: -1}" == "\"" && ${#v} -ge 2 ]]; then
+              v="${v#\"}"
+              v="${v%\"}"
+            fi
+            printf '%s' "${v}"
+          }
+
+          image="$(strip_quotes "${IMAGE}")"
+          version="$(strip_quotes "${VERSION}")"
+          app_name="$(strip_quotes "${APP_NAME}")"
+          app_description="$(strip_quotes "${APP_DESCRIPTION}")"
+          app_url="$(strip_quotes "${APP_URL}")"
+
+          echo "image_name=${image##*/}" >> "$GITHUB_OUTPUT"
+          echo "registry_prefix=${image%/*}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "name=${app_name}" >> "$GITHUB_OUTPUT"
+          echo "description=${app_description}" >> "$GITHUB_OUTPUT"
+          if [[ -n "${app_url}" && "${app_url}" != "null" ]]; then
+            echo "url=${app_url}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Prepare build matrix
