@@ -60,9 +60,20 @@ class Counters:
         self.written = 0
         self.write_errors = 0
         self.internal_errors = 0
+        # Size-guard counters: the live `Writer` owns the authoritative values
+        # (its `stats` object); the server copies them in at stats-emit time.
+        # The datagram corpus uses a capture writer (no guard), so they stay 0
+        # there — which `EXPECTED_COUNTERS` asserts.
+        self.size_rotations = 0
+        self.space_prunes = 0
+        self.bytes_reclaimed = 0
 
     def as_dict(self) -> dict[str, int]:
-        """Snapshot the counters as a plain dict (for stats + ``--check``)."""
+        """Snapshot the counters as a plain dict (for stats + ``--check``).
+
+        The three size-guard counters are appended in fixed order after the
+        existing datagram counters.
+        """
         return {
             "received": self.received,
             "rfc3164": self.rfc3164,
@@ -73,6 +84,9 @@ class Counters:
             "written": self.written,
             "write_errors": self.write_errors,
             "internal_errors": self.internal_errors,
+            "size_rotations": self.size_rotations,
+            "space_prunes": self.space_prunes,
+            "bytes_reclaimed": self.bytes_reclaimed,
         }
 
 
@@ -101,6 +115,28 @@ class _Throttle:
             self._last[key] = monotonic
             return True
         return False
+
+
+# Public alias: ``__main__`` builds one throttle to share between the server's
+# own warnings and the Writer's size-guard warnings. Exposed under a public name
+# so the cross-module construction is not a private-usage access.
+Throttle = _Throttle
+
+
+def make_throttled_warn(throttle: _Throttle) -> Callable[[str, str], None]:
+    """Build a ``warn(key, message)`` callback backed by `throttle`.
+
+    The live `Writer`'s size-guard warnings share the server's throttle through
+    this (one warn per key per window), so a segment-roll flood cannot warn at
+    roll rate. Exposed so ``__main__`` can wire the Writer's warner from the same
+    throttle it hands the `Server`.
+    """
+
+    def _warn(key: str, message: str) -> None:
+        if throttle.should_emit(key, time.monotonic()):
+            _log.warning("%s", message)
+
+    return _warn
 
 
 def _trace_datagram(
@@ -215,13 +251,22 @@ def process_datagram(
 class Server:
     """The live UDP collector: bind, recvfrom loop, shutdown, stats."""
 
-    def __init__(self, config: Config, writer: WriterProtocol) -> None:
+    def __init__(
+        self,
+        config: Config,
+        writer: WriterProtocol,
+        throttle: _Throttle | None = None,
+    ) -> None:
         self._config = config
         self._writer = writer
         self._resolver = Resolver(config.sources)
         self._counters = Counters()
         self._stop = threading.Event()
-        self._throttle = _Throttle()
+        # The live collector shares one throttle between its own warnings and the
+        # Writer's size-guard warnings (``__main__`` builds the Writer's warner
+        # from this same throttle); the oracle call sites omit it and get a fresh
+        # one.
+        self._throttle = throttle if throttle is not None else _Throttle()
         self._sock: socket.socket | None = None
 
     @property
@@ -308,6 +353,10 @@ class Server:
                 pair = self._receive()
                 now = time.monotonic()
                 if now - last_stats >= _STATS_INTERVAL_S:
+                    # Backstop the write-driven guard: re-check the budget at the
+                    # stats tick in case a non-log file grew the volume without a
+                    # size-roll occurring. A no-op when the guard is disabled.
+                    self._writer.enforce_space_tick()
                     self._emit_stats("periodic")
                     last_stats = now
                 if pair is None:
@@ -341,6 +390,38 @@ class Server:
         return (data, addr[0])
 
     def _emit_stats(self, label: str) -> None:
+        # Copy the Writer's authoritative guard counters into the Counters snapshot
+        # (the Writer owns them; the server merely surfaces them here).
+        writer_stats = self._writer.stats
+        self._counters.size_rotations = writer_stats.size_rotations
+        self._counters.space_prunes = writer_stats.space_prunes
+        self._counters.bytes_reclaimed = writer_stats.bytes_reclaimed
+
         counts = self._counters.as_dict()
-        summary = " ".join(f"{key}={value}" for key, value in counts.items())
-        _log.info("stats (%s): %s", label, summary)
+        # Storage segment: the size-guard counters plus two always-rendered live
+        # gauges read at tick time (a measurement failure renders ``?`` rather
+        # than crashing the stats line).
+        free_pct = self._writer.disk_free_pct()
+        log_mb = self._writer.log_dir_mb()
+        free_text = str(free_pct) if free_pct is not None else "?"
+        log_text = str(log_mb) if log_mb is not None else "?"
+
+        counter_keys = (
+            "received",
+            "rfc3164",
+            "rfc5424",
+            "unknown",
+            "malformed",
+            "unknown_source",
+            "written",
+            "write_errors",
+            "internal_errors",
+        )
+        datagram_part = " ".join(f"{key}={counts[key]}" for key in counter_keys)
+        storage_part = (
+            f"disk_free_pct={free_text} log_dir_mb={log_text} "
+            f"size_rotations={counts['size_rotations']} "
+            f"space_prunes={counts['space_prunes']} "
+            f"bytes_reclaimed={counts['bytes_reclaimed']}"
+        )
+        _log.info("stats (%s): %s %s", label, datagram_part, storage_part)

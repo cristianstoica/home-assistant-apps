@@ -31,6 +31,10 @@ _MIN_RETENTION = 1
 _MAX_RETENTION = 3650
 _MIN_PORT = 1
 _MAX_PORT = 65535
+_MIN_PCT = 0
+_MAX_PCT = 99
+_MIN_SEG_MB = 0
+_MAX_SEG_MB = 4096
 
 
 class ConfigError(Exception):
@@ -117,6 +121,29 @@ def validate(options: dict[str, object]) -> Config:
     if retention_days < _MIN_RETENTION or retention_days > _MAX_RETENTION:
         raise ConfigError(f"retention_days: must be {_MIN_RETENTION}-{_MAX_RETENTION}")
 
+    min_free_percent = _require_int(options, "min_free_percent", 0)
+    if min_free_percent < _MIN_PCT or min_free_percent > _MAX_PCT:
+        raise ConfigError(f"min_free_percent: must be {_MIN_PCT}-{_MAX_PCT}")
+
+    max_log_percent = _require_int(options, "max_log_percent", 0)
+    if max_log_percent < _MIN_PCT or max_log_percent > _MAX_PCT:
+        raise ConfigError(f"max_log_percent: must be {_MIN_PCT}-{_MAX_PCT}")
+
+    max_segment_mb = _require_int(options, "max_segment_mb", 0)
+    if max_segment_mb < _MIN_SEG_MB or max_segment_mb > _MAX_SEG_MB:
+        raise ConfigError(f"max_segment_mb: must be {_MIN_SEG_MB}-{_MAX_SEG_MB}")
+
+    # Coherence gate (allowlist-style): proceed only if size-rotation is enabled
+    # whenever either percentage guard is. Without intra-day segments there is
+    # nothing to prune, so a flood in the single active file silently defeats the
+    # cap; rejecting here turns that invisible failure into a fail-fast
+    # ConfigError. The all-zero 1.2.0 default passes this check untouched.
+    if (min_free_percent > 0 or max_log_percent > 0) and max_segment_mb <= 0:
+        raise ConfigError(
+            "max_segment_mb: size guard (min_free_percent/max_log_percent) "
+            "requires max_segment_mb > 0"
+        )
+
     log_level = _require_str(options, "log_level", "info")
     if log_level not in _VALID_LOG_LEVELS:
         raise ConfigError(f"log_level: must be one of {', '.join(_VALID_LOG_LEVELS)}")
@@ -129,6 +156,9 @@ def validate(options: dict[str, object]) -> Config:
         listen_port=listen_port,
         listen_host=listen_host,
         retention_days=retention_days,
+        min_free_percent=min_free_percent,
+        max_log_percent=max_log_percent,
+        max_segment_mb=max_segment_mb,
         log_level=log_level,
         sources=sources,
         log_dir=log_dir,

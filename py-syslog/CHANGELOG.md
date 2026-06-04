@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.3.0 — disk-space guard (size-bounded ring buffer)
+
+- New opt-in disk-space guard turns the on-disk log directory into a
+  size-bounded ring buffer that composes with the existing time-based
+  `retention_days`. Three options govern it and all default to `0` (disabled),
+  so existing deployments are byte-identical until someone opts in —
+  backward-compatible:
+  - `min_free_percent` (`0..99`): floor on free space on the volume backing
+    `/data/log`. Pruning targets the floor, keeping newest segments and
+    dropping oldest first.
+  - `max_log_percent` (`0..99`): cap on the share of the volume the log
+    directory may occupy. Pruning targets the cap with the same
+    keep-newest / drop-oldest policy.
+  - `max_segment_mb` (`0..4096`): intra-day size rotation threshold. The
+    current `syslog.log` is closed and renamed to a sequenced segment
+    `syslog.log.<UTC-date>.<NNN>.gz` (zero-padded `NNN`, monotonic per UTC
+    day) once it crosses the threshold, then atomically gzip-compressed
+    alongside the existing daily-rotation pipeline. Required for either
+    percentage guard to have anything to prune within a single day; both
+    percentage guards are no-ops when `max_segment_mb: 0`.
+- Pruning is two-dimensional (floor + cap evaluated together each cycle) and
+  the active `syslog.log` is never a deletion candidate, so a single oversize
+  current segment cannot be silently truncated and receiving continues across
+  the guard tick.
+- Stats line gains two gauges (`disk_free_pct`, `log_dir_mb`) and counters
+  for size-rotations performed and segments pruned, so operators can see the
+  guard working without enabling `log_level: debug`.
+- `translations/en.yaml` labels the three new options on the HA Configuration
+  tab and explains the `max_segment_mb > 0` precondition for the percentage
+  guards.
+- README documents the ring-buffer semantics, the segment naming scheme, and
+  the composition rule with `retention_days` (time-based deletion still wins
+  when both apply to the same segment).
+
 ## 1.2.0 — configurable `listen_host` (closes bind-all CodeQL finding)
 
 - New `listen_host` option selects the local interface/address the collector

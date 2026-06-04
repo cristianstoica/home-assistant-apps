@@ -49,13 +49,16 @@ Point your devices' syslog forwarding at the Home Assistant host on
 
 ## Options
 
-| Option           | Type                                | Default   | Meaning                                                                                                                 |
-| ---------------- | ----------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `listen_port`    | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                   |
-| `listen_host`    | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).      |
-| `retention_days` | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                |
-| `log_level`      | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below). |
-| `sources`        | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                       |
+| Option             | Type                                | Default   | Meaning                                                                                                                                                          |
+| ------------------ | ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listen_port`      | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                                                            |
+| `listen_host`      | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).                                               |
+| `retention_days`   | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                                                         |
+| `min_free_percent` | `int(0,99)`                         | `0`       | **Size guard.** Free-space floor: prune oldest segments to keep ≥ this % of the volume free. `0` disables (see Size guard below).                                |
+| `max_log_percent`  | `int(0,99)`                         | `0`       | **Size guard.** Log-dir cap: prune oldest segments so the log dir occupies ≤ this % of the volume. `0` disables.                                                 |
+| `max_segment_mb`   | `int(0,4096)`                       | `0`       | **Size guard.** Size-rotation trigger: roll the active file to a `.gz` segment at this many MB. `0` disables; **must be > 0** to enable either percentage guard. |
+| `log_level`        | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below).                                          |
+| `sources`          | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                                                                |
 
 > **`log_level` controls py-syslog's own logging, not the logs it collects.** It
 > sets the verbosity of py-syslog's _own_ operational diagnostics on stderr — the
@@ -134,27 +137,67 @@ free port and restart.
 - **Daily UTC rotation.** At the first write after a UTC-day boundary the active
   file is gzipped atomically (`*.gz.tmp` → fsync → `os.replace` → fsync dir →
   unlink source → fsync dir) into `syslog.log.<date>.gz`.
-- **Retention is time-bounded, not byte-capped.** Archives are pruned by the
-  `<date>` **embedded in the filename** (not mtime), keeping `retention_days` of
-  history. There is **no** size ceiling on the active file or the window.
-- **Residual disk-fill risk.** Because retention is time-only, a misbehaving
-  sender or a UDP flood could fill `/data` within a single day. Storage then
-  degrades through the counted/throttled-warned `WriteError` path (receiving
-  continues), never a silent crash — but it is still a fill. Operationally,
-  watch it:
+- **Retention is time-bounded by default.** Archives are pruned by the `<date>`
+  **embedded in the filename** (not mtime), keeping `retention_days` of history.
+  Time-retention alone has **no** size ceiling on the active file or the window.
+- **Residual disk-fill risk — mitigated when the size guard is enabled.**
+  Because time-retention is time-only, a misbehaving sender or a UDP flood could
+  fill `/data` within a single day. The optional **size guard** (below) closes
+  this gap: set `max_segment_mb` plus a percentage limit to byte-cap the log set
+  as a ring buffer. When the guard is **disabled** (the default — all three
+  knobs `0`), behavior is unchanged from 1.2.0: storage degrades through the
+  counted/throttled-warned `WriteError` path (receiving continues), never a
+  silent crash, but it is still a fill — so watch it:
 
   ```sh
   df -h /data
   du -sh <addon-data>/log
   ```
 
-  Byte-capping is revisited only if a high-volume sender is added.
+  The stats line also surfaces live `disk_free_pct` and `log_dir_mb` gauges
+  (rendered whether or not the guard is enabled), so the manual `df`/`du` above
+  is a fallback, not the only signal.
 
 - **Write failures are propagated.** A failed `write()`/rotation raises a domain
   `WriteError`; the server counts it as `write_errors` (never as `written`),
   emits one throttled WARNING, and keeps receiving. A failed startup
   `log_dir` creation is **fatal** (clear message, exit 1) rather than binding
   and silently dropping every datagram.
+
+### Size guard (ring buffer)
+
+The size guard is an **optional, two-dimensional, byte-bounded ring buffer**
+layered on top of time-retention. It is **disabled by default** — all three
+knobs (`min_free_percent`, `max_log_percent`, `max_segment_mb`) default to `0`,
+so a 1.2.0 → 1.3.0 upgrade changes nothing until you configure it.
+
+- **Two limits, one volume basis.** `min_free_percent` is a **free-space
+  floor** (prune until ≥ this % of the volume is free); `max_log_percent` is a
+  **log-dir cap** (prune until the log dir occupies ≤ this % of the volume).
+  Both derive from one `statvfs` read of the storage volume, so the cap
+  auto-adapts if the volume is resized. Either or both may be set; pruning
+  satisfies both at once (each delete raises free **and** shrinks the log dir).
+- **`max_segment_mb` is a separate granularity knob.** It rolls the active file
+  to a numbered `.gz` segment (`syslog.log.<date>.<NNN>.gz`) once it reaches that
+  many MB, giving the guard intra-day segments to prune. The size check is
+  **write-driven** (checked after each write+flush), so flood response is bounded
+  by one segment's worth of writes, not the periodic stats tick. It **must be > 0**
+  to enable either percentage guard — without intra-day segments a flood in the
+  single active file would silently defeat the cap, so that combination is
+  rejected at startup with a clear error.
+- **Data-loss semantics: keep-newest, drop-oldest.** Under sustained pressure
+  the guard deletes the **oldest archived segments first** (the bare daily
+  archive prunes before same-day numbered segments). The newest data is always
+  preserved; the **active, still-being-written file is never a prune victim**.
+- **Terminal cases (never thrash, never lose live data).** If pruning every
+  rotated segment still can't satisfy the floor (e.g. the disk is full of
+  non-log data), the guard **stops** with one throttled WARNING and lets the
+  counted `WriteError` path take over — it never deletes or truncates the active
+  file to make room. At 999 segments in one UTC day it stops rolling (one
+  WARNING) and keeps appending to the active file; the daily rollover resets the
+  sequence. A `statvfs`/scandir **measurement** failure degrades safe (throttled
+  WARNING, no prune, retry next tick) — deliberately, the guard is a monitoring
+  concern, not a durability one.
 
 ## Watchdog
 
@@ -175,10 +218,14 @@ This drives the built-in fixture corpus through the real processing seam and
 asserts every rendered line, protocol tag, `sender_ts`, resolved site/host, and
 the aggregate counters — including an example `192.0.2.1 → home/router1`
 mapping and the one-line escaping contract — plus the invalid-options rejection
-(duplicate `ip`, empty fields, out-of-range retention). It exits non-zero on any
+(duplicate `ip`, empty fields, out-of-range retention, the size-guard ranges,
+and the `max_segment_mb`-required coherence gate). It exits non-zero on any
 mismatch. `--check --storage` exercises the real rotation/gzip/prune/
-reconciliation state machine; `--check --write-error` asserts the `WriteError`
-contract.
+reconciliation state machine **and the size guard** (numbered-segment
+size-rotation, `(date, seq)` keep-newest prune ordering, the two-dimensional
+floor+cap ring buffer, the only-active-file / seq-overflow terminals, and
+degrade-safe measurement failure); `--check --write-error` asserts the
+`WriteError` contract.
 
 **Live send (any LAN host → resolves to `unknown`/`<that host's IP>` unless it is
 in `sources`):**

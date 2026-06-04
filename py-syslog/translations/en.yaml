@@ -17,6 +17,28 @@ configuration:
     description: >-
       Days of gzipped archives to keep; older ones are pruned. Retention is
       time-bounded by the date in each archive's filename, not byte-capped.
+  min_free_percent:
+    name: Minimum free space (%)
+    description: >-
+      Free-space floor: prune oldest archived segments to keep at least this
+      percent of the storage volume free. 0 disables. Requires Size-rotation
+      segment (MB) > 0 to take effect (without intra-day segments there is
+      nothing to prune). The newest, still-being-written data is never pruned.
+  max_log_percent:
+    name: Maximum log size (% of volume)
+    description: >-
+      Log-dir cap: prune oldest archived segments so the log directory occupies
+      no more than this percent of the storage volume. 0 disables. Requires
+      Size-rotation segment (MB) > 0 to take effect. Oldest history is sacrificed
+      first; the active file is never pruned.
+  max_segment_mb:
+    name: Size-rotation segment (MB)
+    description: >-
+      Size-rotation trigger: roll the active file to a gzip segment once it
+      reaches this many MB, so the size guard has intra-day segments to prune. 0
+      disables size-rotation. This MUST be > 0 to enable either Minimum free
+      space (%) or Maximum log size (%) — both percentage guards are otherwise
+      rejected at startup.
   log_level:
     name: Diagnostics verbosity
     description: >-
