@@ -321,6 +321,34 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options={**_valid_base(), "listen_host": "   "},
         field="listen_host",
     ),
+    InvalidOptionsFixture(
+        name="out-of-range min_free_percent",
+        options={**_valid_base(), "min_free_percent": 150},
+        field="min_free_percent",
+    ),
+    InvalidOptionsFixture(
+        name="out-of-range max_log_percent",
+        options={**_valid_base(), "max_log_percent": 150},
+        field="max_log_percent",
+    ),
+    InvalidOptionsFixture(
+        name="out-of-range max_segment_mb",
+        options={**_valid_base(), "max_segment_mb": 99999},
+        field="max_segment_mb",
+    ),
+    InvalidOptionsFixture(
+        name="size guard enabled without segment rotation",
+        options={**_valid_base(), "min_free_percent": 50, "max_segment_mb": 0},
+        field="max_segment_mb",
+    ),
+    InvalidOptionsFixture(
+        # The OTHER arm of the coherence gate's OR: the cap dimension alone
+        # (max_log_percent > 0) with rotation disabled must also be rejected, or
+        # a regression that checked only min_free_percent would slip through.
+        name="cap guard enabled without segment rotation",
+        options={**_valid_base(), "max_log_percent": 50, "max_segment_mb": 0},
+        field="max_segment_mb",
+    ),
 ]
 
 
@@ -337,4 +365,10 @@ EXPECTED_COUNTERS: dict[str, int] = {
     "written": 10,
     "write_errors": 0,
     "internal_errors": 0,
+    # Size-guard counters: the datagram corpus drives a capture writer (no
+    # guard), so these stay 0 — pinning that the default-disabled guard never
+    # touches the datagram path.
+    "size_rotations": 0,
+    "space_prunes": 0,
+    "bytes_reclaimed": 0,
 }

@@ -8,4 +8,4 @@ The importable package is the de-hyphenated form of the add-on slug
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.3.0"

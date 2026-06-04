@@ -29,11 +29,23 @@ class Config(NamedTuple):
     `listen_host` is the local bind address (``0.0.0.0`` = all interfaces);
     its default lives only in the HA schema (``config.yaml``), never as a Python
     literal. `sources` is keyed by sender IP for O(1) resolution.
+
+    `min_free_percent` / `max_log_percent` / `max_segment_mb` are the size-guard
+    knobs (all default ``0`` = disabled, so a 1.2.0 upgrade changes nothing).
+    `min_free_percent` is the free-space floor (prune to keep ≥ this % of the
+    volume free); `max_log_percent` is the log-dir cap (prune so the log dir
+    occupies ≤ this % of the volume); `max_segment_mb` is the size-rotation
+    trigger (roll the active file to a ``.gz`` segment at this many MB).
+    Validation requires `max_segment_mb` > 0 whenever either percent > 0 —
+    without intra-day segments there is nothing to prune.
     """
 
     listen_port: int
     listen_host: str
     retention_days: int
+    min_free_percent: int
+    max_log_percent: int
+    max_segment_mb: int
     log_level: str
     sources: dict[str, SourceMapping]
     log_dir: str
@@ -63,11 +75,42 @@ class SyslogRecord(NamedTuple):
 
 
 class WriterProtocol(Protocol):
-    """Structural type for the storage sink (real ``Writer`` + test fakes)."""
+    """Structural type for the storage sink (real ``Writer`` + test fakes).
+
+    Beyond the durability surface (`write` / `close`), the storage sink exposes
+    a read-only size-guard surface the server samples at stats-emit time: the
+    two live gauges (`disk_free_pct` / `log_dir_mb`, ``None`` on a measurement
+    failure so the stats line degrades rather than crashes), the cumulative
+    guard counters (`stats`), and the periodic-tick backstop (`enforce_space_tick`).
+    Test fakes implement these as no-ops / zeros (they exercise the datagram
+    path, not the guard).
+    """
 
     def write(self, line: str) -> None: ...
 
     def close(self) -> None: ...
+
+    @property
+    def stats(self) -> WriterStats: ...
+
+    def disk_free_pct(self) -> int | None: ...
+
+    def log_dir_mb(self) -> int | None: ...
+
+    def enforce_space_tick(self) -> None: ...
+
+
+class WriterStats(Protocol):
+    """Read-only view of the storage sink's cumulative size-guard counters."""
+
+    @property
+    def size_rotations(self) -> int: ...
+
+    @property
+    def space_prunes(self) -> int: ...
+
+    @property
+    def bytes_reclaimed(self) -> int: ...
 
 
 def _escape(text: str) -> str:
