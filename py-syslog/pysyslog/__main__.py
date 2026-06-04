@@ -287,6 +287,41 @@ def _check_datagrams() -> bool:
     return ok
 
 
+def _check_listen_host() -> bool:
+    """Assert a configured ``listen_host`` round-trips into `Config.listen_host`.
+
+    The rejection side (missing / empty / non-string) is asserted by the
+    `INVALID_OPTIONS` corpus via `_check_invalid_options`; this pins the positive
+    contract: a valid bind address supplied in the options payload reaches
+    ``Config.listen_host`` unchanged, so the live ``_bind`` binds the configured
+    interface rather than a hardcoded address. (``--check`` is offline and never
+    binds a real socket, so this asserts the value plumbing, not the bind call.)
+    """
+    bind_host = "192.0.2.20"
+    options = {**_default_check_options(), "listen_host": bind_host}
+    try:
+        cfg = config.validate(options)
+    except ConfigError as exc:
+        print(
+            f"FAIL  listen-host: valid host rejected -> {exc}",
+            file=sys.stderr,
+        )
+        return False
+    ok = cfg.listen_host == bind_host
+    if ok:
+        print(
+            f"PASS  listen-host: configured host round-trips ({bind_host})",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"FAIL  listen-host: expected {bind_host!r}, got {cfg.listen_host!r}",
+            file=sys.stderr,
+        )
+    print(f"LISTEN-HOST CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
+    return ok
+
+
 def _check_invalid_options() -> bool:
     """Assert invalid options are rejected with a cause-naming `ConfigError`.
 
@@ -398,9 +433,16 @@ def _default_check_options() -> dict[str, object]:
 
     Mirrors the ``config.yaml`` default seed (the `CHECK_SOURCES` mapping), so
     bare ``--check`` self-validates with no ``/data/options.json`` present.
+
+    `listen_host` uses an RFC 5737 documentation address rather than the
+    schema's ``0.0.0.0`` default: ``--check`` never binds a real socket, so the
+    value is exercise-only, and keeping the bind-all literal out of Python
+    preserves the py/bind-socket-all-network-interfaces invariant (no bind-all
+    string literal anywhere on a path that could reach ``socket.bind``).
     """
     return {
         "listen_port": 5514,
+        "listen_host": "192.0.2.10",
         "retention_days": 30,
         "log_level": "info",
         "sources": [dict(entry) for entry in fixtures.CHECK_SOURCES],
@@ -428,8 +470,9 @@ def _resolved_config(options_path: str) -> Config | None:
         print(f"config error: {exc}", file=sys.stderr)
         return None
     print(
-        f"resolved config: port={cfg.listen_port} retention={cfg.retention_days}d "
-        f"level={cfg.log_level} sources={list(cfg.sources)} "
+        f"resolved config: port={cfg.listen_port} host={cfg.listen_host} "
+        f"retention={cfg.retention_days}d level={cfg.log_level} "
+        f"sources={list(cfg.sources)} "
         f"log_dir={cfg.log_dir} log_file={cfg.log_file}",
         file=sys.stderr,
     )
@@ -466,6 +509,7 @@ def _run_check(options_path: str, storage: bool, write_error: bool) -> int:
     ok = _check_trace() and ok
     ok = _check_warn_once() and ok
     ok = _check_internal_error() and ok
+    ok = _check_listen_host() and ok
     ok = _check_invalid_options() and ok
     if ok:
         print("CHECK PASSED", file=sys.stderr)

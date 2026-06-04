@@ -4,6 +4,14 @@ configuration:
     description: >-
       UDP port to bind on the host network. Point each device's syslog
       forwarding at the Home Assistant host on this port (default 5514).
+  listen_host:
+    name: Listen address
+    description: >-
+      Local interface/address the collector binds. The default 0.0.0.0 binds
+      ALL interfaces; set a specific host IP to accept datagrams on only that
+      interface. UDP syslog is unauthenticated and source-IP-spoofable, so when
+      exposing the port beyond a trusted LAN (e.g. port-forwarding) restrict the
+      bind interface AND firewall the port.
   retention_days:
     name: Retention (days)
     description: >-

@@ -1,5 +1,5 @@
 name: Py-Syslog
-version: "1.1.0"
+version: "1.2.0"
 slug: py-syslog
 description: >-
   Durable UDP syslog collector. Receives RFC 3164/5424 datagrams, resolves each
@@ -13,6 +13,7 @@ host_network: true
 image: ghcr.io/cristianstoica/py-syslog
 options:
   listen_port: 5514
+  listen_host: 0.0.0.0
   retention_days: 30
   log_level: info
   # Map each sender IP to a (site, host) stamped on every collected line.
@@ -22,6 +23,7 @@ options:
   sources: []
 schema:
   listen_port: port
+  listen_host: str
   retention_days: int(1,3650)
   log_level: list(debug|info|warning|error)
   sources:

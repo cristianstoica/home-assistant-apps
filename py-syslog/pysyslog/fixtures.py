@@ -247,9 +247,15 @@ DATAGRAMS: list[DatagramFixture] = [
 
 
 def _valid_base() -> dict[str, Any]:
-    """A minimal valid options payload to mutate per invalid-options fixture."""
+    """A minimal valid options payload to mutate per invalid-options fixture.
+
+    `listen_host` carries an RFC 5737 documentation address (not the schema's
+    ``0.0.0.0`` default): these payloads never bind a socket, and keeping the
+    bind-all literal out of Python preserves the no-bind-all-literal invariant.
+    """
     return {
         "listen_port": 5514,
+        "listen_host": "192.0.2.10",
         "retention_days": 30,
         "log_level": "info",
         "sources": [
@@ -294,6 +300,26 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         name="out-of-range retention_days",
         options={**_valid_base(), "retention_days": 99999},
         field="retention_days",
+    ),
+    InvalidOptionsFixture(
+        name="missing listen_host",
+        options={k: v for k, v in _valid_base().items() if k != "listen_host"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="empty listen_host",
+        options={**_valid_base(), "listen_host": ""},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="non-string listen_host",
+        options={**_valid_base(), "listen_host": 1234},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="whitespace-only listen_host",
+        options={**_valid_base(), "listen_host": "   "},
+        field="listen_host",
     ),
 ]
 
