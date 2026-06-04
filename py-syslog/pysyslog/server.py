@@ -26,7 +26,7 @@ import time
 from datetime import datetime, timezone
 from typing import Callable
 
-from .models import Config, WriterProtocol, format_line
+from .models import Config, SyslogRecord, WriterProtocol, format_line
 from .parser import parse
 from .resolver import Resolver
 
@@ -103,6 +103,52 @@ class _Throttle:
         return False
 
 
+def _trace_datagram(
+    client_ip: str,
+    record: SyslogRecord,
+    site: str,
+    host: str,
+    outcome: str,
+) -> None:
+    """Emit one consolidated DEBUG line surfacing the parse + resolve decision.
+
+    Opt-in only: a true no-op unless DEBUG is enabled (guarded by the caller's
+    ``isEnabledFor`` check and the ``_log.debug`` level gate). Goes to **stderr**
+    (the diagnostics stream), never to the stdout collected-data echo.
+
+    `program` and `sender_ts` are sender-controlled and may carry embedded line
+    breaks, so both are rendered through ``repr()`` before they enter the trace.
+    ``repr()`` escapes every line-break and control code point (``\\n`` / ``\\r``
+    and ``\\xNN`` / ``\\uNNNN``), so the result is guaranteed a single physical
+    line — the same one-physical-line contract the stored-line path enforces, so
+    a crafted datagram cannot split this diagnostics line into extra physical
+    lines. `site`/`host` are config-derived (an unknown source resolves
+    ``host == client_ip``), and the remaining fields are bounded enums/flags.
+
+    Each ``%s`` arg is passed lazily so no formatting happens below DEBUG.
+    """
+    _log.debug(
+        "datagram from %s: protocol=%s priority=%s program=%s sender_ts=%s "
+        "resolved=%s/%s malformed=%s write=%s",
+        client_ip,
+        record.protocol,
+        record.priority_text,
+        repr(record.program),
+        repr(record.sender_ts),
+        site,
+        host,
+        record.malformed,
+        outcome,
+    )
+
+
+# Public seam alias: the ``--check`` trace oracle calls the trace renderer
+# directly (bypassing the parser) to pin the ``repr()`` line-break
+# neutralization on hostile ``program`` / ``sender_ts`` fields. Exposed under a
+# public name so the cross-module call is not a private-usage access.
+trace_datagram = _trace_datagram
+
+
 def process_datagram(
     data: bytes,
     client_ip: str,
@@ -151,9 +197,13 @@ def process_datagram(
         writer.write(line)
     except WriteError:
         counters.write_errors += 1
+        if _log.isEnabledFor(logging.DEBUG):
+            _trace_datagram(client_ip, record, site, host, "error")
         warn(f"write:{client_ip}", f"write failed for datagram from {client_ip}")
         return
     counters.written += 1
+    if _log.isEnabledFor(logging.DEBUG):
+        _trace_datagram(client_ip, record, site, host, "written")
     try:
         sys.stdout.write(line)
         sys.stdout.flush()
