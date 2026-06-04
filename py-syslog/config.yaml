@@ -1,0 +1,28 @@
+name: Py-Syslog
+version: "1.0.0"
+slug: py-syslog
+description: >-
+  Durable UDP syslog collector. Receives RFC 3164/5424 datagrams, resolves each
+  sender to a site/host, writes one daily-rotated, gzip-compressed, retained
+  file under /data/log. Collector only.
+url: https://github.com/cristianstoica/py-syslog
+arch: [aarch64, amd64]
+startup: system
+init: true
+host_network: true
+map: [data]
+options:
+  listen_port: 5514
+  retention_days: 30
+  log_level: info
+  # Map each sender IP to a (site, host) stamped on every collected line.
+  # Add your own rows via the HA add-on Configuration tab, e.g.:
+  #   - { ip: 192.0.2.1, site: home, host: router1 }
+  # Senders not listed are still received and written, stamped unknown/<ip>.
+  sources: []
+schema:
+  listen_port: port
+  retention_days: int(1,3650)
+  log_level: list(debug|info|warning|error)
+  sources:
+    - { ip: str, site: str, host: str }
