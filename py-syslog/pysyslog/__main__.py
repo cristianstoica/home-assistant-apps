@@ -81,6 +81,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="(with --check) assert the WriteError contract via a raising writer fake",
     )
+    parser.add_argument(
+        "--bind",
+        action="store_true",
+        help="(with --check) bind a real loopback UDP socket to prove the bind path",
+    )
     return parser
 
 
@@ -142,9 +147,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.check:
         from .check import run_check
 
-        return run_check(args.options, args.storage, args.write_error)
-    if args.storage or args.write_error:
-        parser.error("--storage and --write-error require --check")
+        return run_check(args.options, args.storage, args.write_error, args.bind)
+    if args.storage or args.write_error or args.bind:
+        parser.error("--storage, --write-error, and --bind require --check")
     return _run_server(args.options)
 
 

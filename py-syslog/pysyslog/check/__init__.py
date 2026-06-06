@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sys
 
+from .bind import check_bind
 from .config_checks import (
     check_invalid_options,
     check_listen_host,
@@ -22,7 +23,7 @@ from .storage import check_storage
 from .survival import check_internal_error, check_warn_once, check_write_error
 
 
-def run_check(options_path: str, storage: bool, write_error: bool) -> int:
+def run_check(options_path: str, storage: bool, write_error: bool, bind: bool) -> int:
     """Dispatch the --check variants; exit 0 only when every assertion holds."""
     from ..__main__ import (
         configure_logging,
@@ -33,6 +34,8 @@ def run_check(options_path: str, storage: bool, write_error: bool) -> int:
         return 0 if check_write_error() else 1
     if storage:
         return 0 if check_storage() else 1
+    if bind:
+        return 0 if check_bind() else 1
 
     if resolved_config(options_path) is None:
         return 1

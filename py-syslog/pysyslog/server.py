@@ -39,6 +39,10 @@ _WARN_THROTTLE_S = 10.0
 _STATS_INTERVAL_S = 600.0
 # recvfrom socket timeout (seconds): the normal per-tick shutdown re-check.
 _RECV_TIMEOUT_S = 1.0
+# Public alias: the ``--check --bind`` oracle asserts the bound socket's recv
+# timeout against this value. Exposed under a public name so the cross-module
+# read is not a private-usage access; ``_bind`` keeps reading ``_RECV_TIMEOUT_S``.
+RECV_TIMEOUT_S = _RECV_TIMEOUT_S
 _MAX_DATAGRAM = 65535
 
 
@@ -300,6 +304,15 @@ class Server:
     def request_stop(self) -> None:
         """Signal the loop to stop (from a signal handler)."""
         self._stop.set()
+
+    def bind(self) -> socket.socket:
+        """Public seam delegating to `_bind`; `run` keeps calling `_bind` directly.
+
+        Exposed so the ``--check --bind`` oracle can drive the production bind
+        path without a private-usage access under ``# pyright: strict``. No body
+        extraction — `run` is untouched.
+        """
+        return self._bind()
 
     def _bind(self) -> socket.socket:
         """Bind ``<listen_host>:<listen_port>``; a bind failure is fatal (exit 1)."""

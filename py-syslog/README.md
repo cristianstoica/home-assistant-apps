@@ -233,7 +233,9 @@ reconciliation state machine **and the size guard** (numbered-segment
 size-rotation, `(date, seq)` keep-newest prune ordering, the two-dimensional
 floor+cap ring buffer, the only-active-file / seq-overflow terminals, and
 degrade-safe measurement failure); `--check --write-error` asserts the
-`WriteError` contract.
+`WriteError` contract. `--check --bind` binds a real `AF_INET`/`SOCK_DGRAM`
+loopback socket through the production bind path to prove the listen-socket setup
+(configured host, family/type, recv timeout, and an OS-ephemeral port).
 
 **Live send (any LAN host → resolves to `unknown`/`<that host's IP>` unless it is
 in `sources`):**
