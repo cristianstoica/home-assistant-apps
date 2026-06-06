@@ -79,8 +79,8 @@ class WriteError(Exception):
     """Domain error for any storage write/rotation failure (wraps ``OSError``)."""
 
 
-class WriterStats:
-    """Mutable size-guard counters owned by the `Writer`.
+class SizeGuardStats:
+    """Mutable size-guard counters owned by the ``Writer``.
 
     The Writer owns its own stats object (it is the only code that knows when a
     size-roll or space-prune happened); `server.py` reads this snapshot at
@@ -203,7 +203,7 @@ class Writer:
         self._volume_stats_fn = volume_stats
         self._handle: TextIO | None = None
         self._open_date: date = now().date()
-        self.stats = WriterStats()
+        self.stats = SizeGuardStats()
 
         self._ensure_dir()
         self._reconcile()
