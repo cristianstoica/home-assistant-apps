@@ -39,7 +39,15 @@ _WARN_THROTTLE_S = 10.0
 _STATS_INTERVAL_S = 600.0
 # recvfrom socket timeout (seconds): the normal per-tick shutdown re-check.
 _RECV_TIMEOUT_S = 1.0
+# Public alias: the ``--check --bind`` oracle asserts the bound socket's recv
+# timeout against this value. Exposed under a public name so the cross-module
+# read is not a private-usage access; ``_bind`` keeps reading ``_RECV_TIMEOUT_S``.
+RECV_TIMEOUT_S = _RECV_TIMEOUT_S
 _MAX_DATAGRAM = 65535
+
+
+class BindError(Exception):
+    """Raised when the UDP listen socket cannot be bound (replaces sys.exit(1))."""
 
 
 class Counters:
@@ -57,6 +65,7 @@ class Counters:
         self.unknown = 0  # protocol unknown (malformed parse)
         self.malformed = 0
         self.unknown_source = 0
+        self.rejected_sources = 0
         self.written = 0
         self.write_errors = 0
         self.internal_errors = 0
@@ -81,6 +90,7 @@ class Counters:
             "unknown": self.unknown,
             "malformed": self.malformed,
             "unknown_source": self.unknown_source,
+            "rejected_sources": self.rejected_sources,
             "written": self.written,
             "write_errors": self.write_errors,
             "internal_errors": self.internal_errors,
@@ -192,6 +202,7 @@ def process_datagram(
     resolver: Resolver,
     writer: WriterProtocol,
     counters: Counters,
+    reject_unknown_sources: bool,
     clock: Callable[[], str] = _utc_now_iso,
     warn: Callable[[str, str], None] = _default_warn,
 ) -> None:
@@ -224,10 +235,18 @@ def process_datagram(
     if record.malformed:
         counters.malformed += 1
 
-    site, host = resolver.resolve(client_ip)
-    if site == "unknown":
+    if not resolver.is_known(client_ip):
         counters.unknown_source += 1
-
+        if reject_unknown_sources:
+            site, host = "unknown", client_ip  # trace labels; resolve() bypassed
+            counters.rejected_sources += 1
+            resolver.note_unknown_rejected(
+                client_ip
+            )  # warn-once per IP via seen_unknown
+            if _log.isEnabledFor(logging.DEBUG):
+                _trace_datagram(client_ip, record, site, host, "rejected")
+            return
+    site, host = resolver.resolve(client_ip)
     line = format_line(record, site, host)
     try:
         writer.write(line)
@@ -290,15 +309,25 @@ class Server:
         """Signal the loop to stop (from a signal handler)."""
         self._stop.set()
 
+    def bind(self) -> socket.socket:
+        """Public seam delegating to `_bind`; `run` keeps calling `_bind` directly.
+
+        Exposed so the ``--check --bind`` oracle can drive the production bind
+        path without a private-usage access under ``# pyright: strict``. No body
+        extraction — `run` is untouched.
+        """
+        return self._bind()
+
     def _bind(self) -> socket.socket:
-        """Bind ``<listen_host>:<listen_port>``; a bind failure is fatal (exit 1)."""
+        """Bind ``<listen_host>:<listen_port>``; raise `BindError` on failure."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.bind((self._config.listen_host, self._config.listen_port))
         except OSError as exc:
             sock.close()
-            _log.error("cannot bind UDP :%d — %s", self._config.listen_port, exc)
-            sys.exit(1)
+            raise BindError(
+                f"cannot bind UDP :{self._config.listen_port} — {exc}"
+            ) from exc
         sock.settimeout(_RECV_TIMEOUT_S)
         return sock
 
@@ -325,6 +354,7 @@ class Server:
                 resolver=self._resolver,
                 writer=self._writer,
                 counters=self._counters,
+                reject_unknown_sources=self._config.reject_unknown_sources,
                 warn=self._warn_throttled,
             )
         except Exception:
@@ -341,7 +371,14 @@ class Server:
         wrapped in a loop-level catch-all so one poison datagram can never kill
         the collector.
         """
-        self._sock = self._bind()
+        try:
+            self._sock = self._bind()
+        except BindError:
+            # Bind failed before the serve loop's finally could run; close the
+            # writer that __main__ opened so it does not leak, then re-raise for
+            # the entrypoint to map to exit 1.
+            self._writer.close()
+            raise
         _log.info(
             "py-syslog listening on UDP :%d (%d source mapping(s))",
             self._config.listen_port,
@@ -413,6 +450,7 @@ class Server:
             "unknown",
             "malformed",
             "unknown_source",
+            "rejected_sources",
             "written",
             "write_errors",
             "internal_errors",

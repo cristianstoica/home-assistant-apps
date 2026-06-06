@@ -16,6 +16,7 @@ testing override, not an unknown field.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
 from typing import cast
@@ -61,6 +62,17 @@ def _require_str(options: dict[str, object], field: str, default: str) -> str:
     return value
 
 
+def _require_bool(options: dict[str, object], field: str, default: bool) -> bool:
+    """Read a real bool field. JSON/HA ``bool`` schema yields a Python ``bool``;
+    an int (incl. 0/1) or string is rejected so the option is unambiguous."""
+    if field not in options:
+        return default
+    value = options[field]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field}: must be a boolean")
+    return value
+
+
 def _build_sources(raw_sources: object) -> dict[str, SourceMapping]:
     """Validate the sources list into an IP-keyed mapping.
 
@@ -77,8 +89,11 @@ def _build_sources(raw_sources: object) -> dict[str, SourceMapping]:
             raise ConfigError(f"sources[{index}]: must be an object")
         entry_dict = cast(dict[str, object], entry)
         ip = _source_field(entry_dict, "ip", index)
+        _require_ipv4(ip, "ip", f" in sources[{index}]")
         site = _source_field(entry_dict, "site", index)
+        _reject_control_chars(site, "site", f" in sources[{index}]")
         host = _source_field(entry_dict, "host", index)
+        _reject_control_chars(host, "host", f" in sources[{index}]")
         if ip in sources:
             raise ConfigError(f"ip: duplicate source ip {ip!r}")
         sources[ip] = SourceMapping(ip=ip, site=site, host=host)
@@ -93,6 +108,41 @@ def _source_field(entry: dict[str, object], field: str, index: int) -> str:
     if value.strip() == "":
         raise ConfigError(f"{field}: must not be empty in sources[{index}]")
     return value
+
+
+def _reject_control_chars(value: str, field: str, context: str) -> None:
+    """Reject config-derived labels carrying any char ``_escape`` would transform
+    into a line break / control escape (C0, DEL, C1, U+2028/U+2029).
+
+    `site`/`host` are config-derived and emitted RAW into the stored line (the
+    render path does not escape them), so a control char here is the only way one
+    could split or corrupt a stored line. Rejecting at load keeps the render path
+    a no-op for these fields. Backslash is intentionally allowed (not a line
+    break; it would render harmlessly).
+    """
+    for ch in value:
+        code = ord(ch)
+        if (
+            code < 0x20
+            or code == 0x7F
+            or 0x80 <= code <= 0x9F
+            or code in (0x2028, 0x2029)
+        ):
+            raise ConfigError(f"{field}: must not contain control characters{context}")
+
+
+def _require_ipv4(value: str, field: str, context: str = "") -> None:
+    """Reject anything that is not a bare IPv4 literal. AF_INET only (the socket
+    binds ``socket.AF_INET``), so IPv6 is intentionally rejected here too.
+
+    ``ipaddress.IPv4Address`` rejects empty/whitespace, embedded control chars,
+    IPv6, CIDR, leading zeros, and trailing spaces — exactly the garbage that
+    would otherwise flow into ``socket.bind`` or a resolver key.
+    """
+    try:
+        ipaddress.IPv4Address(value)
+    except (ipaddress.AddressValueError, ValueError):
+        raise ConfigError(f"{field}: must be an IPv4 address{context}") from None
 
 
 def validate(options: dict[str, object]) -> Config:
@@ -116,6 +166,7 @@ def validate(options: dict[str, object]) -> Config:
         raise ConfigError("listen_host: must be a string")
     if listen_host.strip() == "":
         raise ConfigError("listen_host: must not be empty")
+    _require_ipv4(listen_host, "listen_host")
 
     retention_days = _require_int(options, "retention_days", 30)
     if retention_days < _MIN_RETENTION or retention_days > _MAX_RETENTION:
@@ -144,6 +195,8 @@ def validate(options: dict[str, object]) -> Config:
             "requires max_segment_mb > 0"
         )
 
+    reject_unknown_sources = _require_bool(options, "reject_unknown_sources", False)
+
     log_level = _require_str(options, "log_level", "info")
     if log_level not in _VALID_LOG_LEVELS:
         raise ConfigError(f"log_level: must be one of {', '.join(_VALID_LOG_LEVELS)}")
@@ -159,6 +212,7 @@ def validate(options: dict[str, object]) -> Config:
         min_free_percent=min_free_percent,
         max_log_percent=max_log_percent,
         max_segment_mb=max_segment_mb,
+        reject_unknown_sources=reject_unknown_sources,
         log_level=log_level,
         sources=sources,
         log_dir=log_dir,

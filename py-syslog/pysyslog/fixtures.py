@@ -243,6 +243,161 @@ DATAGRAMS: list[DatagramFixture] = [
             "x\\\\y\\tz\\rA\\r\\nB\\x01C\\x7fD\\x85E F café-日本-🚀\n"
         ),
     ),
+    DatagramFixture(
+        name="rfc5424 hostile APP-NAME/PROCID control chars (program escaping)",
+        client_ip=SOURCE_IP,
+        # APP-NAME 'ap\x1bp' carries ESC, PROCID 'pr\x00oc' carries NUL. Both are
+        # C0 controls Python's re does NOT treat as whitespace, so they survive
+        # into the 5424 APP-NAME/PROCID tokens and reach `program`. Emitted RAW
+        # before finding B (an ESC-sequence / NUL injection into the log viewer);
+        # escaped to \x1b / \x00 after. FAILS byte-exact before B, PASSES after.
+        raw=b"<13>1 2026-06-03T11:59:58.000Z myhost ap\x1bp pr\x00oc - - the message",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 user.notice "
+            "ap\\x1bp[pr\\x00oc]: [2026-06-03T11:59:58.000Z] the message\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc3164 PRI 0 boundary (kern.emerg)",
+        client_ip=SOURCE_IP,
+        raw=b"<0>Jun  3 11:59:58 myhost app: zero pri",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 kern.emerg "
+            "app: [Jun  3 11:59:58] zero pri\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc3164 PRI 191 boundary (local7.debug)",
+        client_ip=SOURCE_IP,
+        raw=b"<191>Jun  3 11:59:58 myhost app: max valid pri",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local7.debug "
+            "app: [Jun  3 11:59:58] max valid pri\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc3164 PRI 192 out-of-range -> priority unknown",
+        client_ip=SOURCE_IP,
+        raw=b"<192>Jun  3 11:59:58 myhost app: over range",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        # PRI 192 > 191: _priority_text returns "unknown", but the record is
+        # still a well-formed rfc3164 parse (NOT malformed).
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 unknown "
+            "app: [Jun  3 11:59:58] over range\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc3164 PRI 255 out-of-range -> priority unknown",
+        client_ip=SOURCE_IP,
+        raw=b"<255>Jun  3 11:59:58 myhost app: way over",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 unknown "
+            "app: [Jun  3 11:59:58] way over\n"
+        ),
+    ),
+    DatagramFixture(
+        name="malformed PRI: 4 digits (<1920>) -> MALFORMED",
+        client_ip=SOURCE_IP,
+        raw=b"<1920>Jun  3 11:59:58 myhost app: four digit pri",
+        tag="malformed",
+        protocol="unknown",
+        sender_ts="",
+        site="home",
+        host="router1",
+        # _PRI_RE is ^<\d{1,3}> — 4 digits do not match, so no PRI is found and
+        # the whole datagram is MALFORMED (raw echoed as the message).
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 unknown "
+            "MALFORMED: [-] <1920>Jun  3 11:59:58 myhost app: four digit pri\n"
+        ),
+    ),
+    DatagramFixture(
+        name="malformed PRI: non-numeric (<abc>) -> MALFORMED",
+        client_ip=SOURCE_IP,
+        raw=b"<abc>Jun  3 11:59:58 myhost app: nonnumeric pri",
+        tag="malformed",
+        protocol="unknown",
+        sender_ts="",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 unknown "
+            "MALFORMED: [-] <abc>Jun  3 11:59:58 myhost app: nonnumeric pri\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc5424 all-nil fields (- - - - -)",
+        client_ip=SOURCE_IP,
+        raw=b"<165>1 - - - - - nil everything",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="",
+        site="home",
+        host="router1",
+        # Nil TIMESTAMP -> sender_ts "" -> [-]; nil APP-NAME -> program "-";
+        # nil PROCID -> no [pid] suffix; nil SD -> message is the tail.
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            "-: [-] nil everything\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc5424 nil timestamp, real app/procid",
+        client_ip=SOURCE_IP,
+        raw=b"<165>1 - myhost app 4711 ID47 - msg with nil ts",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            "app[4711]: [-] msg with nil ts\n"
+        ),
+    ),
+    DatagramFixture(
+        name="rfc5424 structured-data with escaped bracket dropped",
+        client_ip=SOURCE_IP,
+        # SD element contains an escaped ] (\]); _split_structured_data must keep
+        # bracket-matching through the escape and return only the trailing MSG.
+        # The bytes are  ... k="a\]b"] after sd  — a single backslash then ] inside
+        # the SD param. In a Python bytes literal write it as b'... k="a\\]b"] ...'.
+        raw=(b'<165>1 2026-06-03T11:59:58.000Z host app - - [ex@1 k="a\\]b"] after sd'),
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            "app: [2026-06-03T11:59:58.000Z] after sd\n"
+        ),
+    ),
 ]
 
 
@@ -297,6 +452,16 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         field="host",
     ),
     InvalidOptionsFixture(
+        name="control-char in source site",
+        options=_with_sources([{"ip": "192.0.2.1", "site": "bad\nsite", "host": "r"}]),
+        field="site",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in source host",
+        options=_with_sources([{"ip": "192.0.2.1", "site": "home", "host": "h\x1bz"}]),
+        field="host",
+    ),
+    InvalidOptionsFixture(
         name="out-of-range retention_days",
         options={**_valid_base(), "retention_days": 99999},
         field="retention_days",
@@ -320,6 +485,31 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         name="whitespace-only listen_host",
         options={**_valid_base(), "listen_host": "   "},
         field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="non-ipv4 listen_host",
+        options={**_valid_base(), "listen_host": "not.an.ip"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="ipv6 listen_host (AF_INET only)",
+        options={**_valid_base(), "listen_host": "::1"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in listen_host",
+        options={**_valid_base(), "listen_host": "192.0.2.1\x00"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="non-ipv4 source ip",
+        options=_with_sources([{"ip": "999.1.1.1", "site": "home", "host": "r"}]),
+        field="ip",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in source ip",
+        options=_with_sources([{"ip": "192.0.2.1\n", "site": "home", "host": "r"}]),
+        field="ip",
     ),
     InvalidOptionsFixture(
         name="out-of-range min_free_percent",
@@ -349,20 +539,32 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options={**_valid_base(), "max_log_percent": 50, "max_segment_mb": 0},
         field="max_segment_mb",
     ),
+    InvalidOptionsFixture(
+        name="non-bool reject_unknown_sources",
+        options={**_valid_base(), "reject_unknown_sources": "false"},
+        field="reject_unknown_sources",
+    ),
+    InvalidOptionsFixture(
+        name="int reject_unknown_sources (1 is not a bool)",
+        options={**_valid_base(), "reject_unknown_sources": 1},
+        field="reject_unknown_sources",
+    ),
 ]
 
 
 # The expected aggregate counters after driving DATAGRAMS through the seam.
-# received = all 10; rfc3164 = 6 (incl. the unknown-src one); rfc5424 = 2;
-# unknown protocol = 2 malformed; malformed = 2; unknown source = 1; written = 10.
+# received = all 20; rfc3164 = 10 (incl. the unknown-src one); rfc5424 = 6;
+# unknown protocol = 4 malformed; malformed = 4; unknown source = 1; written = 20.
+# rejected_sources = 0: the corpus runs flag-off, so the reject path never fires.
 EXPECTED_COUNTERS: dict[str, int] = {
-    "received": 10,
-    "rfc3164": 6,
-    "rfc5424": 2,
-    "unknown": 2,
-    "malformed": 2,
+    "received": 20,
+    "rfc3164": 10,
+    "rfc5424": 6,
+    "unknown": 4,
+    "malformed": 4,
     "unknown_source": 1,
-    "written": 10,
+    "rejected_sources": 0,
+    "written": 20,
     "write_errors": 0,
     "internal_errors": 0,
     # Size-guard counters: the datagram corpus drives a capture writer (no

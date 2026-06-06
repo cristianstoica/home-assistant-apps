@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.4.0 — sender hardening, IPv4 config validation, and `reject_unknown_sources`
+
+- New opt-in `reject_unknown_sources` option (default `false`) drops datagrams
+  from senders not listed in `sources` instead of stamping them
+  `unknown/<ip>`. A new `rejected_sources` counter on the stats line surfaces
+  how many datagrams were dropped, and a once-per-sender warning identifies
+  the offending IP (warn-once via a shared resolver set). Default is `false`,
+  so existing deployments are byte-identical until someone opts in —
+  backward-compatible.
+- `sources[].ip` and `listen_host` are now validated as IPv4 dotted-quad
+  literals at config load. Misconfigurations that previously slipped through
+  (e.g. typos, non-IPv4 strings) are rejected up front with a precise error
+  pointing at the offending field, instead of failing later at bind or at the
+  first datagram from an un-resolvable sender.
+- Sender-controlled `program` (RFC 3164 tag) is now escaped at render through
+  the same `_escape` pipeline that already protected the message body, so a
+  hostile sender cannot inject control characters or split a stored log line
+  via the program field. The `site` and `host` strings in `sources[]` are
+  additionally rejected at config load if they contain control characters,
+  closing the configured-but-untrusted-string injection path.
+- Bind errors no longer crash the process via `sys.exit`. `Server.bind()`
+  now raises a typed `BindError` that callers handle structurally, and the
+  underlying writer is closed on bind failure so the file handle does not
+  leak when bind fails after writer construction. A new `--check --bind`
+  oracle drives a real loopback bind and a bind-failure path against the
+  production `Server.bind()` to pin these contracts.
+- `translations/en.yaml` labels the new `reject_unknown_sources` option on
+  the HA Configuration tab.
+- Internal: the `--check` oracle was extracted from `__main__.py` into a
+  `pysyslog/check/` package (behavior-preserving move), and the concrete
+  `WriterStats` class was renamed to `SizeGuardStats` (the `WriterStats`
+  name now exclusively names the Protocol in `models.py`). New CI gate
+  `pysyslog --check --bind` runs the bind oracle so future `_bind()`
+  regressions fail CI.
+
 ## 1.3.0 — disk-space guard (size-bounded ring buffer)
 
 - New opt-in disk-space guard turns the on-disk log directory into a

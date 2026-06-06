@@ -44,12 +44,20 @@ configuration:
     description: >-
       Verbosity of Py-Syslog's own diagnostics (startup line, periodic stats,
       and warnings) on stderr. This does NOT filter the syslog collected from
-      your sources — every received datagram is stored and shown in full,
-      whatever its severity. Setting it to debug additionally traces each
+      your sources — every received and non-rejected datagram is stored and shown
+      in full, whatever its severity. Setting it to debug additionally traces each
       received datagram's parse and resolution decision.
   sources:
     name: Source mappings
     description: >-
       IP → (site, host) resolution table stamped on every collected line. A
-      duplicate ip is rejected. Senders not listed here are still received and
-      stored, stamped unknown/<ip>.
+      duplicate ip is rejected. Senders not listed here are received and stored
+      stamped unknown/<ip>, unless Reject unknown sources is enabled, in which
+      case they are dropped.
+  reject_unknown_sources:
+    name: Reject unknown sources
+    description: >-
+      Drop (do not store) syslog datagrams from senders whose IP is not listed in
+      Sources; dropped datagrams are counted in the rejected_sources stat. This is
+      a noise filter, NOT authentication — a spoofed source IP that matches a
+      configured entry bypasses it.
