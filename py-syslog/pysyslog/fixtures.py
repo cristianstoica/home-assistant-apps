@@ -322,6 +322,31 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         field="listen_host",
     ),
     InvalidOptionsFixture(
+        name="non-ipv4 listen_host",
+        options={**_valid_base(), "listen_host": "not.an.ip"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="ipv6 listen_host (AF_INET only)",
+        options={**_valid_base(), "listen_host": "::1"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in listen_host",
+        options={**_valid_base(), "listen_host": "192.0.2.1\x00"},
+        field="listen_host",
+    ),
+    InvalidOptionsFixture(
+        name="non-ipv4 source ip",
+        options=_with_sources([{"ip": "999.1.1.1", "site": "home", "host": "r"}]),
+        field="ip",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in source ip",
+        options=_with_sources([{"ip": "192.0.2.1\n", "site": "home", "host": "r"}]),
+        field="ip",
+    ),
+    InvalidOptionsFixture(
         name="out-of-range min_free_percent",
         options={**_valid_base(), "min_free_percent": 150},
         field="min_free_percent",

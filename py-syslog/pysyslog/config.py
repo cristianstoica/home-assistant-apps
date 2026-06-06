@@ -16,6 +16,7 @@ testing override, not an unknown field.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from pathlib import Path
 from typing import cast
@@ -77,6 +78,7 @@ def _build_sources(raw_sources: object) -> dict[str, SourceMapping]:
             raise ConfigError(f"sources[{index}]: must be an object")
         entry_dict = cast(dict[str, object], entry)
         ip = _source_field(entry_dict, "ip", index)
+        _require_ipv4(ip, "ip", f" in sources[{index}]")
         site = _source_field(entry_dict, "site", index)
         host = _source_field(entry_dict, "host", index)
         if ip in sources:
@@ -93,6 +95,20 @@ def _source_field(entry: dict[str, object], field: str, index: int) -> str:
     if value.strip() == "":
         raise ConfigError(f"{field}: must not be empty in sources[{index}]")
     return value
+
+
+def _require_ipv4(value: str, field: str, context: str = "") -> None:
+    """Reject anything that is not a bare IPv4 literal. AF_INET only (the socket
+    binds ``socket.AF_INET``), so IPv6 is intentionally rejected here too.
+
+    ``ipaddress.IPv4Address`` rejects empty/whitespace, embedded control chars,
+    IPv6, CIDR, leading zeros, and trailing spaces — exactly the garbage that
+    would otherwise flow into ``socket.bind`` or a resolver key.
+    """
+    try:
+        ipaddress.IPv4Address(value)
+    except (ipaddress.AddressValueError, ValueError):
+        raise ConfigError(f"{field}: must be an IPv4 address{context}") from None
 
 
 def validate(options: dict[str, object]) -> Config:
@@ -116,6 +132,7 @@ def validate(options: dict[str, object]) -> Config:
         raise ConfigError("listen_host: must be a string")
     if listen_host.strip() == "":
         raise ConfigError("listen_host: must not be empty")
+    _require_ipv4(listen_host, "listen_host")
 
     retention_days = _require_int(options, "retention_days", 30)
     if retention_days < _MIN_RETENTION or retention_days > _MAX_RETENTION:

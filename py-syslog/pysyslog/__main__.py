@@ -330,6 +330,37 @@ def _check_listen_host() -> bool:
             f"FAIL  listen-host: expected {bind_host!r}, got {cfg.listen_host!r}",
             file=sys.stderr,
         )
+
+    # The shipped production default (config.yaml: ``listen_host: 0.0.0.0``) must
+    # stay accepted by `_require_ipv4`. The no-bind-all-in-seed invariant keeps
+    # ``0.0.0.0`` out of every fixture seed, so no corpus assertion drives it
+    # through `validate`; this is the one place the invariant permits the literal.
+    # Without this guard a future IPv4 tightening could silently reject the
+    # default while the oracle stayed green.
+    bind_all = "0.0.0.0"
+    bind_all_options = {**_default_check_options(), "listen_host": bind_all}
+    try:
+        bind_all_cfg = config.validate(bind_all_options)
+    except ConfigError as exc:
+        ok = False
+        print(
+            f"FAIL  listen-host: shipped default {bind_all!r} rejected -> {exc}",
+            file=sys.stderr,
+        )
+    else:
+        if bind_all_cfg.listen_host == bind_all:
+            print(
+                f"PASS  listen-host: shipped default round-trips ({bind_all})",
+                file=sys.stderr,
+            )
+        else:
+            ok = False
+            print(
+                f"FAIL  listen-host: expected {bind_all!r}, "
+                f"got {bind_all_cfg.listen_host!r}",
+                file=sys.stderr,
+            )
+
     print(f"LISTEN-HOST CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
     return ok
 
