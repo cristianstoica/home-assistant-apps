@@ -243,6 +243,25 @@ DATAGRAMS: list[DatagramFixture] = [
             "x\\\\y\\tz\\rA\\r\\nB\\x01C\\x7fD\\x85E F café-日本-🚀\n"
         ),
     ),
+    DatagramFixture(
+        name="rfc5424 hostile APP-NAME/PROCID control chars (program escaping)",
+        client_ip=SOURCE_IP,
+        # APP-NAME 'ap\x1bp' carries ESC, PROCID 'pr\x00oc' carries NUL. Both are
+        # C0 controls Python's re does NOT treat as whitespace, so they survive
+        # into the 5424 APP-NAME/PROCID tokens and reach `program`. Emitted RAW
+        # before finding B (an ESC-sequence / NUL injection into the log viewer);
+        # escaped to \x1b / \x00 after. FAILS byte-exact before B, PASSES after.
+        raw=b"<13>1 2026-06-03T11:59:58.000Z myhost ap\x1bp pr\x00oc - - the message",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 user.notice "
+            "ap\\x1bp[pr\\x00oc]: [2026-06-03T11:59:58.000Z] the message\n"
+        ),
+    ),
 ]
 
 
@@ -294,6 +313,16 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
     InvalidOptionsFixture(
         name="empty source host",
         options=_with_sources([{"ip": "192.0.2.1", "site": "home", "host": ""}]),
+        field="host",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in source site",
+        options=_with_sources([{"ip": "192.0.2.1", "site": "bad\nsite", "host": "r"}]),
+        field="site",
+    ),
+    InvalidOptionsFixture(
+        name="control-char in source host",
+        options=_with_sources([{"ip": "192.0.2.1", "site": "home", "host": "h\x1bz"}]),
         field="host",
     ),
     InvalidOptionsFixture(
@@ -378,16 +407,16 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
 
 
 # The expected aggregate counters after driving DATAGRAMS through the seam.
-# received = all 10; rfc3164 = 6 (incl. the unknown-src one); rfc5424 = 2;
-# unknown protocol = 2 malformed; malformed = 2; unknown source = 1; written = 10.
+# received = all 11; rfc3164 = 6 (incl. the unknown-src one); rfc5424 = 3;
+# unknown protocol = 2 malformed; malformed = 2; unknown source = 1; written = 11.
 EXPECTED_COUNTERS: dict[str, int] = {
-    "received": 10,
+    "received": 11,
     "rfc3164": 6,
-    "rfc5424": 2,
+    "rfc5424": 3,
     "unknown": 2,
     "malformed": 2,
     "unknown_source": 1,
-    "written": 10,
+    "written": 11,
     "write_errors": 0,
     "internal_errors": 0,
     # Size-guard counters: the datagram corpus drives a capture writer (no

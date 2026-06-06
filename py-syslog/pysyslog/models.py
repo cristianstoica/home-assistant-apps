@@ -159,13 +159,16 @@ def format_line(record: SyslogRecord, site: str, host: str) -> str:
         <recv_ts> <site> <host> <priority_text> <program>: [<sender_ts>] <message>\\n
 
     `message`, `sender_ts`, and `raw` are escaped per the contract so the
-    result is exactly one physical line. A malformed record carries the
-    escaped raw datagram as its message; an empty `sender_ts` renders ``-``.
+    result is exactly one physical line. `program` is sender-controlled
+    (RFC 5424 APP-NAME/PROCID, RFC 3164 tag) and is escaped per the same
+    contract. A malformed record carries the escaped raw datagram as its
+    message; an empty `sender_ts` renders ``-``.
     """
     sender = _escape(record.sender_ts) if record.sender_ts else "-"
     body = record.message if not record.malformed else record.raw
     message = _escape(body)
+    program = _escape(record.program)
     return (
         f"{record.recv_ts} {site} {host} {record.priority_text} "
-        f"{record.program}: [{sender}] {message}\n"
+        f"{program}: [{sender}] {message}\n"
     )

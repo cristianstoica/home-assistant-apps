@@ -80,7 +80,9 @@ def _build_sources(raw_sources: object) -> dict[str, SourceMapping]:
         ip = _source_field(entry_dict, "ip", index)
         _require_ipv4(ip, "ip", f" in sources[{index}]")
         site = _source_field(entry_dict, "site", index)
+        _reject_control_chars(site, "site", f" in sources[{index}]")
         host = _source_field(entry_dict, "host", index)
+        _reject_control_chars(host, "host", f" in sources[{index}]")
         if ip in sources:
             raise ConfigError(f"ip: duplicate source ip {ip!r}")
         sources[ip] = SourceMapping(ip=ip, site=site, host=host)
@@ -95,6 +97,22 @@ def _source_field(entry: dict[str, object], field: str, index: int) -> str:
     if value.strip() == "":
         raise ConfigError(f"{field}: must not be empty in sources[{index}]")
     return value
+
+
+def _reject_control_chars(value: str, field: str, context: str) -> None:
+    """Reject config-derived labels carrying any char ``_escape`` would transform
+    into a line break / control escape (C0, DEL, C1, U+2028/U+2029).
+
+    `site`/`host` are config-derived and emitted RAW into the stored line (the
+    render path does not escape them), so a control char here is the only way one
+    could split or corrupt a stored line. Rejecting at load keeps the render path
+    a no-op for these fields. Backslash is intentionally allowed (not a line
+    break; it would render harmlessly).
+    """
+    for ch in value:
+        code = ord(ch)
+        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F or code in (0x2028, 0x2029):
+            raise ConfigError(f"{field}: must not contain control characters{context}")
 
 
 def _require_ipv4(value: str, field: str, context: str = "") -> None:
