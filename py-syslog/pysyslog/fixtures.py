@@ -515,12 +515,23 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options={**_valid_base(), "max_log_percent": 50, "max_segment_mb": 0},
         field="max_segment_mb",
     ),
+    InvalidOptionsFixture(
+        name="non-bool reject_unknown_sources",
+        options={**_valid_base(), "reject_unknown_sources": "false"},
+        field="reject_unknown_sources",
+    ),
+    InvalidOptionsFixture(
+        name="int reject_unknown_sources (1 is not a bool)",
+        options={**_valid_base(), "reject_unknown_sources": 1},
+        field="reject_unknown_sources",
+    ),
 ]
 
 
 # The expected aggregate counters after driving DATAGRAMS through the seam.
 # received = all 20; rfc3164 = 10 (incl. the unknown-src one); rfc5424 = 6;
 # unknown protocol = 4 malformed; malformed = 4; unknown source = 1; written = 20.
+# rejected_sources = 0: the corpus runs flag-off, so the reject path never fires.
 EXPECTED_COUNTERS: dict[str, int] = {
     "received": 20,
     "rfc3164": 10,
@@ -528,6 +539,7 @@ EXPECTED_COUNTERS: dict[str, int] = {
     "unknown": 4,
     "malformed": 4,
     "unknown_source": 1,
+    "rejected_sources": 0,
     "written": 20,
     "write_errors": 0,
     "internal_errors": 0,

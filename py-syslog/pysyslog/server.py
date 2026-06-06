@@ -57,6 +57,7 @@ class Counters:
         self.unknown = 0  # protocol unknown (malformed parse)
         self.malformed = 0
         self.unknown_source = 0
+        self.rejected_sources = 0
         self.written = 0
         self.write_errors = 0
         self.internal_errors = 0
@@ -81,6 +82,7 @@ class Counters:
             "unknown": self.unknown,
             "malformed": self.malformed,
             "unknown_source": self.unknown_source,
+            "rejected_sources": self.rejected_sources,
             "written": self.written,
             "write_errors": self.write_errors,
             "internal_errors": self.internal_errors,
@@ -192,6 +194,7 @@ def process_datagram(
     resolver: Resolver,
     writer: WriterProtocol,
     counters: Counters,
+    reject_unknown_sources: bool,
     clock: Callable[[], str] = _utc_now_iso,
     warn: Callable[[str, str], None] = _default_warn,
 ) -> None:
@@ -224,10 +227,16 @@ def process_datagram(
     if record.malformed:
         counters.malformed += 1
 
-    site, host = resolver.resolve(client_ip)
-    if site == "unknown":
+    if not resolver.is_known(client_ip):
         counters.unknown_source += 1
-
+        if reject_unknown_sources:
+            site, host = "unknown", client_ip          # trace labels; resolve() bypassed
+            counters.rejected_sources += 1
+            resolver.note_unknown_rejected(client_ip)  # warn-once per IP via seen_unknown
+            if _log.isEnabledFor(logging.DEBUG):
+                _trace_datagram(client_ip, record, site, host, "rejected")
+            return
+    site, host = resolver.resolve(client_ip)
     line = format_line(record, site, host)
     try:
         writer.write(line)
@@ -325,6 +334,7 @@ class Server:
                 resolver=self._resolver,
                 writer=self._writer,
                 counters=self._counters,
+                reject_unknown_sources=self._config.reject_unknown_sources,
                 warn=self._warn_throttled,
             )
         except Exception:
@@ -413,6 +423,7 @@ class Server:
             "unknown",
             "malformed",
             "unknown_source",
+            "rejected_sources",
             "written",
             "write_errors",
             "internal_errors",

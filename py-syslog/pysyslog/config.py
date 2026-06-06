@@ -62,6 +62,17 @@ def _require_str(options: dict[str, object], field: str, default: str) -> str:
     return value
 
 
+def _require_bool(options: dict[str, object], field: str, default: bool) -> bool:
+    """Read a real bool field. JSON/HA ``bool`` schema yields a Python ``bool``;
+    an int (incl. 0/1) or string is rejected so the option is unambiguous."""
+    if field not in options:
+        return default
+    value = options[field]
+    if not isinstance(value, bool):
+        raise ConfigError(f"{field}: must be a boolean")
+    return value
+
+
 def _build_sources(raw_sources: object) -> dict[str, SourceMapping]:
     """Validate the sources list into an IP-keyed mapping.
 
@@ -179,6 +190,8 @@ def validate(options: dict[str, object]) -> Config:
             "requires max_segment_mb > 0"
         )
 
+    reject_unknown_sources = _require_bool(options, "reject_unknown_sources", False)
+
     log_level = _require_str(options, "log_level", "info")
     if log_level not in _VALID_LOG_LEVELS:
         raise ConfigError(f"log_level: must be one of {', '.join(_VALID_LOG_LEVELS)}")
@@ -194,6 +207,7 @@ def validate(options: dict[str, object]) -> Config:
         min_free_percent=min_free_percent,
         max_log_percent=max_log_percent,
         max_segment_mb=max_segment_mb,
+        reject_unknown_sources=reject_unknown_sources,
         log_level=log_level,
         sources=sources,
         log_dir=log_dir,

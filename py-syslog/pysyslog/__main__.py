@@ -192,6 +192,7 @@ def _check_datagrams() -> bool:
             resolver=resolver,
             writer=capture,
             counters=counters,
+            reject_unknown_sources=False,
             clock=_pinned_clock,
         )
         produced = capture.lines[0] if capture.lines else ""
@@ -626,6 +627,7 @@ def _run_check(options_path: str, storage: bool, write_error: bool) -> int:
     ok = _check_listen_host() and ok
     ok = _check_size_guard_config() and ok
     ok = _check_invalid_options() and ok
+    ok = _check_reject_unknown_sources() and ok
     if ok:
         print("CHECK PASSED", file=sys.stderr)
         return 0
@@ -710,6 +712,7 @@ def _check_write_error() -> bool:
                 resolver=resolver,
                 writer=writer,
                 counters=counters,
+                reject_unknown_sources=False,
                 clock=_pinned_clock,
                 warn=warn,
             )
@@ -753,6 +756,7 @@ def _check_write_error() -> bool:
             resolver=resolver,
             writer=writer,
             counters=counters,
+            reject_unknown_sources=False,
             clock=_pinned_clock,
         )
         print("PASS  seam continues after WriteError", file=sys.stderr)
@@ -764,6 +768,155 @@ def _check_write_error() -> bool:
         print("WRITE-ERROR CHECK PASSED", file=sys.stderr)
     else:
         print("WRITE-ERROR CHECK FAILED", file=sys.stderr)
+    return ok
+
+
+# --- --check: reject unknown sources -----------------------------------------
+
+
+def _check_reject_unknown_sources() -> bool:
+    """Assert reject_unknown_sources: default-off WRITES an unknown source (still
+    warning "-> stamped unknown/<ip>"), on DROPS it and counts rejected_sources
+    without echo and with a warn-once "rejected ... enabled" WARNING (NOT a
+    "stamped unknown" claim), a CONFIGURED source still writes regardless of the
+    flag, and the flag round-trips through config.validate() (explicit True stays
+    True; omitted defaults to False)."""
+    import io
+    import contextlib
+    import logging
+
+    sources = {
+        entry["ip"]: SourceMapping(
+            ip=entry["ip"], site=entry["site"], host=entry["host"]
+        )
+        for entry in fixtures.CHECK_SOURCES
+    }
+    unknown_ip = "203.0.113.9"
+    unknown_raw = b"<14>Jun  3 12:00:01 otherhost prog: hello from elsewhere"
+    configured_raw = fixtures.DATAGRAMS[0].raw  # known SOURCE_IP datagram
+    ok = True
+
+    pkg_log = logging.getLogger("pysyslog")
+    rec = _DebugRecordingHandler()
+    prev_level = pkg_log.level
+    pkg_log.addHandler(rec)
+    pkg_log.setLevel(logging.DEBUG)
+    try:
+        off_counters = Counters()
+        off_writer = _CaptureWriter()
+        off_echo = io.StringIO()
+        rec.messages.clear()
+        with contextlib.redirect_stdout(off_echo):
+            process_datagram(
+                unknown_raw, unknown_ip,
+                resolver=Resolver(sources), writer=off_writer,
+                counters=off_counters, reject_unknown_sources=False,
+                clock=_pinned_clock,
+            )
+        off_msgs = list(rec.messages)
+        checks: list[tuple[str, bool]] = [
+            ("OFF: unknown source written", off_counters.written == 1),
+            ("OFF: rejected_sources stayed 0", off_counters.rejected_sources == 0),
+            ("OFF: unknown_source counted", off_counters.unknown_source == 1),
+            ("OFF: line echoed to stdout", off_echo.getvalue() != ""),
+            ("OFF: resolve() still warns '-> stamped unknown/<ip>'",
+             any("stamped unknown" in m for m in off_msgs)),
+            ("OFF: no 'rejected ... enabled' WARNING",
+             not any("reject_unknown_sources enabled" in m for m in off_msgs)),
+        ]
+
+        on_resolver = Resolver(sources)
+        on_counters = Counters()
+        on_writer = _CaptureWriter()
+        on_echo = io.StringIO()
+        rec.messages.clear()
+        with contextlib.redirect_stdout(on_echo):
+            process_datagram(
+                unknown_raw, unknown_ip,
+                resolver=on_resolver, writer=on_writer,
+                counters=on_counters, reject_unknown_sources=True,
+                clock=_pinned_clock,
+            )
+        on_msgs_first = list(rec.messages)
+        reject_warns_first = [
+            m for m in on_msgs_first if "reject_unknown_sources enabled" in m
+        ]
+        rejected_traces = [m for m in on_msgs_first if "write=rejected" in m]
+        with contextlib.redirect_stdout(io.StringIO()):
+            process_datagram(
+                unknown_raw, unknown_ip,
+                resolver=on_resolver, writer=on_writer,
+                counters=on_counters, reject_unknown_sources=True,
+                clock=_pinned_clock,
+            )
+        reject_warns_total = [
+            m for m in rec.messages if "reject_unknown_sources enabled" in m
+        ]
+        checks += [
+            ("ON: unknown source NOT written", on_writer.lines == []),
+            ("ON: rejected_sources incremented to 1 on first", reject_warns_first != [] and on_counters.rejected_sources >= 1),
+            ("ON: unknown_source still counted", on_counters.unknown_source >= 1),
+            ("ON: no stdout echo for rejected datagram", on_echo.getvalue() == ""),
+            ("ON: exactly one 'rejected ... enabled' WARNING on first drop", len(reject_warns_first) == 1),
+            ("ON: drop did NOT claim 'stamped unknown'",
+             not any("stamped unknown" in m for m in on_msgs_first)),
+            ("ON: one write=rejected trace resolving unknown/<ip>",
+             len(rejected_traces) == 1 and any(f"unknown/{unknown_ip}" in m for m in rejected_traces)),
+            ("ON: second same-IP drop counted (rejected_sources==2)", on_counters.rejected_sources == 2),
+            ("ON: warn-once held — no additional WARNING on second drop", len(reject_warns_total) == 1),
+        ]
+    finally:
+        pkg_log.removeHandler(rec)
+        pkg_log.setLevel(prev_level)
+
+    cfg_counters = Counters()
+    cfg_writer = _CaptureWriter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        process_datagram(
+            configured_raw, fixtures.SOURCE_IP,
+            resolver=Resolver(sources), writer=cfg_writer,
+            counters=cfg_counters, reject_unknown_sources=True,
+            clock=_pinned_clock,
+        )
+    checks += [
+        ("ON: configured source still written", cfg_counters.written == 1),
+        ("ON: configured source not rejected", cfg_counters.rejected_sources == 0),
+    ]
+
+    labelled_ip = "198.51.100.7"
+    labelled_sources = {
+        labelled_ip: SourceMapping(
+            ip=labelled_ip, site="unknown", host="labelled-unknown"
+        )
+    }
+    lbl_counters = Counters()
+    lbl_writer = _CaptureWriter()
+    with contextlib.redirect_stdout(io.StringIO()):
+        process_datagram(
+            unknown_raw, labelled_ip,
+            resolver=Resolver(labelled_sources), writer=lbl_writer,
+            counters=lbl_counters, reject_unknown_sources=True,
+            clock=_pinned_clock,
+        )
+    checks += [
+        ('ON: configured source labelled "unknown" still written', lbl_counters.written == 1),
+        ('ON: labelled-"unknown" source not rejected', lbl_counters.rejected_sources == 0),
+        ('ON: labelled-"unknown" source not counted as miss', lbl_counters.unknown_source == 0),
+    ]
+
+    cfg_on = config.validate(
+        {**_default_check_options(), "reject_unknown_sources": True}
+    )
+    cfg_default = config.validate(_default_check_options())
+    checks += [
+        ("CONFIG: explicit True round-trips", cfg_on.reject_unknown_sources is True),
+        ("CONFIG: default is False", cfg_default.reject_unknown_sources is False),
+    ]
+
+    for label, passed in checks:
+        print(f"{'PASS' if passed else 'FAIL'}  reject-unknown: {label}", file=sys.stderr)
+        ok = ok and passed
+    print(f"REJECT-UNKNOWN CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
     return ok
 
 
@@ -1014,6 +1167,7 @@ def _check_trace() -> bool:
             resolver=resolver,
             writer=_CaptureWriter(),
             counters=Counters(),
+            reject_unknown_sources=False,
             clock=_pinned_clock,
         )
     finally:
@@ -1047,6 +1201,7 @@ def _check_trace() -> bool:
                 resolver=resolver,
                 writer=_CaptureWriter(),
                 counters=Counters(),
+                reject_unknown_sources=False,
                 clock=_pinned_clock,
             )
     finally:

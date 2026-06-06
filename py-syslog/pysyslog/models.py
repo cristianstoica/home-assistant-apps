@@ -38,6 +38,9 @@ class Config(NamedTuple):
     trigger (roll the active file to a ``.gz`` segment at this many MB).
     Validation requires `max_segment_mb` > 0 whenever either percent > 0 —
     without intra-day segments there is nothing to prune.
+
+    `reject_unknown_sources` drops+counts unknown-source datagrams when True;
+    default False; NOT authentication.
     """
 
     listen_port: int
@@ -46,6 +49,7 @@ class Config(NamedTuple):
     min_free_percent: int
     max_log_percent: int
     max_segment_mb: int
+    reject_unknown_sources: bool
     log_level: str
     sources: dict[str, SourceMapping]
     log_dir: str

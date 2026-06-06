@@ -21,11 +21,13 @@ options:
   min_free_percent: 0
   max_log_percent: 0
   max_segment_mb: 0
+  reject_unknown_sources: false
   log_level: info
   # Map each sender IP to a (site, host) stamped on every collected line.
   # Add your own rows via the HA add-on Configuration tab, e.g.:
   #   - { ip: 192.0.2.1, site: home, host: router1 }
-  # Senders not listed are still received and written, stamped unknown/<ip>.
+  # Senders not listed are received and written, stamped unknown/<ip>, unless
+  # reject_unknown_sources: true, which drops them.
   sources: []
 schema:
   listen_port: port
@@ -34,6 +36,7 @@ schema:
   min_free_percent: int(0,99)
   max_log_percent: int(0,99)
   max_segment_mb: int(0,4096)
+  reject_unknown_sources: bool
   log_level: list(debug|info|warning|error)
   sources:
     - { ip: str, site: str, host: str }

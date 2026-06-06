@@ -40,3 +40,20 @@ class Resolver:
             self.seen_unknown.add(ip)
             _log.warning("syslog from unknown source %s -> stamped unknown/%s", ip, ip)
         return ("unknown", ip)
+
+    def is_known(self, ip: str) -> bool:
+        """True iff `ip` is a configured source. The authoritative miss signal —
+        callers must not infer a miss from the rendered ``site == "unknown"``,
+        which a configured source may legally use as its label."""
+        return ip in self._sources
+
+    def note_unknown_rejected(self, ip: str) -> None:
+        """Warn-once that an unknown-source datagram from `ip` was rejected.
+        Shares resolve()'s seen_unknown set so each unknown IP warns at most once
+        across BOTH paths; side-effect only, no stamping claim (datagram is dropped)."""
+        if ip not in self.seen_unknown:
+            self.seen_unknown.add(ip)
+            _log.warning(
+                "rejected datagram from unknown source %s (reject_unknown_sources enabled)",
+                ip,
+            )

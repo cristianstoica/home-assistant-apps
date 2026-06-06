@@ -42,32 +42,38 @@ sources:
 A sender that is **not** listed in `sources` is still **received and written**,
 stamped `unknown`/`<ip>`, with a one-time WARNING on first sight. The default
 ships with an empty `sources` list, so add at least one row to get friendly
-site/host labels.
+site/host labels. Set `reject_unknown_sources: true` to **drop** (not store)
+datagrams from senders absent from `sources`; they are counted in the
+`rejected_sources` stat. This is a **noise filter, not authentication** — UDP
+source IPs are spoofable, so a forged datagram claiming a configured IP is still
+accepted.
 
 Point your devices' syslog forwarding at the Home Assistant host on
 `listen_port` (default UDP **5514**).
 
 ## Options
 
-| Option             | Type                                | Default   | Meaning                                                                                                                                                          |
-| ------------------ | ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `listen_port`      | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                                                            |
-| `listen_host`      | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).                                               |
-| `retention_days`   | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                                                         |
-| `min_free_percent` | `int(0,99)`                         | `0`       | **Size guard.** Free-space floor: prune oldest segments to keep ≥ this % of the volume free. `0` disables (see Size guard below).                                |
-| `max_log_percent`  | `int(0,99)`                         | `0`       | **Size guard.** Log-dir cap: prune oldest segments so the log dir occupies ≤ this % of the volume. `0` disables.                                                 |
-| `max_segment_mb`   | `int(0,4096)`                       | `0`       | **Size guard.** Size-rotation trigger: roll the active file to a `.gz` segment at this many MB. `0` disables; **must be > 0** to enable either percentage guard. |
-| `log_level`        | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below).                                          |
-| `sources`          | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                                                                |
+| Option                   | Type                                | Default   | Meaning                                                                                                                                                          |
+| ------------------------ | ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listen_port`            | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                                                            |
+| `listen_host`            | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).                                               |
+| `retention_days`         | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                                                         |
+| `min_free_percent`       | `int(0,99)`                         | `0`       | **Size guard.** Free-space floor: prune oldest segments to keep ≥ this % of the volume free. `0` disables (see Size guard below).                                |
+| `max_log_percent`        | `int(0,99)`                         | `0`       | **Size guard.** Log-dir cap: prune oldest segments so the log dir occupies ≤ this % of the volume. `0` disables.                                                 |
+| `max_segment_mb`         | `int(0,4096)`                       | `0`       | **Size guard.** Size-rotation trigger: roll the active file to a `.gz` segment at this many MB. `0` disables; **must be > 0** to enable either percentage guard. |
+| `log_level`              | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below).                                          |
+| `sources`                | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                                                                |
+| `reject_unknown_sources` | `bool`                              | `false`   | Drop (don't store) datagrams from senders not in `sources`; counted in `rejected_sources`. Noise filter, NOT authentication.                                     |
 
 > **`log_level` controls py-syslog's own logging, not the logs it collects.** It
 > sets the verbosity of py-syslog's _own_ operational diagnostics on stderr — the
 > periodic stats line, the unknown-source warning, and throttled write-error
 > warnings (the sense in which Python's `logging` uses "level"). It has **no
-> effect on the syslog you ingest**: every received datagram is written to
-> `/data/log` and echoed to the Log tab in full, regardless of its own syslog
-> severity. For example, `log_level: error` quiets py-syslog's own chatter but you
-> will still receive and store every `debug`-severity line a sender emits.
+> effect on the syslog you ingest**: every received and non-rejected datagram is
+> written to `/data/log` and echoed to the Log tab in full, regardless of its own
+> syslog severity. For example, `log_level: error` quiets py-syslog's own chatter
+> but you will still receive and store every non-rejected `debug`-severity line a
+> sender emits.
 > py-syslog does **not** currently filter, drop, or route ingested logs by
 > severity.
 
@@ -101,7 +107,9 @@ free port and restart.
   and no sender authentication; the source IP on a UDP datagram can be forged, so
   any host that can reach the port can inject lines stamped as any sender —
   including one mapped in `sources`. Stamped `site`/`host` reflect the **claimed**
-  source IP, not a verified identity.
+  source IP, not a verified identity. `reject_unknown_sources` reduces noise from
+  unconfigured senders but does **not** authenticate — a spoofed source IP
+  matching a configured entry bypasses it.
 - **When exposing beyond a trusted LAN, restrict and firewall.** If you
   port-forward or otherwise expose the port past a trusted network, restrict the
   bind interface via `listen_host` **and** firewall the source (allow only known
