@@ -1,3 +1,11 @@
 __pycache__/
 *.pyc
 .ruff_cache/
+
+# macOS
+.DS_Store
+
+# .claude/ is per-machine state: symlinks to IT/.claude/ (created by
+# IT/scripts/setup-claude-symlinks.sh), agent memory, and worktrees.
+# Nothing in it is meant to be committed at any level of this repo.
+.claude/
