@@ -67,6 +67,8 @@ jobs:
         run: PYTHONPATH=py-syslog python -m pysyslog --check --storage
       - name: pysyslog --check --write-error
         run: PYTHONPATH=py-syslog python -m pysyslog --check --write-error
+      - name: pysyslog --check --bind
+        run: PYTHONPATH=py-syslog python -m pysyslog --check --bind
 
       - name: pyright
         run: pyright py-syslog/pysyslog
