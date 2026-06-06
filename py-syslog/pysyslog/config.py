@@ -122,7 +122,12 @@ def _reject_control_chars(value: str, field: str, context: str) -> None:
     """
     for ch in value:
         code = ord(ch)
-        if code < 0x20 or code == 0x7F or 0x80 <= code <= 0x9F or code in (0x2028, 0x2029):
+        if (
+            code < 0x20
+            or code == 0x7F
+            or 0x80 <= code <= 0x9F
+            or code in (0x2028, 0x2029)
+        ):
             raise ConfigError(f"{field}: must not contain control characters{context}")
 
 

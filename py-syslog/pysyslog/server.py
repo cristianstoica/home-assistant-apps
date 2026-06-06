@@ -230,9 +230,11 @@ def process_datagram(
     if not resolver.is_known(client_ip):
         counters.unknown_source += 1
         if reject_unknown_sources:
-            site, host = "unknown", client_ip          # trace labels; resolve() bypassed
+            site, host = "unknown", client_ip  # trace labels; resolve() bypassed
             counters.rejected_sources += 1
-            resolver.note_unknown_rejected(client_ip)  # warn-once per IP via seen_unknown
+            resolver.note_unknown_rejected(
+                client_ip
+            )  # warn-once per IP via seen_unknown
             if _log.isEnabledFor(logging.DEBUG):
                 _trace_datagram(client_ip, record, site, host, "rejected")
             return

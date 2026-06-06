@@ -266,8 +266,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc3164 PRI 0 boundary (kern.emerg)",
         client_ip=SOURCE_IP,
         raw=b"<0>Jun  3 11:59:58 myhost app: zero pri",
-        tag="3164", protocol="rfc3164", sender_ts="Jun  3 11:59:58",
-        site="home", host="router1",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 kern.emerg "
             "app: [Jun  3 11:59:58] zero pri\n"
@@ -277,8 +280,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc3164 PRI 191 boundary (local7.debug)",
         client_ip=SOURCE_IP,
         raw=b"<191>Jun  3 11:59:58 myhost app: max valid pri",
-        tag="3164", protocol="rfc3164", sender_ts="Jun  3 11:59:58",
-        site="home", host="router1",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 local7.debug "
             "app: [Jun  3 11:59:58] max valid pri\n"
@@ -288,8 +294,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc3164 PRI 192 out-of-range -> priority unknown",
         client_ip=SOURCE_IP,
         raw=b"<192>Jun  3 11:59:58 myhost app: over range",
-        tag="3164", protocol="rfc3164", sender_ts="Jun  3 11:59:58",
-        site="home", host="router1",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
         # PRI 192 > 191: _priority_text returns "unknown", but the record is
         # still a well-formed rfc3164 parse (NOT malformed).
         expected_line=(
@@ -301,8 +310,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc3164 PRI 255 out-of-range -> priority unknown",
         client_ip=SOURCE_IP,
         raw=b"<255>Jun  3 11:59:58 myhost app: way over",
-        tag="3164", protocol="rfc3164", sender_ts="Jun  3 11:59:58",
-        site="home", host="router1",
+        tag="3164",
+        protocol="rfc3164",
+        sender_ts="Jun  3 11:59:58",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 unknown "
             "app: [Jun  3 11:59:58] way over\n"
@@ -312,8 +324,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="malformed PRI: 4 digits (<1920>) -> MALFORMED",
         client_ip=SOURCE_IP,
         raw=b"<1920>Jun  3 11:59:58 myhost app: four digit pri",
-        tag="malformed", protocol="unknown", sender_ts="",
-        site="home", host="router1",
+        tag="malformed",
+        protocol="unknown",
+        sender_ts="",
+        site="home",
+        host="router1",
         # _PRI_RE is ^<\d{1,3}> — 4 digits do not match, so no PRI is found and
         # the whole datagram is MALFORMED (raw echoed as the message).
         expected_line=(
@@ -325,8 +340,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="malformed PRI: non-numeric (<abc>) -> MALFORMED",
         client_ip=SOURCE_IP,
         raw=b"<abc>Jun  3 11:59:58 myhost app: nonnumeric pri",
-        tag="malformed", protocol="unknown", sender_ts="",
-        site="home", host="router1",
+        tag="malformed",
+        protocol="unknown",
+        sender_ts="",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 unknown "
             "MALFORMED: [-] <abc>Jun  3 11:59:58 myhost app: nonnumeric pri\n"
@@ -336,8 +354,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc5424 all-nil fields (- - - - -)",
         client_ip=SOURCE_IP,
         raw=b"<165>1 - - - - - nil everything",
-        tag="5424", protocol="rfc5424", sender_ts="",
-        site="home", host="router1",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="",
+        site="home",
+        host="router1",
         # Nil TIMESTAMP -> sender_ts "" -> [-]; nil APP-NAME -> program "-";
         # nil PROCID -> no [pid] suffix; nil SD -> message is the tail.
         expected_line=(
@@ -349,8 +370,11 @@ DATAGRAMS: list[DatagramFixture] = [
         name="rfc5424 nil timestamp, real app/procid",
         client_ip=SOURCE_IP,
         raw=b"<165>1 - myhost app 4711 ID47 - msg with nil ts",
-        tag="5424", protocol="rfc5424", sender_ts="",
-        site="home", host="router1",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 local4.notice "
             "app[4711]: [-] msg with nil ts\n"
@@ -363,12 +387,12 @@ DATAGRAMS: list[DatagramFixture] = [
         # bracket-matching through the escape and return only the trailing MSG.
         # The bytes are  ... k="a\]b"] after sd  — a single backslash then ] inside
         # the SD param. In a Python bytes literal write it as b'... k="a\\]b"] ...'.
-        raw=(
-            b"<165>1 2026-06-03T11:59:58.000Z host app - - "
-            b'[ex@1 k="a\\]b"] after sd'
-        ),
-        tag="5424", protocol="rfc5424", sender_ts="2026-06-03T11:59:58.000Z",
-        site="home", host="router1",
+        raw=(b'<165>1 2026-06-03T11:59:58.000Z host app - - [ex@1 k="a\\]b"] after sd'),
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
         expected_line=(
             "2026-06-03T12:00:00+00:00 home router1 local4.notice "
             "app: [2026-06-03T11:59:58.000Z] after sd\n"
