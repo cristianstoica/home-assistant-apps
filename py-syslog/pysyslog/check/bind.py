@@ -17,8 +17,8 @@ import socket
 import sys
 
 from .. import config
-from ..server import RECV_TIMEOUT_S, Server
-from .fakes import CaptureWriter
+from ..server import BindError, RECV_TIMEOUT_S, Server
+from .fakes import CaptureWriter, CloseTrackingWriter
 from .options import default_check_options
 
 
@@ -75,4 +75,52 @@ def check_bind() -> bool:
     )
     ok = ok and closed_clean
     print(f"BIND CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
+    ok = _check_bind_failure() and ok
+    return ok
+
+
+def _bind_failure_config(host: str, port: int) -> config.Config:
+    """A valid Config targeting the held host:port (a real ephemeral port).
+
+    Unlike `_loopback_bind_config` it needs no `_replace`: the held socket's
+    assigned port is a real non-zero ephemeral that passes config.validate's
+    _MIN_PORT floor, so the second bind on the same host:port always raises.
+    """
+    options = {**default_check_options(), "listen_host": host, "listen_port": port}
+    return config.validate(options)
+
+
+def _check_bind_failure() -> bool:
+    """Pin C's leak fix: when _bind raises BindError, Server.run() must close
+    the writer and re-raise (never return 0)."""
+    ok = True
+    held = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        held.bind(("127.0.0.1", 0))
+        host, port = held.getsockname()
+        cfg = _bind_failure_config(host, port)  # a valid Config on the held host:port
+        writer = CloseTrackingWriter()
+        server = Server(cfg, writer)
+        raised = False
+        result = None
+        try:
+            result = server.run()
+        except BindError:
+            raised = True
+        checks = [
+            (
+                "BindError propagated (no sys.exit, no return 0)",
+                raised and result is None,
+            ),
+            ("writer closed on bind failure (no leak)", writer.closed is True),
+        ]
+        for label, passed in checks:
+            print(
+                f"{'PASS' if passed else 'FAIL'}  bind-failure: {label}",
+                file=sys.stderr,
+            )
+            ok = ok and passed
+    finally:
+        held.close()
+    print(f"BIND-FAILURE CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
     return ok

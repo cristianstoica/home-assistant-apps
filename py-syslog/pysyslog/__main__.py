@@ -105,7 +105,7 @@ def configure_logging(level: str) -> None:
 
 def _run_server(options_path: str) -> int:
     """Load options, wire signals, and serve until stop."""
-    from .server import Throttle, make_throttled_warn
+    from .server import BindError, Throttle, make_throttled_warn
     from .writer import Writer, WriteError
 
     try:
@@ -137,7 +137,11 @@ def _run_server(options_path: str) -> int:
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
-    return server.run()
+    try:
+        return server.run()
+    except BindError as exc:
+        print(f"fatal: {exc}", file=sys.stderr)
+        return 1
 
 
 def main(argv: list[str] | None = None) -> int:

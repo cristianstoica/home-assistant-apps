@@ -46,6 +46,10 @@ RECV_TIMEOUT_S = _RECV_TIMEOUT_S
 _MAX_DATAGRAM = 65535
 
 
+class BindError(Exception):
+    """Raised when the UDP listen socket cannot be bound (replaces sys.exit(1))."""
+
+
 class Counters:
     """Mutable per-run counters, mutated by `process_datagram` in fixed order.
 
@@ -315,14 +319,15 @@ class Server:
         return self._bind()
 
     def _bind(self) -> socket.socket:
-        """Bind ``<listen_host>:<listen_port>``; a bind failure is fatal (exit 1)."""
+        """Bind ``<listen_host>:<listen_port>``; raise `BindError` on failure."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.bind((self._config.listen_host, self._config.listen_port))
         except OSError as exc:
             sock.close()
-            _log.error("cannot bind UDP :%d — %s", self._config.listen_port, exc)
-            sys.exit(1)
+            raise BindError(
+                f"cannot bind UDP :{self._config.listen_port} — {exc}"
+            ) from exc
         sock.settimeout(_RECV_TIMEOUT_S)
         return sock
 
@@ -366,7 +371,14 @@ class Server:
         wrapped in a loop-level catch-all so one poison datagram can never kill
         the collector.
         """
-        self._sock = self._bind()
+        try:
+            self._sock = self._bind()
+        except BindError:
+            # Bind failed before the serve loop's finally could run; close the
+            # writer that __main__ opened so it does not leak, then re-raise for
+            # the entrypoint to map to exit 1.
+            self._writer.close()
+            raise
         _log.info(
             "py-syslog listening on UDP :%d (%d source mapping(s))",
             self._config.listen_port,

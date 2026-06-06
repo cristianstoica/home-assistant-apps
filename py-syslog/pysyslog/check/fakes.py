@@ -48,6 +48,33 @@ class CaptureWriter:
         pass
 
 
+class CloseTrackingWriter:
+    """Minimal WriterProtocol stand-in that records whether close() ran.
+
+    Used by _check_bind_failure to prove Server.run() closes the writer when
+    _bind raises (the leak fix).
+    """
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.stats = _FakeStats()
+
+    def write(self, line: str) -> None:  # never reached on the bind-fail path
+        raise AssertionError("write() must not run when bind fails")
+
+    def close(self) -> None:
+        self.closed = True
+
+    def disk_free_pct(self) -> int | None:
+        return None
+
+    def log_dir_mb(self) -> int | None:
+        return None
+
+    def enforce_space_tick(self) -> None:
+        pass
+
+
 class RaisingWriter:
     """A `WriterProtocol` fake whose ``write()`` always raises `WriteError`."""
 
