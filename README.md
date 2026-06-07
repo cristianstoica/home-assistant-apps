@@ -20,6 +20,21 @@ with each stored line echoed live to the add-on **Log tab**. Collector only:
 no search engine, no sensors. Storage failures are counted and surfaced, never
 silently swallowed.
 
+### [Py-DDNS](./py-ddns)
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
+
+A generic, stdlib-only **dynamic-DNS updater** for Home Assistant. It keeps one
+DNS A record pointed at the box's current egress IPv4 through one of two
+provider archetypes behind a single `provider` switch: **`azure`** (API
+archetype — create-or-replace via the Azure DNS management API with a
+least-privilege service principal scoped to a single zone), or **`url`**
+(callback archetype — fires a secret cPanel-style endpoint and the server
+detects the source IP). Each cycle reconciles on an interval with bounded
+backoff and post-update DNS confirmation. Secret-safe by construction: SP
+secrets, bearer tokens, and the callback URL path are never logged.
+
 ## Install
 
 > **Requires Home Assistant with the Supervisor** (HA OS or Supervised). HA
