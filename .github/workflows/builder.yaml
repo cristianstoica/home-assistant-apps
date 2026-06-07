@@ -1,7 +1,12 @@
 name: Builder
 
 env:
-  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs"
+  # Trigger tokens matched as `${app}/${file}` substrings against the
+  # changed-files list. `pysyslog` / `pyddns` are the package source dirs
+  # (one per add-on, slug-minus-hyphen) so a Python-only change under
+  # `py-syslog/pysyslog/` or `py-ddns/pyddns/` triggers a rebuild — without
+  # them, source-only edits silently skip the image build.
+  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs pysyslog pyddns"
 
 on:
   pull_request:

@@ -1,0 +1,45 @@
+name: Py-DDNS
+version: "1.0.0"
+slug: py-ddns
+description: >-
+  Generic multi-provider dynamic-DNS updater. Keeps one A record pointed at the
+  box's current egress IPv4 via Azure DNS (API archetype) or a secret cPanel-style
+  callback URL (callback archetype). Reconciles on an interval with bounded backoff
+  and post-update DNS confirmation. Secret-safe by construction.
+url: https://github.com/cristianstoica/home-assistant-apps/tree/main/py-ddns
+arch: [aarch64, amd64]
+startup: services
+init: false
+image: ghcr.io/cristianstoica/py-ddns
+options:
+  provider: azure
+  name: ""
+  # azure provider: paste the SP credential blob (JSON) from the bootstrap step
+  # in the README. Required only when provider=azure. The blob's "zone" is
+  # authoritative; "name" must be a sub-record of it (the zone apex is rejected).
+  azure_token: ""
+  ip_source_urls:
+    - https://api.ipify.org
+    - https://icanhazip.com
+  ttl: 60
+  # url provider: the secret callback endpoint (https only). Required only when
+  # provider=url. url_send_myip appends the locally-detected IP as a ?myip= param;
+  # leave it false to let the server detect the request's source IP.
+  url_endpoint: ""
+  url_send_myip: false
+  interval_seconds: 120
+  drift_reconcile_seconds: 3600
+  log_level: info
+schema:
+  provider: list(azure|url)
+  name: str?
+  azure_token: str?
+  ip_source_urls:
+    - url?
+  ttl: int(30,86400)
+  url_endpoint: url?
+  url_send_myip: bool
+  interval_seconds: int(60,86400)
+  drift_reconcile_seconds: int(0,86400)
+  test_ns: str?
+  log_level: list(debug|info|warning|error)

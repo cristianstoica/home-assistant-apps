@@ -1,0 +1,75 @@
+configuration:
+  provider:
+    name: Provider
+    description: >-
+      Which DNS backend to drive. "azure" (API archetype): this add-on detects
+      the egress IP and writes the A record via the Azure DNS management API.
+      "url" (callback archetype): this add-on fires a secret callback URL and the
+      remote server (e.g. cPanel) sets the record from the request's source IP.
+  name:
+    name: Record name (FQDN)
+    description: >-
+      The fully-qualified record to keep updated, e.g. home.example.com. For the
+      azure provider it MUST be a sub-record of the credential blob's zone (the
+      zone apex is rejected — a host updater must never repoint a zone apex). For
+      the url provider it is informational (used only in diagnostics).
+  azure_token:
+    name: Azure SP credential (JSON)
+    description: >-
+      azure provider only. Paste the service-principal credential blob from the
+      bootstrap step in the README — a JSON object with tenantId, subscriptionId,
+      resourceGroup, zone, clientId and clientSecret. The clientSecret is never
+      logged. The blob's zone is authoritative for the name↔zone check.
+  ip_source_urls:
+    name: IP source URLs
+    description: >-
+      azure provider only. Ordered list of https echo endpoints (ipify /
+      icanhazip) returning the box's egress IPv4 as text; the first global-unicast
+      answer wins. Private, CGNAT, loopback, link-local and 0.0.0.0 answers are
+      rejected so a spoofed/non-routable value is never published. http, hostless,
+      userinfo and fragment URLs are rejected.
+  ttl:
+    name: Record TTL (seconds)
+    description: >-
+      azure provider only. The TTL written on the A record-set (30-86400). Lower
+      values propagate IP changes faster at the cost of more resolver traffic.
+  url_endpoint:
+    name: Callback URL
+    description: >-
+      url provider only. The secret https callback endpoint whose path/query
+      encodes the update credential. Must be https (a plaintext callback leaks the
+      record-repointing secret in transit); http, hostless, userinfo and fragment
+      URLs are rejected. The secret is never logged — diagnostics show the host
+      with the path redacted.
+  url_send_myip:
+    name: Send detected IP (myip)
+    description: >-
+      url provider only. When enabled, append the locally-detected egress IPv4 as
+      a ?myip= query parameter on the callback (replacing any existing myip and
+      preserving other params). Leave disabled to let the remote server detect the
+      record from the request's own source IP (the usual cPanel behaviour).
+  interval_seconds:
+    name: Reconcile interval (seconds)
+    description: >-
+      How often to run a reconcile cycle (60-86400). Each cycle detects the IP (or
+      defers to the server, url provider), updates the record if it changed, and
+      confirms the change in DNS.
+  drift_reconcile_seconds:
+    name: Drift reconcile interval (seconds)
+    description: >-
+      Force an authoritative re-check of the live record even when nothing locally
+      changed, to heal out-of-band drift (0-86400). 0 disables the periodic drift
+      check; the per-interval reconcile still runs.
+  test_ns:
+    name: Confirmation nameserver (optional)
+    description: >-
+      Optional IP of a nameserver to query directly when confirming a post-update
+      record value (e.g. the zone's authoritative NS), bypassing the local
+      resolver cache. Leave blank to confirm via the system resolver.
+  log_level:
+    name: Diagnostics verbosity
+    description: >-
+      Verbosity of Py-DDNS's own diagnostics (startup line, per-cycle decisions,
+      warnings) on stderr. Setting it to debug additionally traces each cycle's IP
+      detection, update decision and confirmation outcome. Secrets are never
+      logged at any level.
