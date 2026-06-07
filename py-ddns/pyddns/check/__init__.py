@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Callable
+from urllib.parse import urlparse
 
 from .. import fixtures
 from ..redact import sanitize
@@ -135,6 +136,14 @@ def check_harness_backstop() -> bool:
         f"(token {fixtures.EXAMPLE_URL_SECRET})"
     )
     scrubbed = _redact_failure(leaky)
+    # Parse the URL the redactor left in the scrubbed message and compare its
+    # hostname structurally, not via substring containment — `<host> in <url>`
+    # is the classic `py/incomplete-url-substring-sanitization` shape and
+    # CodeQL (correctly) won't reason about whether the surrounding context
+    # gates a sanitization decision. We do not gate anything on this; we only
+    # want to confirm the redactor preserves the host for operator legibility.
+    url_match = _URL_RE.search(scrubbed)
+    parsed_host = urlparse(url_match.group(0)).hostname if url_match else None
     checks += [
         (
             "redaction masks the secret URL path",
@@ -146,7 +155,7 @@ def check_harness_backstop() -> bool:
         ),
         (
             "redaction keeps the host (operationally useful)",
-            "dynamicdns.example.com" in scrubbed,
+            parsed_host == "dynamicdns.example.com",
         ),
     ]
     return report("HARNESS-BACKSTOP", "backstop", checks)
