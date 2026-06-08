@@ -138,7 +138,10 @@ is scoped to **only** this zone:
    is **not** least-privilege: `DNS Zone Contributor` grants CRUD on _every_
    record type in the zone, not just the A record. For a tighter grant (an
    A-record-only custom role), an Owner/User-Access-Administrator can define a
-   custom role and pass it as `--role` instead.
+   custom role granting only the actions py-ddns needs and pass it as `--role`
+   instead — see Azure's
+   [Protect DNS zones and records](https://learn.microsoft.com/en-us/azure/dns/dns-protect-zones-recordsets#custom-roles)
+   for a record-type-scoped custom-role example.
 
 ### Fill the Azure DNS section, then set the host name
 

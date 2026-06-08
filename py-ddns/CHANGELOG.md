@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.2.1 — docs: link Azure's "Protect DNS zones and records" for custom-role recipe
+
+**Docs-only.** No code, config schema, or runtime behavior change.
+
+- **README** Azure DNS setup (Avenue 2) now folds in a link to Microsoft's
+  [Protect DNS zones and records](https://learn.microsoft.com/en-us/azure/dns/dns-protect-zones-recordsets#custom-roles)
+  (`#custom-roles` anchor) inside the existing `DNS Zone Contributor` note as
+  the pointer for users who want a tighter, record-type-scoped custom role
+  instead of the broader built-in role. The `DNS Zone Contributor`
+  `az ad sp create-for-rbac` command block is unchanged.
+
 ## 2.2.0 — opt-in `url.insecure_skip_verify` for unverifiable callback certs
 
 **Additive, non-breaking.** No config-shape change beyond the new optional
