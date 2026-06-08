@@ -1,5 +1,7 @@
 name: Py-DDNS
-version: "1.0.0"
+version: "2.0.0"
+breaking_versions:
+  - "2.0.0"
 slug: py-ddns
 description: >-
   Generic multi-provider dynamic-DNS updater. Keeps one A record pointed at the
@@ -12,33 +14,48 @@ startup: services
 init: false
 image: ghcr.io/cristianstoica/py-ddns
 options:
-  provider: azure
+  # Host name → the FQDN to keep updated. For Azure it MUST be a sub-record of the
+  # zone (the apex is rejected); for the callback URL it is the DNS verification
+  # readout. The provider is inferred from whichever section below is filled.
   name: ""
-  # azure provider: paste the SP credential blob (JSON) from the bootstrap step
-  # in the README. Required only when provider=azure. The blob's "zone" is
-  # authoritative; "name" must be a sub-record of it (the zone apex is rejected).
-  azure_token: ""
-  ip_source_urls:
-    - https://api.ipify.org
-    - https://icanhazip.com
-  ttl: 60
-  # url provider: the secret callback endpoint (https only). Required only when
-  # provider=url. url_send_myip appends the locally-detected IP as a ?myip= param;
-  # leave it false to let the server detect the request's source IP.
-  url_endpoint: ""
-  url_send_myip: false
+  # Callback URL section (callback archetype). Fill `endpoint` to select URL mode:
+  # the secret https callback whose path/query encodes the update credential.
+  # `send_myip` appends the locally-detected IP as a ?myip= param; leave false to
+  # let the remote server detect the record from the request's source IP.
+  url:
+    endpoint: ""
+    send_myip: false
+  # Azure DNS section (API archetype). Fill the credential fields to select Azure
+  # mode: this add-on detects the egress IP and writes the A record via the Azure
+  # DNS management API. `zone` is authoritative for the name↔zone check.
+  # `ip_sources` is comma/space-separated https echo endpoints (blank = built-in
+  # defaults); `ttl` is the record TTL. clientSecret/endpoint are masked.
+  azure:
+    client_id: ""
+    client_secret: ""
+    tenant_id: ""
+    subscription_id: ""
+    resource_group: ""
+    zone: ""
+    ip_sources: ""
+    ttl: 60
   interval_seconds: 120
   drift_reconcile_seconds: 3600
   log_level: info
 schema:
-  provider: list(azure|url)
   name: str?
-  azure_token: str?
-  ip_source_urls:
-    - url?
-  ttl: int(30,86400)
-  url_endpoint: url?
-  url_send_myip: bool
+  url:
+    endpoint: password?
+    send_myip: bool?
+  azure:
+    client_id: str?
+    client_secret: password?
+    tenant_id: str?
+    subscription_id: str?
+    resource_group: str?
+    zone: str?
+    ip_sources: str?
+    ttl: int(30,86400)?
   interval_seconds: int(60,86400)
   drift_reconcile_seconds: int(0,86400)
   test_ns: str?

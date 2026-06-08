@@ -2,14 +2,21 @@
 
 A generic, stdlib-only **dynamic-DNS updater**, packaged as a Home Assistant
 add-on. It keeps one DNS **A record** pointed at the box's current egress IPv4
-through one of two provider archetypes, behind a single `provider` switch:
+through one of two provider archetypes. There is **no `provider` option** — the
+provider is **inferred from whichever config section you fill** (the **Azure DNS**
+section selects Azure; the **Callback URL** section selects the callback):
 
-- **`azure` (API archetype)** — this add-on detects the egress IPv4 from an HTTPS
-  echo source, then create-or-replaces the A record via the **Azure DNS**
-  management API (`GET` then `PUT`, pinned to the GA `2018-05-01` api-version).
-- **`url` (callback archetype)** — this add-on fires a **secret callback URL**
-  (cPanel-style) and the remote server reads the request's source IP and sets the
-  record. The client does not need to detect the IP; the server does.
+- **Azure (API archetype)** — fill the **Azure DNS** section. This add-on detects
+  the egress IPv4 from an HTTPS echo source, then create-or-replaces the A record
+  via the **Azure DNS** management API (`GET` then `PUT`, pinned to the GA
+  `2018-05-01` api-version).
+- **Callback URL (callback archetype)** — fill the **Callback URL** section. This
+  add-on fires a **secret callback URL** (cPanel-style) and the remote server
+  reads the request's source IP and sets the record. The client does not need to
+  detect the IP; the server does.
+
+If you fill **both** sections, the **Callback URL wins** — the Azure DNS section
+is ignored (a warning is logged to the Log tab).
 
 Each cycle reconciles on an interval, applies **bounded interruptible backoff** to
 transient failures (3 attempts, exponential with jitter, honoring `Retry-After`),
@@ -30,59 +37,147 @@ store.
    **Close**.
 3. The store refreshes — find the **Py-DDNS** card, open it, and click
    **Install**.
-4. On the **Configuration** tab, set `provider` and that provider's fields (see
-   below), then **Start**.
+4. On the **Configuration** tab, fill **one** of the two sections — **Azure DNS**
+   or **Callback URL** (see below); the provider is inferred from which section
+   you fill. Then **Start**.
 
-## Configuring the `azure` provider
+## Configuring the Azure DNS section
 
-The `azure` provider drives the Azure DNS management API with a **service
-principal** (SP) scoped to exactly one DNS zone. Bootstrap it once with the Azure
-CLI, then paste the credential blob into the add-on.
+The Azure path drives the Azure DNS management API with a **service principal**
+(SP) whose **role assignment is scoped to a single DNS zone** (not the
+subscription or resource group). You fill the six credential fields plus the
+zone-identifying values into the **Azure DNS** section; there is no JSON blob.
 
-1. Create a least-privilege SP scoped to **only** your DNS zone, as **DNS Zone
-   Contributor** (not a subscription-wide role):
+The six identifying values map to the Azure resource path of your zone, the
+**`<SUB>/<RG>/<ZONE>` triplet**:
+
+- **`<SUB>`** — the **subscription ID** (a GUID) that owns the zone.
+- **`<RG>`** — the **resource group** that contains the zone.
+- **`<ZONE>`** — the DNS **zone name**, e.g. `example.com`.
+
+Together they form the zone resource ID
+`/subscriptions/<SUB>/resourceGroups/<RG>/providers/Microsoft.Network/dnszones/<ZONE>`,
+which is the scope the SP's role assignment is pinned to.
+
+### Prerequisites — sign in and discover the triplet
+
+Run these with the Azure CLI before either avenue below:
+
+1. **Sign in** and select the subscription that owns the zone (at the ≥2.61
+   picker, choose the target subscription **by number** — pressing Enter keeps a
+   possibly-wrong default):
+
+   ```sh
+   az login
+   az account show   # confirm id (= <SUB>) and tenantId
+   ```
+
+2. **Find `<RG>` and `<ZONE>`** by listing the DNS zones in the subscription:
+
+   ```sh
+   az network dns zone list --output table
+   ```
+
+   The output's `ResourceGroup` column is `<RG>` and the `Name` column is
+   `<ZONE>`. Optionally inspect the live records first (the apex usually belongs
+   to your website — the add-on must never touch it):
+
+   ```sh
+   az network dns record-set list \
+     --resource-group "<RG>" --zone-name "<ZONE>" --output table
+   ```
+
+### Avenue 1 — discover an existing SP
+
+If you **already have** a DNS zone _and_ a service principal whose role
+assignment is scoped to that zone, you only need to gather its identifiers:
+
+- **`tenant_id`** — from `az account show` (`tenantId`).
+- **`client_id`** — the SP's **application (client) ID** (a GUID, the `appId`).
+- **`client_secret`** — an existing/rotated SP secret (Azure never reveals an old
+  one, so you may need to create a new credential for the SP).
+- **`subscription_id` / `resource_group` / `zone`** — the `<SUB>/<RG>/<ZONE>`
+  triplet from the prerequisites.
+
+Confirm the SP's assignment is single-zone scoped before relying on it:
+
+```sh
+az role assignment list --assignee "<appId>" --all --output table
+```
+
+The `Scope` must end `.../dnszones/<ZONE>` (one zone — not a subscription- or
+resource-group-wide scope). `--all` is required so a zone-scoped assignment is
+not omitted.
+
+### Avenue 2 — provision a new single-zone SP
+
+If you do **not** yet have a service principal, create one whose role assignment
+is scoped to **only** this zone:
+
+1. Get the zone resource ID (the `--scopes` value):
+
+   ```sh
+   az network dns zone show \
+     --resource-group "<RG>" --name "<ZONE>" \
+     --query id --output tsv
+   ```
+
+2. Create the SP with a **single-zone-scoped** role assignment (the assignment
+   targets one zone, not the subscription or resource group):
 
    ```sh
    az ad sp create-for-rbac \
-     --name "py-ddns-<zone>" \
+     --name "py-ddns" \
      --role "DNS Zone Contributor" \
-     --scopes "/subscriptions/<SUB>/resourceGroups/<RG>/providers/Microsoft.Network/dnszones/<ZONE>"
+     --scopes "<paste the zone resource ID from step 1>"
    ```
 
-2. Assemble the credential blob from the CLI output plus your subscription /
-   resource-group / zone, and paste it into the **Azure SP credential (JSON)**
-   field as a single JSON object:
+   This prints `appId` (→ **Client ID**), `password` (→ **Client secret**) and
+   `tenant` (→ **Tenant ID**). The role is **`DNS Zone Contributor`**, scoped to
+   one zone — a leaked credential can then only change records _in that zone_. It
+   is **not** least-privilege: `DNS Zone Contributor` grants CRUD on _every_
+   record type in the zone, not just the A record. For a tighter grant (an
+   A-record-only custom role), an Owner/User-Access-Administrator can define a
+   custom role and pass it as `--role` instead.
 
-   ```json
-   {
-     "tenantId": "<tenant>",
-     "subscriptionId": "<SUB>",
-     "resourceGroup": "<RG>",
-     "zone": "example.com",
-     "clientId": "<appId>",
-     "clientSecret": "<password>"
-   }
-   ```
+### Fill the Azure DNS section, then set the host name
 
-3. Set **Record name** to the FQDN to keep updated, e.g. `home.example.com`. It
-   **must be a sub-record of the blob's `zone`** — the **zone apex is rejected**
-   (a host updater must never repoint a zone apex, which on a shared zone is the
-   live site's record). The blob's `zone` is authoritative for this check.
+Enter the gathered values into the **Azure DNS** section on the Configuration
+tab — leave the **Callback URL** section blank (that is how the add-on infers the
+Azure path):
 
-**Security notes for `azure`:**
+| Azure DNS field     | Value                             |
+| ------------------- | --------------------------------- |
+| **Client ID**       | `appId` (a GUID)                  |
+| **Client secret**   | `password` (masked; never logged) |
+| **Tenant ID**       | `tenant` / `tenantId`             |
+| **Subscription ID** | `<SUB>`                           |
+| **Resource group**  | `<RG>`                            |
+| **DNS zone**        | `<ZONE>`, e.g. `example.com`      |
 
-- Scope the SP to **one zone**, not the subscription — a leaked credential can
-  then only repoint records in that zone.
+Then set the top-level **Host name** to the FQDN to keep updated, e.g.
+`home.example.com`. It **must be a sub-record of the `DNS zone`** — the **zone
+apex is rejected** (a host updater must never repoint a zone apex, which on a
+shared zone is the live site's record). The **DNS zone** field is authoritative
+for this check. No manual DNS record is needed: the first cycle does
+`GET → 404 → create` for the host name and self-heals drift on every boot.
+
+**Security notes for the Azure path:**
+
+- Scope the SP's role assignment to **one zone**, not the subscription or
+  resource group — a leaked credential can then only repoint records in that
+  zone.
 - An expired/rotated client secret is a **terminal** error (it never self-heals);
   the add-on surfaces the AAD error code (e.g. `AADSTS7000222`) in the Log tab
   **without** echoing the secret, so rotate the secret and restart.
 - The api-version is pinned to GA `2018-05-01` so a long-lived unattended client
   never depends on a preview version Azure can retire.
 
-## Configuring the `url` provider
+## Configuring the Callback URL section
 
-The `url` provider fires a **secret callback URL** — the credential is encoded in
-the URL's path/query (the usual cPanel "dynamic DNS" update URL). Set:
+The callback path fires a **secret callback URL** — the credential is encoded in
+the URL's path/query (the usual cPanel "dynamic DNS" update URL). Fill the
+**Callback URL** section (leave the **Azure DNS** section blank):
 
 - **Callback URL** to the full secret endpoint. It **must be `https://`** — a
   plaintext callback would leak the record-repointing secret in transit; `http`,
@@ -97,19 +192,52 @@ The secret never appears in the Log tab: diagnostics render the callback as
 
 ## Options
 
-| Option                    | Type                                | Default                          | Meaning                                                                                                           |
-| ------------------------- | ----------------------------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `provider`                | `list(azure\|url)`                  | `azure`                          | Which DNS backend to drive.                                                                                       |
-| `name`                    | `str?`                              | `""`                             | The FQDN to keep updated. For `azure`, a sub-record of the blob's zone (apex rejected); for `url`, informational. |
-| `azure_token`             | `str?`                              | `""`                             | **`azure` only.** SP credential blob (JSON). Required when `provider=azure`. `clientSecret` is never logged.      |
-| `ip_source_urls`          | list of `url?`                      | `api.ipify.org`, `icanhazip.com` | **`azure` only.** Ordered HTTPS echo endpoints; first global-unicast answer wins. Non-global answers rejected.    |
-| `ttl`                     | `int(30,86400)`                     | `60`                             | **`azure` only.** TTL written on the A record-set.                                                                |
-| `url_endpoint`            | `url?`                              | `""`                             | **`url` only.** The secret HTTPS callback endpoint. Required when `provider=url`. Never logged (redacted).        |
-| `url_send_myip`           | `bool`                              | `false`                          | **`url` only.** Append the detected IP as `?myip=`; leave off to let the server detect the source IP.             |
-| `interval_seconds`        | `int(60,86400)`                     | `120`                            | How often a reconcile cycle runs.                                                                                 |
-| `drift_reconcile_seconds` | `int(0,86400)`                      | `3600`                           | Force an authoritative live re-check to heal out-of-band drift; `0` disables the periodic drift check.            |
-| `test_ns`                 | `str?`                              | `""`                             | Optional nameserver IP to query directly when confirming a record value; blank uses the system resolver.          |
-| `log_level`               | `list(debug\|info\|warning\|error)` | `info`                           | Verbosity of Py-DDNS's **own** diagnostics on stderr. Secrets are never logged at any level.                      |
+There is **no `provider` option**. The provider is **inferred** from which
+section you fill: a non-blank **Callback URL** `endpoint` selects the callback
+path; otherwise any non-blank **Azure DNS** credential field selects the Azure
+path; if **neither** is filled the add-on errors at startup. If you fill **both**
+sections, the **Callback URL wins** — the Azure DNS group is **ignored** (not
+parsed) and a warning is logged.
+
+Configuration is two always-visible nested groups (`url:` and `azure:`) plus the
+shared top-level fields below.
+
+**Shared (top-level):**
+
+| Option                    | Type                                | Default | Meaning                                                                                                                                                                                    |
+| ------------------------- | ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`                    | `str?`                              | `""`    | **Host name** — the FQDN to keep updated. Required for both paths. For Azure it must be a sub-record of `azure.zone` (apex rejected); for the callback it is the DNS verification readout. |
+| `interval_seconds`        | `int(60,86400)`                     | `120`   | How often a reconcile cycle runs.                                                                                                                                                          |
+| `drift_reconcile_seconds` | `int(0,86400)`                      | `3600`  | Force an authoritative live re-check to heal out-of-band drift; `0` disables the periodic drift check.                                                                                     |
+| `test_ns`                 | `str?`                              | `""`    | Optional nameserver IP to query directly when confirming a record value; blank uses the system resolver.                                                                                   |
+| `log_level`               | `list(debug\|info\|warning\|error)` | `info`  | Verbosity of Py-DDNS's **own** diagnostics on stderr. Secrets are never logged at any level.                                                                                               |
+
+**Callback URL section (`url:`) — fill `url.endpoint` to select the callback path:**
+
+| Option          | Type        | Default | Meaning                                                                                                                                       |
+| --------------- | ----------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url.endpoint`  | `password?` | `""`    | The secret HTTPS callback endpoint. Must be `https://` (http, hostless, `user:pass@`, `#fragment` rejected). Masked; never logged (redacted). |
+| `url.send_myip` | `bool?`     | `false` | Append the detected IP as `?myip=`; leave off to let the server detect the source IP.                                                         |
+
+**Azure DNS section (`azure:`) — fill the credential fields to select the Azure path:**
+
+| Option                  | Type             | Default                          | Meaning                                                                                                                                                                            |
+| ----------------------- | ---------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `azure.client_id`       | `str?`           | `""`                             | SP application (client) ID — a GUID (the `appId`).                                                                                                                                 |
+| `azure.client_secret`   | `password?`      | `""`                             | SP secret. Masked; never logged.                                                                                                                                                   |
+| `azure.tenant_id`       | `str?`           | `""`                             | The Azure AD tenant ID the SP belongs to.                                                                                                                                          |
+| `azure.subscription_id` | `str?`           | `""`                             | The subscription ID (`<SUB>`) that owns the zone.                                                                                                                                  |
+| `azure.resource_group`  | `str?`           | `""`                             | The resource group (`<RG>`) that contains the zone.                                                                                                                                |
+| `azure.zone`            | `str?`           | `""`                             | The DNS zone (`<ZONE>`), e.g. `example.com`. Authoritative for the name↔zone check.                                                                                                |
+| `azure.ip_sources`      | `str?`           | `api.ipify.org`, `icanhazip.com` | Comma/space-separated HTTPS echo endpoints; first global-unicast answer wins. **Blank → built-in defaults.** Non-global answers and http/hostless/userinfo/fragment URLs rejected. |
+| `azure.ttl`             | `int(30,86400)?` | `60`                             | TTL written on the A record-set.                                                                                                                                                   |
+
+The six credential fields (`client_id`, `client_secret`, `tenant_id`,
+`subscription_id`, `resource_group`, `zone`) are what select the Azure path —
+`ttl`, `ip_sources` and `send_myip` carry defaults and do **not** select a
+provider on their own. `ip_sources` and `ttl` live under the `azure:` group for
+UI placement only; the built-in default IP sources are used on the callback path
+too.
 
 `state_path` (`/data/last_known_ip`) is a **development override** key recognized
 by the loader but deliberately **absent from the HA schema**, so a deployed add-on

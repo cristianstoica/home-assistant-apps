@@ -89,11 +89,16 @@ def _run_loop(options_path: str) -> int:
     from .updater import Updater
 
     try:
-        cfg = config.load(options_path)
+        selection = config.load(options_path)
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
+    cfg = selection.config
     configure_logging(cfg.log_level)
+    if selection.azure_options_ignored:
+        # Both sections were filled; URL won. Warn now that logging is configured
+        # so the line reaches the HA Log tab (load() runs before configure_logging).
+        config.warn_azure_ignored(logging.getLogger("pyddns"))
 
     http = UrllibHttpClient()
     sleeper = EventSleeper()

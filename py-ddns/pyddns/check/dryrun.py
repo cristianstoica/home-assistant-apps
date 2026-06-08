@@ -11,22 +11,25 @@ its no-network ``plan`` method.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 from .. import config
-from ..config import ConfigError
+from ..config import ConfigError, ConfigSelection
 from ..httpclient import UrllibHttpClient
 from ..providers import plan_provider
 from ..runtime import monotonic
 
 
-def _resolve_config(options_path: str) -> config.Config | None:
+def _resolve_config(options_path: str) -> ConfigSelection | None:
     """Load the options for `options_path`, or the built-in example off-HAOS.
 
     An explicit path that is missing/invalid still errors (naming the cause). The
     default ``/data/options.json`` being absent (off-HAOS) falls back to the
-    built-in azure example so ``--check --dry-run`` runs without a file.
+    built-in azure example so ``--check --dry-run`` runs without a file. Returns
+    the full `ConfigSelection` so the dry-run preview can surface the both-filled
+    'Azure options ignored' warning (the caller unpacks ``.config``).
     """
     from .. import fixtures
 
@@ -47,11 +50,17 @@ def run_dry_run(options_path: str) -> int:
     Returns 0 on a successful (network-free) plan render, 1 on a config error.
     The detected IP is reported as ``<not detected (dry-run)>`` — ``--dry-run``
     never contacts an IP source either, so the plan describes the action shape,
-    not a live value.
+    not a live value. When both sections were filled (URL won), the same
+    `warn_azure_ignored` line production emits is surfaced here too — ``main()``
+    runs ``configure_logging("info")`` before dispatching, so it reaches output
+    instead of being silently dropped.
     """
-    cfg = _resolve_config(options_path)
-    if cfg is None:
+    selection = _resolve_config(options_path)
+    if selection is None:
         return 1
+    cfg = selection.config
+    if selection.azure_options_ignored:
+        config.warn_azure_ignored(logging.getLogger("pyddns"))
     print(
         f"resolved config: provider={cfg.provider.value} name={cfg.name} "
         f"interval={cfg.interval_seconds}s drift={cfg.drift_reconcile_seconds}s "
