@@ -1,5 +1,38 @@
 # Changelog
 
+## 2.2.0 — opt-in `url.insecure_skip_verify` for unverifiable callback certs
+
+**Additive, non-breaking.** No config-shape change beyond the new optional
+field; default off means existing installs behave byte-for-byte as 2.1.1. The
+prior `breaking_versions: ["2.0.0"]` stays as-is — there is no new breaking
+entry.
+
+- **New optional `url.insecure_skip_verify` (default `false`).** When set on
+  the callback (URL) archetype, the callback request is sent over HTTPS with
+  TLS **certificate verification disabled** — the channel is still encrypted,
+  but endpoint authentication is dropped. The intended (and only sensible)
+  use case is a cPanel-style shared-host callback whose served certificate
+  cannot be validated against a public CA. HTTPS remains mandatory; an
+  `http://` callback is still rejected.
+- **Scope is deliberately narrow.** The skip applies **only** to the URL
+  provider's callback request. The Azure DNS management API and the
+  IP-source echo endpoints **always** verify TLS, regardless of this flag.
+- **Loud while enabled.** Every callback cycle (not just at boot) emits a
+  `WARNING` line naming the host and stating that certificate verification
+  is disabled — the operator cannot lose track that the install is running
+  in the weakened mode.
+- **`--check` gains a `TLS-SCOPE` section** that asserts the verification
+  posture per built client: with the flag off, every client verifies; with
+  the flag on, only the URL client skips and azure/ip-source still verify.
+  Backed by a new `verifies_tls` predicate on the HTTP client so the oracle
+  doesn't reach into private SSL-context state.
+- **Tradeoff, explicit.** Disabling cert verification accepts an
+  active-MITM risk on the callback path in exchange for tolerating an
+  otherwise-unverifiable cert. Leave it off unless you specifically need it.
+- **README** gains a "TLS certificate verification (advanced)" section
+  documenting the use case, the encrypted-but-unauthenticated tradeoff, the
+  callback-only scope, and the per-cycle WARNING.
+
 ## 2.1.1 — docs: clarify `az` output keys for Azure credential fields
 
 **Docs-only.** No code, config schema, or runtime behavior change.

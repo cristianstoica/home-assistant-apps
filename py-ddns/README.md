@@ -196,6 +196,39 @@ the URL's path/query (the usual cPanel "dynamic DNS" update URL). Fill the
 The secret never appears in the Log tab: diagnostics render the callback as
 `https://<host>/<redacted>`.
 
+### Skipping TLS certificate verification (advanced, insecure)
+
+`url.insecure_skip_verify` (default **off**) is an opt-out for one specific case:
+your callback endpoint is served over `https://` but presents a certificate that
+**fails verification** (a self-signed cert, or a hostname mismatch on a shared
+cPanel host) **and** your provider only gives you that own-domain URL — there is
+no clean-cert "provider hostname" URL to use instead. With the flag off, every
+cycle fails at request time with a transport error and the add-on cannot run.
+
+When you enable it, the add-on disables TLS **certificate verification** on the
+callback path only. Understand the tradeoff before you do:
+
+- The channel **stays encrypted** — a passive eavesdropper still cannot read the
+  secret callback URL.
+- But **authentication is lost**: an _active_ man-in-the-middle could impersonate
+  the endpoint, terminate the TLS session, and capture the capability URL — which
+  **is** the DDNS update credential. This is _encrypted-but-unauthenticated_:
+  materially safer than plaintext (which the add-on always rejects), strictly
+  weaker than verified TLS.
+
+Scope and guardrails:
+
+- **HTTPS is still mandatory.** The flag only changes which certificate check
+  runs on an already-`https://` URL; `http://`, hostless, `user:pass@` and
+  `#fragment` URLs are still rejected at startup.
+- **Azure and the IP sources always verify** — the skip never reaches them.
+- A **WARNING is logged every callback cycle** while the flag is on (including
+  steady cycles where no update fires), so the downgrade is never silent.
+
+**Recommendation:** leave this off and fix the certificate (or obtain a
+verifiable-cert callback URL) wherever possible. Enable it only when a
+verifiable-cert URL is genuinely unobtainable.
+
 ## Options
 
 There is **no `provider` option**. The provider is **inferred** from which
@@ -220,10 +253,11 @@ shared top-level fields below.
 
 **Callback URL section (`url:`) — fill `url.endpoint` to select the callback path:**
 
-| Option          | Type        | Default | Meaning                                                                                                                                       |
-| --------------- | ----------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `url.endpoint`  | `password?` | `""`    | The secret HTTPS callback endpoint. Must be `https://` (http, hostless, `user:pass@`, `#fragment` rejected). Masked; never logged (redacted). |
-| `url.send_myip` | `bool?`     | `false` | Append the detected IP as `?myip=`; leave off to let the server detect the source IP.                                                         |
+| Option                     | Type        | Default | Meaning                                                                                                                                                                                                                                                                                    |
+| -------------------------- | ----------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `url.endpoint`             | `password?` | `""`    | The secret HTTPS callback endpoint. Must be `https://` (http, hostless, `user:pass@`, `#fragment` rejected). Masked; never logged (redacted).                                                                                                                                              |
+| `url.send_myip`            | `bool?`     | `false` | Append the detected IP as `?myip=`; leave off to let the server detect the source IP.                                                                                                                                                                                                      |
+| `url.insecure_skip_verify` | `bool?`     | `false` | **Advanced, insecure.** Skip TLS _certificate_ verification on the callback path only (HTTPS still required; azure/ip-source always verify). Encrypted but unauthenticated; logs a WARNING every cycle. See [the section above](#skipping-tls-certificate-verification-advanced-insecure). |
 
 **Azure DNS section (`azure:`) — fill the credential fields to select the Azure path:**
 

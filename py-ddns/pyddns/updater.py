@@ -306,6 +306,19 @@ class Updater:
         Otherwise it fires, then confirms by a post-fire resolve whose three-way
         outcome gates whether last-known is persisted.
         """
+        # Loud, once-per-callback-cycle warning while cert verification is off.
+        # Placed here (above the steady-state suppression return and outside the
+        # RetryRunner loop) so it fires exactly once per cycle — including
+        # suppressed steady cycles, and not multiplied by a retried fire. The only
+        # interpolated scalar is `name` (the FQDN, non-secret); the secret
+        # endpoint never appears.
+        if self._config.url_insecure_skip_verify:
+            _log.warning(
+                "%s -> TLS certificate verification is DISABLED (url.insecure_skip_verify=true): "
+                "the channel stays encrypted but an active MITM could impersonate the endpoint "
+                "and capture the secret callback URL",
+                self._config.name,
+            )
         detected = self._ip_source.detect()  # optional change-trigger for url
         # The callback archetype defers authoritative IP detection to the server;
         # `detected` is only the optional local change-trigger.

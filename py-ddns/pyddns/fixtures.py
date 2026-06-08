@@ -275,6 +275,24 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         ),
         field="url.send_myip",
     ),
+    # --- insecure_skip_verify does NOT relax the https contract --------------
+    InvalidOptionsFixture(
+        name="url: http endpoint still rejected even with insecure_skip_verify true",
+        options=example_url_options(
+            url={
+                "endpoint": "http://dynamicdns.example.com/u/x",
+                "insecure_skip_verify": True,
+            }
+        ),
+        field="url.endpoint",
+    ),
+    InvalidOptionsFixture(
+        name="url.insecure_skip_verify not a bool",
+        options=example_url_options(
+            url={"endpoint": EXAMPLE_URL_ENDPOINT, "insecure_skip_verify": 1}
+        ),
+        field="url.insecure_skip_verify",
+    ),
 ]
 
 

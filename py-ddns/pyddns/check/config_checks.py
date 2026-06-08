@@ -289,7 +289,42 @@ def check_callback_precedence() -> bool:  # noqa: C901 - one cohesive positive s
     # --- dry-run path surfaces the warning at the INFO-configured logger --------
     checks.append(_check_both_filled_dry_run(both_filled, canonical))
 
+    # --- insecure_skip_verify: parse + default (§10(a)) ------------------------
+    checks += _check_insecure_skip_verify_parse()
+
     return report("CALLBACK-PRECEDENCE", "precedence", checks)
+
+
+def _check_insecure_skip_verify_parse() -> list[tuple[str, bool]]:
+    """Assert `url.insecure_skip_verify` parses to the right `Config` bool.
+
+    Default url config → ``False``; ``insecure_skip_verify: True`` → ``True``;
+    an azure-mode config (no url group) → ``False`` (it never carries the flag).
+    """
+    default_url = config.validate(fixtures.example_url_options()).config
+    flag_url = config.validate(
+        fixtures.example_url_options(
+            url={
+                "endpoint": fixtures.EXAMPLE_URL_ENDPOINT,
+                "insecure_skip_verify": True,
+            }
+        )
+    ).config
+    azure = config.validate(fixtures.example_azure_options()).config
+    return [
+        (
+            "insecure_skip_verify: defaults False on a url config",
+            default_url.url_insecure_skip_verify is False,
+        ),
+        (
+            "insecure_skip_verify: parses True when set on a url config",
+            flag_url.url_insecure_skip_verify is True,
+        ),
+        (
+            "insecure_skip_verify: False on an azure config (never carries the flag)",
+            azure.url_insecure_skip_verify is False,
+        ),
+    ]
 
 
 def _emit_if_ignored(selection: config.ConfigSelection, _handler: object) -> None:
