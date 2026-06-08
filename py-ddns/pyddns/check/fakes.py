@@ -176,15 +176,20 @@ class RecordingHandler(logging.Handler):
     """Records every message emitted on the ``pyddns`` logger (DEBUG and up).
 
     The no-secret-leakage and callback-diagnostic checks read ``messages`` to
-    assert what was (and was not) logged.
+    assert what was (and was not) logged. ``records`` keeps the ``(levelno,
+    message)`` pair so a check can assert *at which level* a line was emitted
+    (e.g. the debug-trace check proves a line emitted at DEBUG is absent once the
+    logger threshold is raised to INFO).
     """
 
     def __init__(self) -> None:
         super().__init__(level=logging.DEBUG)
         self.messages: list[str] = []
+        self.records: list[tuple[int, str]] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.messages.append(record.getMessage())
+        self.records.append((record.levelno, record.getMessage()))
 
 
 def ok_response(body: str = "", status: int = 200) -> HttpResponse:
@@ -198,14 +203,29 @@ def with_recording_handler(run: Callable[[RecordingHandler], None]) -> list[str]
     Restores the prior logger level/handlers, so checks never leak handler state
     into one another.
     """
+    return capture_at_level(logging.DEBUG, run).messages
+
+
+def capture_at_level(
+    level: int, run: Callable[[RecordingHandler], None]
+) -> RecordingHandler:
+    """Run `run` with the ``pyddns`` logger pinned to `level`; return the handler.
+
+    The handler itself records at DEBUG, so the **logger** threshold is what gates
+    which records are created — exactly the production behaviour. A debug-trace
+    check pins `level` to ``INFO`` to prove a ``_log.debug`` line is filtered out
+    (never created), and to ``DEBUG`` to prove it is emitted. Returns the handler
+    so the caller can read ``records`` (the ``(levelno, message)`` pairs), not
+    just the messages. Restores the prior logger level/handlers.
+    """
     logger = logging.getLogger("pyddns")
     handler = RecordingHandler()
     prev_level = logger.level
     logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(level)
     try:
         run(handler)
     finally:
         logger.removeHandler(handler)
         logger.setLevel(prev_level)
-    return handler.messages
+    return handler

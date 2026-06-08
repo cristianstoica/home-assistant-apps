@@ -34,6 +34,7 @@ from .confirm import (
     check_run_once_never_raises,
     check_startup_self_heal,
 )
+from .debug_trace import check_debug_trace
 from .dryrun import run_dry_run
 from .ipparse import check_ip_parse
 from .resolve import check_resolver
@@ -101,6 +102,7 @@ def run_check() -> int:
     ok = _guarded("api-reconcile", check_api_reconcile, ok)
     ok = _guarded("run-once-contract", check_run_once_never_raises, ok)
     ok = _guarded("startup-self-heal", check_startup_self_heal, ok)
+    ok = _guarded("debug-trace", check_debug_trace, ok)
     ok = _guarded("no-secret-leakage", check_no_secret_leakage, ok)
     ok = _guarded("harness-backstop", check_harness_backstop, ok)
     if ok:

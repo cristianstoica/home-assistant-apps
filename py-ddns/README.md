@@ -270,6 +270,29 @@ never sets it; it exists only for `--check`/test harnesses.
 > a direct **3s** UDP query that bypasses the local resolver cache (useful when
 > the cache would otherwise mask a just-written change).
 
+## Log levels
+
+`log_level` sets how much of Py-DDNS's **own** diagnostics reach the Log tab (all
+on stderr). Secrets are never logged at any level — the callback URL renders as
+`https://<host>/<redacted>` and the Azure `client_secret` is scrubbed. Each level
+adds to the ones below it:
+
+- **`error`** — a failure that won't self-heal this cycle; the last-good IP is
+  **held** (a terminal provider error, or an unexpected error caught by the
+  never-raises backstop).
+- **`warning`** — recoverable/transient conditions: transient-failure retries and
+  retry exhaustion, IP-source failures/non-global-answer fallbacks, the
+  callback's _unconfirmed_ and _inconclusive_ post-fire confirmation outcomes,
+  and the both-sections-filled "Azure ignored" notice.
+- **`info`** _(default)_ — the normal lifecycle and per-cycle outcomes: the
+  startup readout, `matches ✓` / `unchanged` / `wrote A record` / steady-suppress
+  decisions, and the stop-signalled exit line.
+- **`debug`** — adds a per-cycle trace at the three lifecycle points: **IP
+  detection** (the detected egress IPv4, or the deferred-to-server note for the
+  callback path), the **update decision** (authoritative/steady/suppress/fire
+  branch), and the **DNS confirmation** outcome (the apply action or the post-fire
+  resolve status). Useful for answering "why didn't my record update?".
+
 ## Watchdog
 
 No `watchdog:` is configured. HA's watchdog is HTTP/TCP-only and **N/A** for an
