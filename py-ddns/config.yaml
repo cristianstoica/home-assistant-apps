@@ -1,5 +1,5 @@
 name: Py-DDNS
-version: "2.0.0"
+version: "2.1.0"
 breaking_versions:
   - "2.0.0"
 slug: py-ddns
@@ -14,9 +14,7 @@ startup: services
 init: false
 image: ghcr.io/cristianstoica/py-ddns
 options:
-  # Host name → the FQDN to keep updated. For Azure it MUST be a sub-record of the
-  # zone (the apex is rejected); for the callback URL it is the DNS verification
-  # readout. The provider is inferred from whichever section below is filled.
+  # Host name → the FQDN to keep updated.
   name: ""
   # Callback URL section (callback archetype). Fill `endpoint` to select URL mode:
   # the secret https callback whose path/query encodes the update credential.

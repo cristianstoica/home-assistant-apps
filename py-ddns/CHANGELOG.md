@@ -1,5 +1,29 @@
 # Changelog
 
+## 2.1.0 — meaningful `log_level: debug` (secret-safe per-cycle trace)
+
+**Additive, non-breaking.** No config schema change; `error`/`warning`/`info`
+behavior is unchanged. Existing installs upgrade in place — there is no new
+`breaking_versions` entry (the prior `["2.0.0"]` stays as-is).
+
+- **`log_level: debug` now traces each cycle.** The level previously emitted
+  nothing beyond `info`; it now adds a per-cycle trace at the three lifecycle
+  points the README promises — **IP detection** (the detected egress IPv4, or
+  the deferred-to-server note on the callback path), the **update decision**
+  branch (authoritative / steady / suppress / fire), and the **DNS
+  confirmation** outcome (the apply action or the post-fire resolve status).
+  Covers both archetypes (Azure API and callback URL).
+- **Secret-safe by construction.** The trace lines never carry the callback
+  endpoint or the Azure `client_secret`; a new `--check` section
+  `DEBUG-TRACE` pins this against the live fixture secrets (and proves the
+  trace is silenced at the `info` threshold rather than always emitted).
+- **README** gains a "Log levels" section documenting what each level
+  surfaces (`error` / `warning` / `info` / `debug`).
+- **Config UI cleanup.** The verbose provider-inference prose was trimmed
+  from the `Host name` field's description in the Configuration tab
+  (`translations/en.yaml`) and from the matching `config.yaml` comment; the
+  full explanation remains in the README.
+
 ## 2.0.0 — BREAKING: nested `url:` / `azure:` config groups, provider inferred
 
 **Breaking config change.** The flat options `provider`, `azure_token`,

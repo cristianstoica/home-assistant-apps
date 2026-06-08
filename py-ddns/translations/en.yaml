@@ -2,12 +2,7 @@ configuration:
   name:
     name: Host name
     description: >-
-      The fully-qualified record to keep updated, e.g. home.example.com. Fill the
-      Azure DNS section to use Azure (the name MUST be a sub-record of the zone —
-      the zone apex is rejected, since a host updater must never repoint it), or
-      fill the Callback URL section to use a callback (the name is the DNS
-      verification readout). The provider is inferred from whichever section you
-      fill; if you fill both, the Callback URL wins and Azure is ignored.
+      The fully-qualified record to keep updated, e.g. home.example.com.
   url:
     name: Callback URL
     description: >-

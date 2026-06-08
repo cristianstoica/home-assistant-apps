@@ -229,6 +229,7 @@ class Updater:
         detected IP is persisted only on a confirmed 2xx PUT.
         """
         detected = self._ip_source.detect()
+        _log.debug("%s -> ip detection: detected=%s", self._config.name, detected)
         if detected is None:
             _log.warning(
                 "%s -> no valid egress IP this cycle; holding last-good (no write)",
@@ -240,12 +241,24 @@ class Updater:
         if authoritative:
             current = self._read_current_with_retry()
             self._last_drift = self._clock()
+            _log.debug(
+                "%s -> update decision: authoritative read current=%s detected=%s",
+                self._config.name,
+                current,
+                detected,
+            )
             if current == detected:
                 _log.info("%s -> %s (matches ✓)", self._config.name, detected)
                 self._state.write(detected)
                 return
         else:
             last_known = self._state.read()
+            _log.debug(
+                "%s -> update decision: steady last-known=%s detected=%s",
+                self._config.name,
+                last_known,
+                detected,
+            )
             if last_known == detected:
                 _log.info("%s -> %s (unchanged; no write)", self._config.name, detected)
                 return
@@ -273,6 +286,12 @@ class Updater:
 
         if not runner.run(_op):
             raise TransientError("apply did not complete this cycle")
+        _log.debug(
+            "%s -> confirmation: apply action=%s detected=%s",
+            self._config.name,
+            result_box[0].value if result_box[0] is not None else None,
+            detected,
+        )
         if result_box[0] is ApplyAction.WROTE_KNOWN_IP:
             self._state.write(detected)
             _log.info("%s -> %s (wrote A record)", self._config.name, detected)
@@ -288,6 +307,13 @@ class Updater:
         outcome gates whether last-known is persisted.
         """
         detected = self._ip_source.detect()  # optional change-trigger for url
+        # The callback archetype defers authoritative IP detection to the server;
+        # `detected` is only the optional local change-trigger.
+        _log.debug(
+            "%s -> ip detection: detection deferred to server; local trigger=%s",
+            self._config.name,
+            detected,
+        )
         last_known = self._state.read()
         drift = self._drift_due()
         if drift:
@@ -303,6 +329,11 @@ class Updater:
                     outcome.status is ResolveStatus.RESOLVED
                     and outcome.value == last_known
                 ):
+                    _log.debug(
+                        "%s -> update decision: steady (resolve==last-known); "
+                        "suppressing fire",
+                        self._config.name,
+                    )
                     _log.info(
                         "%s -> %s (steady; suppressing fire)",
                         self._config.name,
@@ -310,6 +341,14 @@ class Updater:
                     )
                     return
 
+        _log.debug(
+            "%s -> update decision: firing callback "
+            "(first_cycle=%s drift=%s last_known=%s)",
+            self._config.name,
+            self._first_cycle,
+            drift,
+            last_known,
+        )
         self._fire_and_confirm(detected)
 
     def _fire_and_confirm(self, detected: IPv4Address | None) -> None:
@@ -331,6 +370,13 @@ class Updater:
             retries += 1
             outcome = self._resolver.resolve(self._config.name)
 
+        _log.debug(
+            "%s -> confirmation: post-fire resolve status=%s value=%s retries=%d",
+            self._config.name,
+            outcome.status.value,
+            outcome.value,
+            retries,
+        )
         if outcome.status is ResolveStatus.RESOLVED and outcome.value is not None:
             self._state.write(outcome.value)
             if detected is not None:
