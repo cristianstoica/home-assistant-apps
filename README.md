@@ -27,13 +27,14 @@ silently swallowed.
 
 A generic, stdlib-only **dynamic-DNS updater** for Home Assistant. It keeps one
 DNS A record pointed at the box's current egress IPv4 through one of two
-provider archetypes behind a single `provider` switch: **`azure`** (API
-archetype — create-or-replace via the Azure DNS management API with a
-least-privilege service principal scoped to a single zone), or **`url`**
-(callback archetype — fires a secret cPanel-style endpoint and the server
-detects the source IP). Each cycle reconciles on an interval with bounded
-backoff and post-update DNS confirmation. Secret-safe by construction: SP
-secrets, bearer tokens, and the callback URL path are never logged.
+provider archetypes, with the provider **inferred from whichever config section
+(Callback URL / Azure DNS) you fill**: **Azure** (API archetype —
+create-or-replace via the Azure DNS management API with a service principal
+whose role assignment is scoped to a single DNS zone), or **callback URL**
+(fires a secret cPanel-style endpoint and the server detects the source IP).
+Each cycle reconciles on an interval with bounded backoff and post-update DNS
+confirmation. Secret-safe by construction: SP secrets, bearer tokens, and the
+callback URL path are never logged.
 
 ## Install
 

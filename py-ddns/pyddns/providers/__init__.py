@@ -26,7 +26,7 @@ def build_provider(config: Config, http: HttpClient, clock: Clock) -> DnsProvide
     """
     if config.provider is Provider.AZURE:
         if config.azure is None:
-            raise ConfigError("azure_token: required when provider=azure")
+            raise ConfigError("azure: required")
         return AzureProvider(config.azure, config.record_label, config.ttl, http, clock)
     return UrlProvider(config.url_endpoint, config.url_send_myip, http)
 
@@ -42,7 +42,7 @@ def plan_provider(
     """
     if config.provider is Provider.AZURE:
         if config.azure is None:
-            raise ConfigError("azure_token: required when provider=azure")
+            raise ConfigError("azure: required")
         return AzureProvider(
             config.azure, config.record_label, config.ttl, http, clock
         ).plan(detected_ip)

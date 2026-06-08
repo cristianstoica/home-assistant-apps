@@ -29,18 +29,20 @@ from __future__ import annotations
 
 from typing import Any, NamedTuple
 
-# --- a non-secret example azure token blob (RFC-doc / placeholder values) -----
-# The clientSecret here is a fixed placeholder string the no-secret-leakage check
+# --- a non-secret example azure credential group (RFC-doc / placeholder values) -
+# The client_secret here is a fixed placeholder string the no-secret-leakage check
 # asserts never appears in any logged/printed output. It is not a real secret.
 EXAMPLE_CLIENT_SECRET = "EXAMPLE~secret~value~do~not~use~0000"
 
+# The six credential fields of the nested ``azure`` group (snake_case option
+# keys). `example_azure_group` adds the optional `ip_sources`/`ttl` on top.
 EXAMPLE_AZURE_TOKEN: dict[str, str] = {
-    "tenantId": "00000000-0000-0000-0000-000000000001",
-    "subscriptionId": "00000000-0000-0000-0000-000000000002",
-    "resourceGroup": "rg-example",
+    "tenant_id": "00000000-0000-0000-0000-000000000001",
+    "subscription_id": "00000000-0000-0000-0000-000000000002",
+    "resource_group": "rg-example",
     "zone": "example.com",
-    "clientId": "00000000-0000-0000-0000-000000000003",
-    "clientSecret": EXAMPLE_CLIENT_SECRET,
+    "client_id": "00000000-0000-0000-0000-000000000003",
+    "client_secret": EXAMPLE_CLIENT_SECRET,
 }
 
 # A secret callback URL whose path encodes the secret token; the no-secret-leakage
@@ -49,14 +51,25 @@ EXAMPLE_URL_SECRET = "s3cr3t-callback-token-abcdef"
 EXAMPLE_URL_ENDPOINT = f"https://dynamicdns.example.com/update/{EXAMPLE_URL_SECRET}"
 
 
+def example_azure_group(**overrides: Any) -> dict[str, Any]:
+    """The nested ``azure`` credential group (the six fields + ip_sources)."""
+    group: dict[str, Any] = dict(EXAMPLE_AZURE_TOKEN)
+    group["ip_sources"] = "https://api.ipify.org"
+    group.update(overrides)
+    return group
+
+
 def example_azure_options(**overrides: Any) -> dict[str, Any]:
-    """A valid ``provider=azure`` options payload (override individual keys)."""
+    """A valid Azure-mode options payload (nested ``azure`` group; no ``url``).
+
+    Stays a `config.validate`-acceptable payload — it is the no-``--options``
+    ``--check --dry-run`` default render at ``dryrun.py:37`` — so the loader infers
+    Azure mode and resolves to a plan. Override individual top-level keys via
+    ``**overrides`` (e.g. ``ttl=`` is overridden inside the group below, not here).
+    """
     base: dict[str, Any] = {
-        "provider": "azure",
         "name": "home.example.com",
-        "azure_token": dict(EXAMPLE_AZURE_TOKEN),
-        "ip_source_urls": ["https://api.ipify.org"],
-        "ttl": 60,
+        "azure": example_azure_group(),
         "interval_seconds": 120,
         "drift_reconcile_seconds": 3600,
         "log_level": "info",
@@ -66,12 +79,14 @@ def example_azure_options(**overrides: Any) -> dict[str, Any]:
 
 
 def example_url_options(**overrides: Any) -> dict[str, Any]:
-    """A valid ``provider=url`` options payload (override individual keys)."""
+    """A valid URL-mode options payload (nested ``url`` group; no ``azure``).
+
+    Override individual top-level keys via ``**overrides``; the ``url`` group can
+    be replaced wholesale (e.g. ``url={"endpoint": ..., "send_myip": True}``).
+    """
     base: dict[str, Any] = {
-        "provider": "url",
         "name": "home.example.com",
-        "url_endpoint": EXAMPLE_URL_ENDPOINT,
-        "url_send_myip": False,
+        "url": {"endpoint": EXAMPLE_URL_ENDPOINT, "send_myip": False},
         "interval_seconds": 120,
         "drift_reconcile_seconds": 3600,
         "log_level": "info",
@@ -89,52 +104,53 @@ class InvalidOptionsFixture(NamedTuple):
 
 
 INVALID_OPTIONS: list[InvalidOptionsFixture] = [
-    # --- per-provider required-field rejection ---
+    # --- inferred-provider gate rejection ---
     InvalidOptionsFixture(
-        name="azure: missing token",
+        name="neither section filled (nothing to do)",
         options={
-            "provider": "azure",
             "name": "home.example.com",
-            "ip_source_urls": ["https://api.ipify.org"],
+            "interval_seconds": 120,
+            "drift_reconcile_seconds": 3600,
+            "log_level": "info",
         },
-        field="azure_token",
+        field="url.endpoint / azure",
     ),
     InvalidOptionsFixture(
         name="azure: missing name",
-        options={
-            "provider": "azure",
-            "name": "",
-            "azure_token": dict(EXAMPLE_AZURE_TOKEN),
-            "ip_source_urls": ["https://api.ipify.org"],
-        },
+        options=example_azure_options(name=""),
         field="name",
     ),
     InvalidOptionsFixture(
-        name="azure: token missing clientSecret field",
-        options={
-            "provider": "azure",
-            "name": "home.example.com",
-            "azure_token": {
-                k: v for k, v in EXAMPLE_AZURE_TOKEN.items() if k != "clientSecret"
-            },
-            "ip_source_urls": ["https://api.ipify.org"],
-        },
-        field="azure_token.clientSecret",
+        name="azure: group missing client_secret field",
+        options=example_azure_options(
+            azure=example_azure_group(
+                **{
+                    k: v for k, v in EXAMPLE_AZURE_TOKEN.items() if k != "client_secret"
+                },
+                client_secret="",
+            )
+        ),
+        field="azure.client_secret",
     ),
     InvalidOptionsFixture(
-        name="azure: token not valid JSON",
+        name="azure: non-dict group (stale flat string)",
         options={
-            "provider": "azure",
             "name": "home.example.com",
-            "azure_token": "{ not json",
-            "ip_source_urls": ["https://api.ipify.org"],
+            "azure": "not-a-dict",
+            "url": {"endpoint": ""},
         },
-        field="azure_token",
+        # url.endpoint blank -> azure_selected False on a non-dict azure: the
+        # group-type guard fires first, naming `azure`.
+        field="azure: must be an object",
     ),
+    # --- non-dict url group ---
     InvalidOptionsFixture(
-        name="url: missing endpoint",
-        options={"provider": "url", "name": "home.example.com", "url_endpoint": ""},
-        field="url_endpoint",
+        name="url: non-dict group",
+        options={
+            "name": "home.example.com",
+            "url": "https://dynamicdns.example.com/u/x",
+        },
+        field="url: must be an object",
     ),
     # --- name<->zone contract (azure) ---
     InvalidOptionsFixture(
@@ -168,59 +184,74 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options=example_url_options(name=""),
         field="name",
     ),
-    # --- HTTPS-only contract (url_endpoint) ---
+    # --- HTTPS-only contract (url.endpoint) ---
     InvalidOptionsFixture(
         name="url: http endpoint",
-        options=example_url_options(url_endpoint="http://dynamicdns.example.com/u/x"),
-        field="url_endpoint",
+        options=example_url_options(
+            url={"endpoint": "http://dynamicdns.example.com/u/x"}
+        ),
+        field="url.endpoint",
     ),
     InvalidOptionsFixture(
         name="url: file endpoint",
-        options=example_url_options(url_endpoint="file:///etc/passwd"),
-        field="url_endpoint",
+        options=example_url_options(url={"endpoint": "file:///etc/passwd"}),
+        field="url.endpoint",
     ),
     InvalidOptionsFixture(
         name="url: schemeless endpoint",
-        options=example_url_options(url_endpoint="dynamicdns.example.com/u/x"),
-        field="url_endpoint",
+        options=example_url_options(url={"endpoint": "dynamicdns.example.com/u/x"}),
+        field="url.endpoint",
     ),
     InvalidOptionsFixture(
         name="url: endpoint with userinfo",
         options=example_url_options(
-            url_endpoint="https://user:pass@dynamicdns.example.com/u/x"
+            url={"endpoint": "https://user:pass@dynamicdns.example.com/u/x"}
         ),
-        field="url_endpoint",
+        field="url.endpoint",
     ),
     InvalidOptionsFixture(
         name="url: endpoint with fragment",
         options=example_url_options(
-            url_endpoint="https://dynamicdns.example.com/u/x#frag"
+            url={"endpoint": "https://dynamicdns.example.com/u/x#frag"}
         ),
-        field="url_endpoint",
+        field="url.endpoint",
     ),
-    # --- HTTPS-only contract (ip_source_urls) ---
+    # --- HTTPS-only contract (azure.ip_sources, split-string shape) ---
     InvalidOptionsFixture(
         name="azure: http ip source",
-        options=example_azure_options(ip_source_urls=["http://api.ipify.org"]),
-        field="ip_source_urls[0]",
+        options=example_azure_options(
+            azure=example_azure_group(ip_sources="http://api.ipify.org")
+        ),
+        field="azure.ip_sources",
     ),
     InvalidOptionsFixture(
-        name="azure: file ip source",
+        name="azure: file ip source (second in list)",
         options=example_azure_options(
-            ip_source_urls=["https://api.ipify.org", "file:///tmp/ip"]
+            azure=example_azure_group(
+                ip_sources="https://api.ipify.org, file:///tmp/ip"
+            )
         ),
-        field="ip_source_urls[1]",
+        field="azure.ip_sources",
     ),
     InvalidOptionsFixture(
         name="azure: ip source with userinfo",
-        options=example_azure_options(ip_source_urls=["https://u:p@api.ipify.org"]),
-        field="ip_source_urls[0]",
+        options=example_azure_options(
+            azure=example_azure_group(ip_sources="https://u:p@api.ipify.org")
+        ),
+        field="azure.ip_sources",
+    ),
+    InvalidOptionsFixture(
+        name="azure: ip source with fragment",
+        options=example_azure_options(
+            azure=example_azure_group(ip_sources="https://api.ipify.org/#frag")
+        ),
+        field="azure.ip_sources",
     ),
     # --- range / enum checks ---
     InvalidOptionsFixture(
         name="ttl below range",
-        options=example_azure_options(ttl=10),
-        field="ttl",
+        options=example_azure_options(azure=example_azure_group(ttl=10)),
+        field="azure.ttl",
     ),
     InvalidOptionsFixture(
         name="interval below range",
@@ -233,19 +264,16 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         field="drift_reconcile_seconds",
     ),
     InvalidOptionsFixture(
-        name="bad provider",
-        options=example_azure_options(provider="cloudflare"),
-        field="provider",
-    ),
-    InvalidOptionsFixture(
         name="bad log_level",
         options=example_azure_options(log_level="trace"),
         field="log_level",
     ),
     InvalidOptionsFixture(
         name="url_send_myip not a bool",
-        options=example_url_options(url_send_myip=1),
-        field="url_send_myip",
+        options=example_url_options(
+            url={"endpoint": EXAMPLE_URL_ENDPOINT, "send_myip": 1}
+        ),
+        field="url.send_myip",
     ),
 ]
 

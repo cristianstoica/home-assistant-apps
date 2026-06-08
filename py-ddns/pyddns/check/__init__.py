@@ -23,7 +23,11 @@ from urllib.parse import urlparse
 from .. import fixtures
 from ..redact import sanitize
 from .backoff import check_backoff
-from .config_checks import check_invalid_options, check_name_zone
+from .config_checks import (
+    check_callback_precedence,
+    check_invalid_options,
+    check_name_zone,
+)
 from .confirm import (
     check_api_reconcile,
     check_callback_confirmation,
@@ -87,6 +91,7 @@ def run_check() -> int:
     """Dispatch every oracle case (each guarded); exit 0 only when all hold."""
     ok = _guarded("invalid-options", check_invalid_options, True)
     ok = _guarded("name-zone", check_name_zone, ok)
+    ok = _guarded("callback-precedence", check_callback_precedence, ok)
     ok = _guarded("url-shaping", check_url_endpoint_shaping, ok)
     ok = _guarded("ip-parse", check_ip_parse, ok)
     ok = _guarded("resolver", check_resolver, ok)

@@ -1,59 +1,85 @@
 configuration:
-  provider:
-    name: Provider
-    description: >-
-      Which DNS backend to drive. "azure" (API archetype): this add-on detects
-      the egress IP and writes the A record via the Azure DNS management API.
-      "url" (callback archetype): this add-on fires a secret callback URL and the
-      remote server (e.g. cPanel) sets the record from the request's source IP.
   name:
-    name: Record name (FQDN)
+    name: Host name
     description: >-
-      The fully-qualified record to keep updated, e.g. home.example.com. For the
-      azure provider it MUST be a sub-record of the credential blob's zone (the
-      zone apex is rejected — a host updater must never repoint a zone apex). For
-      the url provider it is informational (used only in diagnostics).
-  azure_token:
-    name: Azure SP credential (JSON)
-    description: >-
-      azure provider only. Paste the service-principal credential blob from the
-      bootstrap step in the README — a JSON object with tenantId, subscriptionId,
-      resourceGroup, zone, clientId and clientSecret. The clientSecret is never
-      logged. The blob's zone is authoritative for the name↔zone check.
-  ip_source_urls:
-    name: IP source URLs
-    description: >-
-      azure provider only. Ordered list of https echo endpoints (ipify /
-      icanhazip) returning the box's egress IPv4 as text; the first global-unicast
-      answer wins. Private, CGNAT, loopback, link-local and 0.0.0.0 answers are
-      rejected so a spoofed/non-routable value is never published. http, hostless,
-      userinfo and fragment URLs are rejected.
-  ttl:
-    name: Record TTL (seconds)
-    description: >-
-      azure provider only. The TTL written on the A record-set (30-86400). Lower
-      values propagate IP changes faster at the cost of more resolver traffic.
-  url_endpoint:
+      The fully-qualified record to keep updated, e.g. home.example.com. Fill the
+      Azure DNS section to use Azure (the name MUST be a sub-record of the zone —
+      the zone apex is rejected, since a host updater must never repoint it), or
+      fill the Callback URL section to use a callback (the name is the DNS
+      verification readout). The provider is inferred from whichever section you
+      fill; if you fill both, the Callback URL wins and Azure is ignored.
+  url:
     name: Callback URL
     description: >-
-      url provider only. The secret https callback endpoint whose path/query
-      encodes the update credential. Must be https (a plaintext callback leaks the
-      record-repointing secret in transit); http, hostless, userinfo and fragment
-      URLs are rejected. The secret is never logged — diagnostics show the host
-      with the path redacted.
-  url_send_myip:
-    name: Send detected IP (myip)
+      Callback archetype. Fill the endpoint to drive a secret callback URL: this
+      add-on fires the URL and the remote server (e.g. cPanel) sets the record
+      from the request's source IP. Leave blank to use Azure instead.
+    fields:
+      endpoint:
+        name: Callback URL
+        description: >-
+          The secret https callback endpoint whose path/query encodes the update
+          credential. Must be https (a plaintext callback leaks the
+          record-repointing secret in transit); http, hostless, userinfo and
+          fragment URLs are rejected. The secret is never logged — diagnostics
+          show the host with the path redacted.
+      send_myip:
+        name: Send detected IP (myip)
+        description: >-
+          When enabled, append the locally-detected egress IPv4 as a ?myip= query
+          parameter on the callback (replacing any existing myip and preserving
+          other params). Leave disabled to let the remote server detect the record
+          from the request's own source IP (the usual cPanel behaviour).
+  azure:
+    name: Azure DNS
     description: >-
-      url provider only. When enabled, append the locally-detected egress IPv4 as
-      a ?myip= query parameter on the callback (replacing any existing myip and
-      preserving other params). Leave disabled to let the remote server detect the
-      record from the request's own source IP (the usual cPanel behaviour).
+      API archetype. Fill the credential fields to drive Azure DNS: this add-on
+      detects the egress IP and writes the A record via the Azure DNS management
+      API. Leave the credential fields blank to use a Callback URL instead.
+    fields:
+      client_id:
+        name: Client ID
+        description: >-
+          The service-principal application (client) ID from the bootstrap step —
+          a GUID (the appId, not the SP object ID used in the role assignment).
+      client_secret:
+        name: Client secret
+        description: >-
+          The service-principal password from the bootstrap step. Never logged.
+      tenant_id:
+        name: Tenant ID
+        description: The Azure AD tenant ID the service principal belongs to.
+      subscription_id:
+        name: Subscription ID
+        description: The subscription ID that owns the DNS zone.
+      resource_group:
+        name: Resource group
+        description: The resource group that contains the DNS zone.
+      zone:
+        name: DNS zone
+        description: >-
+          The DNS zone, e.g. example.com. Authoritative for the name↔zone check:
+          the Host name must be a sub-record of this zone.
+      ip_sources:
+        name: IP source URLs
+        description: >-
+          Optional comma/space-separated list of https echo endpoints (ipify /
+          icanhazip) returning the box's egress IPv4 as text; the first
+          global-unicast answer wins. Leave blank for the built-in defaults.
+          Private, CGNAT, loopback, link-local and 0.0.0.0 answers are rejected so
+          a spoofed/non-routable value is never published; http, hostless,
+          userinfo and fragment URLs are rejected.
+      ttl:
+        name: Record TTL (seconds)
+        description: >-
+          The TTL written on the A record-set (30-86400). Lower values propagate
+          IP changes faster at the cost of more resolver traffic.
   interval_seconds:
     name: Reconcile interval (seconds)
     description: >-
       How often to run a reconcile cycle (60-86400). Each cycle detects the IP (or
-      defers to the server, url provider), updates the record if it changed, and
-      confirms the change in DNS.
+      defers to the server for the callback archetype), updates the record if it
+      changed, and confirms the change in DNS.
   drift_reconcile_seconds:
     name: Drift reconcile interval (seconds)
     description: >-
