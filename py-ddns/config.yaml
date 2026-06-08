@@ -1,5 +1,5 @@
 name: Py-DDNS
-version: "2.1.1"
+version: "2.2.0"
 breaking_versions:
   - "2.0.0"
 slug: py-ddns
@@ -20,9 +20,13 @@ options:
   # the secret https callback whose path/query encodes the update credential.
   # `send_myip` appends the locally-detected IP as a ?myip= param; leave false to
   # let the remote server detect the record from the request's source IP.
+  # `insecure_skip_verify` (advanced, default off) disables TLS *certificate*
+  # verification on the callback path only — HTTPS stays mandatory; azure/ip-source
+  # always verify; a WARNING is logged every callback cycle while it is on.
   url:
     endpoint: ""
     send_myip: false
+    insecure_skip_verify: false
   # Azure DNS section (API archetype). Fill the credential fields to select Azure
   # mode: this add-on detects the egress IP and writes the A record via the Azure
   # DNS management API. `zone` is authoritative for the name↔zone check.
@@ -45,6 +49,7 @@ schema:
   url:
     endpoint: password?
     send_myip: bool?
+    insecure_skip_verify: bool?
   azure:
     client_id: str?
     client_secret: password?

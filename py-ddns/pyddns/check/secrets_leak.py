@@ -19,11 +19,31 @@ from ipaddress import IPv4Address
 from .. import fixtures
 from ..errors import TerminalError, TransientError
 from ..httpclient import HttpError, UrllibHttpClient
-from ..models import AzureToken
+from ..models import (
+    ApplyAction,
+    ApplyResult,
+    AzureToken,
+    Config,
+    Provider,
+    ResolveOutcome,
+    ResolveStatus,
+)
+from ..providers import plan_provider
 from ..providers.azure import AzureProvider
 from ..providers.url import UrlProvider, compose_fire_url
 from ..redact import redact_url, sanitize
-from .fakes import FakeClock, FakeHttp, with_recording_handler
+from ..runtime import monotonic
+from ..updater import Updater
+from .fakes import (
+    FakeClock,
+    FakeHttp,
+    FakeIpSource,
+    FakeProvider,
+    FakeResolver,
+    FakeSleeper,
+    FakeState,
+    with_recording_handler,
+)
 from .report import report
 
 _SECRETS = (
@@ -191,6 +211,15 @@ def check_no_secret_leakage() -> bool:
         )
     )
 
+    # --- 7. flag-set Updater.run_once + plan_provider leak nothing (§10(e)) ------
+    # The insecure-skip surface added two new emit sites: the per-cycle WARNING in
+    # the updater and the appended plan suffix. Both run with the REAL secret
+    # endpoint in scope. Drive a flag-set url Updater (one suppressed steady cycle
+    # + one firing cycle) and capture everything it logs; capture the flag-set
+    # plan line too. Neither may carry the secret (the WARNING interpolates only
+    # `name`; the suffix is a constant string).
+    checks += _check_insecure_skip_surface(_record)
+
     # --- final aggregate: NONE of the captured strings leaked ---
     checks.append(
         (
@@ -199,3 +228,102 @@ def check_no_secret_leakage() -> bool:
         )
     )
     return report("NO-SECRET-LEAKAGE", "secret", checks)
+
+
+_IP_NEW = IPv4Address("203.0.113.50")
+
+
+def _insecure_url_config() -> Config:
+    """A flag-set ``url`` Config carrying the *real* secret endpoint in scope."""
+    return Config(
+        provider=Provider.URL,
+        name="home.example.com",
+        test_ns="",
+        azure=None,
+        record_label="",
+        url_endpoint=fixtures.EXAMPLE_URL_ENDPOINT,
+        url_send_myip=False,
+        url_insecure_skip_verify=True,
+        ttl=60,
+        interval_seconds=120,
+        drift_reconcile_seconds=0,
+        ip_source_urls=("https://api.ipify.org",),
+        log_level="info",
+        state_path="/data/last_known_ip",
+    )
+
+
+def _fired() -> ApplyResult:
+    return ApplyResult(ApplyAction.FIRED_SERVER_DETECTED, "fired", None)
+
+
+def _check_insecure_skip_surface(record: object) -> list[tuple[str, bool]]:
+    """Drive the two new flag-set emit surfaces with the real secret in scope.
+
+    `record` is `check_no_secret_leakage`'s ``_record`` closure (typed loosely to
+    avoid threading its signature); it appends each captured string to the
+    aggregate corpus the final assertion scans.
+    """
+    assert callable(record)
+    checks: list[tuple[str, bool]] = []
+    cfg = _insecure_url_config()
+
+    # A firing first cycle: empty state -> authoritative -> fire -> confirm.
+    fire_updater = Updater(
+        cfg,
+        ip_source=FakeIpSource(_IP_NEW),  # type: ignore[arg-type]
+        provider=FakeProvider(apply_result=_fired()),  # type: ignore[arg-type]
+        resolver=FakeResolver(  # type: ignore[arg-type]
+            ResolveOutcome(ResolveStatus.RESOLVED, _IP_NEW)
+        ),
+        state=FakeState(),
+        clock=FakeClock(),
+        sleeper=FakeSleeper(),
+    )
+    fire_logged = with_recording_handler(lambda _h: fire_updater.run_once())
+    for message in fire_logged:
+        record(message)
+    checks.append(
+        (
+            "flag-set firing cycle logs (incl. the WARNING) leak no secret",
+            not any(_leaks(m) for m in fire_logged),
+        )
+    )
+
+    # A suppressed steady cycle: last-known X, name resolves to X, detected == X.
+    steady_updater = Updater(
+        cfg,
+        ip_source=FakeIpSource(_IP_NEW),  # type: ignore[arg-type]
+        provider=FakeProvider(apply_result=_fired()),  # type: ignore[arg-type]
+        resolver=FakeResolver(  # type: ignore[arg-type]
+            ResolveOutcome(ResolveStatus.RESOLVED, _IP_NEW)
+        ),
+        state=FakeState(initial=_IP_NEW),
+        clock=FakeClock(),
+        sleeper=FakeSleeper(),
+    )
+    steady_updater.mark_started()  # non-first cycle -> suppression path
+    steady_logged = with_recording_handler(lambda _h: steady_updater.run_once())
+    for message in steady_logged:
+        record(message)
+    checks.append(
+        (
+            "flag-set suppressed steady cycle logs (incl. the WARNING) leak no secret",
+            not any(_leaks(m) for m in steady_logged),
+        )
+    )
+
+    # The flag-set plan line (with the appended suffix — the surface that changed).
+    plan = plan_provider(cfg, UrllibHttpClient(), monotonic, None)
+    record(plan)
+    checks += [
+        (
+            "flag-set plan_provider line leaks no secret",
+            not _leaks(plan),
+        ),
+        (
+            "(sanity) flag-set plan line carries the DISABLED suffix",
+            "TLS cert verification DISABLED" in plan,
+        ),
+    ]
+    return checks

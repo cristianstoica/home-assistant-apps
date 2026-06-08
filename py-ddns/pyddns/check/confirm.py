@@ -9,8 +9,10 @@ record (``value`` / ``writes``) — the state seam is the contract surface.
 
 from __future__ import annotations
 
+import logging
 from ipaddress import IPv4Address
 
+from ..errors import TransientError
 from ..models import (
     ApplyAction,
     ApplyResult,
@@ -29,6 +31,7 @@ from .fakes import (
     FakeResolver,
     FakeSleeper,
     FakeState,
+    capture_at_level,
     with_recording_handler,
 )
 from .report import report
@@ -54,8 +57,12 @@ _IP_NEW = IPv4Address("203.0.113.50")
 _IP_OLD = IPv4Address("203.0.113.10")
 
 
-def _url_config() -> Config:
-    """A minimal valid ``url`` Config for the updater (seams are all injected)."""
+def _url_config(*, insecure_skip_verify: bool = False) -> Config:
+    """A minimal valid ``url`` Config for the updater (seams are all injected).
+
+    `insecure_skip_verify` defaults off; the insecure-warning checks pass ``True``
+    to exercise the per-cycle WARNING without touching the rest of the harness.
+    """
     return Config(
         provider=Provider.URL,
         name="home.example.com",
@@ -64,6 +71,7 @@ def _url_config() -> Config:
         record_label="",
         url_endpoint="https://dynamicdns.example.com/update/secret",
         url_send_myip=False,
+        url_insecure_skip_verify=insecure_skip_verify,
         ttl=60,
         interval_seconds=120,
         drift_reconcile_seconds=0,
@@ -90,6 +98,7 @@ def _azure_config(*, drift_reconcile_seconds: int = 0) -> Config:
         record_label="home",
         url_endpoint="",
         url_send_myip=False,
+        url_insecure_skip_verify=False,
         ttl=60,
         interval_seconds=120,
         drift_reconcile_seconds=drift_reconcile_seconds,
@@ -109,11 +118,14 @@ def _make_updater(
     resolver: FakeResolver,
     ip_source: FakeIpSource,
     provider: FakeProvider,
+    config: Config | None = None,
 ) -> Updater:
     # The fakes are structural matches for the Protocols; the updater only calls
-    # the seam methods, so the duck-typed fakes satisfy it at runtime.
+    # the seam methods, so the duck-typed fakes satisfy it at runtime. `config`
+    # defaults to the plain `url` config; the insecure-warning checks pass a
+    # flag-set one to drive the per-cycle WARNING.
     return Updater(
-        _url_config(),
+        config if config is not None else _url_config(),
         ip_source=ip_source,  # type: ignore[arg-type]
         provider=provider,  # type: ignore[arg-type]
         resolver=resolver,  # type: ignore[arg-type]
@@ -513,3 +525,122 @@ def check_run_once_never_raises() -> bool:
         ("run_once reached the raising resolve seam", raising.calls >= 1),
     ]
     return report("RUN-ONCE-CONTRACT", "run-once", checks)
+
+
+class _RaiseOnceProvider:
+    """A `DnsProvider` double whose ``apply`` raises `TransientError` once.
+
+    The stock `FakeProvider` scripts one *fixed* `apply_result`, so it cannot
+    raise on the first call then succeed — exactly what the §10(d.c) retry-path
+    assertion needs (prove the per-cycle WARNING fires **once** even though the
+    `RetryRunner` calls ``apply`` twice). Records every ``apply`` call.
+    """
+
+    def __init__(self) -> None:
+        self.apply_calls: list[IPv4Address | None] = []
+
+    def read_current(self) -> IPv4Address | None:
+        return None
+
+    def apply(self, detected_ip: IPv4Address | None) -> ApplyResult:
+        self.apply_calls.append(detected_ip)
+        if len(self.apply_calls) == 1:
+            raise TransientError("transient on first apply (retry path)")
+        return _fire_result()
+
+
+_WARNING_PHRASE = "verification is DISABLED"
+
+
+def _disabled_records(handler_records: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """The captured records whose message names the cert-verification-disabled warning."""
+    return [(lvl, msg) for lvl, msg in handler_records if _WARNING_PHRASE in msg]
+
+
+def check_insecure_warning() -> bool:
+    """Assert the per-cycle TLS-skip WARNING: once per cycle, survives suppression + retry.
+
+    Drives the **real** `Updater.run_once()` (not `UrlProvider.apply`, which cannot
+    catch the under-/over-emission this fix is for) under
+    `capture_at_level(logging.INFO, ...)` — the production threshold, where a
+    ``debug`` emit would vanish. Three cases:
+
+    * **(d.a)** suppressed steady cycle, flag true → **exactly one** WARNING record
+      at ``logging.WARNING`` *and* ``apply_calls == []`` (fires even though no fire);
+    * **(d.b)** same shape, flag false → **zero** WARNING records;
+    * **(d.c)** firing cycle on the retry path, flag true → **exactly one** WARNING
+      even though ``apply`` is called twice (the emit is outside the retry loop).
+    """
+    checks: list[tuple[str, bool]] = []
+
+    # --- (d.a) suppressed steady cycle, flag true -> exactly one WARNING ---------
+    steady_provider = FakeProvider(apply_result=_fire_result())
+    steady = _make_updater(
+        config=_url_config(insecure_skip_verify=True),
+        state=FakeState(initial=_IP_OLD),  # last-known X
+        resolver=FakeResolver(
+            ResolveOutcome(ResolveStatus.RESOLVED, _IP_OLD)  # name resolves to X
+        ),
+        ip_source=FakeIpSource(_IP_OLD),  # detected == last-known
+        provider=steady_provider,
+    )
+    steady.mark_started()  # non-first cycle -> hits the suppression return
+    steady_handler = capture_at_level(logging.INFO, lambda _h: steady.run_once())
+    steady_disabled = _disabled_records(steady_handler.records)
+    checks += [
+        (
+            "(d.a) suppressed steady cycle emits exactly one TLS-skip WARNING",
+            len(steady_disabled) == 1,
+        ),
+        (
+            "(d.a) the TLS-skip record is at WARNING level (survives info threshold)",
+            len(steady_disabled) == 1 and steady_disabled[0][0] == logging.WARNING,
+        ),
+        (
+            "(d.a) the cycle was genuinely suppressed (no fire happened)",
+            steady_provider.apply_calls == [],
+        ),
+    ]
+
+    # --- (d.b) same shape, flag false -> zero WARNING records -------------------
+    off_provider = FakeProvider(apply_result=_fire_result())
+    off = _make_updater(
+        config=_url_config(insecure_skip_verify=False),
+        state=FakeState(initial=_IP_OLD),
+        resolver=FakeResolver(ResolveOutcome(ResolveStatus.RESOLVED, _IP_OLD)),
+        ip_source=FakeIpSource(_IP_OLD),
+        provider=off_provider,
+    )
+    off.mark_started()
+    off_handler = capture_at_level(logging.INFO, lambda _h: off.run_once())
+    checks.append(
+        (
+            "(d.b) flag false emits zero TLS-skip WARNING records",
+            len(_disabled_records(off_handler.records)) == 0,
+        )
+    )
+
+    # --- (d.c) firing cycle on the retry path, flag true -> exactly one WARNING --
+    retry_provider = _RaiseOnceProvider()
+    retry = _make_updater(
+        config=_url_config(insecure_skip_verify=True),
+        state=FakeState(),  # empty -> first cycle authoritative -> fires
+        resolver=FakeResolver(
+            ResolveOutcome(ResolveStatus.RESOLVED, _IP_NEW)  # post-fire confirm
+        ),
+        ip_source=FakeIpSource(_IP_NEW),
+        provider=retry_provider,  # type: ignore[arg-type]  # structural DnsProvider
+    )
+    retry_handler = capture_at_level(logging.INFO, lambda _h: retry.run_once())
+    checks += [
+        (
+            "(d.c) retry path called apply twice (raise-once then succeed)",
+            len(retry_provider.apply_calls) == 2,
+        ),
+        (
+            "(d.c) retry path still emits exactly one TLS-skip WARNING (outside the loop)",
+            len(_disabled_records(retry_handler.records)) == 1,
+        ),
+    ]
+
+    return report("INSECURE-WARNING", "insecure-warning", checks)

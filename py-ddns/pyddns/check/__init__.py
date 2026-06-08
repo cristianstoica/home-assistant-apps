@@ -31,6 +31,7 @@ from .config_checks import (
 from .confirm import (
     check_api_reconcile,
     check_callback_confirmation,
+    check_insecure_warning,
     check_run_once_never_raises,
     check_startup_self_heal,
 )
@@ -41,6 +42,7 @@ from .resolve import check_resolver
 from .secrets_leak import check_no_secret_leakage
 from .shaping import check_url_endpoint_shaping
 from .status import check_status_handling
+from .tls_scope import check_tls_scope
 
 __all__ = ["run_check", "run_dry_run"]
 
@@ -93,12 +95,14 @@ def run_check() -> int:
     ok = _guarded("invalid-options", check_invalid_options, True)
     ok = _guarded("name-zone", check_name_zone, ok)
     ok = _guarded("callback-precedence", check_callback_precedence, ok)
+    ok = _guarded("tls-scope", check_tls_scope, ok)
     ok = _guarded("url-shaping", check_url_endpoint_shaping, ok)
     ok = _guarded("ip-parse", check_ip_parse, ok)
     ok = _guarded("resolver", check_resolver, ok)
     ok = _guarded("status-handling", check_status_handling, ok)
     ok = _guarded("backoff", check_backoff, ok)
     ok = _guarded("callback-confirm", check_callback_confirmation, ok)
+    ok = _guarded("insecure-warning", check_insecure_warning, ok)
     ok = _guarded("api-reconcile", check_api_reconcile, ok)
     ok = _guarded("run-once-contract", check_run_once_never_raises, ok)
     ok = _guarded("startup-self-heal", check_startup_self_heal, ok)

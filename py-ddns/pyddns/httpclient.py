@@ -10,11 +10,18 @@ error response (an ``HTTPError`` has a status; a connection/timeout failure has
 ``status=None`` and is classified transient by the caller). The real client
 **sanitizes** the underlying exception string against the request URL before
 raising, so a secret callback URL can never surface in a logged error.
+
+The client may be constructed with TLS certificate verification **disabled**
+(``UrllibHttpClient(insecure_skip_verify=True)``) — used **only** by the URL
+(callback) provider when ``url.insecure_skip_verify`` is set; the default
+constructor verifies. The skip keeps the channel encrypted but drops endpoint
+authentication, so it is deliberately narrow (callback path only) and loud.
 """
 
 from __future__ import annotations
 
 import json
+import ssl
 import urllib.error
 import urllib.request
 from typing import Protocol
@@ -105,7 +112,38 @@ class UrllibHttpClient:
     can echo the requested secret URL) is scrubbed against that URL and the host
     is the only locator kept. A transport failure (no HTTP status) raises with
     ``status=None`` so the caller classifies it transient.
+
+    When constructed with ``insecure_skip_verify=True`` the client passes an SSL
+    context with certificate verification disabled to ``urlopen`` — used **only**
+    by the URL provider when ``url.insecure_skip_verify`` is set. The default
+    (verifying) client stores ``None`` and passes nothing, so its behaviour is
+    byte-for-byte today's. `verifies_tls` exposes which mode this client is in.
     """
+
+    def __init__(self, *, insecure_skip_verify: bool = False) -> None:
+        """Build the client, optionally disabling TLS certificate verification.
+
+        Keyword-only so a positional caller can never accidentally enable the
+        skip. When enabled, the unverified context is built **once** here and
+        reused per request; ``check_hostname`` must be cleared **before**
+        ``verify_mode = CERT_NONE`` (``ssl`` raises otherwise).
+        """
+        self._ssl_context: ssl.SSLContext | None = None
+        if insecure_skip_verify:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
+
+    @property
+    def verifies_tls(self) -> bool:
+        """``True`` iff this client verifies TLS certificates (the default).
+
+        A small public predicate over the (private) SSL-context state so callers
+        — including the ``--check`` scope oracle — can assert which mode a built
+        client is in without reaching past the seam into a private attribute.
+        """
+        return self._ssl_context is None
 
     def request(
         self,
@@ -120,7 +158,9 @@ class UrllibHttpClient:
             url, data=data, method=method, headers=headers or {}
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            with urllib.request.urlopen(  # noqa: S310
+                req, timeout=timeout, context=self._ssl_context
+            ) as resp:
                 raw: bytes = resp.read()
                 status = int(resp.status)
                 resp_headers = {k.lower(): v for k, v in resp.headers.items()}

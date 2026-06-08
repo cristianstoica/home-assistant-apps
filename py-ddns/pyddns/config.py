@@ -21,7 +21,10 @@ Two security-load-bearing contracts live here:
   must be an absolute ``https://`` URL with a host and no userinfo or fragment.
   A plaintext callback would leak the record-repointing secret in transit; a
   plaintext/spoofable ip-source could make the add-on publish an attacker-chosen
-  A record. No insecure opt-in in v1.
+  A record. The opt-in `url.insecure_skip_verify` skips TLS certificate
+  *verification* on the callback path **only** — it never relaxes the
+  https/host/userinfo/fragment rejection, and never affects azure or ip-source
+  TLS (those always verify). HTTPS stays mandatory; plaintext is always rejected.
 
 When **both** sections are filled, the callback URL wins (the Azure group is
 ignored, not parsed) and the loader surfaces that on `ConfigSelection` so the
@@ -376,6 +379,12 @@ def validate(options: dict[str, object]) -> ConfigSelection:
         raise ConfigError(f"azure.ttl: must be {_MIN_TTL}-{_MAX_TTL}")
 
     url_send_myip = _require_bool(url_group, "send_myip", False, label="url.send_myip")
+    # Read unconditionally (like send_myip) so a wrong-type value is named even
+    # when the URL path is not the selected provider. It is a modifier, never a
+    # selector — never referenced in url_selected / _azure_selected.
+    url_insecure_skip_verify = _require_bool(
+        url_group, "insecure_skip_verify", False, label="url.insecure_skip_verify"
+    )
 
     url_selected = _is_filled(url_group.get("endpoint"))
     azure_selected = _azure_selected(azure_group)
@@ -430,6 +439,7 @@ def validate(options: dict[str, object]) -> ConfigSelection:
         record_label=record_label,
         url_endpoint=url_endpoint,
         url_send_myip=url_send_myip,
+        url_insecure_skip_verify=url_insecure_skip_verify,
         ttl=ttl,
         interval_seconds=interval_seconds,
         drift_reconcile_seconds=drift_reconcile_seconds,

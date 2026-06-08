@@ -59,6 +59,9 @@ class Config(NamedTuple):
     `state_path` is a dev-override key (default ``/data/last_known_ip``); it is
     absent from the HA schema, so a deployed add-on never sets it and the
     production state path cannot be misconfigured.
+
+    For `url`, `url_insecure_skip_verify` opts the callback path out of TLS
+    certificate verification (default off; never affects azure / ip-source TLS).
     """
 
     provider: Provider
@@ -68,6 +71,7 @@ class Config(NamedTuple):
     record_label: str
     url_endpoint: str
     url_send_myip: bool
+    url_insecure_skip_verify: bool
     ttl: int
     interval_seconds: int
     drift_reconcile_seconds: int
