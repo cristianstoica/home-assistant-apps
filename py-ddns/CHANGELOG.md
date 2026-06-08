@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.1.1 — docs: clarify `az` output keys for Azure credential fields
+
+**Docs-only.** No code, config schema, or runtime behavior change.
+
+- **README** gains a "Where each value comes from" note immediately after the
+  Azure DNS configuration mapping table, naming the exact `az`-CLI output key
+  for each add-on field — **Client ID** = `appId`, **Client secret** =
+  `password` (Microsoft Graph and the Azure portal call the same value
+  `secretText`), **Tenant ID** = `tenantId`, **Subscription ID** = the bare
+  **`id`** field of `az account show` (there is no `subscriptionId` key).
+  Eliminates a common copy-paste foot-gun where the wrong key is grabbed and
+  the add-on fails authentication on first cycle.
+
 ## 2.1.0 — meaningful `log_level: debug` (secret-safe per-cycle trace)
 
 **Additive, non-breaking.** No config schema change; `error`/`warning`/`info`

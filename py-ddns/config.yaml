@@ -1,5 +1,5 @@
 name: Py-DDNS
-version: "2.1.0"
+version: "2.1.1"
 breaking_versions:
   - "2.0.0"
 slug: py-ddns
