@@ -155,6 +155,12 @@ Azure path):
 | **Resource group**  | `<RG>`                            |
 | **DNS zone**        | `<ZONE>`, e.g. `example.com`      |
 
+> **Where each value comes from** (grab the right key — the names differ across layers):
+> **Client ID** = `appId`; **Client secret** = `password` in `az` output (Microsoft Graph and
+> the Azure portal call the same value `secretText`); **Tenant ID** = `tenantId` and
+> **Subscription ID** = the **`id`** field — both from `az account show` (there is no
+> `subscriptionId` key).
+
 Then set the top-level **Host name** to the FQDN to keep updated, e.g.
 `home.example.com`. It **must be a sub-record of the `DNS zone`** — the **zone
 apex is rejected** (a host updater must never repoint a zone apex, which on a
