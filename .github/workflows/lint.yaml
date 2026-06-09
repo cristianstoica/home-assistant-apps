@@ -1,0 +1,105 @@
+name: Lint
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 0 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  find:
+    name: Find apps
+    runs-on: ubuntu-latest
+    outputs:
+      addons: ${{ steps.addons.outputs.addons_list }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v6.0.2
+
+      - name: Find app directories
+        id: addons
+        uses: home-assistant/actions/helpers/find-addons@master
+
+  addon-lint:
+    name: Lint app ${{ matrix.path }}
+    runs-on: ubuntu-latest
+    needs: find
+    strategy:
+      fail-fast: false
+      matrix:
+        path: ${{ fromJson(needs.find.outputs.addons) }}
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v6.0.2
+
+      - name: Run Home Assistant App Lint
+        uses: frenck/action-addon-linter@v2.21
+        with:
+          path: "./${{ matrix.path }}"
+
+  pysyslog-gates:
+    name: Py-Syslog gates (check / pyright / ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.15.13 pyright==1.1.409
+
+      - name: pysyslog --check
+        run: PYTHONPATH=py-syslog python -m pysyslog --check
+      - name: pysyslog --check --storage
+        run: PYTHONPATH=py-syslog python -m pysyslog --check --storage
+      - name: pysyslog --check --write-error
+        run: PYTHONPATH=py-syslog python -m pysyslog --check --write-error
+      - name: pysyslog --check --bind
+        run: PYTHONPATH=py-syslog python -m pysyslog --check --bind
+
+      - name: pyright
+        run: pyright py-syslog/pysyslog
+      - name: ruff check
+        run: ruff check --target-version py313 py-syslog
+      - name: ruff format --check
+        run: ruff format --check py-syslog
+
+  pyddns-gates:
+    name: Py-DDNS gates (check / pyright / ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.15.13 pyright==1.1.409
+
+      - name: pyddns --check
+        run: PYTHONPATH=py-ddns python -m pyddns --check
+
+      - name: pyright
+        run: pyright py-ddns/pyddns
+      - name: ruff check
+        run: ruff check --target-version py313 py-ddns
+      - name: ruff format --check
+        run: ruff format --check py-ddns

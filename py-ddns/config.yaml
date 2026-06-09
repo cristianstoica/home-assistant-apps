@@ -1,0 +1,65 @@
+name: Py-DDNS
+version: "2.2.1"
+breaking_versions:
+  - "2.0.0"
+slug: py-ddns
+description: >-
+  Generic multi-provider dynamic-DNS updater. Keeps one A record pointed at the
+  box's current egress IPv4 via Azure DNS (API archetype) or a secret cPanel-style
+  callback URL (callback archetype). Reconciles on an interval with bounded backoff
+  and post-update DNS confirmation. Secret-safe by construction.
+url: https://github.com/cristianstoica/home-assistant-apps/tree/main/py-ddns
+arch: [aarch64, amd64]
+startup: services
+init: false
+image: ghcr.io/cristianstoica/py-ddns
+options:
+  # Host name → the FQDN to keep updated.
+  name: ""
+  # Callback URL section (callback archetype). Fill `endpoint` to select URL mode:
+  # the secret https callback whose path/query encodes the update credential.
+  # `send_myip` appends the locally-detected IP as a ?myip= param; leave false to
+  # let the remote server detect the record from the request's source IP.
+  # `insecure_skip_verify` (advanced, default off) disables TLS *certificate*
+  # verification on the callback path only — HTTPS stays mandatory; azure/ip-source
+  # always verify; a WARNING is logged every callback cycle while it is on.
+  url:
+    endpoint: ""
+    send_myip: false
+    insecure_skip_verify: false
+  # Azure DNS section (API archetype). Fill the credential fields to select Azure
+  # mode: this add-on detects the egress IP and writes the A record via the Azure
+  # DNS management API. `zone` is authoritative for the name↔zone check.
+  # `ip_sources` is comma/space-separated https echo endpoints (blank = built-in
+  # defaults); `ttl` is the record TTL. clientSecret/endpoint are masked.
+  azure:
+    client_id: ""
+    client_secret: ""
+    tenant_id: ""
+    subscription_id: ""
+    resource_group: ""
+    zone: ""
+    ip_sources: ""
+    ttl: 60
+  interval_seconds: 120
+  drift_reconcile_seconds: 3600
+  log_level: info
+schema:
+  name: str?
+  url:
+    endpoint: password?
+    send_myip: bool?
+    insecure_skip_verify: bool?
+  azure:
+    client_id: str?
+    client_secret: password?
+    tenant_id: str?
+    subscription_id: str?
+    resource_group: str?
+    zone: str?
+    ip_sources: str?
+    ttl: int(30,86400)?
+  interval_seconds: int(60,86400)
+  drift_reconcile_seconds: int(0,86400)
+  test_ns: str?
+  log_level: list(debug|info|warning|error)

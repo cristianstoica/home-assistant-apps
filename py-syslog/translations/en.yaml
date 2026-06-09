@@ -1,0 +1,63 @@
+configuration:
+  listen_port:
+    name: Listen port
+    description: >-
+      UDP port to bind on the host network. Point each device's syslog
+      forwarding at the Home Assistant host on this port (default 5514).
+  listen_host:
+    name: Listen address
+    description: >-
+      Local interface/address the collector binds. The default 0.0.0.0 binds
+      ALL interfaces; set a specific host IP to accept datagrams on only that
+      interface. UDP syslog is unauthenticated and source-IP-spoofable, so when
+      exposing the port beyond a trusted LAN (e.g. port-forwarding) restrict the
+      bind interface AND firewall the port.
+  retention_days:
+    name: Retention (days)
+    description: >-
+      Days of gzipped archives to keep; older ones are pruned. Retention is
+      time-bounded by the date in each archive's filename, not byte-capped.
+  min_free_percent:
+    name: Minimum free space (%)
+    description: >-
+      Free-space floor: prune oldest archived segments to keep at least this
+      percent of the storage volume free. 0 disables. Requires Size-rotation
+      segment (MB) > 0 to take effect (without intra-day segments there is
+      nothing to prune). The newest, still-being-written data is never pruned.
+  max_log_percent:
+    name: Maximum log size (% of volume)
+    description: >-
+      Log-dir cap: prune oldest archived segments so the log directory occupies
+      no more than this percent of the storage volume. 0 disables. Requires
+      Size-rotation segment (MB) > 0 to take effect. Oldest history is sacrificed
+      first; the active file is never pruned.
+  max_segment_mb:
+    name: Size-rotation segment (MB)
+    description: >-
+      Size-rotation trigger: roll the active file to a gzip segment once it
+      reaches this many MB, so the size guard has intra-day segments to prune. 0
+      disables size-rotation. This MUST be > 0 to enable either Minimum free
+      space (%) or Maximum log size (%) — both percentage guards are otherwise
+      rejected at startup.
+  log_level:
+    name: Diagnostics verbosity
+    description: >-
+      Verbosity of Py-Syslog's own diagnostics (startup line, periodic stats,
+      and warnings) on stderr. This does NOT filter the syslog collected from
+      your sources — every received and non-rejected datagram is stored and shown
+      in full, whatever its severity. Setting it to debug additionally traces each
+      received datagram's parse and resolution decision.
+  sources:
+    name: Source mappings
+    description: >-
+      IP → (site, host) resolution table stamped on every collected line. A
+      duplicate ip is rejected. Senders not listed here are received and stored
+      stamped unknown/<ip>, unless Reject unknown sources is enabled, in which
+      case they are dropped.
+  reject_unknown_sources:
+    name: Reject unknown sources
+    description: >-
+      Drop (do not store) syslog datagrams from senders whose IP is not listed in
+      Sources; dropped datagrams are counted in the rejected_sources stat. This is
+      a noise filter, NOT authentication — a spoofed source IP that matches a
+      configured entry bypasses it.

@@ -1,0 +1,108 @@
+configuration:
+  name:
+    name: Host name
+    description: >-
+      The fully-qualified record to keep updated, e.g. home.example.com.
+  url:
+    name: Callback URL
+    description: >-
+      Callback archetype. Fill the endpoint to drive a secret callback URL: this
+      add-on fires the URL and the remote server (e.g. cPanel) sets the record
+      from the request's source IP. Leave blank to use Azure instead.
+    fields:
+      endpoint:
+        name: Callback URL
+        description: >-
+          The secret https callback endpoint whose path/query encodes the update
+          credential. Must be https (a plaintext callback leaks the
+          record-repointing secret in transit); http, hostless, userinfo and
+          fragment URLs are rejected. The secret is never logged — diagnostics
+          show the host with the path redacted.
+      send_myip:
+        name: Send detected IP (myip)
+        description: >-
+          When enabled, append the locally-detected egress IPv4 as a ?myip= query
+          parameter on the callback (replacing any existing myip and preserving
+          other params). Leave disabled to let the remote server detect the record
+          from the request's own source IP (the usual cPanel behaviour).
+      insecure_skip_verify:
+        name: Skip TLS certificate verification (insecure)
+        description: >-
+          Advanced; default off. Disables TLS *certificate* verification on the
+          callback path only. The connection stays encrypted, but authentication
+          is lost: an active man-in-the-middle could impersonate the endpoint and
+          capture the secret callback URL — which is the DDNS update credential.
+          HTTPS is still required (a plaintext callback is always rejected); the
+          Azure and IP-source connections always verify. While this is on, a
+          WARNING is logged every callback cycle (including steady cycles). Enable
+          only if a callback URL with a verifiable certificate is unobtainable —
+          prefer fixing the certificate.
+  azure:
+    name: Azure DNS
+    description: >-
+      API archetype. Fill the credential fields to drive Azure DNS: this add-on
+      detects the egress IP and writes the A record via the Azure DNS management
+      API. Leave the credential fields blank to use a Callback URL instead.
+    fields:
+      client_id:
+        name: Client ID
+        description: >-
+          The service-principal application (client) ID from the bootstrap step —
+          a GUID (the appId, not the SP object ID used in the role assignment).
+      client_secret:
+        name: Client secret
+        description: >-
+          The service-principal password from the bootstrap step. Never logged.
+      tenant_id:
+        name: Tenant ID
+        description: The Azure AD tenant ID the service principal belongs to.
+      subscription_id:
+        name: Subscription ID
+        description: The subscription ID that owns the DNS zone.
+      resource_group:
+        name: Resource group
+        description: The resource group that contains the DNS zone.
+      zone:
+        name: DNS zone
+        description: >-
+          The DNS zone, e.g. example.com. Authoritative for the name↔zone check:
+          the Host name must be a sub-record of this zone.
+      ip_sources:
+        name: IP source URLs
+        description: >-
+          Optional comma/space-separated list of https echo endpoints (ipify /
+          icanhazip) returning the box's egress IPv4 as text; the first
+          global-unicast answer wins. Leave blank for the built-in defaults.
+          Private, CGNAT, loopback, link-local and 0.0.0.0 answers are rejected so
+          a spoofed/non-routable value is never published; http, hostless,
+          userinfo and fragment URLs are rejected.
+      ttl:
+        name: Record TTL (seconds)
+        description: >-
+          The TTL written on the A record-set (30-86400). Lower values propagate
+          IP changes faster at the cost of more resolver traffic.
+  interval_seconds:
+    name: Reconcile interval (seconds)
+    description: >-
+      How often to run a reconcile cycle (60-86400). Each cycle detects the IP (or
+      defers to the server for the callback archetype), updates the record if it
+      changed, and confirms the change in DNS.
+  drift_reconcile_seconds:
+    name: Drift reconcile interval (seconds)
+    description: >-
+      Force an authoritative re-check of the live record even when nothing locally
+      changed, to heal out-of-band drift (0-86400). 0 disables the periodic drift
+      check; the per-interval reconcile still runs.
+  test_ns:
+    name: Confirmation nameserver (optional)
+    description: >-
+      Optional IP of a nameserver to query directly when confirming a post-update
+      record value (e.g. the zone's authoritative NS), bypassing the local
+      resolver cache. Leave blank to confirm via the system resolver.
+  log_level:
+    name: Diagnostics verbosity
+    description: >-
+      Verbosity of Py-DDNS's own diagnostics (startup line, per-cycle decisions,
+      warnings) on stderr. Setting it to debug additionally traces each cycle's IP
+      detection, update decision and confirmation outcome. Secrets are never
+      logged at any level.
