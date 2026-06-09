@@ -5,6 +5,10 @@ __pycache__/
 # macOS
 .DS_Store
 
+# docs/ at the repo root is local-only (planning notes, archived plans).
+# Root-anchored so any nested docs/ inside an add-on dir is unaffected.
+/docs/
+
 # .claude/ is per-machine state: symlinks to IT/.claude/ (created by
 # IT/scripts/setup-claude-symlinks.sh), agent memory, and worktrees.
 # Nothing in it is meant to be committed at any level of this repo.
