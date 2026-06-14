@@ -64,6 +64,7 @@ def check_datagrams() -> bool:
             writer=capture,
             counters=counters,
             reject_unknown_sources=False,
+            include_structured_data=fixture.include_structured_data,
             clock=pinned_clock,
         )
         produced = capture.lines[0] if capture.lines else ""
@@ -255,6 +256,7 @@ def check_trace() -> bool:
                 writer=CaptureWriter(),
                 counters=Counters(),
                 reject_unknown_sources=False,
+                include_structured_data=fixture.include_structured_data,
                 clock=pinned_clock,
             )
     finally:
@@ -310,6 +312,7 @@ def check_trace() -> bool:
         message="body",
         malformed=False,
         raw="raw",
+        structured_data="",
     )
     repr_handler = DebugRecordingHandler()
     logger.addHandler(repr_handler)
@@ -335,4 +338,156 @@ def check_trace() -> bool:
         )
 
     print(f"TRACE CHECK {'PASSED' if ok else 'FAILED'}", file=sys.stderr)
+    return ok
+
+
+def check_include_structured_data() -> bool:
+    """Assert the opt-in ``include_structured_data`` flag contract.
+
+    Four targeted assertions (independent of the datagram-corpus line checks):
+
+    1. **Parsed field populated** — a real RFC 5424 datagram with SD yields a
+       non-empty ``SyslogRecord.structured_data`` field.
+    2. **Parsed field empty for RFC 3164** — a 3164 datagram always yields
+       ``structured_data=""``.
+    3. **Parsed field empty for nil SD** — an RFC 5424 datagram with ``-`` SD
+       yields ``structured_data=""``.
+    4. **Flag-on vs flag-off differ only by the SD token** — for a datagram with
+       real SD, driving through ``process_datagram`` with flag on vs off produces
+       lines that differ exactly at the ``SD={...}`` token and nowhere else.
+
+    Returns ``True`` only if every assertion holds.
+    """
+    ok = True
+
+    # Reference datagram: the plan's canonical example (single SD element).
+    sd_raw = (
+        b"<165>1 2026-06-03T11:59:58.000Z myhost evntslog - ID47 "
+        b'[exampleSDID@32473 iut="3" eventID="1011"] An application event'
+    )
+    rfc3164_raw = b"<13>Jun  3 11:59:58 myhost kernel: link down"
+    nil_sd_raw = b"<165>1 2026-06-03T11:59:58.000Z myhost evntslog - ID47 - nil msg"
+
+    # Assertion 1: RFC 5424 with real SD → structured_data non-empty.
+    r_sd = parse(sd_raw.decode("utf-8", "replace"), fixtures.PINNED_RECV_TS)
+    sd_populated = bool(r_sd.structured_data)
+    if sd_populated:
+        print(
+            f"PASS  sd-field: RFC 5424 SD datagram populates structured_data "
+            f"({r_sd.structured_data!r})",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            "FAIL  sd-field: RFC 5424 SD datagram left structured_data empty",
+            file=sys.stderr,
+        )
+
+    # Assertion 2: RFC 3164 → structured_data always "".
+    r_3164 = parse(rfc3164_raw.decode("utf-8", "replace"), fixtures.PINNED_RECV_TS)
+    if r_3164.structured_data == "":
+        print("PASS  sd-field: RFC 3164 structured_data is empty", file=sys.stderr)
+    else:
+        ok = False
+        print(
+            f"FAIL  sd-field: RFC 3164 structured_data should be '' "
+            f"but got {r_3164.structured_data!r}",
+            file=sys.stderr,
+        )
+
+    # Assertion 3: RFC 5424 nil SD ("-") → structured_data always "".
+    r_nil = parse(nil_sd_raw.decode("utf-8", "replace"), fixtures.PINNED_RECV_TS)
+    if r_nil.structured_data == "":
+        print(
+            "PASS  sd-field: RFC 5424 nil SD structured_data is empty",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            f"FAIL  sd-field: RFC 5424 nil SD structured_data should be '' "
+            f"but got {r_nil.structured_data!r}",
+            file=sys.stderr,
+        )
+
+    # Assertion 4: flag-on vs flag-off differ only by the SD token.
+    sources = {
+        entry["ip"]: SourceMapping(
+            ip=entry["ip"], site=entry["site"], host=entry["host"]
+        )
+        for entry in fixtures.CHECK_SOURCES
+    }
+    resolver = Resolver(sources)
+
+    cap_on = CaptureWriter()
+    process_datagram(
+        sd_raw,
+        fixtures.SOURCE_IP,
+        resolver=resolver,
+        writer=cap_on,
+        counters=Counters(),
+        reject_unknown_sources=False,
+        include_structured_data=True,
+        clock=pinned_clock,
+    )
+    cap_off = CaptureWriter()
+    process_datagram(
+        sd_raw,
+        fixtures.SOURCE_IP,
+        resolver=resolver,
+        writer=cap_off,
+        counters=Counters(),
+        reject_unknown_sources=False,
+        include_structured_data=False,
+        clock=pinned_clock,
+    )
+    line_on = cap_on.lines[0] if cap_on.lines else ""
+    line_off = cap_off.lines[0] if cap_off.lines else ""
+    sd_token = f"SD={{{r_sd.structured_data}}} "
+    on_has_token = sd_token in line_on
+    off_lacks_token = sd_token not in line_off
+    # Stripping the token from the on-line should give the off-line exactly.
+    on_without_sd = line_on.replace(sd_token, "")
+    lines_match_after_strip = on_without_sd == line_off
+    if on_has_token:
+        print(
+            "PASS  sd-render: flag-on line contains SD token",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            f"FAIL  sd-render: flag-on line missing SD token {sd_token!r}: {line_on!r}",
+            file=sys.stderr,
+        )
+    if off_lacks_token:
+        print(
+            "PASS  sd-render: flag-off line omits SD token",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            f"FAIL  sd-render: flag-off line contains unexpected SD token: {line_off!r}",
+            file=sys.stderr,
+        )
+    if lines_match_after_strip:
+        print(
+            "PASS  sd-render: flag-on and flag-off lines differ ONLY by the SD token",
+            file=sys.stderr,
+        )
+    else:
+        ok = False
+        print(
+            "FAIL  sd-render: lines differ beyond the SD token:\n"
+            f"  on-without-sd: {on_without_sd!r}\n"
+            f"  off:           {line_off!r}",
+            file=sys.stderr,
+        )
+
+    print(
+        f"INCLUDE-STRUCTURED-DATA CHECK {'PASSED' if ok else 'FAILED'}",
+        file=sys.stderr,
+    )
     return ok

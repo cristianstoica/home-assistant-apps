@@ -17,7 +17,7 @@ from .config_checks import (
     check_reject_unknown_sources,
     check_size_guard_config,
 )
-from .datagrams import check_datagrams, check_trace
+from .datagrams import check_datagrams, check_include_structured_data, check_trace
 from .options import resolved_config
 from .storage import check_storage
 from .survival import check_internal_error, check_warn_once, check_write_error
@@ -47,6 +47,7 @@ def run_check(options_path: str, storage: bool, write_error: bool, bind: bool) -
     ok = check_size_guard_config() and ok
     ok = check_invalid_options() and ok
     ok = check_reject_unknown_sources() and ok
+    ok = check_include_structured_data() and ok
     if ok:
         print("CHECK PASSED", file=sys.stderr)
         return 0

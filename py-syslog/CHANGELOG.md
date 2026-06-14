@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.0 — opt-in RFC 5424 STRUCTURED-DATA preservation (`include_structured_data`)
+
+- New opt-in `include_structured_data` option (default `false`) preserves the
+  RFC 5424 STRUCTURED-DATA region in the stored line. When enabled, a
+  `SD={...}` field is inserted between the sender timestamp and the message
+  body for datagrams that carry structured data. When the flag is off — or
+  when the datagram is RFC 3164, malformed, or carries a nil SD (`-`) — the
+  stored line is **byte-identical to today**, so existing deployments are
+  unaffected until someone opts in — backward-compatible.
+- SD content is passed through the existing `_escape` pipeline before
+  rendering, so embedded control characters and Unicode line separators cannot
+  split a stored log line (one-datagram → one-physical-line contract
+  preserved).
+- `translations/en.yaml` labels the new option on the HA Configuration tab.
+- README gains an Options-table row for `include_structured_data` documenting
+  the default-off behavior and the on-disk line shape.
+
 ## 1.4.0 — sender hardening, IPv4 config validation, and `reject_unknown_sources`
 
 - New opt-in `reject_unknown_sources` option (default `false`) drops datagrams

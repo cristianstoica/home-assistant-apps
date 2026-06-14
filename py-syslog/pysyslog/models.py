@@ -41,6 +41,10 @@ class Config(NamedTuple):
 
     `reject_unknown_sources` drops+counts unknown-source datagrams when True;
     default False; NOT authentication.
+
+    `include_structured_data` preserves the RFC 5424 STRUCTURED-DATA region in the
+    stored line when True; default False, so an upgrade changes the stored line
+    shape only when explicitly opted in.
     """
 
     listen_port: int
@@ -50,6 +54,7 @@ class Config(NamedTuple):
     max_log_percent: int
     max_segment_mb: int
     reject_unknown_sources: bool
+    include_structured_data: bool
     log_level: str
     sources: dict[str, SourceMapping]
     log_dir: str
@@ -66,6 +71,12 @@ class SyslogRecord(NamedTuple):
     or unparseable, rendered ``-``).
     `raw` — the full decoded datagram (``errors="replace"``), kept for
     malformed/unknown output.
+    `structured_data` — the RFC 5424 STRUCTURED-DATA region as captured (the
+    raw ``[...]`` run, no surrounding label/braces; ``""`` for nil ``-``, RFC 3164,
+    or malformed). Rendered into the stored line only when the collector's
+    `Config.include_structured_data` flag is on (see `format_line`). No NamedTuple
+    default: under ``# pyright: strict`` every constructor must set it, so a future
+    parse path cannot silently drop it.
     """
 
     recv_ts: str
@@ -76,6 +87,7 @@ class SyslogRecord(NamedTuple):
     message: str
     malformed: bool
     raw: str
+    structured_data: str
 
 
 class WriterProtocol(Protocol):
@@ -155,24 +167,39 @@ def _escape(text: str) -> str:
     return "".join(out)
 
 
-def format_line(record: SyslogRecord, site: str, host: str) -> str:
+def format_line(
+    record: SyslogRecord, site: str, host: str, include_structured_data: bool
+) -> str:
     """Render one stored line, terminated by exactly one ``\\n``.
 
-    Canonical shape::
+    Canonical shape (no structured data)::
 
         <recv_ts> <site> <host> <priority_text> <program>: [<sender_ts>] <message>\\n
 
-    `message`, `sender_ts`, and `raw` are escaped per the contract so the
-    result is exactly one physical line. `program` is sender-controlled
-    (RFC 5424 APP-NAME/PROCID, RFC 3164 tag) and is escaped per the same
-    contract. A malformed record carries the escaped raw datagram as its
+    When `include_structured_data` is True **and** `record.structured_data` is
+    non-empty, a labeled, brace-delimited SD field is inserted immediately before
+    ``<message>``::
+
+        ... <program>: [<sender_ts>] SD={<structured_data>} <message>\\n
+
+    Otherwise nothing is inserted there and the line is byte-identical to the
+    no-SD shape (so a flag-off upgrade changes nothing). The flag is **required**
+    so no caller can silently bypass the contract.
+
+    `message`, `sender_ts`, `structured_data`, and `raw` are escaped per the
+    contract so the result is exactly one physical line. `program` is
+    sender-controlled (RFC 5424 APP-NAME/PROCID, RFC 3164 tag) and is escaped per
+    the same contract. A malformed record carries the escaped raw datagram as its
     message; an empty `sender_ts` renders ``-``.
     """
     sender = _escape(record.sender_ts) if record.sender_ts else "-"
     body = record.message if not record.malformed else record.raw
     message = _escape(body)
     program = _escape(record.program)
+    sd_field = ""
+    if include_structured_data and record.structured_data:
+        sd_field = f"SD={{{_escape(record.structured_data)}}} "
     return (
         f"{record.recv_ts} {site} {host} {record.priority_text} "
-        f"{program}: [{sender}] {message}\n"
+        f"{program}: [{sender}] {sd_field}{message}\n"
     )

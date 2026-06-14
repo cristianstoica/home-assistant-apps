@@ -100,6 +100,7 @@ def _malformed(raw: str, recv_ts: str) -> SyslogRecord:
         message="",
         malformed=True,
         raw=raw,
+        structured_data="",
     )
 
 
@@ -116,8 +117,9 @@ def _parse_rfc5424(
         return None
     _version, timestamp, _hostname, app_name, procid, _msgid, tail = match.groups()
     # tail = STRUCTURED-DATA SP MSG. SD is either "-" (nil) or one-or-more
-    # "[...]" elements; split it off so MSG is the human-readable remainder.
-    message = _split_structured_data(tail)
+    # "[...]" elements; split it off so MSG is the human-readable remainder and
+    # the captured SD region can be preserved (rendered only when opted in).
+    structured_data, message = _split_structured_data(tail)
     sender_ts = "" if timestamp == "-" else timestamp
     program = app_name
     if procid not in ("-", ""):
@@ -131,22 +133,29 @@ def _parse_rfc5424(
         message=message,
         malformed=False,
         raw=raw,
+        structured_data=structured_data,
     )
 
 
-def _split_structured_data(tail: str) -> str:
-    """Drop the RFC 5424 STRUCTURED-DATA prefix, return the trailing MSG.
+def _split_structured_data(tail: str) -> tuple[str, str]:
+    """Split the RFC 5424 STRUCTURED-DATA prefix from the trailing MSG.
 
-    `tail` is ``STRUCTURED-DATA [SP MSG]``. STRUCTURED-DATA is ``-`` (nil) or a
-    run of ``[...]`` elements (no SP between elements). Bracket matching ignores
-    ``]`` escaped as ``\\]`` inside param values, per RFC 5424.
+    Returns ``(structured_data, message)``. `tail` is ``STRUCTURED-DATA [SP MSG]``.
+    STRUCTURED-DATA is ``-`` (nil) or a run of ``[...]`` elements (no SP between
+    elements). Bracket matching ignores ``]`` escaped as ``\\]`` inside param
+    values, per RFC 5424.
+
+    The SD slice is ``tail[:i]`` using the same boundary index ``i`` the
+    bracket-matcher computes; MSG is preserved byte-for-byte. Edge cases yield an
+    empty SD: nil ``-`` → ``("", msg)``, no leading ``[`` → ``("", tail)``,
+    unterminated SD → ``("", "")``. Pure string slicing only — never raises.
     """
     if tail.startswith("-"):
         # nil SD; MSG is whatever follows the single space after "-".
-        return tail[2:] if tail.startswith("- ") else ""
+        return ("", tail[2:] if tail.startswith("- ") else "")
     if not tail.startswith("["):
         # No recognizable SD; treat the whole tail as the message.
-        return tail
+        return ("", tail)
     i = 0
     n = len(tail)
     while i < n and tail[i] == "[":
@@ -166,11 +175,12 @@ def _split_structured_data(tail: str) -> str:
             i += 1
         else:
             # Unterminated SD element; bail out, no message recoverable.
-            return ""
+            return ("", "")
+    structured_data = tail[:i]
     # A single SP separates SD from MSG.
     if i < n and tail[i] == " ":
-        return tail[i + 1 :]
-    return tail[i:]
+        return (structured_data, tail[i + 1 :])
+    return (structured_data, tail[i:])
 
 
 def _parse_rfc3164(pri_text: str, rest: str, raw: str, recv_ts: str) -> SyslogRecord:
@@ -198,6 +208,7 @@ def _parse_rfc3164(pri_text: str, rest: str, raw: str, recv_ts: str) -> SyslogRe
         message=message,
         malformed=False,
         raw=raw,
+        structured_data="",
     )
 
 

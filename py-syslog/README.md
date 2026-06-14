@@ -53,17 +53,37 @@ Point your devices' syslog forwarding at the Home Assistant host on
 
 ## Options
 
-| Option                   | Type                                | Default   | Meaning                                                                                                                                                          |
-| ------------------------ | ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `listen_port`            | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                                                            |
-| `listen_host`            | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).                                               |
-| `retention_days`         | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                                                         |
-| `min_free_percent`       | `int(0,99)`                         | `0`       | **Size guard.** Free-space floor: prune oldest segments to keep ≥ this % of the volume free. `0` disables (see Size guard below).                                |
-| `max_log_percent`        | `int(0,99)`                         | `0`       | **Size guard.** Log-dir cap: prune oldest segments so the log dir occupies ≤ this % of the volume. `0` disables.                                                 |
-| `max_segment_mb`         | `int(0,4096)`                       | `0`       | **Size guard.** Size-rotation trigger: roll the active file to a `.gz` segment at this many MB. `0` disables; **must be > 0** to enable either percentage guard. |
-| `log_level`              | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below).                                          |
-| `sources`                | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                                                                |
-| `reject_unknown_sources` | `bool`                              | `false`   | Drop (don't store) datagrams from senders not in `sources`; counted in `rejected_sources`. Noise filter, NOT authentication.                                     |
+| Option                    | Type                                | Default   | Meaning                                                                                                                                                          |
+| ------------------------- | ----------------------------------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `listen_port`             | `port`                              | `5514`    | UDP port to bind on the host network.                                                                                                                            |
+| `listen_host`             | `str`                               | `0.0.0.0` | Interface/address to bind. `0.0.0.0` binds **all** interfaces; set a host IP to restrict (see Threat model below).                                               |
+| `retention_days`          | `int(1,3650)`                       | `30`      | Days of gzipped archives to keep; older ones are pruned.                                                                                                         |
+| `min_free_percent`        | `int(0,99)`                         | `0`       | **Size guard.** Free-space floor: prune oldest segments to keep ≥ this % of the volume free. `0` disables (see Size guard below).                                |
+| `max_log_percent`         | `int(0,99)`                         | `0`       | **Size guard.** Log-dir cap: prune oldest segments so the log dir occupies ≤ this % of the volume. `0` disables.                                                 |
+| `max_segment_mb`          | `int(0,4096)`                       | `0`       | **Size guard.** Size-rotation trigger: roll the active file to a `.gz` segment at this many MB. `0` disables; **must be > 0** to enable either percentage guard. |
+| `log_level`               | `list(debug\|info\|warning\|error)` | `info`    | Verbosity of py-syslog's **own** diagnostics on stderr; does **not** filter ingested logs by severity (see note below).                                          |
+| `sources`                 | list of `{ip, site, host}`          | `[]`      | IP → (site, host) resolution table. A duplicate `ip` is rejected.                                                                                                |
+| `reject_unknown_sources`  | `bool`                              | `false`   | Drop (don't store) datagrams from senders not in `sources`; counted in `rejected_sources`. Noise filter, NOT authentication.                                     |
+| `include_structured_data` | `bool`                              | `false`   | Preserve the RFC 5424 STRUCTURED-DATA region in the stored line (see note below). Default off keeps the stored line byte-identical to prior releases.            |
+
+> **`include_structured_data` is opt-in and default-off.** With the default
+> (`false`), STRUCTURED-DATA is parsed and dropped, exactly as in prior releases,
+> so the stored line is byte-identical. Set it to `true` to keep the SD region. It
+> is then rendered as a labeled, brace-delimited field between `[<sender_ts>]` and
+> the message, and **only** for RFC 5424 datagrams that actually carry SD (a nil
+> `-`, an RFC 3164 datagram, or a malformed one adds nothing):
+>
+> ```
+> # include_structured_data: false (default) — unchanged:
+> 2026-06-03T12:00:00+00:00 home router1 local4.notice evntslog: [2026-06-03T11:59:58.000Z] An application event
+>
+> # include_structured_data: true, SD present:
+> 2026-06-03T12:00:00+00:00 home router1 local4.notice evntslog: [2026-06-03T11:59:58.000Z] SD={[exampleSDID@32473 iut="3" eventID="1011"]} An application event
+> ```
+>
+> The SD region passes through the same single-physical-line escaping as the rest
+> of the line, so enabling it never changes the **collector only / one physical
+> line per datagram** contract.
 
 > **`log_level` controls py-syslog's own logging, not the logs it collects.** It
 > sets the verbosity of py-syslog's _own_ operational diagnostics on stderr — the

@@ -196,6 +196,7 @@ def validate(options: dict[str, object]) -> Config:
         )
 
     reject_unknown_sources = _require_bool(options, "reject_unknown_sources", False)
+    include_structured_data = _require_bool(options, "include_structured_data", False)
 
     log_level = _require_str(options, "log_level", "info")
     if log_level not in _VALID_LOG_LEVELS:
@@ -213,6 +214,7 @@ def validate(options: dict[str, object]) -> Config:
         max_log_percent=max_log_percent,
         max_segment_mb=max_segment_mb,
         reject_unknown_sources=reject_unknown_sources,
+        include_structured_data=include_structured_data,
         log_level=log_level,
         sources=sources,
         log_dir=log_dir,

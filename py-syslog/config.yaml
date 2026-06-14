@@ -1,5 +1,5 @@
 name: Py-Syslog
-version: "1.4.0"
+version: "1.5.0"
 slug: py-syslog
 description: >-
   Durable UDP syslog collector. Receives RFC 3164/5424 datagrams, resolves each
@@ -22,6 +22,10 @@ options:
   max_log_percent: 0
   max_segment_mb: 0
   reject_unknown_sources: false
+  # Preserve the RFC 5424 STRUCTURED-DATA region in the stored line. Default off:
+  # when off the stored line is byte-identical to today; when on, an SD={...}
+  # field is inserted before the message for 5424 datagrams that carry SD.
+  include_structured_data: false
   log_level: info
   # Map each sender IP to a (site, host) stamped on every collected line.
   # Add your own rows via the HA add-on Configuration tab, e.g.:
@@ -37,6 +41,7 @@ schema:
   max_log_percent: int(0,99)
   max_segment_mb: int(0,4096)
   reject_unknown_sources: bool
+  include_structured_data: bool
   log_level: list(debug|info|warning|error)
   sources:
     - { ip: str, site: str, host: str }

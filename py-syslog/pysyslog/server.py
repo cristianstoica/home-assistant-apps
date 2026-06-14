@@ -203,6 +203,7 @@ def process_datagram(
     writer: WriterProtocol,
     counters: Counters,
     reject_unknown_sources: bool,
+    include_structured_data: bool = False,
     clock: Callable[[], str] = _utc_now_iso,
     warn: Callable[[str, str], None] = _default_warn,
 ) -> None:
@@ -218,6 +219,11 @@ def process_datagram(
     a disk-fill flood cannot warn at line rate; the default is un-throttled so
     the oracles stay simple. Any other exception propagates to the loop-level
     catch-all.
+
+    `include_structured_data` is threaded straight into `format_line`; it is
+    keyword-only with a ``False`` default so the existing oracle call sites stay
+    one-line (the live loop passes ``Config.include_structured_data`` via
+    `Server.handle_one`).
     """
     from .writer import WriteError
 
@@ -247,7 +253,7 @@ def process_datagram(
                 _trace_datagram(client_ip, record, site, host, "rejected")
             return
     site, host = resolver.resolve(client_ip)
-    line = format_line(record, site, host)
+    line = format_line(record, site, host, include_structured_data)
     try:
         writer.write(line)
     except WriteError:
@@ -355,6 +361,7 @@ class Server:
                 writer=self._writer,
                 counters=self._counters,
                 reject_unknown_sources=self._config.reject_unknown_sources,
+                include_structured_data=self._config.include_structured_data,
                 warn=self._warn_throttled,
             )
         except Exception:

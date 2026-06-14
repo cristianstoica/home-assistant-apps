@@ -48,6 +48,11 @@ class DatagramFixture(NamedTuple):
     `tag` is the human-facing ``--check`` category
     (``3164`` / ``5424`` / ``malformed`` / ``unknown-src``); `protocol` is the
     `SyslogRecord.protocol` the parser must produce.
+
+    `include_structured_data` mirrors the server's opt-in flag; default ``False``
+    so all existing fixtures continue to assert the unchanged flag-off contract.
+    Flag-on fixtures set it ``True`` and supply an ``expected_line`` that includes
+    the ``SD={...}`` token.
     """
 
     name: str
@@ -59,6 +64,7 @@ class DatagramFixture(NamedTuple):
     site: str
     host: str
     expected_line: str
+    include_structured_data: bool = False
 
 
 class InvalidOptionsFixture(NamedTuple):
@@ -398,6 +404,89 @@ DATAGRAMS: list[DatagramFixture] = [
             "app: [2026-06-03T11:59:58.000Z] after sd\n"
         ),
     ),
+    # ------------------------------------------------------------------ #
+    # Flag-ON fixtures: include_structured_data=True.                     #
+    # These pin the SD={...} render path; all existing flag-off fixtures  #
+    # above pin the unchanged contract from the off side.                 #
+    # ------------------------------------------------------------------ #
+    DatagramFixture(
+        name="rfc5424 SD flag-on: single SD element",
+        client_ip=SOURCE_IP,
+        raw=(
+            b"<165>1 2026-06-03T11:59:58.000Z myhost evntslog - ID47 "
+            b'[exampleSDID@32473 iut="3" eventID="1011"] An application event'
+        ),
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        # SD={[exampleSDID@32473 iut="3" eventID="1011"]} inserted before msg;
+        # no chars in this SD trigger _escape, so it passes through verbatim.
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            'evntslog: [2026-06-03T11:59:58.000Z] SD={[exampleSDID@32473 iut="3" eventID="1011"]} An application event\n'
+        ),
+        include_structured_data=True,
+    ),
+    DatagramFixture(
+        name="rfc5424 SD flag-on: multiple SD elements",
+        client_ip=SOURCE_IP,
+        raw=(
+            b"<165>1 2026-06-03T11:59:58.000Z myhost evntslog - ID47 "
+            b'[exampleSDID@32473 iut="3"][origin ip="192.0.2.1"] Multi SD event'
+        ),
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        # Both SD elements are preserved as a single run; _escape leaves them
+        # unchanged (no control chars).
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            'evntslog: [2026-06-03T11:59:58.000Z] SD={[exampleSDID@32473 iut="3"][origin ip="192.0.2.1"]} Multi SD event\n'
+        ),
+        include_structured_data=True,
+    ),
+    DatagramFixture(
+        name="rfc5424 SD flag-on: escaped ] in SD param value",
+        client_ip=SOURCE_IP,
+        # Wire bytes: [ex@1 k="a\]b"] — one backslash then ] inside the param.
+        # _split_structured_data bracket-matches through \] correctly (escaped ],
+        # not a closing bracket), so structured_data = '[ex@1 k="a\]b"]'.
+        # _escape then doubles the backslash: \ -> \\, so the stored token is
+        # SD={[ex@1 k="a\\]b"]}.  expected_line is computed, not hand-guessed.
+        raw=(b'<165>1 2026-06-03T11:59:58.000Z host app - - [ex@1 k="a\\]b"] after sd'),
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            'app: [2026-06-03T11:59:58.000Z] SD={[ex@1 k="a\\\\]b"]} after sd\n'
+        ),
+        include_structured_data=True,
+    ),
+    DatagramFixture(
+        name="rfc5424 SD flag-on: nil SD collapses (byte-identical to flag-off)",
+        client_ip=SOURCE_IP,
+        # Nil SD ("-") → structured_data="" → format_line omits the SD token
+        # even with include_structured_data=True.  Line must be byte-identical
+        # to the flag-off case.
+        raw=b"<165>1 2026-06-03T11:59:58.000Z myhost evntslog - ID47 - nil msg",
+        tag="5424",
+        protocol="rfc5424",
+        sender_ts="2026-06-03T11:59:58.000Z",
+        site="home",
+        host="router1",
+        expected_line=(
+            "2026-06-03T12:00:00+00:00 home router1 local4.notice "
+            "evntslog: [2026-06-03T11:59:58.000Z] nil msg\n"
+        ),
+        include_structured_data=True,
+    ),
 ]
 
 
@@ -549,22 +638,33 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options={**_valid_base(), "reject_unknown_sources": 1},
         field="reject_unknown_sources",
     ),
+    InvalidOptionsFixture(
+        name="non-bool include_structured_data",
+        options={**_valid_base(), "include_structured_data": "true"},
+        field="include_structured_data",
+    ),
+    InvalidOptionsFixture(
+        name="int include_structured_data (1 is not a bool)",
+        options={**_valid_base(), "include_structured_data": 1},
+        field="include_structured_data",
+    ),
 ]
 
 
 # The expected aggregate counters after driving DATAGRAMS through the seam.
-# received = all 20; rfc3164 = 10 (incl. the unknown-src one); rfc5424 = 6;
-# unknown protocol = 4 malformed; malformed = 4; unknown source = 1; written = 20.
-# rejected_sources = 0: the corpus runs flag-off, so the reject path never fires.
+# received = all 24; rfc3164 = 10 (incl. the unknown-src one); rfc5424 = 10
+# (6 flag-off + 4 flag-on); unknown protocol = 4 malformed; malformed = 4;
+# unknown source = 1; written = 24.
+# rejected_sources = 0: no reject_unknown_sources fixture in the corpus.
 EXPECTED_COUNTERS: dict[str, int] = {
-    "received": 20,
+    "received": 24,
     "rfc3164": 10,
-    "rfc5424": 6,
+    "rfc5424": 10,
     "unknown": 4,
     "malformed": 4,
     "unknown_source": 1,
     "rejected_sources": 0,
-    "written": 20,
+    "written": 24,
     "write_errors": 0,
     "internal_errors": 0,
     # Size-guard counters: the datagram corpus drives a capture writer (no
