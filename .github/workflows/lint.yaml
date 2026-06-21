@@ -103,3 +103,30 @@ jobs:
         run: ruff check --target-version py313 py-ddns
       - name: ruff format --check
         run: ruff format --check py-ddns
+
+  pyweather-gates:
+    name: Py-Weather gates (check / pyright / ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code from GitHub
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff==0.15.13 pyright==1.1.409
+
+      - name: pyweather --check
+        run: PYTHONPATH=py-weather python -m pyweather --check
+
+      - name: pyright
+        run: pyright py-weather/pyweather
+      - name: ruff check
+        run: ruff check --target-version py313 py-weather
+      - name: ruff format --check
+        run: ruff format --check py-weather

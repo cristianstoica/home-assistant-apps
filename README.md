@@ -36,6 +36,20 @@ Each cycle reconciles on an interval with bounded backoff and post-update DNS
 confirmation. Secret-safe by construction: SP secrets, bearer tokens, and the
 callback URL path are never logged.
 
+### [Py-Weather](./py-weather)
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
+
+An adaptive, stdlib-only **poller for Weather.com PWS REST sensors** for Home
+Assistant. It forces a refresh of one representative sensor per station via
+`homeassistant.update_entity` through the Supervisor Core-API proxy, judges each
+station's freshness and health from `/states`, and **adapts the cadence**: a
+randomized fast interval when confirmed, exponential backoff when transient, and a
+slow hold (no tight retry loop) on a terminal token/target fault. Holds no
+Weather.com credentials — the REST integration owns external access — and never
+logs the Supervisor bearer.
+
 ## Install
 
 > **Requires Home Assistant with the Supervisor** (HA OS or Supervised). HA

@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Start the py-weather service
+# s6-overlay docs: https://github.com/just-containers/s6-overlay
+# ==============================================================================
+
+# The pyweather package reads /data/options.json itself (and installs SIGTERM/
+# SIGINT handlers), so nothing to fan out from bashio::config here.
+bashio::log.info "Starting py-weather poller..."
+
+## Run your program
+exec python3 -m pyweather

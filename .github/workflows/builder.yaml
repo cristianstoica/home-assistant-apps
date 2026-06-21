@@ -2,11 +2,11 @@ name: Builder
 
 env:
   # Trigger tokens matched as `${app}/${file}` substrings against the
-  # changed-files list. `pysyslog` / `pyddns` are the package source dirs
-  # (one per add-on, slug-minus-hyphen) so a Python-only change under
-  # `py-syslog/pysyslog/` or `py-ddns/pyddns/` triggers a rebuild — without
-  # them, source-only edits silently skip the image build.
-  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs pysyslog pyddns"
+  # changed-files list. `pysyslog` / `pyddns` / `pyweather` are the package
+  # source dirs (one per add-on, slug-minus-hyphen) so a Python-only change under
+  # `py-syslog/pysyslog/`, `py-ddns/pyddns/`, or `py-weather/pyweather/` triggers a
+  # rebuild — without them, source-only edits silently skip the image build.
+  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs pysyslog pyddns pyweather"
 
 on:
   pull_request:
