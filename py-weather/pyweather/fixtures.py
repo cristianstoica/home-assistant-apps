@@ -107,6 +107,14 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         options=default_options(max_backoff_seconds=59, initial_backoff_seconds=59),
         field="initial_backoff_seconds",
     ),
+    InvalidOptionsFixture(
+        # initial_backoff_seconds is at its default (300, in range) so the
+        # initial range check (lines 151-153 of config.py) passes; the
+        # max_backoff_seconds range check (lines 154-156) fires independently.
+        name="max_backoff_seconds below 60 (initial in range)",
+        options=default_options(max_backoff_seconds=59),
+        field="max_backoff_seconds",
+    ),
     # --- cross-field range relations -----------------------------------------
     InvalidOptionsFixture(
         name="healthy_interval_min > healthy_interval_max",

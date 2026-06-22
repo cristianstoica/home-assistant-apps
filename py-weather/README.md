@@ -59,9 +59,27 @@ store.
 Py-Weather does **not** define any sensors — it refreshes existing ones. Each
 station's representative sensor must already exist in your Home Assistant config
 as `sensor.wu_temp_<key>` (the `sensor.wu_` namespace, **not** the registry
-`sensor.rest_wu_*` `unique_id` form). Set those REST resources' built-in
-`scan_interval` to a long value (e.g. `86400`) so Py-Weather, not the REST
-platform's fixed timer, drives the cadence.
+`sensor.rest_wu_*` `unique_id` form) before Py-Weather can refresh it.
+
+## Safe rollout
+
+Raise the REST resources' built-in `scan_interval` **last**, only after Py-Weather
+is confirmed driving the sensors — otherwise the REST platform's own timer stops
+refreshing them while nothing has taken over, and they can go stale for up to the
+long interval (e.g. 24h):
+
+1. Confirm the REST sensors exist and are refreshing on their normal built-in
+   `scan_interval` (e.g. `300`).
+2. Install and configure Py-Weather with your stations.
+3. Start Py-Weather and confirm from its logs that it is polling and earning a
+   healthy/confirmed cadence — i.e. it is actually driving the sensors.
+4. **Only then** raise the REST resources' built-in `scan_interval` to a long
+   value (e.g. `86400`) so Py-Weather, not the REST platform's fixed timer, drives
+   the cadence.
+5. **Rollback:** if you stop or remove Py-Weather, lower `scan_interval` back to a
+   normal value so the REST platform resumes refreshing on its own; otherwise
+   those sensors go stale (up to the long interval, e.g. 24h) with nothing driving
+   them.
 
 ## Configuration
 

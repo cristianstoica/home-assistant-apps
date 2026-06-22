@@ -1,5 +1,5 @@
 name: Py-Weather
-version: "0.1.0"
+version: "0.1.1"
 slug: py-weather
 description: >-
   Adaptive poller for Weather.com PWS REST sensors. Forces a refresh of one

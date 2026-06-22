@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.1 — clarify scan_interval rollout ordering; add icon; expand config-validation tests
+
+- **Safe rollout doc.** Clarified the correct `scan_interval` migration order in the
+  README: raise the REST sensor `scan_interval` to a long hold value only _after_
+  py-weather is confirmed driving the sensors, not before. Added a rollback note
+  covering how to return control to the REST integration if needed.
+- **Add-on icon.** Added `icon.png` so the add-on displays with the shared family
+  icon in the HA store UI.
+- **Expanded config-validation test coverage.** The offline `--check` oracle now
+  covers additional `config.validate` rejection cases: `max_backoff_seconds` below 60
+  with `initial_backoff_seconds` in range, and `max_backoff_seconds` alone below 60,
+  both pinning the exact field the validator names.
+
 ## 0.1.0 — initial release: adaptive Weather.com PWS poller
 
 First release of **Py-Weather**, a stdlib-only Home Assistant add-on that
