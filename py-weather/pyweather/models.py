@@ -45,10 +45,13 @@ class Config(NamedTuple):
     """Validated, fully-resolved runtime configuration.
 
     Every duration field is range-validated in `config` against an explicit
-    allowlist bound (no open-ended field). `stations` is non-empty with unique,
-    regex-literal keys. `reread_interval_seconds` is an internal cadence (not a
-    user option) reused from `settle_seconds` so the bounded freshness re-reads
-    are spaced through the single sleeper with no additional config surface.
+    allowlist bound (no open-ended field). An **empty** `stations` is legal
+    **only** as the startup auto-populate trigger (resolved at runtime from
+    discovery); a **populated** `stations` still has unique, regex-literal keys,
+    and the `Scheduler` is only ever constructed with a non-empty `stations`
+    tuple. `reread_interval_seconds` is an internal cadence (not a user option)
+    reused from `settle_seconds` so the bounded freshness re-reads are spaced
+    through the single sleeper with no additional config surface.
     """
 
     healthy_interval_min: int

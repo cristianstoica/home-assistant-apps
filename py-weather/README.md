@@ -50,9 +50,11 @@ store.
    **Close**.
 3. The store refreshes — find the **Py-Weather** card, open it, and click
    **Install**.
-4. On the **Configuration** tab, review the cadence options and add your
-   **Stations** (the list ships empty — add one row per Weather.com PWS station
-   you want polled), then **Start**.
+4. On the **Configuration** tab, review the cadence options. If your
+   `sensor.wu_temp_*` entities already exist in Home Assistant you can leave
+   **Stations** empty — the add-on will discover them automatically on first
+   start (see [Auto-populate](#auto-populate-stations)). Otherwise add one row
+   per station manually, then **Start**.
 
 ## Prerequisite: the REST sensors
 
@@ -81,19 +83,55 @@ long interval (e.g. 24h):
    those sensors go stale (up to the long interval, e.g. 24h) with nothing driving
    them.
 
+## Auto-populate stations
+
+When `stations:` is left empty the add-on discovers its fleet automatically at
+startup by reading `/states` from the Supervisor Core-API proxy and matching
+every entity whose id has the form `sensor.wu_temp_<key>`, where `<key>` is
+bare lowercase-alphanumeric. This covers the typical case where the REST
+sensors already exist in Home Assistant and you simply want the add-on to start
+polling without a manual configuration step.
+
+**What happens at startup:**
+
+1. The add-on reads `/states` (up to 5 attempts, spaced by `settle_seconds`,
+   to allow for a brief host-boot lag while REST sensors finish loading).
+2. It performs a confirmation re-read and takes the per-key maximum
+   `expected_sensors` across both reads so a still-loading sibling set is not
+   snapshotted short.
+3. It writes the discovered list back to its own add-on options via the
+   Supervisor API so subsequent restarts find an explicit `stations:` and skip
+   discovery. If that write fails, a paste-ready `stations:` YAML block is
+   logged at WARNING so you can copy it into the Configuration tab manually.
+4. The session then runs off the discovered list exactly as if you had typed
+   it by hand.
+
+**Non-conforming entities** — a `sensor.wu_temp_*` whose id suffix contains an
+underscore or uppercase character (e.g. `sensor.wu_temp_back_yard`) is excluded
+from auto-discovery with a WARNING that names the entity and the expected rename
+target (`sensor.wu_temp_backyard`). Rename the underlying sensor's entity id if
+you want it included.
+
+**If no entities are found** the add-on exits with an error and a hint to check
+`rest.yaml` or populate `stations:` manually.
+
+Once `stations:` is populated (whether by auto-populate or by hand) the
+discovery path is skipped entirely on subsequent restarts and the add-on runs
+in plain manual mode.
+
 ## Configuration
 
-| Option                    | Default | Meaning                                                                                   |
-| ------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| `healthy_interval_min`    | `300`   | Lower bound of the fast cadence window (seconds, 60-86400).                               |
-| `healthy_interval_max`    | `400`   | Upper bound of the fast cadence window; must be `>= min`.                                 |
-| `initial_backoff_seconds` | `300`   | Cold-start / inconclusive holding cadence and the base of backoff (first retry is `* 2`). |
-| `max_backoff_seconds`     | `86400` | Backoff cap and the terminal holding cadence; must be `>= initial`.                       |
-| `settle_seconds`          | `15`    | Wait before the first `/states` read and the spacing between freshness re-reads (1-300).  |
-| `startup_stagger_seconds` | `10`    | Delay between each station's first poll at launch (1-300).                                |
-| `request_timeout_seconds` | `30`    | Per-call Core-API proxy timeout (1-300).                                                  |
-| `log_level`               | `info`  | `debug` / `info` / `warning` / `error`.                                                   |
-| `stations`                | `[]`    | The stations to poll: `key`, `update_entity`, `expected_sensors` per row.                 |
+| Option                    | Default | Meaning                                                                                                                                       |
+| ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `healthy_interval_min`    | `300`   | Lower bound of the fast cadence window (seconds, 60-86400).                                                                                   |
+| `healthy_interval_max`    | `400`   | Upper bound of the fast cadence window; must be `>= min`.                                                                                     |
+| `initial_backoff_seconds` | `300`   | Cold-start / inconclusive holding cadence and the base of backoff (first retry is `* 2`).                                                     |
+| `max_backoff_seconds`     | `86400` | Backoff cap and the terminal holding cadence; must be `>= initial`.                                                                           |
+| `settle_seconds`          | `15`    | Wait before the first `/states` read and the spacing between freshness re-reads (1-300).                                                      |
+| `startup_stagger_seconds` | `10`    | Delay between each station's first poll at launch (1-300).                                                                                    |
+| `request_timeout_seconds` | `30`    | Per-call Core-API proxy timeout (1-300).                                                                                                      |
+| `log_level`               | `info`  | `debug` / `info` / `warning` / `error`.                                                                                                       |
+| `stations`                | `[]`    | Stations to poll: `key`, `update_entity`, `expected_sensors` per row. Leave empty to auto-populate from existing `sensor.wu_temp_*` entities. |
 
 Each station row:
 

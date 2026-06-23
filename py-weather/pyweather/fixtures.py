@@ -56,10 +56,13 @@ def default_stations() -> list[dict[str, Any]]:
 
 
 def default_options(**overrides: Any) -> dict[str, Any]:
-    """A valid default options payload (mirrors ``config.yaml`` defaults).
+    """A valid default options payload.
 
-    Override individual top-level keys via ``**overrides`` (e.g. a bad range or a
-    replaced ``stations`` list).
+    Cadence/timeout/log-level values mirror the ``config.yaml`` defaults; ``stations``
+    is a synthetic eight-station fleet (NOT the manifest's ``stations: []`` first-run
+    placeholder) so the validator/health oracles exercise the real key/entity-id shape.
+    Override any top-level key via ``**overrides`` (e.g. ``stations=[]`` for the
+    auto-populate-trigger case).
     """
     base: dict[str, Any] = {
         "healthy_interval_min": 300,
@@ -139,11 +142,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
         field="log_level",
     ),
     # --- stations list shape --------------------------------------------------
-    InvalidOptionsFixture(
-        name="empty stations list",
-        options=default_options(stations=[]),
-        field="stations",
-    ),
     InvalidOptionsFixture(
         name="duplicate station keys",
         options=default_options(

@@ -173,12 +173,10 @@ def validate(options: dict[str, object]) -> Config:
 
     raw_stations = options.get("stations")
     if raw_stations is None:
-        raise ConfigError("stations: required (at least one station)")
+        raise ConfigError("stations: required (a list, possibly empty)")
     if not isinstance(raw_stations, list):
         raise ConfigError("stations: must be a list")
     stations_list = cast(list[object], raw_stations)
-    if not stations_list:
-        raise ConfigError("stations: must be non-empty (at least one station)")
 
     stations: list[Station] = []
     seen_keys: set[str] = set()

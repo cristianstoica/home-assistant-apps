@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.2.0 — auto-populate stations from existing `sensor.wu_temp_*` entities
+
+- **Auto-discover station fleet.** When `stations:` is left empty at startup,
+  the add-on reads `/states` from the Supervisor Core-API proxy, matches every
+  `sensor.wu_temp_<key>` entity whose suffix is bare lowercase-alphanumeric, and
+  builds the station list from those matches. Discovery is bounded (up to 5
+  attempts with a settle wait between each) so a brief host-boot lag — where the
+  REST sensors have not finished loading — does not produce a false empty fleet.
+- **Count stabilisation.** After the first successful scan the add-on performs a
+  confirmation re-read and takes the per-key maximum `expected_sensors` across
+  both reads, so a sibling set that was still loading at first-scan time does not
+  get snapshotted short.
+- **Best-effort persistence.** The discovered list is written back to the add-on's
+  own options via `POST /addons/self/options` so subsequent restarts find an
+  explicit `stations:` and skip discovery. If the persist call fails the add-on
+  logs a paste-ready `stations:` YAML block at WARNING so the operator can copy it
+  into the Configuration tab manually, then continues the session off the
+  discovered list.
+- **Non-conforming entities skipped, not rejected.** A `sensor.wu_temp_*` whose
+  id suffix contains an underscore or uppercase character (e.g.
+  `sensor.wu_temp_back_yard`) is excluded from auto-discovery with a WARNING
+  naming the entity and the expected rename target; it does not abort the run.
+- **Manual mode unchanged.** When `stations:` is non-empty, the auto-discover and
+  persist paths are skipped entirely; the add-on runs as before.
+- **New manifest grant.** `hassio_api: true` is now required in the manifest (it
+  was not present in earlier releases). This grants write access to
+  `POST /addons/self/options` for the persistence step; it does NOT grant any
+  elevated Supervisor role.
+- **Expanded `--check` coverage.** The offline oracle now covers the full
+  discovery and persistence paths: the pure `discover_stations`/`merge_station_counts`
+  transform, the `SupervisorSelfClient.set_options` body and header contract, the
+  persist-failure paste-block fallback, the cap-exhaustion error variants, and the
+  SIGTERM-during-settle shutdown path.
+
 ## 0.1.1 — clarify scan_interval rollout ordering; add icon; expand config-validation tests
 
 - **Safe rollout doc.** Clarified the correct `scan_interval` migration order in the

@@ -30,6 +30,11 @@ from .config_checks import (
     check_station_key_contract,
     check_valid_defaults,
 )
+from .discovery_checks import (
+    check_discovery_construction_passes_validator,
+    check_discovery_merge_and_render,
+    check_discovery_transform,
+)
 from .health_checks import check_freshness, check_health
 from .report import report
 from .scheduler_checks import (
@@ -44,7 +49,16 @@ from .scheduler_checks import (
     check_transient_path,
 )
 from .secrets_check import check_no_secret_leakage
-from .shaping import check_request_shaping
+from .shaping import check_request_shaping, check_supervisor_request_shaping
+from .startup_checks import (
+    check_discover_count_stability,
+    check_discover_message_discriminators,
+    check_discover_retry_and_exit,
+    check_persist_allowlist_completeness,
+    check_persist_best_effort,
+    check_run_startup_branches,
+    check_skipped_entity_warnings,
+)
 
 __all__ = ["run_check"]
 
@@ -94,7 +108,20 @@ def run_check() -> int:
     ok = _guarded("invalid-options", check_invalid_options, ok)
     ok = _guarded("entity-shape", check_entity_shape, ok)
     ok = _guarded("station-key", check_station_key_contract, ok)
+    ok = _guarded("discovery-transform", check_discovery_transform, ok)
+    ok = _guarded("discovery-merge", check_discovery_merge_and_render, ok)
+    ok = _guarded(
+        "discovery-validator", check_discovery_construction_passes_validator, ok
+    )
     ok = _guarded("request-shaping", check_request_shaping, ok)
+    ok = _guarded("supervisor-shaping", check_supervisor_request_shaping, ok)
+    ok = _guarded("persist-allowlist", check_persist_allowlist_completeness, ok)
+    ok = _guarded("discover-retry", check_discover_retry_and_exit, ok)
+    ok = _guarded("discover-messages", check_discover_message_discriminators, ok)
+    ok = _guarded("discover-count", check_discover_count_stability, ok)
+    ok = _guarded("persist-best-effort", check_persist_best_effort, ok)
+    ok = _guarded("skipped-entity-warnings", check_skipped_entity_warnings, ok)
+    ok = _guarded("run-startup", check_run_startup_branches, ok)
     ok = _guarded("health", check_health, ok)
     ok = _guarded("freshness", check_freshness, ok)
     ok = _guarded("freshness-reread", check_freshness_reread_recovery, ok)

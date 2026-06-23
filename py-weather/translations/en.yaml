@@ -53,7 +53,11 @@ configuration:
       alphanumeric station id (the entity-id suffix); update_entity is that
       station's representative sensor and must be sensor.wu_temp_<key> (never the
       registry sensor.rest_wu_* unique-id form); expected_sensors is a soft signal
-      — a discovered count short of it is logged, not treated as unhealthy.
+      — a discovered count short of it is logged, not treated as unhealthy. Leave
+      this list empty to auto-populate once: on first start the add-on discovers
+      stations from your existing sensor.wu_temp_* entities, writes them back
+      here, and thereafter behaves as a plain manual list (edit or remove rows as
+      normal).
     fields:
       key:
         name: Station key

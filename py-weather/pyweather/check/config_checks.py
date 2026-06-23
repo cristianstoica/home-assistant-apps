@@ -51,6 +51,10 @@ def check_valid_defaults() -> bool:
             "every default station expects 10 sensors",
             all(s.expected_sensors == 10 for s in cfg.stations),
         ),
+        (
+            "empty stations list resolves to an empty Config.stations tuple",
+            config.validate(fixtures.default_options(stations=[])).stations == (),
+        ),
     ]
     return report("VALID-DEFAULTS", "valid-defaults", checks)
 
@@ -172,16 +176,17 @@ def check_entity_shape() -> bool:
 def check_station_key_contract() -> bool:
     """Pure station-key contract validation (no ``/states``).
 
-    Rejects an empty ``stations`` list; rejects the invalid keys ``istation_01``
-    (underscore), ``ISTATION01`` (uppercase), and ``.*`` (regex metacharacters);
-    accepts the valid keys ``istation01`` and ``istation08``. For the ``.*`` case,
-    additionally proves the key is regex-literal: a wrong-suffix ``update_entity``
-    under key ``.*`` is still rejected (the key is not treated as a wildcard).
+    Accepts an empty ``stations`` list (the auto-populate trigger, resolved at
+    runtime); rejects the invalid keys ``istation_01`` (underscore), ``ISTATION01``
+    (uppercase), and ``.*`` (regex metacharacters); accepts the valid keys
+    ``istation01`` and ``istation08``. For the ``.*`` case, additionally proves the
+    key is regex-literal: a wrong-suffix ``update_entity`` under key ``.*`` is still
+    rejected (the key is not treated as a wildcard).
     """
     checks: list[tuple[str, bool]] = [
         (
-            "empty stations list rejected",
-            _rejects(fixtures.default_options(stations=[])),
+            "empty stations list accepted (auto-populate trigger; resolved at runtime)",
+            _accepts(fixtures.default_options(stations=[])),
         ),
         (
             "key 'istation_01' (underscore) rejected",

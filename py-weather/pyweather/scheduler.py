@@ -33,6 +33,7 @@ from __future__ import annotations
 import logging
 import random
 from datetime import datetime
+from typing import Protocol
 
 from .config import Config
 from .errors import TerminalError, TransientError
@@ -41,6 +42,22 @@ from .health import evaluate
 from .models import Clock, HealthStatus, Sleeper, Station, WallClock
 
 _log = logging.getLogger("pyweather")
+
+
+class SchedulerRunner(Protocol):
+    """The run-only seam `StartupDeps.make_scheduler` produces.
+
+    The single method `run_startup` calls on a built scheduler. The real
+    `Scheduler` satisfies it structurally (no explicit inheritance), as does the
+    `--check` oracle's `_RecordingScheduler` — so the recording factory is
+    assignable to the `make_scheduler` callable under pyright-strict with no cast
+    or `# type: ignore`, exactly as `SupervisorOptions` does for the persistence
+    seam. Typing the seam against this Protocol (not the concrete `Scheduler`) is
+    what keeps the `--check` scheduler stand-in type-clean.
+    """
+
+    def run_loop(self) -> None: ...
+
 
 # Bounded best-effort freshness settle: after the initial settle wait and the
 # first /states read, re-read up to this many more times if freshness has not
