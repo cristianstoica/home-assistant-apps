@@ -7,8 +7,8 @@ bearer:
 * ``POST http://supervisor/core/api/services/homeassistant/update_entity`` with
   the JSON body ``{"entity_id": "<station.update_entity>"}`` — drives the sibling
   Weather.com REST sensor to refresh.
-* ``GET http://supervisor/core/api/states`` — reads every entity's state +
-  timestamps, projected into `EntityState` for the health/freshness evaluation.
+* ``GET http://supervisor/core/api/states`` — reads every entity's state,
+  projected into `EntityState` for the health evaluation.
 
 The ``/core`` segment is **required** (the Supervisor proxy form); the direct-Core
 ``/api/...`` form is wrong for an add-on and is never produced here.
@@ -70,19 +70,6 @@ def _classify(exc: HttpError, *, is_update_entity: bool) -> Exception:
         return TerminalError(f"{target}: {exc}")
     # 5xx and anything else server-side: retryable.
     return TransientError(str(exc))
-
-
-def _parse_timestamp(value: object) -> str | None:
-    """Project a raw ``last_*`` field to a non-empty string, else ``None``.
-
-    A present-but-``null`` (JSON ``null`` → Python ``None``) or empty/whitespace
-    string is normalized to ``None`` so the freshness check routes it to the
-    degrade-safe fallback rather than treating it as a real signal. A non-string,
-    non-null value (unexpected shape) is also ``None``.
-    """
-    if not isinstance(value, str):
-        return None
-    return value if value.strip() != "" else None
 
 
 class HaApiClient:
@@ -171,13 +158,5 @@ class HaApiClient:
                     "GET /states: schema-invalid entity "
                     "(entity_id/state missing or not strings)"
                 )
-            states.append(
-                EntityState(
-                    entity_id=entity_id,
-                    state=state,
-                    last_reported=_parse_timestamp(obj.get("last_reported")),
-                    last_updated=_parse_timestamp(obj.get("last_updated")),
-                    last_changed=_parse_timestamp(obj.get("last_changed")),
-                )
-            )
+            states.append(EntityState(entity_id=entity_id, state=state))
         return states

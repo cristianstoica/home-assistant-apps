@@ -24,6 +24,12 @@ from collections.abc import Callable
 
 from .. import fixtures
 from ..redact import sanitize
+from .cadence_checks import (
+    check_cadence_estimator,
+    check_clamp,
+    check_jitter_band,
+    check_stale_predicate,
+)
 from .config_checks import (
     check_entity_shape,
     check_invalid_options,
@@ -35,21 +41,20 @@ from .discovery_checks import (
     check_discovery_merge_and_render,
     check_discovery_transform,
 )
-from .health_checks import check_freshness, check_health
+from .health_checks import check_health
 from .report import report
 from .scheduler_checks import (
     check_429_precedence,
-    check_backoff_reset_after_recovery,
-    check_backoff_sequence,
-    check_freshness_reread_recovery,
-    check_healthy_interval_bounds,
-    check_reward_split,
+    check_boot_state_resumes,
+    check_cadence_event_recording,
     check_stop_during_waits,
     check_terminal_path,
+    check_three_rest_table,
     check_transient_path,
 )
 from .secrets_check import check_no_secret_leakage
 from .shaping import check_request_shaping, check_supervisor_request_shaping
+from .state_checks import check_state_roundtrip, check_state_tolerant_load
 from .startup_checks import (
     check_discover_count_stability,
     check_discover_message_discriminators,
@@ -122,16 +127,19 @@ def run_check() -> int:
     ok = _guarded("persist-best-effort", check_persist_best_effort, ok)
     ok = _guarded("skipped-entity-warnings", check_skipped_entity_warnings, ok)
     ok = _guarded("run-startup", check_run_startup_branches, ok)
+    ok = _guarded("cadence-estimator", check_cadence_estimator, ok)
+    ok = _guarded("clamp", check_clamp, ok)
+    ok = _guarded("jitter-band", check_jitter_band, ok)
+    ok = _guarded("stale-predicate", check_stale_predicate, ok)
+    ok = _guarded("state-roundtrip", check_state_roundtrip, ok)
+    ok = _guarded("state-tolerant", check_state_tolerant_load, ok)
     ok = _guarded("health", check_health, ok)
-    ok = _guarded("freshness", check_freshness, ok)
-    ok = _guarded("freshness-reread", check_freshness_reread_recovery, ok)
-    ok = _guarded("reward-split", check_reward_split, ok)
+    ok = _guarded("three-rest", check_three_rest_table, ok)
+    ok = _guarded("cadence-event", check_cadence_event_recording, ok)
+    ok = _guarded("boot-resume", check_boot_state_resumes, ok)
     ok = _guarded("terminal-path", check_terminal_path, ok)
     ok = _guarded("transient-path", check_transient_path, ok)
     ok = _guarded("429-precedence", check_429_precedence, ok)
-    ok = _guarded("healthy-interval", check_healthy_interval_bounds, ok)
-    ok = _guarded("backoff-sequence", check_backoff_sequence, ok)
-    ok = _guarded("backoff-reset", check_backoff_reset_after_recovery, ok)
     ok = _guarded("stop-during-waits", check_stop_during_waits, ok)
     ok = _guarded("no-secret-leakage", check_no_secret_leakage, ok)
     ok = _guarded("harness-backstop", check_harness_backstop, ok)

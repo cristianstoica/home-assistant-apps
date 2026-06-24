@@ -32,10 +32,8 @@ _LOG = logging.getLogger("pyweather.check")
 # `to_options_dict` in the same change; the check cannot detect a manifest field
 # you forgot to add to both.
 _MANIFEST_OPTION_KEYS = {
-    "healthy_interval_min",
-    "healthy_interval_max",
-    "initial_backoff_seconds",
     "max_backoff_seconds",
+    "min_interval_seconds",
     "settle_seconds",
     "startup_stagger_seconds",
     "request_timeout_seconds",
@@ -272,7 +270,7 @@ def check_discover_retry_and_exit() -> bool:
 
     # --- boot-race recovery: zero on attempt 0, station appears on attempt 1 ----
     # The bounded retry's whole reason to exist (design: a single early-boot scan
-    # may see zero sensor.wu_temp_* purely from Core's REST sensors not yet loaded).
+    # may see zero sensor.wu_obstimeutc_* purely from Core's REST sensors not yet loaded).
     # Proves the loop RECOVERS — zero-match then a station appears before the cap —
     # rather than only proving the exhaustion paths.
     http_recover = FakeHttp(
@@ -377,9 +375,9 @@ def check_discover_message_discriminators() -> bool:
 def check_discover_count_stability() -> bool:
     """Assert the per-key count-stability confirmation re-read (max) + station union.
 
-    count-stability: first read has only `sensor.wu_temp_istation01`; the second
-    (confirmation) read has temp+humidity+pressure+uv ⇒ resolved
-    `expected_sensors == 4` (the fuller second-read count), proving the per-key
+    count-stability: first read has only `sensor.wu_obstimeutc_istation01`; the
+    second (confirmation) read has obstimeutc+temp+humidity+pressure+uv ⇒ resolved
+    `expected_sensors == 5` (the fuller second-read count), proving the per-key
     `max` confirmation re-read fired. Sibling-lower twin: second read LOWER than
     first ⇒ count stays at the higher first-read value (max, never last-wins).
     station-set union: a confirm-only `istation02` is unioned into the resolved
@@ -390,9 +388,11 @@ def check_discover_count_stability() -> bool:
     cfg = _discovered_cfg()
     checks: list[tuple[str, bool]] = []
 
-    # --- count grows on confirmation ⇒ max (4, not 1) -----------------------
-    first_thin = [{"entity_id": "sensor.wu_temp_istation01", "state": "10.0"}]
-    second_full = fixtures.station_states("istation01")  # temp+humidity+pressure+uv = 4
+    # --- count grows on confirmation ⇒ max (5, not 1) -----------------------
+    first_thin = [{"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}]
+    second_full = fixtures.station_states(
+        "istation01"
+    )  # obstimeutc+temp+humidity+pressure+uv = 5
     http_grow = FakeHttp(states_response(first_thin), states_response(second_full))
     sup_grow = FakeSupervisorSelfClient()
     result_grow = run(_api(http_grow), sup_grow, FakeSleeper(), cfg, log=_LOG)
@@ -400,8 +400,8 @@ def check_discover_count_stability() -> bool:
     by_key_grow = {s.key: s for s in result_grow}
     checks += [
         (
-            "count-stability ⇒ resolved expected_sensors is the fuller second-read count (4)",
-            by_key_grow["istation01"].expected_sensors == 4,
+            "count-stability ⇒ resolved expected_sensors is the fuller second-read count (5)",
+            by_key_grow["istation01"].expected_sensors == 5,
         ),
         (
             "count-stability ⇒ persisted once (resolved, best-effort)",
@@ -410,8 +410,10 @@ def check_discover_count_stability() -> bool:
     ]
 
     # --- confirmation LOWER ⇒ keep higher first-read value (max) ------------
-    first_full = fixtures.station_states("istation01")  # 4
-    second_thin = [{"entity_id": "sensor.wu_temp_istation01", "state": "10.0"}]  # 1
+    first_full = fixtures.station_states("istation01")  # 5
+    second_thin = [
+        {"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}
+    ]  # 1
     http_lower = FakeHttp(states_response(first_full), states_response(second_thin))
     result_lower = run(
         _api(http_lower), FakeSupervisorSelfClient(), FakeSleeper(), cfg, log=_LOG
@@ -420,16 +422,16 @@ def check_discover_count_stability() -> bool:
     by_key_lower = {s.key: s for s in result_lower}
     checks.append(
         (
-            "count-stability ⇒ confirmation lower keeps higher first-read count (4, max)",
-            by_key_lower["istation01"].expected_sensors == 4,
+            "count-stability ⇒ confirmation lower keeps higher first-read count (5, max)",
+            by_key_lower["istation01"].expected_sensors == 5,
         )
     )
 
     # --- confirm-only key ⇒ unioned into resolved + persisted ---------------
-    first_one = [{"entity_id": "sensor.wu_temp_istation01", "state": "10.0"}]
+    first_one = [{"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}]
     second_two = [
-        {"entity_id": "sensor.wu_temp_istation01", "state": "10.0"},
-        {"entity_id": "sensor.wu_temp_istation02", "state": "11.0"},
+        {"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"},
+        {"entity_id": "sensor.wu_obstimeutc_istation02", "state": "11.0"},
     ]
     http_union = FakeHttp(states_response(first_one), states_response(second_two))
     sup_union = FakeSupervisorSelfClient()
@@ -565,7 +567,7 @@ def check_persist_best_effort() -> bool:
             "persist FAILURE ⇒ WARNING includes a rendered stations: block with the discovered row",
             "stations:" in warn_msg
             and "key: istation01" in warn_msg
-            and "update_entity: sensor.wu_temp_istation01" in warn_msg,
+            and "update_entity: sensor.wu_obstimeutc_istation01" in warn_msg,
         ),
     ]
     return report("PERSIST-BEST-EFFORT", "persist-best-effort", checks)
@@ -587,10 +589,10 @@ def check_skipped_entity_warnings() -> bool:
 
     First read: a conforming `istation01` (so `stations` is truthy ⇒ the
     confirmation path is reached and persist is attempted) ALONGSIDE a
-    non-conforming `sensor.wu_temp_back_yard` (underscore suffix). Confirmation
-    read: keeps `istation01` and introduces a DIFFERENT non-conforming
-    `sensor.wu_temp_UPPER` (uppercase) that surfaces only on the second read — so
-    asserting on it pins the confirmation-read branch specifically.
+    non-conforming `sensor.wu_obstimeutc_back_yard` (underscore suffix).
+    Confirmation read: keeps `istation01` and introduces a DIFFERENT non-conforming
+    `sensor.wu_obstimeutc_UPPER` (uppercase) that surfaces only on the second read —
+    so asserting on it pins the confirmation-read branch specifically.
     """
     run = _discover_and_persist()
     cfg = _discovered_cfg()
@@ -608,13 +610,13 @@ def check_skipped_entity_warnings() -> bool:
 
     first_read = fixtures.station_states("istation01") + [
         {
-            "entity_id": "sensor.wu_temp_back_yard",
+            "entity_id": "sensor.wu_obstimeutc_back_yard",
             "state": "10.0",
         },  # underscore ⇒ skipped (read 1)
     ]
     confirm_read = fixtures.station_states("istation01") + [
         {
-            "entity_id": "sensor.wu_temp_UPPER",
+            "entity_id": "sensor.wu_obstimeutc_UPPER",
             "state": "11.0",
         },  # uppercase ⇒ skipped (read 2 only)
     ]
@@ -630,12 +632,12 @@ def check_skipped_entity_warnings() -> bool:
             result_skip is not None and {s.key for s in result_skip} == {"istation01"},
         ),
         (
-            "first-read skip ⇒ WARNING names sensor.wu_temp_back_yard",
-            "sensor.wu_temp_back_yard" in warn_msg,
+            "first-read skip ⇒ WARNING names sensor.wu_obstimeutc_back_yard",
+            "sensor.wu_obstimeutc_back_yard" in warn_msg,
         ),
         (
-            "confirm-only skip ⇒ WARNING names sensor.wu_temp_UPPER (pins the confirmation-read branch)",
-            "sensor.wu_temp_UPPER" in warn_msg,
+            "confirm-only skip ⇒ WARNING names sensor.wu_obstimeutc_UPPER (pins the confirmation-read branch)",
+            "sensor.wu_obstimeutc_UPPER" in warn_msg,
         ),
         (
             "skip WARNING names the lowercase-alphanumeric contract",

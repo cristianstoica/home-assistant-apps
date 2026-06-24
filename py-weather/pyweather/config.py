@@ -55,10 +55,6 @@ _MAX_SHORT = 300
 # construction, so the key can be interpolated into the entity matcher / glob.
 _STATION_KEY_RE = re.compile(r"^[a-z0-9]+$")
 
-# The required-core metric subset: a station is unhealthy if any of these is
-# unusable or absent. Optional metrics (e.g. `uv`) are non-fatal.
-REQUIRED_CORE_METRICS = ("temp", "humidity", "pressure")
-
 
 class ConfigError(Exception):
     """Raised when options are invalid; the message names the offending field."""
@@ -142,17 +138,17 @@ def validate(options: dict[str, object]) -> Config:
     Pure with respect to its argument (no I/O, no logging). Raises `ConfigError`
     naming the field on any bad type, out-of-range value, or contract breach.
     """
-    healthy_interval_min = _range_int(
-        options, "healthy_interval_min", 300, _MIN_CADENCE, _MAX_CADENCE
-    )
-    healthy_interval_max = _range_int(
-        options, "healthy_interval_max", 400, _MIN_CADENCE, _MAX_CADENCE
-    )
-    initial_backoff_seconds = _range_int(
-        options, "initial_backoff_seconds", 300, _MIN_CADENCE, _MAX_CADENCE
-    )
     max_backoff_seconds = _range_int(
         options, "max_backoff_seconds", 86400, _MIN_CADENCE, _MAX_CADENCE
+    )
+    # The high bound is the fixed 1800s healthy-slow-uploader ceiling
+    # (== cadence.MAX, the clamp ceiling), NOT _MAX_CADENCE: the learned interval
+    # is clamp(period * FACTOR, min_interval_seconds, cadence.MAX), so capping the
+    # floor at 1800 guarantees low <= high at the clamp call site (a floor above
+    # the ceiling would invert the clamp and void the ceiling). Hard-coded rather
+    # than importing cadence.MAX to keep config.py importing only from .models.
+    min_interval_seconds = _range_int(
+        options, "min_interval_seconds", 300, _MIN_CADENCE, 1800
     )
     settle_seconds = _range_int(options, "settle_seconds", 15, _MIN_SHORT, _MAX_SHORT)
     startup_stagger_seconds = _range_int(
@@ -161,11 +157,6 @@ def validate(options: dict[str, object]) -> Config:
     request_timeout_seconds = _range_int(
         options, "request_timeout_seconds", 30, _MIN_SHORT, _MAX_SHORT
     )
-
-    if healthy_interval_min > healthy_interval_max:
-        raise ConfigError("healthy_interval_min: must be <= healthy_interval_max")
-    if max_backoff_seconds < initial_backoff_seconds:
-        raise ConfigError("max_backoff_seconds: must be >= initial_backoff_seconds")
 
     log_level = _require_str(options, "log_level", "info")
     if log_level not in _VALID_LOG_LEVELS:
@@ -188,10 +179,8 @@ def validate(options: dict[str, object]) -> Config:
         stations.append(station)
 
     return Config(
-        healthy_interval_min=healthy_interval_min,
-        healthy_interval_max=healthy_interval_max,
-        initial_backoff_seconds=initial_backoff_seconds,
         max_backoff_seconds=max_backoff_seconds,
+        min_interval_seconds=min_interval_seconds,
         settle_seconds=settle_seconds,
         startup_stagger_seconds=startup_stagger_seconds,
         request_timeout_seconds=request_timeout_seconds,

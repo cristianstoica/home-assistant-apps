@@ -7,39 +7,62 @@ station's in-memory state — returning the seconds until its next poll. `run_lo
 wraps the per-station polls in a single stop-aware timer loop. Every dependency
 is an explicit constructor argument (no module globals).
 
-Key invariants (from the plan):
+Scheduling model — the **four-rest table** (each poll returns exactly one):
 
-* **Cold start is slow.** Every station starts at the slow/holding cadence
-  (``initial_backoff_seconds``) with **no** immediate fast first poll — a healthy,
-  positively-confirmed first poll *earns* the fast 300-400s cadence. State is
-  in-memory only, so a restart is a cold start: a crash loop cannot re-hammer
-  stations that were correctly held slow, while a genuinely healthy station
-  re-earns its fast cadence on its first confirmed poll.
-* **Reward split.** A *positively-confirmed* poll (primary ``last_reported`` or a
-  fallback timestamp advanced) resets ``current_backoff`` to
-  ``initial_backoff_seconds`` and schedules the next poll at a random
-  ``[healthy_interval_min, healthy_interval_max]``. An *inconclusive-fallback
-  accept* is healthy but holds the prior/slow cadence — never the fast reward.
-* **Backoff split.** A *transient* unhealthy poll doubles ``current_backoff``
-  (first retry ``initial_backoff_seconds * 2``), capped at ``max_backoff_seconds``.
-  A *terminal* fault holds at ``max_backoff_seconds`` (no doubling).
-* **Interruptible everywhere.** The settle wait and the freshness re-read waits
-  all run through the single stop-aware sleeper, so a SIGTERM mid-wait returns
-  promptly and starts no further read/poll.
+* ``ONLINE`` → the **learned cadence**. The obstime sensor is present and
+  parseable; the poll interval is recomputed from the station's rolling
+  ``obsTimeUtc`` window (`cadence.jittered_interval`), so the poller tracks the
+  uploader's real cadence with ±15% jitter applied through the injected
+  `JitterSource`.
+* ``OFFLINE`` → ``cadence.OFFLINE_REPROBE`` (86400). A WU 204 / dead station is
+  re-probed once a day; the cadence window is frozen (no event appended).
+* ``TERMINAL`` → ``max_backoff_seconds`` (86400). A non-retryable config/token
+  fault, raised by the API client, held on the slow cadence.
+* ``TransientError`` **and** an interrupted settle wait →
+  ``min_interval_seconds`` (300). A transient blip (timeout, 5xx, transient
+  429) retries soon at the floor — it is not a dead station and must not inherit
+  the daily ``OFFLINE_REPROBE`` cadence. A stop signal that interrupts the
+  settle wait raises `TransientError` from `_read_health`, so it funnels into
+  the same rest.
+
+**Cadence learning.** On every ONLINE poll, if the read obstime differs from the
+last seen one, it is appended to the station's window (truncated to the last
+``cadence.N``) and the learned interval is re-derived. The window is seeded from
+the persisted ``/data`` boot state, so a restart resumes the learned cadence
+instead of cold-starting; the last persisted obstime seeds the dedupe comparand
+so the first post-restart poll does not re-append it. After every non-raising
+poll the in-memory windows are written back through the debounced best-effort
+``save`` seam (a ``/data`` write failure is swallowed, never crashing the loop).
+
+**Advisory stale log.** When the last observed obstime is older than ``3×`` the
+unjittered learned interval, an advisory line is logged (the predicate is fed
+the unjittered ``base`` so the boundary is stable poll-to-poll). It does not
+change the scheduled rest.
+
+**Interruptible everywhere.** The settle wait runs through the single stop-aware
+sleeper, so a SIGTERM mid-wait returns promptly and starts no further read/poll.
 """
 
 from __future__ import annotations
 
 import logging
-import random
-from datetime import datetime
-from typing import Protocol
+from collections.abc import Callable
+from typing import NamedTuple, Protocol
 
+from . import cadence
 from .config import Config
 from .errors import TerminalError, TransientError
 from .haapi import HaApiClient
-from .health import evaluate
-from .models import Clock, HealthStatus, Sleeper, Station, WallClock
+from .health import discover, evaluate
+from .models import (
+    Clock,
+    HealthStatus,
+    JitterSource,
+    Sleeper,
+    Station,
+    StationCadence,
+    WallClock,
+)
 
 _log = logging.getLogger("pyweather")
 
@@ -59,24 +82,31 @@ class SchedulerRunner(Protocol):
     def run_loop(self) -> None: ...
 
 
-# Bounded best-effort freshness settle: after the initial settle wait and the
-# first /states read, re-read up to this many more times if freshness has not
-# advanced. Each re-read is preceded by a wait through the single sleeper, capped
-# by an explicit total deadline (settle + MAX_FRESHNESS_REREADS * reread_interval).
-MAX_FRESHNESS_REREADS = 2
+class _HealthRead(NamedTuple):
+    """The completed-read result of `_read_health`: the binary health signal and
+    the raw ``obsTimeUtc`` string seen this poll (``None`` when offline /
+    no parseable observation). Reached only on a settled, completed read — a
+    stop during settle raises `TransientError` instead of returning this."""
+
+    status: HealthStatus
+    obstime: str | None
 
 
 class StationState:
-    """Mutable per-station scheduling state (in-memory only; no persistence).
+    """Mutable per-station scheduling state (in-memory, mirrored to ``/data``).
 
-    `current_backoff` is the live backoff value the doubling sequence mutates and
-    a confirmed poll resets to ``initial_backoff_seconds`` — pinning the reset
-    proves a healthy poll actually mutates stored backoff, not a transient value.
+    `cadence` is the live rolling ``obsTimeUtc`` window (seeded from the boot
+    state map); `last_obstime` is the last seen obstime, the dedupe comparand so
+    an unchanged observation is not re-appended. Both are seeded from the loaded
+    window's tail so the first poll after a restart compares against the
+    persisted observation rather than re-appending it.
     """
 
-    def __init__(self, station: Station, initial_backoff: int) -> None:
+    def __init__(self, station: Station, state: dict[str, StationCadence]) -> None:
         self.station = station
-        self.current_backoff = initial_backoff
+        seeded = state.get(station.key, StationCadence(events=()))
+        self.cadence = seeded
+        self.last_obstime = seeded.events[-1] if seeded.events else None
 
 
 class Scheduler:
@@ -90,56 +120,43 @@ class Scheduler:
         clock: Clock,
         wall_clock: WallClock,
         sleeper: Sleeper,
-        rng: random.Random,
+        jitter: JitterSource,
+        state: dict[str, StationCadence],
+        save: Callable[[dict[str, StationCadence]], None],
     ) -> None:
         self._config = config
         self._api = api
         self._clock = clock
         self._wall_clock = wall_clock
         self._sleeper = sleeper
-        self._rng = rng
+        self._jitter = jitter
+        self._save = save
         self._states = {
-            station.key: StationState(station, config.initial_backoff_seconds)
-            for station in config.stations
+            station.key: StationState(station, state) for station in config.stations
         }
 
     def state_for(self, key: str) -> StationState:
         """Return the mutable `StationState` for `key` (oracle introspection)."""
         return self._states[key]
 
-    def _healthy_interval(self) -> int:
-        """A random healthy cadence in ``[healthy_interval_min, healthy_interval_max]``."""
-        return self._rng.randint(
-            self._config.healthy_interval_min, self._config.healthy_interval_max
-        )
+    def _collect_state(self) -> dict[str, StationCadence]:
+        """Snapshot the live per-station cadence windows for the debounced save."""
+        return {key: ss.cadence for key, ss in self._states.items()}
 
-    def _double_backoff(self, state: StationState) -> int:
-        """Double `current_backoff` (capped at ``max_backoff_seconds``); store + return.
+    def _read_health(self, station: Station) -> _HealthRead:
+        """Settle once, GET /states, evaluate; return ``(status, obstime)``.
 
-        On the first unhealthy poll after a reset, ``current_backoff`` is the
-        floor ``initial_backoff_seconds``, so the doubled value is the
-        first-retry ``initial_backoff_seconds * 2``. Doubling compounds across
-        sequential unhealthy polls until capped.
+        Raises `TransientError` if the stop-aware settle wait is interrupted
+        (so the interrupt funnels into `poll_station`'s ``except TransientError``
+        rest at ``min_interval_seconds``) — never returns on that path. On a
+        completed read the obstime is the raw ``obsTimeUtc`` string when ONLINE
+        (the cadence-learning event), else ``None``.
         """
-        doubled = min(state.current_backoff * 2, self._config.max_backoff_seconds)
-        state.current_backoff = doubled
-        return doubled
-
-    def _read_states_with_freshness(
-        self, station: Station, t0: datetime
-    ) -> HealthStatus:
-        """Settle, GET /states, evaluate; re-read up to the bound if not yet fresh.
-
-        Returns the final `HealthStatus` (never TERMINAL — that propagates as a
-        `TerminalError` from the API client). Each inter-read wait runs through
-        the single stop-aware sleeper; a stop mid-wait aborts and is reported as
-        UNHEALTHY (no further read), so the loop exits promptly without rewarding.
-        """
-        # Initial settle window before the first read.
         if self._sleeper(float(self._config.settle_seconds)):
-            return HealthStatus.UNHEALTHY
+            raise TransientError("stop signalled during settle")
 
-        result = evaluate(station, self._api.get_states(), t0)
+        states = self._api.get_states()
+        result = evaluate(station, states)
         if result.discovered < station.expected_sensors:
             _log.info(
                 "%s: discovered %d sensors < expected %d (optional shortfall; non-fatal)",
@@ -147,43 +164,30 @@ class Scheduler:
                 result.discovered,
                 station.expected_sensors,
             )
-        rereads = 0
-        # Re-read only while the primary signal has not advanced (UNHEALTHY): the
-        # inconclusive fallback can never advance by re-reading an unchanged value,
-        # so re-reading there is pointless. Bounded by MAX_FRESHNESS_REREADS and
-        # the implicit total deadline (settle + n * reread_interval).
-        while (
-            result.status is HealthStatus.UNHEALTHY and rereads < MAX_FRESHNESS_REREADS
-        ):
-            rereads += 1
-            if self._sleeper(float(self._config.settle_seconds)):
-                return HealthStatus.UNHEALTHY
-            result = evaluate(station, self._api.get_states(), t0)
-
+        obstime: str | None = None
+        if result.status is HealthStatus.ONLINE:
+            representative = discover(states, station.key).get("obstimeutc")
+            obstime = representative.state if representative is not None else None
         _log.debug(
-            "%s: poll outcome %s after %d re-read(s): %s",
-            station.key,
-            result.status.value,
-            rereads,
-            result.detail,
+            "%s: poll outcome %s: %s", station.key, result.status.value, result.detail
         )
-        return result.status
+        return _HealthRead(result.status, obstime)
 
     def poll_station(self, key: str) -> int:
         """Run one full poll for `key`, mutate its state, return seconds-to-next-poll.
 
-        Sequence: capture ``t0`` (pre-POST tz-aware UTC), POST ``update_entity``,
-        settle + read + freshness re-reads, evaluate, then apply the reward/backoff
-        split. A terminal fault holds at ``max_backoff_seconds`` without doubling;
-        a transient fault doubles; a confirmed poll resets-and-rewards; an
-        inconclusive accept holds the prior interval (never the fast reward).
+        Sequence: POST ``update_entity``, settle + read + evaluate, then schedule
+        per the four-rest table:
+        ONLINE→learned cadence, OFFLINE→``OFFLINE_REPROBE``,
+        TERMINAL→``max_backoff_seconds``, TransientError/interrupted-settle→
+        ``min_interval_seconds``. After mutating state the in-memory windows are
+        written back once through the debounced best-effort save seam.
         """
         state = self._states[key]
         station = state.station
-        t0 = self._wall_clock.now()
         try:
             self._api.update_entity(station.update_entity)
-            status = self._read_states_with_freshness(station, t0)
+            read = self._read_health(station)
         except TerminalError as exc:
             _log.error(
                 "%s: terminal fault; holding at max_backoff (%ds): %s",
@@ -194,51 +198,59 @@ class Scheduler:
             return self._config.max_backoff_seconds
         except TransientError as exc:
             _log.warning(
-                "%s: transient poll failure; backing off: %s", station.key, exc
-            )
-            return self._double_backoff(state)
-
-        if status is HealthStatus.CONFIRMED:
-            state.current_backoff = self._config.initial_backoff_seconds
-            interval = self._healthy_interval()
-            _log.info(
-                "%s: healthy (confirmed); next poll in %ds", station.key, interval
-            )
-            return interval
-        if status is HealthStatus.INCONCLUSIVE:
-            # Healthy but not positively confirmed: hold the prior/slow cadence
-            # (the current backoff value), NOT the fast reward and NOT a reset.
-            hold = state.current_backoff
-            _log.info(
-                "%s: healthy (inconclusive accept); holding at %ds (no fast reward)",
+                "%s: transient poll failure; retrying at floor (%ds): %s",
                 station.key,
-                hold,
+                self._config.min_interval_seconds,
+                exc,
             )
-            return hold
-        # UNHEALTHY (missing/unusable core, failed primary freshness, or a stop
-        # mid-settle): transient backoff.
-        _log.warning("%s: unhealthy; backing off", station.key)
-        return self._double_backoff(state)
+            return self._config.min_interval_seconds
+
+        if read.status is HealthStatus.ONLINE:
+            if read.obstime is not None and read.obstime != state.last_obstime:
+                events = (*state.cadence.events, read.obstime)[-cadence.N :]
+                state.cadence = StationCadence(events=events)
+                state.last_obstime = read.obstime
+            base = cadence.base_interval(
+                state.cadence.events, self._config.min_interval_seconds
+            )
+            interval = cadence.jittered_interval(
+                state.cadence.events, self._config.min_interval_seconds, self._jitter
+            )
+            if cadence.is_stale(state.cadence.events, self._wall_clock.now(), base):
+                _log.warning(
+                    "%s: last observation is stale (> 3x the %ds learned interval); "
+                    "the station may have stopped uploading",
+                    station.key,
+                    base,
+                )
+            _log.info("%s: online; next poll in %ds", station.key, interval)
+            self._save(self._collect_state())
+            return interval
+
+        # OFFLINE (WU 204 / dead station): freeze the window, re-probe daily.
+        _log.info(
+            "%s: offline; re-probing in %ds", station.key, cadence.OFFLINE_REPROBE
+        )
+        self._save(self._collect_state())
+        return cadence.OFFLINE_REPROBE
 
     def run_loop(self) -> None:
         """Run the adaptive loop across all stations until stop is signalled.
 
-        Cold start: every station begins at the slow ``initial_backoff_seconds``
-        holding cadence (no fast first poll). First polls are staggered by
+        Cold start: every station begins at the ``min_interval_seconds`` floor
+        (no learned history yet). First polls are staggered by
         ``startup_stagger_seconds`` to avoid an 8-request burst. Each station's
         next-poll time is tracked in monotonic seconds; the loop sleeps to the
         nearest due station through the single stop-aware sleeper.
         """
         now = self._clock()
-        # Cold start: stagger first polls, each held at the slow initial cadence
-        # until a healthy confirmed poll earns the fast cadence.
         next_poll: dict[str, float] = {}
         for index, station in enumerate(self._config.stations):
             next_poll[station.key] = now + index * self._config.startup_stagger_seconds
         _log.info(
             "py-weather starting: %d station(s); cold-start cadence %ds",
             len(self._config.stations),
-            self._config.initial_backoff_seconds,
+            self._config.min_interval_seconds,
         )
         for station in self._config.stations:
             _log.info("registered station %s -> %s", station.key, station.update_entity)

@@ -60,10 +60,8 @@ def to_options_dict(cfg: Config, stations: list[Station]) -> dict[str, object]:
     itself — see the CONTRACT comment in `startup_checks.py`.
     """
     return {
-        "healthy_interval_min": cfg.healthy_interval_min,
-        "healthy_interval_max": cfg.healthy_interval_max,
-        "initial_backoff_seconds": cfg.initial_backoff_seconds,
         "max_backoff_seconds": cfg.max_backoff_seconds,
+        "min_interval_seconds": cfg.min_interval_seconds,
         "settle_seconds": cfg.settle_seconds,
         "startup_stagger_seconds": cfg.startup_stagger_seconds,
         "request_timeout_seconds": cfg.request_timeout_seconds,

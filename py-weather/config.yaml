@@ -1,12 +1,13 @@
 name: Py-Weather
-version: "0.2.0"
+version: "0.3.0"
 slug: py-weather
 description: >-
   Adaptive poller for Weather.com PWS REST sensors. Forces a refresh of one
   representative sensor per station via homeassistant.update_entity through the
-  Supervisor Core-API proxy, judges per-station freshness/health, and adapts each
-  station's cadence: a randomized fast interval when confirmed, exponential
-  backoff when transient, a slow hold when terminal. Holds no Weather.com secret.
+  Supervisor Core-API proxy, judges each station online/offline from its obsTimeUtc,
+  and adapts the cadence: a learned per-station interval (with jitter) when online,
+  a daily re-probe when offline, a slow hold when terminal. Holds no Weather.com
+  secret.
 url: https://github.com/cristianstoica/home-assistant-apps/tree/main/py-weather
 arch: [aarch64, amd64]
 init: false
@@ -14,19 +15,17 @@ homeassistant_api: true
 hassio_api: true
 image: ghcr.io/cristianstoica/py-weather
 options:
-  # Healthy (positively-confirmed) cadence window: each confirmed poll schedules
-  # the next at a random value in [min, max] seconds, jittering the station
-  # fleet so they do not all poll in lockstep.
-  healthy_interval_min: 300
-  healthy_interval_max: 400
-  # Exponential backoff for a transient-unhealthy station: the first retry is
-  # initial_backoff_seconds * 2, doubling each subsequent failure, capped at
-  # max_backoff_seconds. initial_backoff_seconds is also the cold-start / inconclusive
-  # holding cadence (no fast first poll is assumed; a confirmed poll earns it).
-  initial_backoff_seconds: 300
+  # Slow holding cadence (cap) for a terminal-unhealthy station: a non-retryable
+  # config/token fault is held at this interval, never spun in a tight retry loop.
   max_backoff_seconds: 86400
-  # Initial settle wait before the first /states read after an update_entity POST,
-  # and the spacing between the bounded freshness re-reads.
+  # Floor for the learned poll interval. Even a 1-minute uploader is polled no
+  # more often than this, bounding WU API load. The learned interval is
+  # clamp(observed_period * 0.8, min_interval_seconds, 1800) + ±15% jitter.
+  # Bounded 60-1800: the upper bound is the fixed 1800s healthy-slow-uploader
+  # ceiling (it must not exceed it, or the clamp ceiling would be voided).
+  min_interval_seconds: 300
+  # Settle wait before each station's /states read after an update_entity POST,
+  # and the spacing between the startup discovery attempts.
   settle_seconds: 15
   # Cold-start stagger between the first poll of each station, to avoid an
   # all-at-once request burst at launch.
@@ -36,20 +35,21 @@ options:
   log_level: info
   # The Weather.com PWS stations to poll. `key` is the lowercase-alphanumeric
   # station id (the entity-id suffix); `update_entity` is that station's
-  # representative sensor (must be sensor.wu_temp_<key>, never the registry
-  # sensor.rest_wu_* unique-id form); `expected_sensors` is a soft, logged
+  # representative sensor — use sensor.wu_obstimeutc_<key> for new rows (the
+  # sensor read for the station's online/offline state), never the registry
+  # sensor.rest_wu_* unique-id form. A sensor.wu_temp_<key> representative is
+  # still accepted for back-compat (the validator's metric segment is generic),
+  # so existing rows need not change. `expected_sensors` is a soft, logged
   # signal — a discovered count short of it is logged, not fatal. Fill this in
   # on the add-on Configuration tab with your own stations; one row per station,
   # e.g.:
   #   - key: istation01
-  #     update_entity: sensor.wu_temp_istation01
+  #     update_entity: sensor.wu_obstimeutc_istation01
   #     expected_sensors: 10
   stations: []
 schema:
-  healthy_interval_min: int(60,86400)
-  healthy_interval_max: int(60,86400)
-  initial_backoff_seconds: int(60,86400)
   max_backoff_seconds: int(60,86400)
+  min_interval_seconds: int(60,1800)
   settle_seconds: int(1,300)
   startup_stagger_seconds: int(1,300)
   request_timeout_seconds: int(1,300)

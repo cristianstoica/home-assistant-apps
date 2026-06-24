@@ -5,12 +5,14 @@ Modes:
   * (default)   — load options, wire the production seams + signals, and run the
                   adaptive per-station polling loop until SIGTERM/SIGINT.
   * ``--check`` — run the offline self-validation oracle (config rejection,
-                  entity-id-shape + station-key contract, HA request shaping,
-                  health/freshness evaluation, the terminal/transient
-                  classification incl. 429-on-update_entity precedence, the
-                  reward/backoff sequences, and stop-during-sleep
-                  interruptibility). All seams are faked — no network, no real
-                  sockets/threads. Exit 0 only on all-pass.
+                  entity-id-shape + station-key contract, discovery transform,
+                  HA request shaping, binary obstime-presence health, the
+                  cadence estimator (clamp + ±15% jitter + stale advisory), the
+                  four scheduling rests, the terminal/transient classification
+                  incl. 429-on-update_entity precedence, ``/data`` state
+                  persistence, and stop-during-sleep interruptibility). All
+                  seams are faked — no network, no real sockets/threads. Exit 0
+                  only on all-pass.
 
 Diagnostics (startup, station registration, per-poll outcomes, warnings) go to
 **stderr** for the HA Log tab; ``--check`` writes its PASS/FAIL report to stderr.
@@ -86,9 +88,8 @@ def configure_logging(level: str) -> None:
 
 # A small retry cap covering a realistic host-reboot boot lag (Core's REST
 # sensors may not be loaded the instant the add-on first scans /states).
-# Mirrors the existing MAX_FRESHNESS_REREADS module-constant pattern; no new
-# config surface. Worst-case startup wait ≈ (MAX_DISCOVERY_ATTEMPTS - 1) *
-# settle_seconds before exit.
+# A small fixed retry cap (no config surface); worst-case startup wait ≈
+# (MAX_DISCOVERY_ATTEMPTS - 1) * settle_seconds before exit.
 MAX_DISCOVERY_ATTEMPTS = 5
 
 
@@ -147,7 +148,7 @@ def _discover_and_persist(
                 log.warning(
                     "discovery: excluding %s (its id suffix is not lowercase-alphanumeric, so it "
                     "cannot be an auto-populated or manually-added station; rename the underlying "
-                    "sensor to sensor.wu_temp_<lowercase-alphanumeric> if it should be polled)",
+                    "sensor to sensor.wu_obstimeutc_<lowercase-alphanumeric> if it should be polled)",
                     skipped,
                 )
             stations = result.stations
@@ -170,14 +171,14 @@ def _discover_and_persist(
                     pass
                 else:
                     # A non-conforming representative may surface only on the
-                    # confirmation read (its temp arrived late); log it at WARNING
-                    # too, so the skipped-id contract covers both reads (a
+                    # confirmation read (its obstimeutc arrived late); log it at
+                    # WARNING too, so the skipped-id contract covers both reads (a
                     # confirm-only exclusion is otherwise silently dropped).
                     for skipped in confirm.skipped_entity_ids:
                         log.warning(
                             "discovery: excluding %s (its id suffix is not lowercase-alphanumeric, so it "
                             "cannot be an auto-populated or manually-added station; rename the underlying "
-                            "sensor to sensor.wu_temp_<lowercase-alphanumeric> if it should be polled)",
+                            "sensor to sensor.wu_obstimeutc_<lowercase-alphanumeric> if it should be polled)",
                             skipped,
                         )
                     stations = merge_station_counts(stations, confirm.stations)
@@ -187,7 +188,7 @@ def _discover_and_persist(
         if attempt >= MAX_DISCOVERY_ATTEMPTS:
             if valid_zero_scans >= 1 and transient_count == 0:
                 log.error(
-                    "discovery: no sensor.wu_temp_* entities found; check rest.yaml "
+                    "discovery: no sensor.wu_obstimeutc_* entities found; check rest.yaml "
                     "or define stations manually"
                 )
             elif valid_zero_scans == 0:
@@ -199,7 +200,7 @@ def _discover_and_persist(
                 )
             else:
                 log.error(
-                    "discovery: no sensor.wu_temp_* entities found in the scans that "
+                    "discovery: no sensor.wu_obstimeutc_* entities found in the scans that "
                     "succeeded, but %d API error(s) also occurred (%s); not a "
                     "confirmed empty fleet — check both rest.yaml and the HA API",
                     transient_count,
@@ -293,12 +294,15 @@ def _run_loop(options_path: str) -> int:
 
     from .haapi import HaApiClient
     from .httpclient import UrllibHttpClient
-    from .runtime import EventSleeper, SystemWallClock, monotonic
+    from .runtime import EventSleeper, SystemWallClock, UniformJitter, monotonic
     from .scheduler import Scheduler
+    from .state import DEFAULT_STATE_PATH, load_state, save_state
     from .supervisor import SupervisorSelfClient
 
     http = UrllibHttpClient(secrets=(token,))
     timeout = float(cfg.request_timeout_seconds)
+    rng = random.Random()
+    boot_state = load_state(DEFAULT_STATE_PATH)
 
     def _make_sleeper() -> EventSleeper:
         return EventSleeper()
@@ -321,7 +325,9 @@ def _run_loop(options_path: str) -> int:
             clock=monotonic,
             wall_clock=SystemWallClock(),
             sleeper=sleeper,
-            rng=random.Random(),
+            jitter=UniformJitter(rng),
+            state=boot_state,
+            save=lambda s: save_state(DEFAULT_STATE_PATH, s),
         )
 
     deps = StartupDeps(

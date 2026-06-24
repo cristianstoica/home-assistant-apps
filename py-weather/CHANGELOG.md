@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 — data-presence health check + auto-learned poll cadence
+
+> **Prerequisite before upgrading:** add a `sensor.wu_obstimeutc_<key>` REST
+> sensor to Home Assistant for every station and reload the REST integration
+> **before** installing this version. Without it every station reads as offline
+> immediately on startup.
+
+- **Binary online/offline health.** Replaced the previous freshness-based
+  health check (which compared sensor timestamps to a pre-poll snapshot) with
+  a direct read of each station's `sensor.wu_obstimeutc_<key>` entity. A
+  station is online when that sensor holds a recent UTC timestamp; offline when
+  the value is absent or stale. The old model falsely backed off stations whose
+  Weather.com uploader was slow to publish even when the station itself was
+  working.
+- **Auto-learned poll cadence.** Each station's poll interval is derived from
+  the gap between consecutive `obsTimeUtc` values, so stations that upload
+  every 5 minutes are polled more frequently than stations that upload every
+  30 minutes. The learned interval is clamped to
+  `[min_interval_seconds, 1800]` with ±15 % jitter to spread load.
+- **Cadence persisted across restarts.** The learned interval for each station
+  is written to `/data/cadence.json` and reloaded on startup, so the add-on
+  converges immediately rather than re-learning from cold on every restart.
+- **New `min_interval_seconds` option** (default `300`, valid `60`–`1800`).
+  Sets the floor for the learned poll interval. Operators with fast-uploading
+  stations can lower this; those on metered API plans can raise it.
+- **Offline daily re-probe unchanged.** A station that reads offline is
+  re-checked once a day (governed by `max_backoff_seconds`, default `86400`).
+  Terminal config/token faults hold at that same interval.
+
 ## 0.2.0 — auto-populate stations from existing `sensor.wu_temp_*` entities
 
 - **Auto-discover station fleet.** When `stations:` is left empty at startup,

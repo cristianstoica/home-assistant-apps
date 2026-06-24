@@ -11,11 +11,11 @@ module, so it carries a public name.
 from __future__ import annotations
 
 import json
-import random
 from datetime import datetime
 from typing import Any, NamedTuple
 
 from ..httpclient import HttpError, HttpResponse
+from ..models import StationCadence
 
 
 class HttpCall(NamedTuple):
@@ -116,24 +116,36 @@ class FakeSleeper:
         return self._stop_at is not None and index >= self._stop_at
 
 
-class SequenceRandom(random.Random):
-    """A `random.Random` returning scripted `randint` values in order.
+class FakeSave:
+    """Records each debounced /data save the scheduler issues (no FS).
 
-    Subclasses `random.Random` so it satisfies the `Scheduler` type directly;
-    only `randint` is overridden (the sole randomness the scheduler uses). Each
-    call returns the next scripted value (the last repeats), so a check can pin
-    the exact healthy interval the reward path schedules.
+    The scheduler hands its live ``dict[str, StationCadence]`` to the save seam
+    once per non-raising poll; this snapshots each handed dict (copied so a later
+    in-place mutation cannot retroactively rewrite a recorded save) so a check can
+    assert the per-cycle save count and the persisted station population.
     """
 
-    def __init__(self, *values: int) -> None:
-        super().__init__()
-        self._values = list(values) if values else [350]
-        self.calls = 0
+    def __init__(self) -> None:
+        self.saves: list[dict[str, StationCadence]] = []
 
-    def randint(self, a: int, b: int) -> int:  # noqa: ARG002 - scripted, ignores bounds
-        index = min(self.calls, len(self._values) - 1)
-        self.calls += 1
-        return self._values[index]
+    def __call__(self, stations: dict[str, StationCadence]) -> None:
+        self.saves.append(dict(stations))
+
+
+class FakeJitter:
+    """A deterministic `JitterSource`: ``base * factor`` (identity at ``factor=1.0``).
+
+    Identity (the default) isolates a scheduler interval assertion from jitter, so
+    a learned-interval check pins the bare estimator value. A non-identity factor
+    (e.g. ``0.85``) proves the scheduler actually routes the interval through the
+    injected seam rather than scheduling ``base_interval`` directly.
+    """
+
+    def __init__(self, factor: float = 1.0) -> None:
+        self._factor = factor
+
+    def __call__(self, base: float) -> float:
+        return base * self._factor
 
 
 def states_response(states: list[dict[str, Any]]) -> HttpResponse:

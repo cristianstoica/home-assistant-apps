@@ -2,7 +2,7 @@
 """Pure discovery-transform checks: shape matching, skips, counting, dedup, merge, render.
 
 Drives the pure `discovery` module against synthetic `/states` `EntityState`
-fixtures (no I/O). Asserts the anchored `^sensor\\.wu_temp_([a-z0-9]+)$` match,
+fixtures (no I/O). Asserts the anchored `^sensor\\.wu_obstimeutc_([a-z0-9]+)$` match,
 that non-conforming suffixes are RETURNED in `skipped_entity_ids` (the transform
 logs nothing), `expected_sensors` counting via `health.discover`, dedup, the
 per-key `max` union of two reads, and the paste-ready YAML block.
@@ -27,15 +27,7 @@ def _entities(raw: list[dict[str, object]]) -> list[EntityState]:
         eid = obj["entity_id"]
         state = obj["state"]
         assert isinstance(eid, str) and isinstance(state, str)
-        out.append(
-            EntityState(
-                entity_id=eid,
-                state=state,
-                last_reported=None,
-                last_updated=None,
-                last_changed=None,
-            )
-        )
+        out.append(EntityState(entity_id=eid, state=state))
     return out
 
 
@@ -43,8 +35,11 @@ def check_discovery_transform() -> bool:
     """Assert the pure discovery transform's matching/skip/count/dedup contract."""
     checks: list[tuple[str, bool]] = []
 
-    # --- single conforming station: temp + 3 siblings ⇒ expected_sensors == 4 -
-    one = _entities(fixtures.station_states("istation01"))  # temp+humidity+pressure+uv
+    # --- single conforming station: temp + obstimeutc + humidity + pressure + uv
+    #     (4 siblings) ⇒ expected_sensors == 5 -----------------------------------
+    one = _entities(
+        fixtures.station_states("istation01")
+    )  # obstimeutc+temp+humidity+pressure+uv
     result = discover_stations(one)
     st = {s.key: s for s in result.stations}
     checks += [
@@ -53,12 +48,12 @@ def check_discovery_transform() -> bool:
             [s.key for s in result.stations] == ["istation01"],
         ),
         (
-            "update_entity is sensor.wu_temp_<key>",
-            st["istation01"].update_entity == "sensor.wu_temp_istation01",
+            "update_entity is sensor.wu_obstimeutc_<key>",
+            st["istation01"].update_entity == "sensor.wu_obstimeutc_istation01",
         ),
         (
-            "expected_sensors counts all 4 sibling metrics via health.discover",
-            st["istation01"].expected_sensors == 4,
+            "expected_sensors counts all 5 sibling metrics via health.discover",
+            st["istation01"].expected_sensors == 5,
         ),
         ("no skipped ids for a clean fleet", result.skipped_entity_ids == []),
     ]
@@ -76,13 +71,13 @@ def check_discovery_transform() -> bool:
     )
 
     # --- non-conforming suffix ⇒ skipped, not a station ---------------------
-    # `sensor.wu_temp_back_yard` has an underscore suffix (fails ^[a-z0-9]+$):
+    # `sensor.wu_obstimeutc_back_yard` has an underscore suffix (fails ^[a-z0-9]+$):
     # it must NOT become a station and MUST land in skipped_entity_ids.
     mixed = _entities(
         fixtures.station_states("istation01")
         + [
-            {"entity_id": "sensor.wu_temp_back_yard", "state": "10.0"},
-            {"entity_id": "sensor.wu_temp_UPPER", "state": "11.0"},
+            {"entity_id": "sensor.wu_obstimeutc_back_yard", "state": "10.0"},
+            {"entity_id": "sensor.wu_obstimeutc_UPPER", "state": "11.0"},
         ]
     )
     rm = discover_stations(mixed)
@@ -94,7 +89,7 @@ def check_discovery_transform() -> bool:
         (
             "non-conforming suffixes returned in skipped_entity_ids",
             sorted(rm.skipped_entity_ids)
-            == ["sensor.wu_temp_UPPER", "sensor.wu_temp_back_yard"],
+            == ["sensor.wu_obstimeutc_UPPER", "sensor.wu_obstimeutc_back_yard"],
         ),
     ]
 
@@ -105,15 +100,15 @@ def check_discovery_transform() -> bool:
         ("empty input ⇒ empty skipped_entity_ids", empty.skipped_entity_ids == []),
     ]
 
-    # --- non-temp metric does not anchor a station --------------------------
-    # Only `sensor.wu_temp_<key>` is the representative; a humidity-only entity
-    # for a key with no temp must yield no station.
+    # --- non-obstimeutc metric does not anchor a station --------------------
+    # Only `sensor.wu_obstimeutc_<key>` is the representative; a humidity-only
+    # entity for a key with no obstimeutc must yield no station.
     humidity_only = _entities(
         [{"entity_id": "sensor.wu_humidity_istation09", "state": "55"}]
     )
     checks.append(
         (
-            "humidity-only key (no temp representative) ⇒ no station",
+            "humidity-only key (no obstimeutc representative) ⇒ no station",
             discover_stations(humidity_only).stations == [],
         )
     )
@@ -123,13 +118,19 @@ def check_discovery_transform() -> bool:
 def check_discovery_merge_and_render() -> bool:
     """Assert `merge_station_counts` (UNION + per-key max) and `render_stations_block`."""
     a = Station(
-        key="istation01", update_entity="sensor.wu_temp_istation01", expected_sensors=1
+        key="istation01",
+        update_entity="sensor.wu_obstimeutc_istation01",
+        expected_sensors=1,
     )
     b_same = Station(
-        key="istation01", update_entity="sensor.wu_temp_istation01", expected_sensors=4
+        key="istation01",
+        update_entity="sensor.wu_obstimeutc_istation01",
+        expected_sensors=4,
     )
     confirm_only = Station(
-        key="istation02", update_entity="sensor.wu_temp_istation02", expected_sensors=3
+        key="istation02",
+        update_entity="sensor.wu_obstimeutc_istation02",
+        expected_sensors=3,
     )
 
     # same key in both reads ⇒ per-key max (4, not 1, never "last wins")
@@ -168,7 +169,7 @@ def check_discovery_merge_and_render() -> bool:
             == (
                 "stations:\n"
                 "  - key: istation01\n"
-                "    update_entity: sensor.wu_temp_istation01\n"
+                "    update_entity: sensor.wu_obstimeutc_istation01\n"
                 "    expected_sensors: 1\n"
             ),
         ),

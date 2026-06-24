@@ -15,8 +15,8 @@ import sys
 def report(title: str, prefix: str, checks: list[tuple[str, bool]]) -> bool:
     """Print each assertion's PASS/FAIL line + a footer; return all-passed.
 
-    `title` names the check (e.g. ``FRESHNESS``); `prefix` is the per-line tag
-    (e.g. ``freshness``). Every assertion is printed (no short-circuit) so the
+    `title` names the check (e.g. ``HEALTH``); `prefix` is the per-line tag
+    (e.g. ``health``). Every assertion is printed (no short-circuit) so the
     log shows the full failure surface at once.
     """
     ok = True

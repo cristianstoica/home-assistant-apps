@@ -21,9 +21,10 @@ from .report import report
 def check_valid_defaults() -> bool:
     """Assert the default options payload validates to the expected `Config`.
 
-    Pins the eight default stations (key + representative entity-id), the default
-    cadence/timeout values, and that ``temp`` is the required-core representative
-    target for every station.
+    Pins the eight default stations (key + the configured ``update_entity`` POST
+    target ``sensor.wu_temp_<key>``) and the default cadence/timeout values. The
+    health representative is ``obstimeutc`` (a soft signal); the manifest's
+    refresh target stays ``temp``.
     """
     cfg = config.validate(fixtures.default_options())
     checks: list[tuple[str, bool]] = [
@@ -39,10 +40,8 @@ def check_valid_defaults() -> bool:
         ),
         (
             "default cadence/timeout values",
-            cfg.healthy_interval_min == 300
-            and cfg.healthy_interval_max == 400
-            and cfg.initial_backoff_seconds == 300
-            and cfg.max_backoff_seconds == 86400
+            cfg.max_backoff_seconds == 86400
+            and cfg.min_interval_seconds == 300
             and cfg.settle_seconds == 15
             and cfg.startup_stagger_seconds == 10
             and cfg.request_timeout_seconds == 30,
