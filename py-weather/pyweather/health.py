@@ -16,9 +16,9 @@ references it, never restates it):
   timestamp. A WU 204 collapses the whole REST resource, so obstime presence
   alone captures online vs offline.
 * **No freshness, no required-core gate** (both removed in v0.3.0). A
-  present-but-frozen obstime is still online; a missing individual metric on an
-  otherwise-online station is an informational soft-log in the scheduler, never
-  a health failure here.
+  present-but-frozen obstime is still online; individual sibling metrics are not
+  inspected at all — there is no per-metric count or shortfall signal, only the
+  binary obstime-presence verdict.
 """
 
 from __future__ import annotations
@@ -62,10 +62,11 @@ def evaluate(station: Station, states: list[EntityState]) -> HealthResult:
     OFFLINE — absent / unavailable / unparseable (a WU 204 collapses the whole
               REST resource, so obstime presence alone captures online/offline).
 
-    No t0, no freshness, no required-core gate (all removed in v0.3.0). A
-    missing individual metric on an otherwise-online station is an
-    informational soft-log in the scheduler, never a health failure here.
-    The TERMINAL classification is the API client's, never produced here.
+    No t0, no freshness, no required-core gate (all removed in v0.3.0).
+    Individual sibling metrics are not inspected at all — there is no
+    per-metric count or shortfall signal, only the binary obstime-presence
+    verdict. The TERMINAL classification is the API client's, never produced
+    here.
     """
     discovered = discover(states, station.key)
     representative = discovered.get("obstimeutc")
@@ -73,16 +74,13 @@ def evaluate(station: Station, states: list[EntityState]) -> HealthResult:
         return HealthResult(
             HealthStatus.OFFLINE,
             f"{station.key}: obstimeutc sensor absent/unavailable (offline)",
-            len(discovered),
         )
     if parse_obstime(representative.state) is None:
         return HealthResult(
             HealthStatus.OFFLINE,
             f"{station.key}: obstimeutc unparseable (offline)",
-            len(discovered),
         )
     return HealthResult(
         HealthStatus.ONLINE,
         f"{station.key}: obstimeutc present (online)",
-        len(discovered),
     )

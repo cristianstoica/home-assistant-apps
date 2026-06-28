@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — remove expected_sensors/discovered; tighten schema and logs
+
+- **Removed `expected_sensors` config key.** The per-station `expected_sensors`
+  field introduced in v0.2.0 for discovery counting is no longer used by the
+  v0.3.0 obstime-only health model and has been deleted end-to-end (schema,
+  options, code). A v0.3.0 config blob that still carries the key validates
+  clean — unknown keys are ignored by the schema validator.
+- **Removed `discovered` health-result field.** The internal `discovered` flag
+  on health results was a discovery-era artefact with no role in the current
+  binary online/offline model; removed end-to-end.
+- **Deleted non-fatal scheduler shortfall log.** A log line emitted when a
+  poll cycle ran long was noise in normal operation and has been removed.
+- **Station-merge simplified to key-union dedup.** The merge helper now
+  deduplicates station lists by key union only, dropping the `expected_sensors`
+  count-comparison logic that no longer applies.
+- **`translations/en.yaml` rewritten to v0.4.0 schema.** The UI translation
+  file now reflects the actual configuration options; the `expected_sensors`
+  entry and other stale fields have been removed.
+- **No behavior change.** Health, cadence, and persistence logic are unaffected.
+  This is a schema and log hygiene release.
+
 ## 0.3.0 — data-presence health check + auto-learned poll cadence
 
 > **Prerequisite before upgrading:** add a `sensor.wu_obstimeutc_<key>` REST

@@ -157,13 +157,6 @@ class Scheduler:
 
         states = self._api.get_states()
         result = evaluate(station, states)
-        if result.discovered < station.expected_sensors:
-            _log.info(
-                "%s: discovered %d sensors < expected %d (optional shortfall; non-fatal)",
-                station.key,
-                result.discovered,
-                station.expected_sensors,
-            )
         obstime: str | None = None
         if result.status is HealthStatus.ONLINE:
             representative = discover(states, station.key).get("obstimeutc")

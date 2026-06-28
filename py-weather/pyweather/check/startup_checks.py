@@ -100,12 +100,10 @@ def check_persist_allowlist_completeness() -> bool:
         Station(
             key="istation01",
             update_entity="sensor.wu_temp_istation01",
-            expected_sensors=4,
         ),
         Station(
             key="istation02",
             update_entity="sensor.wu_temp_istation02",
-            expected_sensors=3,
         ),
     ]
     blob = to_options_dict(cfg, stations)
@@ -125,12 +123,10 @@ def check_persist_allowlist_completeness() -> bool:
                 {
                     "key": "istation01",
                     "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 4,
                 },
                 {
                     "key": "istation02",
                     "update_entity": "sensor.wu_temp_istation02",
-                    "expected_sensors": 3,
                 },
             ],
         ),
@@ -280,7 +276,7 @@ def check_discover_retry_and_exit() -> bool:
         ),  # attempt 1: station appears
         states_response(
             fixtures.station_states("istation01")
-        ),  # count-stability confirm read
+        ),  # confirmation re-read (station-union)
     )
     sup_recover = FakeSupervisorSelfClient()
     result_recover = run(_api(http_recover), sup_recover, FakeSleeper(), cfg, log=_LOG)
@@ -372,60 +368,18 @@ def check_discover_message_discriminators() -> bool:
     return report("DISCOVER-MESSAGES", "discover-messages", checks)
 
 
-def check_discover_count_stability() -> bool:
-    """Assert the per-key count-stability confirmation re-read (max) + station union.
+def check_discover_station_union() -> bool:
+    """Assert the confirmation re-read UNIONs late-surfacing stations and is degrade-safe.
 
-    count-stability: first read has only `sensor.wu_obstimeutc_istation01`; the
-    second (confirmation) read has obstimeutc+temp+humidity+pressure+uv ⇒ resolved
-    `expected_sensors == 5` (the fuller second-read count), proving the per-key
-    `max` confirmation re-read fired. Sibling-lower twin: second read LOWER than
-    first ⇒ count stays at the higher first-read value (max, never last-wins).
-    station-set union: a confirm-only `istation02` is unioned into the resolved
-    and persisted list. Confirmation TransientError ⇒ first-read stations kept
-    (degrade-safe, discovery still resolves).
+    station-set union: a confirm-only `istation02` (absent from the first read,
+    present on the confirmation read) is unioned into the resolved and persisted
+    list — the reason the confirmation re-read exists. Confirmation TransientError
+    ⇒ first-read stations kept (degrade-safe, discovery still resolves). Stop
+    DURING the confirmation wait ⇒ return None, no second read, no persist.
     """
     run = _discover_and_persist()
     cfg = _discovered_cfg()
     checks: list[tuple[str, bool]] = []
-
-    # --- count grows on confirmation ⇒ max (5, not 1) -----------------------
-    first_thin = [{"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}]
-    second_full = fixtures.station_states(
-        "istation01"
-    )  # obstimeutc+temp+humidity+pressure+uv = 5
-    http_grow = FakeHttp(states_response(first_thin), states_response(second_full))
-    sup_grow = FakeSupervisorSelfClient()
-    result_grow = run(_api(http_grow), sup_grow, FakeSleeper(), cfg, log=_LOG)
-    assert result_grow is not None
-    by_key_grow = {s.key: s for s in result_grow}
-    checks += [
-        (
-            "count-stability ⇒ resolved expected_sensors is the fuller second-read count (5)",
-            by_key_grow["istation01"].expected_sensors == 5,
-        ),
-        (
-            "count-stability ⇒ persisted once (resolved, best-effort)",
-            len(sup_grow.options_calls) == 1,
-        ),
-    ]
-
-    # --- confirmation LOWER ⇒ keep higher first-read value (max) ------------
-    first_full = fixtures.station_states("istation01")  # 5
-    second_thin = [
-        {"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}
-    ]  # 1
-    http_lower = FakeHttp(states_response(first_full), states_response(second_thin))
-    result_lower = run(
-        _api(http_lower), FakeSupervisorSelfClient(), FakeSleeper(), cfg, log=_LOG
-    )
-    assert result_lower is not None
-    by_key_lower = {s.key: s for s in result_lower}
-    checks.append(
-        (
-            "count-stability ⇒ confirmation lower keeps higher first-read count (5, max)",
-            by_key_lower["istation01"].expected_sensors == 5,
-        )
-    )
 
     # --- confirm-only key ⇒ unioned into resolved + persisted ---------------
     first_one = [{"entity_id": "sensor.wu_obstimeutc_istation01", "state": "10.0"}]
@@ -449,6 +403,10 @@ def check_discover_count_stability() -> bool:
         (
             "station-set union ⇒ confirm-only istation02 in persisted body",
             "istation02" in persisted_keys,
+        ),
+        (
+            "station-set union ⇒ persisted once (resolved, best-effort)",
+            len(sup_union.options_calls) == 1,
         ),
     ]
 
@@ -495,7 +453,7 @@ def check_discover_count_stability() -> bool:
             sup_confirm_stop.options_calls == [],
         ),
     ]
-    return report("DISCOVER-COUNT-STABILITY", "discover-count", checks)
+    return report("DISCOVER-STATION-UNION", "discover-union", checks)
 
 
 def check_persist_best_effort() -> bool:
@@ -706,7 +664,6 @@ def check_run_startup_branches() -> bool:
                 {
                     "key": "istation01",
                     "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 10,
                 }
             ]
         )

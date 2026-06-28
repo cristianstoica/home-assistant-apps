@@ -53,7 +53,7 @@ def to_options_dict(cfg: Config, stations: list[Station]) -> dict[str, object]:
     Enumerates every non-`stations` `config.yaml` schema field at its RESOLVED
     value (so an operator-omitted field persists as the in-range default the
     add-on actually ran with) plus the discovered `stations` (each a
-    `{key, update_entity, expected_sensors}` object). This key set is a
+    `{key, update_entity}` object). This key set is a
     hand-maintained mirror of the `config.yaml` `schema:` block; the
     `persist-allowlist` check proves it agrees with the co-located
     `_MANIFEST_OPTION_KEYS` test constant (code↔code), NOT with `config.yaml`
@@ -70,7 +70,6 @@ def to_options_dict(cfg: Config, stations: list[Station]) -> dict[str, object]:
             {
                 "key": s.key,
                 "update_entity": s.update_entity,
-                "expected_sensors": s.expected_sensors,
             }
             for s in stations
         ],

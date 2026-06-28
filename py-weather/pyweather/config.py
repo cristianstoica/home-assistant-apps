@@ -5,9 +5,9 @@ Validation is strict and **names the offending field** on every rejection, so a
 misconfigured add-on fails fast with an actionable message (the py-ddns /
 py-syslog `config.py:load` pattern). Validation is **pure**: shape/range/
 station-key checks only — it never reads ``/states`` and never resolves or
-confirms live sensor presence. Live representative-sensor presence and the
-``expected_sensors`` count are enforced only at runtime by the discovery glob and
-the health predicate (`health` / `scheduler`).
+confirms live sensor presence. Live representative-sensor presence is resolved
+only at runtime by the discovery glob and the binary obstime-presence health
+predicate (`health` / `scheduler`).
 
 Two contract-bearing checks live here:
 
@@ -95,7 +95,7 @@ def _validate_station(raw: object, index: int) -> Station:
 
     Enforces the key allowlist **before** building the entity matcher (so the key
     is always regex-literal), then the anchored ``update_entity`` shape tying the
-    entity to this station's key, then the positive ``expected_sensors`` count.
+    entity to this station's key.
     """
     if not isinstance(raw, dict):
         raise ConfigError(f"stations[{index}]: must be an object")
@@ -123,13 +123,7 @@ def _validate_station(raw: object, index: int) -> Station:
             "and the trailing key must match this station's key)"
         )
 
-    expected = station.get("expected_sensors")
-    if isinstance(expected, bool) or not isinstance(expected, int):
-        raise ConfigError(f"stations[{index}].expected_sensors: must be an integer")
-    if expected < 1:
-        raise ConfigError(f"stations[{index}].expected_sensors: must be positive")
-
-    return Station(key=key, update_entity=update_entity, expected_sensors=expected)
+    return Station(key=key, update_entity=update_entity)
 
 
 def validate(options: dict[str, object]) -> Config:

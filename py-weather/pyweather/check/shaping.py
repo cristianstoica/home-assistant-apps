@@ -128,7 +128,6 @@ def check_supervisor_request_shaping() -> bool:
         Station(
             key="istation01",
             update_entity="sensor.wu_temp_istation01",
-            expected_sensors=4,
         )
     ]
     blob = to_options_dict(cfg, stations)

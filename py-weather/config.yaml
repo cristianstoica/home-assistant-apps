@@ -1,5 +1,5 @@
 name: Py-Weather
-version: "0.3.0"
+version: "0.4.0"
 slug: py-weather
 description: >-
   Adaptive poller for Weather.com PWS REST sensors. Forces a refresh of one
@@ -39,13 +39,10 @@ options:
   # sensor read for the station's online/offline state), never the registry
   # sensor.rest_wu_* unique-id form. A sensor.wu_temp_<key> representative is
   # still accepted for back-compat (the validator's metric segment is generic),
-  # so existing rows need not change. `expected_sensors` is a soft, logged
-  # signal — a discovered count short of it is logged, not fatal. Fill this in
-  # on the add-on Configuration tab with your own stations; one row per station,
-  # e.g.:
+  # so existing rows need not change. Fill this in on the add-on Configuration
+  # tab with your own stations; one row per station, e.g.:
   #   - key: istation01
   #     update_entity: sensor.wu_obstimeutc_istation01
-  #     expected_sensors: 10
   stations: []
 schema:
   max_backoff_seconds: int(60,86400)
@@ -57,4 +54,3 @@ schema:
   stations:
     - key: str
       update_entity: str
-      expected_sensors: int(1,)
