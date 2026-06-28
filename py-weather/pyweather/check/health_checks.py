@@ -19,15 +19,14 @@ from ..models import EntityState, HealthStatus, Station
 from .report import report
 
 
-def _station(key: str = "istation01", expected: int = 10) -> Station:
-    """A single validated `Station` for `key` with `expected` sensors."""
+def _station(key: str = "istation01") -> Station:
+    """A single validated `Station` for `key`."""
     cfg = validate(
         fixtures.default_options(
             stations=[
                 {
                     "key": key,
                     "update_entity": f"sensor.wu_temp_{key}",
-                    "expected_sensors": expected,
                 }
             ]
         )

@@ -1,35 +1,23 @@
 configuration:
-  healthy_interval_min:
-    name: Healthy interval minimum (seconds)
-    description: >-
-      Lower bound of the fast cadence window. After a positively-confirmed poll,
-      the next poll is scheduled at a random value in [minimum, maximum] seconds,
-      jittering the station fleet so they do not poll in lockstep (60-86400).
-  healthy_interval_max:
-    name: Healthy interval maximum (seconds)
-    description: >-
-      Upper bound of the fast cadence window (60-86400). Must be greater than or
-      equal to the minimum.
-  initial_backoff_seconds:
-    name: Initial backoff / holding cadence (seconds)
-    description: >-
-      The slow cadence a station starts at (cold start) and holds at on an
-      inconclusive-but-accepted poll, and the base of exponential backoff: the
-      first transient-unhealthy retry waits twice this value (60-86400). No fast
-      first poll is assumed — a station earns the fast cadence on its first
-      confirmed poll.
   max_backoff_seconds:
-    name: Maximum backoff (seconds)
+    name: Maximum backoff / terminal hold (seconds)
     description: >-
-      The cap on exponential backoff, and the slow holding cadence used after a
-      terminal (config/token) fault (60-86400). Must be greater than or equal to
-      the initial backoff.
+      The slow holding cadence (cap) for a terminally-unhealthy station — a
+      non-retryable config/token fault is held at this interval rather than spun
+      in a tight retry loop (60-86400).
+  min_interval_seconds:
+    name: Minimum poll interval (seconds)
+    description: >-
+      Floor for the auto-learned poll interval. Even a fast-uploading station is
+      polled no more often than this, bounding Weather.com API load. The learned
+      interval is clamp(observed_period * 0.8, minimum, 1800) plus ±15% jitter
+      (60-1800; the upper bound is the fixed healthy-slow-uploader ceiling).
   settle_seconds:
     name: Settle / re-read interval (seconds)
     description: >-
-      The wait after an update_entity refresh before the first states read, and
-      the spacing between the bounded freshness re-reads (1-300). Long enough for
-      a Weather.com render to land, short enough to stay responsive.
+      The wait after an update_entity refresh before each station's /states
+      read, and the spacing between the startup discovery attempts (1-300). Long
+      enough for a Weather.com render to land, short enough to stay responsive.
   startup_stagger_seconds:
     name: Cold-start stagger (seconds)
     description: >-
@@ -44,20 +32,20 @@ configuration:
     name: Diagnostics verbosity
     description: >-
       Verbosity of Py-Weather's own diagnostics (startup, station registration,
-      backoff transitions) on stderr. debug additionally traces each routine
+      cadence transitions) on stderr. debug additionally traces each routine
       healthy poll. The Supervisor bearer token is never logged at any level.
   stations:
     name: Stations
     description: >-
       The Weather.com PWS stations to poll. Each row's key is the lowercase
       alphanumeric station id (the entity-id suffix); update_entity is that
-      station's representative sensor and must be sensor.wu_temp_<key> (never the
-      registry sensor.rest_wu_* unique-id form); expected_sensors is a soft signal
-      — a discovered count short of it is logged, not treated as unhealthy. Leave
-      this list empty to auto-populate once: on first start the add-on discovers
-      stations from your existing sensor.wu_temp_* entities, writes them back
-      here, and thereafter behaves as a plain manual list (edit or remove rows as
-      normal).
+      station's representative sensor, sensor.wu_obstimeutc_<key> for new rows
+      (the sensor read for the station's online/offline state) — the registry
+      sensor.rest_wu_* unique-id form is rejected, and a sensor.wu_temp_<key>
+      representative is still accepted for back-compat. Leave this list empty to
+      auto-populate once: on first start the add-on discovers stations from your
+      existing sensor.wu_obstimeutc_* entities, writes them back here, and
+      thereafter behaves as a plain manual list (edit or remove rows as normal).
     fields:
       key:
         name: Station key
@@ -69,12 +57,5 @@ configuration:
         name: Representative entity
         description: >-
           The representative sensor refreshed each poll, e.g.
-          sensor.wu_temp_istation01. Must match sensor.wu_temp_<key> for this
-          row's key — the registry sensor.rest_wu_* form is rejected.
-      expected_sensors:
-        name: Expected sensor count
-        description: >-
-          The number of sensors this station normally exposes (a positive
-          integer). A discovered count below this is logged as a soft signal; only
-          a missing or unusable required-core sensor (temp/humidity/pressure)
-          marks the station unhealthy.
+          sensor.wu_obstimeutc_istation01. Must match sensor.wu_<metric>_<key>
+          for this row's key — the registry sensor.rest_wu_* form is rejected.

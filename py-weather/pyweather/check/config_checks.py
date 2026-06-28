@@ -47,10 +47,6 @@ def check_valid_defaults() -> bool:
             and cfg.request_timeout_seconds == 30,
         ),
         (
-            "every default station expects 10 sensors",
-            all(s.expected_sensors == 10 for s in cfg.stations),
-        ),
-        (
             "empty stations list resolves to an empty Config.stations tuple",
             config.validate(fixtures.default_options(stations=[])).stations == (),
         ),
@@ -144,7 +140,7 @@ def _accepts(options: dict[str, object]) -> bool:
 def _one_station(key: str, update_entity: str) -> dict[str, object]:
     """A default-options payload with a single station (for shape/key oracles)."""
     return fixtures.default_options(
-        stations=[{"key": key, "update_entity": update_entity, "expected_sensors": 10}]
+        stations=[{"key": key, "update_entity": update_entity}]
     )
 
 

@@ -34,14 +34,12 @@ class Station(NamedTuple):
     entity-id suffix interpolated into both the ``update_entity`` matcher and the
     runtime discovery glob ``sensor.wu_*_<key>``). `update_entity` is the pinned,
     fully-slugified representative entity-id (``sensor.wu_temp_<key>``) the
-    refresh POST targets. `expected_sensors` is the **soft** full-count signal:
-    a shortfall is logged as a non-fatal advisory, never a health gate. Health
-    keys off ``obstimeutc`` alone, with no required-core sensor subset.
+    refresh POST targets. Health keys off ``obstimeutc`` alone, with no
+    required-core sensor subset and no full-count gate.
     """
 
     key: str
     update_entity: str
-    expected_sensors: int
 
 
 class Config(NamedTuple):
@@ -92,14 +90,11 @@ class HealthResult(NamedTuple):
     """The outcome of evaluating one station poll.
 
     `status` is the binary `HealthStatus`; `detail` is a secret-free human
-    string for the log line; `discovered` is the count of station sensors
-    discovered in ``/states`` (logged against `expected_sensors` as the soft
-    signal).
+    string for the log line.
     """
 
     status: HealthStatus
     detail: str
-    discovered: int
 
 
 class EntityState(NamedTuple):

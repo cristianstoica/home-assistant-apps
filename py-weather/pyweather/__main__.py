@@ -153,9 +153,9 @@ def _discover_and_persist(
                 )
             stations = result.stations
             if stations:
-                # Partial-Core count-stability: ONE confirmation re-read, then take
-                # the per-key MAX expected_sensors so a still-loading sibling set is
-                # not snapshotted short. Rides the SAME stop-aware sleeper.
+                # Confirmation re-read: ONE re-read, then union the two reads'
+                # keys so a station that surfaces only on the second /states read
+                # is still picked up. Rides the SAME stop-aware sleeper.
                 if sleeper(float(cfg.settle_seconds)):
                     return None
                 try:

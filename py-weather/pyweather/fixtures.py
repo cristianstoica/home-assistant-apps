@@ -31,8 +31,7 @@ from typing import Any, NamedTuple
 EXAMPLE_TOKEN = "EXAMPLE-supervisor-token-0000"
 
 # The eight default (synthetic, placeholder) stations: key -> representative
-# entity-id, all with the `sensor.wu_temp_<key>` refresh POST target and
-# expected_sensors 10.
+# entity-id, all with the `sensor.wu_temp_<key>` refresh POST target.
 DEFAULT_STATION_KEYS = (
     "istation01",
     "istation02",
@@ -46,12 +45,11 @@ DEFAULT_STATION_KEYS = (
 
 
 def default_stations() -> list[dict[str, Any]]:
-    """The eight default station option objects (key/update_entity/expected_sensors)."""
+    """The eight default station option objects (key/update_entity)."""
     return [
         {
             "key": key,
             "update_entity": f"sensor.wu_temp_{key}",
-            "expected_sensors": 10,
         }
         for key in DEFAULT_STATION_KEYS
     ]
@@ -125,12 +123,10 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "istation01",
                     "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 10,
                 },
                 {
                     "key": "istation01",
                     "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -144,7 +140,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "istation_01",
                     "update_entity": "sensor.wu_temp_istation_01",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -157,7 +152,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "ISTATION01",
                     "update_entity": "sensor.wu_temp_ISTATION01",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -170,7 +164,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": ".*",
                     "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -184,7 +177,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "istation01",
                     "update_entity": "sensor.rest_wu_temp_istation01",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -197,7 +189,6 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "istation01",
                     "update_entity": "sensor.wu_temp_istation06",
-                    "expected_sensors": 10,
                 },
             ]
         ),
@@ -210,25 +201,10 @@ INVALID_OPTIONS: list[InvalidOptionsFixture] = [
                 {
                     "key": "istation01",
                     "update_entity": "sensor.",
-                    "expected_sensors": 10,
                 },
             ]
         ),
         field="update_entity",
-    ),
-    # --- expected_sensors -----------------------------------------------------
-    InvalidOptionsFixture(
-        name="expected_sensors not positive",
-        options=default_options(
-            stations=[
-                {
-                    "key": "istation01",
-                    "update_entity": "sensor.wu_temp_istation01",
-                    "expected_sensors": 0,
-                },
-            ]
-        ),
-        field="expected_sensors",
     ),
 ]
 
@@ -293,33 +269,19 @@ _OMIT = _Omit()
 OMIT = _OMIT
 
 
-def station_states(
-    key: str,
-    *,
-    temp_state: str = "12.3",
-    humidity_state: str = "60",
-    pressure_state: str = "1013",
-    uv_state: str | None = "2",
-    include_uv: bool = True,
-    extra: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """Build a station's ``/states`` array (temp/humidity/pressure + optional uv).
+def station_states(key: str) -> list[dict[str, Any]]:
+    """Build a station's ``/states`` array: obstimeutc + temp + humidity + pressure + uv.
 
-    `include_uv=False` drops the optional ``uv`` sensor entirely (absence);
-    `uv_state` sets its value (e.g. ``"unavailable"`` for the
-    present-but-unavailable optional case).
+    Five sensors for `key`, the representative `sensor.wu_obstimeutc_<key>` first.
+    Used by the discovery / startup / shaping oracles as a clean conforming fleet.
     """
-    states: list[dict[str, Any]] = [
+    return [
         state_obj(f"sensor.wu_obstimeutc_{key}", "2026-06-23T12:00:00+00:00"),
-        state_obj(f"sensor.wu_temp_{key}", temp_state),
-        state_obj(f"sensor.wu_humidity_{key}", humidity_state),
-        state_obj(f"sensor.wu_pressure_{key}", pressure_state),
+        state_obj(f"sensor.wu_temp_{key}", "12.3"),
+        state_obj(f"sensor.wu_humidity_{key}", "60"),
+        state_obj(f"sensor.wu_pressure_{key}", "1013"),
+        state_obj(f"sensor.wu_uv_{key}", "2"),
     ]
-    if include_uv and uv_state is not None:
-        states.append(state_obj(f"sensor.wu_uv_{key}", uv_state))
-    if extra:
-        states.extend(extra)
-    return states
 
 
 def obstime_states(

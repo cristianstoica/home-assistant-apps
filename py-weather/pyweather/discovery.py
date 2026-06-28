@@ -15,9 +15,8 @@ Discovery rule:
   — the capture group is the station `key`. The match anchors on the `obstimeutc`
   metric specifically because `sensor.wu_obstimeutc_<key>` is the entity health
   and cadence read, and the entity the poller drives.
-* `update_entity` = `sensor.wu_obstimeutc_<key>`; `expected_sensors` = the count
-  of `sensor.wu_*_<key>` siblings present in `/states` (via `health.discover`) — a
-  soft, logged-only first-boot snapshot, never a health gate.
+* `update_entity` = `sensor.wu_obstimeutc_<key>`. Health keys off the obstime
+  sensor's presence alone — there is no sibling-count signal.
 * Any `sensor.wu_obstimeutc_*` whose suffix is NOT bare lowercase-alphanumeric (an
   underscore or uppercase char, e.g. `sensor.wu_obstimeutc_back_yard`) is SKIPPED
   into `skipped_entity_ids` — preserving the strict `^[a-z0-9]+$` key contract
@@ -30,7 +29,6 @@ from __future__ import annotations
 import re
 from typing import NamedTuple
 
-from .health import discover
 from .models import EntityState, Station
 
 # The representative-entity shape; the capture group is the (allowlisted) key.
@@ -60,8 +58,8 @@ def discover_stations(states: list[EntityState]) -> DiscoveryResult:
     """Project a `/states` snapshot into discovered stations + skipped ids (pure).
 
     Matches the anchored representative shape, builds one `Station` per unique
-    key (sibling count via `health.discover`), and collects any
-    `sensor.wu_obstimeutc_*` with a non-conforming suffix into `skipped_entity_ids`.
+    key, and collects any `sensor.wu_obstimeutc_*` with a non-conforming suffix
+    into `skipped_entity_ids`.
     Returns both; logs nothing.
     """
     stations: list[Station] = []
@@ -80,12 +78,10 @@ def discover_stations(states: list[EntityState]) -> DiscoveryResult:
         if key in seen:
             continue
         seen.add(key)
-        expected = len(discover(states, key))
         stations.append(
             Station(
                 key=key,
                 update_entity=f"sensor.wu_obstimeutc_{key}",
-                expected_sensors=expected,
             )
         )
     stations.sort(key=lambda s: s.key)
@@ -93,20 +89,18 @@ def discover_stations(states: list[EntityState]) -> DiscoveryResult:
 
 
 def merge_station_counts(first: list[Station], confirm: list[Station]) -> list[Station]:
-    """Union two reads' keys, taking the per-key MAX `expected_sensors`.
+    """Union two reads' keys into one deduplicated, key-sorted station list.
 
-    The resolved set is the UNION of both reads' keys. For each key the count is
-    the maximum observed across whichever reads contain it (a key absent from a
-    read contributes nothing): a key in both reads takes the higher of its two
-    counts, a confirmation-only key takes its confirmation count, and a
-    first-read-only key keeps its first-read count. Never "last wins", never
-    lowers a count, never drops a first-read station on a confirmation blip.
+    The resolved set is the UNION of both reads' keys: a key in either read
+    appears once in the output. The confirmation re-read exists so a station
+    that surfaces late (its representative arrived only on the second /states
+    read) is still picked up — never to drop a first-read station on a
+    confirmation blip. With no per-station count, two reads of the same key are
+    identical `Station`s, so the union is a plain key dedup.
     """
     best: dict[str, Station] = {}
     for station in [*first, *confirm]:
-        existing = best.get(station.key)
-        if existing is None or station.expected_sensors > existing.expected_sensors:
-            best[station.key] = station
+        best.setdefault(station.key, station)
     return sorted(best.values(), key=lambda s: s.key)
 
 
@@ -121,5 +115,4 @@ def render_stations_block(stations: list[Station]) -> str:
     for station in stations:
         lines.append(f"  - key: {station.key}")
         lines.append(f"    update_entity: {station.update_entity}")
-        lines.append(f"    expected_sensors: {station.expected_sensors}")
     return "\n".join(lines) + "\n"

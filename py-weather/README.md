@@ -110,9 +110,9 @@ polling without a manual configuration step.
 
 1. The add-on reads `/states` (up to 5 attempts, spaced by `settle_seconds`,
    to allow for a brief host-boot lag while REST sensors finish loading).
-2. It performs a confirmation re-read and takes the per-key maximum
-   `expected_sensors` across both reads so a still-loading sibling set is not
-   snapshotted short.
+2. It performs a single confirmation re-read and unions the two reads' keys, so
+   a station whose representative surfaces only on the second read is still
+   picked up.
 3. It writes the discovered list back to its own add-on options via the
    Supervisor API so subsequent restarts find an explicit `stations:` and skip
    discovery. If that write fails, a paste-ready `stations:` YAML block is
@@ -135,14 +135,14 @@ in plain manual mode.
 
 ## Configuration
 
-| Option                    | Default | Meaning                                                                                                                                             |
-| ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `max_backoff_seconds`     | `86400` | Terminal holding cadence (the slow hold for a non-retryable fault).                                                                                 |
-| `settle_seconds`          | `15`    | Wait before each station's `/states` read, and the spacing between the startup discovery attempts (1-300).                                          |
-| `startup_stagger_seconds` | `10`    | Delay between each station's first poll at launch (1-300).                                                                                          |
-| `request_timeout_seconds` | `30`    | Per-call Core-API proxy timeout (1-300).                                                                                                            |
-| `log_level`               | `info`  | `debug` / `info` / `warning` / `error`.                                                                                                             |
-| `stations`                | `[]`    | Stations to poll: `key`, `update_entity`, `expected_sensors` per row. Leave empty to auto-populate from existing `sensor.wu_obstimeutc_*` entities. |
+| Option                    | Default | Meaning                                                                                                                         |
+| ------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `max_backoff_seconds`     | `86400` | Terminal holding cadence (the slow hold for a non-retryable fault).                                                             |
+| `settle_seconds`          | `15`    | Wait before each station's `/states` read, and the spacing between the startup discovery attempts (1-300).                      |
+| `startup_stagger_seconds` | `10`    | Delay between each station's first poll at launch (1-300).                                                                      |
+| `request_timeout_seconds` | `30`    | Per-call Core-API proxy timeout (1-300).                                                                                        |
+| `log_level`               | `info`  | `debug` / `info` / `warning` / `error`.                                                                                         |
+| `stations`                | `[]`    | Stations to poll: `key`, `update_entity` per row. Leave empty to auto-populate from existing `sensor.wu_obstimeutc_*` entities. |
 
 Each station row:
 
@@ -156,9 +156,6 @@ Each station row:
   so existing rows need not change — but new rows should use `obstimeutc`. The
   registry `sensor.rest_wu_*` form and a wrong-key copy-paste are both rejected at
   validation time.
-- **`expected_sensors`** — a positive integer; the station's normal sensor count.
-  A discovered count below it is **logged as a soft signal**, never on its own a
-  reason to mark the station unhealthy.
 
 ## Health model
 
@@ -170,8 +167,8 @@ parses as an ISO-8601 timestamp; **offline** when it is absent, `unavailable`,
 `unknown`, `none`, the empty string, or an unparseable value. A Weather.com `204`
 collapses the entire REST resource, so the presence of a parseable `obsTimeUtc`
 alone captures online-vs-offline. An individually-unavailable other metric (e.g.
-`uv` going `unavailable` overnight) or a discovered count short of
-`expected_sensors` is **non-fatal** — it never makes a station offline.
+`uv` going `unavailable` overnight) is **non-fatal** — it never makes a station
+offline; only the `obstimeutc` representative is inspected.
 
 **Why `obsTimeUtc`, not freshness of the refresh.** `homeassistant.update_entity`
 forces the REST platform to re-fetch, but its return cannot prove Weather.com

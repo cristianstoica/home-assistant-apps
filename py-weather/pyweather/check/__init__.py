@@ -56,9 +56,9 @@ from .secrets_check import check_no_secret_leakage
 from .shaping import check_request_shaping, check_supervisor_request_shaping
 from .state_checks import check_state_roundtrip, check_state_tolerant_load
 from .startup_checks import (
-    check_discover_count_stability,
     check_discover_message_discriminators,
     check_discover_retry_and_exit,
+    check_discover_station_union,
     check_persist_allowlist_completeness,
     check_persist_best_effort,
     check_run_startup_branches,
@@ -123,7 +123,7 @@ def run_check() -> int:
     ok = _guarded("persist-allowlist", check_persist_allowlist_completeness, ok)
     ok = _guarded("discover-retry", check_discover_retry_and_exit, ok)
     ok = _guarded("discover-messages", check_discover_message_discriminators, ok)
-    ok = _guarded("discover-count", check_discover_count_stability, ok)
+    ok = _guarded("discover-union", check_discover_station_union, ok)
     ok = _guarded("persist-best-effort", check_persist_best_effort, ok)
     ok = _guarded("skipped-entity-warnings", check_skipped_entity_warnings, ok)
     ok = _guarded("run-startup", check_run_startup_branches, ok)

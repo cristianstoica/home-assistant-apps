@@ -50,7 +50,6 @@ def _config(**overrides: object) -> Config:
             {
                 "key": "istation01",
                 "update_entity": "sensor.wu_temp_istation01",
-                "expected_sensors": 10,
             }
         ],
         **overrides,
