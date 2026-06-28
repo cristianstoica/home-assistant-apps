@@ -31,7 +31,7 @@ def _entities(raw: list[dict[str, object]]) -> list[EntityState]:
 
 
 def check_discovery_transform() -> bool:
-    """Assert the pure discovery transform's matching/skip/count/dedup contract."""
+    """Assert the pure discovery transform's matching/skip/dedup contract."""
     checks: list[tuple[str, bool]] = []
 
     # --- single conforming station: obstimeutc + temp + humidity + pressure + uv
