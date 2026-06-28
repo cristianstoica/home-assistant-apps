@@ -23,7 +23,7 @@ def check_valid_defaults() -> bool:
 
     Pins the eight default stations (key + the configured ``update_entity`` POST
     target ``sensor.wu_temp_<key>``) and the default cadence/timeout values. The
-    health representative is ``obstimeutc`` (a soft signal); the manifest's
+    health representative is ``obstimeutc``; the manifest's
     refresh target stays ``temp``.
     """
     cfg = config.validate(fixtures.default_options())
