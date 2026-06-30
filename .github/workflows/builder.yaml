@@ -46,16 +46,18 @@ jobs:
           CHANGED_FILES: ${{ steps.changed_files.outputs.all_changed_files }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          all_apps=()
+          read -r -a all_apps <<< "${APPS}"
           changed_apps=()
 
           # On manual dispatch, rebuild all apps.
           if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            changed_apps=(${APPS})
+            changed_apps=("${all_apps[@]}")
           # If the workflow file itself changed, rebuild all apps
           elif [[ "${CHANGED_FILES}" =~ \.github/workflows/(builder|build-app)\.yaml ]]; then
-            changed_apps=(${APPS})
+            changed_apps=("${all_apps[@]}")
           else
-            for app in ${APPS}; do
+            for app in "${all_apps[@]}"; do
               for file in ${MONITORED_FILES}; do
                 if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]]; then
                   changed_apps+=("${app}")

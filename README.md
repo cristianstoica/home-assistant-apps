@@ -62,6 +62,22 @@ logs the Supervisor bearer.
    **Install**.
 4. On the **Configuration** tab, set options, then **Start**.
 
+## Publishing
+
+Release images are built by `.github/workflows/builder.yaml` and published to
+GHCR as per-architecture images plus a multi-architecture manifest. For
+`py-weather`, the workflow must be able to write these packages:
+
+- `ghcr.io/cristianstoica/amd64-py-weather`
+- `ghcr.io/cristianstoica/aarch64-py-weather`
+- `ghcr.io/cristianstoica/py-weather`
+
+If GHCR rejects a push with `permission_denied: write_package`, grant the
+`cristianstoica/home-assistant-apps` repository write access under each package's
+**Package settings -> Manage Actions access**. The workflow can also use a
+repository secret named `GHCR_TOKEN` with `write:packages` scope, and optionally
+`GHCR_USERNAME`, if package access cannot be repaired for `GITHUB_TOKEN`.
+
 ## License
 
 [MIT](LICENSE).
