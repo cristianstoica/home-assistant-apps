@@ -9,13 +9,30 @@ health/scheduler checks instead.
 
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 from pathlib import Path
 
-from .. import config, fixtures
+from .. import __version__, config, fixtures
 from ..config import ConfigError
 from .report import report
+
+
+def check_release_version_lockstep() -> bool:
+    """Assert the package version matches the add-on manifest version."""
+    manifest = Path(__file__).resolve().parents[2] / "config.yaml"
+    text = manifest.read_text(encoding="utf-8")
+    match = re.search(r'^version:\s*["\']?([^"\'\n]+)["\']?\s*$', text, re.MULTILINE)
+    manifest_version = match.group(1) if match else None
+    checks: list[tuple[str, bool]] = [
+        ("config.yaml declares a version", manifest_version is not None),
+        (
+            "pyweather.__version__ matches config.yaml version",
+            manifest_version == __version__,
+        ),
+    ]
+    return report("RELEASE-VERSION", "release-version", checks)
 
 
 def check_valid_defaults() -> bool:

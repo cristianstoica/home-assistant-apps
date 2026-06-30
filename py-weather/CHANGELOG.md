@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.1 — republish 0.4.x image tag and guard release version drift
+
+- **Bump the add-on manifest to `0.4.1`** so the builder publishes a fresh
+  versioned GHCR image tag. The previous `0.4.0` manifest was present in the
+  repository, but the corresponding `ghcr.io/cristianstoica/py-weather:0.4.0`
+  image tag was not published, causing Supervisor updates to fail at image
+  resolution time.
+- **Synchronize `pyweather.__version__` with `config.yaml`.** It was still
+  `0.3.0` after the `0.4.0` manifest bump.
+- **Add a release-version self-check** so `python3 -m pyweather --check` fails if
+  the Python package version and add-on manifest version drift again.
+
 ## 0.4.0 — remove expected_sensors/discovered; tighten schema and logs
 
 - **Removed `expected_sensors` config key.** The per-station `expected_sensors`

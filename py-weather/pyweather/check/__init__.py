@@ -33,6 +33,7 @@ from .cadence_checks import (
 from .config_checks import (
     check_entity_shape,
     check_invalid_options,
+    check_release_version_lockstep,
     check_station_key_contract,
     check_valid_defaults,
 )
@@ -109,7 +110,8 @@ def _guarded(name: str, fn: Callable[[], bool], ok: bool) -> bool:
 
 def run_check() -> int:
     """Dispatch every oracle case (each guarded); exit 0 only when all hold."""
-    ok = _guarded("valid-defaults", check_valid_defaults, True)
+    ok = _guarded("release-version", check_release_version_lockstep, True)
+    ok = _guarded("valid-defaults", check_valid_defaults, ok)
     ok = _guarded("invalid-options", check_invalid_options, ok)
     ok = _guarded("entity-shape", check_entity_shape, ok)
     ok = _guarded("station-key", check_station_key_contract, ok)
