@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Dashboard</h1>
+    {% if site %}
+      <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - {{ variable }}</p>
+    {% endif %}
+  </div>
+  {% if sites %}
+    <div class="control-row">
+      {% for item in sites %}
+        <a class="pill {{ 'active' if site and item.id == site.id else '' }}" href="{{ url('/dashboard?site=' ~ item.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (lead|urlencode)) }}">{{ item.name }}</a>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+{% if site %}
+  <section class="toolbar">
+    <div class="segmented">
+      <a class="{{ 'active' if window == 'rolling' else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=rolling&lead=' ~ (lead|urlencode)) }}">Last {{ rolling_days }} days</a>
+      <a class="{{ 'active' if window == 'all' else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=all&lead=' ~ (lead|urlencode)) }}">All time</a>
+    </div>
+    <div class="segmented">
+      {% for var in ["temperature", "precip", "wind"] %}
+        <a class="{{ 'active' if variable == var else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ var ~ '&window=' ~ window ~ '&lead=' ~ (lead|urlencode)) }}">{{ var|title }}</a>
+      {% endfor %}
+    </div>
+    <div class="segmented" aria-label="Lead time">
+      {% for day in range(0, 8) %}
+        {% set lead_label = "D+" ~ day %}
+        <a class="{{ 'active' if lead == lead_label else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (lead_label|urlencode)) }}">{{ lead_label }}</a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="dashboard-grid">
+    {% include "dashboard/_leaderboard.html" %}
+    {% include "dashboard/_skillcurve.html" %}
+    {% include "dashboard/_winrate.html" %}
+    {% include "dashboard/_composite.html" %}
+  </section>
+{% else %}
+  <p class="empty">No sites configured.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,12 @@
+<section class="panel">
+  <h2>Budget Gauges</h2>
+  {% for row in budgets %}
+    <div class="gauge-row">
+      <div>
+        <strong>{{ row.source }}</strong>
+        <span>{{ row.calls }} / {{ row.daily_call_limit }} calls{% if row.daily_credit_limit %} - {{ row.credits }} / {{ row.daily_credit_limit }} credits{% endif %}</span>
+      </div>
+      <meter min="0" max="{{ row.daily_call_limit }}" value="{{ row.calls }}"></meter>
+    </div>
+  {% endfor %}
+</section>

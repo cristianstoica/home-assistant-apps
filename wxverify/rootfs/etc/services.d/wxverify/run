@@ -1,0 +1,10 @@
+#!/usr/bin/with-contenv bashio
+bashio::log.info "Starting Weather Verify..."
+
+export WXV_INGRESS_ENTRY="$(bashio::addon.ingress_entry)"
+export WXV_LOG_LEVEL="$(bashio::config 'log_level')"
+
+exec python3 -m wxverify serve \
+    --options /data/options.json \
+    --host 0.0.0.0 --port 8099 \
+    --root-path "${WXV_INGRESS_ENTRY}"

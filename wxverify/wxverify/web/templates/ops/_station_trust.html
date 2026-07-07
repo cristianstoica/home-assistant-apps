@@ -1,0 +1,21 @@
+<section class="panel wide">
+  <h2>Station Trust</h2>
+  {% if station_trust %}
+    <table>
+      <thead><tr><th>Site</th><th>Station</th><th>Variable</th><th>n</th><th>Mean delta</th></tr></thead>
+      <tbody>
+        {% for row in station_trust %}
+          <tr>
+            <td>{{ row.site_name }}</td>
+            <td>{{ row.station }}</td>
+            <td>{{ row.variable }}</td>
+            <td>{{ row.n }}</td>
+            <td>{{ "%.2f"|format(row.mean_delta) }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No station diagnostics yet.</p>
+  {% endif %}
+</section>

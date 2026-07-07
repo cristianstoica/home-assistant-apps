@@ -1,0 +1,134 @@
+"""WeatherAPI.com Forecast API adapter."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import ClassVar, Final
+
+import httpx
+from pydantic import BaseModel, ConfigDict, Field
+
+from wxverify.core.timeutil import isoformat_utc, lead_hours
+from wxverify.core.units import kmh_to_ms
+from wxverify.feeds.seam import (
+    CostEstimate,
+    FetchResult,
+    ForecastRequest,
+    NormalizedSample,
+)
+from wxverify.feeds.synthetic_run import snap_run
+
+_ENDPOINT: Final = "https://api.weatherapi.com/v1/forecast.json"
+
+
+class WeatherApiHour(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    time_epoch: int
+    temp_c: float | None = None
+    wind_kph: float | None = None
+    precip_mm: float | None = None
+
+
+def _no_hours() -> list[WeatherApiHour]:
+    return []
+
+
+class WeatherApiForecastDay(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    hour: list[WeatherApiHour] = Field(default_factory=_no_hours)
+
+
+def _no_days() -> list[WeatherApiForecastDay]:
+    return []
+
+
+class WeatherApiForecast(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    forecastday: list[WeatherApiForecastDay] = Field(default_factory=_no_days)
+
+
+class WeatherApiResponse(BaseModel):
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    forecast: WeatherApiForecast = Field(default_factory=WeatherApiForecast)
+
+
+class WeatherApiAdapter:
+    supports_historical: ClassVar[bool] = False
+
+    def __init__(self, api_key: str, client: httpx.AsyncClient) -> None:
+        self._api_key = api_key
+        self._client = client
+
+    def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
+        return CostEstimate(calls=1)
+
+    async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+        response = await self._client.get(
+            _ENDPOINT,
+            params={
+                "key": self._api_key,
+                "q": f"{req.lat},{req.lon}",
+                "days": 3,
+                "aqi": "no",
+                "alerts": "no",
+            },
+            timeout=httpx.Timeout(15.0, connect=5.0),
+        )
+        response.raise_for_status()
+        payload = WeatherApiResponse.model_validate(response.json())
+        return _to_fetch_result(req, payload)
+
+    async def fetch_historical(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> FetchResult | None:
+        return None
+
+
+def _to_fetch_result(req: ForecastRequest, payload: WeatherApiResponse) -> FetchResult:
+    issued_at = snap_run()
+    samples: list[NormalizedSample] = []
+    for day in payload.forecast.forecastday:
+        for hour in day.hour:
+            valid_at = isoformat_utc(datetime.fromtimestamp(hour.time_epoch, tz=UTC))
+            lead = lead_hours(issued_at, valid_at)
+            if lead < 1 or lead > req.max_lead_hours:
+                continue
+            samples.extend(_hour_samples(req, issued_at, valid_at, lead, hour))
+    return FetchResult(samples=samples, grid=None)
+
+
+def _hour_samples(
+    req: ForecastRequest,
+    issued_at: str,
+    valid_at: str,
+    lead: int,
+    hour: WeatherApiHour,
+) -> list[NormalizedSample]:
+    # WeatherAPI returns wind in km/h regardless of unit params -> convert.
+    specs: tuple[tuple[str, float | None, str, bool], ...] = (
+        ("temperature", hour.temp_c, "C", False),
+        ("wind", hour.wind_kph, "km/h", True),
+        ("precip", hour.precip_mm, "mm", False),
+    )
+    out: list[NormalizedSample] = []
+    for variable, raw_value, unit, convert in specs:
+        if variable not in req.variables or raw_value is None:
+            continue
+        value = kmh_to_ms(raw_value) if convert else raw_value
+        out.append(
+            NormalizedSample(
+                model=req.model,
+                variable=variable,
+                issued_at=issued_at,
+                valid_at=valid_at,
+                lead_hours=lead,
+                value=value,
+                source_raw=f"{raw_value} {unit}",
+                model_run_id=f"{req.model}:{issued_at}",
+            )
+        )
+    return out

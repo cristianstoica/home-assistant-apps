@@ -1,0 +1,34 @@
+<section class="subsection" id="feed-toggles-{{ site.id if site else 'missing' }}">
+  {% if site %}
+    <div class="section-line">
+      <h3>Feed Subscriptions</h3>
+      <span>{{ site.feeds|selectattr("effective_enabled")|list|length }} active</span>
+    </div>
+    <div class="toggle-list">
+      {% for feed in site.feeds %}
+        <div class="toggle-row">
+          <div>
+            <strong>{{ feed.label }}</strong>
+            {% if feed.description %}
+              <span class="feed-description">{{ feed.description }}</span>
+            {% endif %}
+            <span>
+              {{ "default on" if feed.default_subscribed else "default off" }}
+              {% if not feed.enabled %} - globally disabled{% endif %}
+              {% if feed.disabled_reason %} - {{ feed.disabled_reason }}{% endif %}
+            </span>
+          </div>
+          <button
+            type="button"
+            class="{{ 'on' if feed.effective_enabled else 'off' }}"
+            hx-put="{{ url('/api/sites/' ~ site.id ~ '/feeds/' ~ feed.id) }}"
+            hx-ext="json-enc"
+            hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+            hx-vals='{"enabled": {{ (not feed.effective_enabled)|tojson }}}'
+            hx-target="#feed-toggles-{{ site.id }}"
+            hx-swap="outerHTML">{{ "On" if feed.effective_enabled else "Off" }}</button>
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>

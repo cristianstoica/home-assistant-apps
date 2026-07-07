@@ -1,0 +1,20 @@
+<section class="panel">
+  <h2>Observation Status</h2>
+  {% if observation_health %}
+    <table>
+      <thead><tr><th>Site</th><th>Status</th><th>Stations</th><th>Last obs</th></tr></thead>
+      <tbody>
+        {% for row in observation_health %}
+          <tr>
+            <td>{{ row.site_name }}</td>
+            <td>{{ row.status }}</td>
+            <td>{{ row.enabled_station_count }}</td>
+            <td>{{ row.last_obs_at or "n/a" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No sites configured.</p>
+  {% endif %}
+</section>

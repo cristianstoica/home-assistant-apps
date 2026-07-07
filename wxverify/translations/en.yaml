@@ -1,0 +1,25 @@
+configuration:
+  log_level:
+    name: Log level
+  meteoblue_key:
+    name: Meteoblue API key
+  weathercom_key:
+    name: Weather.com API key
+  visualcrossing_key:
+    name: Visual Crossing API key
+  openweathermap_key:
+    name: OpenWeatherMap API key
+  weatherapi_key:
+    name: WeatherAPI API key
+  meteosource_key:
+    name: Meteosource API key
+  google_key:
+    name: Google Weather API key
+  rolling_window_days:
+    name: Rolling window days
+  min_n:
+    name: Minimum sample count
+  obs_interval_minutes:
+    name: Observation interval
+  obs_jitter_minutes:
+    name: Observation jitter
