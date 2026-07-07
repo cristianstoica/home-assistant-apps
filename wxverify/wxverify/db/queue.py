@@ -29,6 +29,16 @@ class EnqueueResult:
     job_id: int | None = None
 
 
+@dataclass(frozen=True)
+class FailDisposition:
+    """Outcome of ``fail``: terminal 'failed' or a scheduled retry."""
+
+    terminal: bool
+    retry_count: int
+    max_retries: int
+    next_attempt_at: str | None
+
+
 def _job_from_row(row: sqlite3.Row) -> Job:
     payload_raw = str(row["payload"])
     payload_obj: object = json.loads(payload_raw) if payload_raw else {}
@@ -118,12 +128,13 @@ def complete(conn: sqlite3.Connection, job_id: int, result: str | None = None) -
     )
 
 
-def fail(conn: sqlite3.Connection, job_id: int, error: str) -> None:
+def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition | None:
+    """Record a job failure; returns the disposition, or None if the job is gone."""
     row = conn.execute(
         "SELECT retry_count, max_retries FROM jobs WHERE id = ?", (job_id,)
     ).fetchone()
     if row is None:
-        return
+        return None
     retry_count = int(row["retry_count"]) + 1
     max_retries = int(row["max_retries"])
     if retry_count > max_retries:
@@ -135,7 +146,12 @@ def fail(conn: sqlite3.Connection, job_id: int, error: str) -> None:
             """,
             (retry_count, error, isoformat_utc(), job_id),
         )
-        return
+        return FailDisposition(
+            terminal=True,
+            retry_count=retry_count,
+            max_retries=max_retries,
+            next_attempt_at=None,
+        )
     delay = min(3600, 2 ** min(retry_count, 10))
     next_attempt = isoformat_utc(utc_now() + timedelta(seconds=delay))
     conn.execute(
@@ -146,6 +162,12 @@ def fail(conn: sqlite3.Connection, job_id: int, error: str) -> None:
         WHERE id=?
         """,
         (retry_count, error, next_attempt, isoformat_utc(), job_id),
+    )
+    return FailDisposition(
+        terminal=False,
+        retry_count=retry_count,
+        max_retries=max_retries,
+        next_attempt_at=next_attempt,
     )
 
 

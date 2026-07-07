@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
+from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc, window_cutoff
 from wxverify.scoring.cache import upsert_score_cache
@@ -14,9 +16,20 @@ from wxverify.settings.keys import get_number_setting
 
 
 def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None:
-    pair_real_models(conn, site_id)
-    materialize_persistence(conn, site_id)
-    materialize_multimodel_mean(conn, site_id)
+    """Run the full scoring pipeline monolithically on one connection.
+
+    HTTP routes and the CLI call this inside a single write transaction.
+    The worker dispatch instead iterates ``PAIR_AND_SCORE_PHASES`` with one
+    write transaction per phase so the event loop (and the healthcheck) can
+    breathe between phases — see the convergence-invariant comment at the
+    worker dispatch site (worker/processor.py).
+    """
+    for phase in PAIR_AND_SCORE_PHASES:
+        phase(conn, site_id)
+
+
+def _score_all_windows(conn: sqlite3.Connection, site_id: int | None = None) -> None:
+    """Clear and recompute the score cache for both scoring windows."""
     _clear_score_cache(conn, site_id)
     rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
@@ -24,6 +37,20 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
         conn, site_id, f"w:{rolling_days}", window_cutoff(rolling_days), min_n
     )
     _score_window(conn, site_id, "w:all", None, min_n)
+
+
+# Ordered pipeline phases. Each phase only derives state from tables written
+# by earlier phases (samples/observations -> pairs -> score cache), so
+# running them in separate write transactions is end-state equivalent to the
+# monolithic run as long as no observation write interleaves between phases.
+PAIR_AND_SCORE_PHASES: Final[
+    tuple[Callable[[sqlite3.Connection, int | None], object], ...]
+] = (
+    pair_real_models,
+    materialize_persistence,
+    materialize_multimodel_mean,
+    _score_all_windows,
+)
 
 
 def _clear_score_cache(conn: sqlite3.Connection, site_id: int | None) -> None:

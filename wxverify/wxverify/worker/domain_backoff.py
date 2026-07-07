@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, timedelta
 from email.utils import parsedate_to_datetime
@@ -11,6 +12,8 @@ import httpx
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.worker.control import JobDeferred
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_DELAY_SECONDS = 60
 _MAX_DELAY_SECONDS = 3600
@@ -68,6 +71,13 @@ def record_http_backoff(
             retry_count=excluded.retry_count
         """,
         (domain, next_attempt_at, retry_count),
+    )
+    logger.warning(
+        "domain backoff activated domain=%s status=%d retry=%d until=%s",
+        domain,
+        response.status_code,
+        retry_count,
+        next_attempt_at,
     )
     return next_attempt_at
 

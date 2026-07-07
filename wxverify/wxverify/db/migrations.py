@@ -155,6 +155,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
             ON forecast_pairs(site_id, variable, day_ahead, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_pairs_cell
+            ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
 
         CREATE TABLE IF NOT EXISTS score_cache (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,

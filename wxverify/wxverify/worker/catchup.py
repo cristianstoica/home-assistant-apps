@@ -8,7 +8,12 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from wxverify.collection.budget import reserve_budget
+from wxverify.collection.budget import (
+    Reservation,
+    is_refundable_transport_error,
+    refund_budget,
+    reserve_budget,
+)
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
     persist_fetch_result,
@@ -22,7 +27,7 @@ from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
 from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import pair_and_score
+from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -92,7 +97,11 @@ async def run_catchup(
         if changed:
             changed_sites.add(site.site_id)
     for site_id in changed_sites:
-        await db.write(lambda conn, sid=site_id: pair_and_score(conn, sid))
+        # One write transaction per phase; runs inside the single worker job
+        # executor, so the convergence invariant documented at the
+        # pair_and_score dispatch site (worker/processor.py) applies here too.
+        for phase in PAIR_AND_SCORE_PHASES:
+            await db.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
     if has_more and sites:
         return JobContinuation(
             job_type="catchup",
@@ -142,7 +151,7 @@ async def _fetch_missing_station_history(
                 )
                 if not has_gap:
                     continue
-                await db.write(
+                reservation = await db.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site.site_id, station_id
                     )
@@ -169,9 +178,10 @@ async def _fetch_missing_station_history(
                     raise
                 except Exception as exc:
                     error = sanitized_exception(exc)
+                    refund = reservation if is_refundable_transport_error(exc) else None
                     await db.write(
-                        lambda conn, station_id=station.id, err=error: (
-                            _mark_station_error(conn, station_id, err)
+                        lambda conn, station_id=station.id, err=error, res=refund: (
+                            _mark_station_error_and_refund(conn, station_id, err, res)
                         )
                     )
                     raise
@@ -208,7 +218,7 @@ async def _fetch_due_open_meteo(
                 max_lead_hours=target.max_lead_hours,
             )
             cost = adapter.estimate_cost(req)
-            await db.write(
+            reservation = await db.write(
                 lambda conn, feed=target, reserve=cost: _reserve_feed_call(
                     conn, feed, reserve
                 )
@@ -230,9 +240,10 @@ async def _fetch_due_open_meteo(
                 continue
             except Exception as exc:
                 error = sanitized_exception(exc)
+                refund = reservation if is_refundable_transport_error(exc) else None
                 await db.write(
-                    lambda conn, feed=target, err=error: _mark_feed_error(
-                        conn, feed, err
+                    lambda conn, feed=target, err=error, res=refund: (
+                        _mark_feed_error_and_refund(conn, feed, err, res)
                     )
                 )
                 continue
@@ -352,7 +363,7 @@ def _station_has_gap(
 
 def _reserve_station_history_call(
     conn: sqlite3.Connection, site_id: int, station_id: int
-) -> None:
+) -> Reservation:
     row = conn.execute(
         """
         SELECT 1
@@ -368,7 +379,7 @@ def _reserve_station_history_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
-    reserve_budget(conn, "weathercom", 1)
+    return reserve_budget(conn, "weathercom", 1)
 
 
 def _persist_station_observations(
@@ -423,6 +434,18 @@ def _mark_station_error(conn: sqlite3.Connection, station_id: int, error: str) -
     )
 
 
+def _mark_station_error_and_refund(
+    conn: sqlite3.Connection,
+    station_id: int,
+    error: str,
+    reservation: Reservation | None,
+) -> None:
+    """Record the station failure and, atomically, refund a phantom reservation."""
+    _mark_station_error(conn, station_id, error)
+    if reservation is not None:
+        refund_budget(conn, reservation)
+
+
 def _due_open_meteo_targets(
     conn: sqlite3.Connection, *, site: CatchupSite, window_end: datetime
 ) -> list[ForecastTarget]:
@@ -470,7 +493,7 @@ def _due_open_meteo_targets(
 
 def _reserve_feed_call(
     conn: sqlite3.Connection, feed: ForecastTarget, cost: CostEstimate
-) -> None:
+) -> Reservation:
     active = conn.execute(
         """
         SELECT 1
@@ -490,7 +513,7 @@ def _reserve_feed_call(
     if active is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain(feed.source, historical=True))
-    reserve_budget(conn, feed.source, cost.calls, cost.credits)
+    return reserve_budget(conn, feed.source, cost.calls, cost.credits)
 
 
 def _mark_feed_error(
@@ -507,6 +530,18 @@ def _mark_feed_error(
         """,
         (feed.site_id, feed.feed_id, error),
     )
+
+
+def _mark_feed_error_and_refund(
+    conn: sqlite3.Connection,
+    feed: ForecastTarget,
+    error: str,
+    reservation: Reservation | None,
+) -> None:
+    """Record the fetch failure and, atomically, refund a phantom reservation."""
+    _mark_feed_error(conn, feed, error)
+    if reservation is not None:
+        refund_budget(conn, reservation)
 
 
 def _mark_station_error_and_backoff(

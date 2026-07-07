@@ -24,7 +24,10 @@ RUN pip install --no-cache-dir uv==0.9.17 && \
 COPY rootfs /
 COPY wxverify/ /app/wxverify/
 
-HEALTHCHECK --interval=60s --timeout=10s --start-period=60s --retries=3 \
+# Generous timeout/retries: the single-process asyncio app can starve the
+# healthcheck GET during long scoring write transactions (GIL-bound work in
+# a thread), and boot-time catchup can hold the loop busy well past 60s.
+HEALTHCHECK --interval=60s --timeout=30s --start-period=300s --retries=10 \
     CMD curl -f -s -o /dev/null http://127.0.0.1:8099/api/sites || exit 1
 
 LABEL \

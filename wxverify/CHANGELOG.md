@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.1.1
+
+- Fixed: Web UI now loads correctly through Home Assistant Ingress — the URL
+  prefix is taken from the Supervisor proxy's `X-Ingress-Path` header on every
+  request instead of a boot-time value that could be empty; a stale CSRF cookie
+  left by 0.1.0 is cleaned up automatically on upgrade.
+- Fixed: the add-on is no longer restarted by the Supervisor watchdog during
+  long scoring passes — the container healthcheck tolerates busy periods,
+  scoring runs in smaller per-phase transactions, and the persistence baseline
+  is rebuilt incrementally (~30× faster) with a new database index speeding up
+  score aggregation.
+- Fixed: worker failures now appear in the add-on log (warnings on retried
+  jobs, errors on permanent failures, notices for deferrals and provider
+  backoffs), with API keys — including OpenWeatherMap's `appid` — redacted from
+  all messages.
+- Fixed: connection-level fetch failures (DNS failure, connection refused,
+  connect timeout) no longer consume API call budgets — the reservation is
+  refunded when the request provably never reached the provider.
+
 ## 0.1.0
 
 First public release as a Home Assistant add-on.

@@ -8,7 +8,9 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 _URL_RE = re.compile(r"https?://[^\s'\"<>]+")
-_SECRET_QUERY_KEYS = frozenset({"apikey", "api_key", "key", "token", "password"})
+_SECRET_QUERY_KEYS = frozenset(
+    {"apikey", "api_key", "appid", "key", "token", "password"}
+)
 
 
 def sanitized_exception(exc: BaseException) -> str:

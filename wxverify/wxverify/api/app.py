@@ -19,6 +19,7 @@ from wxverify import config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.api.errors import register_error_handlers
 from wxverify.api.guard import MutationGuard
+from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.api.routes import (
     backfill,
     dashboard,
@@ -56,6 +57,7 @@ def create_app(
     )
     app.state.stop_process = _stop_process
     app.add_middleware(MutationGuard, standalone_origin=config.standalone_origin)
+    app.add_middleware(IngressPathMiddleware)
     register_error_handlers(app)
     app.mount("/static", StaticFiles(directory=static_dir()), name="static")
     app.include_router(sites.router)
