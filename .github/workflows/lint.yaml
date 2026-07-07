@@ -25,7 +25,8 @@ jobs:
 
       - name: Find app directories
         id: addons
-        uses: home-assistant/actions/helpers/find-addons@master
+        # home-assistant/actions/helpers/find-addons master — pinned 2026-07-07 (floating branch)
+        uses: home-assistant/actions/helpers/find-addons@f4ca6f671bd429efb108c0f2fa0ae8af0215986c
 
   addon-lint:
     name: Lint app ${{ matrix.path }}
@@ -130,3 +131,43 @@ jobs:
         run: ruff check --target-version py313 py-weather
       - name: ruff format --check
         run: ruff format --check py-weather
+
+  wxverify-gates:
+    name: Wxverify gates (ruff / pyright / pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wxverify
+    steps:
+      - name: Check out code from GitHub
+        # actions/checkout v6.0.2 — pinned 2026-07-07
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Set up Python
+        # actions/setup-python v6 — pinned 2026-07-07
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run ruff check
+
+      - name: ruff format --check
+        run: uv run ruff format --check
+
+      - name: pyright
+        run: uv run pyright
+
+      - name: pytest
+        run: uv run pytest
+        env:
+          WXV_WEATHERCOM_KEY: "ci-placeholder"
+
+      - name: Import sanity check
+        run: uv run python -m wxverify --help

@@ -1,0 +1,22 @@
+{
+  "htmx.min.js": {
+    "package": "htmx.org",
+    "version": "2.0.8",
+    "source": "https://unpkg.com/htmx.org@2.0.8/dist/htmx.min.js"
+  },
+  "htmx-ext-json-enc.js": {
+    "package": "htmx-ext-json-enc",
+    "version": "2.0.1",
+    "source": "https://unpkg.com/htmx-ext-json-enc@2.0.1/json-enc.js"
+  },
+  "uplot.min.js": {
+    "package": "uplot",
+    "version": "1.6.32",
+    "source": "https://unpkg.com/uplot@1.6.32/dist/uPlot.iife.min.js"
+  },
+  "uplot.min.css": {
+    "package": "uplot",
+    "version": "1.6.32",
+    "source": "https://unpkg.com/uplot@1.6.32/dist/uPlot.min.css"
+  }
+}

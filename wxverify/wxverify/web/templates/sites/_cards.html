@@ -1,0 +1,9 @@
+<div id="site-cards" class="site-grid">
+  {% if sites %}
+    {% for site in sites %}
+      {% include "sites/_card.html" %}
+    {% endfor %}
+  {% else %}
+    <p class="empty">No sites configured.</p>
+  {% endif %}
+</div>

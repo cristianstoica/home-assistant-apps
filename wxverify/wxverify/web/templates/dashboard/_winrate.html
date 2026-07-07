@@ -1,0 +1,19 @@
+<section class="panel">
+  <h2>Win Rate</h2>
+  {% if winrate %}
+    <table>
+      <thead><tr><th>Feed</th><th>Covered</th><th>Rate</th></tr></thead>
+      <tbody>
+        {% for row in winrate %}
+          <tr>
+            <td>{{ row.feed_id }}</td>
+            <td>{{ row.covered }}</td>
+            <td>{{ "%.0f"|format(row.win_rate * 100) if row.win_rate is not none else "0" }}%</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No win-rate rows.</p>
+  {% endif %}
+</section>

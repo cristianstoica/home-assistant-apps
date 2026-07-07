@@ -1,0 +1,12 @@
+<section class="panel">
+  <h2>Skill Curve</h2>
+  <div
+    class="chart"
+    data-chart="skill"
+    data-src="{{ url('/api/curve?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window) }}">
+    <svg viewBox="0 0 640 220" role="img" aria-label="Skill curve fallback">
+      <line x1="40" y1="180" x2="600" y2="180"></line>
+      <line x1="40" y1="20" x2="40" y2="180"></line>
+    </svg>
+  </div>
+</section>

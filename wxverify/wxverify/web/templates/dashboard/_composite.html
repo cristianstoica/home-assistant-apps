@@ -1,0 +1,19 @@
+<section class="panel">
+  <h2>Composite</h2>
+  {% if composite %}
+    <table>
+      <thead><tr><th>Feed</th><th>Score</th><th>Rank</th></tr></thead>
+      <tbody>
+        {% for row in composite %}
+          <tr>
+            <td>{{ row.feed_id }}</td>
+            <td>{{ "%.3f"|format(row.score) if row.score is not none else "n/a" }}</td>
+            <td>{{ loop.index }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No composite rows.</p>
+  {% endif %}
+</section>

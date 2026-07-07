@@ -1,0 +1,31 @@
+<section class="panel">
+  <h2>Leaderboard</h2>
+  {% if leaderboard %}
+    <table>
+      <thead>
+        <tr><th>Feed</th><th>n</th><th>Skill</th><th>MAE</th><th>RMSE</th><th>Confidence</th></tr>
+      </thead>
+      <tbody>
+        {% for row in leaderboard %}
+          <tr>
+            <td>{{ row.label }}</td>
+            <td>{{ row.n }}</td>
+            <td>
+              {% if row.badge is not none %}
+                <span class="badge {{ 'warn' if row.below_baseline else 'ok' }}">{{ row.badge }}</span>
+                {% if row.below_baseline %}<span class="muted">below baseline</span>{% endif %}
+              {% else %}
+                withheld
+              {% endif %}
+            </td>
+            <td>{{ "%.2f"|format(row.mae) if row.mae is not none else "n/a" }}</td>
+            <td>{{ "%.2f"|format(row.rmse) if row.rmse is not none else "n/a" }}</td>
+            <td><span class="badge {{ 'ok' if row.confident else 'warn' }}">{{ "confident" if row.confident else "withheld" }}</span></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="empty">No scored pairs.</p>
+  {% endif %}
+</section>

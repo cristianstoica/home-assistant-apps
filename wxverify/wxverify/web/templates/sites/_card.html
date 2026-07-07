@@ -1,0 +1,27 @@
+<article class="site-card" id="site-{{ site.id }}">
+  <header class="site-card-header">
+    <div>
+      <h2>{{ site.name }}</h2>
+      <p>{{ "%.5f"|format(site.forecast_lat) }}, {{ "%.5f"|format(site.forecast_lon) }} - {{ "%.0f"|format(site.elevation_m) }} m - {{ site.timezone }}</p>
+    </div>
+    <div class="status-stack">
+      <span class="badge {{ 'ok' if site.enabled else 'muted' }}">{{ "Enabled" if site.enabled else "Paused" }}</span>
+      <button
+        type="button"
+        class="ghost danger"
+        hx-delete="{{ url('/api/sites/' ~ site.id) }}"
+        hx-ext="json-enc"
+        hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+        hx-target="#site-cards"
+        hx-swap="outerHTML">Delete</button>
+    </div>
+  </header>
+
+  <dl class="facts">
+    <div><dt>Rain threshold</dt><dd>{{ "%.1f"|format(site.rain_threshold_mm) }} mm</dd></div>
+    <div><dt>Enabled stations</dt><dd>{{ site.enabled_station_count }}</dd></div>
+  </dl>
+
+  {% include "sites/_station_cluster.html" %}
+  {% include "sites/_feed_toggles.html" %}
+</article>

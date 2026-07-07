@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="csrf-token" content="{{ csrf_token }}">
+    <title>{% block title %}{{ app_title }}{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url('/static/uplot.min.css') }}">
+    <link rel="stylesheet" href="{{ url('/static/app.css') }}">
+  </head>
+  <body hx-ext="json-enc" hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
+    <header class="topbar">
+      <a class="brand" href="{{ url('/dashboard') }}">{{ app_title }}</a>
+      <nav class="tabs" aria-label="Primary">
+        <a href="{{ url('/sites') }}">Sites</a>
+        <a href="{{ url('/dashboard') }}">Dashboard</a>
+        <a href="{{ url('/ops') }}">Ops</a>
+        <a href="{{ url('/overlay') }}">Overlay</a>
+      </nav>
+    </header>
+
+    <div id="mutation-notice" class="notice" hidden>
+      <span id="mutation-notice-text"></span>
+      <button type="button" data-dismiss-notice aria-label="Dismiss">x</button>
+    </div>
+
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+      <span>Forecast data includes Open-Meteo CC-BY sources.</span>
+      <span>Weather data provided by <a href="https://www.visualcrossing.com/">Visual Crossing</a>.</span>
+      <span>Weather data provided by <a href="https://openweathermap.org/">OpenWeatherMap</a>.</span>
+      <span>Powered by <a href="https://www.weatherapi.com/">WeatherAPI.com</a>.</span>
+      <span>Weather data provided by <a href="https://www.meteosource.com/">Meteosource</a>.</span>
+      <span>Source: Includes weather data from Google</span>
+    </footer>
+
+    <script src="{{ url('/static/htmx.min.js') }}"></script>
+    <script src="{{ url('/static/htmx-ext-json-enc.js') }}"></script>
+    <script src="{{ url('/static/uplot.min.js') }}"></script>
+    <script>
+      document.body.addEventListener("htmx:configRequest", function (event) {
+        var token = document.querySelector('meta[name="csrf-token"]').content;
+        if (!event.detail.headers["X-CSRF-Token"] && !event.detail.headers["x-csrf-token"]) {
+          event.detail.headers["X-CSRF-Token"] = token;
+        }
+      });
+      document.body.addEventListener("htmx:responseError", function (event) {
+        var notice = document.getElementById("mutation-notice");
+        var text = document.getElementById("mutation-notice-text");
+        var status = event.detail.xhr.status;
+        text.textContent = status === 403
+          ? "Session expired or request blocked — reload the page to continue"
+          : "Request rejected";
+        notice.hidden = false;
+      });
+      document.body.addEventListener("click", function (event) {
+        if (event.target && event.target.matches("[data-dismiss-notice]")) {
+          document.getElementById("mutation-notice").hidden = true;
+        }
+      });
+    </script>
+    <script src="{{ url('/static/app.js') }}"></script>
+  </body>
+</html>

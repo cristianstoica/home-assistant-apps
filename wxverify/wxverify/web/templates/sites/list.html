@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Sites - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Sites</h1>
+    <p>{{ sites|length }} configured locations</p>
+  </div>
+</section>
+
+<section class="surface" id="sites-screen">
+  {% include "sites/_form.html" %}
+  {% include "sites/_cards.html" %}
+</section>
+{% endblock %}

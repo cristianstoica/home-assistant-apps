@@ -1,0 +1,73 @@
+<section class="subsection" id="station-cluster-{{ site.id if site else 'missing' }}">
+  {% if site %}
+    <div class="section-line">
+      <h3>Stations</h3>
+      <span>{{ site.stations|length }} total</span>
+    </div>
+
+    <form
+      class="inline-form"
+      hx-post="{{ url('/api/sites/' ~ site.id ~ '/stations') }}"
+      hx-ext="json-enc"
+      hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+      hx-target="#station-cluster-{{ site.id }}"
+      hx-swap="outerHTML">
+      <label>
+        PWS station ID
+        <input name="pws_station_id" required autocomplete="off">
+      </label>
+      <button type="submit">Add station</button>
+    </form>
+
+    {% if site.stations %}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Station</th>
+              <th>Lat</th>
+              <th>Lon</th>
+              <th>DEM m</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for station in site.stations %}
+              {% set last_enabled = station.enabled and site.enabled_station_count <= 1 %}
+              <tr>
+                <td>{{ station.pws_station_id }}</td>
+                <td>{{ "%.4f"|format(station.lat) }}</td>
+                <td>{{ "%.4f"|format(station.lon) }}</td>
+                <td>{{ "%.0f"|format(station.dem_elevation_m) }}</td>
+                <td>{{ "Enabled" if station.enabled else "Disabled" }}</td>
+                <td class="actions">
+                  <button
+                    type="button"
+                    {% if last_enabled %}disabled{% endif %}
+                    hx-put="{{ url('/api/sites/' ~ site.id ~ '/stations/' ~ station.id) }}"
+                    hx-ext="json-enc"
+                    hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                    hx-vals='{"enabled": {{ (not station.enabled)|tojson }}}'
+                    hx-target="#station-cluster-{{ site.id }}"
+                    hx-swap="outerHTML">{{ "Disable" if station.enabled else "Enable" }}</button>
+                  <button
+                    type="button"
+                    class="ghost danger"
+                    {% if last_enabled %}disabled{% endif %}
+                    hx-delete="{{ url('/api/sites/' ~ site.id ~ '/stations/' ~ station.id) }}"
+                    hx-ext="json-enc"
+                    hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                    hx-target="#station-cluster-{{ site.id }}"
+                    hx-swap="outerHTML">Remove</button>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No stations attached.</p>
+    {% endif %}
+  {% endif %}
+</section>

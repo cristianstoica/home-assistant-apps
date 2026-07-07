@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Overlay - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Overlay</h1>
+    {% if site %}
+      <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - forecast vs observed</p>
+    {% endif %}
+  </div>
+</section>
+
+{% if site and feed_id %}
+  <section class="toolbar">
+    <div class="segmented">
+      {% for item in sites %}
+        <a class="{{ 'active' if item.id == site.id else '' }}" href="{{ url('/overlay?site=' ~ item.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id) }}">{{ item.name }}</a>
+      {% endfor %}
+    </div>
+    <div class="segmented">
+      {% for feed in feeds %}
+        <a class="{{ 'active' if feed.id == feed_id else '' }}" href="{{ url('/overlay?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed.id) }}">{{ feed.label }}</a>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Forecast Overlay</h2>
+    <div
+      class="chart tall"
+      data-chart="overlay"
+      data-src="{{ url('/api/timeseries?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id) }}">
+      <svg viewBox="0 0 780 320" role="img" aria-label="Forecast overlay fallback">
+        <line x1="44" y1="278" x2="738" y2="278"></line>
+        <line x1="44" y1="24" x2="44" y2="278"></line>
+      </svg>
+    </div>
+  </section>
+{% else %}
+  <p class="empty">No overlay data source is available.</p>
+{% endif %}
+{% endblock %}

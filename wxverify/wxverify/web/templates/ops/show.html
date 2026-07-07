@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Ops - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Ops</h1>
+    <p>Feed, budget, backfill, key, and station trust status</p>
+  </div>
+</section>
+
+<section class="ops-grid">
+  {% include "ops/_feed_status.html" %}
+  {% include "ops/_budget_gauges.html" %}
+  {% include "ops/_backfill.html" %}
+  {% include "ops/_key_status.html" %}
+  {% include "ops/_observation_health.html" %}
+  {% include "ops/_station_trust.html" %}
+</section>
+{% endblock %}
