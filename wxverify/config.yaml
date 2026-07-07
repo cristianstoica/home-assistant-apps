@@ -10,8 +10,6 @@ startup: services
 init: false
 image: "ghcr.io/cristianstoica/wxverify"
 ingress: true
-ingress_port: 8099
-watchdog: "http://[HOST]:[PORT:8099]/api/sites"
 panel_icon: mdi:weather-partly-cloudy
 panel_title: "Weather Verify"
 options:
