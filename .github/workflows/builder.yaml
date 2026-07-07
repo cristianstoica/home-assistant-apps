@@ -6,7 +6,7 @@ env:
   # source dirs (one per add-on, slug-minus-hyphen) so a Python-only change under
   # `py-syslog/pysyslog/`, `py-ddns/pyddns/`, or `py-weather/pyweather/` triggers a
   # rebuild — without them, source-only edits silently skip the image build.
-  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs pysyslog pyddns pyweather"
+  MONITORED_FILES: "config.json config.yaml config.yml Dockerfile rootfs pysyslog pyddns pyweather wxverify pyproject.toml uv.lock"
 
 on:
   pull_request:
@@ -33,11 +33,13 @@ jobs:
 
       - name: Get changed files
         id: changed_files
-        uses: tj-actions/changed-files@v47
+        # tj-actions/changed-files v47 — pinned 2026-07-07 (prior compromise history)
+        uses: tj-actions/changed-files@24d32ffd492484c1d75e0c0b894501ddb9d30d62
 
       - name: Find app directories
         id: apps
-        uses: home-assistant/actions/helpers/find-addons@master
+        # home-assistant/actions/helpers/find-addons master — pinned 2026-07-07 (floating branch)
+        uses: home-assistant/actions/helpers/find-addons@f4ca6f671bd429efb108c0f2fa0ae8af0215986c
 
       - name: Filter changed apps
         id: filter

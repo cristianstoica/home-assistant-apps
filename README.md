@@ -50,6 +50,18 @@ slow hold (no tight retry loop) on a terminal token/target fault. Holds no
 Weather.com credentials — the REST integration owns external access — and never
 logs the Supervisor bearer.
 
+### [Wxverify](./wxverify)
+
+![Supports aarch64 Architecture][aarch64-shield]
+![Supports amd64 Architecture][amd64-shield]
+
+A **weather-forecast verification add-on** for Home Assistant. It builds an
+observation consensus from a cluster of Weather.com PWS stations, pairs it
+against multiple forecast providers, and ranks them by skill score — surfacing
+which model is actually most accurate for your local area. State is kept in
+SQLite under `/data`; the add-on serves a JSON API and a small HTMX/uPlot
+dashboard via Ingress.
+
 ## Install
 
 > **Requires Home Assistant with the Supervisor** (HA OS or Supervised). HA
