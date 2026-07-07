@@ -166,6 +166,8 @@ jobs:
 
       - name: pytest
         run: uv run pytest
+        env:
+          WXV_WEATHERCOM_KEY: "ci-placeholder"
 
       - name: Import sanity check
         run: uv run python -m wxverify --help
