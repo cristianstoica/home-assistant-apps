@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2
+
+- Fixed: static assets (CSS/JS) returning 404 under Home Assistant Ingress —
+  `IngressPathMiddleware` now restores the ASGI `root_path`/`path` invariant so
+  `StaticFiles` resolves correctly behind the Supervisor ingress proxy; the
+  dashboard was unstyled in 0.1.1.
+
 ## 0.1.1
 
 - Fixed: Web UI now loads correctly through Home Assistant Ingress — the URL

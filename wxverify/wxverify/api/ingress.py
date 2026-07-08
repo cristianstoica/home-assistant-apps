@@ -28,8 +28,18 @@ class IngressPathMiddleware:
         if scope["type"] == "http":
             ingress_path = _trusted_ingress_path(scope)
             if ingress_path is not None:
-                scope["root_path"] = ingress_path.rstrip("/")
+                prefix = ingress_path.rstrip("/")
+                if prefix and not _already_applied(scope, prefix):
+                    scope["root_path"] = prefix
+                    scope["path"] = prefix + scope["path"]
         await self._app(scope, receive, send)
+
+
+def _already_applied(scope: Scope, prefix: str) -> bool:
+    # Defensive: if a proxy did NOT strip the prefix (or a second pass occurs),
+    # path already starts with prefix and root_path already equals it -- do not
+    # double-prepend.
+    return scope.get("root_path", "") == prefix and scope["path"].startswith(prefix)
 
 
 def _trusted_ingress_path(scope: Scope) -> str | None:
