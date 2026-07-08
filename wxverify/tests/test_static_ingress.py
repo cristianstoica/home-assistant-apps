@@ -97,9 +97,7 @@ def test_static_css_under_ingress_returns_200(
         "prepend the prefix to scope['path'] so StaticFiles resolves correctly."
     )
     content_type = resp.headers.get("content-type", "")
-    assert "text/css" in content_type, (
-        f"Expected text/css; got {content_type!r}"
-    )
+    assert "text/css" in content_type, f"Expected text/css; got {content_type!r}"
     assert len(resp.content) > 0, "app.css body must be non-empty"
 
 
@@ -200,7 +198,7 @@ def test_ingress_middleware_does_not_double_prepend() -> None:
     assert downstream_path.startswith(prefix), (
         f"path must start with prefix; got {downstream_path!r}"
     )
-    remainder = downstream_path[len(prefix):]
+    remainder = downstream_path[len(prefix) :]
     assert not remainder.startswith(prefix), (
         f"double-prepend detected: path={downstream_path!r} starts with prefix twice"
     )
