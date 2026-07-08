@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 import httpx
 
-from wxverify.collection.budget import reserve_budget
+from wxverify.collection.budget import (
+    Reservation,
+    is_refundable_transport_error,
+    refund_budget,
+    reserve_budget,
+)
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
     persist_fetch_result,
@@ -118,8 +123,9 @@ async def fetch_feed_once(
                 conn, tgt, estimate
             )
         )
-        if reserve_outcome is not None:
+        if not isinstance(reserve_outcome, Reservation):
             return reserve_outcome
+        reservation = reserve_outcome
         try:
             result = await adapter.fetch_forecast(req)
         except httpx.HTTPStatusError as exc:
@@ -135,7 +141,12 @@ async def fetch_feed_once(
             raise
         except Exception as exc:
             error = sanitized_exception(exc)
-            await db.write(lambda conn, err=error: mark_feed_error(conn, target, err))
+            refund = reservation if is_refundable_transport_error(exc) else None
+            await db.write(
+                lambda conn, err=error, res=refund: _mark_feed_error_and_refund(
+                    conn, target, err, res
+                )
+            )
             raise
     persist_outcome = await db.write(
         lambda conn, fetch_result=result: _persist_fetch_success(
@@ -230,6 +241,18 @@ def mark_feed_unavailable(
     )
 
 
+def _mark_feed_error_and_refund(
+    conn: sqlite3.Connection,
+    target: FeedFetchTarget,
+    error: str,
+    reservation: Reservation | None,
+) -> None:
+    """Record the fetch failure and, atomically, refund a phantom reservation."""
+    mark_feed_error(conn, target, error)
+    if reservation is not None:
+        refund_budget(conn, reservation)
+
+
 def mark_feed_error_and_backoff(
     conn: sqlite3.Connection,
     target: FeedFetchTarget,
@@ -242,7 +265,7 @@ def mark_feed_error_and_backoff(
 
 def _reserve_feed_call(
     conn: sqlite3.Connection, target: FeedFetchTarget, cost: CostEstimate
-) -> BudgetExhausted | BackoffActive | Ineligible | None:
+) -> BudgetExhausted | BackoffActive | Ineligible | Reservation:
     if feed_fetch_target(conn, target.site_id, target.feed_id) is None:
         return Ineligible("site/feed became ineligible before fetch")
     try:
@@ -250,10 +273,9 @@ def _reserve_feed_call(
     except JobDeferred as exc:
         return BackoffActive(exc.next_attempt_at)
     try:
-        reserve_budget(conn, target.source, cost.calls, cost.credits)
+        return reserve_budget(conn, target.source, cost.calls, cost.credits)
     except JobDeferred as exc:
         return BudgetExhausted(exc.next_attempt_at)
-    return None
 
 
 def _persist_fetch_success(

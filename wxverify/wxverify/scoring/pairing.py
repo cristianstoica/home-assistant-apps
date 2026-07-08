@@ -30,6 +30,14 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
         JOIN sites s ON s.id = fs.site_id
         WHERE f.is_virtual = 0
           AND fs.lead_hours BETWEEN 1 AND f.max_lead_hours
+          AND NOT EXISTS (
+              SELECT 1 FROM forecast_pairs fp
+              WHERE fp.site_id = fs.site_id
+                AND fp.feed_id = fs.feed_id
+                AND fp.variable = fs.variable
+                AND fp.issued_at = fs.issued_at
+                AND fp.valid_at = fs.valid_at
+          )
           {where_site}
         """,
         params,

@@ -7,11 +7,17 @@ import errno
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import httpx
 
-from wxverify.collection.budget import reserve_budget
+from wxverify.collection.budget import (
+    Reservation,
+    is_refundable_transport_error,
+    refund_budget,
+    reserve_budget,
+)
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc
@@ -30,7 +36,7 @@ from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import pair_and_score
+from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -111,6 +117,13 @@ async def run_worker(db: Database) -> None:
                     conn, jid, attempt
                 )
             )
+            logger.info(
+                "job deferred id=%s type=%s site=%s until=%s",
+                job.id,
+                job.type,
+                job.site_id,
+                next_attempt_at,
+            )
         except JobCancelled:
             await db.write(lambda conn, jid=job_id: complete(conn, jid))
         except Exception as exc:
@@ -124,7 +137,30 @@ async def run_worker(db: Database) -> None:
                 )
                 raise
             message = sanitized_exception(exc)
-            await db.write(lambda conn, jid=job_id, err=message: fail(conn, jid, err))
+            disposition = await db.write(
+                lambda conn, jid=job_id, err=message: fail(conn, jid, err)
+            )
+            if disposition is not None and disposition.terminal:
+                logger.error(
+                    "job failed permanently id=%s type=%s site=%s attempts=%d/%d: %s",
+                    job.id,
+                    job.type,
+                    job.site_id,
+                    disposition.retry_count,
+                    disposition.max_retries,
+                    message,
+                )
+            else:
+                logger.warning(
+                    "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
+                    job.id,
+                    job.type,
+                    job.site_id,
+                    disposition.retry_count if disposition else "?",
+                    disposition.max_retries if disposition else "?",
+                    disposition.next_attempt_at if disposition else "?",
+                    message,
+                )
 
 
 async def _maybe_stamp_runtime_heartbeat(
@@ -146,7 +182,28 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        await db.write(lambda conn: _pair_and_score_if_enabled(conn, site_id))
+        # One write transaction per phase so the event loop (and the Docker
+        # healthcheck) gets scheduled between phases instead of stalling for
+        # the whole pipeline.
+        #
+        # CONVERGENCE INVARIANT (do not weaken): the phase split converges to
+        # the same end state as the monolithic run ONLY because no
+        # observation write can interleave between phases:
+        #   (a) this single worker loop is the only job executor, so no other
+        #       job's observation write runs between these transactions; and
+        #   (b) every HTTP route that writes observations (station PUT /
+        #       DELETE, site rain-threshold PUT) runs the monolithic
+        #       pair_and_score INLINE in its own write transaction — it never
+        #       enqueues. Note enqueue_if_absent dedupes against BOTH
+        #       'pending' AND 'running' jobs (db/queue.py), so an enqueue
+        #       issued while this job is mid-split is SWALLOWED, not queued
+        #       behind it: a future route that switches from inline scoring
+        #       to enqueueing would break convergence silently. The dashboard
+        #       _enqueue_score routes do not write observations and are safe.
+        for phase in PAIR_AND_SCORE_PHASES:
+            await db.write(
+                lambda conn, run=phase: _run_score_phase_if_enabled(conn, site_id, run)
+            )
         return None
     if job.type == "fetch_obs":
         site_id = job.site_id
@@ -173,11 +230,15 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
     raise RuntimeError(f"unknown job type {job.type}")
 
 
-def _pair_and_score_if_enabled(conn: sqlite3.Connection, site_id: int) -> None:
+def _run_score_phase_if_enabled(
+    conn: sqlite3.Connection,
+    site_id: int,
+    phase: Callable[[sqlite3.Connection, int | None], object],
+) -> None:
     row = conn.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()
     if row is None or not bool(row["enabled"]):
         raise JobCancelled()
-    pair_and_score(conn, site_id)
+    phase(conn, site_id)
 
 
 async def _fetch_obs(db: Database, site_id: int) -> None:
@@ -196,7 +257,7 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
         for index, station in enumerate(stations):
             await pace_station_call(site_id, station.id, index)
             async with limiter:
-                await db.write(
+                reservation = await db.write(
                     lambda conn, station_id=station.id: _reserve_obs_call(
                         conn, site_id, station_id
                     )
@@ -222,9 +283,10 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                     raise
                 except Exception as exc:
                     error = sanitized_exception(exc)
+                    refund = reservation if is_refundable_transport_error(exc) else None
                     await db.write(
-                        lambda conn, station_id=station.id, err=error: (
-                            _mark_station_error(conn, station_id, err)
+                        lambda conn, station_id=station.id, err=error, res=refund: (
+                            _mark_station_error_and_refund(conn, station_id, err, res)
                         )
                     )
                     raise
@@ -246,6 +308,13 @@ async def _fetch_feed(db: Database, site_id: int, feed_id: int) -> None:
     if isinstance(outcome, Ineligible):
         raise JobCancelled()
     if isinstance(outcome, Unavailable):
+        logger.warning(
+            "feed adapter unavailable site=%s feed=%s source=%s: %s",
+            outcome.target.site_id,
+            outcome.target.feed_id,
+            outcome.target.source,
+            outcome.error,
+        )
         await db.write(
             lambda conn, result=outcome: mark_feed_unavailable(
                 conn, result.target, result.error
@@ -282,7 +351,9 @@ def _site_timezone(conn: sqlite3.Connection, site_id: int) -> str | None:
     return None if row is None else str(row["timezone"])
 
 
-def _reserve_obs_call(conn: sqlite3.Connection, site_id: int, station_id: int) -> None:
+def _reserve_obs_call(
+    conn: sqlite3.Connection, site_id: int, station_id: int
+) -> Reservation:
     row = conn.execute(
         """
         SELECT 1
@@ -298,7 +369,7 @@ def _reserve_obs_call(conn: sqlite3.Connection, site_id: int, station_id: int) -
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
-    reserve_budget(conn, "weathercom", 1)
+    return reserve_budget(conn, "weathercom", 1)
 
 
 def _persist_station_observations(
@@ -378,6 +449,18 @@ def _mark_station_error(conn: sqlite3.Connection, station_id: int, error: str) -
         """,
         (error, station_id),
     )
+
+
+def _mark_station_error_and_refund(
+    conn: sqlite3.Connection,
+    station_id: int,
+    error: str,
+    reservation: Reservation | None,
+) -> None:
+    """Record the station failure and, atomically, refund a phantom reservation."""
+    _mark_station_error(conn, station_id, error)
+    if reservation is not None:
+        refund_budget(conn, reservation)
 
 
 def _payload_int(payload: dict[str, object], key: str) -> int | None:

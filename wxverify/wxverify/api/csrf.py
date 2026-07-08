@@ -27,13 +27,20 @@ def issue_csrf_pair() -> CsrfPair:
 
 
 def set_csrf_cookie(response: Response, pair: CsrfPair, root_path: str) -> None:
+    path = _cookie_path(root_path)
     response.set_cookie(
         "csrf",
         pair.nonce,
-        path=_cookie_path(root_path),
+        path=path,
         samesite="strict",
         httponly=False,
     )
+    if path != "/":
+        # 0.1.0 issued this cookie at path "/". A stale copy left over from an
+        # upgrade shadows the path-scoped cookie (the server keeps the last
+        # occurrence while browsers send the most-specific path first), which
+        # would fail CSRF validation until the browser is restarted.
+        response.delete_cookie("csrf", path="/")
 
 
 def validate_csrf(request: Request) -> bool:

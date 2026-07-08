@@ -138,6 +138,18 @@ def insert_station_observation(
 def materialize_consensus(
     conn: sqlite3.Connection, *, site_id: int, variable: str, valid_at: str
 ) -> None:
+    """Recompute the consensus observation for one (site, variable, hour).
+
+    LOAD-BEARING CONTRACT: this function ALWAYS runs
+    ``_invalidate_consensus_dependents`` before it writes or deletes the
+    ``observations`` row, and every write/delete of ``observations`` goes
+    through here. The incremental persistence materializer
+    (``wxverify.scoring.persistence``) relies on this to guarantee that any
+    existing forecast pair is derivable from current observations — that is
+    what makes its pair-count-equality skip sound. Bypassing the
+    invalidation step makes the incremental materializer silently retain
+    stale pairs.
+    """
     site = conn.execute(
         "SELECT elevation_m FROM sites WHERE id = ?", (site_id,)
     ).fetchone()
@@ -208,6 +220,11 @@ def materialize_consensus(
 def _invalidate_consensus_dependents(
     conn: sqlite3.Connection, *, site_id: int, variable: str, valid_at: str
 ) -> None:
+    # Deletes every pair that depends on the observation at (site, variable,
+    # valid_at): pairs where the hour is the pair's valid_at (all feeds) and
+    # persistence pairs where the hour is the pair's SOURCE (issued_at), plus
+    # the affected score-cache rows. Part of the load-bearing contract
+    # documented on materialize_consensus.
     conn.execute(
         "DELETE FROM forecast_pairs WHERE site_id=? AND variable=? AND valid_at=?",
         (site_id, variable, valid_at),

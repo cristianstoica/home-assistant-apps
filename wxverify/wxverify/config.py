@@ -13,6 +13,7 @@ from typing import Final
 
 APP_TITLE: Final = "Weather Verify"
 ENV_PREFIX: Final = "WXV_"
+SUPERVISOR_INGRESS_CLIENT: Final = "172.30.32.2"
 DEFAULT_DB_PATH: Final = "/data/wxverify.db"
 DEFAULT_OPTIONS_PATH: Final = "/data/options.json"
 
