@@ -92,6 +92,23 @@ def test_config_yaml_declares_monitor_toggles() -> None:
     assert "monitor_db: bool" in config_yaml
 
 
+def test_readme_monitoring_section_rewritten() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    monitoring = readme.split("## Monitoring", 1)[1].split("\n## ", 1)[0]
+    # The false claim is gone: no `watchdog:` supervision key wired to an
+    # endpoint. The bare token is intentionally allowed so the prose can keep
+    # its accurate "there is no `watchdog:` entry in config.yaml" clarification.
+    assert not any(
+        "watchdog:" in line and "://" in line
+        for line in monitoring.lower().splitlines()
+    )
+    # Real supervision + the new surface are documented.
+    assert "HEALTHCHECK" in monitoring
+    assert "/api/health/monitor" in monitoring
+    assert "unavailable" in monitoring
+
+
 def test_monitor_endpoint_envelope_always_200_and_skipped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

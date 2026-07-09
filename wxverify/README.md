@@ -339,11 +339,32 @@ code.
 
 ## Monitoring
 
-As a Home Assistant add-on, wxverify is monitored by the Supervisor: the
-`watchdog` URL in `config.yaml` points at a read-only health route, and the
-Supervisor restarts the add-on when it stops responding. Runtime health is
-exposed through the read-only `/api/health/*` and `/api/worker/status` routes,
-which suit HA REST sensors and automations.
+As a Home Assistant add-on, wxverify's **process supervision** is the Docker
+`HEALTHCHECK` (in `Dockerfile`) plus the Supervisor's default handling of an
+unhealthy container: if the container stops passing its healthcheck, the
+Supervisor restarts it. There is no `watchdog:` entry in `config.yaml`.
+
+**Proactive alerting** is HA-native. The add-on exposes a read-only verdict
+endpoint, `GET /api/health/monitor`, which runs pipeline (group 1), budget
+(group 2), and DB-integrity (group 4) threshold checks against its own database
+and returns a structured verdict (`overall` = `ok` / `warning` / `critical`,
+plus per-condition detail). It always responds `200` with a verdict body — even
+on a database read error, which surfaces as `db_readable:false` /
+`overall:critical` rather than an HTTP failure. Each group can be turned off via
+the `monitor_pipeline`, `monitor_budget`, and `monitor_db` options; a disabled
+group runs no queries and its conditions report `skipped`.
+
+Home Assistant owns the poll loop and delivery: a **REST sensor** polls
+`/api/health/monitor` on the internal add-on network, and two **automations**
+send a persistent notification plus a mobile push when the verdict degrades and
+clear the notification on recovery. If the add-on is down entirely, the REST
+sensor goes `unavailable` — that is the "add-on not responding" signal (it also
+covers startup/migration failures that abort before any request is served). The
+runtime health routes `/api/health/*` and `/api/worker/status` remain available
+for ad-hoc inspection.
+
+The ready-to-paste REST sensor and automations are in
+[`docs/monitoring-ha-package.md`](docs/monitoring-ha-package.md).
 
 ## API Call Budget
 
