@@ -74,10 +74,126 @@ def _skipped(cond_id: str, group: str, severity: str) -> Condition:
 
 # Filled in by Tasks 4-6. Each returns a list[Condition]; grace_active is passed
 # to the pipeline group so it can force ok=True during the post-start window.
+_ELIGIBLE_FEED_WHERE = """
+    s.enabled = 1
+    AND f.enabled = 1
+    AND f.is_virtual = 0
+    AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
+    AND COALESCE(sfs.enabled, f.default_subscribed) = 1
+"""
+
+_ELIGIBLE_OBS_WHERE = """
+    s.enabled = 1
+    AND EXISTS (
+        SELECT 1 FROM stations st WHERE st.site_id = s.id AND st.enabled = 1
+    )
+"""
+
+
+def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> int:
+    row = conn.execute(sql, params).fetchone()
+    return 0 if row is None else int(row[0])
+
+
+def _has_completed_within(
+    conn: sqlite3.Connection, job_type: str, cutoff: str
+) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1 FROM jobs
+        WHERE status='completed' AND type=? AND updated_at >= ?
+        LIMIT 1
+        """,
+        (job_type, cutoff),
+    ).fetchone()
+    return row is not None
+
+
 def _pipeline_conditions(
     conn: sqlite3.Connection, now: datetime, *, grace_active: bool
 ) -> list[Condition]:
-    return []
+    feed_cutoff = isoformat_utc(now - timedelta(hours=FEED_STALE_HOURS))
+    obs_cutoff = isoformat_utc(now - timedelta(hours=OBS_STALE_HOURS))
+    fetch_obs_cutoff = isoformat_utc(now - timedelta(hours=FETCH_OBS_LIVE_HOURS))
+    fetch_feed_cutoff = isoformat_utc(now - timedelta(hours=FETCH_FEED_LIVE_HOURS))
+    pair_cutoff = isoformat_utc(now - timedelta(hours=PAIR_SCORE_LIVE_HOURS))
+
+    # feed_stale: eligible feed with last_run_at > 12h ago OR NULL.
+    feed_stale_n = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        JOIN feeds f
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = s.id AND sfs.feed_id = f.id
+        WHERE {_ELIGIBLE_FEED_WHERE}
+          AND (sfs.last_run_at IS NULL OR sfs.last_run_at < ?)
+        """,
+        (feed_cutoff,),
+    )
+
+    # obs_stale: enabled site with >=1 enabled station and last_obs_at >12h/NULL.
+    obs_stale_n = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        WHERE {_ELIGIBLE_OBS_WHERE}
+          AND (s.last_obs_at IS NULL OR s.last_obs_at < ?)
+        """,
+        (obs_cutoff,),
+    )
+
+    eligible_feeds = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        JOIN feeds f
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = s.id AND sfs.feed_id = f.id
+        WHERE {_ELIGIBLE_FEED_WHERE}
+        """,
+        (),
+    )
+    eligible_obs = _count(
+        conn,
+        f"SELECT COUNT(*) FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}",
+        (),
+    )
+
+    fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
+        conn, "fetch_obs", fetch_obs_cutoff
+    )
+    fetch_feed_live_tripped = eligible_feeds > 0 and not _has_completed_within(
+        conn, "fetch_feed", fetch_feed_cutoff
+    )
+    pair_score_live_tripped = eligible_feeds > 0 and not _has_completed_within(
+        conn, "pair_and_score", pair_cutoff
+    )
+
+    def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
+        if grace_active:
+            return Condition(
+                id=cid, group="pipeline", ok=True, skipped=False,
+                severity="warning", count=count,
+            )
+        return Condition(
+            id=cid, group="pipeline", ok=not tripped, skipped=False,
+            severity="warning", count=count,
+            detail=detail if tripped else None,
+        )
+
+    return [
+        _cond("feed_stale", feed_stale_n > 0, feed_stale_n,
+              f"{feed_stale_n} feeds not run >12h"),
+        _cond("obs_stale", obs_stale_n > 0, obs_stale_n,
+              f"{obs_stale_n} sites not observed >12h"),
+        _cond("fetch_obs_live", fetch_obs_live_tripped, None,
+              "no completed fetch_obs in 8h"),
+        _cond("fetch_feed_live", fetch_feed_live_tripped, None,
+              "no completed fetch_feed in 12h"),
+        _cond("pair_score_live", pair_score_live_tripped, None,
+              "no completed pair_and_score in 12h"),
+    ]
 
 
 def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Condition]:
