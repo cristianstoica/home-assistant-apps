@@ -1169,3 +1169,569 @@ def test_problem_jobs_grace_suppresses_would_trip(
         cond = _cond(body, "problem_jobs")
         assert cond["ok"] is True
         assert "detail" not in cond  # grace suppression drops detail
+
+
+# --- Task 5: Group 2 budget/provider conditions ------------------------------
+
+
+def _seed_source_budget(
+    conn: sqlite3.Connection,
+    source: str,
+    *,
+    calls: int,
+) -> None:
+    tz = str(
+        conn.execute(
+            "SELECT billing_tz FROM sources WHERE source=?", (source,)
+        ).fetchone()["billing_tz"]
+    )
+    from wxverify.collection.budget import current_billing_day
+
+    conn.execute(
+        """
+        INSERT INTO api_budget (source, billing_day, calls, credits)
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(source, billing_day) DO UPDATE SET calls=excluded.calls
+        """,
+        (source, current_billing_day(tz), calls),
+    )
+
+
+def test_budget_calls_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "budget-calls.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        # google daily_call_limit is 100 (config.SOURCE_SEEDS).
+        db.write_sync(lambda c: _seed_source_budget(c, "google", calls=99))
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_calls")["ok"] is True  # 99 == limit-1
+
+        db.write_sync(lambda c: _seed_source_budget(c, "google", calls=100))
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_calls")["ok"] is False  # 100 == limit
+
+
+def test_feed_errors_disabled_feed_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Standalone negative: a DISABLED feed carrying a real (non-sentinel) error is
+    # the ONLY feed with an error in this DB, so feed_errors staying ok proves the
+    # active-feed ladder (f.enabled=1) excludes it — not a vacuous pass riding on
+    # a prior seed. Owns its full precondition: seeds feeds.enabled=0 explicitly.
+    close_db()
+    config.db_path = str(tmp_path / "feed-errors-disabled.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            site_id = _seed_site(conn)
+            vc = _feed_id(conn, "visualcrossing", "blend")  # default_subscribed=0
+            # disabled feed with an error → must NOT trip.
+            conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (vc,))
+            _set_feed_state(
+                conn, site_id, vc, last_run_at="2026-07-08T00:00:00Z",
+                enabled=1, last_error="HTTP 500 boom", error_count=1,
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "feed_errors")["ok"] is True
+
+
+def test_feed_errors_active_feed_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Standalone positive on its own DB: an ENABLED, subscribed feed carrying a
+    # real (non-sentinel) error trips feed_errors. Owns its full precondition.
+    close_db()
+    config.db_path = str(tmp_path / "feed-errors-active.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed_active(conn: sqlite3.Connection) -> None:
+            site_id = _seed_site(conn)
+            om = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # enabled, subscribed
+            _set_feed_state(
+                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
+                last_error="HTTP 500 boom", error_count=1,
+            )
+
+        db.write_sync(_seed_active)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "feed_errors")["ok"] is False
+
+
+def test_costed_noop_repeated_sentinel_active_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "costed-noop.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+
+        def _seed_single(conn: sqlite3.Connection) -> int:
+            site_id = _seed_site(conn)
+            om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+            _set_feed_state(
+                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
+                last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=1,
+            )
+            return om
+
+        db.write_sync(_seed_single)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "costed_noop")["ok"] is True  # single occurrence quiet
+
+        def _bump(conn: sqlite3.Connection) -> None:
+            site_id = int(
+                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
+            )
+            om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+            conn.execute(
+                "UPDATE site_feed_state SET error_count=3 "
+                "WHERE site_id=? AND feed_id=?",
+                (site_id, om),
+            )
+
+        db.write_sync(_bump)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "costed_noop")["ok"] is False  # error_count>=3 trips
+
+
+def test_costed_noop_disabled_feed_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "costed-noop-disabled.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+
+        def _seed_disabled(conn: sqlite3.Connection) -> None:
+            # A DISABLED feed carrying the sentinel + error_count>=N. The active
+            # ladder (f.enabled=1) excludes it, so costed_noop must NOT trip.
+            site_id = _seed_site(conn)
+            om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+            conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (om,))
+            _set_feed_state(
+                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
+                enabled=1, last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=5,
+            )
+
+        db.write_sync(_seed_disabled)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "costed_noop")["ok"] is True
+
+
+def test_key_missing_three_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "key-missing.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.delenv("WXV_VISUALCROSSING_KEY", raising=False)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        # Case A (negative): unsubscribed keyed provider, no key → NOT tripped.
+        def _seed_unsub(conn: sqlite3.Connection) -> None:
+            _seed_site(conn)  # visualcrossing blend is default_subscribed=0
+
+        db.write_sync(_seed_unsub)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is True
+
+        # Case B (negative): subscribed but feed.enabled=0, key absent → NOT tripped.
+        def _seed_sub_disabled(conn: sqlite3.Connection) -> None:
+            site_id = int(
+                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
+            )
+            vc = _feed_id(conn, "visualcrossing", "blend")
+            conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (vc,))
+            _set_feed_state(conn, site_id, vc, last_run_at=None, enabled=1)
+
+        db.write_sync(_seed_sub_disabled)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is True
+
+        # Case C (positive): subscribed AND enabled, key empty → trips.
+        def _seed_sub_enabled(conn: sqlite3.Connection) -> None:
+            site_id = int(
+                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
+            )
+            vc = _feed_id(conn, "visualcrossing", "blend")
+            conn.execute("UPDATE feeds SET enabled=1 WHERE id=?", (vc,))
+            _set_feed_state(conn, site_id, vc, last_run_at=None, enabled=1)
+
+        db.write_sync(_seed_sub_enabled)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is False
+
+
+def test_domain_backoffs_active_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "domain-backoffs.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # A backoff whose next_attempt_at is in the future → still active.
+            conn.execute(
+                """
+                INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)
+                VALUES ('api.example.com', '2099-01-01T00:00:00Z', 2)
+                """
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "domain_backoffs")["ok"] is False
+        assert _cond(body, "domain_backoffs")["count"] >= 1
+
+
+def test_budget_credits_trips_at_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "budget-credits.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.budget import current_billing_day
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # meteoblue is the only seeded source with a non-NULL credit limit
+            # (65000, billing_tz='UTC'). Seed today's row at the limit so the
+            # `credits >= daily_credit_limit` branch trips.
+            tz = str(
+                conn.execute(
+                    "SELECT billing_tz FROM sources WHERE source='meteoblue'"
+                ).fetchone()["billing_tz"]
+            )
+            conn.execute(
+                """
+                INSERT INTO api_budget (source, billing_day, calls, credits)
+                VALUES ('meteoblue', ?, 0, 65000)
+                ON CONFLICT(source, billing_day) DO UPDATE SET
+                    credits=excluded.credits
+                """,
+                (current_billing_day(tz),),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_credits")["ok"] is False
+
+
+def test_budget_credits_boundary_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins both sides of the `credits >= daily_credit_limit` comparator for
+    # meteoblue (the only source with a non-NULL credit limit of 65000).
+    # The existing test_budget_credits_trips_at_limit covers exactly-at-limit;
+    # this test adds the one-below negative (64999 → ok) so that a broken `>`
+    # (strict) in place of `>=` would keep the at-limit test green but fail the
+    # boundary negative here — and the positive (65000 trips) ensures a broken
+    # `>` cannot hide by also checking the trip direction from a single test.
+    close_db()
+    config.db_path = str(tmp_path / "budget-credits-boundary.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.budget import current_billing_day
+
+        def _seed_credits(conn: sqlite3.Connection, *, credits: int) -> None:
+            tz = str(
+                conn.execute(
+                    "SELECT billing_tz FROM sources WHERE source='meteoblue'"
+                ).fetchone()["billing_tz"]
+            )
+            conn.execute(
+                """
+                INSERT INTO api_budget (source, billing_day, calls, credits)
+                VALUES ('meteoblue', ?, 0, ?)
+                ON CONFLICT(source, billing_day) DO UPDATE SET
+                    credits=excluded.credits
+                """,
+                (current_billing_day(tz), credits),
+            )
+
+        db.write_sync(lambda c: _seed_credits(c, credits=64999))
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_credits")["ok"] is True  # one below limit
+
+        db.write_sync(lambda c: _seed_credits(c, credits=65000))
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_credits")["ok"] is False  # at limit
+
+
+def test_budget_credits_null_limit_never_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the `daily_credit_limit is not None` guard in _budget_conditions.
+    # google has daily_credit_limit=NULL in SOURCE_SEEDS (config.py:64).  Seeding
+    # an enormous credits value on today's billing day must NOT trip budget_credits
+    # because the `is not None` guard short-circuits before the `>=` comparison.
+    # A broken impl that dropped the guard (e.g. comparing `credits >= None`)
+    # would raise a TypeError or coerce None to 0 so every source trips — this
+    # test catches both mutations.
+    #
+    # Confirmed: google's daily_credit_limit is NULL in SOURCE_SEEDS
+    # (wxverify/config.py line 64: SourceSeed("google", 100, None, "UTC")).
+    close_db()
+    config.db_path = str(tmp_path / "budget-credits-null-limit.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.budget import current_billing_day
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # Confirm at seed time that google's credit limit IS NULL — the oracle
+            # is only valid when the source has a genuinely NULL limit.
+            row = conn.execute(
+                "SELECT daily_credit_limit FROM sources WHERE source='google'"
+            ).fetchone()
+            assert row is not None
+            assert row["daily_credit_limit"] is None, (
+                "google must have NULL daily_credit_limit for this oracle to be valid"
+            )
+            tz = str(
+                conn.execute(
+                    "SELECT billing_tz FROM sources WHERE source='google'"
+                ).fetchone()["billing_tz"]
+            )
+            # Seed a huge credits value — far beyond any real limit.
+            conn.execute(
+                """
+                INSERT INTO api_budget (source, billing_day, calls, credits)
+                VALUES ('google', ?, 0, 9999999)
+                ON CONFLICT(source, billing_day) DO UPDATE SET
+                    credits=excluded.credits
+                """,
+                (current_billing_day(tz),),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        # NULL credit limit must never produce a credit-tripped condition.
+        assert _cond(body, "budget_credits")["ok"] is True
+
+
+def test_budget_calls_missing_row_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the `budget is None → calls = 0` default in _budget_conditions.
+    # When a source has NO api_budget row for today's billing day, the impl
+    # treats calls as 0 and must NOT trip budget_calls.  A broken impl that
+    # crashed on a missing row (NoneType attribute access) or treated missing as
+    # over-limit would fail this test.  The DB is freshly seeded with no budget
+    # rows, so all sources are in the missing-row state.
+    close_db()
+    config.db_path = str(tmp_path / "budget-calls-missing.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        # No _seed needed: migrations create the sources rows but leave
+        # api_budget empty, so every source has no row for today's day.
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "budget_calls")["ok"] is True
+
+
+def test_domain_backoffs_expired_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the `next_attempt_at > now` comparator on the NEGATIVE side.
+    # The existing test_domain_backoffs_active_trips covers a future backoff
+    # (positive arm).  This negative seeds a backoff whose next_attempt_at is
+    # in the past (already expired) and asserts it does NOT count.  A broken
+    # impl that used `>=` (or dropped the comparator entirely) would count the
+    # expired row and fail this assertion, while the positive-only test would
+    # still pass — the paired negative is what makes the comparator trustworthy.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "domain-backoffs-expired.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # next_attempt_at in 2020 → expired relative to fixed_now 2026-07-09.
+            conn.execute(
+                """
+                INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)
+                VALUES ('api.example.com', '2020-01-01T00:00:00Z', 1)
+                """
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "domain_backoffs")["ok"] is True
+        # Confirm no count leak — count must be 0 (or absent) for an expired row.
+        cond = _cond(body, "domain_backoffs")
+        assert cond.get("count", 0) == 0
+
+
+def test_feed_errors_sentinel_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the `last_error != NO_USABLE_SAMPLES_SENTINEL` clause in
+    # _budget_conditions.  An active feed whose last_error IS the sentinel belongs
+    # to costed_noop's domain, not feed_errors.  A broken impl that dropped the
+    # `!= sentinel` filter would count this row under feed_errors too, turning
+    # ok=True into ok=False — this test catches that mutation.  Paired with the
+    # existing test_feed_errors_active_feed_trips (which asserts a real error
+    # DOES trip), so both sides of the clause are exercised.
+    close_db()
+    config.db_path = str(tmp_path / "feed-errors-sentinel.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            site_id = _seed_site(conn)
+            om = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # enabled, subscribed
+            # Active feed with SENTINEL as its last_error.  Must NOT trip
+            # feed_errors; it belongs to costed_noop.
+            _set_feed_state(
+                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
+                last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=1,
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "feed_errors")["ok"] is True
+
+
+def test_key_missing_weathercom_arm_positive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the weathercom station-based arm of _key_missing_count (positive).
+    # When >=1 enabled station exists on an enabled site AND the weathercom key
+    # is absent, key_missing must trip.  This arm is structurally distinct from
+    # the forecast-source arm (tested in test_key_missing_three_cases): it is
+    # gated on the stations table, not on feeds.  A broken impl that omitted the
+    # weathercom arm entirely would leave this test failing.
+    close_db()
+    config.db_path = str(tmp_path / "key-missing-wc-pos.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.delenv("WXV_WEATHERCOM_KEY", raising=False)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            site_id = _seed_site(conn)  # enabled site
+            conn.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'WXCFAKE1', 47.0, 25.0, 900.0, 1)
+                """,
+                (site_id,),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is False
+
+
+def test_key_missing_weathercom_arm_no_station_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Negative for the weathercom arm: no stations seeded at all, weathercom key
+    # absent.  Without an enabled station on an enabled site, the weathercom arm
+    # must NOT trip — the condition is not exercised.  A broken impl that always
+    # counted the weathercom arm regardless of station presence would turn this
+    # ok=True into ok=False and fail here.  Paired with the positive above so both
+    # sides of the station-gate are exercised.
+    close_db()
+    config.db_path = str(tmp_path / "key-missing-wc-no-station.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.delenv("WXV_WEATHERCOM_KEY", raising=False)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # Seed an enabled site with NO stations at all.
+            _seed_site(conn)
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is True
+
+
+def test_key_missing_weathercom_arm_key_present_negative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Negative for the weathercom arm: enabled station present, but the weathercom
+    # key IS present → must NOT trip.  Confirms the `not resolve_secret("weathercom")`
+    # half of the gate.  A broken impl that ignored the key check and always tripped
+    # when a station exists would fail this assertion.  Paired with the positive test
+    # (station + no key → trips) to pin both arms of the conjunct.
+    close_db()
+    config.db_path = str(tmp_path / "key-missing-wc-key-present.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    # Inject the weathercom key via env (options.json missing → _from_env() path).
+    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "fake-wc-key-for-testing")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            site_id = _seed_site(conn)  # enabled site
+            conn.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'WXCFAKE2', 47.0, 25.0, 900.0, 1)
+                """,
+                (site_id,),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "key_missing")["ok"] is True

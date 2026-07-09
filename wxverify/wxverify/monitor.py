@@ -12,6 +12,9 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from wxverify.collection.budget import current_billing_day
+from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
@@ -220,8 +223,136 @@ def _pipeline_conditions(
     ]
 
 
+_ACTIVE_FEED_WHERE = """
+    s.enabled = 1
+    AND f.enabled = 1
+    AND COALESCE(sfs.enabled, f.default_subscribed) = 1
+"""
+
+
 def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Condition]:
-    return []
+    # budget_calls / budget_credits: current billing-day row per source.
+    sources = conn.execute(
+        "SELECT source, daily_call_limit, daily_credit_limit, billing_tz "
+        "FROM sources"
+    ).fetchall()
+    calls_tripped = 0
+    credits_tripped = 0
+    for row in sources:
+        source = str(row["source"])
+        day = current_billing_day(str(row["billing_tz"]))
+        budget = conn.execute(
+            "SELECT calls, credits FROM api_budget "
+            "WHERE source=? AND billing_day=?",
+            (source, day),
+        ).fetchone()
+        calls = 0 if budget is None else int(budget["calls"])
+        credits = 0 if budget is None else int(budget["credits"])
+        if calls >= int(row["daily_call_limit"]):
+            calls_tripped += 1
+        if (
+            row["daily_credit_limit"] is not None
+            and credits >= int(row["daily_credit_limit"])
+        ):
+            credits_tripped += 1
+
+    # domain_backoffs: any active backoff (no active-provider filter — see spec).
+    now_iso = isoformat_utc(now)
+    backoffs_n = _count(
+        conn,
+        "SELECT COUNT(*) FROM domain_backoffs WHERE next_attempt_at > ?",
+        (now_iso,),
+    )
+
+    # feed_errors: active feed with last_error set and != sentinel.
+    feed_errors_n = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        JOIN feeds f
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = s.id AND sfs.feed_id = f.id
+        WHERE {_ACTIVE_FEED_WHERE}
+          AND sfs.last_error IS NOT NULL
+          AND sfs.last_error != ?
+        """,
+        (NO_USABLE_SAMPLES_SENTINEL,),
+    )
+
+    # costed_noop: active feed with sentinel AND error_count >= N.
+    costed_noop_n = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        JOIN feeds f
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = s.id AND sfs.feed_id = f.id
+        WHERE {_ACTIVE_FEED_WHERE}
+          AND sfs.last_error = ?
+          AND sfs.error_count >= ?
+        """,
+        (NO_USABLE_SAMPLES_SENTINEL, COSTED_NOOP_MIN_ERRORS),
+    )
+
+    key_missing_n = _key_missing_count(conn)
+
+    def _c(cid: str, sev: str, n: int, detail: str) -> Condition:
+        return Condition(
+            id=cid, group="budget", ok=(n == 0), skipped=False,
+            severity=sev, count=n, detail=detail if n else None,
+        )
+
+    return [
+        _c("budget_calls", "critical", calls_tripped,
+           "daily call budget exhausted"),
+        _c("budget_credits", "critical", credits_tripped,
+           "daily credit budget exhausted"),
+        _c("domain_backoffs", "warning", backoffs_n, "active provider backoff"),
+        _c("feed_errors", "warning", feed_errors_n, "active feed error"),
+        _c("costed_noop", "warning", costed_noop_n,
+           "active feed paying for zero usable data"),
+        _c("key_missing", "warning", key_missing_n,
+           "keyed provider exercised without a key"),
+    ]
+
+
+def _key_missing_count(conn: sqlite3.Connection) -> int:
+    missing = 0
+    # Forecast providers: keyed source with an enabled+subscribed feed on an
+    # enabled site, and no resolved key.
+    for source in _KEYED_FORECAST_SOURCES:
+        exercised = conn.execute(
+            """
+            SELECT 1 FROM sites s
+            JOIN feeds f
+            LEFT JOIN site_feed_state sfs
+              ON sfs.site_id = s.id AND sfs.feed_id = f.id
+            WHERE s.enabled = 1
+              AND f.source = ?
+              AND f.enabled = 1
+              AND COALESCE(sfs.enabled, f.default_subscribed) = 1
+            LIMIT 1
+            """,
+            (source,),
+        ).fetchone()
+        if exercised is not None and not resolve_secret(source):
+            missing += 1
+    # weathercom: PWS/obs provider — trip when >=1 enabled station on an
+    # enabled site and no key.
+    wc_exercised = conn.execute(
+        """
+        SELECT 1 FROM sites s
+        WHERE s.enabled = 1
+          AND EXISTS (
+              SELECT 1 FROM stations st
+              WHERE st.site_id = s.id AND st.enabled = 1
+          )
+        LIMIT 1
+        """
+    ).fetchone()
+    if wc_exercised is not None and not resolve_secret("weathercom"):
+        missing += 1
+    return missing
 
 
 def _db_conditions(conn: sqlite3.Connection, now: datetime) -> list[Condition]:
