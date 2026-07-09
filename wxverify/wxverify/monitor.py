@@ -356,7 +356,20 @@ def _key_missing_count(conn: sqlite3.Connection) -> int:
 
 
 def _db_conditions(conn: sqlite3.Connection, now: datetime) -> list[Condition]:
-    return []
+    # A trivial read. Reaching the return means the DB is readable. If the read
+    # raises sqlite3.Error, this function never returns; build_verdict's db-group
+    # `except sqlite3.Error` sets db_read_failed, drops any db_readable condition,
+    # and appends db_readable:false / severity=critical (→ overall:critical).
+    conn.execute("SELECT 1").fetchone()
+    return [
+        Condition(
+            id="db_readable",
+            group="db",
+            ok=True,
+            skipped=False,
+            severity="critical",
+        )
+    ]
 
 
 def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:

@@ -1703,6 +1703,106 @@ def test_key_missing_weathercom_arm_no_station_negative(
         assert _cond(body, "key_missing")["ok"] is True
 
 
+def test_db_readable_green_on_healthy_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the full shape of the green db_readable condition and its contribution
+    # to overall. A broken impl that emitted the wrong group, severity, or skipped
+    # value, or that failed to count ok=True toward overall=ok, would fail here.
+    # Paired with test_db_readable_sqlite_error_composition_invariant (red path)
+    # so the suppression logic is trustworthy only when both sides pass.
+    close_db()
+    config.db_path = str(tmp_path / "db-green.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        body = client.get("/api/health/monitor").json()
+        db_cond = _cond(body, "db_readable")
+        assert db_cond["ok"] is True
+        assert db_cond["skipped"] is False
+        assert db_cond["group"] == "db"
+        assert db_cond["severity"] == "critical"
+        # A green critical condition must not push overall above ok.
+        assert body["overall"] == "ok"
+        # Exactly one db_readable condition — no duplicates.
+        db_readable_conds = [c for c in body["conditions"] if c["id"] == "db_readable"]
+        assert len(db_readable_conds) == 1
+
+
+def test_missing_db_recreation_reports_ok_documented_limitation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    db_file = tmp_path / "db-missing.db"
+    config.db_path = str(db_file)
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        # close_db() BEFORE deleting so we exercise the init_db() recreation
+        # path, not a stale open connection.
+        from wxverify.db.connection import close_db as _close
+
+        _close()
+        for suffix in ("", "-wal", "-shm"):
+            p = Path(str(db_file) + suffix)
+            if p.exists():
+                p.unlink()
+        body = client.get("/api/health/monitor").json()
+        # Connection layer recreates an empty readable DB via init_db():
+        # db_readable is green and overall is ok. This is the v1 documented
+        # limitation (identity-loss is out of db_readable scope).
+        assert _cond(body, "db_readable")["ok"] is True
+        assert body["overall"] == "ok"
+
+
+def test_db_readable_sqlite_error_composition_invariant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Composition invariant: when the db-group read raises sqlite3.Error, the
+    # overall verdict must be "critical", the surviving db_readable condition must
+    # be ok=False / severity="critical" / group="db", and there must be EXACTLY ONE
+    # db_readable in the output (the filter at build_verdict L457 must remove any
+    # green one before appending the red one — a broken filter would leak both).
+    #
+    # Injection: only _db_conditions is patched to raise; pipeline and budget groups
+    # run against the real healthy DB. This isolates the db-group error path from
+    # the all-groups-fail scenario already covered by
+    # test_monitor_endpoint_db_failure_reports_critical_not_500, and ensures the
+    # filter only removes db_readable conditions without corrupting other conditions.
+    close_db()
+    config.db_path = str(tmp_path / "db-composition.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        import wxverify.monitor as monitor_mod
+
+        def _db_boom(conn: sqlite3.Connection, now: object) -> object:
+            raise sqlite3.OperationalError("simulated db read failure")
+
+        monkeypatch.setattr(monitor_mod, "_db_conditions", _db_boom)
+        body = client.get("/api/health/monitor").json()
+
+    # (a) overall must be critical
+    assert body["overall"] == "critical"
+
+    # (b) the surviving db_readable must be the red failure condition
+    db_cond = _cond(body, "db_readable")
+    assert db_cond["ok"] is False
+    assert db_cond["skipped"] is False
+    assert db_cond["severity"] == "critical"
+    assert db_cond["group"] == "db"
+
+    # (c) exactly ONE db_readable — no green condition leaked through the filter
+    db_readable_conds = [c for c in body["conditions"] if c["id"] == "db_readable"]
+    assert len(db_readable_conds) == 1, (
+        f"expected exactly 1 db_readable condition, got {len(db_readable_conds)}: "
+        f"{db_readable_conds}"
+    )
+
+
 def test_key_missing_weathercom_arm_key_present_negative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
