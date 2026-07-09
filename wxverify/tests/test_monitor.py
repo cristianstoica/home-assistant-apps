@@ -711,3 +711,461 @@ def test_liveness_recent_completed_job_does_not_trip(
         for cid in ("fetch_obs_live", "fetch_feed_live", "pair_score_live"):
             c = _cond(body, cid)
             assert c["ok"] is True, f"{cid} should be ok with recent completed job"
+
+
+# --- Task 4b: Group 1 problem_jobs (failed/stuck/overdue-pending) ------------
+
+
+def _seed_job(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    status: str,
+    updated_at: str,
+    next_attempt_at: str | None,
+    job_type: str = "fetch_feed",
+    job_key: str = "fetch:1",
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status,
+                          next_attempt_at, updated_at)
+        VALUES (?, ?, ?, '{}', ?, ?, ?)
+        """,
+        (job_type, site_id, job_key, status, next_attempt_at, updated_at),
+    )
+
+
+def test_problem_jobs_pending_future_deferral_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-defer.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # Pending with a FUTURE next_attempt_at → freshly deferred → NOT overdue.
+            _seed_job(
+                conn, site_id=site_id, status="pending",
+                updated_at="2035-01-01T00:00:00Z",
+                next_attempt_at="2035-01-01T00:00:00Z",
+                job_key="fetch:defer",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_all_three_arms_trip_and_each_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins all three OR arms of the problem_jobs predicate simultaneously.
+    # One job per arm; exact count == 3 so that dropping any single arm
+    # (removing one OR clause from the SQL) would change the count and fail.
+    # fixed_now is injected so cutoffs are deterministic regardless of wall clock.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-all-arms.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # ARM 1: failed job older than FAILED_JOB_AGE_HOURS=48h.
+            # failed_cutoff = 2026-07-07T12:00:00Z;
+            # updated_at 2026-07-07T00:00:00Z ≤ cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="failed",
+                updated_at="2026-07-07T00:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:failed-old",
+            )
+            # ARM 2: running job older than STUCK_RUNNING_MINUTES=20m.
+            # stuck_cutoff = 2026-07-09T11:40:00Z;
+            # updated_at 2026-07-09T11:00:00Z ≤ cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="running",
+                updated_at="2026-07-09T11:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:stuck-running",
+            )
+            # ARM 3: pending job overdue by PENDING_OVERDUE_MINUTES=15m.
+            # pending_cutoff = 2026-07-09T11:45:00Z;
+            # next_attempt_at 2020-01-01 ≤ cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="pending",
+                updated_at="2020-01-01T00:00:00Z",
+                next_attempt_at="2020-01-01T00:00:00Z",
+                job_key="fetch:pending-overdue",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        cond = _cond(body, "problem_jobs")
+        assert cond["ok"] is False
+        assert cond["count"] == 3  # exact: one per arm
+
+
+def test_problem_jobs_pending_null_next_attempt_at_counts_as_stuck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # HARDENING (diverges from the plan's literal `next_attempt_at IS NOT NULL`):
+    # claim_next_job treats `next_attempt_at IS NULL OR next_attempt_at <= now`
+    # as claimable, so a STUCK pending job can carry next_attempt_at=NULL. Such a
+    # job — old updated_at, NULL attempt — is claimable-but-unclaimed and MUST be
+    # counted. The COALESCE(next_attempt_at, updated_at) predicate catches it;
+    # the plan's `IS NOT NULL` arm would silently miss it. This test pins that.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-null-attempt.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # Pending, next_attempt_at NULL (claimable now), old updated_at.
+            _seed_job(
+                conn, site_id=site_id, status="pending",
+                updated_at="2020-01-01T00:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:null-attempt",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] >= 1
+
+
+def test_problem_jobs_pending_null_next_attempt_at_recent_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Complement to the NULL-attempt trip test: a freshly-enqueued pending job
+    # (next_attempt_at=NULL, recent updated_at) is claimable NOW but not yet
+    # overdue, so it must NOT count. This pins that COALESCE falls back to
+    # updated_at against the 15-min cutoff rather than treating every NULL-attempt
+    # pending job as stuck.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-null-recent.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # Pending, NULL attempt, updated_at far in the FUTURE → within cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="pending",
+                updated_at="2035-01-01T00:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:null-recent",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_failed_old_only_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Per-arm isolation: only a failed job older than FAILED_JOB_AGE_HOURS=48h is
+    # present. A broken implementation that omits the failed OR arm would return
+    # count=0/ok=True and fail this assertion.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-failed-only.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # failed_cutoff = 2026-07-07T12:00:00Z; 2026-07-07T00:00:00Z ≤ cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="failed",
+                updated_at="2026-07-07T00:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:failed-old",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        cond = _cond(body, "problem_jobs")
+        assert cond["ok"] is False
+        assert cond["count"] == 1
+
+
+def test_problem_jobs_failed_recent_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Paired negative for test_problem_jobs_failed_old_only_trips: a failed job
+    # updated within the 48h window must NOT count. Without this negative,
+    # the trip test above can stay green even if the cutoff is broken so that ALL
+    # failed jobs count (the positive alone can't detect that).
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-failed-recent.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # failed_cutoff = 2026-07-07T12:00:00Z;
+            # 2026-07-09T06:00:00Z > cutoff → recent.
+            _seed_job(
+                conn, site_id=site_id, status="failed",
+                updated_at="2026-07-09T06:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:failed-recent",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_running_old_only_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Per-arm isolation: only a running job older than STUCK_RUNNING_MINUTES=20m is
+    # present. A broken implementation that omits the running OR arm would return
+    # count=0/ok=True and fail this assertion.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-running-only.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # stuck_cutoff = 2026-07-09T11:40:00Z; 2026-07-09T11:00:00Z ≤ cutoff.
+            _seed_job(
+                conn, site_id=site_id, status="running",
+                updated_at="2026-07-09T11:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:stuck-running",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        cond = _cond(body, "problem_jobs")
+        assert cond["ok"] is False
+        assert cond["count"] == 1
+
+
+def test_problem_jobs_running_recent_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Paired negative for test_problem_jobs_running_old_only_trips: a running job
+    # updated within the 20m window must NOT count. Without this negative, a
+    # broken predicate that counts ALL running jobs would leave the trip test green
+    # but the false-positive undetected.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-running-recent.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # stuck_cutoff = 2026-07-09T11:40:00Z;
+            # 2026-07-09T11:50:00Z > cutoff → recent.
+            _seed_job(
+                conn, site_id=site_id, status="running",
+                updated_at="2026-07-09T11:50:00Z",
+                next_attempt_at=None,
+                job_key="fetch:running-recent",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_running_at_stuck_cutoff_boundary_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Threshold boundary: a running job with updated_at exactly equal to
+    # stuck_cutoff must count because the SQL uses `<=` (not `<`). An off-by-one
+    # that changed `<=` to `<` would leave an at-boundary job uncounted and fail.
+    # Paired with the "one second newer" test below to pin both sides of the edge.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-stuck-boundary.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # stuck_cutoff = now - 20m = 2026-07-09T11:40:00Z exactly.
+            _seed_job(
+                conn, site_id=site_id, status="running",
+                updated_at="2026-07-09T11:40:00Z",
+                next_attempt_at=None,
+                job_key="fetch:stuck-at-boundary",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        cond = _cond(body, "problem_jobs")
+        assert cond["ok"] is False
+        assert cond["count"] == 1  # at-cutoff is included by <=
+
+
+def test_problem_jobs_running_one_second_inside_cutoff_does_not_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Paired: a running job updated one second AFTER the stuck_cutoff must NOT
+    # count. Together with the at-boundary test this pins both sides of the `<=`
+    # operator so a misplaced `<` or `>=` would be caught.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-stuck-inside.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # stuck_cutoff = 2026-07-09T11:40:00Z;
+            # 11:40:01Z is 1 second newer → not stuck.
+            _seed_job(
+                conn, site_id=site_id, status="running",
+                updated_at="2026-07-09T11:40:01Z",
+                next_attempt_at=None,
+                job_key="fetch:stuck-inside",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_grace_suppresses_would_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Grace suppression for problem_jobs: when the worker started within
+    # GRACE_MINUTES=10 min of now, a would-trip condition must be forced ok=True
+    # with no detail key emitted. Mirrors how feed_stale grace suppression works
+    # (test_feed_stale_grace_suppresses) — both are driven by the shared _cond
+    # closure inside _pipeline_conditions.
+    # A broken _cond that ignores grace_active for problem_jobs would return
+    # ok=False and fail the ok assertion; a broken one that drops detail only for
+    # other conditions would pass the ok assertion but leave "detail" present.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-grace.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            # worker_started_at 5 min before fixed_now → within GRACE_MINUTES=10.
+            conn.execute(
+                "UPDATE runtime_state SET value='2026-07-09T11:55:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # A failed job that would definitely trip without grace
+            # (failed_cutoff = 2026-07-07T12:00:00Z; 2026-07-07T00:00:00Z ≤ cutoff).
+            _seed_job(
+                conn, site_id=site_id, status="failed",
+                updated_at="2026-07-07T00:00:00Z",
+                next_attempt_at=None,
+                job_key="fetch:failed-grace",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert body["grace_active"] is True
+        cond = _cond(body, "problem_jobs")
+        assert cond["ok"] is True
+        assert "detail" not in cond  # grace suppression drops detail

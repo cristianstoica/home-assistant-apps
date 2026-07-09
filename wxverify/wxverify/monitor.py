@@ -170,6 +170,28 @@ def _pipeline_conditions(
         conn, "pair_and_score", pair_cutoff
     )
 
+    # problem_jobs: failed (>48h), stuck running (>20m), or overdue pending
+    # (>15m). The pending arm mirrors claim_next_job's claim contract, which
+    # treats `next_attempt_at IS NULL OR next_attempt_at <= now` as claimable —
+    # so a stuck pending job can carry next_attempt_at=NULL. COALESCE(...,
+    # updated_at) folds that NULL case in (a NULL-attempt pending job is overdue
+    # once its updated_at is older than the cutoff), where a bare
+    # `next_attempt_at <= ?` would silently miss it.
+    failed_cutoff = isoformat_utc(now - timedelta(hours=FAILED_JOB_AGE_HOURS))
+    stuck_cutoff = isoformat_utc(now - timedelta(minutes=STUCK_RUNNING_MINUTES))
+    pending_cutoff = isoformat_utc(now - timedelta(minutes=PENDING_OVERDUE_MINUTES))
+    problem_jobs_n = _count(
+        conn,
+        """
+        SELECT COUNT(*) FROM jobs
+        WHERE (status='failed' AND updated_at <= ?)
+           OR (status='running' AND updated_at <= ?)
+           OR (status='pending'
+               AND COALESCE(next_attempt_at, updated_at) <= ?)
+        """,
+        (failed_cutoff, stuck_cutoff, pending_cutoff),
+    )
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -193,6 +215,8 @@ def _pipeline_conditions(
               "no completed fetch_feed in 12h"),
         _cond("pair_score_live", pair_score_live_tripped, None,
               "no completed pair_and_score in 12h"),
+        _cond("problem_jobs", problem_jobs_n > 0, problem_jobs_n,
+              f"{problem_jobs_n} stuck/failed/overdue jobs"),
     ]
 
 
