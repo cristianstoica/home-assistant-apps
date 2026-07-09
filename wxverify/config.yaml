@@ -25,6 +25,9 @@ options:
   min_n: 30
   obs_interval_minutes: 180
   obs_jitter_minutes: 20
+  monitor_pipeline: true
+  monitor_budget: true
+  monitor_db: true
 schema:
   log_level: list(debug|info|warning|error)
   meteoblue_key: password?
@@ -38,3 +41,6 @@ schema:
   min_n: int(0,100000)
   obs_interval_minutes: int(30,1440)
   obs_jitter_minutes: int(0,120)
+  monitor_pipeline: bool
+  monitor_budget: bool
+  monitor_db: bool
