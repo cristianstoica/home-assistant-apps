@@ -52,7 +52,7 @@ from wxverify.db.connection import close_db, get_db
 _OBS_TIME = "2026-07-10T11:55:00Z"
 _NOW_ISO = "2026-07-10T12:00:00Z"
 
-# Synthetic station IDs (opsec: public repo — never live IVATRA*/IDORNA* IDs)
+# Synthetic station IDs (opsec: public repo — never real live station IDs)
 _PWS_COLD = "ISTATION01"
 _PWS_OFFLINE = "ISTATION02"
 _PWS_DISABLED = "ISTATION03"

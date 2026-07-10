@@ -41,6 +41,8 @@ callback URL path are never logged.
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
 
+> **Deprecated:** superseded by wxverify 0.3.0's built-in adaptive PWS poller; no longer maintained; existing GHCR images retained.
+
 An adaptive, stdlib-only **poller for Weather.com PWS REST sensors** for Home
 Assistant. It forces a refresh of one representative sensor per station via
 `homeassistant.update_entity` through the Supervisor Core-API proxy, judges each
