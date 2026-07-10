@@ -363,8 +363,80 @@ covers startup/migration failures that abort before any request is served). The
 runtime health routes `/api/health/*` and `/api/worker/status` remain available
 for ad-hoc inspection.
 
-The ready-to-paste REST sensor and automations are in
-[`docs/monitoring-ha-package.md`](docs/monitoring-ha-package.md).
+### Home Assistant package (REST sensor + automations)
+
+Paste these into your HA configuration to poll the verdict endpoint and alert
+when it degrades.
+
+**Resolve the add-on host.** The add-on is reachable from HA core over the
+internal Docker network at `http://<repo>-wxverify:8099/api/health/monitor`,
+where `<repo>` depends on the install method: a repo hash for a store install
+from `github.com/cristianstoica/home-assistant-apps` (e.g.
+`http://3283fh-wxverify:8099/...`), or `http://local-wxverify:8099/...` for a
+local/dev install. The literal `<repo>` prefix cannot be derived from the repo
+alone — confirm it once from an HA terminal: the sensor must return `200` with a
+verdict body at the resolved host.
+
+**REST sensor:**
+
+```yaml
+rest:
+  - resource: http://<repo>-wxverify:8099/api/health/monitor
+    scan_interval: 300  # seconds — primary load dial; raise to poll less often
+    sensor:
+      - name: "wxverify monitor"
+        unique_id: wxverify_monitor
+        value_template: "{{ value_json.overall }}"
+        json_attributes:
+          - conditions
+          - grace_active
+          - generated_at
+```
+
+**Automation — degraded** (sends a persistent notification plus a mobile push;
+repoint `notify.mobile_app_<your_device>` to your app's entity):
+
+```yaml
+automation:
+  - alias: "wxverify degraded"
+    trigger:
+      - platform: state
+        entity_id: sensor.wxverify_monitor
+    condition:
+      - condition: template
+        value_template: >
+          {{ states('sensor.wxverify_monitor') not in ('ok', 'unavailable', 'unknown') }}
+    action:
+      - variables:
+          tripped: >
+            {{ state_attr('sensor.wxverify_monitor', 'conditions')
+               | selectattr('ok', 'equalto', false)
+               | selectattr('skipped', 'equalto', false)
+               | map(attribute='id') | list | join(', ') }}
+      - service: persistent_notification.create
+        data:
+          notification_id: wxverify_monitor
+          title: "wxverify: {{ states('sensor.wxverify_monitor') }}"
+          message: "Tripped: {{ tripped }}"
+      - service: notify.mobile_app_<your_device>
+        data:
+          title: "wxverify: {{ states('sensor.wxverify_monitor') }}"
+          message: "Tripped: {{ tripped }}"
+```
+
+**Automation — recovered** (clears the notification on return to `ok`):
+
+```yaml
+  - alias: "wxverify recovered"
+    trigger:
+      - platform: state
+        entity_id: sensor.wxverify_monitor
+        to: "ok"
+    action:
+      - service: persistent_notification.dismiss
+        data:
+          notification_id: wxverify_monitor
+```
 
 ## API Call Budget
 

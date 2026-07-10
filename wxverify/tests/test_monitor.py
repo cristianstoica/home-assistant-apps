@@ -107,6 +107,14 @@ def test_readme_monitoring_section_rewritten() -> None:
     assert "HEALTHCHECK" in monitoring
     assert "/api/health/monitor" in monitoring
     assert "unavailable" in monitoring
+    # The HA package (sensor + both automations) is inlined here, not a separate file.
+    assert "rest:" in monitoring
+    assert "-wxverify:8099" in monitoring
+    assert "local-wxverify" in monitoring
+    assert "value_json.overall" in monitoring
+    assert "persistent_notification.create" in monitoring
+    assert "notify.mobile_app_" in monitoring
+    assert monitoring.count("alias:") >= 2  # degraded + recovered
 
 
 def test_monitor_endpoint_envelope_always_200_and_skipped(
