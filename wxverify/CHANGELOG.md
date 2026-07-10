@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0
+
+- New: `GET /api/health/monitor` verdict endpoint — returns a structured JSON
+  envelope grouping health conditions into four categories: `pipeline`
+  (observation staleness, worker liveness), `budget` (per-provider API call
+  reservations), `db` (SQLite readability), and `monitor` (monitor-subsystem
+  self-check). The overall status is `ok`, `degraded`, or `unknown`; individual
+  condition groups carry `ok`/`degraded`/`unknown` verdicts with structured
+  detail payloads.
+- New: three operator toggles in add-on options — `monitor_pipeline` (bool,
+  default true), `monitor_budget` (bool, default true), `monitor_db` (bool,
+  default true) — allow selectively disabling condition groups that are not
+  relevant to a given deployment.
+- New: HA monitoring package documented in README — a ready-made `rest`
+  sensor polling `/api/health/monitor` plus a `degraded` binary sensor, and
+  two automations (notify on degraded, auto-clear on recovery) — so operators
+  can surface add-on health inside Home Assistant without custom scripting.
+
 ## 0.1.2
 
 - Fixed: static assets (CSS/JS) returning 404 under Home Assistant Ingress —

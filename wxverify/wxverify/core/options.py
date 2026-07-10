@@ -29,6 +29,9 @@ class RuntimeOptions(BaseModel):
     min_n: int | None = Field(default=None, ge=0, le=100000)
     obs_interval_minutes: int | None = Field(default=None, ge=30, le=1440)
     obs_jitter_minutes: int | None = Field(default=None, ge=0, le=120)
+    monitor_pipeline: bool = True
+    monitor_budget: bool = True
+    monitor_db: bool = True
 
 
 class RuntimeConfig(BaseModel):
@@ -52,6 +55,13 @@ def _env_int(name: str) -> int | None:
     return int(raw)
 
 
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def _from_env() -> RuntimeConfig:
     return RuntimeConfig(
         secrets={
@@ -63,6 +73,9 @@ def _from_env() -> RuntimeConfig:
             min_n=_env_int("WXV_MIN_N"),
             obs_interval_minutes=_env_int("WXV_OBS_INTERVAL_MINUTES"),
             obs_jitter_minutes=_env_int("WXV_OBS_JITTER_MINUTES"),
+            monitor_pipeline=_env_bool("WXV_MONITOR_PIPELINE") is not False,
+            monitor_budget=_env_bool("WXV_MONITOR_BUDGET") is not False,
+            monitor_db=_env_bool("WXV_MONITOR_DB") is not False,
         ),
         log_level=os.environ.get("WXV_LOG_LEVEL"),
     )
@@ -89,6 +102,9 @@ def _from_options_json(path: Path) -> RuntimeConfig:
             min_n=options.get("min_n"),
             obs_interval_minutes=options.get("obs_interval_minutes"),
             obs_jitter_minutes=options.get("obs_jitter_minutes"),
+            monitor_pipeline=options.get("monitor_pipeline", True),
+            monitor_budget=options.get("monitor_budget", True),
+            monitor_db=options.get("monitor_db", True),
         ),
         log_level=_blank_to_none(options.get("log_level")),
     )

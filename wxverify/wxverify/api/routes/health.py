@@ -9,9 +9,12 @@ from fastapi import APIRouter, Query
 
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+from wxverify.core.options import load_runtime_options
 from wxverify.core.secrets import key_status
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
+from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
 
 router = APIRouter(prefix="/api", tags=["health"])
@@ -217,3 +220,23 @@ async def worker_status() -> dict[str, object]:
         return status
 
     return await get_db().read(_read)
+
+
+@router.get("/health/monitor")
+async def health_monitor() -> dict[str, object]:
+    now = utc_now()
+    try:
+        opts = load_runtime_options()
+
+        def _read(conn: sqlite3.Connection) -> dict[str, object]:
+            return build_verdict(
+                conn,
+                pipeline_enabled=opts.monitor_pipeline,
+                budget_enabled=opts.monitor_budget,
+                db_enabled=opts.monitor_db,
+                now=now,
+            )
+
+        return await get_db().read(_read)
+    except Exception as exc:  # always-200 belt: never surface a 5xx here
+        return error_verdict(now, f"{type(exc).__name__}: {exc}")
