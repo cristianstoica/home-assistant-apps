@@ -23,3 +23,9 @@ configuration:
     name: Observation interval
   obs_jitter_minutes:
     name: Observation jitter
+  monitor_pipeline:
+    name: "Monitor: pipeline checks"
+  monitor_budget:
+    name: "Monitor: budget checks"
+  monitor_db:
+    name: "Monitor: database check"
