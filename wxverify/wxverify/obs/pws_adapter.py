@@ -42,6 +42,30 @@ class _ParsedObservation:
     metric: dict[str, object]
 
 
+@dataclass(frozen=True)
+class CurrentObservation:
+    """A single current-observation snapshot mapped to ``station_current_obs``.
+
+    Every measurement is optional: a missing or uncoercible upstream field maps
+    to ``None`` (a NULL column), never a fabricated zero. ``obs_time_utc`` is the
+    full-precision ISO-``Z`` instant from ``_obs_instant`` (never hour-floored),
+    or ``None`` when the payload's timestamp is missing/unparseable.
+    """
+
+    obs_time_utc: str | None
+    temp: float | None
+    humidity: float | None
+    dewpt: float | None
+    wind_speed: float | None
+    wind_gust: float | None
+    wind_dir: float | None
+    pressure: float | None
+    precip_rate: float | None
+    precip_total: float | None
+    uv: float | None
+    neighborhood: str | None
+
+
 async def validate_station(
     station_id: str, api_key: str, *, lat: float | None = None, lon: float | None = None
 ) -> PwsStation:
@@ -254,14 +278,23 @@ def observations_from_payload(
     return out
 
 
-def _valid_at(row: dict[str, object]) -> str | None:
+def _obs_datetime(row: dict[str, object]) -> datetime | None:
+    """Tolerant parse of an obs timestamp to a tz-aware UTC ``datetime``, else None.
+
+    The shared normalization behind ``_valid_at`` (hourly stream) and
+    ``_obs_instant`` (current stream): prefer a numeric ``epoch``, else normalize
+    ``obsTimeUtc`` (strip trailing `` UTC``, space→``T``, append ``Z`` when
+    offset-less). The two callers differ ONLY in whether they hour-floor the
+    result. This is the battle-tested normalization ``_valid_at`` has always run
+    against the live weather.com PWS payload; ``_obs_instant`` reuses it verbatim.
+    """
     raw_epoch = row.get("valid_time_gmt")
     if raw_epoch is None:
         raw_epoch = row.get("epoch")
     if isinstance(raw_epoch, int | float):
-        return isoformat_utc(floor_hour(datetime.fromtimestamp(raw_epoch, tz=UTC)))
+        return datetime.fromtimestamp(raw_epoch, tz=UTC)
     if isinstance(raw_epoch, str) and raw_epoch.isdigit():
-        return isoformat_utc(floor_hour(datetime.fromtimestamp(int(raw_epoch), tz=UTC)))
+        return datetime.fromtimestamp(int(raw_epoch), tz=UTC)
 
     raw_time = row.get("obsTimeUtc")
     if raw_time is None:
@@ -278,9 +311,106 @@ def _valid_at(row: dict[str, object]) -> str | None:
     if normalized[-1].isdigit() and "+" not in suffix and "-" not in suffix:
         normalized = f"{normalized}Z"
     try:
-        return isoformat_utc(floor_hour(parse_utc(normalized)))
+        return parse_utc(normalized)
     except ValueError:
         return None
+
+
+def _valid_at(row: dict[str, object]) -> str | None:
+    """Hourly-stream timestamp: shared normalization, then hour-floored ISO-``Z``.
+
+    Behaviour is unchanged from before the ``_obs_datetime`` extraction — the
+    hourly history/backfill path depends on the ``floor_hour`` bucketing.
+    """
+    parsed = _obs_datetime(row)
+    if parsed is None:
+        return None
+    return isoformat_utc(floor_hour(parsed))
+
+
+def _obs_instant(row: dict[str, object]) -> str | None:
+    """Current-stream timestamp: shared normalization WITHOUT the hour-floor.
+
+    Identical to ``_valid_at`` except the final ``floor_hour`` wrap is omitted, so
+    the returned ISO-``Z`` instant keeps full precision — cadence learning needs
+    real inter-obs gaps, not hour buckets. Returns ``None`` on missing/unparseable.
+    """
+    parsed = _obs_datetime(row)
+    if parsed is None:
+        return None
+    return isoformat_utc(parsed)
+
+
+def current_obs_from_payload(data: object) -> CurrentObservation | None:
+    """Map ``observations[0]`` of a ``/observations/current`` payload to columns.
+
+    Reads the top-level ``humidity``, ``winddir``, ``uv``, ``obsTimeUtc`` and
+    ``neighborhood`` alongside the ``metric`` sub-object (``temp``, ``windSpeed``,
+    ``windGust``, ``pressure``, ``precipRate``, ``precipTotal``, ``dewpt``). Values
+    are km/h / mm / hPa in the station's native ``units:"m"`` form — this is the
+    raw display snapshot table, NOT the SI-normalized scoring path, so no unit
+    conversion is applied. Returns ``None`` when the payload has no first
+    observation row (the caller treats that as OFFLINE). Missing fields → ``None``.
+    """
+    if not isinstance(data, dict):
+        return None
+    payload = cast(dict[str, object], data)
+    observations_obj = payload.get("observations")
+    if not isinstance(observations_obj, list) or not observations_obj:
+        return None
+    first = cast(list[object], observations_obj)[0]
+    if not isinstance(first, dict):
+        return None
+    row = cast(dict[str, object], first)
+    metric_obj = row.get("metric")
+    metric = cast(dict[str, object], metric_obj) if isinstance(metric_obj, dict) else {}
+    neighborhood_obj = row.get("neighborhood")
+    neighborhood = str(neighborhood_obj) if isinstance(neighborhood_obj, str) else None
+    return CurrentObservation(
+        obs_time_utc=_obs_instant(row),
+        temp=_number(metric, "temp"),
+        humidity=_number(row, "humidity"),
+        dewpt=_number(metric, "dewpt"),
+        wind_speed=_number(metric, "windSpeed"),
+        wind_gust=_number(metric, "windGust"),
+        wind_dir=_number(row, "winddir"),
+        pressure=_number(metric, "pressure"),
+        precip_rate=_number(metric, "precipRate"),
+        precip_total=_number(metric, "precipTotal"),
+        uv=_number(row, "uv"),
+        neighborhood=neighborhood,
+    )
+
+
+async def fetch_current_observation(
+    pws_station_id: str,
+    api_key: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> httpx.Response:
+    """GET ``/v2/pws/observations/current`` and return the raw response.
+
+    The handler needs status-code granularity (204 vs 429 vs 401 vs 2xx-with-body)
+    to drive the poll-state machine, so this seam returns the ``httpx.Response``
+    un-parsed and does NOT call ``raise_for_status`` — the caller classifies. A
+    transport-level failure propagates as the corresponding ``httpx`` exception.
+    """
+    if client is None:
+        async with httpx.AsyncClient() as owned_client:
+            return await fetch_current_observation(
+                pws_station_id, api_key, client=owned_client
+            )
+    logger.debug("pws current_obs request station=%s", pws_station_id)
+    return await client.get(
+        "https://api.weather.com/v2/pws/observations/current",
+        params={
+            "stationId": pws_station_id,
+            "format": "json",
+            "units": "m",
+            "apiKey": api_key,
+        },
+        timeout=httpx.Timeout(10.0, connect=5.0),
+    )
 
 
 def _number(metric: dict[str, object], *keys: str) -> float | None:

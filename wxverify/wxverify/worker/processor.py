@@ -34,12 +34,22 @@ from wxverify.db.queue import (
 from wxverify.db.runtime_state import set_runtime_state_now
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
-from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history
+from wxverify.obs.pws_adapter import (
+    PwsObservation,
+    fetch_current_observation,
+    fetch_hourly_history,
+)
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
+from wxverify.worker.current_obs import (
+    Health,
+    PollOutcome,
+    classify_current_obs,
+    persist_poll_result,
+)
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
     clear_domain_backoff,
@@ -229,6 +239,15 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
             raise JobCancelled()
         await _fetch_obs(db, site_id)
         return None
+    if job.type == "fetch_current_obs":
+        site_id = job.site_id
+        if site_id is None:
+            raise JobCancelled()
+        station_id = _payload_int(job.payload, "station_id")
+        if station_id is None:
+            raise JobCancelled()
+        await _fetch_current_obs(db, site_id, station_id)
+        return None
     if job.type == "fetch_feed":
         site_id = job.site_id
         if site_id is None:
@@ -329,6 +348,116 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                 changed = changed or station_changed
     logger.debug("fetch_obs cycle done site=%s changed=%s", site_id, changed)
     await db.write(lambda conn: _complete_obs_cycle(conn, site_id, changed))
+
+
+async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> None:
+    """Poll ``/observations/current`` for one station, learn cadence, snapshot.
+
+    Independent of the hourly ``_fetch_obs`` stream: touches only
+    ``station_poll_state`` (diagnostics + cadence) and ``station_current_obs``
+    (last-good snapshot), never ``stations`` (plan §5.9). One station per job, one
+    provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
+    recorded and the job is deferred; on transport failure the poll is marked
+    transient and deferred to the floor.
+    """
+    api_key = resolve_secret("weathercom")
+    if not api_key:
+        raise RuntimeError("weathercom key is not configured")
+    pws_station_id = await db.read(
+        lambda conn: _pws_station_id(conn, site_id, station_id)
+    )
+    if pws_station_id is None:
+        raise JobCancelled()
+
+    # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
+    # gate first (raises JobDeferred if active), then budget (raises JobDeferred
+    # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
+    # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
+    # design (plan §3).
+    await db.write(lambda conn: _reserve_current_obs_call(conn, site_id, station_id))
+
+    try:
+        response = await fetch_current_observation(pws_station_id, api_key)
+    except Exception as exc:
+        # Transport-level failure (timeout / connect / read): transient, retry
+        # at the floor. Do not record a domain backoff (no HTTP status to key on).
+        error = sanitized_exception(exc)
+        transient = PollOutcome(Health.TRANSIENT, error=error)
+        await db.write(
+            lambda conn, out=transient: persist_poll_result(
+                conn, site_id, station_id, out
+            )
+        )
+        raise
+
+    outcome = classify_current_obs(response)
+    status = response.status_code
+
+    # 429 / >=500: record the shared domain backoff (single write with the
+    # transient poll-state) and defer, exactly as the hourly stream does.
+    # Classification already returned TRANSIENT for these codes.
+    if status == 429 or status >= 500:
+        next_attempt_at = await db.write(
+            lambda conn, resp=response, out=outcome: _record_current_obs_backoff(
+                conn, site_id, station_id, resp, out
+            )
+        )
+        # record_http_backoff always returns a next-attempt for 429/>=500.
+        raise JobDeferred(next_attempt_at or isoformat_utc())
+
+    await db.write(
+        lambda conn, out=outcome: persist_poll_result(conn, site_id, station_id, out)
+    )
+
+
+def _reserve_current_obs_call(
+    conn: sqlite3.Connection, site_id: int, station_id: int
+) -> None:
+    """Domain-backoff gate then budget reservation (mirrors _reserve_obs_call).
+
+    Raises ``JobDeferred`` if the shared weather.com backoff is active or the
+    daily budget is exhausted; ``JobCancelled`` if the station is gone/disabled.
+    """
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM stations st
+        JOIN sites s ON s.id = st.site_id
+        WHERE s.id = ? AND st.id = ? AND s.enabled = 1 AND st.enabled = 1
+        """,
+        (site_id, station_id),
+    ).fetchone()
+    if row is None:
+        raise JobCancelled()
+    check_domain_backoff(conn, source_domain("weathercom"))
+    reserve_budget(conn, "weathercom", 1)
+
+
+def _record_current_obs_backoff(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    response: httpx.Response,
+    outcome: PollOutcome,
+) -> str | None:
+    """Persist the transient poll-state AND record the shared domain backoff."""
+    persist_poll_result(conn, site_id, station_id, outcome)
+    return record_http_backoff(conn, response)
+
+
+def _pws_station_id(
+    conn: sqlite3.Connection, site_id: int, station_id: int
+) -> str | None:
+    row = conn.execute(
+        """
+        SELECT st.pws_station_id
+        FROM stations st
+        JOIN sites s ON s.id = st.site_id
+        WHERE s.id = ? AND st.id = ? AND s.enabled = 1 AND st.enabled = 1
+        """,
+        (site_id, station_id),
+    ).fetchone()
+    return None if row is None else str(row["pws_station_id"])
 
 
 async def _fetch_feed(db: Database, site_id: int, feed_id: int) -> None:

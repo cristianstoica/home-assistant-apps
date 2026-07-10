@@ -6,7 +6,7 @@ import logging
 import sqlite3
 
 from wxverify.core.hashing import obs_jitter_minutes
-from wxverify.core.timeutil import parse_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.settings.keys import get_number_setting
 
@@ -17,6 +17,7 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
+    _enqueue_due_current_obs(conn)
 
 
 def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
@@ -85,3 +86,31 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
         if elapsed >= interval + jitter:
             logger.debug("scheduler due obs site=%s", int(row["id"]))
             enqueue_if_absent(conn, "fetch_obs", int(row["id"]), "obs", {})
+
+
+def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
+    now = isoformat_utc()
+    rows = conn.execute(
+        """
+        SELECT st.id, st.site_id, st.pws_station_id
+        FROM stations st
+        LEFT JOIN station_poll_state sps ON sps.station_id = st.id
+        WHERE st.enabled = 1
+          AND (sps.next_poll_at IS NULL OR sps.next_poll_at <= ?)
+        """,
+        (now,),
+    ).fetchall()
+    for row in rows:
+        station_id = int(row["id"])
+        logger.debug(
+            "scheduler due current_obs site=%s station=%s",
+            int(row["site_id"]),
+            station_id,
+        )
+        enqueue_if_absent(
+            conn,
+            "fetch_current_obs",
+            int(row["site_id"]),
+            f"curobs:{station_id}",
+            {"station_id": station_id},
+        )
