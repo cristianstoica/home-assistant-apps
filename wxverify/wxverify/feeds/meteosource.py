@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import ClassVar, Final
 
@@ -18,6 +19,8 @@ from wxverify.feeds.seam import (
 from wxverify.feeds.synthetic_run import snap_run
 
 _ENDPOINT: Final = "https://www.meteosource.com/api/v1/free/point"
+
+logger = logging.getLogger(__name__)
 
 
 class MeteosourceWind(BaseModel):
@@ -68,6 +71,7 @@ class MeteosourceAdapter:
         return CostEstimate(calls=1)
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+        logger.debug("meteosource forecast request lat=%s lon=%s", req.lat, req.lon)
         response = await self._client.get(
             _ENDPOINT,
             params={
@@ -81,7 +85,13 @@ class MeteosourceAdapter:
         )
         response.raise_for_status()
         payload = MeteosourceResponse.model_validate(response.json())
-        return _to_fetch_result(req, payload)
+        result = _to_fetch_result(req, payload)
+        logger.debug(
+            "meteosource forecast response status=%s samples=%s",
+            response.status_code,
+            len(result.samples),
+        )
+        return result
 
     async def fetch_historical(
         self, req: ForecastRequest, *, window_start: str, window_end: str

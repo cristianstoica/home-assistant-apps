@@ -16,6 +16,7 @@ from wxverify.api.app import create_app
 from wxverify.collection.budget import set_source_cap
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.error_sanitize import sanitized_exception
+from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.options import load_runtime_config
 from wxverify.db.connection import get_db, init_db
 from wxverify.db.queue import (
@@ -54,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "serve":
         return _serve(args)
+    _configure_logging()
     init_db(args.db)
     if args.command == "score":
         return _score(args)
@@ -176,12 +178,25 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+_LOG_DATEFMT = "%Y-%m-%dT%H:%M:%S%z"
+
+
 def _configure_logging() -> None:
     level_name = load_runtime_config().log_level or "info"
     level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(level=level, force=True)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=level, format=_LOG_FORMAT, datefmt=_LOG_DATEFMT, force=True
+    )
+    # At debug, let httpx/httpcore emit full request/response wire lines; at any
+    # higher level keep them quiet as before. The redaction filter attaches in
+    # both cases so a stray URL-bearing record is scrubbed regardless of level.
+    wire_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    redaction_filter = RedactUrlSecretsFilter()
+    for name in ("httpx", "httpcore"):
+        wire_logger = logging.getLogger(name)
+        wire_logger.setLevel(wire_level)
+        wire_logger.addFilter(redaction_filter)
 
 
 def _score(args: argparse.Namespace) -> int:

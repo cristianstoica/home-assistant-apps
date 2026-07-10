@@ -6,6 +6,7 @@ Single page only: ``hours=24`` with ``pageSize`` left at its default 24, and
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, Final
 
 import httpx
@@ -27,6 +28,8 @@ _ENDPOINT: Final = "https://weather.googleapis.com/v1/forecast/hours:lookup"
 _EXPECTED_TEMPERATURE_UNIT: Final = "CELSIUS"
 _EXPECTED_SPEED_UNIT: Final = "KILOMETERS_PER_HOUR"
 _EXPECTED_PRECIP_UNIT: Final = "MILLIMETERS"
+
+logger = logging.getLogger(__name__)
 
 
 class GoogleInterval(BaseModel):
@@ -98,6 +101,7 @@ class GoogleAdapter:
         return CostEstimate(calls=1)
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+        logger.debug("google forecast request lat=%s lon=%s", req.lat, req.lon)
         response = await self._client.get(
             _ENDPOINT,
             params={
@@ -111,7 +115,13 @@ class GoogleAdapter:
         )
         response.raise_for_status()
         payload = GoogleResponse.model_validate(response.json())
-        return _to_fetch_result(req, payload)
+        result = _to_fetch_result(req, payload)
+        logger.debug(
+            "google forecast response status=%s samples=%s",
+            response.status_code,
+            len(result.samples),
+        )
+        return result
 
     async def fetch_historical(
         self, req: ForecastRequest, *, window_start: str, window_end: str

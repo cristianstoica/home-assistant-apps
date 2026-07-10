@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 
 from wxverify.collection.budget import reserve_budget
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.feeds.seam import FetchResult, GridProvenance, NormalizedSample
+
+logger = logging.getLogger(__name__)
 
 # Distinguishable sentinel stamped into site_feed_state.last_error when a
 # forward fetch returns HTTP 200 but yields zero usable canonical samples.
@@ -31,7 +34,7 @@ class PersistOutcome:
 def register_feed_if_needed(
     conn: sqlite3.Connection, source: str, model: str, *, fetch_interval_minutes: int
 ) -> int:
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT OR IGNORE INTO feeds
             (source, model, enabled, default_subscribed, fetch_interval_minutes,
@@ -40,12 +43,16 @@ def register_feed_if_needed(
         """,
         (source, model, fetch_interval_minutes),
     )
+    inserted = cur.rowcount
     row = conn.execute(
         "SELECT id FROM feeds WHERE source = ? AND model = ?", (source, model)
     ).fetchone()
     if row is None:
         raise RuntimeError("feed registration failed")
-    return int(row["id"])
+    feed_id = int(row["id"])
+    if inserted:
+        logger.debug("feed registered source=%s model=%s id=%s", source, model, feed_id)
+    return feed_id
 
 
 def persist_fetch_result(
@@ -97,6 +104,13 @@ def persist_fetch_result(
         _clear_feed_state(
             conn, site_id, fetch_feed_id, fetched_at, grid, advance_last_run_at
         )
+    logger.debug(
+        "persist site=%s feed=%s usable=%s inserted=%s",
+        site_id,
+        fetch_feed_id,
+        usable,
+        inserted,
+    )
     return PersistOutcome(usable_sample_count=usable, inserted_count=inserted)
 
 

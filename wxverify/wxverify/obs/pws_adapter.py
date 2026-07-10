@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,8 @@ import httpx
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.core.units import kmh_to_ms
 from wxverify.obs.config import RECENT_REFRESH_HOURS
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,7 @@ async def validate_station(
     # the station-create contract without reaching weather.com.
     if lat is not None and lon is not None:
         return PwsStation(station_id=station_id, lat=lat, lon=lon)
+    logger.debug("pws validate_station station=%s", station_id)
     async with httpx.AsyncClient() as client:
         response = await client.get(
             "https://api.weather.com/v2/pws/observations/current",
@@ -94,6 +98,7 @@ async def fetch_hourly_history(
                 timezone=timezone,
                 client=owned_client,
             )
+    logger.debug("pws hourly_history request station=%s hours=%s", station_id, hours)
     response = await client.get(
         "https://api.weather.com/v2/pws/observations/hourly/7day",
         params={
@@ -106,11 +111,17 @@ async def fetch_hourly_history(
     )
     response.raise_for_status()
     cutoff = utc_now() - timedelta(hours=hours)
-    return [
+    observations = [
         observation
         for observation in observations_from_payload(response.json(), timezone=timezone)
         if parse_utc(observation.valid_at) >= cutoff
     ]
+    logger.debug(
+        "pws hourly_history response station=%s samples=%s",
+        station_id,
+        len(observations),
+    )
+    return observations
 
 
 async def fetch_hourly_history_range(
@@ -137,6 +148,12 @@ async def fetch_hourly_history_range(
                 timezone=timezone,
                 client=owned_client,
             )
+    logger.debug(
+        "pws history_range request station=%s window=%s..%s",
+        station_id,
+        window_start,
+        window_end,
+    )
     response = await client.get(
         "https://api.weather.com/v2/pws/history/hourly",
         params={
@@ -152,11 +169,15 @@ async def fetch_hourly_history_range(
     )
     response.raise_for_status()
     observations = observations_from_payload(response.json(), timezone=timezone)
-    return [
+    filtered = [
         observation
         for observation in observations
         if start <= parse_utc(observation.valid_at) < end
     ]
+    logger.debug(
+        "pws history_range response station=%s samples=%s", station_id, len(filtered)
+    )
+    return filtered
 
 
 def observations_from_payload(

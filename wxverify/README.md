@@ -337,6 +337,59 @@ code.
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
 
+## Logging
+
+The add-on writes structured log lines to the add-on log (Settings → Add-ons → Weather
+Verify → Log). Each line is prefixed with a timestamp, level, and the component that
+emitted it, e.g.:
+
+```text
+2026-07-10T14:03:11+0000 INFO wxverify.worker.processor cycle: job=42 type=fetch_feed site=1 outcome=completed
+```
+
+The four levels, loudest to quietest:
+
+- **ERROR — act now.** Something failed and will not fix itself: the worker crashed, a job
+  gave up after exhausting its retries, a forecast or observation fetch failed permanently,
+  or the add-on could not write to its database. If you see ERROR, the add-on needs you.
+- **WARNING — notice, but it handled itself.** The add-on hit a snag and recovered or is
+  degrading gracefully: a provider asked it to back off (rate limit), a job failed once and
+  will retry, a feed provider is temporarily unavailable, a fetch was skipped because the
+  daily API budget was used up, or a fetch came back with no usable samples. Nothing to do
+  unless WARNINGs are constant.
+- **INFO — it's working, here's the heartbeat.** The default level. You'll see the worker
+  start and stop, one `cycle: …` line each time the worker finishes a unit of work (naming the
+  job and its outcome — completed, deferred, retry, or failed), and one `scoring run complete …`
+  line per scoring run. If these keep ticking over, the add-on is alive and doing its job. INFO
+  never prints per-operation detail.
+- **DEBUG — show me literally everything.** The full firehose: every forecast fetch, every
+  observation fetch, every scoring phase, every queue and worker transition, every backfill
+  and catch-up step, every database transaction, and the raw HTTP requests and responses.
+  Use this when you're diagnosing a specific problem; it is very verbose.
+
+### Setting the level
+
+Set `log_level` in the add-on configuration (Settings → Add-ons → Weather Verify →
+Configuration) to one of `error`, `warning`, `info` (default), or `debug`, then restart the
+add-on. The chosen level applies to the running service **and** to any one-shot command you
+run inside the add-on container (for example the CLI `fetch`, `score`, `backfill`, and
+`catchup` commands) — so `log_level: debug` gives you the full trace for a manual command
+too, not just the background worker.
+
+### API keys are never logged
+
+Forecast and observation providers are called with your API keys in the request URL. Every
+log line that could contain a URL — including the raw HTTP request lines at `debug` — has
+its secret query parameters stripped before it is written, so keys are replaced with a
+redaction marker — which appears in the log as `%2A%2A%2A`, the URL-encoded form of `***`:
+
+```text
+2026-07-10T14:03:11+0000 DEBUG httpx HTTP Request: GET https://api.example.com/v1/forecast?key=%2A%2A%2A "HTTP/1.1 200 OK"
+```
+
+This means a `debug` log is safe to copy into a bug report or share for support without
+leaking credentials.
+
 ## Monitoring
 
 As a Home Assistant add-on, wxverify's **process supervision** is the Docker

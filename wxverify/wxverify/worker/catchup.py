@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -42,6 +43,8 @@ from wxverify.worker.station_pacing import pace_station_call, station_call_limit
 
 CATCHUP_SITE_CHUNK = 2
 TARGET_VARIABLE_LIST = tuple(sorted(TARGET_VARIABLES))
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -84,8 +87,15 @@ async def run_catchup(
     sites, has_more = await db.read(
         lambda conn: _catchup_sites(conn, plan.cursor_site_id)
     )
+    logger.debug(
+        "catchup sites=%s cursor=%s has_more=%s",
+        len(sites),
+        plan.cursor_site_id,
+        has_more,
+    )
     changed_sites: set[int] = set()
     for site in sites:
+        logger.debug("catchup site start site=%s", site.site_id)
         try:
             changed = await _catchup_site(db, site, plan)
         except JobDeferred:
@@ -94,8 +104,10 @@ async def run_catchup(
             continue
         except Exception:
             continue
+        logger.debug("catchup site result site=%s changed=%s", site.site_id, changed)
         if changed:
             changed_sites.add(site.site_id)
+    logger.debug("catchup rescoring sites=%s", len(changed_sites))
     for site_id in changed_sites:
         # One write transaction per phase; runs inside the single worker job
         # executor, so the convergence invariant documented at the
@@ -113,6 +125,7 @@ async def run_catchup(
                 "cursor_site_id": sites[-1].site_id,
             },
         )
+    logger.debug("catchup complete through=%s", isoformat_utc(plan.window_end))
     await db.write(
         lambda conn: _mark_catchup_complete(conn, isoformat_utc(plan.window_end))
     )
@@ -151,6 +164,11 @@ async def _fetch_missing_station_history(
                 )
                 if not has_gap:
                     continue
+                logger.debug(
+                    "catchup station gap site=%s station=%s",
+                    site.site_id,
+                    station.id,
+                )
                 reservation = await db.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site.site_id, station_id
@@ -209,6 +227,11 @@ async def _fetch_due_open_meteo(
     written = 0
     async with httpx.AsyncClient() as client:
         for target in targets:
+            logger.debug(
+                "catchup due open-meteo site=%s feed=%s",
+                target.site_id,
+                target.feed_id,
+            )
             adapter = build_adapter(target.source, client)
             req = ForecastRequest(
                 lat=target.lat,

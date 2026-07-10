@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from wxverify import config
+
+logger = logging.getLogger(__name__)
 
 TARGET_USER_VERSION = 2
 
@@ -285,13 +288,20 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     current = int(row[0]) if row is not None else 0
     if current > TARGET_USER_VERSION:
         raise RuntimeError(f"database user_version {current} is newer than this app")
+    logger.debug(
+        "migrations begin user_version=%s target=%s", current, TARGET_USER_VERSION
+    )
     create_schema(conn)
+    logger.debug("migrations schema ensured")
     if current < 2:
+        logger.debug("migrations applying v2 backfill_status")
         migrate_v2_backfill_status(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)
+    logger.debug("migrations seeded sources+feeds+settings")
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
+    logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)
 
 
 def migrate_v2_backfill_status(conn: sqlite3.Connection) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -40,6 +41,8 @@ SETUP_BACKFILL_DAYS = 30
 BACKFILL_CHUNK_DAYS = 7
 BACKFILL_VARIABLES = ("temperature", "wind", "precip")
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class SiteBackfillTarget:
@@ -76,6 +79,14 @@ async def run_backfill_site(
         raise JobCancelled()
     window_start, window_end, chunk_start = _backfill_window(target, payload)
     chunk_end = min(chunk_start + timedelta(days=BACKFILL_CHUNK_DAYS), window_end)
+    logger.debug(
+        "backfill site=%s window=%s..%s chunk=%s..%s",
+        site_id,
+        isoformat_utc(window_start),
+        isoformat_utc(window_end),
+        isoformat_utc(chunk_start),
+        isoformat_utc(chunk_end),
+    )
     forecast_complete = target.backfill_status == "complete"
     if not forecast_complete:
         await db.write(lambda conn: _mark_backfill_started(conn, site_id))
@@ -88,6 +99,7 @@ async def run_backfill_site(
             window_end=isoformat_utc(window_end),
             timezone=target.timezone,
         )
+    logger.debug("backfill station history site=%s changed=%s", site_id, obs_changed)
     forecast_written = 0
     if not forecast_complete:
         forecast_written = await _fetch_historical_forecasts(
@@ -96,7 +108,14 @@ async def run_backfill_site(
             window_start=isoformat_utc(chunk_start),
             window_end=isoformat_utc(chunk_end),
         )
+    logger.debug("backfill forecasts site=%s written=%s", site_id, forecast_written)
     complete = forecast_complete or chunk_end >= window_end
+    logger.debug(
+        "backfill chunk done site=%s through=%s complete=%s",
+        site_id,
+        isoformat_utc(chunk_end),
+        complete,
+    )
     await db.write(
         lambda conn: _finish_backfill_chunk(
             conn,
@@ -313,6 +332,12 @@ async def _fetch_historical_forecasts(
     written = 0
     async with httpx.AsyncClient() as client:
         for feed in feeds:
+            logger.debug(
+                "backfill feed fetch site=%s feed=%s source=%s",
+                feed.site_id,
+                feed.feed_id,
+                feed.source,
+            )
             adapter = build_adapter(feed.source, client)
             req = ForecastRequest(
                 lat=feed.lat,
@@ -335,6 +360,14 @@ async def _fetch_historical_forecasts(
                         _mark_feed_error_and_backoff(conn, f, err, resp)
                     )
                 )
+                logger.debug(
+                    "backfill feed http error site=%s feed=%s source=%s backoff=%s: %s",
+                    feed.site_id,
+                    feed.feed_id,
+                    feed.source,
+                    next_attempt_at is not None,
+                    error,
+                )
                 if next_attempt_at is not None:
                     raise JobDeferred(next_attempt_at) from exc
                 raise
@@ -342,6 +375,13 @@ async def _fetch_historical_forecasts(
                 error = sanitized_exception(exc)
                 await db.write(
                     lambda conn, f=feed, err=error: _mark_feed_error(conn, f, err)
+                )
+                logger.debug(
+                    "backfill feed error site=%s feed=%s source=%s: %s",
+                    feed.site_id,
+                    feed.feed_id,
+                    feed.source,
+                    error,
                 )
                 raise
             if result is None:

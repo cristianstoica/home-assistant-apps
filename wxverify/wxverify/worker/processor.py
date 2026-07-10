@@ -97,9 +97,14 @@ async def run_worker(db: Database) -> None:
             await asyncio.sleep(POLL_INTERVAL)
             continue
         job_id = job.id
+        logger.debug("job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id)
+        outcome = "completed"
         try:
             continuation = await dispatch(db, job)
             await db.write(lambda conn, jid=job_id: complete(conn, jid))
+            logger.debug(
+                "job completed id=%s type=%s site=%s", job.id, job.type, job.site_id
+            )
             if continuation is not None:
                 await db.write(
                     lambda conn, cont=continuation: enqueue_if_absent(
@@ -111,13 +116,14 @@ async def run_worker(db: Database) -> None:
                     )
                 )
         except JobDeferred as exc:
+            outcome = "deferred"
             next_attempt_at = exc.next_attempt_at
             await db.write(
                 lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
                     conn, jid, attempt
                 )
             )
-            logger.info(
+            logger.debug(
                 "job deferred id=%s type=%s site=%s until=%s",
                 job.id,
                 job.type,
@@ -125,6 +131,7 @@ async def run_worker(db: Database) -> None:
                 next_attempt_at,
             )
         except JobCancelled:
+            outcome = "cancelled"
             await db.write(lambda conn, jid=job_id: complete(conn, jid))
         except Exception as exc:
             if _is_process_fatal_permission_error(exc):
@@ -141,6 +148,7 @@ async def run_worker(db: Database) -> None:
                 lambda conn, jid=job_id, err=message: fail(conn, jid, err)
             )
             if disposition is not None and disposition.terminal:
+                outcome = "failed"
                 logger.error(
                     "job failed permanently id=%s type=%s site=%s attempts=%d/%d: %s",
                     job.id,
@@ -151,6 +159,7 @@ async def run_worker(db: Database) -> None:
                     message,
                 )
             else:
+                outcome = "retry"
                 logger.warning(
                     "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
                     job.id,
@@ -161,6 +170,13 @@ async def run_worker(db: Database) -> None:
                     disposition.next_attempt_at if disposition else "?",
                     message,
                 )
+        logger.info(
+            "cycle: job=%s type=%s site=%s outcome=%s",
+            job.id,
+            job.type,
+            job.site_id,
+            outcome,
+        )
 
 
 async def _maybe_stamp_runtime_heartbeat(
@@ -178,6 +194,7 @@ async def _maybe_stamp_runtime_heartbeat(
 
 
 async def dispatch(db: Database, job: Job) -> JobContinuation | None:
+    logger.debug("dispatch type=%s site=%s", job.type, job.site_id)
     if job.type == "pair_and_score":
         site_id = job.site_id
         if site_id is None:
@@ -201,6 +218,7 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         #       to enqueueing would break convergence silently. The dashboard
         #       _enqueue_score routes do not write observations and are safe.
         for phase in PAIR_AND_SCORE_PHASES:
+            logger.debug("score phase=%s site=%s", phase.__name__, site_id)
             await db.write(
                 lambda conn, run=phase: _run_score_phase_if_enabled(conn, site_id, run)
             )
@@ -251,11 +269,18 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
     stations = await db.read(lambda conn: _enabled_stations(conn, site_id))
     if not stations:
         raise JobCancelled()
+    logger.debug("fetch_obs site=%s stations=%s", site_id, len(stations))
     changed = False
     async with httpx.AsyncClient() as client:
         limiter = station_call_limiter()
         for index, station in enumerate(stations):
             await pace_station_call(site_id, station.id, index)
+            logger.debug(
+                "fetch_obs station attempt site=%s station=%s index=%s",
+                site_id,
+                station.id,
+                index,
+            )
             async with limiter:
                 reservation = await db.write(
                     lambda conn, station_id=station.id: _reserve_obs_call(
@@ -295,11 +320,19 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                         _persist_station_observations(conn, site_id, station_id, rows)
                     )
                 )
+                logger.debug(
+                    "fetch_obs station result site=%s station=%s changed=%s",
+                    site_id,
+                    station.id,
+                    station_changed,
+                )
                 changed = changed or station_changed
+    logger.debug("fetch_obs cycle done site=%s changed=%s", site_id, changed)
     await db.write(lambda conn: _complete_obs_cycle(conn, site_id, changed))
 
 
 async def _fetch_feed(db: Database, site_id: int, feed_id: int) -> None:
+    logger.debug("fetch_feed dispatch site=%s feed=%s", site_id, feed_id)
     outcome = await fetch_feed_once(db, site_id, feed_id, adapter_builder=build_adapter)
     if isinstance(outcome, BudgetExhausted):
         raise JobDeferred(outcome.next_window)

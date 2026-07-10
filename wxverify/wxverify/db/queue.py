@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
 
 from wxverify.core.timeutil import isoformat_utc, utc_now
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -77,6 +80,13 @@ def enqueue_if_absent(
         params,
     ).fetchone()
     if row is not None:
+        logger.debug(
+            "job enqueue deduped type=%s site=%s key=%s existing_id=%s",
+            job_type,
+            site_id,
+            job_key,
+            int(row["id"]),
+        )
         return EnqueueResult(created=False, job_id=int(row["id"]))
     try:
         cur = conn.execute(
@@ -94,7 +104,15 @@ def enqueue_if_absent(
         )
     except sqlite3.IntegrityError:
         return EnqueueResult(created=False)
-    return EnqueueResult(created=True, job_id=int(cur.lastrowid or 0))
+    job_id = int(cur.lastrowid or 0)
+    logger.debug(
+        "job enqueued type=%s site=%s key=%s id=%s",
+        job_type,
+        site_id,
+        job_key,
+        job_id,
+    )
+    return EnqueueResult(created=True, job_id=job_id)
 
 
 def claim_next_job(conn: sqlite3.Connection) -> Job | None:
@@ -126,6 +144,7 @@ def complete(conn: sqlite3.Connection, job_id: int, result: str | None = None) -
         """,
         (result, isoformat_utc(), job_id),
     )
+    logger.debug("job row completed id=%s", job_id)
 
 
 def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition | None:
@@ -146,6 +165,9 @@ def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition |
             """,
             (retry_count, error, isoformat_utc(), job_id),
         )
+        logger.debug(
+            "job row failed id=%s retry=%s/%s", job_id, retry_count, max_retries
+        )
         return FailDisposition(
             terminal=True,
             retry_count=retry_count,
@@ -163,6 +185,7 @@ def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition |
         """,
         (retry_count, error, next_attempt, isoformat_utc(), job_id),
     )
+    logger.debug("job row retry id=%s next=%s", job_id, next_attempt)
     return FailDisposition(
         terminal=False,
         retry_count=retry_count,
@@ -180,6 +203,7 @@ def defer_job(conn: sqlite3.Connection, job_id: int, next_attempt_at: str) -> No
         """,
         (next_attempt_at, isoformat_utc(), job_id),
     )
+    logger.debug("job row deferred id=%s next=%s", job_id, next_attempt_at)
 
 
 def count_failed_jobs_older_than(conn: sqlite3.Connection, hours: int) -> int:
@@ -206,6 +230,7 @@ def purge_failed_jobs_older_than(conn: sqlite3.Connection, hours: int) -> int:
         """,
         (cutoff,),
     )
+    logger.debug("job purge older_than_hours=%s rows=%s", hours, cur.rowcount)
     return cur.rowcount
 
 

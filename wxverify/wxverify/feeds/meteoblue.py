@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import ClassVar, Final
 
 import httpx
@@ -23,6 +24,8 @@ VARIABLE_MAP: Final[dict[str, tuple[str, str]]] = {
     "precip": ("precipitation", "mm"),
 }
 METEOBLUE_MULTIMODEL_PACKAGE: Final = "multimodel-1h"
+
+logger = logging.getLogger(__name__)
 
 
 class MeteoblueMetadata(BaseModel):
@@ -73,6 +76,7 @@ class MeteoblueAdapter:
         return CostEstimate(calls=1, credits=16000)
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+        logger.debug("meteoblue forecast request lat=%s lon=%s", req.lat, req.lon)
         response = await self._client.get(
             f"https://my.meteoblue.com/packages/{METEOBLUE_MULTIMODEL_PACKAGE}",
             params={
@@ -86,7 +90,13 @@ class MeteoblueAdapter:
         )
         response.raise_for_status()
         payload = MeteoblueResponse.model_validate(response.json())
-        return _to_fetch_result(req, payload)
+        result = _to_fetch_result(req, payload)
+        logger.debug(
+            "meteoblue forecast response status=%s samples=%s",
+            response.status_code,
+            len(result.samples),
+        )
+        return result
 
     async def fetch_historical(
         self, req: ForecastRequest, *, window_start: str, window_end: str

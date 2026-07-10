@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+- Revised logging levels throughout with a documented four-level policy
+  (ERROR/WARNING/INFO/DEBUG). DEBUG now traces all feed fetches, DB, queue,
+  scheduler, backfill, and catchup operations, and scoring; per-job INFO cycle
+  lines, service start/stop, and scoring-run milestones are emitted at INFO.
+  API keys in request URLs are redacted from log output at every level. The
+  `## Logging` section in the README documents the policy. No change to weather
+  data, scoring, monitoring, or the HTTP API.
+
 ## 0.2.0
 
 - New: `GET /api/health/monitor` verdict endpoint — returns a structured JSON

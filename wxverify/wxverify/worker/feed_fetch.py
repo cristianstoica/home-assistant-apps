@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,8 @@ from wxverify.worker.domain_backoff import (
 )
 
 AdapterBuilder = Callable[[str, httpx.AsyncClient], ForecastAdapter]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -102,8 +105,10 @@ async def fetch_feed_once(
     adapter_builder: AdapterBuilder | None = None,
 ) -> FetchFeedOutcome:
     adapter_builder = adapter_builder or build_adapter
+    logger.debug("fetch_feed_once site=%s feed=%s", site_id, feed_id)
     target = await db.read(lambda conn: feed_fetch_target(conn, site_id, feed_id))
     if target is None:
+        logger.debug("fetch_feed_once ineligible site=%s feed=%s", site_id, feed_id)
         return Ineligible("site/feed is not eligible for fetch")
     req = ForecastRequest(
         lat=target.lat,
@@ -118,14 +123,38 @@ async def fetch_feed_once(
         except Exception as exc:
             return Unavailable(target=target, error=sanitized_exception(exc))
         cost = adapter.estimate_cost(req)
+        logger.debug(
+            "fetch budget estimate source=%s calls=%s credits=%s",
+            target.source,
+            cost.calls,
+            cost.credits,
+        )
         reserve_outcome = await db.write(
             lambda conn, tgt=target, estimate=cost: _reserve_feed_call(
                 conn, tgt, estimate
             )
         )
         if not isinstance(reserve_outcome, Reservation):
+            if isinstance(reserve_outcome, BudgetExhausted | BackoffActive):
+                logger.warning(
+                    "fetch skipped source=%s reason=%s",
+                    target.source,
+                    type(reserve_outcome).__name__,
+                )
+            else:
+                logger.debug(
+                    "fetch budget gate source=%s outcome=%s",
+                    target.source,
+                    type(reserve_outcome).__name__,
+                )
             return reserve_outcome
         reservation = reserve_outcome
+        logger.debug(
+            "fetch reserved source=%s calls=%s credits=%s",
+            reservation.source,
+            reservation.calls,
+            reservation.credits,
+        )
         try:
             result = await adapter.fetch_forecast(req)
         except httpx.HTTPStatusError as exc:
@@ -135,6 +164,14 @@ async def fetch_feed_once(
                 lambda conn, err=error, resp=response: mark_feed_error_and_backoff(
                     conn, target, err, resp
                 )
+            )
+            logger.debug(
+                "fetch http error site=%s feed=%s source=%s backoff=%s: %s",
+                site_id,
+                feed_id,
+                target.source,
+                next_attempt_at is not None,
+                error,
             )
             if next_attempt_at is not None:
                 return BackoffActive(next_attempt_at)
@@ -146,6 +183,14 @@ async def fetch_feed_once(
                 lambda conn, err=error, res=refund: _mark_feed_error_and_refund(
                     conn, target, err, res
                 )
+            )
+            logger.debug(
+                "fetch transport error site=%s feed=%s source=%s refund=%s: %s",
+                site_id,
+                feed_id,
+                target.source,
+                refund is not None,
+                error,
             )
             raise
     persist_outcome = await db.write(
@@ -160,7 +205,20 @@ async def fetch_feed_once(
             )
         )
     if persist_outcome.usable_sample_count == 0:
+        logger.warning(
+            "fetch no usable samples site=%s feed=%s source=%s",
+            site_id,
+            feed_id,
+            target.source,
+        )
         return FetchFeedNoOp()
+    logger.debug(
+        "fetch persisted site=%s feed=%s inserted=%s usable=%s",
+        site_id,
+        feed_id,
+        persist_outcome.inserted_count,
+        persist_outcome.usable_sample_count,
+    )
     return FetchFeedSuccess(
         inserted=persist_outcome.inserted_count,
         usable=persist_outcome.usable_sample_count,
