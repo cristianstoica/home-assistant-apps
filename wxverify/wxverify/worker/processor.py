@@ -355,7 +355,7 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
 
     Independent of the hourly ``_fetch_obs`` stream: touches only
     ``station_poll_state`` (diagnostics + cadence) and ``station_current_obs``
-    (last-good snapshot), never ``stations`` (plan §5.9). One station per job, one
+    (last-good snapshot), never ``stations`` (plan §6). One station per job, one
     provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
     recorded and the job is deferred; on transport failure the poll is marked
     transient and deferred to the floor.

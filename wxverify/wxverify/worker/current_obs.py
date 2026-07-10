@@ -6,7 +6,7 @@ SEPARATE, independent per-station poll of ``/observations/current`` whose only
 job is to learn each station's upload cadence and keep a last-good display
 snapshot in ``station_current_obs``, with liveness tracked on
 ``station_poll_state``'s OWN diagnostic columns. The two streams never touch each
-other's diagnostics — that separation is load-bearing (plan §5.9): the read route
+other's diagnostics — that separation is load-bearing (plan §6): the read route
 surfaces the current-obs terminal reason, and the hourly stream's success reset
 must not wipe it.
 
@@ -175,7 +175,7 @@ def persist_poll_result(
     unseeded row would no-op and leave ``next_poll_at`` NULL ⇒ a tight re-poll
     loop). ``station_current_obs`` is written ONLY on ONLINE (last-good retention
     on every other state). Diagnostics land on ``station_poll_state``'s own
-    columns; ``stations`` is never touched here (plan §5.9).
+    columns; ``stations`` is never touched here (plan §6/§7).
     """
     # Station may have been deleted/disabled between enqueue and run.
     row = conn.execute(
