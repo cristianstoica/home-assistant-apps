@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 from collections.abc import Callable
 from typing import TypeVar
 
 from wxverify import config
 from wxverify.db.migrations import run_migrations
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _db_instance: Database | None = None
@@ -50,13 +53,16 @@ class Database:
         conn.execute("PRAGMA foreign_keys=ON")
 
     def _run_immediate(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        logger.debug("db txn begin")
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             result = fn(self._conn)
         except BaseException:
+            logger.debug("db txn rollback")
             self._conn.rollback()
             raise
         self._conn.commit()
+        logger.debug("db txn commit")
         return result
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:

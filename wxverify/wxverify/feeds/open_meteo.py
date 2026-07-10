@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from typing import ClassVar, Final, cast
 
@@ -37,6 +38,8 @@ VARIABLE_MAP: Final[dict[str, str]] = {
 }
 TRACE_NEGATIVE_PRECIP_MIN: Final = -0.1
 
+logger = logging.getLogger(__name__)
+
 
 class OpenMeteoResponse(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
@@ -67,6 +70,13 @@ class OpenMeteoAdapter:
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
         hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
+        logger.debug(
+            "open_meteo forecast request model=%s lat=%s lon=%s lead=%s",
+            req.model,
+            req.lat,
+            req.lon,
+            req.max_lead_hours,
+        )
         response = await self._client.get(
             "https://api.open-meteo.com/v1/forecast",
             params={
@@ -84,6 +94,11 @@ class OpenMeteoAdapter:
         data = payload.model_dump()
         issued_at = _snap_run(req.model)
         samples = _samples_from_hourly(req.model, issued_at, data)
+        logger.debug(
+            "open_meteo forecast response status=%s samples=%s",
+            response.status_code,
+            len(samples),
+        )
         grid = GridProvenance(
             grid_lat=payload.latitude,
             grid_lon=payload.longitude,
@@ -97,6 +112,12 @@ class OpenMeteoAdapter:
         hourly = _historical_hourly_names(req)
         if not hourly:
             return FetchResult(samples=[], grid=None)
+        logger.debug(
+            "open_meteo historical request model=%s window=%s..%s",
+            req.model,
+            window_start,
+            window_end,
+        )
         response = await self._client.get(
             "https://previous-runs-api.open-meteo.com/v1/forecast",
             params={
@@ -113,17 +134,18 @@ class OpenMeteoAdapter:
         response.raise_for_status()
         payload = OpenMeteoResponse.model_validate(response.json())
         data = payload.model_dump()
+        samples = _historical_samples_from_hourly(req, data, window_start, window_end)
+        logger.debug(
+            "open_meteo historical response status=%s samples=%s",
+            response.status_code,
+            len(samples),
+        )
         grid = GridProvenance(
             grid_lat=payload.latitude,
             grid_lon=payload.longitude,
             grid_elevation_m=payload.elevation,
         )
-        return FetchResult(
-            samples=_historical_samples_from_hourly(
-                req, data, window_start, window_end
-            ),
-            grid=grid,
-        )
+        return FetchResult(samples=samples, grid=grid)
 
 
 def _samples_from_hourly(

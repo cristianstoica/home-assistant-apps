@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from wxverify.core.hashing import obs_jitter_minutes
@@ -9,8 +10,11 @@ from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.settings.keys import get_number_setting
 
+logger = logging.getLogger(__name__)
+
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
+    logger.debug("scheduler tick")
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
 
@@ -39,6 +43,11 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
             minutes = (now - parse_utc(str(last_run_at))).total_seconds() / 60
             due = minutes >= int(row["fetch_interval_minutes"])
         if due:
+            logger.debug(
+                "scheduler due feed site=%s feed=%s",
+                int(row["site_id"]),
+                int(row["feed_id"]),
+            )
             enqueue_if_absent(
                 conn,
                 "fetch_feed",
@@ -66,6 +75,7 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
     for row in rows:
         last = row["last_obs_at"]
         if last is None:
+            logger.debug("scheduler due obs site=%s", int(row["id"]))
             enqueue_if_absent(conn, "fetch_obs", int(row["id"]), "obs", {})
             continue
         last_dt = parse_utc(str(last))
@@ -73,4 +83,5 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
         jitter = obs_jitter_minutes(int(row["id"]), cycle_bucket, jitter_cap)
         elapsed = (now - last_dt).total_seconds() / 60
         if elapsed >= interval + jitter:
+            logger.debug("scheduler due obs site=%s", int(row["id"]))
             enqueue_if_absent(conn, "fetch_obs", int(row["id"]), "obs", {})

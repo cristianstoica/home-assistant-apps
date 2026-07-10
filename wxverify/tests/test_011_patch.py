@@ -537,10 +537,20 @@ def test_worker_terminal_failure_logs_error(
     assert "failed" in errors[0].getMessage()
 
 
-def test_worker_deferred_job_logs_info(
+def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """JobDeferred → INFO record containing 'deferred'."""
+    """BC2: 'job deferred' moved INFO→DEBUG; cycle: outcome=deferred stays INFO.
+
+    The old test matched 'deferred' against the new cycle: INFO line — a false
+    oracle that would pass even if BC2 were reverted or the wrong line fired.
+    This retargeted version pins the real post-BC2 contract:
+      - 'job deferred …' is a DEBUG record (present at DEBUG, absent at INFO)
+      - 'cycle: job=… outcome=deferred' is an INFO record
+
+    Will go red if BC2 is reverted (job deferred re-promoted to INFO), or if the
+    cycle: line stops carrying outcome=deferred.
+    """
     job = _make_job(job_type="fetch_feed", site_id=42)
 
     async def _defer(db: Any, j: Job) -> None:
@@ -551,14 +561,43 @@ def test_worker_deferred_job_logs_info(
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _defer)
     monkeypatch.setattr("wxverify.worker.processor.defer_job", lambda c, jid, at: None)
 
+    # At DEBUG: both the cycle INFO line and the 'job deferred' DEBUG line appear
     with (
-        caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
+        caplog.at_level(logging.DEBUG, logger="wxverify.worker.processor"),
         pytest.raises(_StopLoop),
     ):
         asyncio.run(run_worker(_FakeDb()))  # type: ignore[arg-type]
 
-    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
-    assert any("deferred" in r.getMessage() for r in info_records)
+    # 'job deferred' must be a DEBUG record, not INFO
+    job_deferred_info = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "job deferred" in r.getMessage()
+    ]
+    assert len(job_deferred_info) == 0, (
+        "BC2: 'job deferred' must NOT appear at INFO level"
+    )
+
+    job_deferred_debug = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.DEBUG and "job deferred" in r.getMessage()
+    ]
+    assert len(job_deferred_debug) == 1, (
+        f"'job deferred' must appear at DEBUG exactly once; "
+        f"messages: {[r.getMessage() for r in caplog.records]}"
+    )
+
+    # cycle: INFO line carries outcome=deferred — the sanctioned INFO oracle
+    cycle_info = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "cycle: job=" in r.getMessage()
+    ]
+    assert len(cycle_info) == 1
+    assert "outcome=deferred" in cycle_info[0].getMessage(), (
+        f"cycle: line must carry outcome=deferred; got: {cycle_info[0].getMessage()!r}"
+    )
 
 
 def test_domain_backoff_429_logs_warning_with_domain_and_retry(

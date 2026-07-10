@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import ClassVar, Final
 
@@ -22,6 +23,8 @@ _ENDPOINT: Final = (
     "https://weather.visualcrossing.com/VisualCrossingWebServices"
     "/rest/services/timeline/{lat},{lon}"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class VisualCrossingHour(BaseModel):
@@ -64,6 +67,7 @@ class VisualCrossingAdapter:
         return CostEstimate(calls=1)
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+        logger.debug("visualcrossing forecast request lat=%s lon=%s", req.lat, req.lon)
         response = await self._client.get(
             _ENDPOINT.format(lat=req.lat, lon=req.lon),
             params={
@@ -76,7 +80,13 @@ class VisualCrossingAdapter:
         )
         response.raise_for_status()
         payload = VisualCrossingResponse.model_validate(response.json())
-        return _to_fetch_result(req, payload)
+        result = _to_fetch_result(req, payload)
+        logger.debug(
+            "visualcrossing forecast response status=%s samples=%s",
+            response.status_code,
+            len(result.samples),
+        )
+        return result
 
     async def fetch_historical(
         self, req: ForecastRequest, *, window_start: str, window_end: str

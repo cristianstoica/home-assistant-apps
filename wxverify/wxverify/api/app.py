@@ -99,12 +99,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await set_rolling_window_days(options.rolling_window_days)
     await apply_plain_settings(options)
     worker = asyncio.create_task(run_worker(db))
+    logger.info("worker started")
     worker.add_done_callback(
         lambda task: _stop_on_worker_done(task, app.state.stop_process)
     )
     try:
         yield
     finally:
+        logger.info("worker stopping")
         worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker
