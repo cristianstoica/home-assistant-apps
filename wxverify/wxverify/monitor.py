@@ -70,9 +70,7 @@ class Condition:
 
 
 def _skipped(cond_id: str, group: str, severity: str) -> Condition:
-    return Condition(
-        id=cond_id, group=group, ok=True, skipped=True, severity=severity
-    )
+    return Condition(id=cond_id, group=group, ok=True, skipped=True, severity=severity)
 
 
 # Filled in by Tasks 4-6. Each returns a list[Condition]; grace_active is passed
@@ -98,9 +96,7 @@ def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> in
     return 0 if row is None else int(row[0])
 
 
-def _has_completed_within(
-    conn: sqlite3.Connection, job_type: str, cutoff: str
-) -> bool:
+def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
     row = conn.execute(
         """
         SELECT 1 FROM jobs
@@ -198,28 +194,60 @@ def _pipeline_conditions(
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
-                id=cid, group="pipeline", ok=True, skipped=False,
-                severity="warning", count=count,
+                id=cid,
+                group="pipeline",
+                ok=True,
+                skipped=False,
+                severity="warning",
+                count=count,
             )
         return Condition(
-            id=cid, group="pipeline", ok=not tripped, skipped=False,
-            severity="warning", count=count,
+            id=cid,
+            group="pipeline",
+            ok=not tripped,
+            skipped=False,
+            severity="warning",
+            count=count,
             detail=detail if tripped else None,
         )
 
     return [
-        _cond("feed_stale", feed_stale_n > 0, feed_stale_n,
-              f"{feed_stale_n} feeds not run >12h"),
-        _cond("obs_stale", obs_stale_n > 0, obs_stale_n,
-              f"{obs_stale_n} sites not observed >12h"),
-        _cond("fetch_obs_live", fetch_obs_live_tripped, None,
-              "no completed fetch_obs in 8h"),
-        _cond("fetch_feed_live", fetch_feed_live_tripped, None,
-              "no completed fetch_feed in 12h"),
-        _cond("pair_score_live", pair_score_live_tripped, None,
-              "no completed pair_and_score in 12h"),
-        _cond("problem_jobs", problem_jobs_n > 0, problem_jobs_n,
-              f"{problem_jobs_n} stuck/failed/overdue jobs"),
+        _cond(
+            "feed_stale",
+            feed_stale_n > 0,
+            feed_stale_n,
+            f"{feed_stale_n} feeds not run >12h",
+        ),
+        _cond(
+            "obs_stale",
+            obs_stale_n > 0,
+            obs_stale_n,
+            f"{obs_stale_n} sites not observed >12h",
+        ),
+        _cond(
+            "fetch_obs_live",
+            fetch_obs_live_tripped,
+            None,
+            "no completed fetch_obs in 8h",
+        ),
+        _cond(
+            "fetch_feed_live",
+            fetch_feed_live_tripped,
+            None,
+            "no completed fetch_feed in 12h",
+        ),
+        _cond(
+            "pair_score_live",
+            pair_score_live_tripped,
+            None,
+            "no completed pair_and_score in 12h",
+        ),
+        _cond(
+            "problem_jobs",
+            problem_jobs_n > 0,
+            problem_jobs_n,
+            f"{problem_jobs_n} stuck/failed/overdue jobs",
+        ),
     ]
 
 
@@ -233,8 +261,7 @@ _ACTIVE_FEED_WHERE = """
 def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Condition]:
     # budget_calls / budget_credits: current billing-day row per source.
     sources = conn.execute(
-        "SELECT source, daily_call_limit, daily_credit_limit, billing_tz "
-        "FROM sources"
+        "SELECT source, daily_call_limit, daily_credit_limit, billing_tz FROM sources"
     ).fetchall()
     calls_tripped = 0
     credits_tripped = 0
@@ -242,17 +269,15 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
         source = str(row["source"])
         day = current_billing_day(str(row["billing_tz"]))
         budget = conn.execute(
-            "SELECT calls, credits FROM api_budget "
-            "WHERE source=? AND billing_day=?",
+            "SELECT calls, credits FROM api_budget WHERE source=? AND billing_day=?",
             (source, day),
         ).fetchone()
         calls = 0 if budget is None else int(budget["calls"])
         credits = 0 if budget is None else int(budget["credits"])
         if calls >= int(row["daily_call_limit"]):
             calls_tripped += 1
-        if (
-            row["daily_credit_limit"] is not None
-            and credits >= int(row["daily_credit_limit"])
+        if row["daily_credit_limit"] is not None and credits >= int(
+            row["daily_credit_limit"]
         ):
             credits_tripped += 1
 
@@ -298,21 +323,37 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
 
     def _c(cid: str, sev: str, n: int, detail: str) -> Condition:
         return Condition(
-            id=cid, group="budget", ok=(n == 0), skipped=False,
-            severity=sev, count=n, detail=detail if n else None,
+            id=cid,
+            group="budget",
+            ok=(n == 0),
+            skipped=False,
+            severity=sev,
+            count=n,
+            detail=detail if n else None,
         )
 
     return [
-        _c("budget_calls", "critical", calls_tripped,
-           "daily call budget exhausted"),
-        _c("budget_credits", "critical", credits_tripped,
-           "daily credit budget exhausted"),
+        _c("budget_calls", "critical", calls_tripped, "daily call budget exhausted"),
+        _c(
+            "budget_credits",
+            "critical",
+            credits_tripped,
+            "daily credit budget exhausted",
+        ),
         _c("domain_backoffs", "warning", backoffs_n, "active provider backoff"),
         _c("feed_errors", "warning", feed_errors_n, "active feed error"),
-        _c("costed_noop", "warning", costed_noop_n,
-           "active feed paying for zero usable data"),
-        _c("key_missing", "warning", key_missing_n,
-           "keyed provider exercised without a key"),
+        _c(
+            "costed_noop",
+            "warning",
+            costed_noop_n,
+            "active feed paying for zero usable data",
+        ),
+        _c(
+            "key_missing",
+            "warning",
+            key_missing_n,
+            "keyed provider exercised without a key",
+        ),
     ]
 
 

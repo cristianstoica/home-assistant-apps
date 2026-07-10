@@ -35,9 +35,7 @@ def test_runtime_options_toggles_default_true_and_read_from_options_json(
 
     # Real _from_options_json path: monitor_budget=false flips exactly that one.
     options_path = tmp_path / "options.json"
-    options_path.write_text(
-        json.dumps({"monitor_budget": False}), encoding="utf-8"
-    )
+    options_path.write_text(json.dumps({"monitor_budget": False}), encoding="utf-8")
     config.options_path = str(options_path)
     loaded = load_runtime_options()
     assert loaded.monitor_pipeline is True
@@ -124,9 +122,7 @@ def test_monitor_endpoint_envelope_always_200_and_skipped(
     config.db_path = str(tmp_path / "monitor-envelope.db")
     # Disable budget via the REAL options path (not a monkeypatch of the read).
     options_path = tmp_path / "options.json"
-    options_path.write_text(
-        json.dumps({"monitor_budget": False}), encoding="utf-8"
-    )
+    options_path.write_text(json.dumps({"monitor_budget": False}), encoding="utf-8")
     config.options_path = str(options_path)
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
     app = create_app(root_path="")
@@ -502,7 +498,9 @@ def test_fetch_feed_live_trips_when_eligible_feed_but_no_recent_run(
                 "WHERE key='worker_started_at'"
             )
             _set_feed_state(
-                conn, site_id, _feed_id(conn, "open-meteo", "ecmwf_ifs"),
+                conn,
+                site_id,
+                _feed_id(conn, "open-meteo", "ecmwf_ifs"),
                 last_run_at="2026-07-08T00:00:00Z",
             )
             # No completed fetch_feed job at all → live check trips.
@@ -570,7 +568,9 @@ def test_feed_stale_old_timestamp_trips(
             )
             # A stale-but-not-null last_run_at (year 2000 → far past cutoff).
             _set_feed_state(
-                conn, site_id, _feed_id(conn, "open-meteo", "ecmwf_ifs"),
+                conn,
+                site_id,
+                _feed_id(conn, "open-meteo", "ecmwf_ifs"),
                 last_run_at="2000-01-01T00:00:00Z",
             )
             # Unsubscribe siblings so count is deterministically 1.
@@ -625,7 +625,9 @@ def test_meteoblue_member_feed_excluded_from_staleness(
             # One eligible open-meteo feed to create a real staleness condition
             # (count must be exactly 1 — the meteoblue member must not add to it).
             _set_feed_state(
-                conn, site_id, _feed_id(conn, "open-meteo", "ecmwf_ifs"),
+                conn,
+                site_id,
+                _feed_id(conn, "open-meteo", "ecmwf_ifs"),
                 last_run_at=None,
             )
             # Unsubscribe open-meteo siblings so they don't inflate the count.
@@ -686,9 +688,7 @@ def test_liveness_recent_completed_job_does_not_trip(
     # window, regardless of when the test runs.
     fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
 
-    monkeypatch.setattr(
-        "wxverify.api.routes.health.utc_now", lambda: fixed_now
-    )
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
 
     close_db()
     config.db_path = str(tmp_path / "liveness-complete.db")
@@ -706,7 +706,9 @@ def test_liveness_recent_completed_job_does_not_trip(
             )
             # Eligible feed (recently run, so not stale — only testing liveness).
             _set_feed_state(
-                conn, site_id, _feed_id(conn, "open-meteo", "ecmwf_ifs"),
+                conn,
+                site_id,
+                _feed_id(conn, "open-meteo", "ecmwf_ifs"),
                 last_run_at="2026-07-09T11:00:00Z",
             )
             # Eligible obs target.
@@ -780,7 +782,9 @@ def test_problem_jobs_pending_future_deferral_does_not_trip(
             site_id = _seed_site(conn)
             # Pending with a FUTURE next_attempt_at → freshly deferred → NOT overdue.
             _seed_job(
-                conn, site_id=site_id, status="pending",
+                conn,
+                site_id=site_id,
+                status="pending",
                 updated_at="2035-01-01T00:00:00Z",
                 next_attempt_at="2035-01-01T00:00:00Z",
                 job_key="fetch:defer",
@@ -819,7 +823,9 @@ def test_problem_jobs_all_three_arms_trip_and_each_counted(
             # failed_cutoff = 2026-07-07T12:00:00Z;
             # updated_at 2026-07-07T00:00:00Z ≤ cutoff.
             _seed_job(
-                conn, site_id=site_id, status="failed",
+                conn,
+                site_id=site_id,
+                status="failed",
                 updated_at="2026-07-07T00:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:failed-old",
@@ -828,7 +834,9 @@ def test_problem_jobs_all_three_arms_trip_and_each_counted(
             # stuck_cutoff = 2026-07-09T11:40:00Z;
             # updated_at 2026-07-09T11:00:00Z ≤ cutoff.
             _seed_job(
-                conn, site_id=site_id, status="running",
+                conn,
+                site_id=site_id,
+                status="running",
                 updated_at="2026-07-09T11:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:stuck-running",
@@ -837,7 +845,9 @@ def test_problem_jobs_all_three_arms_trip_and_each_counted(
             # pending_cutoff = 2026-07-09T11:45:00Z;
             # next_attempt_at 2020-01-01 ≤ cutoff.
             _seed_job(
-                conn, site_id=site_id, status="pending",
+                conn,
+                site_id=site_id,
+                status="pending",
                 updated_at="2020-01-01T00:00:00Z",
                 next_attempt_at="2020-01-01T00:00:00Z",
                 job_key="fetch:pending-overdue",
@@ -875,7 +885,9 @@ def test_problem_jobs_pending_null_next_attempt_at_counts_as_stuck(
             site_id = _seed_site(conn)
             # Pending, next_attempt_at NULL (claimable now), old updated_at.
             _seed_job(
-                conn, site_id=site_id, status="pending",
+                conn,
+                site_id=site_id,
+                status="pending",
                 updated_at="2020-01-01T00:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:null-attempt",
@@ -911,7 +923,9 @@ def test_problem_jobs_pending_null_next_attempt_at_recent_does_not_trip(
             site_id = _seed_site(conn)
             # Pending, NULL attempt, updated_at far in the FUTURE → within cutoff.
             _seed_job(
-                conn, site_id=site_id, status="pending",
+                conn,
+                site_id=site_id,
+                status="pending",
                 updated_at="2035-01-01T00:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:null-recent",
@@ -947,7 +961,9 @@ def test_problem_jobs_failed_old_only_trips(
             site_id = _seed_site(conn)
             # failed_cutoff = 2026-07-07T12:00:00Z; 2026-07-07T00:00:00Z ≤ cutoff.
             _seed_job(
-                conn, site_id=site_id, status="failed",
+                conn,
+                site_id=site_id,
+                status="failed",
                 updated_at="2026-07-07T00:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:failed-old",
@@ -987,7 +1003,9 @@ def test_problem_jobs_failed_recent_does_not_trip(
             # failed_cutoff = 2026-07-07T12:00:00Z;
             # 2026-07-09T06:00:00Z > cutoff → recent.
             _seed_job(
-                conn, site_id=site_id, status="failed",
+                conn,
+                site_id=site_id,
+                status="failed",
                 updated_at="2026-07-09T06:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:failed-recent",
@@ -1023,7 +1041,9 @@ def test_problem_jobs_running_old_only_trips(
             site_id = _seed_site(conn)
             # stuck_cutoff = 2026-07-09T11:40:00Z; 2026-07-09T11:00:00Z ≤ cutoff.
             _seed_job(
-                conn, site_id=site_id, status="running",
+                conn,
+                site_id=site_id,
+                status="running",
                 updated_at="2026-07-09T11:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:stuck-running",
@@ -1063,7 +1083,9 @@ def test_problem_jobs_running_recent_does_not_trip(
             # stuck_cutoff = 2026-07-09T11:40:00Z;
             # 2026-07-09T11:50:00Z > cutoff → recent.
             _seed_job(
-                conn, site_id=site_id, status="running",
+                conn,
+                site_id=site_id,
+                status="running",
                 updated_at="2026-07-09T11:50:00Z",
                 next_attempt_at=None,
                 job_key="fetch:running-recent",
@@ -1100,7 +1122,9 @@ def test_problem_jobs_running_at_stuck_cutoff_boundary_counts(
             site_id = _seed_site(conn)
             # stuck_cutoff = now - 20m = 2026-07-09T11:40:00Z exactly.
             _seed_job(
-                conn, site_id=site_id, status="running",
+                conn,
+                site_id=site_id,
+                status="running",
                 updated_at="2026-07-09T11:40:00Z",
                 next_attempt_at=None,
                 job_key="fetch:stuck-at-boundary",
@@ -1139,7 +1163,9 @@ def test_problem_jobs_running_one_second_inside_cutoff_does_not_count(
             # stuck_cutoff = 2026-07-09T11:40:00Z;
             # 11:40:01Z is 1 second newer → not stuck.
             _seed_job(
-                conn, site_id=site_id, status="running",
+                conn,
+                site_id=site_id,
+                status="running",
                 updated_at="2026-07-09T11:40:01Z",
                 next_attempt_at=None,
                 job_key="fetch:stuck-inside",
@@ -1182,7 +1208,9 @@ def test_problem_jobs_grace_suppresses_would_trip(
             # A failed job that would definitely trip without grace
             # (failed_cutoff = 2026-07-07T12:00:00Z; 2026-07-07T00:00:00Z ≤ cutoff).
             _seed_job(
-                conn, site_id=site_id, status="failed",
+                conn,
+                site_id=site_id,
+                status="failed",
                 updated_at="2026-07-07T00:00:00Z",
                 next_attempt_at=None,
                 job_key="fetch:failed-grace",
@@ -1222,9 +1250,7 @@ def _seed_source_budget(
     )
 
 
-def test_budget_calls_boundary(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_budget_calls_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     close_db()
     config.db_path = str(tmp_path / "budget-calls.db")
     config.options_path = str(tmp_path / "missing-options.json")
@@ -1263,8 +1289,13 @@ def test_feed_errors_disabled_feed_does_not_trip(
             # disabled feed with an error → must NOT trip.
             conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (vc,))
             _set_feed_state(
-                conn, site_id, vc, last_run_at="2026-07-08T00:00:00Z",
-                enabled=1, last_error="HTTP 500 boom", error_count=1,
+                conn,
+                site_id,
+                vc,
+                last_run_at="2026-07-08T00:00:00Z",
+                enabled=1,
+                last_error="HTTP 500 boom",
+                error_count=1,
             )
 
         db.write_sync(_seed)
@@ -1289,8 +1320,12 @@ def test_feed_errors_active_feed_trips(
             site_id = _seed_site(conn)
             om = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # enabled, subscribed
             _set_feed_state(
-                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
-                last_error="HTTP 500 boom", error_count=1,
+                conn,
+                site_id,
+                om,
+                last_run_at="2026-07-08T00:00:00Z",
+                last_error="HTTP 500 boom",
+                error_count=1,
             )
 
         db.write_sync(_seed_active)
@@ -1314,8 +1349,12 @@ def test_costed_noop_repeated_sentinel_active_only(
             site_id = _seed_site(conn)
             om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
             _set_feed_state(
-                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
-                last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=1,
+                conn,
+                site_id,
+                om,
+                last_run_at="2026-07-08T00:00:00Z",
+                last_error=NO_USABLE_SAMPLES_SENTINEL,
+                error_count=1,
             )
             return om
 
@@ -1324,9 +1363,7 @@ def test_costed_noop_repeated_sentinel_active_only(
         assert _cond(body, "costed_noop")["ok"] is True  # single occurrence quiet
 
         def _bump(conn: sqlite3.Connection) -> None:
-            site_id = int(
-                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
-            )
+            site_id = int(conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"])
             om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
             conn.execute(
                 "UPDATE site_feed_state SET error_count=3 "
@@ -1358,8 +1395,13 @@ def test_costed_noop_disabled_feed_does_not_trip(
             om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
             conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (om,))
             _set_feed_state(
-                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
-                enabled=1, last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=5,
+                conn,
+                site_id,
+                om,
+                last_run_at="2026-07-08T00:00:00Z",
+                enabled=1,
+                last_error=NO_USABLE_SAMPLES_SENTINEL,
+                error_count=5,
             )
 
         db.write_sync(_seed_disabled)
@@ -1389,9 +1431,7 @@ def test_key_missing_three_cases(
 
         # Case B (negative): subscribed but feed.enabled=0, key absent → NOT tripped.
         def _seed_sub_disabled(conn: sqlite3.Connection) -> None:
-            site_id = int(
-                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
-            )
+            site_id = int(conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"])
             vc = _feed_id(conn, "visualcrossing", "blend")
             conn.execute("UPDATE feeds SET enabled=0 WHERE id=?", (vc,))
             _set_feed_state(conn, site_id, vc, last_run_at=None, enabled=1)
@@ -1402,9 +1442,7 @@ def test_key_missing_three_cases(
 
         # Case C (positive): subscribed AND enabled, key empty → trips.
         def _seed_sub_enabled(conn: sqlite3.Connection) -> None:
-            site_id = int(
-                conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"]
-            )
+            site_id = int(conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"])
             vc = _feed_id(conn, "visualcrossing", "blend")
             conn.execute("UPDATE feeds SET enabled=1 WHERE id=?", (vc,))
             _set_feed_state(conn, site_id, vc, last_run_at=None, enabled=1)
@@ -1658,8 +1696,12 @@ def test_feed_errors_sentinel_does_not_trip(
             # Active feed with SENTINEL as its last_error.  Must NOT trip
             # feed_errors; it belongs to costed_noop.
             _set_feed_state(
-                conn, site_id, om, last_run_at="2026-07-08T00:00:00Z",
-                last_error=NO_USABLE_SAMPLES_SENTINEL, error_count=1,
+                conn,
+                site_id,
+                om,
+                last_run_at="2026-07-08T00:00:00Z",
+                last_error=NO_USABLE_SAMPLES_SENTINEL,
+                error_count=1,
             )
 
         db.write_sync(_seed)
