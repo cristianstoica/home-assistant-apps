@@ -41,6 +41,7 @@ from wxverify.obs.pws_adapter import (
 )
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
+from wxverify.settings.keys import get_number_setting
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -376,8 +377,16 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
     # design (plan §3).
     await db.write(lambda conn: _reserve_current_obs_call(conn, site_id, station_id))
 
+    # Operator-configurable read timeout (plan §10); default 30s, floored at 1s to
+    # match the config.yaml int(1,300) schema.
+    timeout_seconds = await db.read(
+        lambda conn: get_number_setting(conn, "request_timeout_seconds", 30, minimum=1)
+    )
+
     try:
-        response = await fetch_current_observation(pws_station_id, api_key)
+        response = await fetch_current_observation(
+            pws_station_id, api_key, timeout_seconds=timeout_seconds
+        )
     except Exception as exc:
         # Transport-level failure (timeout / connect / read): transient, retry
         # at the floor. Do not record a domain backoff (no HTTP status to key on).

@@ -31,15 +31,24 @@ import httpx
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.obs import cadence
 from wxverify.obs.pws_adapter import CurrentObservation, current_obs_from_payload
+from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
 
+# Defaults + floors for the settings-backed poll intervals (plan §5.6/§10). The
+# live values come from the ``min_interval_seconds`` / ``max_backoff_seconds``
+# settings rows (written from options at boot, §10 site (b)); these constants are
+# the fallback when the row is absent and the ``get_number_setting`` floor.
+
 # The floor poll interval and cold-start learned interval, in seconds. Also the
-# transient-retry backoff (retry at the floor, not a long freeze) (plan §5.6).
+# transient-retry backoff (retry at the floor, not a long freeze).
 MIN_INTERVAL_SECONDS = 300
 # The terminal / offline park interval: a dead or auth-rejected station is
-# re-polled at most once a day (plan §5.6).
+# re-polled at most once a day.
 MAX_BACKOFF_SECONDS = 86400
+# get_number_setting floors, matching the config.yaml int() schema bounds (§10).
+_MIN_INTERVAL_FLOOR = 60
+_MAX_BACKOFF_FLOOR = 60
 
 
 class Health(Enum):
@@ -139,6 +148,7 @@ def _online_cadence(
     last_obstime: str | None,
     obs_instant: str,
     now_ts: float,
+    min_interval: int,
 ) -> tuple[tuple[str, ...], int, int]:
     """Advance cadence learning for an ONLINE poll (plan §5.7).
 
@@ -151,13 +161,13 @@ def _online_cadence(
     Successive polls of one station are ~``learned`` apart and so land in different
     buckets ⇒ successive jitter offsets differ; different ``station_id`` values vary
     independently via the blake2b hash key. ``learned`` is clamped
-    >= ``MIN_INTERVAL_SECONDS`` (>=300) so ``now_ts // learned`` never divides by
-    zero. The delay is ``learned + offset`` (offset is a SIGNED value in
-    ``[-span, +span]``), never ``offset`` alone.
+    >= ``min_interval`` (the settings-backed floor, >=60) so ``now_ts // learned``
+    never divides by zero. The delay is ``learned + offset`` (offset is a SIGNED
+    value in ``[-span, +span]``), never ``offset`` alone.
     """
     if obs_instant != last_obstime:
         events = (*events, obs_instant)[-cadence.WINDOW_N :]
-    learned = cadence.base_interval(events, MIN_INTERVAL_SECONDS)
+    learned = cadence.base_interval(events, min_interval)
     cycle_bucket = int(now_ts // learned)
     offset = cadence.obs_cadence_jitter(station_id, cycle_bucket, learned)
     return events, learned, learned + offset
@@ -188,15 +198,28 @@ def persist_poll_result(
     now = utc_now()
     now_iso = isoformat_utc(now)
 
+    # Settings-backed intervals (written from options at boot, §10); fall back to
+    # the module defaults when the row is absent, floored to the config.yaml
+    # schema bounds.
+    min_interval = get_number_setting(
+        conn, "min_interval_seconds", MIN_INTERVAL_SECONDS, minimum=_MIN_INTERVAL_FLOOR
+    )
+    max_backoff = get_number_setting(
+        conn, "max_backoff_seconds", MAX_BACKOFF_SECONDS, minimum=_MAX_BACKOFF_FLOOR
+    )
+
     if outcome.health is Health.ONLINE:
         assert outcome.obs is not None and outcome.obs_instant is not None
         events, last_obstime = _load_poll_state(conn, station_id)
         new_events, learned, delay = _online_cadence(
-            station_id, events, last_obstime, outcome.obs_instant, now.timestamp()
+            station_id,
+            events,
+            last_obstime,
+            outcome.obs_instant,
+            now.timestamp(),
+            min_interval,
         )
-        next_poll_at = isoformat_utc(
-            now + timedelta(seconds=max(MIN_INTERVAL_SECONDS, delay))
-        )
+        next_poll_at = isoformat_utc(now + timedelta(seconds=max(min_interval, delay)))
         _upsert_current_obs(conn, station_id, outcome.obs, now_iso)
         _upsert_poll_state_online(
             conn,
@@ -211,13 +234,13 @@ def persist_poll_result(
 
     if outcome.health is Health.OFFLINE:
         health = "offline"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=MAX_BACKOFF_SECONDS))
+        next_poll_at = isoformat_utc(now + timedelta(seconds=max_backoff))
     elif outcome.health is Health.TERMINAL:
         health = "terminal"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=MAX_BACKOFF_SECONDS))
+        next_poll_at = isoformat_utc(now + timedelta(seconds=max_backoff))
     else:  # TRANSIENT
         health = "transient"
-        next_poll_at = isoformat_utc(now + timedelta(seconds=MIN_INTERVAL_SECONDS))
+        next_poll_at = isoformat_utc(now + timedelta(seconds=min_interval))
 
     _upsert_poll_state_failure(
         conn,

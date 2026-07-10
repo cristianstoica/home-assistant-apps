@@ -29,6 +29,7 @@ from wxverify.api.routes import (
     stations,
     timeseries,
 )
+from wxverify.collection.budget import set_source_cap
 from wxverify.core.options import load_runtime_options
 from wxverify.db.connection import init_db
 from wxverify.db.queue import reclaim_all_stale
@@ -98,6 +99,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     if options.rolling_window_days is not None:
         await set_rolling_window_days(options.rolling_window_days)
     await apply_plain_settings(options)
+    await db.write(
+        lambda conn: set_source_cap(
+            conn,
+            "weathercom",
+            daily_call_limit=options.weathercom_daily_call_limit,
+        )
+    )
     worker = asyncio.create_task(run_worker(db))
     logger.info("worker started")
     worker.add_done_callback(

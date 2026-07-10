@@ -25,6 +25,10 @@ options:
   min_n: 30
   obs_interval_minutes: 180
   obs_jitter_minutes: 20
+  min_interval_seconds: 300
+  max_backoff_seconds: 86400
+  request_timeout_seconds: 30
+  weathercom_daily_call_limit: 3000
   monitor_pipeline: true
   monitor_budget: true
   monitor_db: true
@@ -41,6 +45,10 @@ schema:
   min_n: int(0,100000)
   obs_interval_minutes: int(30,1440)
   obs_jitter_minutes: int(0,120)
+  min_interval_seconds: int(60,1800)
+  max_backoff_seconds: int(60,86400)
+  request_timeout_seconds: int(1,300)
+  weathercom_daily_call_limit: int(1,20000)
   monitor_pipeline: bool
   monitor_budget: bool
   monitor_db: bool

@@ -387,6 +387,7 @@ async def fetch_current_observation(
     api_key: str,
     *,
     client: httpx.AsyncClient | None = None,
+    timeout_seconds: float = 10.0,
 ) -> httpx.Response:
     """GET ``/v2/pws/observations/current`` and return the raw response.
 
@@ -394,11 +395,18 @@ async def fetch_current_observation(
     to drive the poll-state machine, so this seam returns the ``httpx.Response``
     un-parsed and does NOT call ``raise_for_status`` — the caller classifies. A
     transport-level failure propagates as the corresponding ``httpx`` exception.
+
+    ``timeout_seconds`` is the overall/read timeout (the connect timeout stays at
+    5.0s); the caller passes the operator-configured ``request_timeout_seconds``
+    setting (plan §10), defaulting to the previous 10.0s literal.
     """
     if client is None:
         async with httpx.AsyncClient() as owned_client:
             return await fetch_current_observation(
-                pws_station_id, api_key, client=owned_client
+                pws_station_id,
+                api_key,
+                client=owned_client,
+                timeout_seconds=timeout_seconds,
             )
     logger.debug("pws current_obs request station=%s", pws_station_id)
     return await client.get(
@@ -409,7 +417,7 @@ async def fetch_current_observation(
             "units": "m",
             "apiKey": api_key,
         },
-        timeout=httpx.Timeout(10.0, connect=5.0),
+        timeout=httpx.Timeout(timeout_seconds, connect=5.0),
     )
 
 

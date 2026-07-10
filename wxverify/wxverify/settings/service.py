@@ -33,5 +33,13 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
             set_setting(conn, "obs_interval_minutes", str(options.obs_interval_minutes))
         if options.obs_jitter_minutes is not None:
             set_setting(conn, "obs_jitter_minutes", str(options.obs_jitter_minutes))
+        if options.min_interval_seconds is not None:
+            set_setting(conn, "min_interval_seconds", str(options.min_interval_seconds))
+        if options.max_backoff_seconds is not None:
+            set_setting(conn, "max_backoff_seconds", str(options.max_backoff_seconds))
+        if options.request_timeout_seconds is not None:
+            set_setting(
+                conn, "request_timeout_seconds", str(options.request_timeout_seconds)
+            )
 
     await get_db().write(_apply)
