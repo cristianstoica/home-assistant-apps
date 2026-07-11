@@ -74,7 +74,7 @@ from pydantic import ValidationError
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.collection.budget import reserve_budget
+from wxverify.collection.budget import _billing_day, reserve_budget
 from wxverify.core.options import RuntimeOptions, _from_env
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.migrations import (
@@ -374,7 +374,16 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
         db2 = get_db()
 
         def _fill_budget(conn: sqlite3.Connection) -> None:
-            billing_day = _NOW.astimezone(UTC).date().isoformat()
+            # Derive billing_day the same way reserve_budget does: read the
+            # weathercom billing_tz from the sources row and call _billing_day()
+            # on the real current time.  Using _NOW.date() here caused the row
+            # to be inserted for 2026-07-10 regardless of the actual calendar
+            # date, making the test fail on any day after authorship.
+            tz_row = conn.execute(
+                "SELECT billing_tz FROM sources WHERE source = 'weathercom'"
+            ).fetchone()
+            assert tz_row is not None, "sources row for weathercom must exist"
+            billing_day = _billing_day(str(tz_row["billing_tz"]))
             # Insert a budget row representing 4200 calls already consumed.
             conn.execute(
                 "INSERT OR REPLACE INTO api_budget"
