@@ -173,7 +173,7 @@ def _serve(args: argparse.Namespace) -> int:
     config.db_path = args.db
     config.options_path = args.options
     _configure_logging()
-    app = create_app(root_path=args.root_path or "")
+    app = create_app(root_path=args.root_path or "", bind_port=args.port)
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
