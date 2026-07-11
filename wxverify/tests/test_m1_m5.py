@@ -115,7 +115,7 @@ def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
 def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     conn = _init_tmp_db(tmp_path)
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert (
         conn.execute(
             """
@@ -613,7 +613,7 @@ def test_v1_migration_adds_backfill_columns(tmp_path: Path) -> None:
     row = conn.execute("SELECT backfill_status, backfill_through FROM sites").fetchone()
     assert row["backfill_status"] == "pending"
     assert row["backfill_through"] is None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_database_rejects_sqlite_without_returning(

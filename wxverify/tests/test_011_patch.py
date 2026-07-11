@@ -663,11 +663,11 @@ def test_worker_url_secrets_redacted_in_logs(
 def test_idx_pairs_cell_created_on_fresh_db(tmp_path: Path) -> None:
     conn = _init_tmp_db(tmp_path)
     assert _index_exists(conn, "idx_pairs_cell")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
-    """idx_pairs_cell is added to a user_version=2 DB that lacks it; version stays 2."""
+    """idx_pairs_cell is added to a user_version=2 DB that lacks it; S-M1 bumps to 3."""
     # Build a full-migration DB, then drop the index to simulate the old 0.1.0 schema.
     conn = _init_tmp_db(tmp_path)
     assert _index_exists(conn, "idx_pairs_cell")
@@ -681,7 +681,7 @@ def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
 
     assert _index_exists(conn2, "idx_pairs_cell"), "idx_pairs_cell must be re-created"
     version = conn2.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 2, "user_version must stay 2"
+    assert version == 3, "user_version must reach 3 after S-M1 migration"
 
 
 def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(

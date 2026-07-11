@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+- New: wxverify now runs its own adaptive per-station current-observation poller
+  for Weather.com PWS stations, absorbing the upload-cadence tracking and the
+  online / offline / transient / terminal state machine formerly provided by the
+  separate **py-weather** add-on. wxverify is now the sole caller for these
+  stations; py-weather is deprecated (see its README for migration notes).
+- New route: `GET /api/observations/current` — returns the latest stored
+  observation per station in native units, together with per-station poll
+  diagnostics (state, last-seen timestamp, learned cadence). A companion Home
+  Assistant integration can surface these as HA entities using this route.
+- New config options: `min_interval_seconds` (floor for the per-station learned
+  poll interval, default `300`), `max_backoff_seconds` (terminal holding cadence,
+  default `86400`), `request_timeout_seconds` (per-request Weather.com timeout,
+  default `30`), and `weathercom_daily_call_limit` (daily Weather.com API call
+  cap, default `3000`, sized above natural poll volume for typical fleets; the
+  existing budget guard remains the hard backstop).
+- Schema upgraded to v3: adds per-station poll-state and latest-observation
+  tables; migration runs automatically on start with no operator action required.
+- Unchanged: the native hourly-history stream and scoring continue to consume
+  Weather.com's native hourly aggregates; current-observation samples are stored
+  separately and never feed scoring.
+
 ## 0.2.1
 
 - Revised logging levels throughout with a documented four-level policy

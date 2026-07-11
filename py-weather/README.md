@@ -3,6 +3,8 @@
 ![Supports aarch64 Architecture][aarch64-shield]
 ![Supports amd64 Architecture][amd64-shield]
 
+> **Deprecated:** superseded by wxverify 0.3.0's built-in adaptive PWS poller; no longer maintained; existing GHCR images retained.
+
 An adaptive, stdlib-only **poller for Weather.com PWS REST sensors**, packaged as
 a Home Assistant add-on. The Weather.com REST sensors stay in your Home Assistant
 config as the source of truth for the values; Py-Weather becomes their **adaptive

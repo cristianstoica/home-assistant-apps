@@ -195,6 +195,84 @@ async def health_backoffs() -> list[dict[str, object]]:
     return await get_db().read(_read)
 
 
+@router.get("/observations/current")
+async def observations_current(
+    station: int | None = None,
+) -> list[dict[str, object]]:
+    """Latest current-obs snapshot per enabled station (READ, guard-exempt).
+
+    One row per ``stations.enabled = 1`` station, LEFT JOINed to
+    ``station_current_obs`` (the raw display snapshot) and ``station_poll_state``
+    (the current-obs stream's own diagnostics). Two health cases stay distinct:
+    a **cold** station has no ``station_current_obs`` row, so its obs fields are
+    ``null``; a **previously-online-now-offline** station retains its last-good
+    row (non-null obs) with ``health_state="offline"`` — the LEFT JOIN returns
+    the retained row, so null-obs and ``offline`` are separate cases. The
+    diagnostic fields (``health_state``, ``next_poll_at``, ``last_error``) come
+    from ``station_poll_state``, never ``stations.last_error`` (which the hourly
+    stream resets on success). Obs values are the stored native ``units:"m"``
+    form (km/h wind, hPa, mm) — no conversion in the route. Optional
+    ``?station=<id>`` filter; empty registry → ``[]``.
+    """
+
+    def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
+        params: list[object] = []
+        where = "WHERE st.enabled = 1"
+        if station is not None:
+            where += " AND st.id = ?"
+            params.append(station)
+        rows = conn.execute(
+            f"""
+            SELECT st.id AS station_id, st.pws_station_id AS pws_station_id,
+                   sps.health_state AS health_state,
+                   sps.next_poll_at AS next_poll_at,
+                   sps.last_error AS last_error,
+                   sps.error_count AS error_count,
+                   sps.last_poll_at AS last_poll_at,
+                   co.obs_time_utc AS obs_time_utc,
+                   co.temp AS temp, co.humidity AS humidity, co.dewpt AS dewpt,
+                   co.wind_speed AS wind_speed, co.wind_gust AS wind_gust,
+                   co.wind_dir AS wind_dir, co.pressure AS pressure,
+                   co.precip_rate AS precip_rate, co.precip_total AS precip_total,
+                   co.uv AS uv, co.neighborhood AS neighborhood
+            FROM stations st
+            LEFT JOIN station_current_obs co ON co.station_id = st.id
+            LEFT JOIN station_poll_state sps ON sps.station_id = st.id
+            {where}
+            ORDER BY st.id
+            """,
+            params,
+        ).fetchall()
+        return [
+            {
+                "station_id": int(row["station_id"]),
+                "pws_station_id": str(row["pws_station_id"]),
+                "health_state": row["health_state"],
+                "obs_time_utc": row["obs_time_utc"],
+                "temp": row["temp"],
+                "humidity": row["humidity"],
+                "dewpt": row["dewpt"],
+                "wind_speed": row["wind_speed"],
+                "wind_gust": row["wind_gust"],
+                "wind_dir": row["wind_dir"],
+                "pressure": row["pressure"],
+                "precip_rate": row["precip_rate"],
+                "precip_total": row["precip_total"],
+                "uv": row["uv"],
+                "neighborhood": row["neighborhood"],
+                "next_poll_at": row["next_poll_at"],
+                "last_error": row["last_error"],
+                "error_count": (
+                    None if row["error_count"] is None else int(row["error_count"])
+                ),
+                "last_poll_at": row["last_poll_at"],
+            }
+            for row in rows
+        ]
+
+    return await get_db().read(_read)
+
+
 @router.get("/worker/status")
 async def worker_status() -> dict[str, object]:
     def _read(conn: sqlite3.Connection) -> dict[str, object]:

@@ -29,6 +29,14 @@ class RuntimeOptions(BaseModel):
     min_n: int | None = Field(default=None, ge=0, le=100000)
     obs_interval_minutes: int | None = Field(default=None, ge=30, le=1440)
     obs_jitter_minutes: int | None = Field(default=None, ge=0, le=120)
+    min_interval_seconds: int | None = Field(default=None, ge=60, le=1800)
+    max_backoff_seconds: int | None = Field(default=None, ge=60, le=86400)
+    request_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+    # Explicit non-None default: set_source_cap no-ops on daily_call_limit is
+    # None, so a None here would leave the seeded 1000 weathercom cap in force on
+    # any boot path that omits the key — below the ~2368/day natural total,
+    # deferring both weather.com streams (the LD-M8 breach this option prevents).
+    weathercom_daily_call_limit: int = Field(default=3000, ge=1, le=20000)
     monitor_pipeline: bool = True
     monitor_budget: bool = True
     monitor_db: bool = True
@@ -73,6 +81,11 @@ def _from_env() -> RuntimeConfig:
             min_n=_env_int("WXV_MIN_N"),
             obs_interval_minutes=_env_int("WXV_OBS_INTERVAL_MINUTES"),
             obs_jitter_minutes=_env_int("WXV_OBS_JITTER_MINUTES"),
+            min_interval_seconds=_env_int("WXV_MIN_INTERVAL_SECONDS"),
+            max_backoff_seconds=_env_int("WXV_MAX_BACKOFF_SECONDS"),
+            request_timeout_seconds=_env_int("WXV_REQUEST_TIMEOUT_SECONDS"),
+            weathercom_daily_call_limit=_env_int("WXV_WEATHERCOM_DAILY_CALL_LIMIT")
+            or 3000,
             monitor_pipeline=_env_bool("WXV_MONITOR_PIPELINE") is not False,
             monitor_budget=_env_bool("WXV_MONITOR_BUDGET") is not False,
             monitor_db=_env_bool("WXV_MONITOR_DB") is not False,
@@ -102,6 +115,11 @@ def _from_options_json(path: Path) -> RuntimeConfig:
             min_n=options.get("min_n"),
             obs_interval_minutes=options.get("obs_interval_minutes"),
             obs_jitter_minutes=options.get("obs_jitter_minutes"),
+            min_interval_seconds=options.get("min_interval_seconds"),
+            max_backoff_seconds=options.get("max_backoff_seconds"),
+            request_timeout_seconds=options.get("request_timeout_seconds"),
+            weathercom_daily_call_limit=options.get("weathercom_daily_call_limit")
+            or 3000,
             monitor_pipeline=options.get("monitor_pipeline", True),
             monitor_budget=options.get("monitor_budget", True),
             monitor_db=options.get("monitor_db", True),

@@ -23,6 +23,14 @@ configuration:
     name: Observation interval
   obs_jitter_minutes:
     name: Observation jitter
+  min_interval_seconds:
+    name: Minimum poll interval (seconds)
+  max_backoff_seconds:
+    name: Maximum backoff (seconds)
+  request_timeout_seconds:
+    name: Request timeout (seconds)
+  weathercom_daily_call_limit:
+    name: Weather.com daily call limit
   monitor_pipeline:
     name: "Monitor: pipeline checks"
   monitor_budget:
