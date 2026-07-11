@@ -17,6 +17,7 @@ from starlette.datastructures import MutableHeaders
 
 from wxverify import config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
+from wxverify.api.discovery import publish_discovery
 from wxverify.api.errors import register_error_handlers
 from wxverify.api.guard import MutationGuard
 from wxverify.api.ingress import IngressPathMiddleware
@@ -48,7 +49,10 @@ def _default_stop_process() -> None:
 
 
 def create_app(
-    *, root_path: str = "", _stop_process: StopProcess = _default_stop_process
+    *,
+    root_path: str = "",
+    bind_port: int = 8099,
+    _stop_process: StopProcess = _default_stop_process,
 ) -> FastAPI:
     config.ingress_root_path = root_path or ""
     app = FastAPI(
@@ -57,6 +61,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.stop_process = _stop_process
+    app.state.bind_port = bind_port
     app.add_middleware(MutationGuard, standalone_origin=config.standalone_origin)
     app.add_middleware(IngressPathMiddleware)
     register_error_handlers(app)
@@ -111,6 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     worker.add_done_callback(
         lambda task: _stop_on_worker_done(task, app.state.stop_process)
     )
+    await publish_discovery(app.state.bind_port)
     try:
         yield
     finally:

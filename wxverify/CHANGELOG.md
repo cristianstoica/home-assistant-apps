@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.1
+
+- Fix: request decimal precision (`numericPrecision=decimal`) on current-observation
+  and hourly/7-day observation fetches from the Weather.com PWS API — previously
+  temperature, dew point, and wind values were integer-rounded (history-range fetch
+  already had this parameter).
+- Add: best-effort Supervisor discovery publish at startup — the add-on posts its
+  host and port to the HA Supervisor discovery endpoint so a companion integration
+  can locate it without manual configuration. Fail-open: any HTTP error, unexpected
+  status, or absent `SUPERVISOR_TOKEN` (standalone/dev) is logged and startup
+  continues normally.
+
 ## 0.3.0
 
 - New: wxverify now runs its own adaptive per-station current-observation poller
