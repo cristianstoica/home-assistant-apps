@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.2
+
+- Add `backup: cold` — the Supervisor now stops the add-on while taking a
+  backup, so the WAL SQLite database is snapshotted consistently (a hot
+  backup could capture a mid-commit db/-wal pair that fails at restore).
+- Fix: `python -m wxverify --version` now reports the add-on version (was
+  frozen at 0.1.0). The package, project, and add-on versions are synced
+  and a regression test pins them together.
+- Docs: README Monitoring section now documents the actual supervision
+  model — the Watchdog toggle gates both crash-restart and Docker-HEALTHCHECK-
+  unhealthy restart; turning it off disables all Supervisor restarts
+  including crash recovery.
+
 ## 0.3.1
 
 - Fix: request decimal precision (`numericPrecision=decimal`) on current-observation

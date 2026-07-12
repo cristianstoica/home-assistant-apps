@@ -152,22 +152,25 @@ jobs:
       - name: Install uv
         run: pip install uv
 
+      - name: Check lockfile is fresh
+        run: uv lock --check
+
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
 
       - name: ruff check
-        run: uv run ruff check
+        run: uv run --locked ruff check
 
       - name: ruff format --check
-        run: uv run ruff format --check
+        run: uv run --locked ruff format --check
 
       - name: pyright
-        run: uv run pyright
+        run: uv run --locked pyright
 
       - name: pytest
-        run: uv run pytest
+        run: uv run --locked pytest
         env:
           WXV_WEATHERCOM_KEY: "ci-placeholder"
 
       - name: Import sanity check
-        run: uv run python -m wxverify --help
+        run: uv run --locked python -m wxverify --help

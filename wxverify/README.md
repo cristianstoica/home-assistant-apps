@@ -392,10 +392,21 @@ leaking credentials.
 
 ## Monitoring
 
-As a Home Assistant add-on, wxverify's **process supervision** is the Docker
-`HEALTHCHECK` (in `Dockerfile`) plus the Supervisor's default handling of an
-unhealthy container: if the container stops passing its healthcheck, the
-Supervisor restarts it. There is no `watchdog:` entry in `config.yaml`.
+As a Home Assistant add-on, wxverify's **process supervision** is the
+Supervisor's Watchdog, gated by the add-on's **Watchdog toggle** in the HA UI.
+With the toggle on, the Supervisor restarts the add-on on either of two
+signals: a clean crash (the worker exits and the container halts), or the
+Docker `HEALTHCHECK` (in `Dockerfile`, probing `/api/sites`) reporting the
+container unhealthy — a deliberately lax envelope (60 s interval × 10 retries,
+so ~10-11 minutes to trip). With the toggle off, neither triggers a restart: a
+crashed worker stays halted and data collection stops silently.
+
+The generous healthcheck envelope is deliberate: a long scoring transaction or
+boot-time catchup can starve the event loop and miss a probe or two, and a
+tighter envelope would restart a healthy add-on mid-run — a false restart with
+no actual hang. The cost is the ~10-11 minute detection window for an app that
+is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
+only — it disables all Supervisor restarts, including crash recovery.
 
 **Proactive alerting** is HA-native. The add-on exposes a read-only verdict
 endpoint, `GET /api/health/monitor`, which runs pipeline (group 1), budget
@@ -410,11 +421,16 @@ group runs no queries and its conditions report `skipped`.
 Home Assistant owns the poll loop and delivery: a **REST sensor** polls
 `/api/health/monitor` on the internal add-on network, and two **automations**
 send a persistent notification plus a mobile push when the verdict degrades and
-clear the notification on recovery. If the add-on is down entirely, the REST
-sensor goes `unavailable` — that is the "add-on not responding" signal (it also
-covers startup/migration failures that abort before any request is served). The
-runtime health routes `/api/health/*` and `/api/worker/status` remain available
-for ad-hoc inspection.
+clear the notification on recovery. If the add-on is down, the REST sensor goes
+`unavailable` — that is the "add-on not responding" signal. It covers a crash
+with the Watchdog toggle off (the add-on stays halted), startup/migration
+failures that abort before any request is served, and the window while the
+Supervisor's Watchdog restarts the add-on after a trip. A brief `unavailable`
+that clears on its own is consistent with a Watchdog-triggered restart —
+confirm in the Supervisor log, which shows
+a `Watchdog found app Weather Verify ...` line.
+The runtime health routes `/api/health/*` and
+`/api/worker/status` remain available for ad-hoc inspection.
 
 ### Home Assistant package (REST sensor + automations)
 
