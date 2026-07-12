@@ -9,7 +9,6 @@ arch:
 startup: services
 init: false
 backup: cold
-watchdog: "http://[HOST]:[PORT:8099]/api/sites"
 image: "ghcr.io/cristianstoica/wxverify"
 ingress: true
 panel_icon: mdi:weather-partly-cloudy

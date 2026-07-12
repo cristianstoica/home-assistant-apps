@@ -394,29 +394,19 @@ leaking credentials.
 
 As a Home Assistant add-on, wxverify's **process supervision** is the
 Supervisor's Watchdog, gated by the add-on's **Watchdog toggle** in the HA UI.
-With the toggle on, the Supervisor restarts the add-on on any of three
-signals: a clean crash (the worker exits and the container halts), the Docker
-`HEALTHCHECK` (in `Dockerfile`) reporting the container unhealthy — a
-deliberately lax envelope (60 s interval × 10 retries, so ~10-11 minutes to
-trip), and the `watchdog:` URL in `config.yaml` (`/api/sites`, the same
-endpoint the healthcheck probes) — a tighter application-level probe (~2 ×
-120 s polls, so ~2-4 minutes) that also catches an app that is semantically
-wedged but still answering the container healthcheck. With the toggle off,
-none of these trigger a restart: a crashed worker stays halted and data
-collection stops silently.
+With the toggle on, the Supervisor restarts the add-on on either of two
+signals: a clean crash (the worker exits and the container halts), or the
+Docker `HEALTHCHECK` (in `Dockerfile`, probing `/api/sites`) reporting the
+container unhealthy — a deliberately lax envelope (60 s interval × 10 retries,
+so ~10-11 minutes to trip). With the toggle off, neither triggers a restart: a
+crashed worker stays halted and data collection stops silently.
 
-The tight probe carries a known **false-restart risk**: a long scoring
-transaction or boot-time catchup can starve the event loop (the reason the
-Docker healthcheck got its generous envelope), and the Supervisor's probe
-envelope — 10 s HTTP timeout, 120 s poll, two misses (not necessarily
-consecutive) before restarting — is not configurable. A
-`Watchdog missing application response` warning in the Supervisor log that
-does not escalate to a restart is the yellow signal. If the add-on restarts
-during a normal boot-catchup or scoring run — a Watchdog restart with no
-actual hang — the fix is a patch release that drops the `watchdog:` key while
-leaving the Watchdog toggle on: that removes only the tight probe and keeps
-crash- and unhealthy-restart intact. Turning the toggle off is an emergency
-stopgap only — it also disables crash-restart entirely.
+The generous healthcheck envelope is deliberate: a long scoring transaction or
+boot-time catchup can starve the event loop and miss a probe or two, and a
+tighter envelope would restart a healthy add-on mid-run — a false restart with
+no actual hang. The cost is the ~10-11 minute detection window for an app that
+is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
+only — it disables all Supervisor restarts, including crash recovery.
 
 **Proactive alerting** is HA-native. The add-on exposes a read-only verdict
 endpoint, `GET /api/health/monitor`, which runs pipeline (group 1), budget
@@ -438,9 +428,8 @@ failures that abort before any request is served, and the window while the
 Supervisor's Watchdog restarts the add-on after a trip. A brief `unavailable`
 that clears on its own is consistent with a Watchdog-triggered restart —
 confirm in the Supervisor log, which shows
-`Watchdog found a problem with wxverify application!` (application-probe path)
-or `Watchdog found app wxverify is unhealthy, restarting...`
-(crash/unhealthy-container path). The runtime health routes `/api/health/*` and
+a `Watchdog found app Weather Verify ...` line.
+The runtime health routes `/api/health/*` and
 `/api/worker/status` remain available for ad-hoc inspection.
 
 ### Home Assistant package (REST sensor + automations)
