@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.2
+
+- Add `backup: cold` — the Supervisor now stops the add-on while taking a
+  backup, so the WAL SQLite database is snapshotted consistently (a hot
+  backup could capture a mid-commit db/-wal pair that fails at restore).
+- Add a Supervisor `watchdog` URL (`/api/sites`) that tightens hang
+  detection from ~10-11 min (the lax Docker healthcheck envelope) to
+  ~2-4 min and also catches a semantically wedged app that still answers
+  the container healthcheck. This requires the add-on's Watchdog toggle
+  to be enabled — the same toggle that already gates Supervisor's
+  crash- and unhealthy-restart. Note: a long scoring run that starves the
+  event loop can trip a false restart. If the add-on restarts during a
+  normal boot-catchup or scoring run — a Watchdog restart with no actual
+  hang — the fix is a patch release that drops the `watchdog:` key while
+  leaving the Watchdog toggle ON (that removes only the tight probe and
+  keeps crash/unhealthy restart). Turning the toggle off is an emergency
+  stopgap only: it also disables Supervisor crash-restart, so a crashed
+  worker would stay halted and data collection would stop silently until
+  the patch lands.
+- Fix: `python -m wxverify --version` now reports the add-on version (was
+  frozen at 0.1.0). The package, project, and add-on versions are synced
+  and a regression test pins them together.
+
 ## 0.3.1
 
 - Fix: request decimal precision (`numericPrecision=decimal`) on current-observation
