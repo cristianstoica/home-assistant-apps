@@ -1,18 +1,21 @@
 <section class="panel">
   <h2>Composite</h2>
+  <p class="panel-hint">An overall ranking that blends skill and win rate into one score.</p>
   {% if composite %}
-    <table>
-      <thead><tr><th>Feed</th><th>Score</th><th>Rank</th></tr></thead>
-      <tbody>
-        {% for row in composite %}
-          <tr>
-            <td>{{ row.feed_id }}</td>
-            <td>{{ "%.3f"|format(row.score) if row.score is not none else "n/a" }}</td>
-            <td>{{ loop.index }}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Feed</th><th>Score</th><th>Rank</th></tr></thead>
+        <tbody>
+          {% for row in composite %}
+            <tr>
+              <td>{{ feed_label(row.source, row.model) }}</td>
+              <td>{{ "%.3f"|format(row.score) if row.score is not none else "n/a" }}</td>
+              <td>{{ loop.index }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No composite rows.</p>
   {% endif %}

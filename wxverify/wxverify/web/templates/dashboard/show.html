@@ -5,7 +5,7 @@
   <div>
     <h1>Dashboard</h1>
     {% if site %}
-      <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - {{ variable }}</p>
+      <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - {{ selected_variable_label }}</p>
     {% endif %}
   </div>
   {% if sites %}
@@ -25,23 +25,24 @@
     </div>
     <div class="segmented">
       {% for var in ["temperature", "precip", "wind"] %}
-        <a class="{{ 'active' if variable == var else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ var ~ '&window=' ~ window ~ '&lead=' ~ (lead|urlencode)) }}">{{ var|title }}</a>
+        <a class="{{ 'active' if variable == var else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ var ~ '&window=' ~ window ~ '&lead=' ~ (lead|urlencode)) }}">{{ variable_label_for(var) }}</a>
       {% endfor %}
     </div>
     <div class="segmented" aria-label="Lead time">
-      {% for day in range(0, 8) %}
-        {% set lead_label = "D+" ~ day %}
-        <a class="{{ 'active' if lead == lead_label else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (lead_label|urlencode)) }}">{{ lead_label }}</a>
+      {% for opt in lead_options %}
+        <a class="{{ 'active' if lead == opt.value else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (opt.value|urlencode)) }}">{{ opt.word }} <small class="lead-code">{{ opt.value }}</small></a>
       {% endfor %}
     </div>
   </section>
 
   <section class="dashboard-grid">
+    {% include "dashboard/_verdict.html" %}
     {% include "dashboard/_leaderboard.html" %}
     {% include "dashboard/_skillcurve.html" %}
     {% include "dashboard/_winrate.html" %}
     {% include "dashboard/_composite.html" %}
   </section>
+  {% include "dashboard/_help.html" %}
 {% else %}
   <p class="empty">No sites configured.</p>
 {% endif %}

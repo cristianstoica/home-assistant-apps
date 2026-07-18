@@ -73,6 +73,77 @@ class LeaderboardItem:
 
 
 @dataclass(frozen=True)
+class Verdict:
+    state: str  # "ok" | "tie" | "insufficient" | "empty"
+    winner: LeaderboardItem | None
+    runner_up: LeaderboardItem | None
+    margin: float | None
+
+
+VARIABLE_LABELS: dict[str, str] = {
+    "temperature": "Temperature",
+    "precip": "Precipitation",
+    "wind": "Wind",
+}
+
+LEAD_OPTIONS: list[dict[str, str]] = [
+    {"value": "D+0", "word": "Today"},
+    {"value": "D+1", "word": "Tomorrow"},
+    *[{"value": f"D+{d}", "word": f"+{d} days"} for d in range(2, 8)],
+]
+
+
+def variable_label_for(variable: str) -> str:
+    """Return the display label for a variable, humanizing unknown values.
+
+    Total by construction: the dashboard route accepts ``variable`` as an
+    unrestricted string, so an unknown value must resolve to a humanized
+    fallback (``"foo"`` -> ``"Foo"``) rather than raising a ``KeyError`` and
+    regressing today's graceful 200 to a 500.
+    """
+    return VARIABLE_LABELS.get(variable, variable.replace("_", " ").title())
+
+
+def _skill_or_zero(value: float | None) -> float:
+    return value if value is not None else 0.0
+
+
+def compute_verdict(
+    items: list[LeaderboardItem], *, tie_epsilon: float = 0.01
+) -> Verdict:
+    """Derive the "best feed" verdict from an already-built leaderboard.
+
+    Candidates are the eligible rows — the single predicate shared with the
+    curve and leaderboard sort: ``confident`` (``n >= min_n`` and
+    ``skill_score`` non-None) — sorted skill-descending. States: ``empty``
+    (no rows), ``insufficient`` (rows but none eligible), ``tie`` (top two
+    within ``tie_epsilon``), ``ok`` otherwise. A single eligible candidate is
+    ``ok`` with ``runner_up=None``.
+    """
+    if not items:
+        return Verdict(state="empty", winner=None, runner_up=None, margin=None)
+    candidates = sorted(
+        (item for item in items if item.confident),
+        key=lambda item: (-_skill_or_zero(item.skill_score), item.label),
+    )
+    if not candidates:
+        return Verdict(state="insufficient", winner=None, runner_up=None, margin=None)
+    winner = candidates[0]
+    if len(candidates) == 1:
+        return Verdict(state="ok", winner=winner, runner_up=None, margin=None)
+    runner_up = candidates[1]
+    winner_skill = winner.skill_score
+    runner_skill = runner_up.skill_score
+    # confident guarantees non-None skill; the guard keeps pyright honest and
+    # degrades safely to a single-winner ok rather than raising.
+    if winner_skill is None or runner_skill is None:
+        return Verdict(state="ok", winner=winner, runner_up=None, margin=None)
+    margin = winner_skill - runner_skill
+    state = "tie" if margin <= tie_epsilon else "ok"
+    return Verdict(state=state, winner=winner, runner_up=runner_up, margin=margin)
+
+
+@dataclass(frozen=True)
 class FeedHealthRow:
     site_id: int
     site_name: str
@@ -165,15 +236,20 @@ def load_dashboard(
         else (sites[0] if sites else None)
     )
     rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     if site is None:
         return {
             "sites": sites,
             "site": None,
             "variable": variable,
+            "selected_variable_label": variable_label_for(variable),
             "window": window,
             "lead": lead,
+            "lead_options": LEAD_OPTIONS,
             "rolling_days": rolling_days,
+            "min_n": min_n,
             "leaderboard": [],
+            "verdict": compute_verdict([]),
             "winrate": [],
             "composite": [],
         }
@@ -199,14 +275,31 @@ def load_dashboard(
             window=window,
         )
     ]
+    # Presentation-layer sort: eligible rows first (skill DESC, then label),
+    # withheld rows after (label order). Never interleave by raw skill across
+    # the eligibility boundary — a withheld row with a high numeric skill still
+    # sorts below every eligible row. The scoring-query ORDER BY is untouched
+    # (it is load-bearing on the cache-equivalence path).
+    leaderboard.sort(
+        key=lambda item: (
+            0 if item.confident else 1,
+            -_skill_or_zero(item.skill_score) if item.confident else 0.0,
+            item.label,
+        )
+    )
+    verdict = compute_verdict(leaderboard)
     return {
         "sites": sites,
         "site": site,
         "variable": variable,
+        "selected_variable_label": variable_label_for(variable),
         "window": window,
         "lead": lead,
+        "lead_options": LEAD_OPTIONS,
         "rolling_days": rolling_days,
+        "min_n": min_n,
         "leaderboard": leaderboard,
+        "verdict": verdict,
         "winrate": winrate_query(
             conn,
             site_id=site.id,

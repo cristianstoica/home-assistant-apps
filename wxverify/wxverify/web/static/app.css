@@ -1,17 +1,65 @@
 :root {
-  color-scheme: light;
-  --bg: #f7f7f4;
+  color-scheme: light dark;
+  --bg: #fafafa;
   --surface: #ffffff;
-  --text: #17202a;
-  --muted: #5f6b76;
-  --line: #d7dce0;
-  --blue: #2563eb;
-  --teal: #0f766e;
-  --green: #15803d;
-  --amber: #b45309;
-  --red: #b91c1c;
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --surface-2: #f2f4f5;
+  --line: #e0e0e0;
+  --text: #212121;
+  --muted: #6b6b6b;
+  --accent: #0277bd;
+  --accent-soft: rgba(2, 119, 189, 0.1);
+  --success: #2e7d32;
+  --success-soft: rgba(46, 125, 50, 0.12);
+  --success-on-soft: #1b5e20;
+  --warn: #b26a00;
+  --warn-soft: rgba(255, 152, 0, 0.14);
+  --warn-on-soft: #8a5200;
+  --danger: #c62828;
+  --danger-soft: rgba(198, 40, 40, 0.1);
+  --topbar-bg: rgba(250, 250, 250, 0.92);
+  --shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --chart-1: #0288d1;
+  --chart-2: #d81b60;
+  --chart-3: #43a047;
+  --chart-4: #f4511e;
+  --chart-5: #8e24aa;
+  --chart-6: #00897b;
+  --chart-axis: #6b6b6b;
+  --chart-grid: #e0e0e0;
+  font-family: Roboto, "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111111;
+    --surface: #1c1c1c;
+    --surface-2: #242424;
+    --line: #2c2c2c;
+    --text: #e1e1e1;
+    --muted: #9b9b9b;
+    --accent: #03a9f4;
+    --accent-soft: rgba(3, 169, 244, 0.16);
+    --success: #4caf50;
+    --success-soft: rgba(76, 175, 80, 0.16);
+    --success-on-soft: #4caf50;
+    --warn: #ffa726;
+    --warn-soft: rgba(255, 152, 0, 0.16);
+    --warn-on-soft: #ffa726;
+    --danger: #ef5350;
+    --danger-soft: rgba(239, 83, 80, 0.16);
+    --topbar-bg: rgba(17, 17, 17, 0.92);
+    --shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+    --chart-1: #4fc3f7;
+    --chart-2: #f06292;
+    --chart-3: #66bb6a;
+    --chart-4: #ff8a65;
+    --chart-5: #ba68c8;
+    --chart-6: #4db6ac;
+    --chart-axis: #9b9b9b;
+    --chart-grid: #2c2c2c;
+  }
 }
 
 * {
@@ -40,7 +88,7 @@ button,
 .segmented a {
   min-height: 36px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--text);
   padding: 7px 11px;
@@ -51,7 +99,7 @@ button,
 button:hover,
 .pill:hover,
 .segmented a:hover {
-  border-color: var(--blue);
+  border-color: var(--accent);
 }
 
 button:disabled {
@@ -60,8 +108,8 @@ button:disabled {
 }
 
 button.on {
-  border-color: var(--green);
-  color: var(--green);
+  border-color: var(--success);
+  color: var(--success);
 }
 
 button.off,
@@ -70,7 +118,7 @@ button.off,
 }
 
 .danger {
-  color: var(--red);
+  color: var(--danger);
 }
 
 .topbar {
@@ -84,7 +132,7 @@ button.off,
   min-height: 58px;
   padding: 0 24px;
   border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--topbar-bg);
   backdrop-filter: blur(12px);
 }
 
@@ -103,6 +151,20 @@ button.off,
   padding: 8px 10px;
   color: var(--muted);
   text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+
+.tabs a.active {
+  color: var(--accent);
+  font-weight: 700;
+  border-bottom-color: var(--accent);
+}
+
+.panel-hint {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 main {
@@ -165,7 +227,7 @@ dd {
 .site-card,
 .panel {
   border: 1px solid var(--line);
-  border-radius: 8px;
+  border-radius: var(--radius);
   background: var(--surface);
   box-shadow: var(--shadow);
 }
@@ -201,10 +263,10 @@ input {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   padding: 7px 9px;
   color: var(--text);
-  background: #fff;
+  background: var(--surface);
 }
 
 .site-grid,
@@ -259,20 +321,20 @@ dd {
   min-height: 26px;
   border-radius: 999px;
   padding: 3px 9px;
-  background: #eef2f7;
+  background: var(--surface-2);
   color: var(--muted);
   font-size: 12px;
   font-weight: 700;
 }
 
 .badge.ok {
-  background: #e8f7ef;
-  color: var(--green);
+  background: var(--success-soft);
+  color: var(--success-on-soft);
 }
 
 .badge.warn {
-  background: #fff4e6;
-  color: var(--amber);
+  background: var(--warn-soft);
+  color: var(--warn-on-soft);
 }
 
 .badge.muted {
@@ -292,7 +354,7 @@ dd {
 
 .toggle-row {
   min-height: 48px;
-  border-bottom: 1px solid #edf0f2;
+  border-bottom: 1px solid var(--line);
   padding: 8px 0;
 }
 
@@ -319,7 +381,7 @@ table {
 
 th,
 td {
-  border-bottom: 1px solid #edf0f2;
+  border-bottom: 1px solid var(--line);
   padding: 9px 8px;
   text-align: left;
   vertical-align: top;
@@ -350,8 +412,8 @@ th {
 
 .pill.active,
 .segmented a.active {
-  border-color: var(--blue);
-  color: var(--blue);
+  border-color: var(--accent);
+  color: var(--accent);
   font-weight: 700;
 }
 
@@ -365,6 +427,52 @@ th {
 
 .panel.wide {
   grid-column: 1 / -1;
+}
+
+.verdict {
+  border-left: 4px solid var(--accent);
+}
+
+.verdict-head {
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.verdict-caveat {
+  margin-top: 8px;
+  color: var(--warn-on-soft);
+  font-size: 13px;
+}
+
+tr.is-top td {
+  background: var(--accent-soft);
+}
+
+tr.is-top td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.lead-code {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+details.help > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 15px;
+}
+
+details.help[open] > summary {
+  margin-bottom: 10px;
+}
+
+details.help p {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 .chart {
@@ -386,10 +494,10 @@ th {
 .notice {
   width: min(760px, calc(100vw - 32px));
   margin: 14px auto 0;
-  border: 1px solid #fecaca;
-  border-radius: 8px;
-  background: #fff1f2;
-  color: var(--red);
+  border: 1px solid var(--danger-soft);
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+  color: var(--danger);
   padding: 10px 12px;
 }
 
@@ -447,4 +555,76 @@ meter {
   meter {
     width: 100%;
   }
+}
+
+@media (max-width: 700px) {
+  /* Prune low-priority columns so the payload columns stay unscrolled. */
+  .col-extra {
+    display: none;
+  }
+
+  /* Toolbar segmented groups and topbar tabs scroll rather than wrap. */
+  .tabs,
+  .segmented {
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Card-ify the widest Ops table: stacked label/value rows on phones. */
+  table.cardify thead {
+    display: none;
+  }
+
+  table.cardify,
+  table.cardify tbody,
+  table.cardify tr,
+  table.cardify td {
+    display: block;
+    width: 100%;
+  }
+
+  table.cardify tr {
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    margin-bottom: 10px;
+    padding: 4px 2px;
+  }
+
+  table.cardify td {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: none;
+  }
+
+  table.cardify td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+}
+
+/* uPlot palette overrides — vendored uplot.min.css assumes a light theme. */
+.u-legend {
+  color: var(--text);
+}
+
+.u-legend .u-value {
+  color: var(--muted);
+}
+
+/*
+ * The crosshair cursor is DOM (absolutely-positioned), not canvas — it has no
+ * uPlot JS color option, so it is themed here. Vendored default is #607D8B.
+ */
+.u-cursor-x {
+  border-right-color: var(--chart-axis);
+}
+
+.u-cursor-y {
+  border-bottom-color: var(--chart-axis);
 }

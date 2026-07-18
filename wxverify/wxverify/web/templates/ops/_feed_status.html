@@ -1,21 +1,24 @@
 <section class="panel wide">
   <h2>Feed Status</h2>
+  <p class="panel-hint">Per-site health of every subscribed feed: whether it last ran, and any error.</p>
   {% if feed_status %}
-    <table>
-      <thead><tr><th>Site</th><th>Feed</th><th>Subscription</th><th>Status</th><th>Last run</th><th>Error</th></tr></thead>
-      <tbody>
-        {% for row in feed_status %}
-          <tr>
-            <td>{{ row.site_name }}</td>
-            <td>{{ row.label }}</td>
-            <td>{{ "subscribed" if row.subscribed else "not subscribed" }}</td>
-            <td>{{ row.status }}</td>
-            <td>{{ row.last_run_at or "n/a" }}</td>
-            <td>{{ row.disabled_reason or row.last_error or "n/a" }}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table class="cardify">
+        <thead><tr><th>Site</th><th>Feed</th><th>Subscription</th><th>Status</th><th>Last run</th><th>Error</th></tr></thead>
+        <tbody>
+          {% for row in feed_status %}
+            <tr>
+              <td data-label="Site">{{ row.site_name }}</td>
+              <td data-label="Feed">{{ row.label }}</td>
+              <td data-label="Subscription">{{ "subscribed" if row.subscribed else "not subscribed" }}</td>
+              <td data-label="Status">{{ row.status }}</td>
+              <td data-label="Last run">{{ row.last_run_at or "n/a" }}</td>
+              <td data-label="Error">{{ row.disabled_reason or row.last_error or "n/a" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No feed status rows.</p>
   {% endif %}

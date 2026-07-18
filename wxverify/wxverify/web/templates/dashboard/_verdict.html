@@ -1,0 +1,24 @@
+<section class="panel wide verdict verdict-{{ verdict.state }}">
+  {% set lead_word = (lead_options | selectattr("value", "equalto", lead) | map(attribute="word") | first) or lead %}
+  {% if verdict.state == "ok" %}
+    <p class="verdict-head">
+      Best {{ selected_variable_label }} forecast for {{ lead_word }} at {{ site.name }}:
+      <strong>{{ verdict.winner.label }}</strong>
+    </p>
+    {% if verdict.runner_up is not none %}
+      <p class="panel-hint">Runner-up: {{ verdict.runner_up.label }} (skill {{ (verdict.winner.skill_score * 100) | round | int }} vs {{ (verdict.runner_up.skill_score * 100) | round | int }})</p>
+    {% endif %}
+    <p class="panel-hint">Based on {{ verdict.winner.n }} verified forecasts.</p>
+  {% elif verdict.state == "tie" %}
+    <p class="verdict-head">Too close to call: {{ verdict.winner.label }} and {{ verdict.runner_up.label }} are within a hair of each other.</p>
+  {% elif verdict.state == "insufficient" %}
+    <p class="verdict-head">No feed has a rankable skill score yet — a feed needs enough verified pairs <em>and</em> a computable skill score before it can be ranked.</p>
+  {% else %}
+    <p class="verdict-head">No scored data yet for this selection.</p>
+  {% endif %}
+  {% if verdict.winner is not none and verdict.winner.skill_score is not none and verdict.winner.skill_score <= 0 %}
+    <p class="verdict-caveat">
+      {% if variable == "precip" %}Note: no feed currently beats chance at predicting rain days.{% else %}Note: no feed currently beats a naive 'same as yesterday' forecast.{% endif %}
+    </p>
+  {% endif %}
+</section>

@@ -1,20 +1,23 @@
 <section class="panel wide">
   <h2>Station Trust</h2>
+  <p class="panel-hint">How far each station's readings drift from the site consensus, largest first.</p>
   {% if station_trust %}
-    <table>
-      <thead><tr><th>Site</th><th>Station</th><th>Variable</th><th>n</th><th>Mean delta</th></tr></thead>
-      <tbody>
-        {% for row in station_trust %}
-          <tr>
-            <td>{{ row.site_name }}</td>
-            <td>{{ row.station }}</td>
-            <td>{{ row.variable }}</td>
-            <td>{{ row.n }}</td>
-            <td>{{ "%.2f"|format(row.mean_delta) }}</td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Site</th><th>Station</th><th>Variable</th><th class="col-extra">n</th><th>Mean delta</th></tr></thead>
+        <tbody>
+          {% for row in station_trust %}
+            <tr>
+              <td>{{ row.site_name }}</td>
+              <td>{{ row.station }}</td>
+              <td>{{ variable_label_for(row.variable) }}</td>
+              <td class="col-extra">{{ row.n }}</td>
+              <td>{{ "%.2f"|format(row.mean_delta) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No station diagnostics yet.</p>
   {% endif %}

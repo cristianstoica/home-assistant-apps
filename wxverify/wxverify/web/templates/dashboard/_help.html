@@ -1,0 +1,9 @@
+<details class="panel wide help">
+  <summary>How scoring works</summary>
+  <p><strong>Skill</strong> measures how much better a feed does than a simple baseline. For temperature and wind the baseline is persistence — "tomorrow will be like today". A skill of 0 means the feed is no better than that baseline; higher is better, and a negative skill means it does worse.</p>
+  <p><strong>Precipitation</strong> is scored differently: instead of persistence, its skill compares the feed against chance at calling rain vs. dry days (the Equitable Threat Score). A skill of 0 there means no better than chance.</p>
+  <p><strong>Confidence.</strong> A feed is only ranked once it has both enough verified forecasts (at least the minimum sample count) and a skill score that can actually be computed. Meeting the sample count alone is not enough — some samples can't produce a comparable skill (for example, when there is nothing to compare against), and those feeds are withheld rather than ranked.</p>
+  <p><strong>Win rate</strong> is a simpler, head-to-head view: of the days every feed covered, how often was this feed the closest to what was observed.</p>
+  <p><strong>Composite</strong> blends skill across variables into a single overall ranking, so you can compare feeds at a glance.</p>
+  <p><strong>Window.</strong> "Last N days" scores only recent forecasts, so it reflects how a feed is doing now; "All time" uses every verified forecast on record.</p>
+</details>

@@ -4,6 +4,7 @@
 <section class="page-heading">
   <div>
     <h1>Overlay</h1>
+    <p>Compare a feed's forecast against what was actually observed, hour by hour.</p>
     {% if site %}
       <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - forecast vs observed</p>
     {% endif %}
@@ -26,6 +27,7 @@
 
   <section class="panel wide">
     <h2>Forecast Overlay</h2>
+    <p class="panel-hint">Two lines on one chart: what the feed predicted and what was observed.</p>
     <div
       class="chart tall"
       data-chart="overlay"
