@@ -1,6 +1,7 @@
 <section class="panel" id="backfill-panel">
   {% set backfill_rows = rows if rows is defined else backfill %}
   <h2>Backfill Progress</h2>
+  <p class="panel-hint">How far each site's history has been filled in, and controls to fetch more.</p>
   <div class="button-row">
     <button
       type="button"
@@ -11,27 +12,29 @@
       hx-swap="outerHTML">Catch up</button>
   </div>
   {% if backfill_rows %}
-    <table>
-      <thead><tr><th>Site</th><th>Status</th><th>Through</th><th></th></tr></thead>
-      <tbody>
-        {% for row in backfill_rows %}
-          <tr>
-            <td>{{ row.site_name }}</td>
-            <td>{{ row.status or "not started" }}</td>
-            <td>{{ row.through or "n/a" }}</td>
-            <td>
-              <button
-                type="button"
-                hx-post="{{ url('/api/sites/' ~ row.site_id ~ '/backfill') }}"
-                hx-ext="json-enc"
-                hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
-                hx-target="#backfill-panel"
-                hx-swap="outerHTML">Backfill</button>
-            </td>
-          </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Site</th><th>Status</th><th>Through</th><th></th></tr></thead>
+        <tbody>
+          {% for row in backfill_rows %}
+            <tr>
+              <td>{{ row.site_name }}</td>
+              <td>{{ row.status or "not started" }}</td>
+              <td>{{ row.through or "n/a" }}</td>
+              <td>
+                <button
+                  type="button"
+                  hx-post="{{ url('/api/sites/' ~ row.site_id ~ '/backfill') }}"
+                  hx-ext="json-enc"
+                  hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                  hx-target="#backfill-panel"
+                  hx-swap="outerHTML">Backfill</button>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No sites configured.</p>
   {% endif %}

@@ -1,30 +1,48 @@
 <section class="panel">
   <h2>Leaderboard</h2>
+  <p class="panel-hint">Which feed is most accurate for this selection. Ranked feeds have enough data to compare; withheld ones don't yet.</p>
   {% if leaderboard %}
-    <table>
-      <thead>
-        <tr><th>Feed</th><th>n</th><th>Skill</th><th>MAE</th><th>RMSE</th><th>Confidence</th></tr>
-      </thead>
-      <tbody>
-        {% for row in leaderboard %}
+    {% if verdict.state == "ok" and verdict.winner is not none %}
+      {% set top_ids = [verdict.winner.feed_id] %}
+    {% elif verdict.state == "tie" and verdict.winner is not none and verdict.runner_up is not none %}
+      {% set top_ids = [verdict.winner.feed_id, verdict.runner_up.feed_id] %}
+    {% else %}
+      {% set top_ids = [] %}
+    {% endif %}
+    {% set ns = namespace(rank=0) %}
+    <div class="table-wrap">
+      <table>
+        <thead>
           <tr>
-            <td>{{ row.label }}</td>
-            <td>{{ row.n }}</td>
-            <td>
-              {% if row.badge is not none %}
-                <span class="badge {{ 'warn' if row.below_baseline else 'ok' }}">{{ row.badge }}</span>
-                {% if row.below_baseline %}<span class="muted">below baseline</span>{% endif %}
-              {% else %}
-                withheld
-              {% endif %}
-            </td>
-            <td>{{ "%.2f"|format(row.mae) if row.mae is not none else "n/a" }}</td>
-            <td>{{ "%.2f"|format(row.rmse) if row.rmse is not none else "n/a" }}</td>
-            <td><span class="badge {{ 'ok' if row.confident else 'warn' }}">{{ "confident" if row.confident else "withheld" }}</span></td>
+            <th title="Rank among feeds with enough data to compare">#</th>
+            <th>Feed</th>
+            <th title="Number of forecast/observation pairs verified">Samples</th>
+            <th title="{% if variable == 'precip' %}0-100: how much better than chance at predicting rain days (ETS). Higher is better.{% else %}0-100: how much better than a naive 'same as yesterday' forecast. Higher is better.{% endif %}">Skill</th>
+            <th class="col-extra" title="Mean absolute error (lower is better)">MAE</th>
+            <th class="col-extra" title="Root mean squared error (lower is better)">RMSE</th>
           </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {% for row in leaderboard %}
+            <tr class="{{ 'is-top' if row.feed_id in top_ids else '' }}">
+              <td>{% if row.confident %}{% set ns.rank = ns.rank + 1 %}{{ ns.rank }}{% else %}—{% endif %}</td>
+              <td>{{ row.label }}</td>
+              <td>{{ row.n }}</td>
+              <td>
+                {% if row.confident %}
+                  <span class="badge {{ 'warn' if row.below_baseline else 'ok' }}">{{ row.badge }}</span>
+                {% else %}
+                  —
+                  <span class="muted">{% if row.n < min_n %}needs {{ min_n }}+ samples{% elif variable == "precip" %}ETS unavailable for this sample mix{% else %}persistence comparison unavailable for these samples{% endif %}</span>
+                {% endif %}
+              </td>
+              <td class="col-extra">{{ "%.2f"|format(row.mae) if row.mae is not none else "n/a" }}</td>
+              <td class="col-extra">{{ "%.2f"|format(row.rmse) if row.rmse is not none else "n/a" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
   {% else %}
     <p class="empty">No scored pairs.</p>
   {% endif %}

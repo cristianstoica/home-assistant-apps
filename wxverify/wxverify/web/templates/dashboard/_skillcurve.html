@@ -1,9 +1,12 @@
 <section class="panel">
-  <h2>Skill Curve</h2>
+  <h2>Skill by lead day</h2>
+  <p class="panel-hint">
+    {% if variable == "precip" %}How each feed's skill holds up from today out to 7 days ahead. Higher is better; 0 = no better than chance.{% else %}How each feed's skill holds up from today out to 7 days ahead. Higher is better; 0 = no better than persistence.{% endif %}
+  </p>
   <div
     class="chart"
     data-chart="skill"
-    data-src="{{ url('/api/curve?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window) }}">
+    data-src="{{ url('/api/curve?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (lead|urlencode)) }}">
     <svg viewBox="0 0 640 220" role="img" aria-label="Skill curve fallback">
       <line x1="40" y1="180" x2="600" y2="180"></line>
       <line x1="40" y1="20" x2="40" y2="180"></line>

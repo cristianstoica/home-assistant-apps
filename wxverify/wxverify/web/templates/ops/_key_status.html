@@ -1,14 +1,17 @@
 <section class="panel">
   <h2>Key Status</h2>
-  <table>
-    <thead><tr><th>Provider</th><th>Status</th></tr></thead>
-    <tbody>
-      {% for row in keys %}
-        <tr>
-          <td>{{ row.provider }}</td>
-          <td><span class="badge {{ 'ok' if row.present else 'warn' }}">{{ "present" if row.present else "absent" }}</span></td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <p class="panel-hint">Which provider API keys are configured for this add-on.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Provider</th><th>Status</th></tr></thead>
+      <tbody>
+        {% for row in keys %}
+          <tr>
+            <td>{{ row.provider }}</td>
+            <td><span class="badge {{ 'ok' if row.present else 'warn' }}">{{ "present" if row.present else "absent" }}</span></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 </section>

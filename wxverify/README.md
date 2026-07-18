@@ -244,26 +244,33 @@ Top controls:
 - Site pills choose the verification site.
 - `Last N days` / `All time` chooses the scoring window. `Last N days` uses the
   `rolling_window_days` setting.
-- `Temperature` / `Precip` / `Wind` chooses the variable.
-- `D+0` through `D+7` chooses the day-ahead lead bucket. `D+0` is same-day,
-  `D+1` is next-day, and so on through 7 days ahead.
+- `Temperature` / `Precipitation` / `Wind` chooses the variable.
+- The lead control chooses the day-ahead bucket, labelled by word — `Today`,
+  `Tomorrow`, then `+2 days` through `+7 days` — with the `D+n` code shown small
+  beside each. `Today` is same-day, `Tomorrow` is next-day, and so on through 7
+  days ahead.
 
 Dashboard panels:
 
+- `Best forecast` (top card) names, in plain words, the single best feed for the
+  current site, variable, window, and lead, with its runner-up and how many
+  verified forecasts back it. When the top two are too close to separate it says
+  so instead, and when no feed beats its baseline it adds that caveat.
 - `Leaderboard` is the main ranking for the selected site, variable, window,
-  and lead. `n` is the number of matched forecast-vs-consensus observation
-  pairs. `Skill` is a `0-100` badge: temperature and wind use skill against the
+  and lead. `Samples` is the number of matched forecast-vs-observation pairs.
+  `Skill` is a `0-100` badge: temperature and wind use skill against the
   persistence baseline, while precipitation uses ETS for rain-event
-  classification. `below baseline` means the raw skill was negative, so the
-  model performed worse than baseline and displays as `0`. `MAE` and `RMSE` are
-  error magnitudes where lower is better. `Confidence` is withheld until
-  `n >= min_n`, default `30`. The practical ranking rule is: among rows marked
-  `confident`, the best-scoring model is the one with the highest `Skill`. Use
-  `MAE` and `RMSE` to understand how large the errors were; use `n` to judge
-  how much data supports the score.
-- `Skill Curve` shows skill across day-ahead buckets `D+0` through `D+7` for the
-  selected variable and window. Use it to see how model skill changes as the
-  forecast lead gets longer.
+  classification; a warn-coloured badge means the feed scored at or below its
+  baseline. `MAE` and `RMSE` are error magnitudes where lower is better. A feed
+  is ranked — and given a rank number — only once it has both enough verified
+  pairs (`n >= min_n`, default `30`) and a skill score that can actually be
+  computed; sample count alone is not enough, and feeds that fall short are
+  withheld with the reason shown in place of a score. The best-scoring ranked
+  feed is the one to trust; use `MAE`, `RMSE`, and `Samples` to judge how large
+  the errors were and how much data supports the score.
+- `Skill Curve` plots a separate line per feed across the day-ahead buckets
+  (`Today` through `+7 days`), with the lead axis labelled in words. Use it to
+  see how each feed's skill changes as the forecast lead gets longer.
 - `Win Rate` counts comparable valid-hour cells where a feed was closest to the
   consensus. `Covered` is how many cells the feed covered. `Rate` is the share
   of comparable cells it won; ties are split fractionally. This is different

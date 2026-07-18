@@ -3468,7 +3468,7 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
         assert "Paused Smoke" not in dashboard.text
         disabled_dashboard = client.get(f"/dashboard?site={disabled_site_id}")
         assert disabled_dashboard.status_code == 200
-        assert "Paused Smoke - paused - temperature" in disabled_dashboard.text
+        assert "Paused Smoke - paused - Temperature" in disabled_dashboard.text
 
         ops = client.get("/ops")
         assert ops.status_code == 200
