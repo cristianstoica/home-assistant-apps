@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- Web UI overhaul aimed at non-expert operators. The dashboard now leads with a
+  plain-language verdict, and the station leaderboard is ranked with everyday
+  explainers instead of raw metrics.
+- The skill curve is labelled in words and its curve API was restructured to
+  serve the labelled representation.
+- HA-native theming: the interface now follows Home Assistant's light/dark theme
+  automatically.
+- Responsive layouts for phone-width screens, with navigation corrected for the
+  Ingress-served path.
+
 ## 0.3.2
 
 - Add `backup: cold` — the Supervisor now stops the add-on while taking a
