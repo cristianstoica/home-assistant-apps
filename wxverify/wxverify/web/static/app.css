@@ -372,6 +372,7 @@ dd {
 
 .table-wrap {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 table {
@@ -451,11 +452,6 @@ tr.is-top td {
 
 tr.is-top td:first-child {
   box-shadow: inset 3px 0 0 var(--accent);
-}
-
-.lead-code {
-  color: var(--muted);
-  font-size: 11px;
 }
 
 details.help > summary {

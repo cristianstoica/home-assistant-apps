@@ -16,7 +16,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from wxverify import config
+from wxverify import __version__, config
 from wxverify.api.app import _default_stop_process, _stop_on_worker_done, create_app
 from wxverify.api.routes.feeds import _rebuild_mean_for_site
 from wxverify.collection.budget import current_billing_day
@@ -3349,8 +3349,8 @@ def test_ui_root_path_htmx_and_create_site_fragment(tmp_path: Path) -> None:
         page = client.get("/sites")
         assert page.status_code == 200
         html = page.text
-        assert 'src="/ingress/path/static/htmx.min.js"' in html
-        assert 'src="/ingress/path/static/htmx-ext-json-enc.js"' in html
+        assert f'src="/ingress/path/static/{__version__}/htmx.min.js"' in html
+        assert f'src="/ingress/path/static/{__version__}/htmx-ext-json-enc.js"' in html
         assert 'class="brand" href="/ingress/path/dashboard"' in html
         assert 'src="https://' not in html
         assert (
@@ -3458,8 +3458,8 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
         assert "Last 14 days" in dashboard.text
         assert "lead=D%2B1" in dashboard.text
         assert 'aria-label="Lead time"' in dashboard.text
-        assert ">D+0<" in dashboard.text
-        assert ">D+7<" in dashboard.text
+        assert ">Today<" in dashboard.text
+        assert ">+7 days<" in dashboard.text
         assert "/api/curve?site=" in dashboard.text
         decoded_plus_dashboard = client.get(
             f"/dashboard?site={site_id}&variable=precip&window=rolling&lead=D+1"

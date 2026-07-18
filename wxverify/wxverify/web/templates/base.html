@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="csrf-token" content="{{ csrf_token }}">
     <title>{% block title %}{{ app_title }}{% endblock %}</title>
-    <link rel="stylesheet" href="{{ url('/static/uplot.min.css') }}">
-    <link rel="stylesheet" href="{{ url('/static/app.css') }}">
+    <link rel="stylesheet" href="{{ url('/static/' ~ static_version ~ '/uplot.min.css') }}">
+    <link rel="stylesheet" href="{{ url('/static/' ~ static_version ~ '/app.css') }}">
   </head>
   <body hx-ext="json-enc" hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
     <header class="topbar">
@@ -29,17 +29,12 @@
     </main>
 
     <footer class="footer">
-      <span>Forecast data includes Open-Meteo CC-BY sources.</span>
-      <span>Weather data provided by <a href="https://www.visualcrossing.com/">Visual Crossing</a>.</span>
-      <span>Weather data provided by <a href="https://openweathermap.org/">OpenWeatherMap</a>.</span>
-      <span>Powered by <a href="https://www.weatherapi.com/">WeatherAPI.com</a>.</span>
-      <span>Weather data provided by <a href="https://www.meteosource.com/">Meteosource</a>.</span>
-      <span>Source: Includes weather data from Google</span>
+      <span>Weather data by: Open-Meteo, <a href="https://www.visualcrossing.com/">Visual Crossing</a>, <a href="https://openweathermap.org/">OpenWeatherMap</a>, <a href="https://www.weatherapi.com/">WeatherAPI.com</a>, <a href="https://www.meteosource.com/">Meteosource</a>, and Google.</span>
     </footer>
 
-    <script src="{{ url('/static/htmx.min.js') }}"></script>
-    <script src="{{ url('/static/htmx-ext-json-enc.js') }}"></script>
-    <script src="{{ url('/static/uplot.min.js') }}"></script>
+    <script src="{{ url('/static/' ~ static_version ~ '/htmx.min.js') }}"></script>
+    <script src="{{ url('/static/' ~ static_version ~ '/htmx-ext-json-enc.js') }}"></script>
+    <script src="{{ url('/static/' ~ static_version ~ '/uplot.min.js') }}"></script>
     <script>
       document.body.addEventListener("htmx:configRequest", function (event) {
         var token = document.querySelector('meta[name="csrf-token"]').content;
@@ -62,6 +57,6 @@
         }
       });
     </script>
-    <script src="{{ url('/static/app.js') }}"></script>
+    <script src="{{ url('/static/' ~ static_version ~ '/app.js') }}"></script>
   </body>
 </html>

@@ -21,6 +21,7 @@ Synthetic fixtures only — fake site names/coords, no real keys or station IDs.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -407,6 +408,22 @@ def test_render_insufficient_state(
     # All rows withheld -> rank cells are em dashes, no highlight, no rank digit.
     assert "<td>—</td>" in html
     assert "is-top" not in html
+    # STRENGTHEN §10 oracle: every withheld row carries an em-dash rank — not
+    # just ≥1 row.  Two feeds were seeded, so exactly 2 em-dash rank cells must
+    # appear.  The rank cell is uniquely `<td>—</td>` (the skill cell for
+    # withheld rows contains both `—` and a `<span>`, never the bare pattern).
+    _n_withheld_feeds = 2
+    _n_dash_cells = html.count("<td>—</td>")
+    assert _n_dash_cells == _n_withheld_feeds, (
+        f"Expected {_n_withheld_feeds} em-dash rank cells (one per withheld feed); "
+        f"got {_n_dash_cells}. A row may carry a numeric rank "
+        "when it should be withheld."
+    )
+    # No rank-column cell must carry a digit — `<td>1</td>` is rank #1.
+    assert "<td>1</td>" not in html, (
+        "Rank cell '<td>1</td>' found — a withheld row was incorrectly assigned "
+        "a numeric rank."
+    )
 
 
 def test_render_tie_state_both_rows_highlighted(
@@ -631,8 +648,164 @@ def test_render_precip_d2_ok_uses_display_labels_and_callable_global(
     # Toolbar rendered "Precipitation" via the callable variable_label_for
     # global — a 200 here proves the global is not shadowed by a same-named
     # context string (shadowing would 500 on calling a str).
-    assert ">Precipitation <small" not in html  # sanity: toolbar has no lead-code
+    # Variable label must not be followed by a <small> lead-code tag.
+    assert ">Precipitation <small" not in html
     assert html.count("Precipitation") >= 2
+
+
+def test_render_single_eligible_candidate_no_runner_up_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oracle §10.3: one confident feed → runner-up line absent from rendered HTML.
+
+    The precondition is injected (one confident, one withheld — n < min_n),
+    not ambient.  A paired positive follows to make the negative non-vacuous.
+    """
+    conn = _init_tmp_db(tmp_path)
+    set_setting(conn, "min_n", "2")
+    site_id = _make_site(conn, "Single Eligible Site")
+    ecmwf = _feed_id(conn, "ecmwf_ifs")
+    gfs = _feed_id(conn, "gfs_global")
+    # One confident candidate (n >= min_n, skill non-None).
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=ecmwf,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.40,
+        n=5,
+    )
+    # Withheld: n=1 < min_n=2 → NOT a confident candidate.
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=gfs,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.90,
+        n=1,
+    )
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        html = _get_dashboard(client, site_id)
+    assert "verdict-ok" in html
+    assert feed_label("open-meteo", "ecmwf_ifs") in html
+    # compute_verdict returns runner_up=None for a single eligible candidate;
+    # the template's {% if verdict.runner_up is not none %} guard must suppress
+    # the runner-up paragraph.
+    assert "Runner-up:" not in html, (
+        "Runner-up line rendered for a single-eligible verdict. "
+        "compute_verdict must return runner_up=None when only one confident "
+        "candidate exists, and the template must not render the paragraph."
+    )
+
+
+def test_render_two_eligible_candidates_runner_up_line_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paired positive for the single-eligible no-runner-up oracle.
+
+    With ≥2 confident feeds the runner-up line MUST render; without this
+    positive the absence test is vacuously green if the line never rendered.
+    """
+    conn = _init_tmp_db(tmp_path)
+    set_setting(conn, "min_n", "2")
+    site_id = _make_site(conn, "Two Eligible Site")
+    ecmwf = _feed_id(conn, "ecmwf_ifs")
+    gfs = _feed_id(conn, "gfs_global")
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=ecmwf,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.60,
+        n=5,
+    )
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=gfs,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.30,
+        n=5,
+    )
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        html = _get_dashboard(client, site_id)
+    assert "verdict-ok" in html
+    assert "Runner-up:" in html, (
+        "Runner-up line absent with ≥2 eligible candidates. "
+        "The template's {% if verdict.runner_up is not none %} guard may be "
+        "broken, or compute_verdict returned runner_up=None incorrectly."
+    )
+
+
+def test_render_high_skill_withheld_row_never_gets_is_top(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oracle §10.3: a withheld feed (high skill but n < min_n) must never
+    receive the ``is-top`` leaderboard highlight.
+
+    ``is-top`` follows the verdict winner; a withheld feed cannot be the
+    winner because ``compute_verdict`` considers only confident rows.  Seed
+    exactly: high-skill withheld feed + lower-skill confident winner → assert
+    the confident winner has ``is-top`` and the withheld feed does not.
+    """
+    conn = _init_tmp_db(tmp_path)
+    set_setting(conn, "min_n", "2")
+    site_id = _make_site(conn, "Withheld High Skill Site")
+    ecmwf = _feed_id(conn, "ecmwf_ifs")
+    gfs = _feed_id(conn, "gfs_global")
+    # High skill, but n=1 < min_n=2 → withheld (non-confident).
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=ecmwf,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.90,
+        n=1,
+    )
+    # Lower skill, n=5 >= min_n=2 → confident → the only possible winner.
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=gfs,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.20,
+        n=5,
+    )
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        html = _get_dashboard(client, site_id)
+    assert "verdict-ok" in html
+    # Exactly one row should be highlighted — the confident winner.
+    n_is_top = html.count('class="is-top"')
+    assert n_is_top == 1, (
+        f"Expected exactly 1 is-top row (the confident winner); got {n_is_top}. "
+        "A withheld feed may be incorrectly highlighted."
+    )
+    # The is-top row must contain the confident winner, not the withheld feed.
+    is_top_match = re.search(r'<tr class="is-top">(.*?)</tr>', html, re.DOTALL)
+    assert is_top_match is not None, "is-top <tr> not found in the rendered leaderboard"
+    is_top_content = is_top_match.group(1)
+    winner_label = feed_label("open-meteo", "gfs_global")
+    withheld_label = feed_label("open-meteo", "ecmwf_ifs")
+    assert winner_label in is_top_content, (
+        f"Confident winner '{winner_label}' not found in the is-top row. "
+        "The wrong row may be highlighted."
+    )
+    assert withheld_label not in is_top_content, (
+        f"Withheld feed '{withheld_label}' appears in the is-top row — "
+        "a feed with n < min_n must never receive the winner highlight."
+    )
 
 
 # ===========================================================================
@@ -903,27 +1076,125 @@ def test_curve_top_clamp_at_both_bounds(
 def test_curve_lead_guard_unparseable_and_out_of_range(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Oracle §10.6: invalid/garbage lead → D+1 ordering; D+99 → deterministic
+    nulls-last / label-ASC order distinct from D+1 skill-ranked order.
+
+    (a) ``lead=foo`` (unparseable) coerces to D+1 via ``_coerce_lead_day``'s
+        ValueError catch; the series ordering must equal an explicit
+        ``lead=D+1`` request — not just be a non-empty list.
+    (b) ``lead=D+99`` (out-of-range — not in ``_CURVE_LEADS`` 0-7) produces
+        ``selected_index=None`` → all feeds have ``selected=None`` → sort key
+        ``(1, 0.0, label)`` → alphabetical label-ASC; two identical D+99
+        requests must yield identical ordering (determinism), and that order
+        must differ from the D+1 skill-ranked order (oracle has teeth).
+
+    Three feeds with distinct D+1 skills give a D+1 skill order of
+    gem > ecmwf > gfs, while D+99 label-ASC gives ecmwf < gem < gfs — the
+    two orderings differ, making the D+99 pin non-vacuous.
+
+    ``params=`` is used throughout so httpx percent-encodes ``D+1`` →
+    ``D%2B1``; a literal ``+`` in a raw query string decodes as a space
+    server-side (``D+1`` → ``"D 1"``).
+    """
     conn = _init_tmp_db(tmp_path)
     set_setting(conn, "min_n", "2")
     site_id = _make_site(conn, "Lead Guard Site")
+    ecmwf = _feed_id(conn, "ecmwf_ifs")
+    gfs = _feed_id(conn, "gfs_global")
+    gem = _feed_id(conn, "gem_global")
+    # Three feeds with distinct D+1 skills so the D+1 and D+99 orderings differ:
+    #   D+1 skill order:  gem (0.70) > ecmwf (0.50) > gfs (0.30) → [gem, ecmwf, gfs]
+    #   D+99 label order: ecmwf < gem < gfs (all "open-meteo / …") → [ecmwf, gem, gfs]
     _seed_cell(
         conn,
         site_id=site_id,
-        feed_id=_feed_id(conn, "ecmwf_ifs"),
+        feed_id=gem,
         variable="temperature",
         day_ahead=1,
-        skill=0.5,
+        skill=0.70,
+        n=5,
+    )
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=ecmwf,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.50,
+        n=5,
+    )
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=gfs,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.30,
         n=5,
     )
     conn.commit()
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
-        bad = client.get(f"/api/curve?site={site_id}&window=all&lead=foo")
-        oob = client.get(f"/api/curve?site={site_id}&window=all&lead=D%2B99")
-    assert bad.status_code == 200
-    assert oob.status_code == 200
-    assert isinstance(bad.json()["series"], list)
-    assert isinstance(oob.json()["series"], list)
+        # Baseline: explicit D+1 order (skill DESC → gem, ecmwf, gfs).
+        d1 = client.get(
+            "/api/curve",
+            params={"site": site_id, "window": "all", "lead": "D+1"},
+        ).json()
+        # (a) Unparseable lead → D+1 fallback.
+        bad = client.get(
+            "/api/curve",
+            params={"site": site_id, "window": "all", "lead": "foo"},
+        ).json()
+        # (b) Out-of-range lead → nulls-last / label-ASC; request twice for
+        #     determinism check.
+        oob_1 = client.get(
+            "/api/curve",
+            params={"site": site_id, "window": "all", "lead": "D+99"},
+        ).json()
+        oob_2 = client.get(
+            "/api/curve",
+            params={"site": site_id, "window": "all", "lead": "D+99"},
+        ).json()
+
+    # Shape checks: all responses must be 200 with a non-None series list.
+    assert isinstance(d1["series"], list)
+    assert isinstance(bad["series"], list)
+    assert isinstance(oob_1["series"], list)
+
+    d1_order = [s["feed_id"] for s in d1["series"]]
+    bad_order = [s["feed_id"] for s in bad["series"]]
+    oob_1_order = [s["feed_id"] for s in oob_1["series"]]
+    oob_2_order = [s["feed_id"] for s in oob_2["series"]]
+
+    # (a) Invalid lead coerces to D+1: ordering must exactly match explicit D+1.
+    assert bad_order == d1_order, (
+        f"lead=foo must fall back to D+1 ordering; "
+        f"got {bad_order!r}, expected {d1_order!r}. "
+        "_coerce_lead_day must return 1 (D+1 default) for an unparseable string."
+    )
+
+    # (b) D+99 is deterministic: two identical requests yield identical ordering.
+    assert oob_1_order == oob_2_order, (
+        f"D+99 ordering is non-deterministic: "
+        f"first={oob_1_order!r}, second={oob_2_order!r}"
+    )
+
+    # Pin D+99 order: selected_index=None (99 ∉ _CURVE_LEADS=[0…7]) → every
+    # feed's sort key is (1, 0.0, label) → alphabetical label-ASC.
+    # "open-meteo / ecmwf_ifs" < "open-meteo / gem_global" < "open-meteo / gfs_global"
+    expected_oob_order = [ecmwf, gem, gfs]
+    assert oob_1_order == expected_oob_order, (
+        f"D+99 (out-of-range, nulls-last / label-ASC) order wrong: "
+        f"got {oob_1_order!r}, expected {expected_oob_order!r} "
+        "(ecmwf < gem < gfs alphabetically). "
+        "D+99 must not clamp to 7 or use skill-ranked ordering."
+    )
+
+    # Sanity: D+99 order must differ from D+1 order, so the D+99 pin has teeth.
+    assert oob_1_order != d1_order, (
+        "D+99 and D+1 orderings are identical — the D+99 oracle cannot detect "
+        "a regression in out-of-range lead handling."
+    )
 
 
 def test_curve_exactly_zero_series_survives_exclusion(
