@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 
-from wxverify import config
+from wxverify import __version__, config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.api.discovery import publish_discovery
 from wxverify.api.errors import register_error_handlers
@@ -65,7 +65,17 @@ def create_app(
     app.add_middleware(MutationGuard, standalone_origin=config.standalone_origin)
     app.add_middleware(IngressPathMiddleware)
     register_error_handlers(app)
-    app.mount("/static", StaticFiles(directory=static_dir()), name="static")
+    # Version-prefixed static mount: the HA frontend service worker caches
+    # /static/ paths cache-first with ignoreSearch, so a query-string buster
+    # never invalidates. A new version yields new asset PATHS, guaranteeing a
+    # cache miss on every release. No bare /static mount: nothing references
+    # it, and a stray bare-path link should 404 loudly rather than resurrect
+    # the stale-cache bug.
+    app.mount(
+        f"/static/{__version__}",
+        StaticFiles(directory=static_dir()),
+        name="static",
+    )
     app.include_router(sites.router)
     app.include_router(stations.router)
     app.include_router(feeds.router)

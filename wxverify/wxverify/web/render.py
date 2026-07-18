@@ -9,7 +9,7 @@ import jinja2
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
-from wxverify import config
+from wxverify import __version__, config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.web.context import feed_label, variable_label_for
 
@@ -29,6 +29,11 @@ env = jinja2.Environment(
 _template_globals = cast("dict[str, object]", env.globals)
 _template_globals["feed_label"] = feed_label
 _template_globals["variable_label_for"] = variable_label_for
+# Static assets are mounted at /static/<version>/ so every release produces
+# new asset URLs (the HA frontend service worker caches /static/ paths
+# cache-first and ignores query strings — only a path change busts it).
+# Templates compose url('/static/' ~ static_version ~ '/<asset>').
+_template_globals["static_version"] = __version__
 
 
 def static_dir() -> Path:

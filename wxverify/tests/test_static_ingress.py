@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from wxverify import config
+from wxverify import __version__, config
 from wxverify.api.app import create_app
 from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.db.connection import close_db, init_db
@@ -39,6 +39,12 @@ from wxverify.db.connection import close_db, init_db
 # ---------------------------------------------------------------------------
 _INGRESS_TOKEN = "abc123synthetic"
 _INGRESS_PREFIX = f"/api/hassio_ingress/{_INGRESS_TOKEN}"
+# Since 0.4.1 static assets are mounted under a version-prefixed path
+# (/static/<version>/...) so each release busts the HA frontend service
+# worker's cache-first /static/ cache. The mount-serving oracles below
+# request the versioned path; the raw-middleware oracles keep an arbitrary
+# path string (the middleware never touches the mount).
+_STATIC_CSS = f"/static/{__version__}/app.css"
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
 
@@ -88,11 +94,11 @@ def test_static_css_under_ingress_returns_200(
         app, client=(_SUPERVISOR_IP, 4321), follow_redirects=False
     ) as client:
         resp = client.get(
-            "/static/app.css",
+            _STATIC_CSS,
             headers={"X-Ingress-Path": _INGRESS_PREFIX},
         )
     assert resp.status_code == 200, (
-        f"Expected 200 for /static/app.css under ingress; got {resp.status_code}. "
+        f"Expected 200 for {_STATIC_CSS} under ingress; got {resp.status_code}. "
         "This is the 0.1.1 static-404 regression — IngressPathMiddleware must "
         "prepend the prefix to scope['path'] so StaticFiles resolves correctly."
     )
@@ -118,7 +124,7 @@ def test_static_css_standalone_returns_200(
     with TestClient(
         app, client=(_NON_SUPERVISOR_IP, 9000), follow_redirects=False
     ) as client:
-        resp = client.get("/static/app.css")
+        resp = client.get(_STATIC_CSS)
     assert resp.status_code == 200, (
         f"Standalone static serve broken; got {resp.status_code}"
     )
@@ -326,4 +332,62 @@ def test_passthrough_none_client() -> None:
     )
     assert result["root_path"] == "", (
         f"root_path must be unchanged when client is None; got {result['root_path']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 6 (hoare's note) — bare /static/app.css → 404 under both shapes
+#
+# Since 0.4.1 the bare /static mount has been removed; assets are served only
+# at /static/<version>/…. A bare GET /static/app.css must return 404 so that
+# a stale HA service-worker cache-first entry never silently resurrects the
+# old unversioned path.  The paired 200 for the versioned path is already
+# proven by Oracle 1 (under ingress) and Oracle 2 (standalone).
+# ---------------------------------------------------------------------------
+
+_BARE_STATIC_CSS = "/static/app.css"
+
+
+def test_bare_static_path_returns_404_standalone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oracle 6a: bare /static/app.css → 404 in standalone (no ingress) mode.
+
+    The only static mount since 0.4.1 is /static/<version>/; a bare path must
+    not accidentally match it.
+    """
+    app = _make_app(tmp_path, monkeypatch)
+    with TestClient(
+        app, client=(_NON_SUPERVISOR_IP, 9000), follow_redirects=False
+    ) as client:
+        resp = client.get(_BARE_STATIC_CSS)
+    assert resp.status_code == 404, (
+        f"Expected 404 for bare {_BARE_STATIC_CSS} (no versioned mount); "
+        f"got {resp.status_code}. "
+        "If this is 200, the bare /static mount was re-added, which would "
+        "resurrect the stale-cache bug that 0.4.1 fixed."
+    )
+
+
+def test_bare_static_path_returns_404_under_ingress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Oracle 6b: bare /static/app.css → 404 under HA Ingress.
+
+    The IngressPathMiddleware prepends the ingress prefix to scope["path"],
+    but neither the prefix-rewritten path nor the bare path may resolve to
+    the versioned static mount.
+    """
+    app = _make_app(tmp_path, monkeypatch)
+    with TestClient(
+        app, client=(_SUPERVISOR_IP, 4321), follow_redirects=False
+    ) as client:
+        resp = client.get(
+            _BARE_STATIC_CSS,
+            headers={"X-Ingress-Path": _INGRESS_PREFIX},
+        )
+    assert resp.status_code == 404, (
+        f"Expected 404 for bare {_BARE_STATIC_CSS} under HA Ingress; "
+        f"got {resp.status_code}. "
+        "The versioned static mount must not serve unversioned asset paths."
     )

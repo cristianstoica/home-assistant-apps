@@ -30,7 +30,7 @@
     </div>
     <div class="segmented" aria-label="Lead time">
       {% for opt in lead_options %}
-        <a class="{{ 'active' if lead == opt.value else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (opt.value|urlencode)) }}">{{ opt.word }} <small class="lead-code">{{ opt.value }}</small></a>
+        <a class="{{ 'active' if lead == opt.value else '' }}" href="{{ url('/dashboard?site=' ~ site.id ~ '&variable=' ~ variable ~ '&window=' ~ window ~ '&lead=' ~ (opt.value|urlencode)) }}">{{ opt.word }}</a>
       {% endfor %}
     </div>
   </section>

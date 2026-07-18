@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.1
+
+- Fixed: the skill chart and dark theme no longer revert to old styles after an
+  add-on upgrade. Static assets are now served from a versioned path
+  (`/static/0.4.1/…`) so Home Assistant fetches fresh files on each release
+  instead of serving the cached copy from the previous version.
+- Changed: lead-day labels now show plain words only ("Today", "Tomorrow",
+  "+2 days", …). The redundant `D+N` codes alongside each label have been
+  removed.
+- Changed: the weather-data attribution in the page footer is now a single
+  combined line instead of one `<span>` per provider.
+- Fixed: horizontal tables now scroll smoothly on iOS (momentum scrolling
+  re-enabled via `-webkit-overflow-scrolling: touch`).
+
 ## 0.4.0
 
 - Web UI overhaul aimed at non-expert operators. The dashboard now leads with a
