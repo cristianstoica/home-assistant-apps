@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.2
+
+- Fixed: dashboard loads no longer stall behind a slow Composite recompute.
+  Composite scoring for the rolling/all-time windows is now served from the
+  persisted score cache (stale-while-revalidate) instead of being recomputed
+  live on every request. The previous live recompute could take up to ~16s
+  and, because it ran on the single serialized database reader connection,
+  blocked every other dashboard read for that same span. A stale cache entry
+  is now served immediately while a rescore is enqueued in the background;
+  custom day-window queries are unaffected and continue to compute live.
+- No config or API response-shape changes: the `/api/composite` response
+  contract (a bare JSON list) is unchanged.
+
 ## 0.4.1
 
 - Fixed: the skill chart and dark theme no longer revert to old styles after an

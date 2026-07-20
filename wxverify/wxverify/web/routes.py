@@ -6,7 +6,9 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from wxverify.db.connection import get_db
+from wxverify.scoring.composite import enqueue_composite_rescore
 from wxverify.web.context import (
+    SiteView,
     load_dashboard,
     load_ops,
     load_overlay,
@@ -46,6 +48,18 @@ async def dashboard_page(
             lead=lead,
         )
     )
+    # Second composite enqueue site (mirrors /api/composite): the read above is
+    # closed before this write, and the cooldown-guarded composite-only helper
+    # does the enqueue. The resolved site comes from the context because
+    # load_dashboard defaults to the first enabled site when `site` is None.
+    resolved_site = context.get("site")
+    if context.get("composite_status") in ("stale", "rebuilding") and isinstance(
+        resolved_site, SiteView
+    ):
+        resolved_site_id = resolved_site.id
+        await get_db().write(
+            lambda conn: enqueue_composite_rescore(conn, resolved_site_id)
+        )
     return render(request, "dashboard/show.html", **context)
 
 

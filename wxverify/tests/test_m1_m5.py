@@ -2406,7 +2406,14 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
     )
     add_pair(feed_ids[3], "temperature", 1.0, valid_hour=4)
 
-    rows = {int(row["feed_id"]): row for row in composite(conn, site_id=site_id)}
+    # Custom `Nd` window: the live compute path. The `rolling` window is
+    # cache-backed since 0.4.2 and would return `rebuilding` (empty) with no
+    # seeded score_cache; the live aggregation/filter math under test here is
+    # unchanged and identical across window cutoffs.
+    rows = {
+        int(row["feed_id"]): row
+        for row in composite(conn, site_id=site_id, window="30d")
+    }
     assert feed_ids[0] in rows
     assert feed_ids[1] in rows
     assert feed_ids[3] not in rows

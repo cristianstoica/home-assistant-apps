@@ -9,7 +9,7 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
-from wxverify.scoring.composite import composite as composite_query
+from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
 from wxverify.scoring.winrate import winrate as winrate_query
@@ -252,6 +252,7 @@ def load_dashboard(
             "verdict": compute_verdict([]),
             "winrate": [],
             "composite": [],
+            "composite_status": "empty",
         }
     day_ahead = _lead_to_day(lead)
     leaderboard = [
@@ -288,6 +289,9 @@ def load_dashboard(
         )
     )
     verdict = compute_verdict(leaderboard)
+    # Pure read: the status is surfaced for the route to act on AFTER the read
+    # connection closes (dashboard_page enqueues the rescore); never write here.
+    composite_result = composite_with_status(conn, site_id=site.id, window=window)
     return {
         "sites": sites,
         "site": site,
@@ -307,7 +311,8 @@ def load_dashboard(
             day_ahead=day_ahead,
             window=window,
         ),
-        "composite": composite_query(conn, site_id=site.id, window=window),
+        "composite": composite_result.rows,
+        "composite_status": composite_result.status,
     }
 
 
