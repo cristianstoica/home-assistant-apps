@@ -1,5 +1,5 @@
 name: "Weather Verify"
-version: "0.4.2"
+version: "0.5.0"
 slug: wxverify
 description: "Verify weather-forecast accuracy via cluster-consensus ground truth"
 url: "https://github.com/cristianstoica/home-assistant-apps/tree/main/wxverify"
@@ -26,6 +26,7 @@ options:
   google_key: ""
   rolling_window_days: 30
   min_n: 30
+  forecast_blend_depth: 2
   obs_interval_minutes: 180
   obs_jitter_minutes: 20
   min_interval_seconds: 300
@@ -46,6 +47,7 @@ schema:
   google_key: password?
   rolling_window_days: int(1,3650)
   min_n: int(0,100000)
+  forecast_blend_depth: int(1,6)
   obs_interval_minutes: int(30,1440)
   obs_jitter_minutes: int(0,120)
   min_interval_seconds: int(60,1800)

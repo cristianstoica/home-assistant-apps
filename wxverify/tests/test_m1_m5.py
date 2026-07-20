@@ -3351,14 +3351,14 @@ def test_ui_root_path_htmx_and_create_site_fragment(tmp_path: Path) -> None:
     app = create_app(root_path="/ingress/path/")
     with TestClient(app) as client:
         root = client.get("/", follow_redirects=False)
-        assert root.status_code == 307
-        assert root.headers["location"] == "/ingress/path/dashboard"
+        assert root.status_code == 200
+        assert "<h1>Forecast</h1>" in root.text
         page = client.get("/sites")
         assert page.status_code == 200
         html = page.text
         assert f'src="/ingress/path/static/{__version__}/htmx.min.js"' in html
         assert f'src="/ingress/path/static/{__version__}/htmx-ext-json-enc.js"' in html
-        assert 'class="brand" href="/ingress/path/dashboard"' in html
+        assert 'class="brand" href="/ingress/path/"' in html
         assert 'src="https://' not in html
         assert (
             "Session expired or request blocked — reload the page to continue" in html

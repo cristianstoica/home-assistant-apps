@@ -36,6 +36,8 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
     def _apply(conn: sqlite3.Connection) -> None:
         if options.min_n is not None:
             set_setting(conn, "min_n", str(options.min_n))
+        if options.forecast_blend_depth is not None:
+            set_setting(conn, "forecast_blend_depth", str(options.forecast_blend_depth))
         if options.obs_interval_minutes is not None:
             set_setting(conn, "obs_interval_minutes", str(options.obs_interval_minutes))
         if options.obs_jitter_minutes is not None:

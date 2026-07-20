@@ -1,0 +1,27 @@
+{% if site %}
+  <section class="panel wide day-detail-inner">
+    <div class="section-line">
+      <h3>Hourly &mdash; {% if day == 0 %}Today{% elif day == 1 %}Tomorrow{% else %}+{{ day }} days{% endif %}</h3>
+      <div class="day-detail-controls">
+        <label class="feed-toggle">
+          <input type="checkbox" data-feed-toggle="forecast-hourly-chart">
+          Show individual feeds
+        </label>
+        <button type="button" class="ghost" onclick="this.closest('.day-detail').innerHTML=''">Close</button>
+      </div>
+    </div>
+    <div
+      id="forecast-hourly-chart"
+      class="chart tall"
+      data-chart="forecast-hourly"
+      data-src="{{ url('/api/forecast/hourly?site=' ~ site.id ~ '&day=' ~ day) }}">
+      <svg viewBox="0 0 780 320" role="img" aria-label="Hourly forecast fallback">
+        <line x1="44" y1="278" x2="738" y2="278"></line>
+        <line x1="44" y1="24" x2="44" y2="278"></line>
+      </svg>
+    </div>
+    <p class="panel-hint">Blend of the top-performing feeds for this day. Temperature and wind are lines; precipitation is bars (right axis). Toggle individual feeds to see how much the members disagree.</p>
+  </section>
+{% else %}
+  <p class="empty">Site not found.</p>
+{% endif %}

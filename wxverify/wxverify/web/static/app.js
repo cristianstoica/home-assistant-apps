@@ -128,6 +128,103 @@
     }, data, el);
   }
 
+  // Blended hourly drill-down: temp line (left axis), precip bars (right
+  // axis), wind line (legend-only scale). Per-feed series are created hidden
+  // and toggled via the "Show individual feeds" checkbox.
+  function renderForecastHourly(el, payload) {
+    var hours = payload.hours || [];
+    var xs = [];
+    var keep = [];
+    hours.forEach(function (value, index) {
+      var t = parseTime(value);
+      if (t !== null) {
+        xs.push(t);
+        keep.push(index);
+      }
+    });
+    if (!window.uPlot || xs.length === 0) {
+      emptyChart(el, "No hourly data yet.");
+      return;
+    }
+    function pick(values) {
+      return keep.map(function (index) {
+        var v = (values || [])[index];
+        return v === undefined ? null : v;
+      });
+    }
+    var blend = payload.blend || {};
+    var series = [{}];
+    var data = [xs];
+    series.push({
+      label: "Temp °C",
+      scale: "t",
+      stroke: cssVar("--chart-1"),
+      width: 2
+    });
+    data.push(pick(blend.temp_c));
+    series.push({
+      label: "Precip mm",
+      scale: "p",
+      stroke: cssVar("--chart-2"),
+      fill: cssVar("--chart-2"),
+      width: 1,
+      paths: uPlot.paths.bars({ size: [0.6, 100] }),
+      points: { show: false }
+    });
+    data.push(pick(blend.precip_mm));
+    series.push({
+      label: "Wind km/h",
+      scale: "w",
+      stroke: cssVar("--chart-3"),
+      width: 2
+    });
+    data.push(pick(blend.wind_kmh));
+    var feedSeriesIdx = [];
+    (payload.feeds || []).forEach(function (feed, feedIndex) {
+      var color = cssVar(SKILL_PALETTE[feedIndex % SKILL_PALETTE.length]);
+      [
+        ["temp_c", "t", "temp"],
+        ["precip_mm", "p", "precip"],
+        ["wind_kmh", "w", "wind"]
+      ].forEach(function (spec) {
+        series.push({
+          label: feed.label + " " + spec[2],
+          scale: spec[1],
+          stroke: color,
+          width: 1,
+          show: false
+        });
+        data.push(pick(feed[spec[0]]));
+        feedSeriesIdx.push(series.length - 1);
+      });
+    });
+    var xAxis = themedAxis();
+    var tAxis = themedAxis();
+    tAxis.scale = "t";
+    tAxis.label = "°C";
+    var pAxis = themedAxis();
+    pAxis.scale = "p";
+    pAxis.side = 1;
+    pAxis.label = "mm";
+    el.innerHTML = "";
+    var chart = new uPlot({
+      width: Math.max(el.clientWidth, 320),
+      height: 300,
+      scales: {
+        x: { time: true },
+        p: {
+          range: function (u, min, max) {
+            return [0, Math.max(max || 0, 1)];
+          }
+        }
+      },
+      axes: [xAxis, tAxis, pAxis],
+      series: series
+    }, data, el);
+    el.uplotInstance = chart;
+    el.feedSeriesIdx = feedSeriesIdx;
+  }
+
   function loadChart(el) {
     if (el.dataset.loaded === "true") {
       return;
@@ -143,6 +240,8 @@
       .then(function (payload) {
         if (el.dataset.chart === "overlay") {
           renderOverlay(el, payload);
+        } else if (el.dataset.chart === "forecast-hourly") {
+          renderForecastHourly(el, payload);
         } else {
           renderSkill(el, payload);
         }
@@ -162,4 +261,45 @@
   document.body.addEventListener("htmx:afterSettle", function (event) {
     bootCharts(event.target);
   });
+
+  // "Show individual feeds" checkbox: flips visibility of the hidden per-feed
+  // series registered on the chart element by renderForecastHourly.
+  document.body.addEventListener("change", function (event) {
+    var target = event.target;
+    if (!target || !target.matches("input[data-feed-toggle]")) {
+      return;
+    }
+    var chartEl = document.getElementById(target.getAttribute("data-feed-toggle"));
+    if (!chartEl || !chartEl.uplotInstance || !chartEl.feedSeriesIdx) {
+      return;
+    }
+    chartEl.feedSeriesIdx.forEach(function (index) {
+      chartEl.uplotInstance.setSeries(index, { show: target.checked });
+    });
+  });
+
+  // "Updated X ago" stays honest between polls: the tiles fragment answers
+  // 204 (no swap) while data is unchanged, so the text is re-derived
+  // client-side from the data-updated-at timestamp once a minute.
+  function refreshRelativeTimes() {
+    document.querySelectorAll("[data-updated-at]").forEach(function (el) {
+      var t = Date.parse(el.getAttribute("data-updated-at"));
+      if (!Number.isFinite(t)) {
+        return;
+      }
+      var seconds = Math.max(0, (Date.now() - t) / 1000);
+      var text;
+      if (seconds < 60) {
+        text = "just now";
+      } else if (seconds < 3600) {
+        text = Math.floor(seconds / 60) + " min ago";
+      } else if (seconds < 86400) {
+        text = Math.floor(seconds / 3600) + " h ago";
+      } else {
+        text = Math.floor(seconds / 86400) + " d ago";
+      }
+      el.textContent = "Updated " + text;
+    });
+  }
+  setInterval(refreshRelativeTimes, 60000);
 })();

@@ -487,6 +487,99 @@ details.help p {
   fill: none;
 }
 
+/* Forecast home page: 8 day tiles + full-width hourly drill-down. */
+.forecast-updated {
+  margin: 0 0 10px;
+}
+
+.tile-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.tile {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
+.tile.state-low_confidence {
+  border-left: 4px solid var(--warn);
+}
+
+.tile.state-not_available {
+  border-style: dashed;
+  box-shadow: none;
+}
+
+.tile-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tile-rows {
+  display: grid;
+  gap: 4px;
+}
+
+.tile-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 14px;
+}
+
+.tile-row span {
+  color: var(--muted);
+}
+
+.tile-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tile-expand {
+  justify-self: start;
+  min-height: 30px;
+  padding: 4px 9px;
+  font-size: 13px;
+}
+
+.day-detail {
+  margin-top: 16px;
+}
+
+.day-detail:empty {
+  display: none;
+}
+
+.day-detail-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.feed-toggle {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.feed-toggle input {
+  width: auto;
+  min-height: 0;
+}
+
 .notice {
   width: min(760px, calc(100vw - 32px));
   margin: 14px auto 0;
@@ -538,6 +631,10 @@ meter {
   .ops-grid,
   .facts {
     grid-template-columns: 1fr;
+  }
+
+  .tile-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .inline-form {

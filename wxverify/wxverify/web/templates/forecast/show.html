@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Forecast - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Forecast</h1>
+    {% if site %}
+      <p>{{ site.name }}{% if not site.enabled %} - paused{% endif %} - combined forecast from the best-performing feeds</p>
+    {% endif %}
+  </div>
+  {% if sites %}
+    <div class="control-row">
+      {% for item in sites %}
+        <a class="pill {{ 'active' if site and item.id == site.id else '' }}" href="{{ url('/forecast?site=' ~ item.id) }}">{{ item.name }}</a>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+{% if site and view %}
+  {% include "forecast/_tiles.html" %}
+  <div id="forecast-day-detail" class="day-detail"></div>
+{% else %}
+  <p class="empty">No sites configured.</p>
+{% endif %}
+{% endblock %}

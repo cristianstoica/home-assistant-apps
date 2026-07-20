@@ -1,0 +1,68 @@
+<div
+  id="forecast-tiles"
+  hx-get="{{ url('/forecast/tiles?site=' ~ site.id ~ '&fingerprint=' ~ view.fingerprint) }}"
+  hx-trigger="every 300s"
+  hx-swap="outerHTML">
+  {% if view.empty %}
+    <p class="empty">Still collecting forecasts — check back shortly.</p>
+  {% else %}
+    <p class="muted forecast-updated" data-updated-at="{{ view.updated_at }}">Updated {{ view.updated_ago }}</p>
+    <div class="tile-grid">
+      {% for tile in view.tiles %}
+        <article class="tile state-{{ tile.state }}">
+          <header class="tile-head">
+            <h3>{{ tile.label }}</h3>
+            <span class="muted">{{ tile.date_iso }}</span>
+          </header>
+          {% if tile.state == 'not_available' %}
+            <p class="empty">Not available yet</p>
+          {% else %}
+            <div class="tile-rows">
+              <div class="tile-row" {% if tile.temp.meta.available %}title="Feeds: {{ tile.temp.meta.feed_labels }}"{% endif %}>
+                <span>High / Low</span>
+                {% if tile.temp.meta.available and tile.temp.high_c is not none and tile.temp.low_c is not none %}
+                  <strong>{{ '%.0f'|format(tile.temp.high_c) }}° / {{ '%.0f'|format(tile.temp.low_c) }}°</strong>
+                {% else %}
+                  <strong class="muted">&mdash;</strong>
+                {% endif %}
+              </div>
+              <div class="tile-row" {% if tile.wind.meta.available %}title="Feeds: {{ tile.wind.meta.feed_labels }}"{% endif %}>
+                <span>Wind max</span>
+                {% if tile.wind.meta.available and tile.wind.max_kmh is not none %}
+                  <strong>{{ '%.0f'|format(tile.wind.max_kmh) }} km/h</strong>
+                {% else %}
+                  <strong class="muted">&mdash;</strong>
+                {% endif %}
+              </div>
+              <div class="tile-row" {% if tile.precip.meta.available %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Chance of rain is the share of hours at or above this site's rain threshold, not a true probability."{% endif %}>
+                <span>Rain</span>
+                {% if tile.precip.meta.available and tile.precip.total_mm is not none %}
+                  <strong>
+                    {{ '%.1f'|format(tile.precip.total_mm) }} mm
+                    {%- if tile.precip.chance_pct is not none %} &middot; {{ tile.precip.chance_pct }}%{% endif %}
+                    {%- if tile.precip.show_rain_glyph %} &#127783;{% endif %}
+                  </strong>
+                {% else %}
+                  <strong class="muted">&mdash;</strong>
+                {% endif %}
+              </div>
+            </div>
+            {% if tile.state == 'low_confidence' or tile.stale or tile.partial %}
+              <div class="tile-badges">
+                {% if tile.state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
+                {% if tile.stale %}<span class="badge warn">stale</span>{% endif %}
+                {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
+              </div>
+            {% endif %}
+            <button
+              type="button"
+              class="tile-expand"
+              hx-get="{{ url('/forecast/day?site=' ~ site.id ~ '&day=' ~ tile.day_index) }}"
+              hx-target="#forecast-day-detail"
+              hx-swap="innerHTML">Hourly</button>
+          {% endif %}
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
+</div>

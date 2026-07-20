@@ -10,10 +10,11 @@
   </head>
   <body hx-ext="json-enc" hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
     <header class="topbar">
-      <a class="brand" href="{{ url('/dashboard') }}">{{ app_title }}</a>
+      <a class="brand" href="{{ url('/') }}">{{ app_title }}</a>
       <nav class="tabs" aria-label="Primary">
-        <a class="{{ 'active' if active_page == '/sites' else '' }}" href="{{ url('/sites') }}">Sites</a>
+        <a class="{{ 'active' if active_page in ('/', '/forecast') else '' }}" href="{{ url('/forecast') }}">Forecast</a>
         <a class="{{ 'active' if active_page == '/dashboard' else '' }}" href="{{ url('/dashboard') }}">Dashboard</a>
+        <a class="{{ 'active' if active_page == '/sites' else '' }}" href="{{ url('/sites') }}">Sites</a>
         <a class="{{ 'active' if active_page == '/ops' else '' }}" href="{{ url('/ops') }}">Ops</a>
         <a class="{{ 'active' if active_page == '/overlay' else '' }}" href="{{ url('/overlay') }}">Overlay</a>
       </nav>
