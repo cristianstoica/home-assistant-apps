@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+- Added: a new Forecast landing page (replaces the previous dashboard
+  redirect at `/`) showing 8 day tiles, Today through +7. Each tile blends
+  the top-N best-verifying feeds per weather variable per day, computed from
+  existing forecast data with no new fetching.
+- Added: `forecast_blend_depth` option (default 2, range 1-6) controlling how
+  many top feeds are blended per variable/day.
+- Added: hourly HTMX drill-down per day tile, with a per-feed spread toggle.
+- Added: a minimum-coverage guard plus stale/partial badges shown when feed
+  data for a tile is incomplete.
+- Added: the forecast page auto-polls roughly every 5 minutes and leaves any
+  open day detail untouched when nothing has changed.
+- Changed: navigation now puts Forecast first, ahead of Dashboard/Sites/Ops.
+
 ## 0.4.2
 
 - Fixed: dashboard loads no longer stall behind a slow Composite recompute.
