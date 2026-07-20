@@ -25,6 +25,7 @@ from wxverify.api.routes import (
     backfill,
     dashboard,
     feeds,
+    forecast,
     health,
     sites,
     stations,
@@ -80,6 +81,7 @@ def create_app(
     app.include_router(stations.router)
     app.include_router(feeds.router)
     app.include_router(dashboard.router)
+    app.include_router(forecast.router)
     app.include_router(timeseries.router)
     app.include_router(health.router)
     app.include_router(backfill.router)

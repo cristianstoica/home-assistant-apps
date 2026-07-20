@@ -27,6 +27,7 @@ class RuntimeOptions(BaseModel):
 
     rolling_window_days: int | None = Field(default=None, ge=1, le=3650)
     min_n: int | None = Field(default=None, ge=0, le=100000)
+    forecast_blend_depth: int | None = Field(default=None, ge=1, le=6)
     obs_interval_minutes: int | None = Field(default=None, ge=30, le=1440)
     obs_jitter_minutes: int | None = Field(default=None, ge=0, le=120)
     min_interval_seconds: int | None = Field(default=None, ge=60, le=1800)
@@ -79,6 +80,7 @@ def _from_env() -> RuntimeConfig:
         options=RuntimeOptions(
             rolling_window_days=_env_int("WXV_ROLLING_WINDOW_DAYS"),
             min_n=_env_int("WXV_MIN_N"),
+            forecast_blend_depth=_env_int("WXV_FORECAST_BLEND_DEPTH"),
             obs_interval_minutes=_env_int("WXV_OBS_INTERVAL_MINUTES"),
             obs_jitter_minutes=_env_int("WXV_OBS_JITTER_MINUTES"),
             min_interval_seconds=_env_int("WXV_MIN_INTERVAL_SECONDS"),
@@ -113,6 +115,7 @@ def _from_options_json(path: Path) -> RuntimeConfig:
         options=RuntimeOptions(
             rolling_window_days=options.get("rolling_window_days"),
             min_n=options.get("min_n"),
+            forecast_blend_depth=options.get("forecast_blend_depth"),
             obs_interval_minutes=options.get("obs_interval_minutes"),
             obs_jitter_minutes=options.get("obs_jitter_minutes"),
             min_interval_seconds=options.get("min_interval_seconds"),

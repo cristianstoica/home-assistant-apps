@@ -19,6 +19,8 @@ configuration:
     name: Rolling window days
   min_n:
     name: Minimum sample count
+  forecast_blend_depth:
+    name: Forecast blend depth
   obs_interval_minutes:
     name: Observation interval
   obs_jitter_minutes:
