@@ -20,8 +20,15 @@ def set_rolling_window_days_sync(conn: sqlite3.Connection, days: int) -> None:
     if days < 1 or days > 3650:
         raise ValueError("rolling_window_days out of range")
     set_setting(conn, "rolling_window_days", str(days))
+    # Single-branch contract, run on every apply (no change detection): keep
+    # `w:all` and the CURRENT `w:{days}` slice, drop obsolete `w:N` keys. An
+    # unchanged boot re-apply preserves the usable rolling cache across
+    # restarts; a genuine value change invalidates the previous slice and the
+    # next rescore rebuilds the new one.
     conn.execute(
-        "DELETE FROM score_cache WHERE window_key LIKE 'w:%' AND window_key != 'w:all'"
+        "DELETE FROM score_cache WHERE window_key LIKE 'w:%' "
+        "AND window_key NOT IN ('w:all', ?)",
+        (f"w:{days}",),
     )
 
 

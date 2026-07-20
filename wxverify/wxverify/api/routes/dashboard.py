@@ -11,7 +11,7 @@ from wxverify.api.schemas import LeaderboardOut
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import get_db
 from wxverify.db.queue import enqueue_if_absent
-from wxverify.scoring.composite import composite as composite_query
+from wxverify.scoring.composite import composite_with_status, enqueue_composite_rescore
 from wxverify.scoring.leaderboard import LeaderboardResult, leaderboard_with_status
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.web.context import feed_label
@@ -195,9 +195,14 @@ async def winrate(
 async def composite(
     site: int = Query(...), window: str = Query("rolling")
 ) -> list[dict[str, object]]:
-    return await get_db().read(
-        lambda conn: composite_query(conn, site_id=site, window=window)
+    result = await get_db().read(
+        lambda conn: composite_with_status(conn, site_id=site, window=window)
     )
+    # Enqueue only after the read connection is released; the composite-only
+    # helper carries the terminal-failure cooldown (never `_enqueue_score`).
+    if result.status in ("stale", "rebuilding"):
+        await get_db().write(lambda conn: enqueue_composite_rescore(conn, site))
+    return result.rows
 
 
 def _lead_to_day(lead: str) -> int:
