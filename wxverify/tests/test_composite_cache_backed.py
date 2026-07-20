@@ -6,9 +6,12 @@ Covers ``composite_with_status``/``enqueue_composite_rescore`` in
 perf property that ``hit``/``stale`` never fall through to a live recompute,
 the full status matrix (``hit``/``stale``/``rebuilding``/``empty``/``live``)
 plus enqueue dedup at both enqueue sites (``/api/composite`` and the
-dashboard), the whole-window partial-snapshot contract, the terminal-failure
-enqueue cooldown, the custom-window cache bypass, and the restart cache
-preservation contract in ``wxverify/settings/service.py``.
+``/dashboard`` route -- including its default-site resolution branch, which
+``/api/composite`` never exercises), the whole-window partial-snapshot
+contract, the terminal-failure enqueue cooldown, the custom-window cache
+bypass, the restart cache preservation contract in
+``wxverify/settings/service.py``, and the write-through-read guard proving
+``composite_with_status``/``load_dashboard`` never write on the read path.
 
 Isolation: every test builds its own tmp DB via ``_init_tmp_db`` (scoring-level
 tests) or ``_start_app`` (HTTP-level tests via ``TestClient`` + an idle
@@ -55,6 +58,7 @@ from wxverify.scoring.leaderboard import resolve_window
 from wxverify.scoring.metrics import MetricResult, MetricStrategy, strategy_for
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
+from wxverify.web.context import load_dashboard
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_web_ui.py).
@@ -900,6 +904,135 @@ def test_api_composite_completed_zero_row_rebuild_never_reenqueues(
 
 
 # ---------------------------------------------------------------------------
+# Area 4b -- the SECOND composite enqueue site: dashboard_page (routes.py:
+# 51-62). Previously only /api/composite had enqueue coverage; these exercise
+# the dashboard's own enqueue-after-read call plus its default-site
+# resolution branch, which /api/composite never touches (it always takes an
+# explicit `site` id).
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_stale_cache_enqueues_exactly_once_across_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors ``test_api_composite_stale_cache_enqueues_exactly_once_across_polls``
+    but through the dashboard's enqueue call site: a full but STALE snapshot
+    is rendered (never recomputed), and the render enqueues exactly one
+    rescore job; a repeated poll against the same idle-worker job dedups to
+    the same single job.
+    """
+    app = _start_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> int:
+            set_setting(conn, "min_n", "1")
+            set_setting(conn, "rolling_window_days", "14")
+            site_id = _make_site(conn, "Dashboard Stale Dedup")
+            feed_id = _open_meteo_feed_ids(conn, 1)[0]
+            _add_temperature_cell(
+                conn, site_id=site_id, feed_id=feed_id, valid_at="2035-01-02T00:00:00Z"
+            )
+            upsert_score_cache(
+                conn,
+                site_id=site_id,
+                feed_id=feed_id,
+                variable="temperature",
+                day_ahead=1,
+                window_key="w:14",
+                result=MetricResult(n=1, skill_score=0.4, confident=True),
+                # Fixed PAST date -> stale, never the w:all/2035 always-fresh
+                # convention (that would silently skip the staleness branch).
+                computed_at="2020-01-01T00:00:00Z",
+            )
+            return site_id
+
+        site_id = db.write_sync(_seed)
+        first = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
+        assert first.status_code == 200
+        second = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
+        assert second.status_code == 200
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
+
+
+def test_dashboard_missing_snapshot_rebuilds_and_enqueues_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Dashboard counterpart to the /api/composite rebuilding-dedup test above:
+    an absent snapshot (rebuilding, empty composite rows) still enqueues
+    exactly once across repeated polls.
+    """
+    app = _start_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> int:
+            set_setting(conn, "min_n", "1")
+            set_setting(conn, "rolling_window_days", "14")
+            site_id = _make_site(conn, "Dashboard Rebuilding Dedup")
+            feed_id = _open_meteo_feed_ids(conn, 1)[0]
+            _add_temperature_cell(
+                conn, site_id=site_id, feed_id=feed_id, valid_at="2035-01-02T00:00:00Z"
+            )
+            return site_id
+
+        site_id = db.write_sync(_seed)
+        first = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
+        assert first.status_code == 200
+        second = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
+        assert second.status_code == 200
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
+
+
+def test_dashboard_default_site_resolution_enqueues_for_first_enabled_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch /api/composite structurally cannot exercise: no ``site``
+    query param at all. ``load_dashboard`` defaults to the first enabled site
+    by name (``context.py:233-237``), and ``dashboard_page``'s enqueue guard
+    (the ``isinstance(resolved_site, SiteView)`` check) fires off THAT
+    resolved site -- not whatever site happens to be seeded first in the DB.
+
+    Two enabled, independently rebuilding-eligible sites are seeded, named so
+    "AAA Default Site" sorts first (COLLATE NOCASE) and "ZZZ Other Site"
+    sorts second. The enqueue must land on the alphabetically-first site only
+    -- the second site's zero job count is the paired negative proving the
+    first site's job came from genuine default-resolution, not from every
+    site being enqueued indiscriminately.
+    """
+    app = _start_app(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> tuple[int, int]:
+            set_setting(conn, "min_n", "1")
+            set_setting(conn, "rolling_window_days", "14")
+            feed_id = _open_meteo_feed_ids(conn, 1)[0]
+            site_first = _make_site(conn, "AAA Default Site")
+            site_second = _make_site(conn, "ZZZ Other Site")
+            _add_temperature_cell(
+                conn,
+                site_id=site_first,
+                feed_id=feed_id,
+                valid_at="2035-01-02T00:00:00Z",
+            )
+            _add_temperature_cell(
+                conn,
+                site_id=site_second,
+                feed_id=feed_id,
+                valid_at="2035-01-02T00:00:00Z",
+            )
+            return site_first, site_second
+
+        site_first, site_second = db.write_sync(_seed)
+
+        response = client.get("/dashboard", params={"window": "rolling"})
+        assert response.status_code == 200
+        assert db.read_sync(lambda conn: _job_count(conn, site_first)) == 1
+        assert db.read_sync(lambda conn: _job_count(conn, site_second)) == 0
+
+
+# ---------------------------------------------------------------------------
 # Area 5 -- partial snapshot after consensus invalidation -> rebuilding, never
 # a partial aggregate over the surviving variable.
 # ---------------------------------------------------------------------------
@@ -1319,3 +1452,57 @@ def test_restart_window_change_removes_old_slice_and_preserves_all(
 
     result = composite_with_status(conn, site_id=site_id, window="rolling")
     assert result.status == "rebuilding"  # w:14 absent -- next rescore rebuilds it
+
+
+# ---------------------------------------------------------------------------
+# Area 9 -- write-through-read guard: composite_with_status/load_dashboard
+# never write on the read path.
+# ---------------------------------------------------------------------------
+
+
+def test_composite_read_functions_never_write_on_read_connection(
+    tmp_path: Path,
+) -> None:
+    """Both ``composite_with_status`` (called directly) and ``load_dashboard``
+    (which calls it internally, per ``context.py:294``'s own "Pure read ...
+    never write here" contract) must never attempt a write while resolving a
+    stale composite snapshot.
+
+    Real enforcement, not a mock: after seeding a full-but-STALE snapshot on
+    a genuine on-disk tmp DB, ``PRAGMA query_only=ON`` is set on that same
+    connection -- SQLite itself then raises ``sqlite3.OperationalError`` on
+    any attempted INSERT/UPDATE/DELETE. Both functions returning normally
+    (and still reporting ``stale``, proving they did real work rather than
+    short-circuiting) is the only way this test can pass if either one holds
+    a hidden write.
+    """
+    conn = _init_tmp_db(tmp_path)
+    set_setting(conn, "min_n", "1")
+    set_setting(conn, "rolling_window_days", "14")
+    site_id = _make_site(conn, "Write Guard")
+    feed_id = _open_meteo_feed_ids(conn, 1)[0]
+    _add_temperature_cell(
+        conn, site_id=site_id, feed_id=feed_id, valid_at="2035-01-02T00:00:00Z"
+    )
+    upsert_score_cache(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        day_ahead=1,
+        window_key="w:14",
+        result=MetricResult(n=1, skill_score=0.4, confident=True),
+        # Fixed PAST date -> stale (never w:all/2035 always-fresh), and stale
+        # is the branch most likely to tempt an opportunistic write-back.
+        computed_at="2020-01-01T00:00:00Z",
+    )
+
+    conn.execute("PRAGMA query_only=ON")
+
+    composite_result = composite_with_status(conn, site_id=site_id, window="rolling")
+    assert composite_result.status == "stale"
+
+    context = load_dashboard(
+        conn, site_id=site_id, variable="temperature", window="rolling", lead="D+1"
+    )
+    assert context["composite_status"] == "stale"
