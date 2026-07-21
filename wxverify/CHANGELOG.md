@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+- Added: Ops → Database Export downloads a consistent snapshot of the live
+  database (`VACUUM INTO`), safe to take while the worker is running.
+- Added: Ops → Database Import uploads a previously exported `.db` file and
+  fully replaces the live database with it, so an operator can edit values
+  offline and re-import instead of waiting on an in-app data migration. The
+  upload is validated (integrity check, schema version, required tables)
+  before anything is swapped, the current database is automatically backed
+  up to `/data/wxverify-<timestamp>Z.db.bak` first, and the swap happens
+  in-process (WAL-safe reopen) with no add-on restart. After a successful
+  import, consensus observations, forecast pairs, and cached scores are
+  rebuilt in the background.
+- Both endpoints are operator-only, reached the same way as the rest of the
+  add-on UI (HA ingress auth), and the existing same-origin/CSRF mutation
+  guard applies to the import upload as it does to every other write.
+
 ## 0.5.0
 
 - Added: a new Forecast landing page (replaces the previous dashboard

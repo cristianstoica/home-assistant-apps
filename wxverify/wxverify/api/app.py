@@ -24,6 +24,7 @@ from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.api.routes import (
     backfill,
     dashboard,
+    db_transfer,
     feeds,
     forecast,
     health,
@@ -85,6 +86,7 @@ def create_app(
     app.include_router(timeseries.router)
     app.include_router(health.router)
     app.include_router(backfill.router)
+    app.include_router(db_transfer.router)
     app.include_router(web_router)
 
     @app.middleware("http")

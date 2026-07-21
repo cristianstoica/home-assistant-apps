@@ -302,4 +302,59 @@
     });
   }
   setInterval(refreshRelativeTimes, 60000);
+
+  // Database import: POSTs the chosen file as a raw octet-stream body. htmx
+  // cannot send a raw file body (hx-post encodes params, and multipart would
+  // need a server-side parser), so this is a plain fetch. The CSRF token is
+  // read from the meta tag exactly as the htmx configRequest hook does; the
+  // ingress-prefixed URL is server-rendered into data-import-url.
+  document.body.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.matches("#import-run")) {
+      return;
+    }
+    var fileInput = document.getElementById("import-file");
+    var result = document.getElementById("import-result");
+    function show(text) {
+      result.hidden = false;
+      result.textContent = text;
+    }
+    var file = fileInput && fileInput.files && fileInput.files[0];
+    if (!file) {
+      show("Choose a database file first.");
+      return;
+    }
+    var confirmed = window.confirm(
+      "Replaces the ENTIRE database. Data collected since your export will be lost. A backup is saved automatically to /data. Continue?"
+    );
+    if (!confirmed) {
+      return;
+    }
+    var token = document.querySelector('meta[name="csrf-token"]').content;
+    show("Importing...");
+    fetch(target.dataset.importUrl, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "X-CSRF-Token": token,
+        "Content-Type": "application/octet-stream"
+      },
+      body: file
+    })
+      .then(function (response) {
+        return response.json().then(function (payload) {
+          if (response.ok) {
+            show(
+              "Imported. Backup saved as " + payload.backup +
+              ". Scores are rebuilding."
+            );
+          } else {
+            show(payload.error || "Import failed.");
+          }
+        });
+      })
+      .catch(function () {
+        show("Import failed.");
+      });
+  });
 })();

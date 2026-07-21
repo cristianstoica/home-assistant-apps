@@ -1,0 +1,10 @@
+<section class="panel" id="export-panel">
+  <h2>Database Export</h2>
+  <p class="panel-hint">Download a consistent snapshot of the add-on database.</p>
+  <div class="button-row">
+    {# Plain <a>, deliberately NOT htmx: a download must be a normal browser
+       navigation — an hx-get would try to swap the binary body into the DOM.
+       Content-Disposition: attachment makes the browser download instead. #}
+    <a class="pill" href="{{ url('/api/export/db') }}">Download database</a>
+  </div>
+</section>
