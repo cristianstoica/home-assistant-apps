@@ -12,6 +12,11 @@ from wxverify.api.csrf import validate_csrf
 
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
+# Raw-body upload routes allowed to POST application/octet-stream. Everything
+# else about the mutation contract (same-origin check, CSRF double-submit)
+# still applies to these paths; multipart stays rejected everywhere.
+_OCTET_STREAM_PATHS = frozenset({"/api/import/db"})
+
 
 class MutationGuard(BaseHTTPMiddleware):
     def __init__(self, app: object, *, standalone_origin: str | None = None) -> None:
@@ -31,11 +36,30 @@ class MutationGuard(BaseHTTPMiddleware):
             )
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
         has_body = int(request.headers.get("content-length", "0") or "0") > 0
-        if has_body and content_type != "application/json":
+        allowed = {"application/json"}
+        if _bare_path(request) in _OCTET_STREAM_PATHS:
+            allowed.add("application/octet-stream")
+        if has_body and content_type not in allowed:
             return JSONResponse({"error": "disallowed content-type"}, status_code=415)
         if not validate_csrf(request):
             return JSONResponse({"error": "bad csrf token"}, status_code=403)
         return await call_next(request)  # type: ignore[misc]
+
+
+def _bare_path(request: Request) -> str:
+    """Route path with the ingress ``root_path`` prefix removed.
+
+    ``IngressPathMiddleware`` runs outside this guard and PREPENDS the
+    ingress prefix to ``scope["path"]``, so ``request.url.path`` arrives
+    prefixed under ingress. Stripping the root path (the ``active_page``
+    idiom, web/render.py) yields the bare route the allowlist compares
+    against — the same path standalone and under ingress alike.
+    """
+    path = request.url.path
+    root = str(request.scope.get("root_path", "") or "").rstrip("/")
+    if root and path.startswith(root):
+        path = path[len(root) :] or "/"
+    return path
 
 
 def _origin_of(referer: str | None) -> str | None:

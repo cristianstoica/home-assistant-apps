@@ -1,0 +1,13 @@
+<section class="panel" id="import-panel">
+  <h2>Database Import</h2>
+  <p class="panel-hint">Replace the database with a previously exported file.</p>
+  <div class="button-row">
+    {# htmx deliberately NOT used: hx-post cannot send a raw file body, and
+       multipart encoding would require a server-side parser dependency.
+       The handler lives in app.js and POSTs the file as octet-stream. #}
+    <input type="file" id="import-file" accept=".db">
+    <button type="button" id="import-run"
+            data-import-url="{{ url('/api/import/db') }}">Import database</button>
+  </div>
+  <p class="empty" id="import-result" hidden></p>
+</section>
