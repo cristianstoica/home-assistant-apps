@@ -85,6 +85,9 @@ class MeteoblueAdapter:
                 "lon": req.lon,
                 "tz": "utc",
                 "format": "json",
+                "windspeed": "kmh",
+                "temperature": "C",
+                "precipitationamount": "mm",
             },
             timeout=httpx.Timeout(15.0, connect=5.0),
         )

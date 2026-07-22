@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import statistics
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Final
 
@@ -41,6 +43,86 @@ class ConsensusResult(BaseModel):
     rejected_stations: int
 
 
+def _p90(values: list[float]) -> float:
+    """Linear-interpolated 90th percentile of a non-empty list."""
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    k = (len(s) - 1) * 0.9
+    f = math.floor(k)
+    c = min(f + 1, len(s) - 1)
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _low_trim(values: list[float]) -> float:
+    """Mean after dropping the single lowest value; fewer than 2 -> plain mean."""
+    s = sorted(values)
+    core = s[1:] if len(s) >= 2 else s
+    return sum(core) / len(core)
+
+
+def _mean(values: list[float]) -> float:
+    """Arithmetic mean of a non-empty list."""
+    return sum(values) / len(values)
+
+
+def _median_mad(values: list[float], mad_floor: float) -> tuple[float, int, int] | None:
+    """Median of MAD-band inliers; returns (value, n_inliers, n_rejected)."""
+    median = statistics.median(values)
+    mad = max(statistics.median([abs(value - median) for value in values]), mad_floor)
+    band = 3.0 * MAD_TO_SIGMA * mad
+    inliers = [value for value in values if abs(value - median) <= band]
+    if not inliers:
+        return None
+    return (
+        float(statistics.median(inliers)),
+        len(inliers),
+        len(values) - len(inliers),
+    )
+
+
+def _wind_estimator(values: list[float], mad_floor: float) -> tuple[float, int, int]:
+    """p90 over all stations; no MAD filtering, so ``mad_floor`` is ignored."""
+    del mad_floor
+    return (_p90(values), len(values), 0)
+
+
+def _temperature_estimator(
+    values: list[float], mad_floor: float
+) -> tuple[float, int, int] | None:
+    """Median + MAD inlier filtering, unchanged from 0.6.0."""
+    return _median_mad(values, mad_floor)
+
+
+def _precip_estimator(
+    values: list[float], mad_floor: float
+) -> tuple[float, int, int] | None:
+    """Precip consensus — intentionally kept on median/MAD in this release.
+    A low-trimmed-mean estimator is implemented and unit-tested but is
+    deliberately not wired here until it has been validated against
+    reference precipitation data. Switching precip to the validated
+    estimator (_low_trim or _mean) is a one-line change to the return
+    line below."""
+    return _median_mad(values, mad_floor)
+
+
+# Candidate precip estimators: implemented and unit-tested in this release,
+# but NOT wired into _precip_estimator until they have been validated
+# against reference precipitation data; a follow-up release picks one.
+_GATED_PRECIP_CANDIDATES: Final[tuple[Callable[[list[float]], float], ...]] = (
+    _low_trim,
+    _mean,
+)
+
+_Estimator = Callable[[list[float], float], tuple[float, int, int] | None]
+
+_ESTIMATORS: Final[dict[str, _Estimator]] = {
+    "wind": _wind_estimator,
+    "temperature": _temperature_estimator,
+    "precip": _precip_estimator,
+}
+
+
 def compute_consensus(
     readings: list[StationReading],
     *,
@@ -57,18 +139,21 @@ def compute_consensus(
         ]
     else:
         values = [reading.value for reading in readings]
-    median = statistics.median(values)
-    mad = max(statistics.median([abs(value - median) for value in values]), mad_floor)
-    band = 3.0 * MAD_TO_SIGMA * mad
-    inliers = [value for value in values if abs(value - median) <= band]
-    if not inliers:
+    estimator = _ESTIMATORS.get(variable)
+    if estimator is None:
+        # Allowlist dispatch: an unknown variable must never silently
+        # inherit the median/MAD path.
         return None
+    estimate = estimator(values, mad_floor)
+    if estimate is None:
+        return None
+    value, n_stations, rejected_stations = estimate
     return ConsensusResult(
         variable=variable,
         valid_at=readings[0].valid_at,
-        value=float(statistics.median(inliers)),
-        n_stations=len(inliers),
-        rejected_stations=len(values) - len(inliers),
+        value=value,
+        n_stations=n_stations,
+        rejected_stations=rejected_stations,
     )
 
 

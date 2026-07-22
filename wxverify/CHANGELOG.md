@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.0
+
+- Changed: wind consensus now uses a 90th-percentile estimator across all
+  reporting stations instead of median + outlier filtering. Exposed or gusty
+  stations that read genuinely higher wind speeds were previously discarded
+  as statistical outliers; they are now counted toward the consensus value.
+- Fixed: the Meteoblue feed now explicitly requests km/h, °C, and mm units
+  from the provider instead of relying on its (locale-dependent) default,
+  preventing a unit mismatch in wind readings.
+- Temperature and precipitation consensus are unchanged in this release.
+
 ## 0.6.0
 
 - Added: Ops → Database Export downloads a consistent snapshot of the live
