@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.2
+
+- Fixed: exporting a large database through Home Assistant's ingress failed
+  on the first download attempt — the stream dropped partway with a
+  "Connection lost" error, and a browser retry was needed to complete it.
+  Export snapshots are now gzip-compressed before download, so the transfer
+  is far smaller and completes on the first attempt.
+- Changed: Ops → Database Import now automatically detects and decompresses
+  a gzipped export, while still accepting an uncompressed `.db` file. No
+  action is needed — older uncompressed exports keep importing as before.
+
 ## 0.8.1
 
 - Fixed: Ops → Database Export failed to start with a 415 error when the

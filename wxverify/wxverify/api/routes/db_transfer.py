@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import logging
+import shutil
 import sqlite3
 import time
 import uuid
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -30,11 +33,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["export"])
 
-_TMP_GLOBS = (".wxverify-export-*.db.tmp", ".wxverify-import-*.db.tmp")
+_TMP_GLOBS = (
+    ".wxverify-export-*.db.tmp",
+    ".wxverify-import-*.db.tmp",
+    # The `*.db.tmp` globs do NOT match the `.gz` sibling, so an export that
+    # dies after compress but before download would otherwise leak its gz.
+    ".wxverify-export-*.db.gz",
+)
 _STALE_AFTER_S = 3600.0
 # 256 MiB: the live DB is single-digit MBs today, and /data must hold upload
 # temp + backup + live DB simultaneously, so the cap bounds worst-case disk.
 _MAX_IMPORT_BYTES = 256 * 1024 * 1024
+# 1 MiB copy/inflate chunk: bounds the per-call decompress output (zip-bomb
+# guard) and the compress copy buffer.
+_DECOMP_CHUNK = 1 * 1024 * 1024
 _REQUIRED_TABLES = ("sites", "stations", "station_observations")
 
 
@@ -102,16 +114,31 @@ def _unlink(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+def _compress(src: Path, dst: Path) -> None:
+    """Gzip ``src`` into ``dst`` (single-member, level 6). Sync; run off-loop."""
+    with src.open("rb") as fin, gzip.open(dst, "wb", compresslevel=6) as fout:
+        shutil.copyfileobj(fin, fout, length=_DECOMP_CHUNK)
+
+
 async def _prepare_export(export_id: str, tmp: Path) -> None:
-    """Fire-and-forget snapshot: VACUUM INTO ``tmp`` off the event loop.
+    """Fire-and-forget snapshot: VACUUM INTO ``tmp``, then gzip to ``.db.gz``.
 
     Runs the sync VACUUM via the existing serialized read executor
     (``get_db().read`` -> ``asyncio.to_thread``), so the event loop is
     never blocked and the snapshot stays mutually exclusive with an import
-    swap. Terminal state is written back into the registry; a failure
-    becomes ``error`` (never a hung ``preparing``). Never re-raises a plain
-    Exception (an unretrieved task exception would only warn); re-raises
-    CancelledError after cleanup.
+    swap. The raw ``.db.tmp`` is then compressed off-loop and dropped, so
+    the served artifact is the single-member ``.db.gz`` and ``/data`` never
+    holds both for longer than one compress. Terminal state is written back
+    into the registry; a failure becomes ``error`` (never a hung
+    ``preparing``). Never re-raises a plain Exception (an unretrieved task
+    exception would only warn); re-raises CancelledError after cleanup.
+
+    Sweep invariant (do not "fix" this into a race): during compress,
+    ``job.path`` is still the raw ``.db.tmp``, so ``_sweep_stale``'s
+    ``active`` set protects the raw from unlink. The in-flight ``.db.gz`` is
+    NOT in ``active``; it rides the 3600 s mtime cutoff instead, exactly as
+    a slow VACUUM's temp does. Compress of a single-digit-MB DB is ``<<`` 1 h,
+    so the cutoff cannot reap a live gz.
     """
 
     def _snapshot(conn: sqlite3.Connection) -> None:
@@ -136,22 +163,49 @@ async def _prepare_export(export_id: str, tmp: Path) -> None:
             job.state = "error"
             job.error = "snapshot failed"
         return
+    gz = tmp.parent / f".wxverify-export-{export_id}.db.gz"
+    # Compress off-loop. `job.*` mutations stay AFTER the to_thread returns
+    # (on the loop), so the loop-only `_EXPORTS` invariant holds. Both temps
+    # are cleaned on every failure path -- nothing is ever left `preparing`.
+    try:
+        await asyncio.to_thread(_compress, tmp, gz)
+    except asyncio.CancelledError:
+        _unlink(tmp)
+        _unlink(gz)
+        job = _EXPORTS.get(export_id)
+        if job is not None:
+            job.state = "error"
+            job.error = "cancelled"
+        raise
+    except Exception:
+        logger.exception("export: compress failed")
+        _unlink(tmp)
+        _unlink(gz)
+        job = _EXPORTS.get(export_id)
+        if job is not None:
+            job.state = "error"
+            job.error = "compress failed"
+        return
+    # Raw snapshot is now redundant -- drop it immediately to bound /data.
+    _unlink(tmp)
     job = _EXPORTS.get(export_id)
     if job is None:
-        # Entry dropped (swept) mid-prepare -- don't leak the temp.
-        _unlink(tmp)
+        # Entry dropped (swept) mid-prepare -- don't leak the gz (the raw
+        # tmp is already unlinked at this point).
+        _unlink(gz)
         return
-    # The terminal size read is inside failure handling: if the temp
-    # vanished between VACUUM and stat (e.g. an over-long VACUUM let a
-    # sweep reap it), surface `error` -- never a hung `preparing`.
+    # The terminal size read is inside failure handling: if the gz vanished
+    # between compress and stat (e.g. an over-long window let a sweep reap
+    # it), surface `error` -- never a hung `preparing`.
     try:
-        size = tmp.stat().st_size
+        size = gz.stat().st_size
     except OSError:
-        logger.exception("export: snapshot temp missing after VACUUM")
-        _unlink(tmp)
+        logger.exception("export: snapshot gz missing after compress")
+        _unlink(gz)
         job.state = "error"
         job.error = "snapshot failed"
         return
+    job.path = gz
     job.state = "ready"
     job.size = size
 
@@ -218,8 +272,8 @@ async def export_download(export_id: str) -> FileResponse:
         raise ApiError(409, "export expired")
     return FileResponse(
         job.path,
-        media_type="application/octet-stream",
-        filename=f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db",
+        media_type="application/gzip",
+        filename=f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db.gz",
         background=BackgroundTask(_finish_download, export_id),
     )
 
@@ -251,24 +305,82 @@ async def import_db(request: Request) -> JSONResponse:
 
 
 async def _stream_to(request: Request, tmp: Path) -> int:
-    """Stream the raw request body into ``tmp``; return the byte count.
+    """Stream the request body into ``tmp``, auto-inflating a gzip upload.
 
-    The cap is enforced on the counted bytes (the header can lie; the
-    counter cannot).
+    The first two bytes are sniffed for the gzip magic (``1f 8b``). A gzip
+    body is inflated with a bounded per-call output cap (the zip-bomb guard);
+    a raw body is a byte-for-byte passthrough. Either way the returned count
+    is the number of bytes WRITTEN to ``tmp`` (the decompressed size for a
+    gzip upload), and the cap is enforced on that count -- the content-length
+    header bounds only the compressed upload; the counter cannot lie.
+
+    ``_compress`` emits a single-member gzip. A concatenated multi-member
+    ``.gz`` inflates only its FIRST member (``zlib.decompressobj`` leaves the
+    rest in ``unused_data``, never written), so such an upload imports its
+    first member only -- trailing members are silently discarded, not
+    rejected. The security property that holds: only the first, fully
+    integrity-checked member ever becomes the DB (no validation bypass).
     """
-    received = 0
+    written = 0
     handle = await asyncio.to_thread(tmp.open, "wb")
+    # `decomp is not None` is the gzip indicator once sniffing has decided.
+    decomp = None
+    decided = False
+    prefix = b""
     try:
         async for chunk in request.stream():
             if not chunk:
                 continue
-            received += len(chunk)
-            if received > _MAX_IMPORT_BYTES:
+            if not decided:
+                prefix += chunk
+                if len(prefix) < 2:
+                    # Cannot branch on <2 bytes: buffer and wait. Writing the
+                    # prefix raw now would corrupt a gzip upload whose first
+                    # chunk is a single byte.
+                    continue
+                decided = True
+                chunk = prefix
+                prefix = b""
+                if chunk[:2] == b"\x1f\x8b":
+                    # wbits=31 selects the gzip (not zlib/raw) container.
+                    decomp = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+            if decomp is not None:
+                try:
+                    data = chunk
+                    while data:
+                        # max_length caps output <=1 MiB/call, so the 413
+                        # fires the instant cumulative output would cross.
+                        out = decomp.decompress(data, _DECOMP_CHUNK)
+                        written += len(out)
+                        if written > _MAX_IMPORT_BYTES:
+                            raise ApiError(413, "file too large")
+                        if out:
+                            await asyncio.to_thread(handle.write, out)
+                        data = decomp.unconsumed_tail
+                except zlib.error as exc:
+                    raise ApiError(422, "not a valid gzip") from exc
+            else:
+                written += len(chunk)
+                if written > _MAX_IMPORT_BYTES:
+                    raise ApiError(413, "file too large")
+                await asyncio.to_thread(handle.write, chunk)
+        if decomp is not None:
+            try:
+                tail = decomp.flush()
+            except zlib.error as exc:
+                raise ApiError(422, "not a valid gzip") from exc
+            written += len(tail)
+            if written > _MAX_IMPORT_BYTES:
                 raise ApiError(413, "file too large")
-            await asyncio.to_thread(handle.write, chunk)
+            if tail:
+                await asyncio.to_thread(handle.write, tail)
+            if not decomp.eof:
+                # Stream ended without a complete gzip trailer: crisp
+                # truncated-stream error rather than a later integrity fail.
+                raise ApiError(422, "truncated gzip stream")
     finally:
         await asyncio.to_thread(handle.close)
-    return received
+    return written
 
 
 def _validate_upload(tmp: Path) -> None:
