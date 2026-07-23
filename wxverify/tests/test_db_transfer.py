@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gzip
 import json
 import os
 import re
@@ -35,6 +36,7 @@ from starlette.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.api.csrf import issue_csrf_pair
+from wxverify.api.errors import ApiError
 from wxverify.api.guard import MutationGuard
 from wxverify.api.routes import db_transfer
 from wxverify.db import connection as db_connection
@@ -255,9 +257,13 @@ def test_export_status_transitions_preparing_to_ready(
         }
         final = _await_ready(client, export_id)
         assert final["state"] == "ready"
-        tmp = db_dir / f".wxverify-export-{export_id}.db.tmp"
-        assert final["size"] == tmp.stat().st_size, (
-            "reported size must match the built snapshot temp on disk"
+        # 0.8.2: the served artifact is the compressed `.db.gz`; the raw
+        # `.db.tmp` is unlinked once compress succeeds, and `size` is the gz.
+        raw = db_dir / f".wxverify-export-{export_id}.db.tmp"
+        gz = db_dir / f".wxverify-export-{export_id}.db.gz"
+        assert not raw.exists(), "raw snapshot temp must be dropped after compress"
+        assert final["size"] == gz.stat().st_size, (
+            "reported size must match the compressed snapshot on disk"
         )
 
 
@@ -277,21 +283,23 @@ def test_export_download_matches_source_and_disposition(
         resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
         export_id = resp.json()["export_id"]
         _await_ready(client, export_id)
-        # Read the prepared snapshot temp BEFORE downloading -- the download's
-        # post-send background task unlinks it (mirrors X3's temp-path pattern).
-        tmp = Path(config.db_path).parent / f".wxverify-export-{export_id}.db.tmp"
-        prepared_bytes = tmp.read_bytes()
+        # Read the prepared compressed snapshot BEFORE downloading -- the
+        # download's post-send background task unlinks it (0.8.2: the served
+        # artifact is `.db.gz`; the raw `.db.tmp` is already gone).
+        gz = Path(config.db_path).parent / f".wxverify-export-{export_id}.db.gz"
+        prepared_bytes = gz.read_bytes()
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
         assert dl.status_code == 200, f"{dl.status_code}: {dl.text}"
         assert dl.content == prepared_bytes, (
-            "download must stream the prepared snapshot byte-for-byte"
+            "download must stream the prepared compressed snapshot byte-for-byte"
         )
+        assert dl.content[:2] == b"\x1f\x8b", "download must carry gzip magic"
         disposition = dl.headers.get("content-disposition", "")
         assert re.fullmatch(
-            r'attachment; filename="wxverify-\d{8}-\d{6}Z\.db"', disposition
+            r'attachment; filename="wxverify-\d{8}-\d{6}Z\.db\.gz"', disposition
         ), f"unexpected Content-Disposition: {disposition!r}"
         out = tmp_path / "downloaded.db"
-        out.write_bytes(dl.content)
+        out.write_bytes(gzip.decompress(dl.content))
         source = sqlite3.connect(config.db_path)
         try:
             source_names = {r[0] for r in source.execute("SELECT name FROM sites")}
@@ -330,7 +338,8 @@ def test_export_download_includes_uncheckpointed_wal_rows(
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
     assert dl.status_code == 200
     out = tmp_path / "downloaded.db"
-    out.write_bytes(dl.content)
+    # 0.8.2: the download is gzip-compressed -- decompress before opening it.
+    out.write_bytes(gzip.decompress(dl.content))
     exported = sqlite3.connect(str(out))
     try:
         row = exported.execute(
@@ -685,11 +694,13 @@ def test_export_glob_sweep_never_unlinks_live_preparing_temp(
 def test_export_temp_vanished_after_vacuum_surfaces_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """X17: temp reaped between VACUUM and stat -> state:error (stat OSError).
+    """X17: temp reaped right after VACUUM -> state:error (never hung preparing).
 
     Wraps the read so the snapshot temp is unlinked immediately after the real
-    VACUUM returns, simulating a concurrent reap; the `tmp.stat()` OSError
-    branch must transition the entry to `error`, never leave it `preparing`.
+    VACUUM returns, simulating a concurrent reap. 0.8.2: the reap now lands
+    during `_compress` (which reopens the raw temp), so the failure surfaces as
+    a terminal `compress failed` error rather than the old post-VACUUM stat()
+    path -- either way the entry must go terminal, never hang in `preparing`.
     """
     _init_tmp_db(tmp_path)
     db_dir = Path(config.db_path).parent
@@ -713,7 +724,10 @@ def test_export_temp_vanished_after_vacuum_surfaces_error(
         )
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
         assert dl.status_code == 409
-        assert dl.json() == {"error": "snapshot failed"}
+        # 0.8.2: the reap lands during compress (which opens the raw temp),
+        # so the terminal error is "compress failed", not the old "snapshot
+        # failed" post-VACUUM stat() path -- still terminal:error, 409 download.
+        assert dl.json() == {"error": "compress failed"}
 
 
 # --- X18: content-type allowlist gate under chunk framing (direct-app) ------
@@ -1558,3 +1572,479 @@ def test_import_fails_cleanly_when_backup_path_already_exists(
     assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
         "upload temp must still be cleaned up on this failure path"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part C -- 0.8.2 gzip transfer (G1-G13).
+# ---------------------------------------------------------------------------
+#
+# 0.8.2 gzip-compresses the export snapshot (`_compress` -> `.db.gz`) and
+# auto-detects gzip on import in `_stream_to` (2-byte magic sniff -> bounded
+# streaming inflate, 413-capped on the DECOMPRESSED size; raw passthrough for
+# non-gzip). These tests target that new surface. Byte-boundary behavior is
+# driven directly through `_stream_to` with a hand-built ASGI receive so the
+# exact chunk framing (a single-byte first chunk) is deterministic -- httpx
+# does not let a test control stream chunk boundaries.
+
+
+def _stream_request(chunks: list[bytes]) -> Request:
+    """A POST `Request` whose body streams exactly ``chunks`` in order.
+
+    The hand-built ASGI ``receive`` delivers one ``http.request`` message per
+    chunk (``more_body`` True on all but the last), giving a test byte-exact
+    control over ``request.stream()`` chunk boundaries -- the seam the gzip
+    sniff's <2-byte-prefix buffering turns on. An empty ``chunks`` yields a
+    single empty terminal message (an empty upload).
+    """
+    scope: dict[str, Any] = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/import/db",
+        "raw_path": b"/api/import/db",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "server": ("testserver", 80),
+        "client": (_NON_SUPERVISOR_IP, 12345),
+    }
+    messages: list[dict[str, Any]] = [
+        {"type": "http.request", "body": chunk, "more_body": i < len(chunks) - 1}
+        for i, chunk in enumerate(chunks)
+    ] or [{"type": "http.request", "body": b"", "more_body": False}]
+    pending = iter(messages)
+
+    async def receive() -> dict[str, Any]:
+        return next(pending, {"type": "http.request", "body": b"", "more_body": False})
+
+    return Request(scope, receive)
+
+
+def _run_stream_to(chunks: list[bytes], tmp: Path) -> int:
+    """Drive the real `_stream_to` over ``chunks``; return the written count."""
+    return asyncio.run(db_transfer._stream_to(_stream_request(chunks), tmp))  # noqa: SLF001
+
+
+# --- G1-G3: export produces gzip, downloads it, round-trips through import --
+
+
+def test_export_produces_ready_gzip_snapshot_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G1: begin -> ready gz; artifact is single-member gzip, size/path/raw
+    are the gz contract, and its decompressed bytes import byte-identically.
+
+    Pins the whole 0.8.2 export contract at once: `job.state=="ready"`,
+    `job.path` ends `.db.gz` with gzip magic, `job.size` == the gz on disk,
+    the raw `.db.tmp` was unlinked, and feeding the gz through the real import
+    inflate yields exactly `gzip.decompress(gz)` -- which is a valid SQLite DB
+    (`_validate_upload` passes). Byte-identity of the inflate is the paired
+    positive that makes the corrupt/truncated 422 tests non-vacuous.
+    """
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "Gzip Round Trip Site")  # noqa: SLF001
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        final = _await_ready(client, export_id)
+        job = db_transfer._EXPORTS[export_id]  # noqa: SLF001
+        gz_path = db_dir / f".wxverify-export-{export_id}.db.gz"
+        raw_path = db_dir / f".wxverify-export-{export_id}.db.tmp"
+
+        assert job.state == "ready"
+        assert job.path == gz_path and job.path.name.endswith(".db.gz")
+        assert not raw_path.exists(), "raw .db.tmp must be unlinked after compress"
+        gz_bytes = gz_path.read_bytes()
+        assert gz_bytes[:2] == b"\x1f\x8b", "artifact must carry gzip magic"
+        assert final["size"] == len(gz_bytes) == gz_path.stat().st_size
+
+    # The gz decompresses to a valid SQLite DB, and the real import inflate
+    # reproduces it byte-for-byte on disk.
+    decompressed = gzip.decompress(gz_bytes)
+    assert decompressed[:16] == b"SQLite format 3\x00"
+    import_tmp = tmp_path / "inflated.db"
+    written = _run_stream_to([gz_bytes], import_tmp)
+    assert written == len(decompressed)
+    assert import_tmp.read_bytes() == decompressed, (
+        "the streaming inflate must reproduce the compressed snapshot exactly"
+    )
+    db_transfer._validate_upload(import_tmp)  # must not raise  # noqa: SLF001
+
+
+def test_export_download_gzip_media_type_and_filename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G2 (surface 7): download of a ready gz job carries `application/gzip`,
+    a `.db.gz` filename, and gzip magic in its body."""
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "Gzip Download Site")  # noqa: SLF001
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        _await_ready(client, export_id)
+        dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
+    assert dl.status_code == 200
+    assert dl.headers.get("content-type") == "application/gzip", (
+        "media_type must be application/gzip"
+    )
+    disposition = dl.headers.get("content-disposition", "")
+    assert re.fullmatch(
+        r'attachment; filename="wxverify-\d{8}-\d{6}Z\.db\.gz"', disposition
+    ), f"unexpected Content-Disposition: {disposition!r}"
+    assert dl.content[:2] == b"\x1f\x8b", "download body must be gzip"
+
+
+def test_gzip_export_round_trips_end_to_end_through_http_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G3 (surface 1, end-to-end): the exact gz an export emits imports cleanly
+    over HTTP and the imported DB serves the exported site."""
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "End To End Site")  # noqa: SLF001
+        begin = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = begin.json()["export_id"]
+        _await_ready(client, export_id)
+        gz_payload = client.get(f"{_EXPORT_BASE}/download/{export_id}").content
+        assert gz_payload[:2] == b"\x1f\x8b"
+
+        resp = client.post(
+            "/api/import/db", content=gz_payload, headers=_csrf_headers(client)
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text}"
+        assert resp.json()["status"] == "imported"
+        names = {s["name"] for s in client.get("/api/sites").json()}
+    assert names == {"End To End Site"}, "imported gz must serve the exported site"
+
+
+# --- G4-G5: the 2-byte magic sniff, both branches + the <2-byte boundary ----
+
+
+def test_stream_to_sniffs_gzip_and_raw_branches(tmp_path: Path) -> None:
+    """G4 (surfaces 2 + 3): a gzip body inflates to its source; a raw SQLite
+    body passes through byte-for-byte with the inflate branch NOT taken.
+
+    The raw fixture is a real SQLite DB (magic bytes ``SQLite format 3\\x00``,
+    never ``1f 8b``), so if the sniff wrongly inflated it the write would error
+    or corrupt -- an identity match proves the raw branch was taken.
+    """
+    raw = _build_replacement_db(tmp_path, "sniff-source.db", "Sniff Site").read_bytes()
+    assert raw[:2] != b"\x1f\x8b", "a SQLite file must not look like gzip"
+
+    # gzip branch: inflates back to the exact source bytes.
+    gz_tmp = tmp_path / "from-gzip.db"
+    assert _run_stream_to([gzip.compress(raw)], gz_tmp) == len(raw)
+    assert gz_tmp.read_bytes() == raw, "gzip branch must inflate to the source"
+
+    # raw branch: byte-for-byte passthrough (paired positive).
+    raw_tmp = tmp_path / "from-raw.db"
+    assert _run_stream_to([raw], raw_tmp) == len(raw)
+    assert raw_tmp.read_bytes() == raw, "raw branch must pass through untouched"
+
+
+def test_stream_to_buffers_sub_two_byte_first_chunk(tmp_path: Path) -> None:
+    """G5 (surface 3, R3 boundary): a gzip upload whose FIRST chunk is the
+    single magic byte ``\\x1f`` must still be detected and round-trip.
+
+    Proves the <2-byte prefix is BUFFERED, not written raw: if the lone
+    ``\\x1f`` were written to the raw branch, the inflate would never run and
+    the tmp would differ. Paired with a raw upload whose first chunk is a
+    single byte -- that must pass through intact (the buffered prefix flushes
+    correctly to the raw branch too).
+    """
+    payload = b"single-member gzip payload " * 40
+    gz = gzip.compress(payload)
+    assert gz[:1] == b"\x1f"
+
+    # gzip, first chunk == lone magic byte, remainder in the next chunk.
+    gz_tmp = tmp_path / "split-gzip.db"
+    written = _run_stream_to([gz[:1], gz[1:]], gz_tmp)
+    assert written == len(payload)
+    assert gz_tmp.read_bytes() == payload, (
+        "a single-byte first chunk must be buffered, not written raw"
+    )
+
+    # raw, first chunk == single byte (paired positive): passes through intact.
+    raw = b"RAW-not-gzip payload bytes " * 40
+    assert raw[:2] != b"\x1f\x8b"
+    raw_tmp = tmp_path / "split-raw.db"
+    assert _run_stream_to([raw[:1], raw[1:]], raw_tmp) == len(raw)
+    assert raw_tmp.read_bytes() == raw, "buffered single-byte prefix must flush raw"
+
+
+# --- G6: zip-bomb bound -> 413, disk stays bounded --------------------------
+
+
+def test_gzip_zip_bomb_rejected_413_and_disk_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G6 (surface 4): a gzip whose DECOMPRESSED size crosses the cap -> 413,
+    and the on-disk tmp never exceeds the cap (the 413 fires before full
+    expansion). Paired with a gzip UNDER the same cap that inflates fully."""
+    cap = 4096
+    monkeypatch.setattr("wxverify.api.routes.db_transfer._MAX_IMPORT_BYTES", cap)
+
+    # Paired positive: comfortably under the cap -> inflates fully.
+    under = b"under the cap"
+    ok_tmp = tmp_path / "under.db"
+    assert _run_stream_to([gzip.compress(under)], ok_tmp) == len(under)
+    assert ok_tmp.read_bytes() == under
+
+    # Bomb: 2 MiB of zeros compresses tiny but expands far past the cap.
+    bomb = gzip.compress(b"\x00" * (2 * 1024 * 1024))
+    bomb_tmp = tmp_path / "bomb.db"
+    with pytest.raises(ApiError) as exc:
+        _run_stream_to([bomb], bomb_tmp)
+    assert exc.value.status_code == 413
+    assert bomb_tmp.stat().st_size <= cap, (
+        "413 must fire before the decompressed payload is fully written to disk"
+    )
+
+
+# --- G7-G8: corrupt / truncated gzip -> 422 (never 500) ---------------------
+
+
+def test_import_corrupt_gzip_returns_422_not_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G7 (surface 5, R2): magic present but a corrupt payload -> 422 "not a
+    valid gzip" (NOT a 500), live DB untouched, no leaked import temp.
+
+    Uses a deterministic corrupt payload (magic + an invalid compression-method
+    byte) rather than `os.urandom`, so the zlib.error branch -- and thus the
+    exact 422 message -- is pinned rather than probabilistic.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Corrupt Guard Site")
+    conn.commit()
+    # `1f 8b` magic, then method byte 0x00 (valid gzip requires 0x08=deflate):
+    # zlib raises immediately on the header -> the decompress-loop 422.
+    corrupt = b"\x1f\x8b" + b"\x00" * 4096
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/import/db", content=corrupt, headers=_csrf_headers(client)
+        )
+        assert resp.status_code == 422, f"expected 422; got {resp.status_code}"
+        assert resp.json() == {"error": "not a valid gzip"}
+        names = {s["name"] for s in client.get("/api/sites").json()}
+    assert names == {"Corrupt Guard Site"}, "live DB must be untouched"
+    db_dir = Path(config.db_path).parent
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        "import temp must be cleaned up on a corrupt-gzip 422"
+    )
+
+
+def test_import_truncated_gzip_returns_422(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G8 (surface 6, A2): a valid gzip cut off before its 8-byte trailer ->
+    422 "truncated gzip stream". Paired positive: the full gzip imports (200).
+
+    Truncation drops only the trailer, so the deflate body decodes without a
+    zlib.error; the miss is caught by the post-stream ``decomp.eof`` check --
+    distinct from the corrupt-payload path (G7).
+    """
+    _init_tmp_db(tmp_path)
+    b_path = _build_replacement_db(tmp_path, "trunc-source.db", "Trunc Site")
+    valid_gz = gzip.compress(b_path.read_bytes())
+    truncated = valid_gz[:-8]  # strip exactly the CRC32 + ISIZE trailer
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        bad = client.post("/api/import/db", content=truncated, headers=headers)
+        assert bad.status_code == 422, f"expected 422; got {bad.status_code}"
+        assert bad.json() == {"error": "truncated gzip stream"}
+
+        # Paired positive: the intact gzip imports cleanly.
+        ok = client.post(
+            "/api/import/db", content=valid_gz, headers=_csrf_headers(client)
+        )
+    assert ok.status_code == 200, f"intact gzip must import: {ok.text}"
+    db_dir = Path(config.db_path).parent
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        "import temp must be cleaned up on a truncated-gzip 422"
+    )
+
+
+# --- G9: empty upload -> 422 on both branches -------------------------------
+
+
+def test_import_empty_upload_returns_422_both_branches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G9 (surface 10): a raw empty body AND a gzip-of-empty (decompresses to
+    zero bytes) both -> 422 "empty upload". Paired positive: a non-empty valid
+    import returns 200, so the 422 is not a blanket rejection."""
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    empty_gz = gzip.compress(b"")
+    assert empty_gz[:2] == b"\x1f\x8b" and gzip.decompress(empty_gz) == b""
+    with TestClient(app, raise_server_exceptions=False) as client:
+        raw_empty = client.post(
+            "/api/import/db", content=b"", headers=_csrf_headers(client)
+        )
+        assert raw_empty.status_code == 422, f"raw empty: {raw_empty.status_code}"
+        assert raw_empty.json() == {"error": "empty upload"}
+
+        gz_empty = client.post(
+            "/api/import/db", content=empty_gz, headers=_csrf_headers(client)
+        )
+        assert gz_empty.status_code == 422, f"gzip-of-empty: {gz_empty.status_code}"
+        assert gz_empty.json() == {"error": "empty upload"}
+
+        # Paired positive: a real payload still imports.
+        b_path = _build_replacement_db(tmp_path, "nonempty.db", "Non Empty Site")
+        ok = client.post(
+            "/api/import/db",
+            content=b_path.read_bytes(),
+            headers=_csrf_headers(client),
+        )
+    assert ok.status_code == 200, f"non-empty import must succeed: {ok.text}"
+
+
+# --- G10: multi-member gzip decodes first member, then rejected -------------
+
+
+def test_import_multi_member_gzip_is_not_a_validation_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G10 (design note): only single-member gzip is supported -- the inflate
+    honors just the FIRST member and routes trailing members to zlib's
+    `unused_data`. The safety property under test: extra members cannot smuggle
+    content past validation. A two-member gzip whose first member is only HALF
+    a DB decodes to that truncated (corrupt) DB and is rejected by the existing
+    integrity_check (422), NOT silently accepted.
+
+    Paired positive: the same DB as a single, complete member imports (200).
+
+    (Finding reported alongside this suite: a multi-member gzip whose first
+    member IS a complete valid DB imports that member and ignores the rest --
+    benign, since the imported content is still fully integrity-checked, but it
+    is the reason this test splits the DB rather than appending garbage.)
+    """
+    _init_tmp_db(tmp_path)
+    db_bytes = _build_replacement_db(tmp_path, "member.db", "Member Site").read_bytes()
+    single = gzip.compress(db_bytes)
+    half = len(db_bytes) // 2
+    # Two members, each a valid gzip, but member 1 is only the first half of the
+    # DB -> decoding member 1 alone yields a truncated, corrupt SQLite file.
+    multi = gzip.compress(db_bytes[:half]) + gzip.compress(db_bytes[half:])
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        bad = client.post(
+            "/api/import/db", content=multi, headers=_csrf_headers(client)
+        )
+        assert bad.status_code == 422, (
+            f"multi-member (partial first member) must be rejected; "
+            f"got {bad.status_code}: {bad.text}"
+        )
+        # Paired positive: the single-member form of the same DB imports.
+        ok = client.post(
+            "/api/import/db", content=single, headers=_csrf_headers(client)
+        )
+    assert ok.status_code == 200, f"single-member gzip must import: {ok.text}"
+
+
+# --- G11-G12: export compress-failure paths mark terminal error, clean temps -
+
+
+def test_export_compress_failure_terminal_error_cleans_temps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G11 (surface 8a): `_compress` raising -> job terminal `error`
+    ("compress failed"), NOT hung `preparing`; both the raw temp and any gz are
+    cleaned; download -> 409 with the error."""
+    _init_tmp_db(tmp_path)
+
+    def _boom(_src: Path, _dst: Path) -> None:
+        raise RuntimeError("synthetic compress failure")
+
+    monkeypatch.setattr(db_transfer, "_compress", _boom)
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        final = _await_ready(client, export_id)
+        assert final == {"state": "error"}, "compress failure must be terminal:error"
+        dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
+        assert dl.status_code == 409
+        assert dl.json() == {"error": "compress failed"}
+    assert list(db_dir.glob(".wxverify-export-*.db.tmp")) == [], (
+        "raw temp must be unlinked on compress failure"
+    )
+    assert list(db_dir.glob(".wxverify-export-*.db.gz")) == [], (
+        "any partial gz must be unlinked on compress failure"
+    )
+
+
+def test_export_compress_cancelled_marks_error_reraises_cleans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G12 (surface 8b): a CancelledError during compress must mark the entry
+    terminal `error`/"cancelled", re-raise the CancelledError, and unlink both
+    temps -- never leave the entry hung in `preparing` (the sweep skips
+    `preparing` forever).
+
+    Drives `_prepare_export` directly and injects the cancel at the compress
+    step (deterministic: the exact `except asyncio.CancelledError` cleanup
+    branch is exercised without a thread-timing race).
+    """
+    _init_tmp_db(tmp_path)
+    db_dir = Path(config.db_path).parent
+    export_id = "cancelprobe0000000000000000000000"
+    tmp = db_dir / f".wxverify-export-{export_id}.db.tmp"
+    gz = db_dir / f".wxverify-export-{export_id}.db.gz"
+    db_transfer._EXPORTS[export_id] = db_transfer._ExportJob(  # noqa: SLF001
+        state="preparing", path=tmp, created_at=time.time()
+    )
+
+    def _cancel(_src: Path, _dst: Path) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(db_transfer, "_compress", _cancel)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(db_transfer._prepare_export(export_id, tmp))  # noqa: SLF001
+
+    job = db_transfer._EXPORTS[export_id]  # noqa: SLF001
+    assert job.state == "error" and job.error == "cancelled", (
+        "cancellation must mark terminal:error, never leave it preparing"
+    )
+    assert not tmp.exists(), "raw temp must be unlinked on cancellation"
+    assert not gz.exists(), "any partial gz must be unlinked on cancellation"
+
+
+# --- G13: the sweep reaps orphaned `.db.gz` --------------------------------
+
+
+def test_export_begin_sweeps_stale_gz_keeps_fresh_gz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """G13 (surface 9): `_TMP_GLOBS` now covers `.wxverify-export-*.db.gz`, so
+    begin's sweep unlinks an aged orphaned gz and keeps a fresh one.
+
+    Paired on mtime alone (both unregistered): the stale gz (mtime past
+    `_STALE_AFTER_S`) is reaped; the fresh gz survives -- so the survival is
+    attributable to age, and the reaping to the new glob covering `.gz`.
+    """
+    _init_tmp_db(tmp_path)
+    db_dir = Path(config.db_path).parent
+    stale = db_dir / ".wxverify-export-stalegz00000000000000000000000.db.gz"
+    fresh = db_dir / ".wxverify-export-freshgz00000000000000000000000.db.gz"
+    stale.write_bytes(gzip.compress(b"stale export"))
+    fresh.write_bytes(gzip.compress(b"fresh export"))
+    old_time = time.time() - 7200
+    os.utime(stale, (old_time, old_time))
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        assert resp.status_code == 202
+        assert not stale.exists(), "an aged orphaned .db.gz must be swept on begin"
+        assert fresh.exists(), "a fresh .db.gz must survive the sweep"
+        _await_ready(client, resp.json()["export_id"])
