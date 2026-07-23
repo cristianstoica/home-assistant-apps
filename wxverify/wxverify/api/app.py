@@ -130,12 +130,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     worker.add_done_callback(
         lambda task: _stop_on_worker_done(task, app.state.stop_process)
     )
+    # Retain-and-resume: downloaded exports are NOT deleted post-send, so the
+    # export TTL sweep must run on a timer (not only on `/begin`) to reap a
+    # retained snapshot when no further export is ever started.
+    export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
     await publish_discovery(app.state.bind_port)
     try:
         yield
     finally:
         logger.info("worker stopping")
+        export_sweeper.cancel()
         worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await export_sweeper
         with contextlib.suppress(asyncio.CancelledError):
             await worker
 

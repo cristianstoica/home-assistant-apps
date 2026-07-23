@@ -283,9 +283,12 @@ def test_export_download_matches_source_and_disposition(
         resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
         export_id = resp.json()["export_id"]
         _await_ready(client, export_id)
-        # Read the prepared compressed snapshot BEFORE downloading -- the
-        # download's post-send background task unlinks it (0.8.2: the served
-        # artifact is `.db.gz`; the raw `.db.tmp` is already gone).
+        # Read the prepared compressed snapshot to compare byte-for-byte. The
+        # served artifact is the `.db.gz` (the raw `.db.tmp` was dropped at
+        # compress). Retain-and-resume: the gz is NOT unlinked post-download --
+        # it persists (see test_export_download_retains_artifact_and_registry_entry
+        # and the Range-resume regression), so reading it before or after the
+        # GET is equivalent.
         gz = Path(config.db_path).parent / f".wxverify-export-{export_id}.db.gz"
         prepared_bytes = gz.read_bytes()
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
@@ -352,13 +355,20 @@ def test_export_download_includes_uncheckpointed_wal_rows(
     )
 
 
-def test_export_download_cleans_up_temp_and_entry(
+def test_export_download_retains_artifact_and_registry_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """X6: a successful download unlinks the temp AND pops the registry entry.
+    """X6: a successful download RETAINS the .db.gz AND its registry entry.
 
-    `TestClient` runs `BackgroundTask(_finish_download)` inline before the GET
-    returns, so both effects are observable immediately after download.
+    Retain-and-resume: the post-send ``BackgroundTask(_finish_download)`` was
+    removed, so a downloaded export is deliberately NOT deleted -- the identical
+    file is served on every subsequent GET (repeat download or ``Range:``
+    resume). Cleanup is entirely the TTL sweep's job (``run_export_sweeper`` /
+    on-``/begin`` ``_sweep_registry``), covered separately.
+
+    The raw ``.db.tmp`` glob-empty assertion still holds: the raw snapshot is
+    unlinked at compress time, well before download; only the served ``.db.gz``
+    persists.
     """
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
@@ -370,10 +380,84 @@ def test_export_download_cleans_up_temp_and_entry(
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
         assert dl.status_code == 200
         assert list(db_dir.glob(".wxverify-export-*.db.tmp")) == [], (
-            "temp must be unlinked after a successful download"
+            "raw snapshot temp must already be unlinked (dropped at compress)"
         )
-        assert export_id not in db_transfer._EXPORTS, (  # noqa: SLF001
-            "registry entry must be popped after a successful download"
+        gz = db_dir / f".wxverify-export-{export_id}.db.gz"
+        assert gz.exists(), (
+            "the served .db.gz must SURVIVE the download (retain-and-resume): "
+            "restoring BackgroundTask(_finish_download) would turn this red"
+        )
+        job = db_transfer._EXPORTS.get(export_id)  # noqa: SLF001
+        assert job is not None and job.state == "ready", (
+            "registry entry must be RETAINED (state=ready) after a download"
+        )
+
+
+def test_export_download_range_resume_and_repeat_get(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """X6b (retain-and-resume regression): a retained export serves a `Range:`
+    resume (206) and a plain repeat GET (200, full bytes) against the same id.
+
+    This is the exact bug's oracle. The old one-shot
+    ``BackgroundTask(_finish_download)`` deleted the gz and popped the entry
+    after the FIRST send, so a browser's auto-resume `Range:` GET to the same
+    URL 404'd ("unknown export id"). With the file retained, Starlette's
+    ``FileResponse`` serves the identical bytes every time, so:
+
+    - `Range: bytes=<half>-` -> 206 + correct `Content-Range` + `Accept-Ranges:
+      bytes`, body == the corresponding tail slice of the full gz;
+    - a plain repeat GET -> 200 with the full bytes, entry + gz still present.
+
+    Under the removed BackgroundTask both follow-up GETs would 404 -- so this
+    goes red on the unfixed code for the right reason.
+    """
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "Resume Site")  # noqa: SLF001
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        _await_ready(client, export_id)
+
+        # First full download establishes the served byte string.
+        first = client.get(f"{_EXPORT_BASE}/download/{export_id}")
+        assert first.status_code == 200
+        full = first.content
+        assert len(full) > 1, "gz must be non-trivial to slice a Range"
+        assert first.headers.get("accept-ranges") == "bytes", (
+            "a retained file response must advertise byte-range support"
+        )
+
+        # Resume from the midpoint: 206 + exact Content-Range + tail bytes.
+        start = len(full) // 2
+        ranged = client.get(
+            f"{_EXPORT_BASE}/download/{export_id}",
+            headers={"Range": f"bytes={start}-"},
+        )
+        assert ranged.status_code == 206, (
+            f"Range resume must return 206, got {ranged.status_code} "
+            "(the removed BackgroundTask would 404 the resumed id)"
+        )
+        assert ranged.headers.get("accept-ranges") == "bytes"
+        assert ranged.headers.get("content-range") == (
+            f"bytes {start}-{len(full) - 1}/{len(full)}"
+        ), f"unexpected Content-Range: {ranged.headers.get('content-range')!r}"
+        assert ranged.content == full[start:], (
+            "resumed bytes must equal the corresponding slice of the full gz"
+        )
+
+        # Plain repeat GET: the artifact is reusable -- full bytes again, 200.
+        repeat = client.get(f"{_EXPORT_BASE}/download/{export_id}")
+        assert repeat.status_code == 200, "a retained export must serve a repeat GET"
+        assert repeat.content == full, "repeat GET must return the identical bytes"
+
+        assert (db_dir / f".wxverify-export-{export_id}.db.gz").exists(), (
+            "the gz must still exist after multiple downloads"
+        )
+        assert export_id in db_transfer._EXPORTS, (  # noqa: SLF001
+            "the registry entry must persist across repeat/Range downloads"
         )
 
 
@@ -538,6 +622,98 @@ def test_export_begin_registry_sweep_reaps_abandoned_terminal_entry(
         )
         assert prep_temp.exists(), "a skipped preparing entry's temp must survive"
         _await_ready(client, resp.json()["export_id"])
+
+
+def test_sweep_registry_reaps_backdated_retained_ready_export(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """X12b: a downloaded-but-retained `ready` export is TTL-reaped by the sweep.
+
+    Retain-and-resume leaves a downloaded export's ``.db.gz`` and its registry
+    entry in place, so ``_sweep_registry`` is now the ONLY thing that reaps a
+    downloaded-then-never-exported-again snapshot. Directly invoke it (no clock
+    sleep): a back-dated (created_at older than ``_STALE_AFTER_S``) ``ready``
+    entry whose path is the served ``.db.gz`` must have the gz unlinked and the
+    entry popped. Paired positive: a FRESH ``ready`` entry + its gz survive the
+    same sweep -- so the reap is attributable to the age cutoff, not to a blanket
+    clear.
+    """
+    _init_tmp_db(tmp_path)
+    db_dir = Path(config.db_path).parent
+    stale_old = time.time() - db_transfer._STALE_AFTER_S - 1  # noqa: SLF001
+
+    stale_gz = db_dir / ".wxverify-export-staleready0000000000000000000000.db.gz"
+    stale_gz.write_bytes(b"\x1f\x8b\x08stale-retained-gz")
+    db_transfer._EXPORTS["staleready"] = db_transfer._ExportJob(  # noqa: SLF001
+        state="ready", path=stale_gz, created_at=stale_old, size=stale_gz.stat().st_size
+    )
+    fresh_gz = db_dir / ".wxverify-export-freshready0000000000000000000000.db.gz"
+    fresh_gz.write_bytes(b"\x1f\x8b\x08fresh-retained-gz")
+    db_transfer._EXPORTS["freshready"] = db_transfer._ExportJob(  # noqa: SLF001
+        state="ready",
+        path=fresh_gz,
+        created_at=time.time(),
+        size=fresh_gz.stat().st_size,
+    )
+
+    db_transfer._sweep_registry()  # noqa: SLF001
+
+    assert "staleready" not in db_transfer._EXPORTS, (  # noqa: SLF001
+        "a back-dated retained `ready` export must be reaped by _sweep_registry"
+    )
+    assert not stale_gz.exists(), "the reaped export's .db.gz must be unlinked"
+    assert "freshready" in db_transfer._EXPORTS, (  # noqa: SLF001
+        "a fresh `ready` export must survive the sweep (age-cutoff, not blanket)"
+    )
+    assert fresh_gz.exists(), "a fresh retained export's .db.gz must survive"
+
+
+def test_run_export_sweeper_loop_reaps_on_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """X12c: the lifespan ``run_export_sweeper`` loop reaps a stale retained
+    entry on a tick -- driven deterministically, never a 300 s real sleep.
+
+    The tick period is patched to 0 and the loop's ``_sweep_registry`` is wrapped
+    to signal an ``asyncio.Event`` the moment it fires; the task is cancelled as
+    soon as the event is set (via ``wait_for``, not a wall-clock poll). This
+    pins that the loop actually calls the sweep on the API event loop, not just
+    that the sweep function works in isolation.
+    """
+    _init_tmp_db(tmp_path)
+    db_dir = Path(config.db_path).parent
+    stale_old = time.time() - db_transfer._STALE_AFTER_S - 1  # noqa: SLF001
+    stale_gz = db_dir / ".wxverify-export-loopstale00000000000000000000000.db.gz"
+    stale_gz.write_bytes(b"\x1f\x8b\x08loop-stale-gz")
+    db_transfer._EXPORTS["loopstale"] = db_transfer._ExportJob(  # noqa: SLF001
+        state="ready", path=stale_gz, created_at=stale_old, size=stale_gz.stat().st_size
+    )
+
+    real_sweep = db_transfer._sweep_registry  # noqa: SLF001
+
+    async def _drive() -> None:
+        fired = asyncio.Event()
+
+        def _wrapped_sweep() -> None:
+            real_sweep()
+            fired.set()
+
+        monkeypatch.setattr(db_transfer, "_SWEEP_INTERVAL_S", 0)
+        monkeypatch.setattr(db_transfer, "_sweep_registry", _wrapped_sweep)
+        task = asyncio.create_task(db_transfer.run_export_sweeper())
+        try:
+            await asyncio.wait_for(fired.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_drive())
+
+    assert "loopstale" not in db_transfer._EXPORTS, (  # noqa: SLF001
+        "the sweeper loop must reap a back-dated retained entry on a tick"
+    )
+    assert not stale_gz.exists(), "the loop-reaped export's .db.gz must be unlinked"
 
 
 def test_export_expired_ready_entry_returns_409(

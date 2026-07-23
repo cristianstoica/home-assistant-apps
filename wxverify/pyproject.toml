@@ -1,6 +1,6 @@
 [project]
 name = "wxverify"
-version = "0.8.2"
+version = "0.8.3"
 description = "Weather forecast verification add-on for Home Assistant"
 requires-python = ">=3.13,<3.14"
 dependencies = [
