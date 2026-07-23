@@ -1,5 +1,5 @@
 name: "Weather Verify"
-version: "0.8.4"
+version: "0.8.5"
 slug: wxverify
 description: "Verify weather-forecast accuracy via cluster-consensus ground truth"
 url: "https://github.com/cristianstoica/home-assistant-apps/tree/main/wxverify"

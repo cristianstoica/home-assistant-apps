@@ -358,16 +358,18 @@
       });
   });
 
-  // Database export: prepare-then-stream. A plain GET download would hold the
-  // request open (no headers) through VACUUM INTO and trip HA ingress's
-  // response-start timeout, so this POSTs /begin (with CSRF), polls /status
-  // until ready, then fetch()es /download and saves the body as a local Blob.
-  // The fetch is deliberate: triggering the download by navigating a bare
-  // <a> routes it through Firefox/Zen's legacy navigation-download channel,
-  // which Cloudflare/ingress cancels at ~30 s on large files; the Fetch
-  // channel is not subject to that cut. The status/download GETs are safe
-  // methods and carry no CSRF; begin sends no body/Content-Type so the
-  // mutation guard's allowlist is not exercised.
+  // Database export: prepare-then-chunked-download. A plain GET download would
+  // hold the request open (no headers) through VACUUM INTO and trip HA
+  // ingress's response-start timeout, so this POSTs /begin (with CSRF), polls
+  // /status until ready, then downloads the retained gz in bounded Range
+  // requests and assembles a local Blob. Live capture showed the cutoff is NOT
+  // channel-specific: a single long streaming response is cut at ~30 s through
+  // Supervisor's ingress proxy on BOTH the navigation and Fetch channels (a
+  // 200 was returned to the Fetch while Supervisor logged a stream Connection
+  // lost at the same instant). The robust property is that no single response
+  // lives long enough to be cut — each ~4 MB Range chunk completes in seconds.
+  // The status/download GETs are safe methods and carry no CSRF; begin sends
+  // no body/Content-Type so the mutation guard's allowlist is not exercised.
   document.body.addEventListener("click", function (event) {
     var target = event.target;
     if (!target || !target.matches("#export-run")) {
@@ -415,7 +417,7 @@
         })
         .then(function (payload) {
           if (payload.state === "ready") {
-            triggerDownload(base + "/download/" + exportId);
+            triggerDownload(base + "/download/" + exportId, payload.size);
             show("Download started.");
           } else if (payload.state === "error") {
             show("Export failed.");
@@ -485,51 +487,123 @@
       result.appendChild(link);
     }
 
-    // Downloads on the normal Fetch channel (not the legacy navigation-download
-    // channel that Cloudflare/ingress cuts at ~30 s), streaming the body so the
-    // status line can show bytes received. Ingress strips Content-Length
-    // (chunked), so total size is unknown → bytes only, no percentage.
-    function triggerDownload(downloadUrl) {
+    // Bounded-Range chunked download: fetch the retained gz in sequential
+    // ~4 MB Range requests, each of which completes in a few seconds (far under
+    // the ~30 s ingress cutoff), then assemble the parts into one local Blob.
+    // No single response lives long enough to be cut, and a ~4 MB chunk also
+    // stays under Supervisor's streaming threshold (~4,194,000 bytes) so each
+    // takes the buffered/simple-response path — but correctness does not depend
+    // on that exact constant. Needs the total byte size (from the ready status
+    // payload) to compute chunk boundaries; if it is missing or zero, fall back
+    // to the retained-file link rather than guessing. Any per-chunk failure
+    // (non-206, wrong length, network error) retries that chunk up to 3 times,
+    // then falls through to showFallbackLink (the 0.8.3 retained file + the
+    // browser's native download / Firefox Retry still survive).
+    function triggerDownload(downloadUrl, totalSize) {
+      var total = Number(totalSize);
+      if (!Number.isFinite(total) || total <= 0) {
+        showFallbackLink(
+          "Export ready, but its size is unknown. Use this link to save it:",
+          downloadUrl,
+          "wxverify-export.db.gz"
+        );
+        return;
+      }
+      var CHUNK_SIZE = 4000000;
       var filename = "wxverify-export.db.gz";
+      var parts = [];
+      var received = 0;
       show("Downloading...");
-      fetch(downloadUrl, { credentials: "same-origin" })
-        .then(function (response) {
-          if (!response.ok) {
-            throw new Error("download failed");
-          }
-          filename = parseFilename(response);
-          if (!response.body || !response.body.getReader) {
-            return response.blob().then(function (blob) {
-              saveBlob(blob, filename);
-              show("Download complete. Saved.");
-            });
-          }
-          var reader = response.body.getReader();
-          var chunks = [];
-          var received = 0;
-          function pump() {
-            return reader.read().then(function (chunk) {
-              if (chunk.done) {
-                var blob = new Blob(chunks, { type: "application/gzip" });
-                saveBlob(blob, filename);
-                show("Download complete. Saved.");
-                return;
-              }
-              chunks.push(chunk.value);
-              received += chunk.value.length;
-              show("Downloading... " + formatBytes(received));
-              return pump();
-            });
-          }
-          return pump();
+
+      function fail() {
+        showFallbackLink(
+          "Download failed. Use this link to save the retained file:",
+          downloadUrl,
+          filename
+        );
+      }
+
+      // Fetch [start, end] as a 206 Range request, retrying that chunk up to
+      // `attemptsLeft` total tries before rejecting. Resolves the chunk's
+      // ArrayBuffer once its status, Content-Range, and byte length all check.
+      function fetchChunk(start, attemptsLeft) {
+        var end = Math.min(start + CHUNK_SIZE - 1, total - 1);
+        var expected = end - start + 1;
+        return fetch(downloadUrl, {
+          credentials: "same-origin",
+          headers: { Range: "bytes=" + start + "-" + end }
         })
-        .catch(function () {
-          showFallbackLink(
-            "Download failed. Use this link to save the retained file:",
-            downloadUrl,
-            filename
-          );
-        });
+          .then(function (response) {
+            if (response.status !== 206) {
+              throw new Error("expected 206, got " + response.status);
+            }
+            var contentRange = response.headers.get("Content-Range");
+            if (!contentRange) {
+              throw new Error("missing Content-Range");
+            }
+            var m = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+            if (!m) {
+              throw new Error("bad Content-Range: " + contentRange);
+            }
+            if (Number(m[1]) !== start || Number(m[3]) !== total) {
+              throw new Error(
+                "Content-Range " + contentRange + " != bytes " +
+                  start + "-" + end + "/" + total
+              );
+            }
+            if (start === 0) {
+              filename = parseFilename(response);
+            }
+            return response.arrayBuffer();
+          })
+          .then(function (buffer) {
+            if (buffer.byteLength !== expected) {
+              throw new Error(
+                "chunk length " + buffer.byteLength + " != " + expected
+              );
+            }
+            return buffer;
+          })
+          .catch(function (err) {
+            if (attemptsLeft > 1) {
+              return fetchChunk(start, attemptsLeft - 1);
+            }
+            throw err;
+          });
+      }
+
+      // Sequential chunk loop, mirroring the recursive pump() reader: each
+      // chunk is fetched only after the previous one lands, so at most one
+      // chunk is in flight and only one failure path can fire.
+      function nextChunk(start) {
+        if (start >= total) {
+          var blob = new Blob(parts, { type: "application/gzip" });
+          if (blob.size !== total) {
+            fail();
+            return;
+          }
+          saveBlob(blob, filename);
+          show("Download complete. Saved.");
+          return;
+        }
+        fetchChunk(start, 3)
+          .then(function (buffer) {
+            parts.push(buffer);
+            received += buffer.byteLength;
+            show(
+              "Downloading... " +
+                formatBytes(received) +
+                " / " +
+                formatBytes(total)
+            );
+            nextChunk(start + CHUNK_SIZE);
+          })
+          .catch(function () {
+            fail();
+          });
+      }
+
+      nextChunk(0);
     }
   });
 })();
