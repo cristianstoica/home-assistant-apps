@@ -25,6 +25,19 @@ from wxverify.core.timeutil import parse_utc
 # hours rather than a fraction, per the spec.
 MIN_COVERAGE_HOURS = 18
 
+# A feed needs enough distinct local hours for its daily high/low to be
+# meaningful: with contiguous-from-midnight partial coverage, the feed must
+# reach far enough into the day to catch the afternoon peak, not just the
+# overnight minimum. This selection-preference floor is deliberately BELOW
+# MIN_COVERAGE_HOURS (the >= 18h "full day covered" badge gate) so a feed can
+# be preferred for selection yet still flagged partial.
+MIN_SPREAD_HOURS = 12
+
+# Absolute degeneracy floor: a feed covering fewer than this many distinct
+# local hours cannot express ANY daily spread (a single point has max == min),
+# so it must never be the sole selected feed while a multi-point feed exists.
+MULTIPOINT_MIN_HOURS = 2
+
 
 def display_day_index(valid_at: str, *, timezone: str, now: datetime) -> int:
     """Now-relative local-day index of a sample: 0 = Today tile, 1 = Tomorrow.

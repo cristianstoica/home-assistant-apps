@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+from wxverify.forecast.aggregate import MIN_SPREAD_HOURS, MULTIPOINT_MIN_HOURS
 from wxverify.forecast.selection import (
     CellCandidate,
     representative_day_ahead,
@@ -33,6 +34,7 @@ def _candidate(
     pair_n: int = 0,
     mae: float | None = None,
     future_sample_count: int = 0,
+    covered_hours: int = 24,
 ) -> CellCandidate:
     return CellCandidate(
         feed_id=feed_id,
@@ -43,6 +45,7 @@ def _candidate(
         pair_n=pair_n,
         mae=mae,
         future_sample_count=future_sample_count,
+        covered_hours=covered_hours,
     )
 
 
@@ -177,6 +180,128 @@ def test_blend_depth_non_positive_clamps_to_one() -> None:
     ]
     selection = select_cell_feeds(candidates, blend_depth=0)
     assert [c.feed_id for c in selection.feeds] == [1]
+
+
+# ---------------------------------------------------------------------------
+# Coverage pool (pre-ladder): the two-tier adequate/multipoint gate that keeps
+# a lone degenerate single-point feed from winning on skill while a feed with
+# real intra-day spread is available. The pool is applied BEFORE the confidence
+# ladder, so a high-skill but single-point feed can be demoted below a
+# lower-skill well-covered one.
+# ---------------------------------------------------------------------------
+
+
+def test_coverage_gate_demotes_degenerate_high_skill_feed() -> None:
+    # Two confident feeds. The higher-skill one covers only 1 hour (its daily
+    # high == low -- a collapse); the lower-skill one covers 15h. The adequate
+    # pool (>= MIN_SPREAD_HOURS) restricts to the 15h feed, so skill does NOT
+    # win. Pre-fix (no pool) the confidence ladder ranked by skill would pick
+    # the 1h feed first; this asserts coverage gates it out entirely.
+    candidates = [
+        _candidate(
+            1, model="degenerate", confident=True, skill_score=0.99, covered_hours=1
+        ),
+        _candidate(
+            2, model="covered", confident=True, skill_score=0.60, covered_hours=15
+        ),
+    ]
+    # blend_depth=2 leaves room for both; the pool -- not the depth cap --
+    # excludes the degenerate feed.
+    selection = select_cell_feeds(candidates, blend_depth=2)
+    assert [c.feed_id for c in selection.feeds] == [2]
+    assert selection.low_confidence is False
+
+
+def test_no_near_tile_regression_skill_decides_when_coverage_uniform() -> None:
+    # Paired positive: when coverage is uniform (both adequate) the pool is a
+    # no-op and skill decides, exactly as before the fix. Guards the gate from
+    # over-firing on ordinary near tiles.
+    candidates = [
+        _candidate(1, model="high", confident=True, skill_score=0.9, covered_hours=24),
+        _candidate(2, model="low", confident=True, skill_score=0.7, covered_hours=24),
+    ]
+    selection = select_cell_feeds(candidates, blend_depth=1)
+    assert [c.feed_id for c in selection.feeds] == [1]
+    assert selection.low_confidence is False
+
+
+def test_min_spread_hours_boundary_pins_adequate_tier() -> None:
+    # Boundary pinned against the imported constant, not a literal 12 (mirrors
+    # the clears_coverage boundary style). A feed at exactly MIN_SPREAD_HOURS
+    # is adequate -> alone in the pool -> wins over a higher-skill feed that
+    # only reaches the multipoint tier; one hour below, it drops out of the
+    # adequate tier and skill decides among the multipoint feeds instead.
+    def pick(covered: int) -> int:
+        boundary = _candidate(
+            1, model="boundary", confident=True, skill_score=0.5, covered_hours=covered
+        )
+        multipoint = _candidate(
+            2, model="multipoint", confident=True, skill_score=0.9, covered_hours=5
+        )
+        return select_cell_feeds([boundary, multipoint], blend_depth=1).feeds[0].feed_id
+
+    assert pick(MIN_SPREAD_HOURS) == 1  # inclusive: == threshold is adequate
+    assert pick(MIN_SPREAD_HOURS - 1) == 2  # just below: not adequate, skill wins
+
+
+def test_multipoint_floor_selects_multipoint_over_single_slot() -> None:
+    # hoare correction #2 (degeneracy floor): every feed below MIN_SPREAD_HOURS,
+    # but a >= MULTIPOINT_MIN_HOURS multi-point feed present alongside a
+    # 1-sample feed -> the multi-point feed is selected, the single-slot feed
+    # absent, even though the single-slot out-skills it. Pins BOTH sides of the
+    # MULTIPOINT_MIN_HOURS boundary: the multipoint feed sits exactly at the
+    # constant (included) and the single-slot at constant-1 (excluded).
+    multipoint = _candidate(
+        1,
+        model="multipoint",
+        confident=True,
+        skill_score=0.5,
+        covered_hours=MULTIPOINT_MIN_HOURS,
+    )
+    single_slot = _candidate(
+        2,
+        model="single",
+        confident=True,
+        skill_score=0.99,
+        covered_hours=MULTIPOINT_MIN_HOURS - 1,
+    )
+    selection = select_cell_feeds([multipoint, single_slot], blend_depth=2)
+    assert [c.feed_id for c in selection.feeds] == [1]
+
+
+def test_all_single_slot_falls_back_to_candidates_and_returns_a_feed() -> None:
+    # Companion honest-degeneracy case: when EVERY feed is a single point both
+    # tiers are empty, so the pool falls back to all candidates and selection
+    # still returns the (skill-ranked) winner -- the truthful max == min tile.
+    candidates = [
+        _candidate(1, model="a", confident=True, skill_score=0.5, covered_hours=1),
+        _candidate(2, model="b", confident=True, skill_score=0.9, covered_hours=1),
+    ]
+    selection = select_cell_feeds(candidates, blend_depth=1)
+    assert [c.feed_id for c in selection.feeds] == [2]
+    assert selection.available is True
+
+
+def test_coverage_pool_sits_above_confidence_ladder() -> None:
+    # The gate runs BEFORE the confidence ladder: an adequate (>=12h) feed that
+    # only reaches the cheapest sample-count rung is chosen over a CONFIDENT
+    # single-slot feed, and is flagged low_confidence. Pre-fix the confident
+    # single-slot would win rung 1 (normal); the pool excludes it first.
+    adequate_unscored = _candidate(
+        1,
+        model="covered",
+        confident=False,
+        skill_score=None,
+        pair_n=0,
+        future_sample_count=15,
+        covered_hours=15,
+    )
+    confident_single = _candidate(
+        2, model="degenerate", confident=True, skill_score=0.99, covered_hours=1
+    )
+    selection = select_cell_feeds([adequate_unscored, confident_single], blend_depth=2)
+    assert [c.feed_id for c in selection.feeds] == [1]
+    assert selection.low_confidence is True
 
 
 # ---------------------------------------------------------------------------

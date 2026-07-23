@@ -367,6 +367,9 @@ def _select(
                 pair_n=row.n if row is not None else 0,
                 mae=row.mae if row is not None else None,
                 future_sample_count=len(feed_samples),
+                covered_hours=covered_hours(
+                    (s.valid_at for s in feed_samples), timezone=timezone
+                ),
             )
         )
     return select_cell_feeds(candidates, blend_depth=blend_depth)

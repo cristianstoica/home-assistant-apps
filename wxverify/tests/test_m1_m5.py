@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -2101,7 +2102,13 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
 
 def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pin "now" near the fixture dates so the default rolling window
+    # (30 days) is stable forever; otherwise these June-2026 pairs age out
+    # of the wall-clock-relative window and covered drops from 2 to 1.
+    fixed_now = datetime(2026, 6, 24, 0, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: fixed_now)
     conn = _init_tmp_db(tmp_path)
     site_id = int(
         conn.execute(

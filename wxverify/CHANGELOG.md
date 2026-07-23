@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.1
+
+- Fixed: far-horizon forecast tiles (6–7 days out) could show an identical
+  daily high and low — a single collapsed value — with only one point in the
+  hourly view, when the top-ranked feed supplied just one sample at that
+  range. Feed selection now prefers feeds with enough hourly coverage (≥12
+  hours) to form a real daily high/low, falling back gracefully at the very
+  edge of the forecast range.
+
 ## 0.7.0
 
 - Changed: wind consensus now uses a 90th-percentile estimator across all

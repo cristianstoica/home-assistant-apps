@@ -2,7 +2,17 @@
 
 Pure logic — no SQLite. The service layer builds :class:`CellCandidate`
 values from the sample query plus the skill ranking; this module applies the
-fallback ladder from the spec / ADR 0001:
+fallback ladder from the spec / ADR 0001.
+
+Before the ladder ranks, candidates are first restricted to a coverage pool:
+those clearing ``MIN_SPREAD_HOURS`` when any do, else multi-point feeds
+(>= ``MULTIPOINT_MIN_HOURS``) when any do, else all candidates (the truthful
+all-single-point fallback). The ladder then ranks within that pool. This keeps
+a lone far-horizon single-point feed (whose daily high == low) from winning on
+skill alone while a multi-point feed is available; only when EVERY feed is a
+single point does a max == min tile render, which is then honest.
+
+The ladder:
 
 1. one or more *confident* rows -> top ``min(N, count)`` by skill (normal);
    this covers both the ">= N confident" and the "exactly one confident"
@@ -20,12 +30,19 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from wxverify.forecast.aggregate import MIN_SPREAD_HOURS, MULTIPOINT_MIN_HOURS
+
 _MAE_NONE_LAST = float("inf")
 
 
 @dataclass(frozen=True)
 class CellCandidate:
-    """A feed eligible for one cell: skill info (if any) + sample presence."""
+    """A feed eligible for one cell: skill info (if any) + sample presence.
+
+    ``covered_hours`` is the count of distinct local hours the feed supplies
+    for this tile day — the selection-side coverage signal used to build the
+    pre-ladder coverage pool.
+    """
 
     feed_id: int
     source: str
@@ -35,6 +52,7 @@ class CellCandidate:
     pair_n: int
     mae: float | None
     future_sample_count: int
+    covered_hours: int
 
 
 @dataclass(frozen=True)
@@ -76,7 +94,11 @@ def select_cell_feeds(
         return CellSelection(feeds=[], low_confidence=False)
     depth = max(1, blend_depth)
 
-    confident = [c for c in candidates if c.confident]
+    adequate = [c for c in candidates if c.covered_hours >= MIN_SPREAD_HOURS]
+    multipoint = [c for c in candidates if c.covered_hours >= MULTIPOINT_MIN_HOURS]
+    pool = adequate or multipoint or candidates
+
+    confident = [c for c in pool if c.confident]
     if confident:
         ranked = sorted(
             confident,
@@ -84,7 +106,7 @@ def select_cell_feeds(
         )
         return CellSelection(feeds=ranked[:depth], low_confidence=False)
 
-    scored = [c for c in candidates if c.pair_n > 0]
+    scored = [c for c in pool if c.pair_n > 0]
     if scored:
         ranked = sorted(
             scored,
@@ -98,7 +120,7 @@ def select_cell_feeds(
         return CellSelection(feeds=ranked[:depth], low_confidence=True)
 
     ranked = sorted(
-        candidates,
+        pool,
         key=lambda c: (-c.future_sample_count, c.source, c.model),
     )
     return CellSelection(feeds=ranked[:depth], low_confidence=True)
