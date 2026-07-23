@@ -3115,6 +3115,13 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
             },
         )
         assert simple.status_code == 415
+        # Contract (0.8.1): a body with NO declared Content-Type passes the
+        # content-type gate and reaches the handler -- it is protected by the
+        # same-origin check + CSRF double-submit only. (HA ingress forwards
+        # bodyless POSTs as chunked with Content-Length stripped and no
+        # Content-Type; 0.8.0 wrongly 415'd those.) The allowlist still rejects
+        # a DISALLOWED content-type that IS declared -- see the `text/plain`
+        # PUT above, which stays 415: that is this gate's paired negative.
         missing_type_body = client.put(
             f"/api/sites/{site_id}",
             content=b'{"enabled": true}',
@@ -3123,7 +3130,7 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
                 "X-CSRF-Token": csrf,
             },
         )
-        assert missing_type_body.status_code == 415
+        assert missing_type_body.status_code == 200
         missing_csrf = client.post(
             "/api/catchup", headers={"Origin": "http://testserver"}
         )

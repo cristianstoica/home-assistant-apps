@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1
+
+- Fixed: Ops → Database Export failed to start with a 415 error when the
+  add-on was opened through Home Assistant's ingress. The same failure
+  affected other bodyless actions — catch-up, backfill, and delete — which
+  ingress forwards without a declared content type. The request guard now
+  checks its content-type allowlist only when a Content-Type is actually
+  declared, so these bodyless requests are no longer rejected. Same-origin
+  and CSRF protection are unchanged.
+
 ## 0.8.0
 
 - Fixed: importing a large database no longer fails at HA ingress's 16 MiB

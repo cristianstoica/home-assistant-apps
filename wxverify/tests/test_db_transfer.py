@@ -14,6 +14,7 @@ All fixture data is synthetic (fake site/station names and IDs, RFC-5737
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -715,11 +716,12 @@ def test_export_temp_vanished_after_vacuum_surfaces_error(
         assert dl.json() == {"error": "snapshot failed"}
 
 
-# --- X18: guard body-detection under chunk framing (direct-app) -------------
+# --- X18: content-type allowlist gate under chunk framing (direct-app) ------
 # ingress_stream forwards the POST body chunk-framed (Transfer-Encoding set, no
 # Content-Length). These drive MutationGuard.dispatch directly with a fabricated
 # request because httpx auto-computes Content-Length and cannot emit the
-# header-less chunked shape the widened `has_body` exists to catch.
+# header-less chunked shape HA ingress produces; the chunk framing is incidental
+# here -- the guard gates the content-type allowlist on Content-Type presence.
 
 
 async def _dummy_asgi(scope: object, receive: object, send: object) -> None:
@@ -751,19 +753,19 @@ def _run_guard(headers: dict[str, str], *, path: str) -> Response:
     return asyncio.run(guard.dispatch(request, _call_next))
 
 
-def test_guard_has_body_detects_chunk_framing() -> None:
-    """X18: widened `has_body` keeps the content-type allowlist effective when
-    the body is chunk-framed (Transfer-Encoding, no Content-Length).
+def test_guard_rejects_declared_disallowed_content_type() -> None:
+    """X18: the content-type allowlist gate rejects a DECLARED disallowed
+    Content-Type (chunk-framed or not); the gate keys on Content-Type presence.
 
-    - multipart on a mutating route -> 415 (would slip through pre-fix)
+    - multipart on a mutating route -> 415 (declared, not in the allowlist)
     - octet-stream on a NON-import mutating route -> 415
-    - json still passes the allowlist and reaches CSRF (valid -> through)
-    - bodyless begin (neither header) stays a pass (no over-broadening)
+    - json is in the allowlist and reaches CSRF (valid -> through)
+    - begin with NO declared Content-Type stays a pass (nothing to reject)
     """
     pair = issue_csrf_pair()
     csrf = {"X-CSRF-Token": pair.token, "Cookie": f"csrf={pair.nonce}"}
 
-    # (a) multipart, chunk-framed -> 415 (pre-fix: has_body False -> would pass).
+    # (a) multipart declared, chunk-framed -> 415 (disallowed content-type).
     multipart = _run_guard(
         {
             "Transfer-Encoding": "chunked",
@@ -802,14 +804,99 @@ def test_guard_has_body_detects_chunk_framing() -> None:
         "a json mutation must still pass the allowlist under chunk framing"
     )
 
-    # (d) bodyless begin (neither Content-Length nor Transfer-Encoding) -> pass.
+    # (d) begin with no declared Content-Type -> pass (nothing to reject).
     bodyless = _run_guard(
         {"Origin": "http://testserver", **csrf},
         path="/api/export/begin",
     )
     assert bodyless.status_code == 200, (
-        "bodyless begin must not be caught by the widened has_body"
+        "a begin with no declared Content-Type must pass the allowlist gate"
     )
+
+
+def _dispatch_begin(headers: dict[str, str]) -> tuple[int, bytes]:
+    """Drive `MutationGuard.dispatch` over a fabricated bodyless `begin` POST,
+    invoking the REAL `export_begin` handler as ``call_next``.
+
+    Uses a hand-built scope (not httpx) so ``Transfer-Encoding: chunked`` is
+    genuinely present with no Content-Length -- the exact shape HA ingress
+    (``ingress_stream: true``) forwards for a bodyless POST, and the shape
+    httpx cannot emit (it auto-computes Content-Length). Returns
+    ``(status, body)`` of the guard's response: the real 202 + ``export_id``
+    when the request passes the guard and reaches the handler.
+    """
+    raw = [(k.lower().encode(), v.encode()) for k, v in headers.items()]
+    scope: dict[str, Any] = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/export/begin",
+        "raw_path": b"/api/export/begin",
+        "query_string": b"",
+        "root_path": "",
+        "headers": raw,
+        "server": ("testserver", 80),
+        "client": (_NON_SUPERVISOR_IP, 12345),
+    }
+    guard = MutationGuard(_dummy_asgi, standalone_origin=None)
+
+    async def _call_next(_req: Request) -> Response:
+        return await db_transfer.export_begin()
+
+    async def _drive() -> tuple[int, bytes]:
+        response = await guard.dispatch(Request(scope), _call_next)
+        status, body = response.status_code, response.body
+        # Cancel the fire-and-forget snapshot task so asyncio.run's loop closes
+        # clean; `_reset_exports` unlinks the registered temp at teardown.
+        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for task in pending:
+            task.cancel()
+        for task in pending:
+            with contextlib.suppress(BaseException):
+                await task
+        return status, body
+
+    return asyncio.run(_drive())
+
+
+def test_export_begin_survives_bodyless_chunked_ingress_framing(
+    tmp_path: Path,
+) -> None:
+    """Regression (live 0.8.0 `415` on begin): HA ingress forwards a BODYLESS
+    `POST /api/export/begin` as ``Transfer-Encoding: chunked`` with
+    Content-Length stripped and NO Content-Type. The 0.8.0 guard derived
+    ``has_body`` from the presence of Transfer-Encoding and 415'd such a
+    request (``content_type == "" not in allowed``) BEFORE the handler ran.
+
+    The 0.8.1 fix gates the allowlist on Content-Type PRESENCE, so a request
+    with no declared Content-Type passes the guard and reaches the handler.
+    The exact live signature must therefore now return 202 + an ``export_id``.
+
+    Red/green: under the removed ``has_body``-includes-Transfer-Encoding
+    predicate this request is 415'd before the handler (see the scratchpad
+    red-proof driving HEAD's guard); under the fix it is 202. Same-origin +
+    CSRF still run -- this test carries a valid Origin and CSRF pair, so the
+    only thing the fix changes is the content-type gate.
+    """
+    _init_tmp_db(tmp_path)
+    pair = issue_csrf_pair()
+    headers = {
+        # ingress_stream frames even a bodyless POST as chunked, no Content-Type.
+        "Transfer-Encoding": "chunked",
+        "Origin": "http://testserver",
+        "Host": "testserver",
+        "X-CSRF-Token": pair.token,
+        "Cookie": f"csrf={pair.nonce}",
+    }
+
+    status, body = _dispatch_begin(headers)
+
+    assert status == 202, (
+        f"bodyless chunked begin must reach handler: {status} {body!r}"
+    )
+    export_id = json.loads(body)["export_id"]
+    assert re.fullmatch(r"[0-9a-f]{32}", export_id), export_id
 
 
 # ---------------------------------------------------------------------------
