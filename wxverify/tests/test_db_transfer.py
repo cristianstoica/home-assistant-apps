@@ -14,6 +14,7 @@ All fixture data is synthetic (fake site/station names and IDs, RFC-5737
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -275,8 +276,15 @@ def test_export_download_matches_source_and_disposition(
         resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
         export_id = resp.json()["export_id"]
         _await_ready(client, export_id)
+        # Read the prepared snapshot temp BEFORE downloading -- the download's
+        # post-send background task unlinks it (mirrors X3's temp-path pattern).
+        tmp = Path(config.db_path).parent / f".wxverify-export-{export_id}.db.tmp"
+        prepared_bytes = tmp.read_bytes()
         dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
         assert dl.status_code == 200, f"{dl.status_code}: {dl.text}"
+        assert dl.content == prepared_bytes, (
+            "download must stream the prepared snapshot byte-for-byte"
+        )
         disposition = dl.headers.get("content-disposition", "")
         assert re.fullmatch(
             r'attachment; filename="wxverify-\d{8}-\d{6}Z\.db"', disposition
@@ -765,6 +773,9 @@ def test_guard_has_body_detects_chunk_framing() -> None:
         path="/api/catchup",
     )
     assert multipart.status_code == 415, "chunk-framed multipart must be rejected"
+    assert json.loads(multipart.body) == {"error": "disallowed content-type"}, (
+        "415 body must carry the disallowed-content-type error contract"
+    )
 
     # (b) octet-stream to a non-import mutating route, chunk-framed -> 415.
     octet = _run_guard(
