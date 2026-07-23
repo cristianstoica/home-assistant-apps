@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.5
+
+- Fixed: the database export's first download attempt could still be cut off
+  after about 30 seconds through Home Assistant's ingress and Nabu Casa. The
+  ingress proxy cancels any single long streaming response, regardless of how
+  the download is started — a page fetch was cut off just the same as a
+  navigation download — so the 0.8.4 fetch approach did not help. The export
+  is now downloaded in sequential 4 MB chunks (roughly 17 requests for a
+  64 MB export), so no single response lives long enough to be cut. Each chunk
+  is validated and retried on failure, and the reassembled file's size is
+  checked against the export before it is saved. If any chunk cannot be
+  fetched, a direct browser-native download link is shown against the retained
+  export file, preserving the resume-and-retry behaviour from 0.8.3.
+
 ## 0.8.4
 
 - Fixed: the database export's first download attempt could still be cut off

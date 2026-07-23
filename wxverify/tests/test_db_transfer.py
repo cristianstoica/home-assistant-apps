@@ -453,11 +453,88 @@ def test_export_download_range_resume_and_repeat_get(
         assert repeat.status_code == 200, "a retained export must serve a repeat GET"
         assert repeat.content == full, "repeat GET must return the identical bytes"
 
+        # Bounded FIRST chunk (0.8.5 chunked-download contract): the browser
+        # assembles the download from ~17 sequential ~4 MB bounded `Range`
+        # requests (`bytes=0-N`, `bytes=N+1-2N+1`, ...) into a local Blob to
+        # dodge Supervisor's ~30 s ingress-stream cut. Pin the first BOUNDED
+        # chunk -- the case X6b's open-ended midpoint range does not exercise:
+        # exact `Content-Range` string, `Content-Length == N+1`, and
+        # byte-identity against the served `.db.gz` ON DISK (not just the
+        # earlier `full` response body).
+        served = (db_dir / f".wxverify-export-{export_id}.db.gz").read_bytes()
+        assert served == full, "the served gz on disk must equal the full body"
+        n = min(8, len(full) - 1)  # small bounded chunk; gz is non-trivial
+        head = client.get(
+            f"{_EXPORT_BASE}/download/{export_id}",
+            headers={"Range": f"bytes=0-{n}"},
+        )
+        assert head.status_code == 206, (
+            f"a bounded first-chunk Range must return 206, got {head.status_code}"
+        )
+        assert head.headers.get("content-range") == f"bytes 0-{n}/{len(full)}", (
+            f"unexpected Content-Range: {head.headers.get('content-range')!r}"
+        )
+        assert head.headers.get("content-length") == str(n + 1), (
+            "bounded-range Content-Length must be exactly the requested span (N+1)"
+        )
+        assert head.content == served[: n + 1], (
+            "bounded-range body must be byte-identical to the served gz's "
+            "first N+1 bytes on disk"
+        )
+
         assert (db_dir / f".wxverify-export-{export_id}.db.gz").exists(), (
             "the gz must still exist after multiple downloads"
         )
         assert export_id in db_transfer._EXPORTS, (  # noqa: SLF001
             "the registry entry must persist across repeat/Range downloads"
+        )
+
+
+def test_export_status_size_matches_full_download_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """X6c (0.8.5 chunked-download contract): `status.size` for a `ready`
+    export equals the length the no-Range download actually serves.
+
+    The 0.8.5 browser download reads `status.size` as the total, splits it into
+    sequential bounded `Range` chunks, assembles them into a Blob, and gates on
+    `blob.size === total`. So the number `status` reports for a `ready` export
+    MUST equal the byte length the download serves -- otherwise the client's
+    final size gate is comparing against a wrong total. X3 pins
+    `size == gz.stat().st_size` and X4 pins `body == gz bytes`; this pins the
+    end-to-end equality the frontend actually leans on -- `status.size` against
+    the served no-Range download length -- in a single oracle.
+
+    It also documents the exact NO-Range response shape (`200`, full body,
+    `Content-Length == size`) that the client's strict `206`-required assembler
+    is designed to REJECT: were an ingress proxy to strip the `Range` header and
+    the server to fall back to a full `200`, the client must not accept it as a
+    chunk. Pinning the unranged shape keeps that contract explicit even though
+    the client refuses it.
+    """
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "Chunk Contract Site")  # noqa: SLF001
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        final = _await_ready(client, export_id)
+        assert final["state"] == "ready"
+        size = final["size"]
+        assert isinstance(size, int) and size > 0, f"unexpected size: {size!r}"
+
+        # No-Range GET: a plain 200 whose body length equals the reported size.
+        dl = client.get(f"{_EXPORT_BASE}/download/{export_id}")
+        assert dl.status_code == 200, (
+            "an unranged download must be a plain 200 -- the full-body fallback "
+            "the 0.8.5 strict-206 assembler is built to reject"
+        )
+        assert len(dl.content) == size, (
+            "status.size must equal the served full-download length: the 0.8.5 "
+            "`blob.size === total` gate depends on this exact equality"
+        )
+        assert dl.headers.get("content-length") == str(size), (
+            "no-Range Content-Length must equal the reported status size"
         )
 
 
