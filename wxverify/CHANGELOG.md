@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.4
+
+- Fixed: the database export's first download attempt could still be cut off
+  after about 30 seconds when opened through Home Assistant's ingress and Nabu
+  Casa — a bare download link routed the transfer onto the browser's legacy
+  navigation-download channel, which Cloudflare/ingress cancels at 30 seconds
+  on large files. The export is now downloaded on the browser's normal fetch
+  channel and saved as a local file, bypassing the legacy channel entirely,
+  and the status line shows bytes received as it downloads. If the fetch fails
+  for any reason, a direct browser-native download link is shown against the
+  retained export file, preserving the resume-and-retry behaviour added in
+  0.8.3.
+
 ## 0.8.3
 
 - Fixed: a database export interrupted partway through download — for example

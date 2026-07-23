@@ -361,9 +361,13 @@
   // Database export: prepare-then-stream. A plain GET download would hold the
   // request open (no headers) through VACUUM INTO and trip HA ingress's
   // response-start timeout, so this POSTs /begin (with CSRF), polls /status
-  // until ready, then navigates a transient <a download> to /download. The
-  // status/download GETs are safe methods and carry no CSRF; begin sends no
-  // body/Content-Type so the mutation guard's allowlist is not exercised.
+  // until ready, then fetch()es /download and saves the body as a local Blob.
+  // The fetch is deliberate: triggering the download by navigating a bare
+  // <a> routes it through Firefox/Zen's legacy navigation-download channel,
+  // which Cloudflare/ingress cancels at ~30 s on large files; the Fetch
+  // channel is not subject to that cut. The status/download GETs are safe
+  // methods and carry no CSRF; begin sends no body/Content-Type so the
+  // mutation guard's allowlist is not exercised.
   document.body.addEventListener("click", function (event) {
     var target = event.target;
     if (!target || !target.matches("#export-run")) {
@@ -426,13 +430,106 @@
         });
     }
 
-    function triggerDownload(downloadUrl) {
+    function formatBytes(bytes) {
+      return (bytes / 1048576).toFixed(1) + " MB";
+    }
+
+    // The route sets Content-Disposition: attachment; the filename is
+    // wxverify-<UTC timestamp>Z.db.gz (timestamp %Y%m%d-%H%M%S, not ISO-8601).
+    // Falls back to a stable name if the header is absent or unparseable.
+    function parseFilename(response) {
+      var fallback = "wxverify-export.db.gz";
+      var header = response.headers.get("Content-Disposition");
+      if (!header) {
+        return fallback;
+      }
+      var match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+      if (!match || !match[1]) {
+        return fallback;
+      }
+      try {
+        return decodeURIComponent(match[1]);
+      } catch (err) {
+        return match[1];
+      }
+    }
+
+    // Saves an in-memory Blob via a transient <a download>. The object URL is
+    // revoked on a delayed tick: revoking synchronously right after click can
+    // cancel the save in some browsers.
+    function saveBlob(blob, filename) {
+      var url = URL.createObjectURL(blob);
       var anchor = document.createElement("a");
-      anchor.href = downloadUrl;
-      anchor.rel = "noopener";
+      anchor.href = url;
+      anchor.download = filename;
       document.body.appendChild(anchor);
       anchor.click();
       document.body.removeChild(anchor);
+      window.setTimeout(function () {
+        URL.revokeObjectURL(url);
+      }, 60000);
+    }
+
+    // Retained-file fallback (0.8.3 safety net): on any fetch/read failure,
+    // render a clickable browser-native download link into the result area so
+    // the user can still download + Retry against the retained export file.
+    function showFallbackLink(message, downloadUrl, filename) {
+      result.hidden = false;
+      result.textContent = "";
+      result.appendChild(document.createTextNode(message + " "));
+      var link = document.createElement("a");
+      link.href = downloadUrl;
+      link.download = filename;
+      link.rel = "noopener";
+      link.textContent = "Download database";
+      result.appendChild(link);
+    }
+
+    // Downloads on the normal Fetch channel (not the legacy navigation-download
+    // channel that Cloudflare/ingress cuts at ~30 s), streaming the body so the
+    // status line can show bytes received. Ingress strips Content-Length
+    // (chunked), so total size is unknown → bytes only, no percentage.
+    function triggerDownload(downloadUrl) {
+      var filename = "wxverify-export.db.gz";
+      show("Downloading...");
+      fetch(downloadUrl, { credentials: "same-origin" })
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error("download failed");
+          }
+          filename = parseFilename(response);
+          if (!response.body || !response.body.getReader) {
+            return response.blob().then(function (blob) {
+              saveBlob(blob, filename);
+              show("Download complete. Saved.");
+            });
+          }
+          var reader = response.body.getReader();
+          var chunks = [];
+          var received = 0;
+          function pump() {
+            return reader.read().then(function (chunk) {
+              if (chunk.done) {
+                var blob = new Blob(chunks, { type: "application/gzip" });
+                saveBlob(blob, filename);
+                show("Download complete. Saved.");
+                return;
+              }
+              chunks.push(chunk.value);
+              received += chunk.value.length;
+              show("Downloading... " + formatBytes(received));
+              return pump();
+            });
+          }
+          return pump();
+        })
+        .catch(function () {
+          showFallbackLink(
+            "Download failed. Use this link to save the retained file:",
+            downloadUrl,
+            filename
+          );
+        });
     }
   });
 })();
