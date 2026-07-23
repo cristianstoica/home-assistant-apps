@@ -41,6 +41,10 @@ _TMP_GLOBS = (
     ".wxverify-export-*.db.gz",
 )
 _STALE_AFTER_S = 3600.0
+# The lifespan sweeper's tick period. A retained export is reaped within one
+# cutoff + one tick, so 300 s bounds a downloaded export to <= ~65 min on disk
+# even if `/begin` is never called again.
+_SWEEP_INTERVAL_S = 300.0
 # 256 MiB: the live DB is single-digit MBs today, and /data must hold upload
 # temp + backup + live DB simultaneously, so the cap bounds worst-case disk.
 _MAX_IMPORT_BYTES = 256 * 1024 * 1024
@@ -210,15 +214,28 @@ async def _prepare_export(export_id: str, tmp: Path) -> None:
     job.size = size
 
 
-async def _finish_download(export_id: str) -> None:
-    """Post-send cleanup: forget the entry and unlink its temp.
+async def run_export_sweeper() -> None:
+    """Periodically reap stale export registry entries and their temps.
 
-    Async so the registry mutation runs on the event loop, not a
-    threadpool thread — preserving the loop-only ``_EXPORTS`` invariant.
+    Retain-and-resume moves ALL export cleanup here. A downloaded export is
+    deliberately NOT deleted post-send (so a repeat GET or a Firefox ``Range:``
+    resume can complete against the same stable file), and the on-``/begin``
+    sweep alone would leak a single downloaded-then-never-exported-again entry
+    forever. This loop guarantees a retained ``ready`` export is TTL-reaped
+    even when no further ``/begin`` ever arrives.
+
+    Runs as a lifespan task on the API event loop, so the registry mutation in
+    ``_sweep_registry`` stays on the single loop that owns ``_EXPORTS`` — the
+    loop-only invariant is preserved (no threadpool registry mutation).
     """
-    job = _EXPORTS.pop(export_id, None)
-    if job is not None:
-        _unlink(job.path)
+    db_dir = Path(config.db_path).parent
+    while True:
+        await asyncio.sleep(_SWEEP_INTERVAL_S)
+        try:
+            _sweep_registry()
+            _sweep_stale(db_dir)
+        except Exception:
+            logger.exception("export: periodic sweep failed")
 
 
 @router.post("/export/begin")
@@ -257,8 +274,19 @@ async def export_download(export_id: str) -> FileResponse:
     """Stream the prebuilt snapshot; headers emit at once.
 
     The file path comes from the registry entry, never from the URL id
-    (no path traversal). A background task forgets the entry and unlinks
-    the temp after send.
+    (no path traversal). The prepared artifact is RETAINED after send —
+    it is NOT deleted post-download. This is the retain-and-resume fix:
+    uvicorn silently swallows body sends after a client disconnect, so an
+    aborted download still runs Starlette to EOF; deleting on that path
+    (the old one-shot ``BackgroundTask``) removed the gz before Firefox's
+    auto-retry could issue its ``Range:`` resume to the same URL, 404-ing
+    the resume. Serving the identical file every time keeps the file's
+    ETag/Last-Modified (``st_mtime``/``st_size`` derived) stable, so an
+    ``If-Range`` resume validates and returns 206 instead of restarting.
+    Cleanup is entirely the TTL sweep's job (``run_export_sweeper`` /
+    on-``/begin`` ``_sweep_registry``) plus supersession by a later
+    ``/begin``. Starlette's ``FileResponse`` implements Range/206/
+    Accept-Ranges natively (0.46.2), so no Range code is added here.
     """
     job = _EXPORTS.get(export_id)
     if job is None:
@@ -274,7 +302,6 @@ async def export_download(export_id: str) -> FileResponse:
         job.path,
         media_type="application/gzip",
         filename=f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db.gz",
-        background=BackgroundTask(_finish_download, export_id),
     )
 
 

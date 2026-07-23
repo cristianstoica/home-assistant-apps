@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.3
+
+- Fixed: a database export interrupted partway through download — for example
+  over Home Assistant's ingress — could not be resumed. The browser's
+  automatic retry failed with an "unknown export id" error, and the download
+  had to be restarted from scratch, which hit the same interruption again. The
+  prepared export snapshot was being deleted the moment the response finished,
+  even when the download had been aborted, so the retry had nothing left to
+  resume from. The prepared export is now retained, letting an interrupted
+  download resume where it left off or be re-requested, and a periodic sweeper
+  reclaims old export files after about an hour instead of relying on
+  delete-on-download.
+
 ## 0.8.2
 
 - Fixed: exporting a large database through Home Assistant's ingress failed
