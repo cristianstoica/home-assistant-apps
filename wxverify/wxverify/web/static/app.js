@@ -357,4 +357,82 @@
         show("Import failed.");
       });
   });
+
+  // Database export: prepare-then-stream. A plain GET download would hold the
+  // request open (no headers) through VACUUM INTO and trip HA ingress's
+  // response-start timeout, so this POSTs /begin (with CSRF), polls /status
+  // until ready, then navigates a transient <a download> to /download. The
+  // status/download GETs are safe methods and carry no CSRF; begin sends no
+  // body/Content-Type so the mutation guard's allowlist is not exercised.
+  document.body.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.matches("#export-run")) {
+      return;
+    }
+    var beginUrl = target.dataset.beginUrl;
+    var base = target.dataset.exportBase;
+    var result = document.getElementById("export-result");
+    function show(text) {
+      result.hidden = false;
+      result.textContent = text;
+    }
+    var token = document.querySelector('meta[name="csrf-token"]').content;
+    show("Preparing export...");
+    fetch(beginUrl, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "X-CSRF-Token": token }
+    })
+      .then(function (response) {
+        if (!response.ok) {
+          throw new Error("begin failed");
+        }
+        return response.json();
+      })
+      .then(function (payload) {
+        pollStatus(payload.export_id, 0);
+      })
+      .catch(function () {
+        show("Export failed to start.");
+      });
+
+    var MAX_POLLS = 240;
+    function pollStatus(exportId, attempts) {
+      if (attempts >= MAX_POLLS) {
+        show("Export timed out.");
+        return;
+      }
+      fetch(base + "/status/" + exportId, { credentials: "same-origin" })
+        .then(function (response) {
+          if (!response.ok) {
+            throw new Error("status failed");
+          }
+          return response.json();
+        })
+        .then(function (payload) {
+          if (payload.state === "ready") {
+            triggerDownload(base + "/download/" + exportId);
+            show("Download started.");
+          } else if (payload.state === "error") {
+            show("Export failed.");
+          } else {
+            window.setTimeout(function () {
+              pollStatus(exportId, attempts + 1);
+            }, 750);
+          }
+        })
+        .catch(function () {
+          show("Export failed.");
+        });
+    }
+
+    function triggerDownload(downloadUrl) {
+      var anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.rel = "noopener";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    }
+  });
 })();

@@ -1,5 +1,5 @@
 name: "Weather Verify"
-version: "0.7.1"
+version: "0.8.0"
 slug: wxverify
 description: "Verify weather-forecast accuracy via cluster-consensus ground truth"
 url: "https://github.com/cristianstoica/home-assistant-apps/tree/main/wxverify"
@@ -11,6 +11,7 @@ init: false
 backup: cold
 image: "ghcr.io/cristianstoica/wxverify"
 ingress: true
+ingress_stream: true
 panel_icon: mdi:weather-partly-cloudy
 panel_title: "Weather Verify"
 discovery:

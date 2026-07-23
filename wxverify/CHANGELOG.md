@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+- Fixed: importing a large database (hundreds of MiB) no longer fails at the
+  16 MiB request-size cap. The add-on now streams the upload through HA
+  ingress instead of buffering the whole request in memory, so an offline-
+  edited database can be re-imported whole regardless of size.
+- Changed: Ops → Database Export now prepares the snapshot and then streams
+  it (begin → poll status → download) instead of building and sending it in
+  a single blocking request. First-attempt exports of a large database no
+  longer time out waiting for the snapshot to finish. The previous
+  `GET /api/export/db` endpoint has been removed.
+
 ## 0.7.1
 
 - Fixed: far-horizon forecast tiles (6–7 days out) could show an identical

@@ -7,7 +7,9 @@ import logging
 import sqlite3
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse
@@ -36,11 +38,39 @@ _MAX_IMPORT_BYTES = 256 * 1024 * 1024
 _REQUIRED_TABLES = ("sites", "stations", "station_observations")
 
 
+# --- Export registry (prepare-then-stream) --------------------------------
+# A tiny in-process store tracks each snapshot's lifecycle so `begin` can return
+# immediately (headers emit at once) while `VACUUM INTO` runs off the event
+# loop. Matches the repo's module-global singleton idiom (`_db_instance`,
+# `_CSRF_KEY`). The map is mutated ONLY from coroutines on the event loop, so no
+# lock is needed (single-threaded loop invariant); the sync `_snapshot` worker
+# touches only the temp file, never the registry.
+@dataclass
+class _ExportJob:
+    state: Literal["preparing", "ready", "error"]
+    path: Path
+    created_at: float
+    size: int | None = None
+    error: str | None = None
+    task: asyncio.Task[None] | None = None
+
+
+_EXPORTS: dict[str, _ExportJob] = {}
+
+
 def _sweep_stale(db_dir: Path) -> None:
-    """Reclaim transfer temps orphaned by a crash or client disconnect."""
+    """Reclaim transfer temps orphaned by a crash or client disconnect.
+
+    Skips temps owned by a live ``preparing`` export: an in-flight VACUUM
+    holds its temp open, and an mtime past the cutoff (a very slow VACUUM)
+    must not let the sweep unlink the file out from under it.
+    """
     cutoff = time.time() - _STALE_AFTER_S
+    active = {job.path for job in _EXPORTS.values() if job.state == "preparing"}
     for pattern in _TMP_GLOBS:
         for leftover in db_dir.glob(pattern):
+            if leftover in active:
+                continue
             try:
                 if leftover.stat().st_mtime < cutoff:
                     leftover.unlink(missing_ok=True)
@@ -51,30 +81,146 @@ def _sweep_stale(db_dir: Path) -> None:
                 continue
 
 
+def _sweep_registry() -> None:
+    """Drop terminal registry entries older than the temp-file cutoff.
+
+    Skips ``preparing`` entries: a VACUUM in flight owns its temp, so
+    reaping it would race the snapshot. Terminal (``ready``/``error``)
+    entries past the cutoff are abandoned exports — unlink any surviving
+    temp and forget them so the in-memory map cannot grow unbounded.
+    """
+    cutoff = time.time() - _STALE_AFTER_S
+    for export_id in list(_EXPORTS):
+        job = _EXPORTS[export_id]
+        if job.state == "preparing" or job.created_at >= cutoff:
+            continue
+        _unlink(job.path)
+        del _EXPORTS[export_id]
+
+
 def _unlink(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
-@router.get("/export/db")
-async def export_db() -> FileResponse:
-    """Stream a consistent snapshot of the configured SQLite database."""
-    db_dir = Path(config.db_path).parent
-    _sweep_stale(db_dir)
-    tmp = db_dir / f".wxverify-export-{uuid.uuid4().hex}.db.tmp"
+async def _prepare_export(export_id: str, tmp: Path) -> None:
+    """Fire-and-forget snapshot: VACUUM INTO ``tmp`` off the event loop.
+
+    Runs the sync VACUUM via the existing serialized read executor
+    (``get_db().read`` -> ``asyncio.to_thread``), so the event loop is
+    never blocked and the snapshot stays mutually exclusive with an import
+    swap. Terminal state is written back into the registry; a failure
+    becomes ``error`` (never a hung ``preparing``). Never re-raises a plain
+    Exception (an unretrieved task exception would only warn); re-raises
+    CancelledError after cleanup.
+    """
 
     def _snapshot(conn: sqlite3.Connection) -> None:
         conn.execute("VACUUM INTO ?", (str(tmp),))
 
     try:
         await get_db().read(_snapshot)
-    except BaseException:
+    except asyncio.CancelledError:
         _unlink(tmp)
+        # Mark terminal before the mandatory re-raise so no path leaves the
+        # entry hung in `preparing` (the sweep skips `preparing` forever).
+        job = _EXPORTS.get(export_id)
+        if job is not None:
+            job.state = "error"
+            job.error = "cancelled"
         raise
+    except Exception:
+        logger.exception("export: snapshot failed")
+        _unlink(tmp)
+        job = _EXPORTS.get(export_id)
+        if job is not None:
+            job.state = "error"
+            job.error = "snapshot failed"
+        return
+    job = _EXPORTS.get(export_id)
+    if job is None:
+        # Entry dropped (swept) mid-prepare -- don't leak the temp.
+        _unlink(tmp)
+        return
+    # The terminal size read is inside failure handling: if the temp
+    # vanished between VACUUM and stat (e.g. an over-long VACUUM let a
+    # sweep reap it), surface `error` -- never a hung `preparing`.
+    try:
+        size = tmp.stat().st_size
+    except OSError:
+        logger.exception("export: snapshot temp missing after VACUUM")
+        _unlink(tmp)
+        job.state = "error"
+        job.error = "snapshot failed"
+        return
+    job.state = "ready"
+    job.size = size
+
+
+async def _finish_download(export_id: str) -> None:
+    """Post-send cleanup: forget the entry and unlink its temp.
+
+    Async so the registry mutation runs on the event loop, not a
+    threadpool thread — preserving the loop-only ``_EXPORTS`` invariant.
+    """
+    job = _EXPORTS.pop(export_id, None)
+    if job is not None:
+        _unlink(job.path)
+
+
+@router.post("/export/begin")
+async def export_begin() -> JSONResponse:
+    """Start a fire-and-forget snapshot; return its id immediately.
+
+    Sweeps terminal registry entries first, then orphaned temps (the glob
+    sweep skips any temp a `preparing` entry still owns), then kicks off the
+    VACUUM off the event loop. CSRF/same-origin are enforced upstream by
+    MutationGuard (POST); this route carries no body.
+    """
+    db_dir = Path(config.db_path).parent
+    _sweep_registry()
+    _sweep_stale(db_dir)
+    export_id = uuid.uuid4().hex
+    tmp = db_dir / f".wxverify-export-{export_id}.db.tmp"
+    job = _ExportJob(state="preparing", path=tmp, created_at=time.time())
+    _EXPORTS[export_id] = job
+    job.task = asyncio.create_task(_prepare_export(export_id, tmp))
+    return JSONResponse({"export_id": export_id}, status_code=202)
+
+
+@router.get("/export/status/{export_id}")
+async def export_status(export_id: str) -> dict[str, str | int]:
+    """Report a snapshot's state; include byte size once ready."""
+    job = _EXPORTS.get(export_id)
+    if job is None:
+        raise ApiError(404, "unknown export id")
+    if job.state == "ready" and job.size is not None:
+        return {"state": "ready", "size": job.size}
+    return {"state": job.state}
+
+
+@router.get("/export/download/{export_id}")
+async def export_download(export_id: str) -> FileResponse:
+    """Stream the prebuilt snapshot; headers emit at once.
+
+    The file path comes from the registry entry, never from the URL id
+    (no path traversal). A background task forgets the entry and unlinks
+    the temp after send.
+    """
+    job = _EXPORTS.get(export_id)
+    if job is None:
+        raise ApiError(404, "unknown export id")
+    if job.state == "preparing":
+        raise ApiError(409, "export still preparing")
+    if job.state == "error":
+        raise ApiError(409, job.error or "export failed")
+    if not job.path.exists():
+        _EXPORTS.pop(export_id, None)
+        raise ApiError(409, "export expired")
     return FileResponse(
-        tmp,
+        job.path,
         media_type="application/octet-stream",
         filename=f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db",
-        background=BackgroundTask(_unlink, tmp),
+        background=BackgroundTask(_finish_download, export_id),
     )
 
 

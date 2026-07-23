@@ -2,9 +2,13 @@
   <h2>Database Export</h2>
   <p class="panel-hint">Download a consistent snapshot of the add-on database.</p>
   <div class="button-row">
-    {# Plain <a>, deliberately NOT htmx: a download must be a normal browser
-       navigation — an hx-get would try to swap the binary body into the DOM.
-       Content-Disposition: attachment makes the browser download instead. #}
-    <a class="pill" href="{{ url('/api/export/db') }}">Download database</a>
+    {# JS-driven prepare-then-stream: a plain GET download would hold the
+       request open (no headers) through VACUUM INTO and trip HA ingress's
+       response-start timeout. app.js POSTs /begin, polls /status, then
+       navigates an <a download> to /download once ready. #}
+    <button type="button" id="export-run"
+            data-begin-url="{{ url('/api/export/begin') }}"
+            data-export-base="{{ url('/api/export') }}">Download database</button>
   </div>
+  <p class="empty" id="export-result" hidden></p>
 </section>

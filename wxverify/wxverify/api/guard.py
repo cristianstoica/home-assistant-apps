@@ -35,7 +35,8 @@ class MutationGuard(BaseHTTPMiddleware):
                 {"error": "cross-origin mutation rejected"}, status_code=403
             )
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
-        has_body = int(request.headers.get("content-length", "0") or "0") > 0
+        content_length = int(request.headers.get("content-length", "0") or "0")
+        has_body = content_length > 0 or bool(request.headers.get("transfer-encoding"))
         allowed = {"application/json"}
         if _bare_path(request) in _OCTET_STREAM_PATHS:
             allowed.add("application/octet-stream")
