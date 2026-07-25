@@ -53,6 +53,11 @@ _QUERY_REPEATS = 5
 _QUERY_GATE_S = 2.0
 _ENDPOINT_GATE_S = 20.0
 
+# Mirrors the HA coordinator's _LEADERBOARD_VARIABLES: production polls exactly
+# these three shapes at day_ahead=1, so they are always measured even when a
+# variable is absent from the export.
+REQUIRED_VARIABLES = ("temperature", "wind", "precip")
+
 
 def _open_readonly(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -96,7 +101,7 @@ def _query_measurements(db_path: Path, site_id: int) -> dict[str, Any]:
     conn = _open_readonly(db_path)
     try:
         resolved = resolve_window(conn, "rolling")
-        variables = [
+        db_variables = [
             str(row["variable"])
             for row in conn.execute(
                 "SELECT DISTINCT variable FROM forecast_pairs WHERE site_id=?"
@@ -104,6 +109,7 @@ def _query_measurements(db_path: Path, site_id: int) -> dict[str, Any]:
                 (site_id,),
             )
         ]
+        variables = sorted(set(db_variables) | set(REQUIRED_VARIABLES))
         measurements: list[dict[str, Any]] = []
 
         def _measure(name: str, run: Any) -> None:
@@ -120,10 +126,14 @@ def _query_measurements(db_path: Path, site_id: int) -> dict[str, Any]:
                 }
             )
 
+        def _count(sql: str, params: tuple[object, ...] = ()) -> int:
+            return int(conn.execute(sql, params).fetchone()[0])
+
         _measure(
             "_expected_active_cells",
             lambda: _expected_active_cells(conn, site_id=site_id, resolved=resolved),
         )
+        variable_row_counts: dict[str, int] = {}
         for variable in variables:
             _measure(
                 f"_expected_active_feed_ids[{variable}]",
@@ -131,9 +141,11 @@ def _query_measurements(db_path: Path, site_id: int) -> dict[str, Any]:
                     conn, site_id=site_id, variable=v, day_ahead=1, resolved=resolved
                 ),
             )
-
-        def _count(sql: str, params: tuple[object, ...] = ()) -> int:
-            return int(conn.execute(sql, params).fetchone()[0])
+            variable_row_counts[variable] = _count(
+                "SELECT COUNT(*) FROM forecast_pairs"
+                " WHERE site_id=? AND variable=? AND day_ahead=1 AND valid_at>=?",
+                (site_id, variable, resolved.cutoff),
+            )
 
         row_counts = {
             "forecast_pairs_total": _count("SELECT COUNT(*) FROM forecast_pairs"),
@@ -150,13 +162,20 @@ def _query_measurements(db_path: Path, site_id: int) -> dict[str, Any]:
             ),
             "feeds_total": _count("SELECT COUNT(*) FROM feeds"),
         }
-        return {
+        result: dict[str, Any] = {
             "window_key": resolved.window_key,
             "cutoff": resolved.cutoff,
             "variables": variables,
+            "variable_row_counts": variable_row_counts,
             "row_counts": row_counts,
             "measurements": measurements,
         }
+        missing_required = [
+            v for v in REQUIRED_VARIABLES if variable_row_counts[v] == 0
+        ]
+        if missing_required:
+            result["missing_required_variables"] = missing_required
+        return result
     finally:
         conn.close()
 
@@ -250,6 +269,9 @@ def _endpoint_measurements(db_path: Path, site_id: int, warm: int) -> dict[str, 
     http_all_200 = all(s["http_status"] == 200 for s in samples)
     cold_s = float(samples[0]["duration_s"])
     warm_max = max(warm_durations) if warm_durations else 0.0
+    # Belt-and-braces alongside the argparse floor: a run with fewer than ten
+    # warm samples cannot certify the warm gate (plan §4.1).
+    run_valid = consistent and http_all_200 and len(warm_samples) >= 10
     return {
         "note": (
             "in-process ASGI: uvicorn/network overhead excluded"
@@ -263,11 +285,11 @@ def _endpoint_measurements(db_path: Path, site_id: int, warm: int) -> dict[str, 
             else warm_max
         ),
         "warm_max_s": warm_max,
+        "warm_count": len(warm_samples),
         "warm_statuses_consistent": consistent,
         "http_all_200": http_all_200,
-        "run_valid": consistent and http_all_200,
-        "gate_pass": consistent
-        and http_all_200
+        "run_valid": run_valid,
+        "gate_pass": run_valid
         and cold_s < _ENDPOINT_GATE_S
         and warm_max < _ENDPOINT_GATE_S,
     }
@@ -298,7 +320,10 @@ def main() -> int:
         "--site", type=int, default=None, help="site id (default: first enabled)"
     )
     parser.add_argument(
-        "--warm", type=int, default=10, help="warm endpoint samples (default 10)"
+        "--warm",
+        type=int,
+        default=10,
+        help="warm endpoint samples (default 10, minimum 10 per plan §4.1)",
     )
     parser.add_argument(
         "--out", type=Path, default=None, help="write the JSON report here"
@@ -309,6 +334,10 @@ def main() -> int:
         help="query plans/timings only (no ASGI endpoint run)",
     )
     args = parser.parse_args()
+    if args.warm < 10:
+        parser.error(
+            "--warm must be >= 10 (plan §4.1 requires at least ten warm samples)"
+        )
 
     if not args.db.exists():
         raise SystemExit(f"database not found: {args.db}")
@@ -335,22 +364,38 @@ def main() -> int:
     print(rendered)
 
     query_pass = all(m["gate_pass"] for m in report["queries"]["measurements"])
+    missing_required = report["queries"].get("missing_required_variables", [])
     endpoint = report.get("endpoint")
+    endpoint_pass: bool | None = None
     if endpoint is None:
-        # Queries-only run: the endpoint gate never executed, so an
-        # unqualified PASS would overstate the result.
-        verdict = "PARTIAL (endpoint skipped)" if query_pass else "FAIL"
         endpoint_note = ": skipped"
     else:
         endpoint_pass = bool(endpoint["gate_pass"])
-        verdict = "PASS" if query_pass and endpoint_pass else "FAIL"
         endpoint_note = f"<{_ENDPOINT_GATE_S}s+consistent+200s: {endpoint_pass}"
+    # Verdict precedence: FAIL beats PARTIAL beats PASS. PARTIAL means a gate
+    # was not evaluable (endpoint skipped, required variable unmeasurable) and
+    # nothing failed, so an unqualified PASS would overstate the result.
+    if not query_pass or endpoint_pass is False:
+        verdict = "FAIL"
+    elif endpoint_pass is None or missing_required:
+        reasons: list[str] = []
+        if endpoint_pass is None:
+            reasons.append("endpoint skipped")
+        if missing_required:
+            reasons.append("missing required variables: " + ", ".join(missing_required))
+        verdict = f"PARTIAL ({'; '.join(reasons)})"
+    else:
+        verdict = "PASS"
     print(
         f"\n§4.2 gate: {verdict} (queries<{_QUERY_GATE_S}s: {query_pass};"
         f" endpoint{endpoint_note})",
         file=sys.stderr,
     )
-    return 1 if verdict == "FAIL" else 0
+    if verdict == "FAIL":
+        return 1
+    if verdict.startswith("PARTIAL"):
+        return 2
+    return 0
 
 
 if __name__ == "__main__":
