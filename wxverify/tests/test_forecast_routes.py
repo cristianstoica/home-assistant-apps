@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,10 @@ from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.db.connection import close_db, init_db
+from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
+from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.forecast.service import build_forecast, build_hourly
+from wxverify.settings.keys import set_setting
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_web_ui.py / tests/test_static_ingress.py).
@@ -220,3 +224,152 @@ def test_forecast_day_clamps_and_embeds_clamped_day_in_chart_src(
     # Jinja autoescapes the literal `&` in the query string to `&amp;`.
     assert f"/api/forecast/hourly?site={site_id}&amp;day=7" in response.text
     assert "day=99" not in response.text
+
+
+# ---------------------------------------------------------------------------
+# New Forecast degradation test (deliberate no-score_cache case): pins §2.3
+# approach (a). This is the intentional counterpart to the score_cache
+# seeding migration required elsewhere -- a rebuilding-empty ranking must
+# degrade gracefully (low_confidence, never a crash or a silent stale
+# "normal"), and only this test may run Forecast against an unseeded cache.
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_degrades_to_low_confidence_without_score_cache_no_enqueue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """forecast_pairs + future_samples exist -- enough for a live skill
+    computation to be genuinely confident -- but `score_cache` is left
+    EMPTY. Pre-fix, `leaderboard()`'s live-fallback on a cache miss makes
+    this cell confident/`normal` regardless of the cache; post-fix (§2), an
+    absent cache-backed rolling-window snapshot degrades to a
+    `rebuilding`-empty ranking, so every candidate is unconfident/unscored
+    and the selection ladder falls to the future-sample-count rung ->
+    `low_confidence`.
+
+    A ``virtual/_persistence`` baseline with matching (site, variable,
+    valid_at, lead_hours, day_ahead) `forecast_pairs` rows is REQUIRED for
+    this contrast to be real: `_paired_skill` (metrics.py) returns
+    ``skill_score=None`` -- and therefore ``confident=False`` -- whenever no
+    persistence baseline pairs exist, live-recompute or not. Without the
+    baseline, both pre- and post-fix code degrade to `low_confidence` for
+    the same unrelated reason (no skill data), which would make this test
+    pass vacuously regardless of the cache-miss bug -- confirmed by running
+    it against pre-fix code with only the candidate feed's pairs seeded.
+
+    Asserts against OBSERVABLE output surfaces only -- `confident` /
+    `skill_score` / `pair_n` are candidate-level fields the rendered views
+    do not expose, so asserting them on view output would be a false
+    oracle.
+
+    Future samples are anchored to TOMORROW relative to the real wall
+    clock (not a fixed calendar date) so the SAME fixture populates day
+    tile 1 both for the direct `build_forecast`/`build_hourly` calls below
+    (captured `now`, passed explicitly) and for the HTTP round trip (which
+    has no `now` override and always reads the real clock) -- the two must
+    exercise the identical degraded-ranking scenario, not a coincidentally
+    already-empty day. `forecast_pairs` use a fixed far-future date
+    (2035-06-30) instead: the rolling window's cutoff is a lower bound
+    only, so a far-future pair stays "in window" regardless of which real
+    day the suite runs on -- the same pattern
+    `test_forecast_blend_depth_option.py::_seed_two_confident_feeds` relies
+    on.
+
+    The no-enqueue assertion is HTTP-level: a `rebuilding`-empty ranking
+    must degrade gracefully with NO Forecast-side rescore enqueue -- a
+    direct `build_forecast` call is a pure read, so a function-level
+    zero-job assertion would be vacuous.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Forecast Degradation")
+    set_setting(conn, "min_n", "1")
+    feed_id = int(
+        conn.execute(
+            "SELECT id FROM feeds WHERE source='open-meteo' AND model='ecmwf_ifs'"
+        ).fetchone()["id"]
+    )
+    persistence_id = int(
+        conn.execute(
+            "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
+        ).fetchone()["id"]
+    )
+
+    now = utc_now()
+    tomorrow = now.date() + timedelta(days=1)
+    issued_at = isoformat_utc(floor_hour(now))
+    for h in range(24):
+        conn.execute(
+            """
+            INSERT INTO forecast_samples
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 value, source_raw, model_run_id, fetched_at)
+            VALUES (?, ?, 'temperature', ?, ?, ?, 11.0, '{}', 'run-1', ?)
+            """,
+            (
+                site_id,
+                feed_id,
+                issued_at,
+                f"{tomorrow.isoformat()}T{h:02d}:00:00Z",
+                h + 1,
+                issued_at,
+            ),
+        )
+    for i, valid_at in enumerate(
+        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
+    ):
+        conn.execute(
+            """
+            INSERT INTO forecast_pairs
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 day_ahead, forecast, observed, error, abs_error, sq_error)
+            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
+                    11.0, 10.0, 1.0, 1.0, 1.0)
+            """,
+            (site_id, feed_id, valid_at, i + 1),
+        )
+    for i, valid_at in enumerate(
+        ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
+    ):
+        # Persistence baseline paired on the SAME (site, variable, valid_at,
+        # lead_hours, day_ahead) as the candidate feed's rows above --
+        # required by `_paired_skill`'s join. A worse forecast (15.0 vs
+        # observed 10.0) than the candidate's (11.0 vs 10.0) gives a
+        # nonzero, genuinely-confident skill_score under live recompute.
+        conn.execute(
+            """
+            INSERT INTO forecast_pairs
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 day_ahead, forecast, observed, error, abs_error, sq_error)
+            VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
+                    15.0, 10.0, 5.0, 5.0, 25.0)
+            """,
+            (site_id, persistence_id, valid_at, i + 1),
+        )
+    # Deliberately NO upsert_score_cache call -- the point of this fixture.
+
+    view = build_forecast(
+        conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    assert view.tiles[1].temp.meta.state == "low_confidence"
+    assert any(ref.feed_id == feed_id for ref in view.tiles[1].temp.meta.feeds)
+
+    hourly = build_hourly(conn, site_id=site_id, timezone="UTC", day=1, now=now)
+    assert hourly["states"]["temperature"] == "low_confidence"
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        tiles_resp = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
+        assert tiles_resp.status_code == 200
+
+        hourly_resp = client.get(f"/api/forecast/hourly?site={site_id}&day=1")
+        assert hourly_resp.status_code == 200
+        assert hourly_resp.json()["states"]["temperature"] == "low_confidence"
+
+        job_count = get_db().read_sync(
+            lambda c: c.execute(
+                "SELECT COUNT(*) AS n FROM jobs"
+                " WHERE type='pair_and_score' AND site_id=?",
+                (site_id,),
+            ).fetchone()["n"]
+        )
+        assert job_count == 0

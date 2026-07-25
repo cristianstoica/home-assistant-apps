@@ -37,9 +37,13 @@ import pytest
 from pydantic import ValidationError
 
 from wxverify.core.options import RuntimeOptions, _from_env
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.forecast.service import build_forecast
-from wxverify.settings.keys import get_setting, set_setting
+from wxverify.scoring.cache import upsert_score_cache
+from wxverify.scoring.leaderboard import resolve_window
+from wxverify.scoring.metrics import strategy_for
+from wxverify.settings.keys import get_number_setting, get_setting, set_setting
 from wxverify.settings.service import apply_plain_settings
 
 T = TypeVar("T")
@@ -217,20 +221,67 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
             )
 
 
+def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
+    """Seed a fresh, complete score_cache snapshot for the (temperature,
+    day_ahead=1, w:30) cell `_seed_two_confident_feeds` populates.
+
+    It seeds forecast_pairs for THREE feeds -- the two competitors plus
+    ``virtual/_persistence`` -- and `active_competitor_clause` counts virtual
+    feeds unconditionally, so the expected feed universe for the cache-backed
+    leaderboard lookup is all three; a snapshot missing persistence would be
+    a partial (and therefore ignored) snapshot, falling through to
+    'rebuilding'-empty rather than the confident-feed selection this test
+    exercises. `computed_at` is the REAL current UTC time, not the fixture's
+    injected `now` -- `is_cache_fresh` buckets against the actual wall-clock
+    UTC day, never an injectable test `now`.
+    """
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    resolved = resolve_window(conn, "rolling")
+    for source, model in (
+        ("open-meteo", "ecmwf_ifs"),
+        ("open-meteo", "gfs_global"),
+        ("virtual", "_persistence"),
+    ):
+        feed_id = _feed_id(conn, source, model)
+        result = strategy_for("temperature").aggregate(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            window_cutoff=resolved.cutoff,
+            min_n=min_n,
+        )
+        upsert_score_cache(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            window_key=resolved.window_key,
+            result=result,
+            computed_at=isoformat_utc(),
+        )
+
+
 def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
     conn_default = _make_db()
     _seed_two_confident_feeds(conn_default)
+    _seed_score_cache_for_fixture(conn_default)
     view_default = build_forecast(
         conn_default, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     assert len(view_default.tiles[0].temp.meta.feeds) == 2  # default depth = 2
+    assert view_default.tiles[0].temp.meta.state != "low_confidence"
 
     conn_narrow = _make_db()
     _seed_two_confident_feeds(conn_narrow)
+    _seed_score_cache_for_fixture(conn_narrow)
     set_setting(conn_narrow, "forecast_blend_depth", "1")
     view_narrow = build_forecast(
         conn_narrow, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     assert len(view_narrow.tiles[0].temp.meta.feeds) == 1
+    assert view_narrow.tiles[0].temp.meta.state != "low_confidence"

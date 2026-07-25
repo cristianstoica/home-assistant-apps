@@ -227,7 +227,8 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         #       issued while this job is mid-split is SWALLOWED, not queued
         #       behind it: a future route that switches from inline scoring
         #       to enqueueing would break convergence silently. The dashboard
-        #       _enqueue_score routes do not write observations and are safe.
+        #       enqueue_score_rescore routes do not write observations and
+        #       are safe.
         for phase in PAIR_AND_SCORE_PHASES:
             logger.debug("score phase=%s site=%s", phase.__name__, site_id)
             await db.write(

@@ -35,7 +35,10 @@ from wxverify.forecast.data import (
     load_future_samples,
     samples_fingerprint,
 )
-from wxverify.settings.keys import set_setting
+from wxverify.scoring.cache import upsert_score_cache
+from wxverify.scoring.leaderboard import resolve_window
+from wxverify.scoring.metrics import strategy_for
+from wxverify.settings.keys import get_number_setting, set_setting
 
 _FAR_FUTURE_VALID_ATS = (
     "2035-07-01T00:00:00Z",
@@ -414,9 +417,51 @@ def _seed_ranking_exclusion_fixture(conn: sqlite3.Connection) -> dict[str, int]:
     }
 
 
+def _seed_complete_score_cache(
+    conn: sqlite3.Connection, *, feed_ids: list[int], variable: str, day_ahead: int
+) -> None:
+    """Seed a fresh, complete score_cache snapshot for exactly `feed_ids` at
+    one (variable, day_ahead) cell on the default rolling window.
+
+    forecast_ranking's cache-backed leaderboard lookup requires a snapshot
+    whose feed set equals the query's expected-active-feed set exactly (a
+    partial snapshot is treated as absent) or it degrades to a 'rebuilding'
+    empty ranking rather than the live-recomputed values these tests assert
+    on. Seeding via the same strategy_for(...).aggregate call the live path
+    used reproduces identical numbers. `computed_at` is
+    the REAL current UTC time (not a fixture-injected `now`) because
+    `is_cache_fresh` buckets against the actual wall-clock UTC day.
+    """
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    resolved = resolve_window(conn, "rolling")
+    for feed_id in feed_ids:
+        result = strategy_for(variable).aggregate(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_cutoff=resolved.cutoff,
+            min_n=min_n,
+        )
+        upsert_score_cache(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_key=resolved.window_key,
+            result=result,
+            computed_at=isoformat_utc(),
+        )
+
+
 def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None:
     conn = _make_db()
     ids = _seed_ranking_exclusion_fixture(conn)
+    _seed_complete_score_cache(
+        conn, feed_ids=list(ids.values()), variable="temperature", day_ahead=0
+    )
 
     ranking = forecast_ranking(
         conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"

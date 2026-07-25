@@ -33,6 +33,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import close_db, init_db
+from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import set_setting
 from wxverify.web.context import (
@@ -862,6 +863,34 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
     assert result.skill_score is None
     assert result.confident is False
 
+    # Cache-backed windows never live-recompute (§2 SWR migration): the
+    # dashboard's `window=all` read serves exclusively from score_cache, so
+    # the fixture seeds a COMPLETE `w:all` snapshot of the expected active
+    # feed universe (the feed AND virtual/_persistence, both of which have
+    # pairs) from the SAME live aggregates asserted above — the boundary
+    # semantics (skill withheld at n >= min_n) still come from the real
+    # strategy math, the render just reads them through the cache.
+    for cached_feed in (feed, persistence):
+        upsert_score_cache(
+            conn,
+            site_id=site_id,
+            feed_id=cached_feed,
+            variable="temperature",
+            day_ahead=1,
+            window_key="w:all",
+            result=strategy_for("temperature").aggregate(
+                conn,
+                site_id=site_id,
+                feed_id=cached_feed,
+                variable="temperature",
+                day_ahead=1,
+                window_cutoff=None,
+                min_n=2,
+            ),
+            computed_at=_COMPUTED_AT,
+        )
+    conn.commit()
+
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         html = _get_dashboard(client, site_id)
@@ -907,6 +936,22 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
     assert result.n >= 2
     assert result.skill_score is None
     assert result.confident is False
+
+    # §2 SWR migration (see the temperature boundary test above): the
+    # cache-backed `window=all` read never live-recomputes, so seed the
+    # complete `w:all` snapshot (this feed is the whole expected universe —
+    # no persistence pairs exist for precip here) from the asserted aggregate.
+    upsert_score_cache(
+        conn,
+        site_id=site_id,
+        feed_id=feed,
+        variable="precip",
+        day_ahead=1,
+        window_key="w:all",
+        result=result,
+        computed_at=_COMPUTED_AT,
+    )
+    conn.commit()
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:

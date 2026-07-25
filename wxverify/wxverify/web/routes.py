@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from fastapi import APIRouter, Request, Response
@@ -9,7 +10,7 @@ from fastapi.responses import HTMLResponse
 
 from wxverify.db.connection import get_db
 from wxverify.forecast.service import ForecastView, build_forecast
-from wxverify.scoring.composite import enqueue_composite_rescore
+from wxverify.scoring.composite import enqueue_score_rescore
 from wxverify.web.context import (
     SiteView,
     load_dashboard,
@@ -19,6 +20,8 @@ from wxverify.web.context import (
     load_sites,
 )
 from wxverify.web.render import render, render_fragment
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(include_in_schema=False)
 
@@ -107,17 +110,23 @@ async def dashboard_page(
         )
     )
     # Second composite enqueue site (mirrors /api/composite): the read above is
-    # closed before this write, and the cooldown-guarded composite-only helper
-    # does the enqueue. The resolved site comes from the context because
-    # load_dashboard defaults to the first enabled site when `site` is None.
+    # closed before this write, and the shared cooldown-guarded helper does the
+    # enqueue. The resolved site comes from the context because load_dashboard
+    # defaults to the first enabled site when `site` is None. Best-effort: an
+    # enqueue failure must never fail a page that already rendered its data.
     resolved_site = context.get("site")
     if context.get("composite_status") in ("stale", "rebuilding") and isinstance(
         resolved_site, SiteView
     ):
         resolved_site_id = resolved_site.id
-        await get_db().write(
-            lambda conn: enqueue_composite_rescore(conn, resolved_site_id)
-        )
+        try:
+            await get_db().write(
+                lambda conn: enqueue_score_rescore(conn, resolved_site_id)
+            )
+        except Exception:
+            logger.warning(
+                "rescore enqueue failed site=%s", resolved_site_id, exc_info=True
+            )
     return render(request, "dashboard/show.html", **context)
 
 

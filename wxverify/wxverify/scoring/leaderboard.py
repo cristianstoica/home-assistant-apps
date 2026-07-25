@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from typing import Literal
 
 from wxverify.core.timeutil import window_cutoff
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
+
+LeaderboardStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
 
 
 @dataclass(frozen=True)
@@ -40,7 +43,7 @@ class WindowResolution:
 @dataclass(frozen=True)
 class LeaderboardResult:
     rows: list[LeaderboardRow]
-    cache_miss: bool
+    status: LeaderboardStatus
     window_key: str
     window_days: int | None
 
@@ -70,35 +73,84 @@ def leaderboard_with_status(
     day_ahead: int,
     window: str,
 ) -> LeaderboardResult:
+    """Return leaderboard rows plus a cache status for the resolved window.
+
+    Mirrors ``composite_with_status``'s state model: cache-backed windows
+    (``rolling`` / ``all``) are served exclusively from ``score_cache`` — a
+    fresh complete snapshot is a ``hit``, a complete-but-stale snapshot is
+    served as ``stale`` (never recomputed live), and an absent/mismatched
+    snapshot with applicable input is ``rebuilding`` (empty rows). The
+    no-input gate runs before any cache branch: a missing/disabled site or an
+    empty expected feed universe is genuinely ``empty`` regardless of cache
+    contents, and callers MUST NOT enqueue for it. Custom ``Nd`` windows
+    always compute live and return ``live`` — the engine never writes
+    ``live:{N}d`` cache keys, so they must not look like cache misses.
+    Callers enqueue a rescore (after the read closes) only for ``stale`` and
+    ``rebuilding``.
+    """
     resolved = resolve_window(conn, window)
-    if resolved.cache_backed:
-        rows = _cached_leaderboard(
+    if not resolved.cache_backed:
+        rows = _live_leaderboard(
             conn,
             site_id=site_id,
             variable=variable,
             day_ahead=day_ahead,
             resolved=resolved,
         )
-        if rows is not None:
-            return LeaderboardResult(
-                rows=rows,
-                cache_miss=False,
-                window_key=resolved.window_key,
-                window_days=resolved.window_days,
-            )
-    rows = _live_leaderboard(
+        return LeaderboardResult(
+            rows=rows,
+            status="live",
+            window_key=resolved.window_key,
+            window_days=resolved.window_days,
+        )
+    if not _site_enabled(conn, site_id):
+        return LeaderboardResult(
+            rows=[],
+            status="empty",
+            window_key=resolved.window_key,
+            window_days=resolved.window_days,
+        )
+    expected_feed_ids = _expected_active_feed_ids(
         conn,
         site_id=site_id,
         variable=variable,
         day_ahead=day_ahead,
         resolved=resolved,
     )
+    if not expected_feed_ids:
+        return LeaderboardResult(
+            rows=[],
+            status="empty",
+            window_key=resolved.window_key,
+            window_days=resolved.window_days,
+        )
+    cached = _cached_leaderboard(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        resolved=resolved,
+        expected_feed_ids=expected_feed_ids,
+    )
+    if cached is None:
+        return LeaderboardResult(
+            rows=[],
+            status="rebuilding",
+            window_key=resolved.window_key,
+            window_days=resolved.window_days,
+        )
+    rows, fresh = cached
     return LeaderboardResult(
         rows=rows,
-        cache_miss=resolved.cache_backed,
+        status="hit" if fresh else "stale",
         window_key=resolved.window_key,
         window_days=resolved.window_days,
     )
+
+
+def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:
+    row = conn.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()
+    return row is not None and bool(row["enabled"])
 
 
 def _live_leaderboard(
@@ -163,7 +215,15 @@ def _cached_leaderboard(
     variable: str,
     day_ahead: int,
     resolved: WindowResolution,
-) -> list[LeaderboardRow] | None:
+    expected_feed_ids: set[int],
+) -> tuple[list[LeaderboardRow], bool] | None:
+    """Serve the leaderboard from ``score_cache``; None only on absent/mismatch.
+
+    Returns ``(rows, fresh)``: a complete same-window feed-set snapshot is
+    served even when stale (``fresh=False``) — the stale path must never fall
+    through to the live recompute. ``expected_feed_ids`` is computed by the
+    caller so the hot-path DISTINCT query runs only once per read.
+    """
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     rows = conn.execute(
         f"""
@@ -186,15 +246,9 @@ def _cached_leaderboard(
     if not rows:
         return None
     cached_feed_ids = {int(row["feed_id"]) for row in rows}
-    expected_feed_ids = _expected_active_feed_ids(
-        conn,
-        site_id=site_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        resolved=resolved,
-    )
     if cached_feed_ids != expected_feed_ids:
         return None
+    fresh = True
     out: list[LeaderboardRow] = []
     for row in rows:
         cache_row = ScoreCacheRow(
@@ -211,7 +265,7 @@ def _cached_leaderboard(
             computed_at=None if row["computed_at"] is None else str(row["computed_at"]),
         )
         if not is_cache_fresh(cache_row, resolved.window_key):
-            return None
+            fresh = False
         raw = cache_row.skill_score
         out.append(
             LeaderboardRow(
@@ -230,7 +284,7 @@ def _cached_leaderboard(
                 window_days=resolved.window_days,
             )
         )
-    return out
+    return out, fresh
 
 
 def _expected_active_feed_ids(

@@ -24,6 +24,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, datetime
 
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.forecast.service import (
@@ -32,7 +33,10 @@ from wxverify.forecast.service import (
     build_hourly,
     relative_ago,
 )
-from wxverify.settings.keys import set_setting
+from wxverify.scoring.cache import upsert_score_cache
+from wxverify.scoring.leaderboard import resolve_window
+from wxverify.scoring.metrics import strategy_for
+from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import feed_label
 
 _FAR_FUTURE_VALID_ATS = (
@@ -294,6 +298,56 @@ def _seed_far_horizon_collapse(conn: sqlite3.Connection) -> None:
     )
 
 
+def _seed_complete_score_cache(
+    conn: sqlite3.Connection, *, variable: str, day_ahead: int
+) -> None:
+    """Seed a fresh, complete score_cache snapshot for every feed that has
+    forecast_pairs at (site 1, `variable`, `day_ahead`) on the default
+    rolling window.
+
+    Cache-backed forecast_ranking (via leaderboard_with_status) requires a
+    snapshot whose feed set equals the query's expected-active-feed set
+    EXACTLY -- a partial snapshot is treated as absent, same as no snapshot
+    at all -- or the cell degrades to a 'rebuilding' empty ranking rather
+    than the live-recomputed skill/confidence values these tests assert on.
+    Seeding via the same `strategy_for(...).aggregate` call the live path
+    used to make reproduces identical numbers, so this changes WHERE the
+    numbers come from, never what they are. `computed_at` is the REAL
+    current UTC time (never a fixture-injected `now`) because
+    `is_cache_fresh` buckets against the actual wall-clock UTC day.
+    """
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    resolved = resolve_window(conn, "rolling")
+    feed_ids = {
+        int(row["feed_id"])
+        for row in conn.execute(
+            "SELECT DISTINCT feed_id FROM forecast_pairs "
+            "WHERE site_id=1 AND variable=? AND day_ahead=?",
+            (variable, day_ahead),
+        ).fetchall()
+    }
+    for feed_id in feed_ids:
+        result = strategy_for(variable).aggregate(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_cutoff=resolved.cutoff,
+            min_n=min_n,
+        )
+        upsert_score_cache(
+            conn,
+            site_id=1,
+            feed_id=feed_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_key=resolved.window_key,
+            result=result,
+            computed_at=isoformat_utc(),
+        )
+
+
 # ---------------------------------------------------------------------------
 # B2 audit gate: a run issued the PRIOR local day, landing in TODAY's display
 # tile, must rank by its issue-relative day_ahead (1), not the display day
@@ -320,6 +374,7 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
     # service wrongly ranked by the display day index (0) instead, this feed
     # would find no ranking row there and read as not-confident.
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -383,6 +438,7 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
         valid_ats=valid_ats,
     )
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -416,6 +472,7 @@ def test_partial_badge_when_under_coverage_tile_stays_populated() -> None:
         value=12.0,
     )
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -451,6 +508,7 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
         valid_ats=valid_ats,
     )
     _make_confident(conn, feed_id=ecmwf_id, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     # wind: samples present, but zero forecast_pairs anywhere -> low_confidence
     # (fresh-install sample-count rung).
@@ -609,6 +667,7 @@ def test_build_hourly_hour_axis_reflects_selected_feed_only() -> None:
         valid_ats=_hours("2026-07-20", 4, 2),
     )
     _make_confident(conn, feed_id=winner_id, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
     # Loser: not confident (no pairs), disjoint hours.
     _seed_hourly(
         conn,
@@ -667,6 +726,7 @@ def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)  # local date 2026-07-20
     set_setting(conn, "forecast_blend_depth", "1")
     _seed_far_horizon_collapse(conn)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -720,6 +780,7 @@ def test_near_tile_skill_still_decides_end_to_end() -> None:
     _seed_scoring_pairs(
         conn, feed_id=low_id, variable="temperature", day_ahead=1, forecast=11.0
     )  # lower skill
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -740,6 +801,7 @@ def test_build_hourly_far_tile_is_not_a_single_point() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     set_setting(conn, "forecast_blend_depth", "1")
     _seed_far_horizon_collapse(conn)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
     hours = payload["hours"]
@@ -814,6 +876,8 @@ def test_coverage_gate_is_variable_agnostic_precip_and_wind() -> None:
     _seed_scoring_pairs(
         conn, feed_id=single_id, variable="precip", day_ahead=5, forecast=10.5
     )
+    _seed_complete_score_cache(conn, variable="wind", day_ahead=5)
+    _seed_complete_score_cache(conn, variable="precip", day_ahead=5)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -877,6 +941,7 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
     _seed_scoring_pairs(
         conn, feed_id=partial_id, variable="temperature", day_ahead=7, forecast=11.0
     )  # lower skill
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -955,6 +1020,7 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
     _seed_scoring_pairs(
         conn, feed_id=covered, variable="temperature", day_ahead=7, forecast=11.0
     )
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now

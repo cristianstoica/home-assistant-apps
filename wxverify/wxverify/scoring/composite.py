@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -14,6 +15,8 @@ from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import WindowResolution, resolve_window, score_badge
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
+
+logger = logging.getLogger(__name__)
 
 CompositeStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
 
@@ -78,15 +81,17 @@ def composite_with_status(
     return CompositeResult(rows=rows, status="hit" if fresh else "stale")
 
 
-def enqueue_composite_rescore(conn: sqlite3.Connection, site_id: int) -> None:
+def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:
     """Enqueue a ``pair_and_score`` rescore with terminal-failure cooldown.
 
-    Composite-only guard: if the latest ``pair_and_score`` job for this site is
-    terminally ``failed`` and was updated within the last 15 minutes, suppress
-    the enqueue so per-request cache misses cannot re-enqueue a persistently
-    failing scoring job on every poll. The latest outcome (not "any recent
-    failed row") decides, so a later ``completed`` job supersedes an older
-    failure. Leaderboard/curve enqueues (``_enqueue_score``) are not gated.
+    Shared guard for every post-read rescore enqueue (composite, leaderboard,
+    and curve routes plus the dashboard page — they all enqueue the identical
+    generic scoring job): if the latest ``pair_and_score`` job for this site
+    is terminally ``failed`` and was updated within the last 15 minutes,
+    suppress the enqueue so per-request stale/rebuilding reads cannot
+    re-enqueue a persistently failing scoring job on every poll. The latest
+    outcome (not "any recent failed row") decides, so a later ``completed``
+    job supersedes an older failure.
     """
     row = conn.execute(
         """
@@ -103,6 +108,13 @@ def enqueue_composite_rescore(conn: sqlite3.Connection, site_id: int) -> None:
     if row is not None and str(row["status"]) == "failed":
         updated_at = parse_utc(str(row["updated_at"]))
         if utc_now() - updated_at < _RESCORE_FAILURE_COOLDOWN:
+            logger.debug(
+                "rescore enqueue suppressed type=%s site=%s key=%s"
+                " (terminal failure within cooldown)",
+                "pair_and_score",
+                site_id,
+                "score",
+            )
             return
     enqueue_if_absent(conn, "pair_and_score", site_id, "score", {"site_id": site_id})
 

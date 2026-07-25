@@ -22,6 +22,7 @@ from wxverify.api.app import _default_stop_process, _stop_on_worker_done, create
 from wxverify.api.routes.feeds import _rebuild_mean_for_site
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import persist_fetch_result
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.queue import (
     Job,
@@ -51,7 +52,7 @@ from wxverify.obs.pws_adapter import (
     fetch_hourly_history_range,
     observations_from_payload,
 )
-from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
+from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh, upsert_score_cache
 from wxverify.scoring.composite import composite
 from wxverify.scoring.consensus import (
     StationReading,
@@ -63,10 +64,12 @@ from wxverify.scoring.leaderboard import (
     below_baseline,
     leaderboard,
     leaderboard_with_status,
+    resolve_window,
     score_badge,
 )
+from wxverify.scoring.metrics import strategy_for
 from wxverify.scoring.winrate import winrate
-from wxverify.settings.keys import set_setting
+from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
@@ -2019,6 +2022,35 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
         observed=10.0,
     )
 
+    # window="all" is cache-backed (w:all): leaderboard_with_status now serves
+    # exclusively from score_cache for cache-backed windows, so the expected
+    # active feed universe -- real_feed_ids[0] AND virtual/_persistence, both
+    # of which have pairs in this window -- needs a complete seeded snapshot
+    # or the read degrades to a 'rebuilding' empty ranking instead of the
+    # skill_score assertion below.
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    resolved = resolve_window(conn, "all")
+    for feed_id in (real_feed_ids[0], persistence_feed_id):
+        result = strategy_for("temperature").aggregate(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            window_cutoff=resolved.cutoff,
+            min_n=min_n,
+        )
+        upsert_score_cache(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            window_key=resolved.window_key,
+            result=result,
+            computed_at=isoformat_utc(),
+        )
+
     skill_rows = leaderboard(
         conn,
         site_id=site_id,
@@ -2697,7 +2729,7 @@ def test_meteoblue_package_gates_members_for_leaderboard_and_mean(
     assert set(member_ids).isdisjoint(listed_after_unsubscribe)
 
 
-def test_dashboard_rolling_readthrough_enqueues_only_on_cache_miss(
+def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     close_db()
@@ -2755,9 +2787,13 @@ def test_dashboard_rolling_readthrough_enqueues_only_on_cache_miss(
         )
         assert response.status_code == 200
         rows = response.json()
-        assert rows
-        assert rows[0]["window_key"] == "w:14"
-        assert rows[0]["window_days"] == 14
+        # Applicable input exists (a forecast_pairs row for the one active
+        # feed), but score_cache is absent -- cache-backed windows never
+        # live-recompute, so the read degrades to 'rebuilding': empty rows,
+        # not a live fallback that fills in a row straight from
+        # forecast_pairs. Exactly one job is enqueued for the miss (not zero,
+        # not duplicated across the single read).
+        assert rows == []
         assert (
             db.read_sync(
                 lambda conn: conn.execute(
@@ -2769,7 +2805,7 @@ def test_dashboard_rolling_readthrough_enqueues_only_on_cache_miss(
                     (site_id,),
                 ).fetchone()["n"]
             )
-            >= 1
+            == 1
         )
 
 
@@ -2819,8 +2855,12 @@ def test_cached_leaderboard_misses_when_active_feed_cache_is_incomplete(
         day_ahead=1,
         window="all",
     )
-    assert result.cache_miss is True
-    assert {row.feed_id for row in result.rows} == set(feed_ids)
+    # A partial snapshot (one of the two expected active feeds cached) is
+    # treated as absent -- cache-backed windows never live-recompute, so an
+    # incomplete cache degrades to a 'rebuilding' empty ranking rather than
+    # a live fallback that fills in the missing feed's row.
+    assert result.status == "rebuilding"
+    assert result.rows == []
 
 
 def test_station_toggle_and_rain_threshold_restore_pairs(
@@ -3927,7 +3967,8 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
     """Button typed-job oracle + paired negative (§11a-B / T01 / S02):
     - POST /api/catchup → 'catchup' typed row in jobs (not just pending count)
     - POST /api/sites/<id>/backfill → 'backfill_site' row for that site_id
-    - GET /api/leaderboard (cache-miss) → NO catchup/backfill_site row created
+    - GET /api/leaderboard (rebuilding: applicable input, absent cache) →
+      NO catchup/backfill_site row created
     """
     close_db()
     config.db_path = str(tmp_path / "oracle.db")

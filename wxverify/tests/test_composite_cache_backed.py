@@ -1,7 +1,7 @@
 """Verification suite for the composite cache-backed read path (plan
 "ground-yourself-in-home-assistant-apps-mutable-blanket", 0.4.2).
 
-Covers ``composite_with_status``/``enqueue_composite_rescore`` in
+Covers ``composite_with_status``/``enqueue_score_rescore`` in
 ``wxverify/scoring/composite.py``: the cached/live equivalence linchpin, the
 perf property that ``hit``/``stale`` never fall through to a live recompute,
 the full status matrix (``hit``/``stale``/``rebuilding``/``empty``/``live``)
@@ -51,7 +51,7 @@ from wxverify.scoring.composite import (
     _expected_active_cells,
     _live_composite,
     composite_with_status,
-    enqueue_composite_rescore,
+    enqueue_score_rescore,
 )
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.leaderboard import resolve_window
@@ -1126,7 +1126,7 @@ def test_api_composite_partial_snapshot_after_consensus_invalidation_is_rebuildi
 # ---------------------------------------------------------------------------
 
 
-def test_enqueue_composite_rescore_suppressed_within_failure_cooldown(
+def test_enqueue_score_rescore_suppressed_within_failure_cooldown(
     tmp_path: Path,
 ) -> None:
     conn = _init_tmp_db(tmp_path)
@@ -1139,11 +1139,11 @@ def test_enqueue_composite_rescore_suppressed_within_failure_cooldown(
         created_at=isoformat_utc(now - timedelta(minutes=5)),
         updated_at=isoformat_utc(now - timedelta(minutes=5)),
     )
-    enqueue_composite_rescore(conn, site_id)
+    enqueue_score_rescore(conn, site_id)
     assert _job_count(conn, site_id) == 1  # suppressed: no new job
 
 
-def test_enqueue_composite_rescore_fires_after_cooldown_expires(
+def test_enqueue_score_rescore_fires_after_cooldown_expires(
     tmp_path: Path,
 ) -> None:
     """Paired positive for the suppression test above: once the failed job is
@@ -1159,7 +1159,7 @@ def test_enqueue_composite_rescore_fires_after_cooldown_expires(
         created_at=isoformat_utc(now - timedelta(minutes=20)),
         updated_at=isoformat_utc(now - timedelta(minutes=20)),
     )
-    enqueue_composite_rescore(conn, site_id)
+    enqueue_score_rescore(conn, site_id)
     assert _job_count(conn, site_id) == 2
     newest = conn.execute(
         "SELECT status FROM jobs WHERE site_id=? ORDER BY id DESC LIMIT 1", (site_id,)
@@ -1167,7 +1167,7 @@ def test_enqueue_composite_rescore_fires_after_cooldown_expires(
     assert newest["status"] == "pending"
 
 
-def test_enqueue_composite_rescore_completed_supersedes_older_failed(
+def test_enqueue_score_rescore_completed_supersedes_older_failed(
     tmp_path: Path,
 ) -> None:
     conn = _init_tmp_db(tmp_path)
@@ -1187,7 +1187,7 @@ def test_enqueue_composite_rescore_completed_supersedes_older_failed(
         created_at=isoformat_utc(now - timedelta(minutes=1)),
         updated_at=isoformat_utc(now - timedelta(minutes=1)),
     )
-    enqueue_composite_rescore(conn, site_id)
+    enqueue_score_rescore(conn, site_id)
     # Latest outcome (completed) supersedes the older failure -- proceeds.
     assert _job_count(conn, site_id) == 3
 
@@ -1227,11 +1227,14 @@ def test_api_composite_repeated_polls_during_cooldown_do_not_spawn_jobs(
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
-def test_api_leaderboard_enqueue_unaffected_by_composite_cooldown(
+def test_api_leaderboard_enqueue_shares_composite_cooldown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression guard: /api/leaderboard's `_enqueue_score` is not gated by
-    the composite-only cooldown, unlike /api/composite's enqueue path.
+    """Regression guard (post-§3.2): /api/leaderboard's enqueue now goes
+    through the SAME cooldown-guarded function as /api/composite (the
+    generic score-rescore enqueue), so a recent terminal failure suppresses
+    the leaderboard-driven enqueue exactly as it would a composite one --
+    job count stays at 1 (the pre-existing failed job), no second job.
     """
     app = _start_app(tmp_path, monkeypatch)
     with TestClient(app) as client:
@@ -1260,12 +1263,15 @@ def test_api_leaderboard_enqueue_unaffected_by_composite_cooldown(
             params={"site": site_id, "variable": "temperature", "lead": "D+1"},
         )
         assert response.status_code == 200
-        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 2
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
-def test_api_curve_enqueue_unaffected_by_composite_cooldown(
+def test_api_curve_enqueue_shares_composite_cooldown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Curve analogue of the leaderboard cooldown-sharing regression guard
+    above: a recent terminal failure suppresses the curve-driven enqueue too.
+    """
     app = _start_app(tmp_path, monkeypatch)
     with TestClient(app) as client:
         db = get_db()
@@ -1293,7 +1299,7 @@ def test_api_curve_enqueue_unaffected_by_composite_cooldown(
             params={"site": site_id, "variable": "temperature", "lead": "D+1"},
         )
         assert response.status_code == 200
-        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 2
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
 # ---------------------------------------------------------------------------

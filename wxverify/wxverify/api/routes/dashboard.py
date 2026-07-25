@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass
 
@@ -10,11 +11,16 @@ from fastapi import APIRouter, Query
 from wxverify.api.schemas import LeaderboardOut
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import get_db
-from wxverify.db.queue import enqueue_if_absent
-from wxverify.scoring.composite import composite_with_status, enqueue_composite_rescore
-from wxverify.scoring.leaderboard import LeaderboardResult, leaderboard_with_status
+from wxverify.scoring.composite import composite_with_status, enqueue_score_rescore
+from wxverify.scoring.leaderboard import (
+    LeaderboardResult,
+    LeaderboardStatus,
+    leaderboard_with_status,
+)
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.web.context import feed_label
+
+logger = logging.getLogger(__name__)
 
 _CURVE_LEADS: list[int] = list(range(0, 8))
 _MAX_SERIES = 6  # number of --chart-* palette tokens
@@ -31,7 +37,9 @@ async def leaderboard(
 ) -> list[LeaderboardOut]:
     day_ahead = _lead_to_day(lead)
 
-    def _read(conn: sqlite3.Connection) -> tuple[list[LeaderboardOut], bool]:
+    def _read(
+        conn: sqlite3.Connection,
+    ) -> tuple[list[LeaderboardOut], LeaderboardStatus]:
         result = leaderboard_with_status(
             conn,
             site_id=site,
@@ -39,14 +47,12 @@ async def leaderboard(
             day_ahead=day_ahead,
             window=window,
         )
-        return [
-            LeaderboardOut(**row.__dict__) for row in result.rows
-        ], result.cache_miss
+        return [LeaderboardOut(**row.__dict__) for row in result.rows], result.status
 
-    result, cache_miss = await get_db().read(_read)
+    result, status = await get_db().read(_read)
 
-    if cache_miss:
-        await get_db().write(lambda conn: _enqueue_score(conn, site))
+    if status in ("stale", "rebuilding"):
+        await _enqueue_rescore_best_effort(site)
 
     return result
 
@@ -90,11 +96,13 @@ async def curve(
             "series": series,
             "window_key": results[0].window_key if results else None,
             "window_days": results[0].window_days if results else None,
-        }, any(result.cache_miss for result in results)
+        }, any(result.status in ("stale", "rebuilding") for result in results)
 
-    result, cache_miss = await get_db().read(_read)
-    if cache_miss:
-        await get_db().write(lambda conn: _enqueue_score(conn, site))
+    result, needs_rescore = await get_db().read(_read)
+    # `empty` leads do not gate: a genuinely inapplicable curve slice must not
+    # turn into a rebuild request of its own.
+    if needs_rescore:
+        await _enqueue_rescore_best_effort(site)
     return result
 
 
@@ -198,10 +206,10 @@ async def composite(
     result = await get_db().read(
         lambda conn: composite_with_status(conn, site_id=site, window=window)
     )
-    # Enqueue only after the read connection is released; the composite-only
-    # helper carries the terminal-failure cooldown (never `_enqueue_score`).
+    # Enqueue only after the read connection is released; the shared helper
+    # carries the terminal-failure cooldown.
     if result.status in ("stale", "rebuilding"):
-        await get_db().write(lambda conn: enqueue_composite_rescore(conn, site))
+        await _enqueue_rescore_best_effort(site)
     return result.rows
 
 
@@ -209,5 +217,13 @@ def _lead_to_day(lead: str) -> int:
     return parse_day_ahead(lead)
 
 
-def _enqueue_score(conn: sqlite3.Connection, site_id: int) -> None:
-    enqueue_if_absent(conn, "pair_and_score", site_id, "score", {"site_id": site_id})
+async def _enqueue_rescore_best_effort(site_id: int) -> None:
+    """Best-effort post-read rescore enqueue shared by the three JSON routes.
+
+    An enqueue failure must never fail a read that already has rows to serve —
+    the caller returns its 200 response regardless, and the failure is logged.
+    """
+    try:
+        await get_db().write(lambda conn: enqueue_score_rescore(conn, site_id))
+    except Exception:
+        logger.warning("rescore enqueue failed site=%s", site_id, exc_info=True)
