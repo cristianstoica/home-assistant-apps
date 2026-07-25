@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.6
+
+- Fixed: leaderboard and skill-curve reads no longer stall behind a slow
+  live rescore. Cache-backed leaderboard windows are now served
+  stale-while-revalidate, the same as composite scoring: a stale cached
+  snapshot is served immediately while a rescore is enqueued in the
+  background, instead of recomputing live inside the request. A site or
+  variable with no applicable input returns an empty result without
+  enqueueing any work.
+- Changed: the leaderboard, curve, composite, and dashboard-page rescore
+  enqueues now share one cooldown-guarded helper, so a persistently
+  failing scoring job cannot be re-enqueued on every poll from any of
+  those routes. An enqueue failure never fails a read that already has
+  rows to serve.
+- No config or API response-shape changes: the leaderboard, curve, and
+  composite JSON contracts are unchanged.
+
 ## 0.8.5
 
 - Fixed: the database export's first download attempt could still be cut off
