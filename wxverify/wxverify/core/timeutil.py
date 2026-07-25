@@ -29,6 +29,13 @@ def floor_hour(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 
 
+def local_day_start(now: datetime, timezone: str) -> datetime:
+    """UTC instant of local midnight of ``now``'s calendar day in ``timezone``."""
+    local_now = now.astimezone(ZoneInfo(timezone))
+    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.astimezone(UTC)
+
+
 def lead_hours(issued_at: str, valid_at: str) -> int:
     delta = parse_utc(valid_at) - parse_utc(issued_at)
     return int(delta.total_seconds() // 3600)

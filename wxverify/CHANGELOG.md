@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.7
+
+- Fixed: today's forecast now covers the full local calendar day (the
+  "forecast of record"). Daily aggregation for the Today tile previously
+  started its window at the current hour rather than local midnight, so
+  the tile under-reported the daily max and degraded to "partial" as the
+  day went on even though earlier hours had already been forecast. The
+  window now starts at local midnight, and elapsed hours resolve to the
+  freshest forecast run that covers them.
+
 ## 0.8.6
 
 - Fixed: leaderboard and skill-curve reads no longer stall behind a slow

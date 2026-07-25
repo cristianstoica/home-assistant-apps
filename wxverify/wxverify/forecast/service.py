@@ -19,8 +19,8 @@ from wxverify.core.timeutil import (
     day_ahead as issue_day_ahead,
 )
 from wxverify.core.timeutil import (
-    floor_hour,
     isoformat_utc,
+    local_day_start,
     parse_utc,
     utc_now,
 )
@@ -137,10 +137,20 @@ def build_forecast(
     rain_threshold_mm: float,
     now: datetime | None = None,
 ) -> ForecastView:
-    """Build the full 8-tile Forecast view model for one site."""
+    """Build the full 8-tile Forecast view model for one site.
+
+    The sample window starts at today's local midnight, so day 0 is the
+    "forecast of record": each elapsed hour shows the freshest run that
+    covered it, and the daily aggregate spans the full local day. As a
+    consequence, a site with only elapsed-today samples renders tiles (with
+    stale badges) instead of the empty state until local midnight — intended
+    forecast-of-record behavior.
+    """
     at = now or utc_now()
     samples = load_future_samples(
-        conn, site_id=site_id, since_valid_at=isoformat_utc(floor_hour(at))
+        conn,
+        site_id=site_id,
+        since_valid_at=isoformat_utc(local_day_start(at, timezone)),
     )
     fingerprint = samples_fingerprint(conn, site_id=site_id)
     if not samples:
@@ -212,10 +222,18 @@ def build_hourly(
     Per-variable winner sets are the SAME selections the tile used; the blend
     at each hour averages the selected feeds that cover that hour. Per-feed
     series ride along for the "show individual feeds" toggle.
+
+    The sample window starts at today's local midnight, so day 0 is the
+    "forecast of record": each elapsed hour shows the freshest run that
+    covered it. A site with only elapsed-today samples thus yields hourly
+    data (with stale badges) instead of an empty payload until local
+    midnight — intended forecast-of-record behavior.
     """
     at = now or utc_now()
     samples = load_future_samples(
-        conn, site_id=site_id, since_valid_at=isoformat_utc(floor_hour(at))
+        conn,
+        site_id=site_id,
+        since_valid_at=isoformat_utc(local_day_start(at, timezone)),
     )
     grouped = _group_samples(samples, timezone=timezone, now=at)
     blend_depth = get_number_setting(conn, "forecast_blend_depth", 2, minimum=1)
