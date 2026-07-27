@@ -28,7 +28,7 @@ from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
 from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
+from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -39,6 +39,7 @@ from wxverify.worker.domain_backoff import (
     source_domain,
 )
 from wxverify.worker.scheduler import scheduler_tick
+from wxverify.worker.score_batches import run_batched_scoring
 from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
 
 CATCHUP_SITE_CHUNK = 2
@@ -109,11 +110,22 @@ async def run_catchup(
             changed_sites.add(site.site_id)
     logger.debug("catchup rescoring sites=%s", len(changed_sites))
     for site_id in changed_sites:
-        # One write transaction per phase; runs inside the single worker job
-        # executor, so the convergence invariant documented at the
-        # pair_and_score dispatch site (worker/processor.py) applies here too.
-        for phase in PAIR_AND_SCORE_PHASES:
-            await db.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
+        # Same shape as the worker's pair_and_score dispatch: one write
+        # transaction per pair phase, then the shared batched scoring
+        # orchestrator. Both lanes run inside the single worker job executor,
+        # so the convergence invariant documented at the pair_and_score
+        # dispatch site (worker/processor.py) applies here too — read it
+        # there rather than restating it. Per-site guard: the batched path
+        # runs a per-batch enabled check (a named, deliberate semantic
+        # change — today's rescore lane had none), so a site vanished or
+        # disabled mid-catchup raises JobCancelled mid-rescore; the continue
+        # ensures one vanished site does not abort rescoring the others.
+        try:
+            for phase in PAIR_PHASES:
+                await db.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
+            await run_batched_scoring(db, site_id)
+        except (JobCancelled, sqlite3.IntegrityError):
+            continue
     if has_more and sites:
         return JobContinuation(
             job_type="catchup",

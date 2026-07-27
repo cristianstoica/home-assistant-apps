@@ -17,6 +17,23 @@ def isoformat_utc(value: datetime | None = None) -> str:
     return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def isoformat_utc_micro(value: datetime | None = None) -> str:
+    """Fixed-width UTC stamp (microseconds always present) for lexical ordering.
+
+    ``isoformat_utc`` omits the fractional-seconds field when
+    ``microsecond == 0``, and since ``'.' < 'Z'`` a later same-second stamp
+    with microseconds compares lexically SMALLER than a whole-second one.
+    The scoring run stamp (``discover_score_work``) relies on SQL string
+    comparison as a time ordering, so it must use this fixed-width form.
+    Do not switch other call sites: ``floor_hour``-derived ``…:00Z`` values
+    are stored DB-wide and would cross-format-compare against new values.
+    """
+    dt = value or utc_now()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def parse_utc(value: str) -> datetime:
     normalized = value.replace("Z", "+00:00")
     dt = datetime.fromisoformat(normalized)

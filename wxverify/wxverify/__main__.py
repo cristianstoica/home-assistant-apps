@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import logging
 import sqlite3
-from typing import NoReturn, cast
+import sys
+from typing import Any, NoReturn, cast
 
 import uvicorn
+import uvicorn.config
 
 from wxverify import __version__, config
 from wxverify.api.app import create_app
@@ -48,6 +51,8 @@ from wxverify.worker.feed_fetch import (
     Ineligible,
     fetch_feed_once,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,8 +179,21 @@ def _serve(args: argparse.Namespace) -> int:
     config.options_path = args.options
     _configure_logging()
     app = create_app(root_path=args.root_path or "", bind_port=args.port)
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run(app, host=args.host, port=args.port, log_config=_uvicorn_log_config())
     return 0
+
+
+def _uvicorn_log_config() -> dict[str, Any]:
+    """Uvicorn's default log config with its `default` handler on stdout.
+
+    A stream override only, never a log-config rewrite: uvicorn's own
+    startup/error lines otherwise land on stderr, the stream the supervisor
+    container log did not retain (access lines — the only stdout handler —
+    were the sole survivors).
+    """
+    log_config: dict[str, Any] = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    log_config["handlers"]["default"]["stream"] = "ext://sys.stdout"
+    return log_config
 
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -186,8 +204,16 @@ def _configure_logging() -> None:
     level_name = load_runtime_config().log_level or "info"
     level = getattr(logging, level_name.upper(), logging.INFO)
     logging.basicConfig(
-        level=level, format=_LOG_FORMAT, datefmt=_LOG_DATEFMT, force=True
+        stream=sys.stdout,
+        level=level,
+        format=_LOG_FORMAT,
+        datefmt=_LOG_DATEFMT,
+        force=True,
     )
+    # Self-evidencing startup line: its presence in the container log proves
+    # both the effective level and the stdout stream path live; its absence
+    # with access lines present falsifies the stream hypothesis.
+    logger.info("logging configured level=%s stream=stdout", level_name)
     # At debug, let httpx/httpcore emit full request/response wire lines; at any
     # higher level keep them quiet as before. The redaction filter attaches in
     # both cases so a stray URL-bearing record is scrubbed regardless of level.

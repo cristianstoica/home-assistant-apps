@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.8
+
+- Fixed: leaderboard and composite reads could time out during a scoring
+  rebuild. Scoring previously held one long write transaction for the
+  whole rebuild, blocking reads for the duration; it is now serialized
+  into short batched write transactions (24 cells per transaction), so
+  reads interleave between batches instead of queuing behind a single
+  long lock hold.
+- Changed: route-triggered rescores are now fire-and-forget — a stale
+  cached read returns immediately and the rescore runs in the
+  background, instead of the request waiting on the rescore to enqueue.
+- Changed: worker and scoring milestones now log at INFO instead of
+  DEBUG, and all logs go to stdout, so rebuild progress is visible in
+  the add-on log without raising the log level.
+- Added: `scripts/bench_route_during_rebuild.py`, a bench script that
+  measures route latency while a scoring rebuild is running.
+
 ## 0.8.7
 
 - Fixed: today's forecast now covers the full local calendar day (the

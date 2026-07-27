@@ -60,6 +60,7 @@ from wxverify.scoring.leaderboard import (
     leaderboard_with_status,
 )
 from wxverify.scoring.metrics import MetricResult
+from wxverify.scoring.rescore import drain_pending_rescores
 from wxverify.settings.keys import set_setting
 
 # ---------------------------------------------------------------------------
@@ -808,10 +809,14 @@ def test_api_curve_enqueues_once_for_the_stale_lead_only(
 def test_api_leaderboard_enqueue_failure_is_best_effort_still_returns_200(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T8 API route sub-test. Monkeypatches the CONSUMER's own qualified
-    reference (``wxverify.api.routes.dashboard.enqueue_score_rescore``), not
-    the defining module -- the route imports the helper by name, so patching
-    the defining module would miss the bound reference and exercise nothing.
+    """T8 API route sub-test. Post-§2/§3, ``/api/leaderboard`` no longer calls
+    ``enqueue_score_rescore`` directly -- it calls the synchronous
+    ``schedule_score_rescore``, which schedules a fire-and-forget task that
+    reaches ``enqueue_score_rescore`` via a further ``db.write`` hop inside
+    ``wxverify.scoring.rescore``. Monkeypatch that single new seam (the
+    routes no longer import the symbol at all) and drain the scheduled task
+    via the running ``TestClient``'s portal before inspecting the spy --
+    ``TestClient.get()`` does not wait for background tasks.
     """
     app = _start_app(tmp_path, monkeypatch)
     calls: list[int] = []
@@ -820,7 +825,7 @@ def test_api_leaderboard_enqueue_failure_is_best_effort_still_returns_200(
         calls.append(site_id)
         raise RuntimeError("simulated enqueue failure")
 
-    monkeypatch.setattr("wxverify.api.routes.dashboard.enqueue_score_rescore", _raise)
+    monkeypatch.setattr("wxverify.scoring.rescore.enqueue_score_rescore", _raise)
 
     with TestClient(app) as client:
         db = get_db()
@@ -851,6 +856,7 @@ def test_api_leaderboard_enqueue_failure_is_best_effort_still_returns_200(
         )
         assert resp.status_code == 200
         assert resp.json()  # stale rows still served despite the enqueue raising
+        client.portal.call(drain_pending_rescores)
         assert calls == [site_id]  # non-vacuity: the raising patch was reached
 
 
@@ -858,10 +864,13 @@ def test_dashboard_html_enqueue_failure_is_best_effort_still_renders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T8 dashboard HTML sub-test. Same best-effort contract at the
-    ``web/routes.py:118-120`` enqueue site. The fixture must yield
-    ``composite_status in ("stale", "rebuilding")`` -- that is the gate at
-    that call site, so a fresh/empty composite would never reach the wrapped
-    call.
+    ``web/routes.py`` enqueue site (``schedule_score_rescore`` call). The
+    fixture must yield ``composite_status in ("stale", "rebuilding")`` --
+    that is the gate at that call site, so a fresh/empty composite would
+    never reach the wrapped call. Monkeypatches the single new
+    ``wxverify.scoring.rescore.enqueue_score_rescore`` seam (the route no
+    longer imports the symbol) and drains the scheduled task via the running
+    ``TestClient``'s portal before inspecting the spy.
     """
     app = _start_app(tmp_path, monkeypatch)
     calls: list[int] = []
@@ -870,7 +879,7 @@ def test_dashboard_html_enqueue_failure_is_best_effort_still_renders(
         calls.append(site_id)
         raise RuntimeError("simulated enqueue failure")
 
-    monkeypatch.setattr("wxverify.web.routes.enqueue_score_rescore", _raise)
+    monkeypatch.setattr("wxverify.scoring.rescore.enqueue_score_rescore", _raise)
 
     with TestClient(app) as client:
         db = get_db()
@@ -898,4 +907,5 @@ def test_dashboard_html_enqueue_failure_is_best_effort_still_renders(
         resp = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
         assert resp.status_code == 200
         assert "<html" in resp.text.lower()  # full page rendered despite the failure
+        client.portal.call(drain_pending_rescores)
         assert calls == [site_id]  # non-vacuity: the raising patch was reached

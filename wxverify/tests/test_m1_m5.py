@@ -68,6 +68,7 @@ from wxverify.scoring.leaderboard import (
     score_badge,
 )
 from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.rescore import drain_pending_rescores
 from wxverify.scoring.winrate import winrate
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
@@ -2794,6 +2795,10 @@ def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
         # forecast_pairs. Exactly one job is enqueued for the miss (not zero,
         # not duplicated across the single read).
         assert rows == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert (
             db.read_sync(
                 lambda conn: conn.execute(

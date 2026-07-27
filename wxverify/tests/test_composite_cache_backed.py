@@ -56,6 +56,7 @@ from wxverify.scoring.composite import (
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.leaderboard import resolve_window
 from wxverify.scoring.metrics import MetricResult, MetricStrategy, strategy_for
+from wxverify.scoring.rescore import drain_pending_rescores
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.settings.service import set_rolling_window_days_sync
 from wxverify.web.context import load_dashboard
@@ -1118,6 +1119,12 @@ def test_api_composite_partial_snapshot_after_consensus_invalidation_is_rebuildi
         assert post.status_code == 200
         # NEVER a partial aggregate over the surviving temperature component.
         assert post.json() == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table
+        # -- an un-drained check here is racy (caught empirically: this
+        # assertion flaked under a full-suite run, passing standalone).
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 

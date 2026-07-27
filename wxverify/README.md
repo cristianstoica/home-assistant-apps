@@ -367,11 +367,12 @@ file beside it, and start the add-on again.
 ## Logging
 
 The add-on writes structured log lines to the add-on log (Settings → Add-ons → Weather
-Verify → Log). Each line is prefixed with a timestamp, level, and the component that
-emitted it, e.g.:
+Verify → Log). All log output goes to stdout, so the add-on log pane (or `docker logs`)
+sees everything the add-on emits. Each line is prefixed with a timestamp, level, and the
+component that emitted it, e.g.:
 
 ```text
-2026-07-10T14:03:11+0000 INFO wxverify.worker.processor cycle: job=42 type=fetch_feed site=1 outcome=completed
+2026-07-10T14:03:11+0000 INFO wxverify.worker.processor cycle: job=42 type=fetch_feed site=1 outcome=completed elapsed=0.4s
 ```
 
 The four levels, loudest to quietest:
@@ -384,11 +385,15 @@ The four levels, loudest to quietest:
   will retry, a feed provider is temporarily unavailable, a fetch was skipped because the
   daily API budget was used up, or a fetch came back with no usable samples. Nothing to do
   unless WARNINGs are constant.
-- **INFO — it's working, here's the heartbeat.** The default level. You'll see the worker
-  start and stop, one `cycle: …` line each time the worker finishes a unit of work (naming the
-  job and its outcome — completed, deferred, retry, or failed), and one `scoring run complete …`
-  line per scoring run. If these keep ticking over, the add-on is alive and doing its job. INFO
-  never prints per-operation detail.
+- **INFO — it's working, here's the heartbeat.** The default level. On startup, a single
+  `logging configured level=… stream=stdout` line confirms the active level. From then on
+  you'll see the worker start and stop, a `job claimed …` line when the worker picks up a
+  job, one `cycle: …` line each time it finishes a unit of work (naming the job, its
+  outcome — completed, deferred, retry, or failed — and how long it took, `elapsed=…`),
+  the scoring milestones (`score phase=…`, `score discovery …`, `score window=…`, and
+  `score sweep …`, each with its own elapsed time), and one `scoring run complete …` line
+  per scoring run. If these keep ticking over, the add-on is alive and doing its job.
+  Finer-grained per-batch and per-request detail stays at DEBUG.
 - **DEBUG — show me literally everything.** The full firehose: every forecast fetch, every
   observation fetch, every scoring phase, every queue and worker transition, every backfill
   and catch-up step, every database transaction, and the raw HTTP requests and responses.

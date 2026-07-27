@@ -16,14 +16,20 @@ Covers:
 - T15    BC1: cycle INFO line present with correct outcome; DEBUG per-op lines absent
 - T16    D5: terminal ERROR comes from processor, NOT from feed_fetch.py
 - T17/T7b BC2: job deferred moved INFO → DEBUG (paired positive + negative)
+- L1     Plan §4: _configure_logging's handler streams to sys.stdout by identity
+- L2     Plan §4: _uvicorn_log_config overrides only handlers.default.stream
+- L3     Plan §4: cycle:/score discovery/score window=/score sweep INFO lines
+         are actually emitted (not just whitelisted); score batch stays DEBUG
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 import sqlite3
+import sys
 from logging import LogRecord
 from pathlib import Path
 from typing import Any
@@ -31,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+import uvicorn.config
 
 from wxverify import config
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
@@ -40,6 +47,7 @@ from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import fetch_feed_once
 from wxverify.worker.processor import run_worker
+from wxverify.worker.score_batches import run_batched_scoring
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror test_011_patch.py conventions exactly)
@@ -73,6 +81,49 @@ def _open_meteo_feed_id(conn: sqlite3.Connection) -> int:
             " WHERE source='open-meteo' AND is_virtual=0"
             " ORDER BY id LIMIT 1"
         ).fetchone()["id"]
+    )
+
+
+def _seed_forecast_pair(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    variable: str = "temperature",
+    day_ahead: int = 1,
+    valid_at: str = "2026-01-01T06:00:00Z",
+    issued_at: str = "2026-01-01T00:00:00Z",
+    forecast: float = 11.0,
+    observed: float = 10.0,
+) -> None:
+    """Seed one forecast_pairs row so score discovery finds a real cell.
+
+    Mirrors test_write_lock_serialization.py's ``_seed_pair`` — cell identity
+    (site/feed/variable/day_ahead) is all discovery needs; the exact
+    valid_at/window relationship is irrelevant to L3 (it asserts log-line
+    emission, not score values), so no wall-clock freezing is required.
+    """
+    error = forecast - observed
+    conn.execute(
+        """
+        INSERT INTO forecast_pairs
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,
+             forecast, observed, error, abs_error, sq_error)
+        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            site_id,
+            feed_id,
+            variable,
+            issued_at,
+            valid_at,
+            day_ahead,
+            forecast,
+            observed,
+            error,
+            abs(error),
+            error * error,
+        ),
     )
 
 
@@ -478,6 +529,11 @@ def test_info_level_policy_only_sanctioned_milestones(
         "worker started",
         "worker stopping",
         "scoring run complete",
+        "job claimed",
+        "score phase=",
+        "score discovery",
+        "score window=",
+        "score sweep",
     )
     info_records = [r for r in caplog.records if r.levelno == logging.INFO]
     for r in info_records:
@@ -854,7 +910,7 @@ def test_scoring_run_complete_cells_count_is_accurate(
 def test_worker_cycle_debug_lines_at_debug(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T11-D: at DEBUG, job claimed and completed lines appear for a successful job."""
+    """T11-D: 'job claimed' is INFO (§4.1 promotion); 'job completed' stays DEBUG."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
     async def _succeed(db: Any, j: Job) -> None:
@@ -876,24 +932,22 @@ def test_worker_cycle_debug_lines_at_debug(
         for r in caplog.records
         if r.name == "wxverify.worker.processor" and r.levelno == logging.DEBUG
     ]
-    assert any("job claimed" in m for m in proc_debug), (
-        f"'job claimed' DEBUG line missing; got: {proc_debug}"
+    proc_info = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "wxverify.worker.processor" and r.levelno == logging.INFO
+    ]
+    # §4.1 promotes the claim line to INFO; 'job completed' remains at DEBUG.
+    assert any("job claimed" in m for m in proc_info), (
+        f"'job claimed' INFO line missing; got: {proc_info}"
     )
     assert any("job completed" in m for m in proc_debug), (
         f"'job completed' DEBUG line missing; got: {proc_debug}"
     )
 
-    # Confirm these are absent at INFO
-    info_proc = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == "wxverify.worker.processor"
-        and r.levelno == logging.INFO
-        and ("job claimed" in r.getMessage() or "job completed" in r.getMessage())
-    ]
-    assert len(info_proc) == 0, (
-        "'job claimed'/'job completed' must not appear as INFO records"
-    )
+    # Confirm 'job completed' is absent at INFO ('job claimed' is now expected there).
+    info_completed = [m for m in proc_info if "job completed" in m]
+    assert len(info_completed) == 0, "'job completed' must not appear as an INFO record"
 
 
 # ---------------------------------------------------------------------------
@@ -1366,4 +1420,200 @@ def test_d5_feed_fetch_transport_error_emits_no_error_record(
     ]
     assert any("fetch transport error" in m for m in feed_fetch_debug), (
         f"'fetch transport error' DEBUG trace must be emitted; got: {feed_fetch_debug}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L1 — plan §4: _configure_logging's handler streams to sys.stdout by identity
+# ---------------------------------------------------------------------------
+
+
+def test_configure_logging_handler_streams_to_sys_stdout_by_identity(
+    tmp_path: Path,
+    restore_logging_state: Any,
+) -> None:
+    """L1: root logger's sole handler streams to the *identical* sys.stdout object.
+
+    An identity check (`is sys.stdout`), not a name/string match: this pins the
+    literal ``stream=sys.stdout`` kwarg on the ``basicConfig`` call. Goes red on
+    a silent revert to stderr (dropping ``stream=sys.stdout`` from the call
+    falls back to the logging module's own default, which is stderr).
+    """
+    from wxverify.__main__ import _configure_logging  # noqa: PLC0415
+
+    config.options_path = str(tmp_path / "missing-options.json")
+    _configure_logging()
+
+    root = logging.getLogger()
+    assert len(root.handlers) == 1, (
+        f"basicConfig(force=True) must leave exactly one handler on the root "
+        f"logger; got {len(root.handlers)}"
+    )
+    handler = root.handlers[0]
+    assert isinstance(handler, logging.StreamHandler), (
+        f"root handler must be a StreamHandler; got {type(handler)}"
+    )
+    assert handler.stream is sys.stdout, (
+        "root logger's handler must stream to sys.stdout by object identity; "
+        f"got stream={handler.stream!r} (sys.stdout={sys.stdout!r})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L2 — plan §4: _uvicorn_log_config overrides only handlers.default.stream
+# ---------------------------------------------------------------------------
+
+
+def test_uvicorn_log_config_overrides_only_default_stream() -> None:
+    """L2: _uvicorn_log_config sets handlers.default.stream and touches nothing else.
+
+    Two halves: (i) the override actually lands as uvicorn's own string-URI
+    stream spec (``ext://sys.stdout``); (ii) a deep-copy equality check against
+    uvicorn.config.LOGGING_CONFIG with that one key re-applied pins that the
+    helper is a pure single-key patch — any other silent mutation (a formatter,
+    another handler's stream, a logger's level) fails this test.
+    """
+    from wxverify.__main__ import _uvicorn_log_config  # noqa: PLC0415
+
+    result = _uvicorn_log_config()
+
+    assert result["handlers"]["default"]["stream"] == "ext://sys.stdout", (
+        f"default handler stream must be 'ext://sys.stdout'; got: "
+        f"{result['handlers']['default']['stream']!r}"
+    )
+
+    expected = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    expected["handlers"]["default"]["stream"] = "ext://sys.stdout"
+    assert result == expected, (
+        "_uvicorn_log_config must equal uvicorn.config.LOGGING_CONFIG with "
+        "exactly the one handlers.default.stream key overridden — no other "
+        "key may be added, removed, or changed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# L3 — plan §4: cycle:/score discovery/score window=/score sweep INFO lines
+# are actually EMITTED (the T7 whitelist only permits them); score batch
+# stays DEBUG-only, never promoted to INFO.
+# ---------------------------------------------------------------------------
+
+
+def test_cycle_info_line_carries_elapsed_field(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """L3 (cycle): the 'cycle: ...' INFO line carries an elapsed= field.
+
+    T7/T15 already pin outcome=/type=/site= on this line; this test is the
+    one that would go red if the %.1fs elapsed field were ever dropped from
+    the format string in worker/processor.py's run_worker.
+    """
+    job = _make_job(job_type="fetch_feed", site_id=42)
+
+    async def _succeed(db: Any, j: Job) -> None:
+        return None
+
+    _patch_worker_infra(monkeypatch)
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _succeed)
+    monkeypatch.setattr("wxverify.worker.processor.complete", lambda conn, jid: None)
+
+    with (
+        caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
+        pytest.raises(_StopLoop),
+    ):
+        asyncio.run(run_worker(_FakeDb()))  # type: ignore[arg-type]
+
+    cycle_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and r.getMessage().startswith("cycle: job=")
+    ]
+    assert len(cycle_lines) == 1, (
+        f"expected exactly 1 cycle: INFO line; got: {cycle_lines}"
+    )
+    assert "elapsed=" in cycle_lines[0], (
+        f"cycle: INFO line must carry an elapsed= field; got: {cycle_lines[0]!r}"
+    )
+
+
+def test_batched_scoring_orchestrator_info_lines_actually_emitted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """L3 (score_batches): score discovery/window=/sweep fire at INFO with elapsed=.
+
+    Drives run_batched_scoring directly against a seeded test DB (pattern from
+    test_write_lock_serialization.py) instead of trusting T7's whitelist, which
+    only *permits* these prefixes without ever proving the orchestrator emits
+    them. Goes red if any of the three lines is dropped, demoted, or loses its
+    elapsed= field.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _open_meteo_feed_id(conn)
+    _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
+    db = get_db()
+
+    with caplog.at_level(logging.DEBUG, logger="wxverify.worker.score_batches"):
+        asyncio.run(run_batched_scoring(db, site_id))
+
+    info_records = [
+        r
+        for r in caplog.records
+        if r.name == "wxverify.worker.score_batches" and r.levelno == logging.INFO
+    ]
+    info_msgs = [r.getMessage() for r in info_records]
+
+    discovery = [m for m in info_msgs if m.startswith("score discovery")]
+    assert len(discovery) == 1, (
+        f"expected exactly 1 'score discovery' INFO line; got: {info_msgs}"
+    )
+    assert "elapsed=" in discovery[0], f"got: {discovery[0]!r}"
+    assert f"site={site_id}" in discovery[0], f"got: {discovery[0]!r}"
+
+    windows = [m for m in info_msgs if m.startswith("score window=")]
+    # discover_score_work builds exactly 2 windows (rolling + all-time).
+    assert len(windows) == 2, f"expected 2 'score window=' INFO lines; got: {info_msgs}"
+    assert all("elapsed=" in m for m in windows), f"got: {windows}"
+
+    sweep = [m for m in info_msgs if m.startswith("score sweep")]
+    assert len(sweep) == 1, (
+        f"expected exactly 1 'score sweep' INFO line; got: {info_msgs}"
+    )
+    assert "elapsed=" in sweep[0], f"got: {sweep[0]!r}"
+    assert f"site={site_id}" in sweep[0], f"got: {sweep[0]!r}"
+
+
+def test_score_batch_line_is_debug_only_never_info(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """L3 (score batch): the per-batch 'score batch' line is DEBUG-only.
+
+    Positive: with caplog at DEBUG, 'score batch' fires from
+    wxverify.scoring.engine.score_cell_batch (called once per batch by
+    run_batched_scoring). Paired negative, from the SAME capture (not an
+    ambient absence): none of those records carry levelno INFO — this is the
+    regression a silent logger.debug -> logger.info promotion would trip.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _open_meteo_feed_id(conn)
+    _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
+    db = get_db()
+
+    with caplog.at_level(logging.DEBUG, logger="wxverify"):
+        asyncio.run(run_batched_scoring(db, site_id))
+
+    engine_records = [r for r in caplog.records if r.name == "wxverify.scoring.engine"]
+    batch_records = [r for r in engine_records if "score batch" in r.getMessage()]
+
+    debug_batch = [r for r in batch_records if r.levelno == logging.DEBUG]
+    assert len(debug_batch) > 0, (
+        "positive: 'score batch' must fire at DEBUG from score_cell_batch; "
+        f"engine records: {[r.getMessage() for r in engine_records]}"
+    )
+
+    info_batch = [r for r in batch_records if r.levelno == logging.INFO]
+    assert len(info_batch) == 0, (
+        "'score batch' must never appear at INFO — it is a per-batch DEBUG "
+        f"line, not a milestone; got: {[r.getMessage() for r in info_batch]}"
     )

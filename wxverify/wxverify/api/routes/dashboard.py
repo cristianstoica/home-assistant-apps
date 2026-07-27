@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from dataclasses import dataclass
 
@@ -11,16 +10,15 @@ from fastapi import APIRouter, Query
 from wxverify.api.schemas import LeaderboardOut
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import get_db
-from wxverify.scoring.composite import composite_with_status, enqueue_score_rescore
+from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.leaderboard import (
     LeaderboardResult,
     LeaderboardStatus,
     leaderboard_with_status,
 )
+from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.web.context import feed_label
-
-logger = logging.getLogger(__name__)
 
 _CURVE_LEADS: list[int] = list(range(0, 8))
 _MAX_SERIES = 6  # number of --chart-* palette tokens
@@ -52,7 +50,7 @@ async def leaderboard(
     result, status = await get_db().read(_read)
 
     if status in ("stale", "rebuilding"):
-        await _enqueue_rescore_best_effort(site)
+        schedule_score_rescore(site)
 
     return result
 
@@ -102,7 +100,7 @@ async def curve(
     # `empty` leads do not gate: a genuinely inapplicable curve slice must not
     # turn into a rebuild request of its own.
     if needs_rescore:
-        await _enqueue_rescore_best_effort(site)
+        schedule_score_rescore(site)
     return result
 
 
@@ -206,24 +204,12 @@ async def composite(
     result = await get_db().read(
         lambda conn: composite_with_status(conn, site_id=site, window=window)
     )
-    # Enqueue only after the read connection is released; the shared helper
-    # carries the terminal-failure cooldown.
+    # The read connection is already released; the fire-and-forget scheduler
+    # carries the terminal-failure cooldown and never gates the response.
     if result.status in ("stale", "rebuilding"):
-        await _enqueue_rescore_best_effort(site)
+        schedule_score_rescore(site)
     return result.rows
 
 
 def _lead_to_day(lead: str) -> int:
     return parse_day_ahead(lead)
-
-
-async def _enqueue_rescore_best_effort(site_id: int) -> None:
-    """Best-effort post-read rescore enqueue shared by the three JSON routes.
-
-    An enqueue failure must never fail a read that already has rows to serve —
-    the caller returns its 200 response regardless, and the failure is logged.
-    """
-    try:
-        await get_db().write(lambda conn: enqueue_score_rescore(conn, site_id))
-    except Exception:
-        logger.warning("rescore enqueue failed site=%s", site_id, exc_info=True)

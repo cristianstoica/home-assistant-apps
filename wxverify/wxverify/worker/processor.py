@@ -40,7 +40,7 @@ from wxverify.obs.pws_adapter import (
     fetch_hourly_history,
 )
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import PAIR_AND_SCORE_PHASES
+from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_number_setting
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
@@ -66,6 +66,7 @@ from wxverify.worker.feed_fetch import (
     mark_feed_unavailable,
 )
 from wxverify.worker.scheduler import scheduler_tick
+from wxverify.worker.score_batches import run_batched_scoring
 from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
 
 POLL_INTERVAL = 1.0
@@ -108,7 +109,8 @@ async def run_worker(db: Database) -> None:
             await asyncio.sleep(POLL_INTERVAL)
             continue
         job_id = job.id
-        logger.debug("job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id)
+        claimed_at = time.monotonic()
+        logger.info("job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id)
         outcome = "completed"
         try:
             continuation = await dispatch(db, job)
@@ -182,11 +184,12 @@ async def run_worker(db: Database) -> None:
                     message,
                 )
         logger.info(
-            "cycle: job=%s type=%s site=%s outcome=%s",
+            "cycle: job=%s type=%s site=%s outcome=%s elapsed=%.1fs",
             job.id,
             job.type,
             job.site_id,
             outcome,
+            time.monotonic() - claimed_at,
         )
 
 
@@ -210,15 +213,21 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        # One write transaction per phase so the event loop (and the Docker
-        # healthcheck) gets scheduled between phases instead of stalling for
-        # the whole pipeline.
+        # One write transaction per pair phase, then the batched scoring
+        # orchestrator, so the event loop (and the Docker healthcheck) gets
+        # scheduled between transactions instead of stalling for the whole
+        # pipeline, and no single transaction holds the write lock for a
+        # whole scoring rebuild.
         #
-        # CONVERGENCE INVARIANT (do not weaken): the phase split converges to
-        # the same end state as the monolithic run ONLY because no
-        # observation write can interleave between phases:
+        # CONVERGENCE INVARIANT (do not weaken): the split converges to the
+        # same end state as the monolithic run ONLY because no observation
+        # write can interleave between its transactions:
         #   (a) this single worker loop is the only job executor, so no other
-        #       job's observation write runs between these transactions; and
+        #       job's observation write runs between these transactions.
+        #       Catchup's rescore lane shares the same orchestrator
+        #       (worker/score_batches.run_batched_scoring) and runs as a
+        #       worker job too, so leg (a) serializes the two lanes against
+        #       each other; and
         #   (b) every HTTP route that writes observations (station PUT /
         #       DELETE, site rain-threshold PUT) runs the monolithic
         #       pair_and_score INLINE in its own write transaction — it never
@@ -229,11 +238,41 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         #       to enqueueing would break convergence silently. The dashboard
         #       enqueue_score_rescore routes do not write observations and
         #       are safe.
-        for phase in PAIR_AND_SCORE_PHASES:
-            logger.debug("score phase=%s site=%s", phase.__name__, site_id)
+        # One writer lane sits outside (a)/(b): Database.replace_from
+        # (POST /api/import/db) holds both locks and can swap the ENTIRE
+        # database file between any two transactions here — accepted, not a
+        # defect: the per-batch enabled guard covers the common
+        # site-vanished-after-import case (JobCancelled); the residue (site
+        # present in the imported DB but a feed_id absent) surfaces as an FK
+        # IntegrityError and fails the job; a sweep that strips imported
+        # export-time stamps merely leaves the affected windows 'rebuilding'.
+        # Every path heals through the import route's own _rebuild_derived
+        # background task.
+        #
+        # The batching subdivides only the LAST phase (scoring), whose inputs
+        # are written by the earlier phases of the SAME job. Run-stamp/sweep
+        # rule: discovery captures ONE fixed-width run_stamp INSIDE the
+        # batched run's first write transaction — acquiring the write lock
+        # guarantees an in-flight inline route rescore has committed first,
+        # so its cells are discovered and re-upserted rather than swept; an
+        # inline rescore that starts after discovery writes a LATER stamp
+        # and survives the strict computed_at < run_stamp sweep. Named
+        # accepted relaxation: a same-UTC-day re-run can briefly serve a
+        # 'fresh' snapshot mixing two intra-day generations (both computed
+        # from the same day's observation set); it self-heals when the run
+        # completes and does not affect the midnight staleness contract.
+        for phase in PAIR_PHASES:
+            phase_started = time.monotonic()
             await db.write(
                 lambda conn, run=phase: _run_score_phase_if_enabled(conn, site_id, run)
             )
+            logger.info(
+                "score phase=%s site=%s elapsed=%.1fs",
+                phase.__name__,
+                site_id,
+                time.monotonic() - phase_started,
+            )
+        await run_batched_scoring(db, site_id)
         return None
     if job.type == "fetch_obs":
         site_id = job.site_id

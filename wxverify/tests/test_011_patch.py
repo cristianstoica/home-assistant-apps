@@ -717,7 +717,7 @@ def test_pair_and_score_stops_when_site_disabled_between_phases(
         phases_called.append(1)  # must never run
 
     monkeypatch.setattr(
-        "wxverify.worker.processor.PAIR_AND_SCORE_PHASES",
+        "wxverify.worker.processor.PAIR_PHASES",
         (_phase0, _phase1),
     )
 
