@@ -4047,6 +4047,10 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
             ).status_code
             == 200
         )
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         job_types = db.read_sync(
             lambda conn: {
                 str(row["type"])

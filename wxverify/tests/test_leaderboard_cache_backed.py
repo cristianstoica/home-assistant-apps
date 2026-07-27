@@ -412,6 +412,10 @@ def test_applicable_input_absent_cache_is_rebuilding_no_live_recompute(
         )
         assert resp.status_code == 200
         assert resp.json() == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -545,6 +549,10 @@ def test_api_leaderboard_custom_window_never_enqueues(
             },
         )
         assert rolling_resp.json() == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
         custom_resp = client.get(
@@ -559,6 +567,7 @@ def test_api_leaderboard_custom_window_never_enqueues(
         assert custom_resp.status_code == 200
         custom_rows = custom_resp.json()
         assert any(row["feed_id"] == feed_id for row in custom_rows)
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1  # unchanged
 
 
@@ -622,6 +631,11 @@ def test_stale_read_enqueue_cooldown_suppresses_then_fires_after_expiry(
         )
         assert resp_suppressed.status_code == 200
         assert resp_suppressed.json()  # stale is still served
+        # Drain BEFORE the suppression assertion too -- otherwise "stays at
+        # 1" is vacuous (indistinguishable from "the enqueue task just
+        # hasn't run yet"). Draining first makes the suppression real: the
+        # cooldown-guarded enqueue genuinely ran and genuinely no-opped.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, suppressed_site)) == 1
 
         resp_expired = client.get(
@@ -630,6 +644,7 @@ def test_stale_read_enqueue_cooldown_suppresses_then_fires_after_expiry(
         )
         assert resp_expired.status_code == 200
         assert resp_expired.json()
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, expired_site)) == 2
 
 
@@ -671,12 +686,18 @@ def test_api_leaderboard_stale_cache_enqueues_exactly_once_across_polls(
         )
         assert first.status_code == 200
         assert first.json()  # stale is served, never recomputed to empty
+        # Drain after the FIRST read so the dedup check below (second read
+        # still == 1) is comparing against a settled count, not racing the
+        # first read's own still-in-flight enqueue task.
+        client.portal.call(drain_pending_rescores)
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
         second = client.get(
             "/api/leaderboard",
             params={"site": site_id, "variable": "temperature", "lead": "D+1"},
         )
         assert second.status_code == 200
         assert second.json()
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -795,6 +816,7 @@ def test_api_curve_enqueues_once_for_the_stale_lead_only(
             "/api/curve", params={"site": site_id, "variable": "temperature"}
         )
         assert resp.status_code == 200
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 

@@ -689,10 +689,16 @@ def test_api_composite_stale_cache_enqueues_exactly_once_across_polls(
         )
         assert first.status_code == 200
         assert first.json()  # stale is still SERVED, never recomputed to empty
+        # Drain after the FIRST read so the dedup check below (second read
+        # still == 1) is comparing against a settled count, not racing the
+        # first read's own still-in-flight enqueue task.
+        client.portal.call(drain_pending_rescores)
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
         second = client.get(
             "/api/composite", params={"site": site_id, "window": "rolling"}
         )
         assert second.status_code == 200
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -719,10 +725,16 @@ def test_api_composite_missing_snapshot_rebuilds_and_enqueues_exactly_once(
         )
         assert first.status_code == 200
         assert first.json() == []
+        # Drain after the FIRST read so the dedup check below (second read
+        # still == 1) is comparing against a settled count, not racing the
+        # first read's own still-in-flight enqueue task.
+        client.portal.call(drain_pending_rescores)
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
         second = client.get(
             "/api/composite", params={"site": site_id, "window": "rolling"}
         )
         assert second.json() == []
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -771,6 +783,10 @@ def test_api_composite_historical_only_pairs_are_empty_with_within_cutoff_positi
             "/api/composite", params={"site": site_current, "window": "rolling"}
         )
         assert rebuilding_resp.json() == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_current)) == 1
 
 
@@ -870,6 +886,10 @@ def test_api_composite_disabled_feed_yields_empty_with_enabled_feed_positive(
         )
         assert enabled_resp.json() == []  # still empty rows (no cache seeded)...
         # ...but IS input (rebuilding-eligible), unlike the disabled twin above.
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, enabled_site)) == 1
 
 
@@ -951,8 +971,14 @@ def test_dashboard_stale_cache_enqueues_exactly_once_across_polls(
         site_id = db.write_sync(_seed)
         first = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
         assert first.status_code == 200
+        # Drain after the FIRST read so the dedup check below (second read
+        # still == 1) is comparing against a settled count, not racing the
+        # first read's own still-in-flight enqueue task.
+        client.portal.call(drain_pending_rescores)
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
         second = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
         assert second.status_code == 200
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -980,8 +1006,14 @@ def test_dashboard_missing_snapshot_rebuilds_and_enqueues_exactly_once(
         site_id = db.write_sync(_seed)
         first = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
         assert first.status_code == 200
+        # Drain after the FIRST read so the dedup check below (second read
+        # still == 1) is comparing against a settled count, not racing the
+        # first read's own still-in-flight enqueue task.
+        client.portal.call(drain_pending_rescores)
+        assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
         second = client.get("/dashboard", params={"site": site_id, "window": "rolling"})
         assert second.status_code == 200
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -1029,6 +1061,10 @@ def test_dashboard_default_site_resolution_enqueues_for_first_enabled_site(
 
         response = client.get("/dashboard", params={"window": "rolling"})
         assert response.status_code == 200
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_first)) == 1
         assert db.read_sync(lambda conn: _job_count(conn, site_second)) == 0
 
@@ -1231,6 +1267,12 @@ def test_api_composite_repeated_polls_during_cooldown_do_not_spawn_jobs(
             )
             assert resp.status_code == 200
             assert resp.json() == []
+            # Drain after EACH poll: each read is "rebuilding" and schedules
+            # a fire-and-forget enqueue attempt that the cooldown-guarded
+            # enqueue_score_rescore then suppresses. Without draining here,
+            # "count stays at 1" would be vacuous -- indistinguishable from
+            # the scheduled task simply not having run yet.
+            client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -1270,6 +1312,11 @@ def test_api_leaderboard_enqueue_shares_composite_cooldown(
             params={"site": site_id, "variable": "temperature", "lead": "D+1"},
         )
         assert response.status_code == 200
+        # Drain BEFORE the suppression assertion -- otherwise "stays at 1" is
+        # vacuous (indistinguishable from "the enqueue task just hasn't run
+        # yet"). Draining first makes the suppression real: the
+        # cooldown-guarded enqueue genuinely ran and genuinely no-opped.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -1306,6 +1353,11 @@ def test_api_curve_enqueue_shares_composite_cooldown(
             params={"site": site_id, "variable": "temperature", "lead": "D+1"},
         )
         assert response.status_code == 200
+        # Drain BEFORE the suppression assertion -- otherwise "stays at 1" is
+        # vacuous (indistinguishable from "the enqueue task just hasn't run
+        # yet"). Draining first makes the suppression real: the
+        # cooldown-guarded enqueue genuinely ran and genuinely no-opped.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
 
@@ -1372,6 +1424,10 @@ def test_api_composite_custom_window_never_enqueues_regardless_of_cache_state(
             "/api/composite", params={"site": site_id, "window": "rolling"}
         )
         assert rolling_resp.json() == []
+        # The rescore enqueue is fire-and-forget (schedule_score_rescore);
+        # TestClient.get() does not wait for it, so drain the scheduled task
+        # via the running TestClient's portal before checking the jobs table.
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1
 
         # Custom Nd window bypasses the cache entirely -- zero jobs, even
@@ -1382,6 +1438,7 @@ def test_api_composite_custom_window_never_enqueues_regardless_of_cache_state(
         assert custom_resp.status_code == 200
         custom_rows = custom_resp.json()
         assert any(row["feed_id"] == feed_id for row in custom_rows)
+        client.portal.call(drain_pending_rescores)
         assert db.read_sync(lambda conn: _job_count(conn, site_id)) == 1  # unchanged
 
 
