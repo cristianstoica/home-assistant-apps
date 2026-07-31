@@ -30,7 +30,7 @@ from typing import Any
 
 import pytest
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 from starlette.testclient import TestClient
 
 from wxverify import config
@@ -1392,7 +1392,7 @@ def test_import_creates_correct_backup(
     backups = list(db_dir.glob("wxverify-*.db.bak"))
     assert len(backups) == 1, f"expected exactly one backup; got {backups}"
     backup = backups[0]
-    assert re.fullmatch(r"wxverify-\d{8}-\d{6}Z\.db\.bak", backup.name)
+    assert re.fullmatch(r"wxverify-\d{8}-\d{6}-[0-9a-f]{8}Z\.db\.bak", backup.name)
     bconn = sqlite3.connect(str(backup))
     try:
         assert bconn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -1805,8 +1805,15 @@ def test_import_fails_cleanly_when_backup_path_already_exists(
         monkeypatch.setattr(
             "wxverify.api.routes.db_transfer.utc_now", lambda: fixed_now
         )
+        fixed_token = "deadbeef"
+        monkeypatch.setattr(
+            "wxverify.api.routes.db_transfer.uuid.uuid4",
+            lambda: uuid.UUID(hex="deadbeef" * 4),  # .hex[:8] == "deadbeef"
+        )
         db_dir = Path(config.db_path).parent
-        backup_path = db_dir / f"wxverify-{fixed_now:%Y%m%d-%H%M%S}Z.db.bak"
+        backup_path = (
+            db_dir / f"wxverify-{fixed_now:%Y%m%d-%H%M%S}-{fixed_token}Z.db.bak"
+        )
         backup_path.write_bytes(b"pre-existing backup contents")
 
         headers = _csrf_headers(client)
@@ -1825,6 +1832,378 @@ def test_import_fails_cleanly_when_backup_path_already_exists(
     assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
         "upload temp must still be cleaned up on this failure path"
     )
+
+
+# ---------------------------------------------------------------------------
+# Part B (cont'd) -- import admission control (AC1-AC6).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_import_guard() -> Iterator[None]:
+    """Isolate the module-global import-admission flag across every test.
+
+    Mirrors ``_reset_exports`` above -- without this, a guard left held by an
+    earlier failing/interrupted test bleeds into a later one and makes order
+    matter.
+    """
+    db_transfer._import_in_progress = False  # noqa: SLF001
+    yield
+    db_transfer._import_in_progress = False  # noqa: SLF001
+
+
+async def _drive_import(request: Request) -> JSONResponse:
+    """Call import_db and then run its BackgroundTask, exactly as Starlette's
+    ASGI response dispatch does after the body is sent. Lets a direct
+    coroutine call exercise the guard's hold-through-background-task scope
+    without a full ASGI/CSRF round trip.
+    """
+    resp = await db_transfer.import_db(request)
+    if resp.background is not None:
+        await resp.background()
+    return resp
+
+
+def test_import_second_overlapping_request_rejected_with_409(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second import arriving while the first's background rebuild+sweep is
+    still running must get 409, not be admitted, AND the rejection must not
+    disturb the holder's guard. Must be RED against a guard that releases
+    when import_db() returns its JSONResponse (i.e. is scoped only to the
+    handler body) -- that shape lets this exact request through -- and
+    against `_acquire_import_guard()` placed INSIDE the try:, where the
+    rejected request's own 409 reaches the release clause and clears the
+    FIRST import's guard.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    payload = b_path.read_bytes()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_rebuild(backup: Path) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(db_transfer, "_rebuild_derived", _blocking_rebuild)
+
+    async def _run() -> None:
+        task1 = asyncio.create_task(_drive_import(_stream_request([payload])))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        with pytest.raises(ApiError) as exc_info:
+            await db_transfer.import_db(_stream_request([payload]))
+        assert exc_info.value.status_code == 409
+        assert db_transfer._import_in_progress is True, (  # noqa: SLF001
+            "a rejected request must not release the HOLDER's guard"
+        )
+        release.set()
+        await task1
+
+    asyncio.run(_run())
+
+
+def test_import_overlap_rejection_leaves_first_imports_state_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live DB after the exchange is exactly the admitted (first)
+    import's content -- the rejected second request must not have touched
+    anything. Must be RED against a guard checked AFTER _stream_to/
+    replace_from instead of before them (a second request that gets as far
+    as writing its own temp/replacing before being rejected would either
+    corrupt ordering or silently overwrite with the wrong content).
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    payload = b_path.read_bytes()
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_rebuild(backup: Path) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(db_transfer, "_rebuild_derived", _blocking_rebuild)
+
+    async def _run() -> None:
+        task1 = asyncio.create_task(_drive_import(_stream_request([payload])))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        with pytest.raises(ApiError):
+            await db_transfer.import_db(_stream_request([payload]))
+        release.set()
+        await task1
+
+    asyncio.run(_run())
+    direct = sqlite3.connect(config.db_path)
+    try:
+        names = {r[0] for r in direct.execute("SELECT name FROM sites")}
+    finally:
+        direct.close()
+    assert names == {"Site B"}, "only the admitted import's content must be live"
+
+
+def test_import_sequential_admission_sweep_leaves_exactly_intended_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two REAL sequential imports (guard forces B to wait for A's full
+    lifecycle, including A's own sweep) -- after both complete, exactly one
+    `.bak` file survives, and it is B's. Must be RED against a `_BAK_RE`/sort
+    regression from the naming change (a regex that no longer matches the
+    new shape makes sweep_bak_files silently no-op, leaving BOTH backups on
+    disk) and against a guard that lets B's sweep start before A's finishes
+    (would non-deterministically leave 0 or 2 backups, per the 0.8.9 mutual-
+    delete hazard the brief describes).
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    c_path = _build_replacement_db(tmp_path, "source-c.db", "Site C")
+
+    async def _run() -> None:
+        resp_a = await _drive_import(_stream_request([b_path.read_bytes()]))
+        assert resp_a.status_code == 200
+        resp_b = await _drive_import(_stream_request([c_path.read_bytes()]))
+        assert resp_b.status_code == 200
+
+    asyncio.run(_run())
+    db_dir = Path(config.db_path).parent
+    backups = list(db_dir.glob("wxverify-*.db.bak"))
+    assert len(backups) == 1, f"expected exactly one surviving backup; got {backups}"
+    bconn = sqlite3.connect(str(backups[0]))
+    try:
+        names = {r[0] for r in bconn.execute("SELECT name FROM sites")}
+    finally:
+        bconn.close()
+    assert names == {"Site B"}, "surviving backup must be the PRE-second-import state"
+
+
+def test_import_guard_released_after_validation_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must be RED against a guard release that's missing on the 422 exit
+    (e.g. an `except ApiError` clause that doesn't also cover this path, or
+    a release placed only after `replace_from`)."""
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    # `_build_invalid_upload` (test_db_transfer.py:1334-1345) accepts exactly
+    # "random_bytes" / "version_zero" / "version_too_new" / "missing_table";
+    # anything else hits its `raise ValueError(case)`. "random_bytes" is the
+    # case the existing parametrized rejection matrix already pins at 422.
+    bad_payload = _build_invalid_upload(tmp_path, "random_bytes")
+
+    async def _run() -> None:
+        with pytest.raises(ApiError) as exc_info:
+            await db_transfer.import_db(_stream_request([bad_payload]))
+        assert exc_info.value.status_code == 422
+        assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+        b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+        resp = await _drive_import(_stream_request([b_path.read_bytes()]))
+        assert resp.status_code == 200, (
+            "guard must be released; import must be admitted"
+        )
+
+    asyncio.run(_run())
+
+
+def test_import_guard_released_after_replacement_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must be RED against a guard release missing on the replace_from
+    failure exit specifically (distinct from the validation-failure exit --
+    a naive `except ApiError` clause would cover 422 but miss this, since
+    replace_from failures are not ApiError)."""
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    payload = b_path.read_bytes()
+
+    async def _raising_replace(self: Database, new_db: Path, backup: Path) -> None:
+        raise RuntimeError("synthetic replace failure")
+
+    async def _run() -> None:
+        with monkeypatch.context() as mp:
+            mp.setattr(Database, "replace_from", _raising_replace)
+            with pytest.raises(RuntimeError):
+                await db_transfer.import_db(_stream_request([payload]))
+        assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+        c_path = _build_replacement_db(tmp_path, "source-c.db", "Site C")
+        resp = await _drive_import(_stream_request([c_path.read_bytes()]))
+        assert resp.status_code == 200, (
+            "guard must be released; import must be admitted"
+        )
+
+    asyncio.run(_run())
+
+
+def test_import_guard_released_after_background_task_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must be RED if `_rebuild_derived_and_release`'s release is not in a
+    `finally` (e.g. placed only after a successful `await
+    _rebuild_derived(...)`, which a raising rebuild would then skip)."""
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+
+    async def _raising_rebuild(backup: Path) -> None:
+        raise RuntimeError("synthetic rebuild failure")
+
+    async def _run() -> None:
+        # Scoped, mirroring the replacement-failure test above: an unscoped
+        # patch stays live through the readmission import, whose own
+        # background task would then re-enter _raising_rebuild and blow up
+        # before the 200 assertion -- failing against a CORRECT
+        # implementation, and inviting the "fix" of swallowing the rebuild
+        # exception inside _rebuild_derived_and_release (which would suppress
+        # every real background failure and defeat the wrapper).
+        with monkeypatch.context() as mp:
+            mp.setattr(db_transfer, "_rebuild_derived", _raising_rebuild)
+            resp = await db_transfer.import_db(_stream_request([b_path.read_bytes()]))
+            assert resp.status_code == 200
+            with pytest.raises(RuntimeError):
+                await resp.background()
+        assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+        c_path = _build_replacement_db(tmp_path, "source-c.db", "Site C")
+        resp2 = await _drive_import(_stream_request([c_path.read_bytes()]))
+        assert resp2.status_code == 200, (
+            "guard must be released; import must be admitted"
+        )
+
+    asyncio.run(_run())
+
+
+def test_import_guard_released_after_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must be RED against a guard whose release is skipped for
+    BaseException (e.g. `except Exception` instead of `except
+    BaseException`), which would leak the guard on a dropped-connection
+    CancelledError."""
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+
+    async def _blocked_stream(_request: Request, _tmp: Path) -> int:
+        await asyncio.Event().wait()
+        return 0  # unreachable
+
+    async def _run() -> None:
+        # Scoped, mirroring the replacement/rebuild-failure tests above: an
+        # unscoped patch would stay live through the readmission import
+        # below, which would then also block on _blocked_stream forever
+        # instead of asserting -- a hang, not a red, and against a CORRECT
+        # implementation.
+        with monkeypatch.context() as mp:
+            mp.setattr(db_transfer, "_stream_to", _blocked_stream)
+            task = asyncio.create_task(
+                db_transfer.import_db(_stream_request([b"irrelevant"]))
+            )
+            await asyncio.sleep(0.05)  # let the coroutine reach the blocked await
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+        b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+        resp = await _drive_import(_stream_request([b_path.read_bytes()]))
+        assert resp.status_code == 200, (
+            "guard must be released; import must be admitted"
+        )
+
+    asyncio.run(_run())
+
+
+def test_import_same_second_sequential_backups_do_not_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two sequential imports whose `utc_now()` is frozen to the SAME second
+    (the guard forces serialization but not wall-clock spacing) must both
+    succeed with two DISTINCT backup filenames. Must be RED against the old
+    bare-timestamp naming: under that scheme the second import's computed
+    path equals the first import's still-live backup (its own sweep excludes
+    it via `keep`), so `_replace_sync`'s `backup.exists()` guard raises
+    FileExistsError and the second import 500s.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    fixed_now = datetime(2035, 1, 1, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.db_transfer.utc_now", lambda: fixed_now)
+
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    c_path = _build_replacement_db(tmp_path, "source-c.db", "Site C")
+
+    async def _run() -> tuple[JSONResponse, JSONResponse]:
+        resp_a = await _drive_import(_stream_request([b_path.read_bytes()]))
+        resp_b = await _drive_import(_stream_request([c_path.read_bytes()]))
+        return resp_a, resp_b
+
+    resp_a, resp_b = asyncio.run(_run())
+    assert resp_a.status_code == 200
+    assert resp_b.status_code == 200
+    name_a = json.loads(bytes(resp_a.body))["backup"]
+    name_b = json.loads(bytes(resp_b.body))["backup"]
+    assert name_a != name_b, "same-second imports must not collide on backup filename"
+
+
+def test_import_stalled_upload_times_out_and_releases_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client that stops sending body bytes without closing the connection
+    must not park the handler forever holding the guard. Must be RED against
+    an unbounded `_stream_to` await: without the `asyncio.timeout` the
+    coroutine never returns, so this test hangs instead of asserting -- the
+    exact third exit class (`neither` failure nor background completion) that
+    turns one stuck request into a permanent 409 on every later import.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+
+    async def _stalled_stream(_request: Request, _tmp: Path) -> int:
+        await asyncio.Event().wait()
+        return 0  # unreachable
+
+    async def _run() -> None:
+        # Scoped: an unscoped patch would stay live through the readmission
+        # import below (monkeypatch only tears down at test end, not between
+        # asyncio.run() calls in the same test), which would then also stall
+        # and 408 instead of proving recovery on the real path.
+        with monkeypatch.context() as mp:
+            # Real bound is 900 s; shrink it so the test is fast AND
+            # deterministic (no wall-clock sleep, no flake window) --
+            # `import_db` reads the module global at call time, so the
+            # patch takes effect.
+            mp.setattr(db_transfer, "_IMPORT_STREAM_TIMEOUT_S", 0.05)
+            mp.setattr(db_transfer, "_stream_to", _stalled_stream)
+            with pytest.raises(ApiError) as exc_info:
+                await db_transfer.import_db(_stream_request([b"irrelevant"]))
+            assert exc_info.value.status_code == 408
+        assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+    asyncio.run(_run())
+
+    async def _readmit() -> None:
+        b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+        resp = await _drive_import(_stream_request([b_path.read_bytes()]))
+        assert resp.status_code == 200, (
+            "guard must be released; import must be admitted"
+        )
+
+    asyncio.run(_readmit())
 
 
 # ---------------------------------------------------------------------------

@@ -54,9 +54,17 @@ _MAX_IMPORT_BYTES = 256 * 1024 * 1024
 # guard) and the compress copy buffer.
 _DECOMP_CHUNK = 1 * 1024 * 1024
 _REQUIRED_TABLES = ("sites", "stations", "station_observations")
-# Anchored: only this producer's exact output shape (db_transfer.py's own
-# `f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db.bak"`) is ever a sweep candidate.
-_BAK_RE = re.compile(r"^wxverify-(\d{8}-\d{6})Z\.db\.bak$")
+# Anchored: only this producer's own output shapes are ever a sweep
+# candidate. The token group is optional on purpose -- it spans BOTH
+# `_new_backup_path`'s suffixed name and the pre-0.9 bare-timestamp name,
+# so `.bak` files already sitting in /data from an earlier version stay
+# sweepable across the upgrade.
+_BAK_RE = re.compile(r"^wxverify-(\d{8}-\d{6})(?:-[0-9a-f]{8})?Z\.db\.bak$")
+# The only await in import_db that can block on client behavior is the body
+# read. 900 s bounds a full 256 MiB upload (_MAX_IMPORT_BYTES) at a ~291 KiB/s
+# floor -- far below any LAN or ingress path -- so this can only fire on a
+# genuinely stalled client, never on a slow-but-live one.
+_IMPORT_STREAM_TIMEOUT_S = 900.0
 
 
 # --- Export registry (prepare-then-stream) --------------------------------
@@ -162,6 +170,19 @@ def _looks_like_valid_sqlite(path: Path) -> bool:
         conn.close()
 
 
+def _new_backup_path(db_dir: Path) -> Path:
+    """Build a collision-proof `.bak` path: timestamp for humans/sort order,
+    an 8-hex-char uuid4 suffix for uniqueness. The admission-control guard
+    serializes imports but does not space them out in wall-clock time -- two
+    sequential imports can complete and begin inside the same second, and
+    the prior import's own backup is never deleted by its own sweep
+    (`keep` excludes it), so a bare-timestamp name can collide with a
+    still-live backup from the immediately preceding import.
+    """
+    token = uuid.uuid4().hex[:8]
+    return db_dir / f"wxverify-{utc_now():%Y%m%d-%H%M%S}-{token}Z.db.bak"
+
+
 def _unlink_bak(path: Path) -> None:
     """Delete one stale ``.bak`` candidate; log and continue on failure."""
     try:
@@ -198,7 +219,7 @@ def sweep_bak_files(db_dir: Path, *, keep: Path | None = None) -> None:
         candidates.append((match.group(1), path))
     if not candidates:
         return
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(key=lambda item: (item[0], item[1].name), reverse=True)
     if keep is None:
         newest, stale = candidates[0][1], [path for _, path in candidates[1:]]
         if not stale:
@@ -402,29 +423,72 @@ async def export_download(export_id: str) -> FileResponse:
     )
 
 
+_import_in_progress = False
+
+
+def _acquire_import_guard() -> None:
+    """Reject a second import while one is in flight (plan: rare, destructive,
+    operator-driven action -> reject, don't queue)."""
+    global _import_in_progress
+    if _import_in_progress:
+        raise ApiError(409, "an import is already in progress")
+    _import_in_progress = True
+
+
+def _release_import_guard() -> None:
+    global _import_in_progress
+    _import_in_progress = False
+
+
 @router.post("/import/db")
 async def import_db(request: Request) -> JSONResponse:
-    """Replace the live database with an uploaded export (full overwrite)."""
-    declared = int(request.headers.get("content-length", "0") or "0")
-    if declared > _MAX_IMPORT_BYTES:
-        raise ApiError(413, "file too large")
-    db_dir = Path(config.db_path).parent
-    tmp = db_dir / f".wxverify-import-{uuid.uuid4().hex}.db.tmp"
+    """Replace the live database with an uploaded export (full overwrite).
+
+    Admission-controlled: only one import may be in flight, where "in
+    flight" spans upload/validation/replace AND the post-response
+    background rebuild + backup sweep (`_rebuild_derived`). A second
+    request arriving anywhere in that window gets 409, not queued -- an
+    import is a rare, destructive, operator-driven action.
+    """
+    _acquire_import_guard()
     try:
-        received = await _stream_to(request, tmp)
-        if received == 0:
-            raise ApiError(422, "empty upload")
-        _validate_upload(tmp)
-        backup = db_dir / f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db.bak"
-        # COMMIT POINT: past a successful replace_from the live DB has been
-        # overwritten, so the success response must go out regardless of any
-        # downstream outcome — reclaim and rebuild run post-response.
-        await get_db().replace_from(tmp, backup)
-    finally:
-        _unlink(tmp)
+        declared = int(request.headers.get("content-length", "0") or "0")
+        if declared > _MAX_IMPORT_BYTES:
+            raise ApiError(413, "file too large")
+        db_dir = Path(config.db_path).parent
+        tmp = db_dir / f".wxverify-import-{uuid.uuid4().hex}.db.tmp"
+        try:
+            try:
+                # A half-open client never delivers http.disconnect, so an
+                # unbounded body read would hold the guard forever and 409
+                # every later import until restart.
+                async with asyncio.timeout(_IMPORT_STREAM_TIMEOUT_S):
+                    received = await _stream_to(request, tmp)
+            except TimeoutError as exc:
+                raise ApiError(408, "upload stalled") from exc
+            if received == 0:
+                raise ApiError(422, "empty upload")
+            _validate_upload(tmp)
+            backup = _new_backup_path(db_dir)
+            # COMMIT POINT: past a successful replace_from the live DB has
+            # been overwritten, so the success response must go out
+            # regardless of any downstream outcome -- reclaim and rebuild
+            # run post-response. The guard, unlike the response, is held
+            # across that post-response work (see _rebuild_derived_and_release).
+            await get_db().replace_from(tmp, backup)
+        finally:
+            _unlink(tmp)
+    except BaseException:
+        # Every failure/cancellation exit releases the guard here, in the
+        # same coroutine, before propagating -- 413/422/408 stall/replace
+        # failure/CancelledError all funnel through this one clause. Note
+        # the acquire is OUTSIDE this try: a 409 for a REJECTED request must
+        # never reach here and clear the holder's guard.
+        _release_import_guard()
+        raise
     return JSONResponse(
         {"status": "imported", "backup": backup.name, "rebuild": "started"},
-        background=BackgroundTask(_rebuild_derived, backup),
+        background=BackgroundTask(_rebuild_derived_and_release, backup),
     )
 
 
@@ -564,6 +628,20 @@ async def _rebuild_derived(backup: Path) -> None:
         await asyncio.to_thread(sweep_bak_files, backup.parent, keep=backup)
     except Exception:
         logger.exception("import: bak retention sweep failed")
+
+
+async def _rebuild_derived_and_release(backup: Path) -> None:
+    """Run the post-import background work, then release the import guard.
+
+    `_rebuild_derived` itself never raises (every phase inside it is already
+    error-isolated -- see its docstring), but the release is still in a
+    `finally` so a future change to that function, or an exception raised
+    by Starlette's own background-task machinery, cannot leak the guard.
+    """
+    try:
+        await _rebuild_derived(backup)
+    finally:
+        _release_import_guard()
 
 
 def _rebuild_all(conn: sqlite3.Connection) -> None:
