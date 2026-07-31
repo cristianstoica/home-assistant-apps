@@ -354,11 +354,11 @@ Ops → Database Import uploads a previously exported `.db` file and **fully
 replaces** the live database with it. Any data collected since that export is
 lost. The upload is validated first (integrity check, wxverify schema version,
 required tables), and the current database is automatically backed up to
-`/data/wxverify-<timestamp>Z.db.bak` before the swap. Backups are never
-deleted automatically; old `/data/wxverify-*.db.bak` files may be removed by
-the operator (for example over the Samba or SSH add-on). After a successful
-import the add-on rebuilds consensus observations, forecast pairs, and cached
-scores in the background — no restart is needed.
+`/data/wxverify-<timestamp>Z.db.bak` before the swap. Only the newest
+`.bak` file is kept; older ones are swept automatically after each import and
+on every add-on startup, so the operator never needs to remove them by hand.
+After a successful import the add-on rebuilds consensus observations,
+forecast pairs, and cached scores in the background — no restart is needed.
 
 To restore a backup manually: stop the add-on, copy the chosen `.bak` file
 over `/data/wxverify.db`, delete any `wxverify.db-wal` or `wxverify.db-shm`

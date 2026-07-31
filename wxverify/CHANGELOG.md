@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.9
+
+- Fixed: a job claimed by the worker when Home Assistant stops the
+  add-on was left stranded in `running` status forever. The worker now
+  reclaims its own in-flight job on cancellation, returning it to
+  `pending` so the next start picks it back up.
+- Fixed: `wxverify-<timestamp>Z.db.bak` backup files accumulated
+  indefinitely with nothing ever deleting them. A new sweep now keeps
+  exactly the newest valid backup and removes the rest, running at
+  startup and after each import; it never prunes when the newest file
+  fails a validity check, and never deletes the backup the current
+  import just created. Backups are also excluded from Supervisor
+  snapshot archives (`backup_exclude`).
+
 ## 0.8.8
 
 - Fixed: leaderboard and composite reads could time out during a scoring

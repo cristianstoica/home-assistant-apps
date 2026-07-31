@@ -1,5 +1,5 @@
 name: "Weather Verify"
-version: "0.8.8"
+version: "0.8.9"
 slug: wxverify
 description: "Verify weather-forecast accuracy via cluster-consensus ground truth"
 url: "https://github.com/cristianstoica/home-assistant-apps/tree/main/wxverify"
@@ -8,7 +8,19 @@ arch:
   - amd64
 startup: services
 init: false
+# cold: the supervisor stops the container before archiving /data, so no
+# process is writing while the archive is taken and the whole SQLite file
+# set (.db plus its -wal/-shm sidecars) is captured as one consistent
+# point-in-time image. Do NOT change this to `hot` (the default): hot backups
+# require pausing writes for the duration of an external archive step and
+# resuming them from `backup_post`, which is a write-lock hold released by
+# an external condition that may never fire (Supervisor never calling
+# backup_post) — a deadman-style hazard in the exact subsystem that already
+# had a write-lock serialization incident (0.8.8, see CHANGELOG). cold's
+# ~5 min daily downtime is the safer trade.
 backup: cold
+backup_exclude:
+  - "*.db.bak"
 image: "ghcr.io/cristianstoica/wxverify"
 ingress: true
 ingress_stream: true

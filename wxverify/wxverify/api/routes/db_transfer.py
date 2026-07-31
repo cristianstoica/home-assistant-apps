@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import gzip
 import logging
+import re
 import shutil
 import sqlite3
 import time
 import uuid
 import zlib
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -52,6 +54,9 @@ _MAX_IMPORT_BYTES = 256 * 1024 * 1024
 # guard) and the compress copy buffer.
 _DECOMP_CHUNK = 1 * 1024 * 1024
 _REQUIRED_TABLES = ("sites", "stations", "station_observations")
+# Anchored: only this producer's exact output shape (db_transfer.py's own
+# `f"wxverify-{utc_now():%Y%m%d-%H%M%S}Z.db.bak"`) is ever a sweep candidate.
+_BAK_RE = re.compile(r"^wxverify-(\d{8}-\d{6})Z\.db\.bak$")
 
 
 # --- Export registry (prepare-then-stream) --------------------------------
@@ -116,6 +121,98 @@ def _sweep_registry() -> None:
 
 def _unlink(path: Path) -> None:
     path.unlink(missing_ok=True)
+
+
+def _looks_like_valid_sqlite(path: Path) -> bool:
+    """Allowlist gate mirroring ``_validate_upload``'s shape (plan §3.2).
+
+    ``quick_check`` alone is not enough: SQLite treats a zero-length file
+    (the shape a SIGKILL mid-``VACUUM INTO`` leaves behind, since that call
+    writes straight to the final filename with no temp-then-rename) as a
+    valid, empty database. ``user_version != 0`` is the discriminator --
+    ``VACUUM INTO`` preserves it, a truncated file has 0. Never raises into
+    the sweep.
+    """
+    try:
+        if path.stat().st_size <= 0:
+            return False
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except (sqlite3.Error, OSError):
+        return False
+    try:
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+        except sqlite3.Error:
+            return False
+        if row is None or str(row[0]) != "ok":
+            return False
+        version_row = conn.execute("PRAGMA user_version").fetchone()
+        if version_row is None or int(version_row[0]) == 0:
+            return False
+        names = {
+            str(name_row[0])
+            for name_row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        return all(table in names for table in _REQUIRED_TABLES)
+    except (sqlite3.Error, OSError):
+        return False
+    finally:
+        conn.close()
+
+
+def _unlink_bak(path: Path) -> None:
+    """Delete one stale ``.bak`` candidate; log and continue on failure."""
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        logger.warning("bak sweep: failed to remove %s", path.name, exc_info=True)
+
+
+def sweep_bak_files(db_dir: Path, *, keep: Path | None = None) -> None:
+    """Keep exactly the newest ``.bak`` file, delete the rest (plan §3.2).
+
+    ``keep``, when given, is the file just created by this import cycle and
+    is unconditionally excluded from the delete candidate set and treated as
+    the retained file regardless of what timestamp ordering would conclude.
+    When ``keep`` is ``None`` (the startup sweep), the newest-by-embedded-
+    timestamp candidate is retained instead. Either way the retained file is
+    validated before anything is deleted: a corrupt/truncated "newest" file
+    aborts the whole sweep rather than risk pruning every good backup down
+    to a bad one.
+    """
+    candidates: list[tuple[str, Path]] = []
+    for path in db_dir.glob("wxverify-*.db.bak"):
+        if keep is not None and path == keep:
+            continue
+        match = _BAK_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        try:
+            datetime.strptime(match.group(1), "%Y%m%d-%H%M%S")
+        except ValueError:
+            continue
+        candidates.append((match.group(1), path))
+    if not candidates:
+        return
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if keep is None:
+        newest, stale = candidates[0][1], [path for _, path in candidates[1:]]
+        if not stale:
+            return
+    else:
+        newest, stale = keep, [path for _, path in candidates]
+    if not _looks_like_valid_sqlite(newest):
+        logger.warning(
+            "bak sweep: newest backup %s failed validity check; skipping sweep",
+            newest.name,
+        )
+        return
+    for path in stale:
+        _unlink_bak(path)
 
 
 def _compress(src: Path, dst: Path) -> None:
@@ -327,7 +424,7 @@ async def import_db(request: Request) -> JSONResponse:
         _unlink(tmp)
     return JSONResponse(
         {"status": "imported", "backup": backup.name, "rebuild": "started"},
-        background=BackgroundTask(_rebuild_derived),
+        background=BackgroundTask(_rebuild_derived, backup),
     )
 
 
@@ -442,12 +539,14 @@ def _validate_upload(tmp: Path) -> None:
         conn.close()
 
 
-async def _rebuild_derived() -> None:
+async def _rebuild_derived(backup: Path) -> None:
     """Post-import background task: reclaim imported jobs, rebuild derived.
 
     Runs entirely post-response (nothing here can affect the already-sent
     200). The reclaim is error-isolated in its own try/except so a reclaim
-    failure cannot abort the rebuild that follows.
+    failure cannot abort the rebuild that follows. ``backup`` is the ``.bak``
+    file this import cycle just created; it is passed through to the
+    retention sweep as ``keep`` so it survives regardless of ordering.
     """
     db = get_db()
     # The jobs table arrives WITH the imported DB; running/pending rows in it
@@ -461,6 +560,10 @@ async def _rebuild_derived() -> None:
         await db.write(_rebuild_all)
     except Exception:
         logger.exception("import: derived rebuild failed")
+    try:
+        await asyncio.to_thread(sweep_bak_files, backup.parent, keep=backup)
+    except Exception:
+        logger.exception("import: bak retention sweep failed")
 
 
 def _rebuild_all(conn: sqlite3.Connection) -> None:

@@ -9,6 +9,7 @@ import logging
 import os
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response
@@ -114,6 +115,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     db = init_db(config.db_path)
     options = load_runtime_options()
     await db.write(reclaim_all_stale)
+    try:
+        await asyncio.to_thread(
+            db_transfer.sweep_bak_files, Path(config.db_path).parent
+        )
+    except Exception:
+        logger.exception("startup: bak retention sweep failed")
     await db.write(lambda conn: set_runtime_state_now(conn, "worker_started_at"))
     if options.rolling_window_days is not None:
         await set_rolling_window_days(options.rolling_window_days)

@@ -30,6 +30,7 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     fail,
     purge_failed_jobs_older_than,
+    reclaim_all_stale,
 )
 from wxverify.db.runtime_state import set_runtime_state_now
 from wxverify.feeds.registry import build_adapter
@@ -87,110 +88,120 @@ async def run_worker(db: Database) -> None:
     last_housekeeping_at = 0.0
     last_worker_heartbeat_at = 0.0
     last_scheduler_heartbeat_at = 0.0
-    while True:
-        now = time.monotonic()
-        last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
-            db, "worker_last_loop_at", last_worker_heartbeat_at, now
-        )
-        await db.write(scheduler_tick)
-        now = time.monotonic()
-        last_scheduler_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
-            db, "scheduler_last_tick_at", last_scheduler_heartbeat_at, now
-        )
-        if now - last_housekeeping_at >= JOB_HOUSEKEEPING_INTERVAL_SECONDS:
-            await db.write(
-                lambda conn: purge_failed_jobs_older_than(
-                    conn, FAILED_JOB_RETENTION_HOURS
-                )
+    try:
+        while True:
+            now = time.monotonic()
+            last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
+                db, "worker_last_loop_at", last_worker_heartbeat_at, now
             )
-            last_housekeeping_at = now
-        job = await db.write(claim_next_job)
-        if job is None:
-            await asyncio.sleep(POLL_INTERVAL)
-            continue
-        job_id = job.id
-        claimed_at = time.monotonic()
-        logger.info("job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id)
-        outcome = "completed"
-        try:
-            continuation = await dispatch(db, job)
-            await db.write(lambda conn, jid=job_id: complete(conn, jid))
-            logger.debug(
-                "job completed id=%s type=%s site=%s", job.id, job.type, job.site_id
+            await db.write(scheduler_tick)
+            now = time.monotonic()
+            last_scheduler_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
+                db, "scheduler_last_tick_at", last_scheduler_heartbeat_at, now
             )
-            if continuation is not None:
+            if now - last_housekeeping_at >= JOB_HOUSEKEEPING_INTERVAL_SECONDS:
                 await db.write(
-                    lambda conn, cont=continuation: enqueue_if_absent(
-                        conn,
-                        cont.job_type,
-                        cont.site_id,
-                        cont.job_key,
-                        cont.payload,
+                    lambda conn: purge_failed_jobs_older_than(
+                        conn, FAILED_JOB_RETENTION_HOURS
                     )
                 )
-        except JobDeferred as exc:
-            outcome = "deferred"
-            next_attempt_at = exc.next_attempt_at
-            await db.write(
-                lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
-                    conn, jid, attempt
-                )
+                last_housekeeping_at = now
+            job = await db.write(claim_next_job)
+            if job is None:
+                await asyncio.sleep(POLL_INTERVAL)
+                continue
+            job_id = job.id
+            claimed_at = time.monotonic()
+            logger.info(
+                "job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id
             )
-            logger.debug(
-                "job deferred id=%s type=%s site=%s until=%s",
+            outcome = "completed"
+            try:
+                continuation = await dispatch(db, job)
+                await db.write(lambda conn, jid=job_id: complete(conn, jid))
+                logger.debug(
+                    "job completed id=%s type=%s site=%s", job.id, job.type, job.site_id
+                )
+                if continuation is not None:
+                    await db.write(
+                        lambda conn, cont=continuation: enqueue_if_absent(
+                            conn,
+                            cont.job_type,
+                            cont.site_id,
+                            cont.job_key,
+                            cont.payload,
+                        )
+                    )
+            except JobDeferred as exc:
+                outcome = "deferred"
+                next_attempt_at = exc.next_attempt_at
+                await db.write(
+                    lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
+                        conn, jid, attempt
+                    )
+                )
+                logger.debug(
+                    "job deferred id=%s type=%s site=%s until=%s",
+                    job.id,
+                    job.type,
+                    job.site_id,
+                    next_attempt_at,
+                )
+            except JobCancelled:
+                outcome = "cancelled"
+                await db.write(lambda conn, jid=job_id: complete(conn, jid))
+            except Exception as exc:
+                if _is_process_fatal_permission_error(exc):
+                    logger.critical(
+                        "fatal OS permission error while processing job id=%s type=%s; "
+                        "terminating worker for process restart",
+                        job.id,
+                        job.type,
+                        exc_info=True,
+                    )
+                    raise
+                message = sanitized_exception(exc)
+                disposition = await db.write(
+                    lambda conn, jid=job_id, err=message: fail(conn, jid, err)
+                )
+                if disposition is not None and disposition.terminal:
+                    outcome = "failed"
+                    logger.error(
+                        "job failed permanently id=%s type=%s site=%s "
+                        "attempts=%d/%d: %s",
+                        job.id,
+                        job.type,
+                        job.site_id,
+                        disposition.retry_count,
+                        disposition.max_retries,
+                        message,
+                    )
+                else:
+                    outcome = "retry"
+                    logger.warning(
+                        "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
+                        job.id,
+                        job.type,
+                        job.site_id,
+                        disposition.retry_count if disposition else "?",
+                        disposition.max_retries if disposition else "?",
+                        disposition.next_attempt_at if disposition else "?",
+                        message,
+                    )
+            logger.info(
+                "cycle: job=%s type=%s site=%s outcome=%s elapsed=%.1fs",
                 job.id,
                 job.type,
                 job.site_id,
-                next_attempt_at,
+                outcome,
+                time.monotonic() - claimed_at,
             )
-        except JobCancelled:
-            outcome = "cancelled"
-            await db.write(lambda conn, jid=job_id: complete(conn, jid))
-        except Exception as exc:
-            if _is_process_fatal_permission_error(exc):
-                logger.critical(
-                    "fatal OS permission error while processing job id=%s type=%s; "
-                    "terminating worker for process restart",
-                    job.id,
-                    job.type,
-                    exc_info=True,
-                )
-                raise
-            message = sanitized_exception(exc)
-            disposition = await db.write(
-                lambda conn, jid=job_id, err=message: fail(conn, jid, err)
-            )
-            if disposition is not None and disposition.terminal:
-                outcome = "failed"
-                logger.error(
-                    "job failed permanently id=%s type=%s site=%s attempts=%d/%d: %s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                    disposition.retry_count,
-                    disposition.max_retries,
-                    message,
-                )
-            else:
-                outcome = "retry"
-                logger.warning(
-                    "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
-                    job.id,
-                    job.type,
-                    job.site_id,
-                    disposition.retry_count if disposition else "?",
-                    disposition.max_retries if disposition else "?",
-                    disposition.next_attempt_at if disposition else "?",
-                    message,
-                )
-        logger.info(
-            "cycle: job=%s type=%s site=%s outcome=%s elapsed=%.1fs",
-            job.id,
-            job.type,
-            job.site_id,
-            outcome,
-            time.monotonic() - claimed_at,
-        )
+    except asyncio.CancelledError:
+        try:
+            await db.write(reclaim_all_stale)
+        except Exception:
+            logger.warning("shutdown reclaim failed", exc_info=True)
+        raise
 
 
 async def _maybe_stamp_runtime_heartbeat(
