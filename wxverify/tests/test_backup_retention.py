@@ -260,6 +260,42 @@ def test_sweep_never_deletes_the_just_created_file(tmp_path: Path) -> None:
     assert not newer_sibling.exists(), "every non-keep candidate must be swept"
 
 
+def test_startup_sweep_spans_legacy_and_suffixed_bak_shapes(tmp_path: Path) -> None:
+    """A `/data` inherited from <=0.8.9 holds bare-timestamp `.bak` files; a
+    post-upgrade import writes suffixed ones. The startup sweep must treat
+    both as candidates and prune to the single newest across the two shapes.
+
+    Catches: a `_BAK_RE` that requires the uuid token, which drops every
+    legacy file out of the candidate set silently (no log at any level) and
+    pins it in /data forever -- the pre-0.9 accumulation bug, reintroduced
+    for exactly the artifacts the retention sweep was shipped to clean up.
+    """
+    legacy = _make_valid_bak(tmp_path / "wxverify-20000101-000001Z.db.bak")
+    suffixed = _make_valid_bak(tmp_path / "wxverify-20000101-000002-deadbeefZ.db.bak")
+
+    sweep_bak_files(tmp_path)
+
+    assert not legacy.exists(), "a pre-0.9 bare-timestamp .bak must still be swept"
+    assert suffixed.exists(), "the newest across both shapes must survive"
+
+
+def test_startup_sweep_legacy_shape_can_also_win_newest(tmp_path: Path) -> None:
+    """Reverse ordering of `test_startup_sweep_spans_legacy_and_suffixed_bak_shapes`:
+    a legacy bare-timestamp file with the LATER embedded timestamp must win
+    "newest" over an older suffixed file -- proving the mixed-shape
+    comparison is a real timestamp compare, not "suffixed always wins" (which
+    the first test alone cannot distinguish, since there the suffixed file is
+    also the newer one).
+    """
+    suffixed = _make_valid_bak(tmp_path / "wxverify-20000101-000001-deadbeefZ.db.bak")
+    legacy = _make_valid_bak(tmp_path / "wxverify-20000101-000002Z.db.bak")
+
+    sweep_bak_files(tmp_path)
+
+    assert not suffixed.exists(), "the older suffixed file must still be swept"
+    assert legacy.exists(), "a legacy bare-timestamp file can also win newest"
+
+
 @pytest.mark.parametrize("corruption", ["zero_byte", "garbage_bytes"])
 def test_sweep_skips_pruning_when_newest_is_corrupt(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, corruption: str

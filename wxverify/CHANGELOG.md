@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.10
+
+- Fixed: a second DB import started while one was already in progress
+  could race the first, corrupting derived state. The import endpoint
+  now rejects a concurrent import with `409 Conflict`; the admission
+  lock is held through the background rebuild and backup sweep, not
+  just until the handler returns, since two overlapping sweeps could
+  otherwise delete each other's backups.
+- Fixed: two fast sequential imports within the same wall-clock second
+  could produce colliding backup filenames. Backup filenames now
+  include a random token (`wxverify-<timestamp>-<token>Z.db.bak`); the
+  sweep regex still matches the older bare-timestamp filename shape so
+  backups written by earlier versions remain sweepable after upgrade.
+- Added: a 900s timeout on stalled import uploads, returning `408`.
+
 ## 0.8.9
 
 - Fixed: a job claimed by the worker when Home Assistant stops the

@@ -297,7 +297,8 @@ def test_lifespan_shutdown_reclaims_claimed_job(
 
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _blocked_dispatch)
 
-    app = create_app(root_path="")
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
     with TestClient(app) as client:
         conn = get_db()._conn  # noqa: SLF001 - fresh conn opened by lifespan startup
         job_id = _insert_job(conn)
@@ -315,6 +316,7 @@ def test_lifespan_shutdown_reclaims_claimed_job(
     ).fetchone()
     assert row is not None
     assert row["status"] == "pending"
+    assert stopped == [], "the default hard-kill stop_process must never fire"
 
 
 def test_cancellation_inside_claim_transaction_logs_and_defers_to_boot_reclaim(
