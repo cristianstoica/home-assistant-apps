@@ -8,7 +8,7 @@ from typing import Literal
 
 from wxverify.core.timeutil import window_cutoff
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
-from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.effective import active_competitor_clause, active_feed_cte
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
 
@@ -296,21 +296,23 @@ def _expected_active_feed_ids(
     resolved: WindowResolution,
 ) -> set[int]:
     window_clause = "" if resolved.cutoff is None else "AND fp.valid_at >= ?"
-    params: tuple[object, ...] = (site_id, variable, day_ahead)
+    params: tuple[object, ...] = (site_id, site_id, site_id, variable, day_ahead)
     if resolved.cutoff is not None:
         params = (*params, resolved.cutoff)
     rows = conn.execute(
         f"""
-        SELECT DISTINCT fp.feed_id
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
-        WHERE fp.site_id = ?
-          AND fp.variable = ?
-          AND fp.day_ahead = ?
-          {window_clause}
-          AND {active_competitor_clause(site_expr="fp.site_id")}
+        WITH {active_feed_cte()}
+        SELECT a.feed_id
+        FROM active_feeds a
+        WHERE EXISTS (
+            SELECT 1
+            FROM forecast_pairs fp
+            WHERE fp.site_id = ?
+              AND fp.feed_id = a.feed_id
+              AND fp.variable = ?
+              AND fp.day_ahead = ?
+              {window_clause}
+        )
         """,
         params,
     ).fetchall()

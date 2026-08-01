@@ -8,10 +8,16 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Literal
 
+from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
-from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.effective import (
+    MAX_DAY_AHEAD,
+    active_competitor_clause,
+    active_feed_cte,
+    cell_grid_cte,
+)
 from wxverify.scoring.leaderboard import WindowResolution, resolve_window, score_badge
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
@@ -127,21 +133,34 @@ def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:
 def _expected_active_cells(
     conn: sqlite3.Connection, *, site_id: int, resolved: WindowResolution
 ) -> set[tuple[int, str, int]]:
-    """Whole-window active cell universe: (feed_id, variable, day_ahead)."""
+    """Whole-window active cell universe: (feed_id, variable, day_ahead).
+
+    Enumerates the closed candidate grid (active feeds x FORECAST_VARIABLES x
+    day_ahead 0..MAX_DAY_AHEAD) and probes idx_pairs_cell once per candidate,
+    rather than rebuilding the universe with a DISTINCT over every pair row for
+    the site. Set-identical to the DISTINCT form by construction: a candidate is
+    admitted iff at least one in-window pair exists for it, which is exactly the
+    DISTINCT's membership test. Cost is O(candidates) and independent of how
+    much history the table holds.
+    """
     window_clause = "" if resolved.cutoff is None else "AND fp.valid_at >= ?"
-    params: tuple[object, ...] = (
-        (site_id,) if resolved.cutoff is None else (site_id, resolved.cutoff)
-    )
+    params: tuple[object, ...] = (site_id, site_id, site_id)
+    if resolved.cutoff is not None:
+        params = (*params, resolved.cutoff)
     rows = conn.execute(
         f"""
-        SELECT DISTINCT fp.feed_id, fp.variable, fp.day_ahead
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
-        WHERE fp.site_id = ?
-          {window_clause}
-          AND {active_competitor_clause(site_expr="fp.site_id")}
+        WITH {active_feed_cte()},{cell_grid_cte()}
+        SELECT a.feed_id, v.variable, l.day_ahead
+        FROM active_feeds a, grid_variables v, grid_leads l
+        WHERE EXISTS (
+            SELECT 1
+            FROM forecast_pairs fp
+            WHERE fp.site_id = ?
+              AND fp.feed_id = a.feed_id
+              AND fp.variable = v.variable
+              AND fp.day_ahead = l.day_ahead
+              {window_clause}
+        )
         """,
         params,
     ).fetchall()
@@ -183,6 +202,26 @@ def _cached_composite(
     ).fetchall()
     if not rows:
         return None
+    canonical_variables = set(FORECAST_VARIABLES)
+    kept: list[sqlite3.Row] = []
+    dropped: set[tuple[str, int]] = set()
+    for row in rows:
+        cell = (str(row["variable"]), int(row["day_ahead"]))
+        if cell[0] in canonical_variables and 0 <= cell[1] <= MAX_DAY_AHEAD:
+            kept.append(row)
+        else:
+            dropped.add(cell)
+    if dropped:
+        logger.warning(
+            "score_cache rows outside the canonical (variable, day_ahead)"
+            " grid ignored site=%s window=%s cells=%s",
+            site_id,
+            resolved.window_key,
+            sorted(dropped),
+        )
+        rows = kept
+        if not rows:
+            return None
     cached_cells = {
         (int(row["feed_id"]), str(row["variable"]), int(row["day_ahead"]))
         for row in rows
