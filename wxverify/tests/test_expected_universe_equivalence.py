@@ -1,5 +1,4 @@
-"""Equivalence + safety-net tests for the read-path latency rewrite (plan
-2026-08-01-read-path-latency, §8.1).
+"""Equivalence + safety-net tests for the read-path grid+EXISTS rewrites.
 
 Covers three grid+EXISTS rewrites against independent, hand-written DISTINCT
 reference queries built from the SAME shared predicate
