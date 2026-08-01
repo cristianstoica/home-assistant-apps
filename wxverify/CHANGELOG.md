@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.12
+
+- Fixed: the ops dashboard and the health-feeds API endpoint each ran
+  a full `COUNT(*)` over the entire forecast-samples history just to
+  report whether a feed had recent data. Both now use a bound-seek
+  existence probe instead, while the health endpoint continues to
+  report the exact same sample count as before. The health endpoint
+  is polled every five minutes by the Home Assistant integration, so
+  this removes the last unbounded read on that path.
+
 ## 0.8.11
 
 - Fixed: six hot read-path queries each bound only a prefix of their

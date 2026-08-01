@@ -13,6 +13,7 @@ from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.web.context import (
     SiteView,
+    load_backfill,
     load_dashboard,
     load_ops,
     load_overlay,
@@ -201,10 +202,8 @@ async def render_feed_toggles(request: Request, site_id: int) -> HTMLResponse:
 
 
 async def render_backfill(request: Request) -> HTMLResponse:
-    context = await get_db().read(load_ops)
-    return render_fragment(
-        request, "ops/_backfill.html", sites=context["sites"], rows=context["backfill"]
-    )
+    rows = await get_db().read(load_backfill)
+    return render_fragment(request, "ops/_backfill.html", rows=rows)
 
 
 def wants_html_fragment(request: Request) -> bool:

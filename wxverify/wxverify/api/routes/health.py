@@ -19,6 +19,47 @@ from wxverify.provider_ops import provider_health
 
 router = APIRouter(prefix="/api", tags=["health"])
 
+HEALTH_FEEDS_SQL = """
+    WITH feed_rollup AS (
+        SELECT m.id AS src_feed_id,
+               CASE
+                 WHEN m.source='meteoblue' AND m.model!='multimodel'
+                 THEN pkg.id
+                 ELSE m.id
+               END AS display_feed_id
+        FROM feeds m
+        LEFT JOIN feeds pkg
+          ON pkg.source='meteoblue' AND pkg.model='multimodel'
+    )
+    SELECT s.id AS site_id, s.name AS site_name, f.id AS feed_id,
+           s.enabled AS site_enabled,
+           f.source, f.model, f.enabled AS feed_enabled,
+           f.default_subscribed, f.disabled_reason,
+           sfs.enabled AS override_enabled, sfs.last_run_at, sfs.last_error,
+           sfs.error_count,
+           (
+               SELECT COUNT(*)
+               FROM feed_rollup r
+               -- CROSS JOIN is load-bearing: it pins feed_rollup as the outer
+               -- loop so the probe binds BOTH (site_id, feed_id) on
+               -- sqlite_autoindex_forecast_samples_1 (from the
+               -- forecast_samples UNIQUE constraint). With a plain JOIN the
+               -- planner drives from forecast_samples, binds site_id only,
+               -- and the seek degrades to an index scan -- measured 5x
+               -- SLOWER than the full-table aggregate this replaced.
+               CROSS JOIN forecast_samples fs
+                 ON fs.site_id = s.id AND fs.feed_id = r.src_feed_id
+               WHERE r.display_feed_id = f.id
+           ) AS sample_count
+    FROM sites s
+    JOIN feeds f
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = s.id AND sfs.feed_id = f.id
+    WHERE f.is_virtual = 0
+      AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
+    ORDER BY s.name, f.source, f.model
+    """
+
 
 @router.get("/health/keys")
 async def health_keys() -> dict[str, bool]:
@@ -63,44 +104,7 @@ async def health_budget() -> list[dict[str, object]]:
 @router.get("/health/feeds")
 async def health_feeds() -> list[dict[str, object]]:
     def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
-        rows = conn.execute(
-            """
-            SELECT s.id AS site_id, s.name AS site_name, f.id AS feed_id,
-                   s.enabled AS site_enabled,
-                   f.source, f.model, f.enabled AS feed_enabled,
-                   f.default_subscribed, f.disabled_reason,
-                   sfs.enabled AS override_enabled, sfs.last_run_at, sfs.last_error,
-                   sfs.error_count,
-                   COALESCE(sample_counts.n, 0) AS sample_count
-            FROM sites s
-            JOIN feeds f
-            LEFT JOIN site_feed_state sfs
-              ON sfs.site_id = s.id AND sfs.feed_id = f.id
-            LEFT JOIN (
-                SELECT fs.site_id,
-                       CASE
-                         WHEN sf.source='meteoblue' AND sf.model!='multimodel'
-                         THEN pkg.id
-                         ELSE fs.feed_id
-                       END AS feed_id,
-                       COUNT(*) AS n
-                FROM forecast_samples fs
-                JOIN feeds sf ON sf.id = fs.feed_id
-                LEFT JOIN feeds pkg
-                  ON pkg.source='meteoblue' AND pkg.model='multimodel'
-                GROUP BY fs.site_id,
-                         CASE
-                           WHEN sf.source='meteoblue' AND sf.model!='multimodel'
-                           THEN pkg.id
-                           ELSE fs.feed_id
-                         END
-            ) sample_counts
-              ON sample_counts.site_id = s.id AND sample_counts.feed_id = f.id
-            WHERE f.is_virtual = 0
-              AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
-            ORDER BY s.name, f.source, f.model
-            """
-        ).fetchall()
+        rows = conn.execute(HEALTH_FEEDS_SQL).fetchall()
         out: list[dict[str, object]] = []
         for row in rows:
             subscribed = bool(

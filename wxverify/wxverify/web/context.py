@@ -157,7 +157,7 @@ class FeedHealthRow:
     error_count: int
     feed_enabled: bool
     site_enabled: bool
-    sample_count: int
+    has_samples: bool
 
 
 @dataclass(frozen=True)
@@ -357,45 +357,50 @@ def load_overlay(
     }
 
 
+FEED_HEALTH_SQL = """
+    WITH feed_rollup AS (
+        SELECT m.id AS src_feed_id,
+               CASE
+                 WHEN m.source='meteoblue' AND m.model!='multimodel'
+                 THEN pkg.id
+                 ELSE m.id
+               END AS display_feed_id
+        FROM feeds m
+        LEFT JOIN feeds pkg
+          ON pkg.source='meteoblue' AND pkg.model='multimodel'
+    )
+    SELECT s.id AS site_id, s.name AS site_name, f.id AS feed_id,
+           s.enabled AS site_enabled,
+           f.source, f.model, f.enabled AS feed_enabled,
+           f.default_subscribed, f.disabled_reason,
+           sfs.enabled AS override_enabled, sfs.last_run_at, sfs.last_error,
+           sfs.error_count,
+           EXISTS (
+               SELECT 1
+               FROM feed_rollup r
+               -- CROSS JOIN is load-bearing: it pins feed_rollup as the outer
+               -- loop so the probe binds BOTH (site_id, feed_id) on
+               -- sqlite_autoindex_forecast_samples_1 (from the
+               -- forecast_samples UNIQUE constraint). With a plain JOIN the
+               -- planner drives from forecast_samples, binds site_id only,
+               -- and the seek degrades to an index scan -- measured 5x
+               -- SLOWER than the full-table aggregate this replaced.
+               CROSS JOIN forecast_samples fs
+                 ON fs.site_id = s.id AND fs.feed_id = r.src_feed_id
+               WHERE r.display_feed_id = f.id
+           ) AS has_samples
+    FROM sites s
+    JOIN feeds f
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = s.id AND sfs.feed_id = f.id
+    WHERE f.is_virtual = 0
+      AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
+    ORDER BY s.name COLLATE NOCASE, f.source, f.model
+    """
+
+
 def load_feed_health(conn: sqlite3.Connection) -> list[FeedHealthRow]:
-    rows = conn.execute(
-        """
-        SELECT s.id AS site_id, s.name AS site_name, f.id AS feed_id,
-               s.enabled AS site_enabled,
-               f.source, f.model, f.enabled AS feed_enabled,
-               f.default_subscribed, f.disabled_reason,
-               sfs.enabled AS override_enabled, sfs.last_run_at, sfs.last_error,
-               sfs.error_count,
-               COALESCE(sample_counts.n, 0) AS sample_count
-        FROM sites s
-        JOIN feeds f
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = s.id AND sfs.feed_id = f.id
-        LEFT JOIN (
-            SELECT fs.site_id,
-                   CASE
-                     WHEN sf.source='meteoblue' AND sf.model!='multimodel'
-                     THEN pkg.id
-                     ELSE fs.feed_id
-                   END AS feed_id,
-                   COUNT(*) AS n
-            FROM forecast_samples fs
-            JOIN feeds sf ON sf.id = fs.feed_id
-            LEFT JOIN feeds pkg
-              ON pkg.source='meteoblue' AND pkg.model='multimodel'
-            GROUP BY fs.site_id,
-                     CASE
-                       WHEN sf.source='meteoblue' AND sf.model!='multimodel'
-                       THEN pkg.id
-                       ELSE fs.feed_id
-                     END
-        ) sample_counts
-          ON sample_counts.site_id = s.id AND sample_counts.feed_id = f.id
-        WHERE f.is_virtual = 0
-          AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
-        ORDER BY s.name COLLATE NOCASE, f.source, f.model
-        """
-    ).fetchall()
+    rows = conn.execute(FEED_HEALTH_SQL).fetchall()
     out: list[FeedHealthRow] = []
     for row in rows:
         subscribed = bool(
@@ -415,7 +420,7 @@ def load_feed_health(conn: sqlite3.Connection) -> list[FeedHealthRow]:
             status = "fetched, 0 usable"
         elif row["last_error"] is not None:
             status = "error"
-        elif int(row["sample_count"]) == 0:
+        elif not bool(row["has_samples"]):
             status = "ran / no usable data"
         else:
             status = "ok"
@@ -439,7 +444,7 @@ def load_feed_health(conn: sqlite3.Connection) -> list[FeedHealthRow]:
                 error_count=int(row["error_count"] or 0),
                 feed_enabled=bool(row["feed_enabled"]),
                 site_enabled=bool(row["site_enabled"]),
-                sample_count=int(row["sample_count"]),
+                has_samples=bool(row["has_samples"]),
             )
         )
     return out
