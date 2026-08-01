@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.13
+
+- Fixed: the ops dashboard reported "never run / due" for a feed whose every
+  fetch attempt had failed, instead of "error" — the two health API
+  endpoints already agreed on "error" for the same state, but the ops
+  dashboard tested `last_run_at is None` before checking `last_error`.
+  Marking a feed's fetch as failed records the error without ever setting
+  `last_run_at`, so a feed that has never once completed successfully kept
+  reading as "never run / due" indefinitely instead of surfacing the error.
+  All three surfaces now derive status in the same order.
+
 ## 0.8.12
 
 - Fixed: the ops dashboard and the health-feeds API endpoint each ran
