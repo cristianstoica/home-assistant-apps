@@ -414,12 +414,16 @@ def load_feed_health(conn: sqlite3.Connection) -> list[FeedHealthRow]:
             status = "disabled"
         elif not subscribed:
             status = "not subscribed / available"
-        elif row["last_run_at"] is None:
-            status = "never run / due"
+        # last_error must be tested before last_run_at is None: a failed
+        # fetch (mark_feed_error) never sets last_run_at, so an all-failures
+        # feed would otherwise be misreported as never having run. Every
+        # surface deriving feed status from these fields must keep this order.
         elif row["last_error"] == NO_USABLE_SAMPLES_SENTINEL:
             status = "fetched, 0 usable"
         elif row["last_error"] is not None:
             status = "error"
+        elif row["last_run_at"] is None:
+            status = "never run / due"
         elif not bool(row["has_samples"]):
             status = "ran / no usable data"
         else:

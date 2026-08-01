@@ -33,6 +33,7 @@ from wxverify.api.routes.health import HEALTH_FEEDS_SQL
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.migrations import run_migrations
 from wxverify.web.context import FEED_HEALTH_SQL, load_feed_health
+from wxverify.worker.feed_fetch import FeedFetchTarget, mark_feed_error
 
 # The exact statement `load_feed_health` and `health_feeds` computed before
 # this change: a full-table GROUP BY materialised as a subquery, then LEFT
@@ -385,6 +386,135 @@ def test_ops_and_api_agree_on_which_feeds_have_samples() -> None:
     assert ops_by_key, "fixture produced no rows; the drift guard is vacuous"
     for key, ops_row in ops_by_key.items():
         assert ops_row.has_samples == (int(api_by_key[key]["sample_count"]) > 0)
+
+
+# --- The status branch-order regression -------------------------------------
+
+
+def _mark_error(
+    conn: sqlite3.Connection, *, site_id: int, feed_id: int, error: str
+) -> None:
+    # Only site_id/feed_id/error reach the row mark_feed_error() writes; the
+    # rest of FeedFetchTarget is plumbing for the real fetch path and is
+    # irrelevant here.
+    target = FeedFetchTarget(
+        site_id=site_id,
+        feed_id=feed_id,
+        lat=47.0,
+        lon=25.0,
+        source="provider-two",
+        model="modelB",
+        max_lead_hours=168,
+    )
+    mark_feed_error(conn, target, error)
+
+
+def test_feed_health_reports_error_for_a_feed_that_has_never_completed_a_run() -> None:
+    """mark_feed_error() writes last_error/error_count but never last_run_at,
+    so a feed whose every fetch attempt has failed reaches load_feed_health
+    with last_run_at still NULL. That state must report "error", not
+    "never run / due" -- the two must be distinguishable on last_error alone.
+    """
+    conn, ids = _seed(package_present=True)
+    _mark_error(
+        conn,
+        site_id=ids.bravo,
+        feed_id=ids.model_b_zero_samples,
+        error="connection refused",
+    )
+
+    row = conn.execute(
+        "SELECT last_run_at, last_error FROM site_feed_state"
+        " WHERE site_id=? AND feed_id=?",
+        (ids.bravo, ids.model_b_zero_samples),
+    ).fetchone()
+    assert row["last_run_at"] is None, (
+        "fixture precondition broken: mark_feed_error is expected to leave "
+        "last_run_at NULL"
+    )
+    assert row["last_error"] == "connection refused"
+
+    rows = {(r.site_id, r.feed_id): r for r in load_feed_health(conn)}
+    assert rows[(ids.bravo, ids.model_b_zero_samples)].status == "error"
+
+
+def test_feed_health_still_reports_never_run_due_without_an_error() -> None:
+    """Paired positive for the test above: the SAME (site, feed) pair with no
+    site_feed_state row at all (the state before any fetch attempt, success
+    or failure) must still report "never run / due". Without this, the fix
+    could have deleted that status outright instead of merely reordering it.
+    """
+    conn, ids = _seed(package_present=True)
+    row = conn.execute(
+        "SELECT 1 FROM site_feed_state WHERE site_id=? AND feed_id=?",
+        (ids.bravo, ids.model_b_zero_samples),
+    ).fetchone()
+    assert row is None, (
+        "fixture precondition broken: expected no site_feed_state row for "
+        "this feed before mark_feed_error writes one"
+    )
+
+    rows = {(r.site_id, r.feed_id): r for r in load_feed_health(conn)}
+    assert rows[(ids.bravo, ids.model_b_zero_samples)].status == "never run / due"
+
+
+def test_ops_and_api_agree_on_status_for_every_reachable_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """load_feed_health (/ops) and health_feeds (/api/health/feeds) derive
+    status from the same site_feed_state row through two independently
+    written branch chains. They must agree on every row, including the
+    all-failures-no-run row an out-of-order chain misreports.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "status-branch-order.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _build(conn: sqlite3.Connection) -> _FeedHealthIds:
+            ids = _seed_into(conn, package_present=True)
+            _mark_error(
+                conn,
+                site_id=ids.bravo,
+                feed_id=ids.model_b_zero_samples,
+                error="connection refused",
+            )
+            return ids
+
+        db.write_sync(_build)
+        ops_rows = db.read_sync(load_feed_health)
+        response = client.get("/api/health/feeds")
+
+    assert response.status_code == 200
+    ops_by_key = {(r.site_id, r.feed_id): r.status for r in ops_rows}
+    api_by_key = {
+        (int(r["site_id"]), int(r["feed_id"])): str(r["status"])
+        for r in response.json()
+    }
+    assert ops_by_key.keys() == api_by_key.keys()
+    for key, ops_status in ops_by_key.items():
+        assert ops_status == api_by_key[key], (
+            f"ops/api status disagreement for {key}: "
+            f"{ops_status!r} vs {api_by_key[key]!r}"
+        )
+    # Only the statuses this fixture actually reaches -- not the full
+    # branch set -- so the assertion cannot silently pass on an empty
+    # intersection. Checked last so a real ops/api divergence is reported
+    # accurately instead of being masked by this coverage check.
+    assert {
+        "site disabled",
+        "never run / due",
+        "error",
+        "ran / no usable data",
+        "ok",
+    } <= set(ops_by_key.values()), (
+        "fixture no longer reaches every status branch, or a status "
+        "derivation regressed"
+    )
 
 
 _PUBLISHED_HEALTH_FEEDS_KEYS = frozenset(
