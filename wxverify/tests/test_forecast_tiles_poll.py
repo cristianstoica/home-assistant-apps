@@ -33,6 +33,7 @@ from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting, set_setting
+from wxverify.web.context import SiteView
 
 # ---------------------------------------------------------------------------
 # Harness (mirrors tests/test_forecast_routes.py).
@@ -106,6 +107,25 @@ def _feed_id(conn: sqlite3.Connection, source: str, model: str) -> int:
 
 def _current_fingerprint(site_id: int) -> str:
     return get_db().read_sync(lambda conn: samples_fingerprint(conn, site_id=site_id))
+
+
+def _count_load_sites_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Counts real invocations of the ``load_sites`` binding routes.py
+    resolves at call time (``wxverify.web.routes.load_sites``) -- not the
+    definition in ``web.context``, which is never called directly by the
+    route handlers. Delegates to the original function so behavior is
+    unchanged and only the count is observed."""
+    from wxverify.web import routes as routes_module
+
+    original = routes_module.load_sites
+    calls = {"n": 0}
+
+    def _wrapped(*args: object, **kwargs: object) -> list[SiteView]:
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(routes_module, "load_sites", _wrapped)
+    return calls
 
 
 _HIGH_LOW_RE = re.compile(r"High / Low</span>\s*<strong[^>]*>(.*?)</strong>", re.DOTALL)
@@ -349,3 +369,121 @@ def test_tiles_204_when_only_non_sample_state_changed(
         assert depth_one_page.status_code == 200
         assert _high_low_values(depth_two_page.text) == ["13° / 13°"]
         assert _high_low_values(depth_one_page.text) == ["11° / 11°"]
+
+
+# ---------------------------------------------------------------------------
+# Read-amplification regression: ``_resolve_site`` must not re-load the
+# enabled-site list that ``_load_forecast_context`` already loaded, and the
+# poll path (which never needs the list for an explicit site_id) must not
+# load it at all.
+# ---------------------------------------------------------------------------
+
+
+def test_index_default_site_calls_load_sites_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Only Site")
+    app = _make_app(monkeypatch)
+    calls = _count_load_sites_calls(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert calls["n"] == 1
+
+
+def test_forecast_page_explicit_site_calls_load_sites_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Explicit Site")
+    app = _make_app(monkeypatch)
+    calls = _count_load_sites_calls(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get(f"/forecast?site={site_id}")
+    assert response.status_code == 200
+    assert calls["n"] == 1
+
+
+def test_tiles_explicit_site_calls_load_sites_zero_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching fingerprint short-circuits before ``_load_forecast_context``
+    ever runs, so an explicit-site_id poll that finds nothing new must not
+    load the enabled-site list at all -- unlike the page path, which always
+    needs it to build the site-picker nav."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Poll Site")  # zero samples -> fingerprint "0"
+    app = _make_app(monkeypatch)
+    calls = _count_load_sites_calls(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get(f"/forecast/tiles?site={site_id}&fingerprint=0")
+    assert response.status_code == 204
+    assert calls["n"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Behavior preservation: the call-count reduction above must not change which
+# site is resolved, or how an unknown/absent site is handled.
+# ---------------------------------------------------------------------------
+
+
+def test_index_default_site_prefers_enabled_over_earlier_named_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rendered context's site list is the enabled-only one: a disabled
+    site must never appear in the site picker, and the default pick (no
+    ``site`` param) comes from that same enabled-only list."""
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "AAA Disabled", enabled=0)
+    _make_site(conn, "ZZZ Enabled", enabled=1)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert "ZZZ Enabled" in response.text
+    assert "AAA Disabled" not in response.text
+
+
+def test_index_with_no_enabled_sites_resolves_to_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Only Disabled", enabled=0)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/")
+    assert response.status_code == 200
+    assert "No sites configured." in response.text
+
+
+def test_unknown_site_id_resolves_to_none_on_forecast_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Real Site")
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/forecast?site=999999")
+    assert response.status_code == 200
+    assert "No sites configured." in response.text
+
+
+def test_explicit_site_id_resolves_disabled_site_via_page_and_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An EXPLICIT site_id resolves through ``load_site``, which does not
+    filter on ``enabled`` -- pinned on both the page and the poll, the two
+    call sites the fix touches."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Paused Village", enabled=0)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        page = client.get(f"/forecast?site={site_id}")
+        assert page.status_code == 200
+        assert "Paused Village" in page.text
+        assert "- paused" in page.text
+
+        tiles = client.get(f"/forecast/tiles?site={site_id}&fingerprint=")
+        assert tiles.status_code == 200
+        assert 'id="forecast-tiles"' in tiles.text

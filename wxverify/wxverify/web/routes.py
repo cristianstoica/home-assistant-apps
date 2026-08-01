@@ -24,22 +24,31 @@ from wxverify.web.render import render, render_fragment
 router = APIRouter(include_in_schema=False)
 
 
-def _resolve_site(conn: sqlite3.Connection, site_id: int | None) -> SiteView | None:
+def _resolve_site(
+    conn: sqlite3.Connection,
+    site_id: int | None,
+    enabled_sites: list[SiteView] | None = None,
+) -> SiteView | None:
     """Site resolution shared by the page and poll paths.
 
     Contract preserved verbatim from _load_forecast_context: an EXPLICIT
     site_id resolves through load_site, which does not filter on `enabled`
     (web/context.py:219) -- a disabled site resolves normally on both the page
-    and the poll. Only the implicit (site_id is None) branch is restricted to
-    enabled sites, via load_sites(include_disabled=False). None is returned
-    only for an unknown id, or when no enabled site exists at all.
+    and the poll, and the enabled-site list is never loaded for this branch.
+    Only the implicit (site_id is None) branch is restricted to enabled
+    sites, via load_sites(include_disabled=False) -- reusing the caller's
+    already-loaded list when one is supplied via `enabled_sites`, otherwise
+    loading it here. None is returned only for an unknown id, or when no
+    enabled site exists at all.
     """
-    sites = load_sites(conn, include_disabled=False)
-    return (
-        load_site(conn, site_id)
-        if site_id is not None
-        else (sites[0] if sites else None)
+    if site_id is not None:
+        return load_site(conn, site_id)
+    sites = (
+        enabled_sites
+        if enabled_sites is not None
+        else load_sites(conn, include_disabled=False)
     )
+    return sites[0] if sites else None
 
 
 def _load_forecast_context(
@@ -47,7 +56,7 @@ def _load_forecast_context(
 ) -> dict[str, object]:
     """Resolve the site (first enabled when unspecified) and build the view."""
     sites = load_sites(conn, include_disabled=False)
-    site = _resolve_site(conn, site_id)
+    site = _resolve_site(conn, site_id, enabled_sites=sites)
     view: ForecastView | None = None
     if site is not None:
         view = build_forecast(
