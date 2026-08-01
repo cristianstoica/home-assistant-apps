@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.11
+
+- Fixed: six hot read-path queries each bound only a prefix of their
+  covering index, leaving a middle column unbound, so SQLite could
+  never reach the selective range predicate that follows it in index
+  order and fell back to scanning. Each query now enumerates the
+  bounded candidate grid and issues one fully-bound index seek per
+  candidate. Measured warm, best-of-3, on real data, with every
+  rewrite asserted set-equal to the original output first:
+  feed-freshness lookup ~980x, scoring-feed lookup ~1172x, composite
+  ~16x, leaderboard ~8x, accuracy curve ~7x, forecast build ~4x,
+  dashboard ~3x faster; the forecast tiles poll's unchanged-data
+  response dropped from 1135ms to 15ms.
+- Fixed: a shared site-resolution helper introduced during the above
+  work caused full forecast-page builds to load the enabled-site list
+  twice. It now returns early for an explicit site id and reuses the
+  caller's already-loaded list otherwise; behavior is unchanged.
+
 ## 0.8.10
 
 - Fixed: a second DB import started while one was already in progress
