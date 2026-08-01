@@ -19,7 +19,10 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
+from wxverify.collection.forecast_validation import (
+    FORECAST_VARIABLES,
+    invalid_forecast_sample_sql,
+)
 from wxverify.core.timeutil import parse_utc
 from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard
 
@@ -57,33 +60,37 @@ def load_future_samples(
     """Load the latest-run future samples for a site.
 
     Latest-run pick: for each ``(feed, variable, valid_at)`` slot only the
-    sample from the newest run (``MAX(issued_at)``) survives — a correlated
-    subquery, so an older run's hours never mix into a newer run's day. The
-    inner subquery repeats the validity predicate so an invalid sample from a
-    newer run cannot shadow a valid older one.
+    sample from the newest run survives. ``UNIQUE(site_id, feed_id, variable,
+    issued_at, valid_at)`` makes ``issued_at`` unique within a slot, so
+    ``ROW_NUMBER() = 1`` over ``issued_at DESC`` selects exactly the row the old
+    ``issued_at = (SELECT MAX(...))`` form selected -- with no ties possible and
+    no correlated rescan per row. The validity predicate is applied before the
+    window function, so an invalid sample from a newer run still cannot shadow a
+    valid older one. ``variable IN (...)`` is implied by ``NOT invalid`` and is
+    stated only to make idx_samples_site_var_valid's valid_at range reachable.
     """
     invalid = invalid_forecast_sample_sql("fs")
-    invalid_inner = invalid_forecast_sample_sql("fs2")
+    variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
     rows = conn.execute(
         f"""
-        SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
-               fs.valid_at, fs.value
-        FROM forecast_samples fs
-        JOIN feeds f ON f.id = fs.feed_id
-        WHERE fs.site_id = ?
-          AND fs.valid_at >= ?
-          AND {_EXCLUDED_FEEDS_SQL}
-          AND NOT {invalid}
-          AND fs.issued_at = (
-              SELECT MAX(fs2.issued_at)
-              FROM forecast_samples fs2
-              WHERE fs2.site_id = fs.site_id
-                AND fs2.feed_id = fs.feed_id
-                AND fs2.variable = fs.variable
-                AND fs2.valid_at = fs.valid_at
-                AND NOT {invalid_inner}
-          )
-        ORDER BY fs.valid_at, fs.feed_id
+        SELECT feed_id, source, model, variable, issued_at, valid_at, value
+        FROM (
+            SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
+                   fs.valid_at, fs.value,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY fs.feed_id, fs.variable, fs.valid_at
+                       ORDER BY fs.issued_at DESC
+                   ) AS rn
+            FROM forecast_samples fs
+            JOIN feeds f ON f.id = fs.feed_id
+            WHERE fs.site_id = ?
+              AND fs.variable IN ({variables})
+              AND fs.valid_at >= ?
+              AND {_EXCLUDED_FEEDS_SQL}
+              AND NOT {invalid}
+        )
+        WHERE rn = 1
+        ORDER BY valid_at, feed_id
         """,
         (site_id, since_valid_at),
     ).fetchall()
@@ -111,16 +118,29 @@ def load_feed_freshness(
     flagged and a fast one is not silently excused.
     """
     invalid = invalid_forecast_sample_sql("fs")
+    grid = ", ".join(f"('{variable}')" for variable in FORECAST_VARIABLES)
     rows = conn.execute(
         f"""
-        SELECT fs.feed_id, MAX(fs.issued_at) AS latest_issued_at,
-               f.fetch_interval_minutes
-        FROM forecast_samples fs
-        JOIN feeds f ON f.id = fs.feed_id
-        WHERE fs.site_id = ?
-          AND {_EXCLUDED_FEEDS_SQL}
-          AND NOT {invalid}
-        GROUP BY fs.feed_id
+        WITH grid_variables(variable) AS (VALUES {grid}),
+        candidates AS (
+            SELECT f.id AS feed_id, f.fetch_interval_minutes, v.variable
+            FROM feeds f, grid_variables v
+            WHERE {_EXCLUDED_FEEDS_SQL}
+        )
+        SELECT c.feed_id, c.fetch_interval_minutes,
+               MAX((
+                   SELECT fs.issued_at
+                   FROM forecast_samples fs
+                   WHERE fs.site_id = ?
+                     AND fs.feed_id = c.feed_id
+                     AND fs.variable = c.variable
+                     AND NOT {invalid}
+                   ORDER BY fs.issued_at DESC
+                   LIMIT 1
+               )) AS latest_issued_at
+        FROM candidates c
+        GROUP BY c.feed_id, c.fetch_interval_minutes
+        HAVING latest_issued_at IS NOT NULL
         """,
         (site_id,),
     ).fetchall()

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
 from wxverify.db.connection import get_db
+from wxverify.forecast.data import samples_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.web.context import (
@@ -23,16 +24,30 @@ from wxverify.web.render import render, render_fragment
 router = APIRouter(include_in_schema=False)
 
 
+def _resolve_site(conn: sqlite3.Connection, site_id: int | None) -> SiteView | None:
+    """Site resolution shared by the page and poll paths.
+
+    Contract preserved verbatim from _load_forecast_context: an EXPLICIT
+    site_id resolves through load_site, which does not filter on `enabled`
+    (web/context.py:219) -- a disabled site resolves normally on both the page
+    and the poll. Only the implicit (site_id is None) branch is restricted to
+    enabled sites, via load_sites(include_disabled=False). None is returned
+    only for an unknown id, or when no enabled site exists at all.
+    """
+    sites = load_sites(conn, include_disabled=False)
+    return (
+        load_site(conn, site_id)
+        if site_id is not None
+        else (sites[0] if sites else None)
+    )
+
+
 def _load_forecast_context(
     conn: sqlite3.Connection, site_id: int | None
 ) -> dict[str, object]:
     """Resolve the site (first enabled when unspecified) and build the view."""
     sites = load_sites(conn, include_disabled=False)
-    site = (
-        load_site(conn, site_id)
-        if site_id is not None
-        else (sites[0] if sites else None)
-    )
+    site = _resolve_site(conn, site_id)
     view: ForecastView | None = None
     if site is not None:
         view = build_forecast(
@@ -62,13 +77,31 @@ async def forecast_tiles(
 ) -> Response:
     """Auto-poll target: 204 (no swap) unless newer samples have landed.
 
-    On a 204 htmx leaves the DOM untouched; when the data changed, the
-    ``outerHTML`` swap replaces only ``#forecast-tiles``, so an open day
-    detail (a sibling element) is left intact across a tile poll.
+    The fingerprint is computed BEFORE the view is built. It is a single
+    MAX(id) over the site's samples and is the same value the full build would
+    have reported, so an unchanged fingerprint is answered without paying for a
+    build whose result would be discarded. On a 204 htmx leaves the DOM
+    untouched -- including the hx-get that carries the old fingerprint, which
+    stays correct precisely because nothing changed. When the data did change,
+    the outerHTML swap replaces only #forecast-tiles, so an open day detail (a
+    sibling element) is left intact across a tile poll.
     """
-    context = await get_db().read(lambda conn: _load_forecast_context(conn, site))
-    view = context.get("view")
-    if not isinstance(view, ForecastView) or view.fingerprint == fingerprint:
+
+    def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
+        site_view = _resolve_site(conn, site)
+        if site_view is None:
+            return None
+        if samples_fingerprint(conn, site_id=site_view.id) == fingerprint:
+            return None
+        return _load_forecast_context(conn, site)
+
+    context = await get_db().read(_poll)
+    view = context.get("view") if context is not None else None
+    if (
+        context is None
+        or not isinstance(view, ForecastView)
+        or view.fingerprint == fingerprint
+    ):
         return Response(status_code=204)
     return render_fragment(request, "forecast/_tiles.html", **context)
 

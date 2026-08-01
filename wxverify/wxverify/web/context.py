@@ -10,7 +10,7 @@ from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
 from wxverify.scoring.composite import composite_with_status
-from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.settings.keys import get_number_setting
@@ -717,17 +717,19 @@ def _scoring_feeds(
         return []
     rows = conn.execute(
         f"""
-        SELECT DISTINCT f.*, sfs.enabled AS override_enabled
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
+        WITH {active_feed_cte()}
+        SELECT f.*, sfs.enabled AS override_enabled
+        FROM active_feeds a
+        JOIN feeds f ON f.id = a.feed_id
         LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = f.id
-        WHERE fp.site_id = ?
-          AND fp.variable = ?
-          AND {active_competitor_clause(site_expr="fp.site_id")}
+          ON sfs.site_id = ? AND sfs.feed_id = f.id
+        WHERE EXISTS (
+            SELECT 1 FROM forecast_pairs fp
+            WHERE fp.site_id = ? AND fp.feed_id = a.feed_id AND fp.variable = ?
+        )
         ORDER BY f.source, f.model
         """,
-        (site_id, variable),
+        (site_id, site_id, site_id, site_id, variable),
     ).fetchall()
     out: list[FeedToggle] = []
     for row in rows:
