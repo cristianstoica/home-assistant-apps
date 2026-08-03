@@ -42,8 +42,7 @@ def _fresh_conn() -> sqlite3.Connection:
 
 def _plan(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> list[str]:
     return [
-        str(row["detail"])
-        for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+        str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
     ]
 
 

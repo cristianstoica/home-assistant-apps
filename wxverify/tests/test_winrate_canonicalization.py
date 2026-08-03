@@ -237,38 +237,56 @@ def test_winrate_matches_reference_for_reissues_ties_and_sparse_cells() -> None:
     # exercises the max-issued_at tie-break rather than a min-abs_error
     # shortcut or a reversed issued_at ordering.
     _add_pair(
-        conn, site_id=site_id, feed_id=fa,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fa,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=0.5,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fa,
-        issued_at="2026-01-01T06:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fa,
+        issued_at="2026-01-01T06:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=2.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fb,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fb,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=1.0,
     )
 
     # An exact tie at a second valid_at between fa and fb.
     _add_pair(
-        conn, site_id=site_id, feed_id=fa,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-03T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fa,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-03T00:00:00Z",
         abs_error=1.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fb,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-03T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fb,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-03T00:00:00Z",
         abs_error=1.0,
     )
 
     # fc is never compared against anything at any valid_at: covered=1,
     # comparable=0, win_rate=None.
     _add_pair(
-        conn, site_id=site_id, feed_id=fc,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-04T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fc,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-04T00:00:00Z",
         abs_error=9.0,
     )
 
@@ -308,13 +326,19 @@ def test_winrate_matches_reference_for_meteoblue_member_eligibility() -> None:
     other_id = int(other_row["id"])
 
     _add_pair(
-        conn, site_id=site_id, feed_id=member_id,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=member_id,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=1.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=other_id,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=other_id,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=2.0,
     )
 
@@ -356,26 +380,38 @@ def test_winrate_bind_order_is_not_confused_across_sites() -> None:
     fa, fb = _eligible_feed_ids(conn, 2)
 
     _add_pair(
-        conn, site_id=site_a, feed_id=fa,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_a,
+        feed_id=fa,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=1.0,
     )
     _add_pair(
-        conn, site_id=site_a, feed_id=fb,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_a,
+        feed_id=fb,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=5.0,
     )
     # Same feed_ids, same valid_at, OPPOSITE winner at site B: if site_id
     # binding ever leaked across the two sites this would show up as a
     # mismatched winner or a merged/doubled row count.
     _add_pair(
-        conn, site_id=site_b, feed_id=fa,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_b,
+        feed_id=fa,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=5.0,
     )
     _add_pair(
-        conn, site_id=site_b, feed_id=fb,
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-02T00:00:00Z",
+        conn,
+        site_id=site_b,
+        feed_id=fb,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
         abs_error=1.0,
     )
 
@@ -416,23 +452,35 @@ def test_winrate_window_filtering_matches_reference() -> None:
     # patching, mirroring test_winrate_applies_window_to_canonical_cells in
     # tests/test_m1_m5.py.
     _add_pair(
-        conn, site_id=site_id, feed_id=fa,
-        issued_at="2035-01-01T00:00:00Z", valid_at="2035-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fa,
+        issued_at="2035-01-01T00:00:00Z",
+        valid_at="2035-01-02T00:00:00Z",
         abs_error=1.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fb,
-        issued_at="2035-01-01T00:00:00Z", valid_at="2035-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fb,
+        issued_at="2035-01-01T00:00:00Z",
+        valid_at="2035-01-02T00:00:00Z",
         abs_error=2.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fa,
-        issued_at="2020-01-01T00:00:00Z", valid_at="2020-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fa,
+        issued_at="2020-01-01T00:00:00Z",
+        valid_at="2020-01-02T00:00:00Z",
         abs_error=9.0,
     )
     _add_pair(
-        conn, site_id=site_id, feed_id=fb,
-        issued_at="2020-01-01T00:00:00Z", valid_at="2020-01-02T00:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=fb,
+        issued_at="2020-01-01T00:00:00Z",
+        valid_at="2020-01-02T00:00:00Z",
         abs_error=9.0,
     )
 

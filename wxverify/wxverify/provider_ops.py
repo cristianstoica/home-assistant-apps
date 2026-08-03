@@ -419,9 +419,7 @@ def sample_metrics(
     return SampleMetrics(
         sample_count=int(count_row["sample_count"]),
         variables=tuple(sorted(json.loads(count_row["variables"] or "[]"))),
-        model_run_count=0
-        if run_row is None
-        else int(run_row["model_run_count"] or 0),
+        model_run_count=0 if run_row is None else int(run_row["model_run_count"] or 0),
         latest_issued_at=None
         if count_row["latest_issued_at"] is None
         else str(count_row["latest_issued_at"]),
