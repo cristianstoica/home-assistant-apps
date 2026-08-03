@@ -174,3 +174,35 @@ jobs:
 
       - name: Import sanity check
         run: uv run --locked python -m wxverify --help
+
+  wxverify-shipping-sqlite-plan:
+    name: Wxverify query-plan tests (shipping SQLite)
+    runs-on: ubuntu-latest
+    container:
+      # Same base image as wxverify/Dockerfile — query-plan tests must run
+      # against the SQLite build that actually ships, not the runner's.
+      image: ghcr.io/home-assistant/base-python:3.13-alpine3.23
+    defaults:
+      run:
+        working-directory: wxverify
+    steps:
+      - name: Check out code from GitHub
+        # actions/checkout v6.0.2 — pinned 2026-07-07
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Report SQLite version
+        run: python3 -c "import sqlite3; print(sqlite3.sqlite_version)"
+
+      - name: Install uv
+        run: pip install --no-cache-dir uv==0.9.17
+
+      - name: Install test dependencies
+        run: uv sync --locked
+
+      - name: Query-plan regression tests
+        run: >-
+          uv run --locked pytest
+          tests/test_query_plan_regressions.py
+          tests/test_index_predicate_reconciliation.py
+        env:
+          WXV_WEATHERCOM_KEY: "ci-placeholder"
