@@ -7,6 +7,7 @@ import sqlite3
 from datetime import timedelta
 
 from wxverify import config
+from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import isoformat_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_samples_site_var_valid
             ON forecast_samples(site_id, variable, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_samples_runs
+            ON forecast_samples(site_id, feed_id, model_run_id);
 
         CREATE TABLE IF NOT EXISTS api_budget (
             source TEXT NOT NULL REFERENCES sources(source) ON DELETE RESTRICT,
@@ -166,6 +169,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON forecast_pairs(site_id, variable, day_ahead, valid_at);
         CREATE INDEX IF NOT EXISTS idx_pairs_cell
             ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_pairs_winrate
+            ON forecast_pairs(site_id, variable, day_ahead, feed_id,
+                              valid_at, issued_at DESC, abs_error);
 
         CREATE TABLE IF NOT EXISTS score_cache (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -258,6 +264,69 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         """,
     )
+    _sync_invalid_sample_index(conn)
+
+
+def _sync_invalid_sample_index(conn: sqlite3.Connection) -> None:
+    """Reconcile idx_samples_invalid's stored predicate with the live one.
+
+    The partial index is built from invalid_forecast_sample_sql() so the
+    index predicate and the query predicate are the same string by
+    construction. CREATE INDEX IF NOT EXISTS matches on name only: on a
+    database that already has idx_samples_invalid it is a no-op even when the
+    stored predicate differs, so an edit to the validation constants that
+    build that predicate would leave the old predicate on disk while the
+    query carries the new one. INDEXED BY then makes SQLite try to prove the
+    query predicate implies the index predicate; it cannot, and the statement
+    fails with "no query solution" -- a runtime error on a route that polls
+    this table every few minutes. Reconcile instead of trusting the name.
+
+    The SAVEPOINT is load-bearing, not ceremony. The executescript that runs
+    immediately before this commits the pending transaction before running
+    its own script, so by this point the connection is back in autocommit and
+    each statement below would otherwise land individually: an unprotected
+    failure between DROP and CREATE would leave no idx_samples_invalid on
+    disk at all, and INDEXED BY would then fail with "no such index" -- the
+    same class of error, reached from the other direction. SAVEPOINT nests
+    regardless of autocommit state, and execute() (unlike executescript)
+    never forces an implicit commit.
+    """
+    invalid_index_ddl = (
+        "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
+        "ON forecast_samples(site_id, feed_id) "
+        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+    )
+    conn.execute("SAVEPOINT idx_samples_invalid_sync")
+    try:
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' AND name='idx_samples_invalid'"
+        ).fetchone()
+        if stored is not None and _index_predicate(stored["sql"]) != _index_predicate(
+            invalid_index_ddl
+        ):
+            logger.info("rebuilding idx_samples_invalid: predicate changed")
+            conn.execute("DROP INDEX idx_samples_invalid")
+            stored = None
+        if stored is None:
+            conn.execute(invalid_index_ddl)
+    except BaseException:
+        conn.execute("ROLLBACK TO idx_samples_invalid_sync")
+        conn.execute("RELEASE idx_samples_invalid_sync")
+        raise
+    conn.execute("RELEASE idx_samples_invalid_sync")
+
+
+def _index_predicate(ddl: str) -> str:
+    # Comparing from "ON forecast_samples" onward, rather than the full
+    # statement, sidesteps SQLite stripping "IF NOT EXISTS" from the text it
+    # persists to sqlite_master -- a full-text compare against our own
+    # generated DDL (which still has it) would otherwise always mismatch.
+    return _squash_ws(ddl[ddl.index("ON forecast_samples") :])
+
+
+def _squash_ws(text: str) -> str:
+    return " ".join(text.split())
 
 
 def seed_default_sources(conn: sqlite3.Connection) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -341,41 +342,86 @@ def provider_health(
     return [groups[source] for source in sorted(groups)]
 
 
+def sample_rollup_sql(placeholders: str) -> str:
+    """Count / min-max / distinct-variables statement for a feed partition.
+
+    Every column read here is part of the UNIQUE(site_id, feed_id, variable,
+    issued_at, valid_at) autoindex, so this seeks it as a covering index with
+    no rowid lookup into the main table. The variable set is folded into the
+    same aggregate as a JSON array rather than fetched via a second `SELECT
+    DISTINCT` statement, and rather than `GROUP_CONCAT`: `variable` is
+    unrestricted TEXT, so a value containing a comma is a reachable state a
+    comma-delimited aggregate cannot invert, and SQLite rejects
+    `GROUP_CONCAT(DISTINCT x, sep)` outright (DISTINCT aggregates take exactly
+    one argument). `json_group_array` escapes the delimiter by construction
+    and returns '[]', not NULL, for an empty partition.
+    """
+    return f"""
+        SELECT COUNT(*) AS sample_count,
+               MAX(issued_at) AS latest_issued_at,
+               MIN(valid_at) AS valid_from,
+               MAX(valid_at) AS valid_to,
+               json_group_array(DISTINCT variable) AS variables
+        FROM forecast_samples
+        WHERE site_id=? AND feed_id IN ({placeholders})
+        """
+
+
+def model_run_count_sql(placeholders: str) -> str:
+    """Distinct-model-run-count statement for a feed partition.
+
+    INDEXED BY is load-bearing, not decoration: `model_run_id` is absent from
+    the UNIQUE autoindex, so without idx_samples_runs this seek fetches every
+    row from the main table instead of the index alone.
+    """
+    return f"""
+        SELECT COUNT(DISTINCT CASE
+                 WHEN TRIM(model_run_id) != '' THEN model_run_id
+               END) AS model_run_count
+        FROM forecast_samples INDEXED BY idx_samples_runs
+        WHERE site_id=? AND feed_id IN ({placeholders})
+        """
+
+
+def bad_sample_count_sql(placeholders: str) -> str:
+    """Invalid-sample-count statement for a feed partition.
+
+    INDEXED BY is load-bearing: idx_samples_invalid is a PARTIAL index
+    holding only rows that fail validation -- normally none -- so this seek
+    is O(bad rows), not O(history). The pin is defensive: index choice for
+    a wide feed_id IN-list depends on the SQLite build and table
+    statistics, and an unpinned planner could pick a non-partial index
+    instead, turning this into an O(history) scan for the same zero-row
+    result. The unaliased `forecast_samples` form keeps this predicate
+    textually identical to the one in the index DDL.
+    """
+    return f"""
+        SELECT COUNT(*) AS bad_sample_count
+        FROM forecast_samples INDEXED BY idx_samples_invalid
+        WHERE site_id=? AND feed_id IN ({placeholders})
+          AND {invalid_forecast_sample_sql("forecast_samples")}
+        """
+
+
 def sample_metrics(
     conn: sqlite3.Connection, site_id: int, feed_id: int
 ) -> SampleMetrics:
     sample_feed_ids = sample_feed_ids_for_metrics(conn, feed_id)
     placeholders = _placeholders(sample_feed_ids)
-    count_row = conn.execute(
-        f"""
-        SELECT COUNT(*) AS sample_count,
-               COUNT(DISTINCT CASE
-                 WHEN TRIM(model_run_id) != '' THEN model_run_id
-               END) AS model_run_count,
-               MAX(issued_at) AS latest_issued_at,
-               MIN(valid_at) AS valid_from,
-               MAX(valid_at) AS valid_to
-        FROM forecast_samples
-        WHERE site_id=? AND feed_id IN ({placeholders})
-        """,
-        (site_id, *sample_feed_ids),
-    ).fetchone()
-    variable_rows = conn.execute(
-        f"""
-        SELECT DISTINCT variable
-        FROM forecast_samples
-        WHERE site_id=? AND feed_id IN ({placeholders})
-        ORDER BY variable
-        """,
-        (site_id, *sample_feed_ids),
-    ).fetchall()
-    bad_count = bad_sample_count(conn, site_id, feed_id)
+    params = (site_id, *sample_feed_ids)
+
+    count_row = conn.execute(sample_rollup_sql(placeholders), params).fetchone()
+    run_row = conn.execute(model_run_count_sql(placeholders), params).fetchone()
+    bad_row = conn.execute(bad_sample_count_sql(placeholders), params).fetchone()
+
     if count_row is None:
-        return SampleMetrics(0, (), 0, None, None, None, bad_count)
+        return SampleMetrics(0, (), 0, None, None, None, 0)
     return SampleMetrics(
         sample_count=int(count_row["sample_count"]),
-        variables=tuple(str(row["variable"]) for row in variable_rows),
-        model_run_count=int(count_row["model_run_count"] or 0),
+        variables=tuple(sorted(json.loads(count_row["variables"] or "[]"))),
+        model_run_count=0
+        if run_row is None
+        else int(run_row["model_run_count"] or 0),
         latest_issued_at=None
         if count_row["latest_issued_at"] is None
         else str(count_row["latest_issued_at"]),
@@ -383,23 +429,8 @@ def sample_metrics(
         if count_row["valid_from"] is None
         else str(count_row["valid_from"]),
         valid_to=None if count_row["valid_to"] is None else str(count_row["valid_to"]),
-        bad_sample_count=bad_count,
+        bad_sample_count=0 if bad_row is None else int(bad_row["bad_sample_count"]),
     )
-
-
-def bad_sample_count(conn: sqlite3.Connection, site_id: int, feed_id: int) -> int:
-    sample_feed_ids = sample_feed_ids_for_metrics(conn, feed_id)
-    placeholders = _placeholders(sample_feed_ids)
-    row = conn.execute(
-        f"""
-        SELECT COUNT(*) AS n
-        FROM forecast_samples fs
-        WHERE fs.site_id=? AND fs.feed_id IN ({placeholders})
-          AND {invalid_forecast_sample_sql("fs")}
-        """,
-        (site_id, *sample_feed_ids),
-    ).fetchone()
-    return 0 if row is None else int(row["n"])
 
 
 def sample_feed_ids_for_metrics(

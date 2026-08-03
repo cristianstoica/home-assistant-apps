@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.9.0
+
+### Added
+
+- `/api/worker/status` now reports cumulative per-callback database read timing
+  (`read_timing`, `read_timing_since`): lock wait, executor dispatch and query
+  execution, with call counts, error counts and maxima. Reads taking 250 ms or
+  more in any phase now log a warning.
+- `/api/worker/status?counts=exact` reports exact `forecast_samples` and
+  `forecast_pairs` row counts. Opt-in, so the default five-minutely poll does
+  not pay for them.
+- A progress bar appears at the top of the page when a full-page navigation
+  takes longer than 150 ms, and respects `prefers-reduced-motion`.
+
+### Changed
+
+- Provider health collects per-feed sample metrics in three index-covered
+  statements instead of one query per feed, removing a long read-lock hold that
+  delayed other API reads.
+- Win-rate scoring now selects the latest forecast per feed and valid time in
+  SQL instead of fetching every reissue and reducing in Python, and resolves the
+  active-feed set once per query instead of once per row. Roughly a 2x
+  reduction in win-rate query time on a 444k-row database.
+- New indexes are built on first start after this update, which adds a few
+  seconds to that one startup and roughly 48 MB of database size at 444k
+  forecast pairs.
+
 ## 0.8.13
 
 - Fixed: the ops dashboard reported "never run / due" for a feed whose every

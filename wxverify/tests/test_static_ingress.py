@@ -45,6 +45,7 @@ _INGRESS_PREFIX = f"/api/hassio_ingress/{_INGRESS_TOKEN}"
 # request the versioned path; the raw-middleware oracles keep an arbitrary
 # path string (the middleware never touches the mount).
 _STATIC_CSS = f"/static/{__version__}/app.css"
+_STATIC_JS = f"/static/{__version__}/app.js"
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
 
@@ -391,3 +392,39 @@ def test_bare_static_path_returns_404_under_ingress(
         f"got {resp.status_code}. "
         "The versioned static mount must not serve unversioned asset paths."
     )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 7 — nav-progress indicator assets are actually served
+#
+# The top-of-page navigation progress indicator relies on a specific element
+# id in app.css and specific hooks in app.js; a served-content check catches
+# a rename or a build step that silently drops either half.
+# ---------------------------------------------------------------------------
+
+
+def test_served_app_css_contains_the_nav_progress_indicator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _make_app(tmp_path, monkeypatch)
+    with TestClient(
+        app, client=(_NON_SUPERVISOR_IP, 9000), follow_redirects=False
+    ) as client:
+        resp = client.get(_STATIC_CSS)
+    assert resp.status_code == 200
+    assert "#nav-progress" in resp.text
+
+
+def test_served_app_js_wires_nav_progress_to_pageshow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _make_app(tmp_path, monkeypatch)
+    with TestClient(
+        app, client=(_NON_SUPERVISOR_IP, 9000), follow_redirects=False
+    ) as client:
+        resp = client.get(_STATIC_JS)
+    assert resp.status_code == 200
+    # pageshow must clear the indicator on every restore, including from the
+    # bfcache, or a back-navigation can strand it visible.
+    assert "nav-progress" in resp.text
+    assert "pageshow" in resp.text

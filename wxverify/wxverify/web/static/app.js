@@ -606,4 +606,112 @@
       nextChunk(0);
     }
   });
+
+  // Full-page navigation feedback. Clicking a nav or filter link leaves the
+  // CURRENT document on screen until the server responds; on the slow pages
+  // that is seconds with no sign anything is happening. The browser cannot
+  // blank the page early -- blanking requires the REPLACEMENT document to
+  // start rendering -- so the indicator has to be drawn by the page being
+  // left, and torn down by every path that comes back to it.
+  var NAV_DELAY_MS = 150; // under this a navigation reads as instant
+  var NAV_MAX_MS = 30000; // ingress cuts a single response at ~30 s
+  var navShowTimer = null;
+  var navHideTimer = null;
+
+  function navBar() {
+    var el = document.getElementById("nav-progress");
+    if (el) {
+      return el;
+    }
+    el = document.createElement("div");
+    el.id = "nav-progress";
+    el.setAttribute("role", "status");
+    el.setAttribute("aria-live", "polite");
+    el.hidden = true;
+    var label = document.createElement("span");
+    label.className = "visually-hidden";
+    label.textContent = "Loading";
+    el.appendChild(label);
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function navClear() {
+    window.clearTimeout(navShowTimer);
+    window.clearTimeout(navHideTimer);
+    navShowTimer = null;
+    navHideTimer = null;
+    var el = document.getElementById("nav-progress");
+    if (el) {
+      el.hidden = true;
+    }
+  }
+
+  function navStart() {
+    navClear();
+    navShowTimer = window.setTimeout(function () {
+      navBar().hidden = false;
+    }, NAV_DELAY_MS);
+    navHideTimer = window.setTimeout(navClear, NAV_MAX_MS);
+  }
+
+  // True only when the click will actually replace this document. Everything
+  // else -- new tab, download, external host, in-page anchor, htmx swap --
+  // leaves the document in place, so a bar shown for it would never be torn
+  // down by a load.
+  function navigatesAway(event, a) {
+    if (event.defaultPrevented || event.button !== 0) {
+      return false;
+    }
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return false;
+    }
+    if (a.hasAttribute("download") || a.hasAttribute("target")) {
+      return false;
+    }
+    // No anchor carries hx-* today; this keeps it true by construction rather
+    // than by convention, so an htmx fragment swap can never raise the bar.
+    var attrs = a.getAttributeNames();
+    for (var i = 0; i < attrs.length; i++) {
+      if (attrs[i].indexOf("hx-") === 0) {
+        return false;
+      }
+    }
+    // mailto:/tel:/javascript: resolve to an opaque origin, so this one check
+    // covers non-http schemes as well as other hosts.
+    if (a.origin !== window.location.origin) {
+      return false;
+    }
+    // Same path+search plus a fragment is a scroll, not a load. A link to the
+    // identical URL with no fragment IS a reload and does get the bar.
+    return !(
+      a.hash &&
+      a.pathname === window.location.pathname &&
+      a.search === window.location.search
+    );
+  }
+
+  document.body.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.closest) {
+      return;
+    }
+    var a = target.closest("a[href]");
+    if (a && navigatesAway(event, a)) {
+      navStart();
+    }
+  });
+
+  // A bfcache restore replays this document with the bar still visible, so
+  // pageshow must clear on EVERY restore. Without it, Back leaves a spinner
+  // that never goes away.
+  window.addEventListener("pageshow", navClear);
+
+  // Esc cancels a pending navigation in every major browser but fires no
+  // event of its own; clear on the keypress so the bar does not outlive it.
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") {
+      navClear();
+    }
+  });
 })();
