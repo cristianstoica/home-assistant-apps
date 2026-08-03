@@ -1,6 +1,6 @@
 """Tests for the 0.8.8 write-lock-serialization fix.
 
-Two families, per docs/plans/2026-07-27-write-lock-serialization-fix.md:
+Two families, per the write-lock-serialization plan:
 
 - R1-R4 (S2): the leaderboard route's fire-and-forget rescore scheduling no
   longer blocks the read behind a held write lock.

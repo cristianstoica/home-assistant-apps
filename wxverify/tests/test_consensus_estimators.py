@@ -7,8 +7,7 @@ median/MAD), the temperature no-op regression pin, the precip gate pin, and
 one `materialize_consensus` integration path over a real tmp SQLite DB.
 
 Every expected value below is hand-derived from the arithmetic in the plan
-(`docs/plans/2026-07-21-wxverify-baseline-estimators-and-migration.md` §A6),
-not read off the implementation.
+(§A6), not read off the implementation.
 """
 
 from __future__ import annotations
