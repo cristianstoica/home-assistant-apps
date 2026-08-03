@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import cutoff_for_window
 
 
@@ -15,7 +15,6 @@ class CanonicalCell:
     source: str
     model: str
     valid_at: str
-    issued_at: str
     abs_error: float
 
 
@@ -28,6 +27,45 @@ class FeedStats:
     wins: float = 0.0
 
 
+def winrate_sql(window_clause: str) -> str:
+    """Canonical-cell query: latest issued_at per (feed, valid_at), in SQL.
+
+    Canonicalizes via ROW_NUMBER() rather than fetching every candidate row
+    and reducing in Python: UNIQUE(site_id, feed_id, variable, issued_at,
+    valid_at) makes issued_at unique within a (feed, valid_at) slot, so
+    rn = 1 always picks exactly the row the old max-issued_at reduction
+    picked, with no ties possible. active_feed_cte() replaces a per-row
+    correlated EXISTS with a JOIN against a feed set computed once.
+    """
+    return f"""
+        WITH {active_feed_cte()},
+        canonical AS (
+            SELECT fp.feed_id, fp.valid_at, fp.abs_error,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY fp.feed_id, fp.valid_at
+                       ORDER BY fp.issued_at DESC
+                   ) AS rn
+            FROM forecast_pairs fp
+            JOIN active_feeds a ON a.feed_id = fp.feed_id
+            WHERE fp.site_id = ?
+              AND fp.variable = ?
+              AND fp.day_ahead = ?
+              AND fp.abs_error IS NOT NULL
+              {window_clause}
+        )
+        SELECT c.feed_id, f.source, f.model, c.valid_at, c.abs_error
+        FROM canonical c
+        JOIN feeds f ON f.id = c.feed_id
+        WHERE c.rn = 1
+        -- Load-bearing, not cosmetic: cells_by_valid_at below groups rows by
+        -- insertion order (dict order), and the win/tie loop sums float
+        -- credits per group in that order -- float addition is
+        -- order-dependent, so this ORDER BY is what makes `wins`
+        -- bit-identical across runs rather than merely approximately equal.
+        ORDER BY c.valid_at, c.feed_id
+        """
+
+
 def winrate(
     conn: sqlite3.Connection,
     *,
@@ -38,29 +76,16 @@ def winrate(
 ) -> list[dict[str, object]]:
     cutoff = cutoff_for_window(conn, window)
     window_clause = "" if cutoff is None else "AND fp.valid_at >= ?"
-    params: list[object] = [site_id, variable, day_ahead]
+    # active_feed_cte() consumes TWO binds (its LEFT JOIN, and the meteoblue
+    # package EXISTS inside active_competitor_clause) and they come first
+    # because the CTE is textually first -- same bind shape as
+    # leaderboard._expected_active_feed_ids.
+    params: list[object] = [site_id, site_id, site_id, variable, day_ahead]
     if cutoff is not None:
         params.append(cutoff)
-    rows = conn.execute(
-        f"""
-        SELECT fp.feed_id, f.source, f.model, fp.valid_at, fp.issued_at,
-               fp.abs_error
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
-        WHERE fp.site_id = ?
-          AND fp.variable = ?
-          AND fp.day_ahead = ?
-          AND fp.abs_error IS NOT NULL
-          {window_clause}
-          AND {active_competitor_clause(site_expr="fp.site_id")}
-        ORDER BY fp.valid_at, fp.feed_id, fp.issued_at
-        """,
-        tuple(params),
-    ).fetchall()
-    canonical: dict[tuple[int, str], CanonicalCell] = {}
+    rows = conn.execute(winrate_sql(window_clause), tuple(params)).fetchall()
     stats: dict[int, FeedStats] = {}
+    cells_by_valid_at: dict[str, list[CanonicalCell]] = {}
     for row in rows:
         feed_id = int(row["feed_id"])
         cell = CanonicalCell(
@@ -68,18 +93,12 @@ def winrate(
             source=str(row["source"]),
             model=str(row["model"]),
             valid_at=str(row["valid_at"]),
-            issued_at=str(row["issued_at"]),
             abs_error=float(row["abs_error"]),
         )
-        stats.setdefault(feed_id, FeedStats(source=cell.source, model=cell.model))
-        key = (feed_id, cell.valid_at)
-        previous = canonical.get(key)
-        if previous is None or cell.issued_at > previous.issued_at:
-            canonical[key] = cell
-
-    cells_by_valid_at: dict[str, list[CanonicalCell]] = {}
-    for cell in canonical.values():
-        stats[cell.feed_id].covered += 1
+        feed_stats = stats.setdefault(
+            feed_id, FeedStats(source=cell.source, model=cell.model)
+        )
+        feed_stats.covered += 1
         cells_by_valid_at.setdefault(cell.valid_at, []).append(cell)
 
     for cells in cells_by_valid_at.values():

@@ -19,6 +19,12 @@ from wxverify.provider_ops import provider_health
 
 router = APIRouter(prefix="/api", tags=["health"])
 
+# Named so a test can import the same symbol production runs rather than a
+# re-typed copy: a bare COUNT(*) with no WHERE lets the planner pick whichever
+# index is smallest, so this stays a table-free scan without an INDEXED BY hint.
+FORECAST_SAMPLES_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_samples"
+FORECAST_PAIRS_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_pairs"
+
 HEALTH_FEEDS_SQL = """
     WITH feed_rollup AS (
         SELECT m.id AS src_feed_id,
@@ -278,7 +284,7 @@ async def observations_current(
 
 
 @router.get("/worker/status")
-async def worker_status() -> dict[str, object]:
+async def worker_status(counts: str = Query("")) -> dict[str, object]:
     def _read(conn: sqlite3.Connection) -> dict[str, object]:
         rows = conn.execute(
             "SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"
@@ -299,9 +305,27 @@ async def worker_status() -> dict[str, object]:
             status[f"last_completed_{job_type}_at"] = (
                 None if row is None else row["completed_at"]
             )
+        # Exact, not estimated, and opt-in: forecast_pairs has five delete
+        # paths (multimodel rematerialization on every scoring run among
+        # them), so its rowid watermark is not a valid row-count estimate,
+        # and this route is a five-minutely coordinator-polled core slice
+        # that must not carry the cost of an exact count on every poll.
+        if counts == "exact":
+            status["forecast_samples_rows"] = int(
+                conn.execute(FORECAST_SAMPLES_COUNT_SQL).fetchone()["n"]
+            )
+            status["forecast_pairs_rows"] = int(
+                conn.execute(FORECAST_PAIRS_COUNT_SQL).fetchone()["n"]
+            )
         return status
 
-    return await get_db().read(_read)
+    db = get_db()
+    result = await db.read(_read)
+    # Read after the await, never inside _read: this does no DB work and must
+    # not run under the read lock it is reporting on.
+    result["read_timing"] = db.read_timing_snapshot()
+    result["read_timing_since"] = db.read_timing_since
+    return result
 
 
 @router.get("/health/monitor")

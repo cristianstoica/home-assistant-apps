@@ -8,17 +8,47 @@ import logging
 import os
 import shutil
 import sqlite3
+import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
 from wxverify import config
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 _db_instance: Database | None = None
+
+# Any single read-lock wait, executor dispatch or query execution at or above
+# this is worth a log line: /sites, the fastest page, is ~100 ms end to end
+# INCLUDING transport, so 250 ms of DB work alone is already an outlier.
+SLOW_READ_MS = 250.0
+
+
+@dataclass
+class ReadTiming:
+    calls: int = 0
+    errors: int = 0
+    wait_ms: float = 0.0
+    dispatch_ms: float = 0.0
+    exec_ms: float = 0.0
+    max_wait_ms: float = 0.0
+    max_dispatch_ms: float = 0.0
+    max_exec_ms: float = 0.0
+
+
+def _read_label(fn: object) -> str:
+    label = getattr(fn, "__qualname__", None) or type(fn).__name__
+    code = getattr(fn, "__code__", None)
+    # Line number, not a counter: it separates every lambda pair that shares a
+    # qualname (each collides on a different line) into one label per callback
+    # DEFINITION rather than per call site, and takes the operator from a
+    # WARNING straight to the defining line.
+    return label if code is None else f"{label}:{code.co_firstlineno}"
 
 
 class Database:
@@ -35,6 +65,11 @@ class Database:
         # connection.
         self._write_lock = asyncio.Lock()
         self._read_lock = asyncio.Lock()
+        # Written only from the event-loop thread (see `read`'s `finally`),
+        # so it needs no lock of its own. Cumulative for the process lifetime
+        # of this Database instance; never reset.
+        self._read_stats: dict[str, ReadTiming] = {}
+        self._read_stats_since = isoformat_utc()
         self._open()
 
     def _open(self) -> None:
@@ -84,8 +119,129 @@ class Database:
             return await asyncio.to_thread(self._run_immediate, fn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        async with self._read_lock:
-            return await asyncio.to_thread(fn, self._read_conn)
+        label = _read_label(fn)
+        requested = time.perf_counter()
+        # None means "this phase was never reached": a read cancelled while
+        # still queued for the lock knows only its wait; a read that raises
+        # inside the thread knows its wait but not its exec time.
+        acquired: float | None = None
+        started: float | None = None
+        finished: float | None = None
+        try:
+            async with self._read_lock:
+                acquired = time.perf_counter()
+
+                # `started` is captured INSIDE the worker thread so executor
+                # dispatch delay is attributed separately from query cost —
+                # under a saturated thread pool the two are otherwise
+                # indistinguishable.
+                def _timed(conn: sqlite3.Connection) -> tuple[float, float, T]:
+                    started_at = time.perf_counter()
+                    result = fn(conn)
+                    return started_at, time.perf_counter(), result
+
+                started, finished, result = await asyncio.to_thread(
+                    _timed, self._read_conn
+                )
+            return result
+        finally:
+            # The `finally` wraps the `async with`, so on BOTH paths the lock
+            # is already released when this runs: bookkeeping must never
+            # extend the hold it is measuring. This runs on the event-loop
+            # thread, which is single-threaded, so `_read_stats` needs no
+            # lock of its own.
+            self._record_read(label, requested, acquired, started, finished)
+
+    def _record_read(
+        self,
+        label: str,
+        requested: float,
+        acquired: float | None,
+        started: float | None,
+        finished: float | None,
+    ) -> None:
+        # A read cancelled while still queued for the lock never sets
+        # `acquired`, so its wait is unknowable exactly; `now` stands in for
+        # it, making `wait_ms` a lower bound rather than missing entirely.
+        wait_end = acquired if acquired is not None else time.perf_counter()
+        wait_ms = (wait_end - requested) * 1000
+        dispatch_ms = (
+            None if acquired is None or started is None else (started - acquired) * 1000
+        )
+        exec_ms = (
+            None if started is None or finished is None else (finished - started) * 1000
+        )
+        failed = finished is None
+
+        timing = self._read_stats.setdefault(label, ReadTiming())
+        timing.calls += 1
+        if failed:
+            timing.errors += 1
+        timing.wait_ms += wait_ms
+        timing.max_wait_ms = max(timing.max_wait_ms, wait_ms)
+        if dispatch_ms is not None:
+            timing.dispatch_ms += dispatch_ms
+            timing.max_dispatch_ms = max(timing.max_dispatch_ms, dispatch_ms)
+        if exec_ms is not None:
+            timing.exec_ms += exec_ms
+            timing.max_exec_ms = max(timing.max_exec_ms, exec_ms)
+
+        if failed:
+            logger.warning(
+                "db read failed or cancelled %s wait=%.0fms dispatch=%s exec=%s",
+                label,
+                wait_ms,
+                "---" if dispatch_ms is None else f"{dispatch_ms:.0f}ms",
+                "---" if exec_ms is None else f"{exec_ms:.0f}ms",
+            )
+        elif (
+            wait_ms >= SLOW_READ_MS
+            or (dispatch_ms or 0) >= SLOW_READ_MS
+            or (exec_ms or 0) >= SLOW_READ_MS
+        ):
+            logger.warning(
+                "slow db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                label,
+                wait_ms,
+                dispatch_ms or 0,
+                exec_ms or 0,
+            )
+        else:
+            logger.debug(
+                "db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                label,
+                wait_ms,
+                dispatch_ms or 0,
+                exec_ms or 0,
+            )
+
+    def read_timing_snapshot(self) -> dict[str, dict[str, float]]:
+        """Cumulative per-label read timing, since ``self.read_timing_since``.
+
+        Counters never reset for the life of this ``Database`` instance —
+        there is no reset endpoint. ``calls`` counts attempts, not successes;
+        ``errors`` counts the attempts that never produced an ``exec_ms``
+        (raised or were cancelled). A label whose ``errors`` tracks its
+        ``calls`` is a read that is failing or being cancelled, not one that
+        is slow.
+        """
+        return {
+            label: {
+                "calls": timing.calls,
+                "errors": timing.errors,
+                "wait_ms": timing.wait_ms,
+                "dispatch_ms": timing.dispatch_ms,
+                "exec_ms": timing.exec_ms,
+                "max_wait_ms": timing.max_wait_ms,
+                "max_dispatch_ms": timing.max_dispatch_ms,
+                "max_exec_ms": timing.max_exec_ms,
+            }
+            for label, timing in self._read_stats.items()
+        }
+
+    @property
+    def read_timing_since(self) -> str:
+        return self._read_stats_since
 
     def write_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return self._run_immediate(fn)
