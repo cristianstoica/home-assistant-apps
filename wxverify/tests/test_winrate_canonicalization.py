@@ -305,6 +305,115 @@ def test_winrate_matches_reference_for_reissues_ties_and_sparse_cells() -> None:
     assert by_feed[fc]["win_rate"] is None
 
 
+def test_winrate_matches_reference_for_near_tie_and_differing_denominators() -> None:
+    """Two corrections to the naive "just add a 3-way tie" reading:
+
+    (1) A bare 3-way near-tie whose three credits (1/3 each) are summed
+    within ONE group proves nothing about ORDER BY: three equal fractional
+    credits sum to exactly the same float in every summation order, so it is
+    just as order-insensitive as the pre-existing 2-way exact tie. It DOES
+    still pin something else worth pinning: the 1e-9 tolerance predicate
+    itself (winrate.py:108). f0/f1/f2 below are constructed to be close but
+    NOT bit-identical -- an implementation using exact `==` instead of
+    `abs(diff) <= 1e-9` would credit only f0 (the strict min) instead of
+    splitting 1/3 to each.
+
+    (2) What actually detects the `ORDER BY c.valid_at, c.feed_id` this
+    module documents as "Load-bearing, not cosmetic": one feed (f0)
+    accumulating credit from three DIFFERENT-sized tie groups (3-way, 7-way,
+    2-way, in that chronological order) across three valid_at slots. 1/3,
+    1/7 and 1/2 have no common representation short of the full sum, so
+    float addition of these three specific values is order-dependent --
+    verified separately that summing them in (1/3, 1/7, 1/2) order and in
+    the fully-reversed (1/2, 1/7, 1/3) order differ in the last bit (the
+    naive "reverse the tie sizes" pairing of 1/3, 1/2, 1/7 does NOT
+    discriminate under reversal -- this specific assignment of tie-width to
+    valid_at slot was chosen because it does). Groups are summed into `wins`
+    in the order winrate() visits them, which is the row order the SQL
+    returns -- so a build that reorders or drops the ORDER BY can make f0's
+    total sum in a different order and come out bit-different from
+    `_winrate_reference`, which always visits groups in (valid_at, feed_id)
+    order by construction.
+    """
+    conn = _fresh_conn()
+    site_id = _insert_site(conn, "WinrateEqNearTieDenoms")
+    f0, f1, f2, f3, f4, f5, f6 = _eligible_feed_ids(conn, 7)
+
+    # V1 (2026-02-01): a THREE-WAY near-tie, credit 1/3 each. Not
+    # bit-identical (spaced 3e-10 apart), but within the 1e-9 tolerance.
+    _add_pair(
+        conn,
+        site_id=site_id,
+        feed_id=f0,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-02-01T00:00:00Z",
+        abs_error=10.0,
+    )
+    _add_pair(
+        conn,
+        site_id=site_id,
+        feed_id=f1,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-02-01T00:00:00Z",
+        abs_error=10.0 + 3e-10,
+    )
+    _add_pair(
+        conn,
+        site_id=site_id,
+        feed_id=f2,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-02-01T00:00:00Z",
+        abs_error=10.0 + 6e-10,
+    )
+
+    # V2 (2026-03-01): an exact SEVEN-WAY tie, credit 1/7 each.
+    for feed_id in (f0, f1, f2, f3, f4, f5, f6):
+        _add_pair(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-03-01T00:00:00Z",
+            abs_error=2.0,
+        )
+
+    # V3 (2026-04-01): an exact TWO-WAY tie, credit 1/2 each.
+    _add_pair(
+        conn,
+        site_id=site_id,
+        feed_id=f0,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-04-01T00:00:00Z",
+        abs_error=1.0,
+    )
+    _add_pair(
+        conn,
+        site_id=site_id,
+        feed_id=f3,
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-04-01T00:00:00Z",
+        abs_error=1.0,
+    )
+
+    actual = winrate(
+        conn, site_id=site_id, variable="temperature", day_ahead=1, window="all"
+    )
+    expected = _winrate_reference(
+        conn, site_id=site_id, variable="temperature", day_ahead=1, window="all"
+    )
+    assert actual == expected
+
+    by_feed = {row["feed_id"]: row for row in actual}
+    # f0 collects all three credits, in valid_at order: 1/3 + 1/7 + 1/2.
+    assert by_feed[f0]["wins"] == (1.0 / 3.0 + 1.0 / 7.0 + 1.0 / 2.0)
+    # f1 and f2 share f0's V1 near-tie credit despite not being
+    # bit-identical to it, plus their V2 share.
+    assert by_feed[f1]["wins"] == 1.0 / 3.0 + 1.0 / 7.0
+    assert by_feed[f2]["wins"] == 1.0 / 3.0 + 1.0 / 7.0
+    # f3 shares f0's V3 credit plus its V2 share.
+    assert by_feed[f3]["wins"] == 1.0 / 7.0 + 1.0 / 2.0
+
+
 def test_winrate_matches_reference_for_meteoblue_member_eligibility() -> None:
     conn = _fresh_conn()
     site_id = _insert_site(conn, "WinrateEqMeteoblue")

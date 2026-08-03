@@ -355,13 +355,22 @@ def sample_rollup_sql(placeholders: str) -> str:
     `GROUP_CONCAT(DISTINCT x, sep)` outright (DISTINCT aggregates take exactly
     one argument). `json_group_array` escapes the delimiter by construction
     and returns '[]', not NULL, for an empty partition.
+
+    DB-import validator only checks integrity/user_version/table presence,
+    not storage classes, so a restored database can legitimately contain a
+    BLOB in this column. `json_group_array` raises on BLOB values, which
+    would 500 the whole provider-health route over one bad row, so any BLOB
+    is hex-quoted via `quote()` before being folded into the array -- lossy
+    to human readability but lossless and reversible, which is all that
+    matters for a value that was already an invalid stored state.
     """
     return f"""
         SELECT COUNT(*) AS sample_count,
                MAX(issued_at) AS latest_issued_at,
                MIN(valid_at) AS valid_from,
                MAX(valid_at) AS valid_to,
-               json_group_array(DISTINCT variable) AS variables
+               json_group_array(DISTINCT CASE WHEN typeof(variable)='blob'
+                   THEN quote(variable) ELSE variable END) AS variables
         FROM forecast_samples
         WHERE site_id=? AND feed_id IN ({placeholders})
         """
