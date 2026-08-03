@@ -4,13 +4,27 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import timedelta
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.queue import enqueue_if_absent_with_cooldown
 from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
+
+# Metered external provider calls on a machine-driven path: nobody is
+# waiting, so a false-suppress costs ~nothing while a false-permit burns
+# quota. One hour keeps the suppression inside the default 180-minute obs
+# cadence and only bites the shorter-interval fetch_feed/fetch_current_obs
+# paths, and only after several consecutive failures -- a strong signal the
+# endpoint is genuinely down, not a blip. This does not fully close the
+# quota-exhaustion risk for a provider with a small daily budget and a short
+# poll interval: it delays exhaustion, it does not prevent it. Closing that
+# residual needs a longer retry ladder inside each failure episode
+# (max_retries is tuned for a transient blip, not a dead provider) -- a
+# separate change, recorded here rather than silently absorbed into this one.
+_DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
@@ -49,12 +63,13 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
                 int(row["site_id"]),
                 int(row["feed_id"]),
             )
-            enqueue_if_absent(
+            enqueue_if_absent_with_cooldown(
                 conn,
                 "fetch_feed",
                 int(row["site_id"]),
                 f"fetch:{int(row['feed_id'])}",
                 {"feed_id": int(row["feed_id"])},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
             )
 
 
@@ -77,7 +92,14 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
         last = row["last_obs_at"]
         if last is None:
             logger.debug("scheduler due obs site=%s", int(row["id"]))
-            enqueue_if_absent(conn, "fetch_obs", int(row["id"]), "obs", {})
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "fetch_obs",
+                int(row["id"]),
+                "obs",
+                {},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
             continue
         last_dt = parse_utc(str(last))
         cycle_bucket = int(last_dt.timestamp() // (interval * 60))
@@ -85,7 +107,14 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
         elapsed = (now - last_dt).total_seconds() / 60
         if elapsed >= interval + jitter:
             logger.debug("scheduler due obs site=%s", int(row["id"]))
-            enqueue_if_absent(conn, "fetch_obs", int(row["id"]), "obs", {})
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "fetch_obs",
+                int(row["id"]),
+                "obs",
+                {},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
 
 
 def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
@@ -107,10 +136,11 @@ def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
             int(row["site_id"]),
             station_id,
         )
-        enqueue_if_absent(
+        enqueue_if_absent_with_cooldown(
             conn,
             "fetch_current_obs",
             int(row["site_id"]),
             f"curobs:{station_id}",
             {"station_id": station_id},
+            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
         )

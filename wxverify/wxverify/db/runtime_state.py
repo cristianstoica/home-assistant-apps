@@ -8,6 +8,7 @@ RUNTIME_STATE_KEYS = (
     "worker_started_at",
     "worker_last_loop_at",
     "scheduler_last_tick_at",
+    "import_rebuild_done_at",
 )
 
 
@@ -39,13 +40,10 @@ def set_runtime_state_now(conn: sqlite3.Connection, key: str) -> None:
 
 def runtime_status(conn: sqlite3.Connection) -> dict[str, str | None]:
     values: dict[str, str | None] = {key: None for key in RUNTIME_STATE_KEYS}
+    placeholders = ", ".join("?" for _ in RUNTIME_STATE_KEYS)
     rows = conn.execute(
-        """
-        SELECT key, value
-        FROM runtime_state
-        WHERE key IN ('worker_started_at', 'worker_last_loop_at',
-                      'scheduler_last_tick_at')
-        """
+        f"SELECT key, value FROM runtime_state WHERE key IN ({placeholders})",
+        RUNTIME_STATE_KEYS,
     ).fetchall()
     for row in rows:
         values[str(row["key"])] = str(row["value"])

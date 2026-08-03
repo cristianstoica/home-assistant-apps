@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.9.2
+
+### Fixed
+
+- A `jobs` row that could not be read back — a corrupt JSON payload, a
+  payload that parsed but was not a JSON object, or a BLOB stored in
+  `retry_count`/`max_retries` — was previously raised straight out of the
+  claim path with nothing to catch it, stopping the worker process. Such a
+  row is now dispositioned to `failed` in the same transaction as the claim,
+  so an unreadable row costs one job instead of the worker.
+- A job that keeps failing was re-enqueued on every scheduler tick, and a
+  failing scoring rescore was re-enqueued on every subsequent read of a
+  stale cache. Scheduled fetch jobs (feed, observation, and
+  current-observation polling) and post-read rescores now back off for a
+  cooldown after a terminal failure — one hour for scheduled fetches,
+  fifteen minutes for rescore — before being enqueued again automatically.
+  Operator-triggered retries (Ops → retry, backfill, and the CLI) are
+  unchanged: those still enqueue immediately, so a manual retry is never
+  silently dropped by a stale cooldown.
+- Polling a current-observation station reserved a Weather.com API call
+  before the request was made but never refunded it on a connection
+  failure, even when the request never reached the provider. The
+  reservation is now refunded for that case. A malformed body on an
+  otherwise successful response could also escape the poller's failure
+  handling before the usual retry floor was recorded, allowing an immediate
+  re-poll of a station that had just failed; it now follows the same
+  delayed-retry path as a transport failure.
+- Importing a database whose `variable` column holds a BLOB instead of text
+  — a state `PRAGMA integrity_check` does not catch, since SQLite's type
+  affinity lets a BLOB survive an insert into a TEXT column — is now
+  rejected. Import validation also now runs a foreign-key check and rejects
+  an upload that fails it.
+- `/api/worker/status` now reports `import_rebuild_done_at`, the timestamp
+  of the last post-import rebuild. The value has been recorded since import
+  rebuilds were added, but the status endpoint's query listed the reported
+  keys by name and never included it.
+
 ## 0.9.1
 
 ### Fixed

@@ -220,6 +220,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
         CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
             ON jobs(type, COALESCE(site_id, -1), job_key)
             WHERE status IN ('pending','running') AND job_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+            ON jobs(type, job_key, site_id, id);
 
         CREATE TABLE IF NOT EXISTS station_poll_state (
             station_id INTEGER PRIMARY KEY REFERENCES stations(id) ON DELETE CASCADE,
@@ -526,6 +528,12 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
                 ON jobs(type, COALESCE(site_id, -1), job_key)
                 WHERE status IN ('pending','running') AND job_key IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+                ON jobs(type, job_key, site_id, id)
             """
         )
         # Seed a poll-state row per existing station with a staggered

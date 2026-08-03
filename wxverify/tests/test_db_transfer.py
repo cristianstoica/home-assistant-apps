@@ -1331,6 +1331,74 @@ def _sqlite_bytes_missing_required_table(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _sqlite_bytes_with_late_blob_variable(path: Path) -> bytes:
+    """A fully valid, migrated DB except station_observations.variable holds
+    a BLOB on the LAST of several rows -- pins that the typeof() scan checks
+    every row, not just the first (SQLite's type affinity lets a BLOB survive
+    an insert into a TEXT column unconverted, so this is a legitimate on-disk
+    state a corrupted or hand-edited restore could carry).
+    """
+    db = Database(str(path))
+    try:
+        site_id = _make_site(db._conn, "BlobSite")  # noqa: SLF001
+        station_id = int(
+            db._conn.execute(  # noqa: SLF001
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m)
+                VALUES (?, 'IBLOBSTATION1', 47.0, 25.0, 900.0)
+                """,
+                (site_id,),
+            ).lastrowid
+        )
+        for i in range(5):
+            db._conn.execute(  # noqa: SLF001
+                """
+                INSERT INTO station_observations
+                    (station_id, variable, valid_at, value, qc_flag)
+                VALUES (?, 'temperature', ?, 10.0, 'ok')
+                """,
+                (station_id, f"2026-01-01T{i:02d}:00:00Z"),
+            )
+        db._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO station_observations
+                (station_id, variable, valid_at, value, qc_flag)
+            VALUES (?, ?, '2026-01-01T05:00:00Z', 10.0, 'ok')
+            """,
+            (station_id, b"\x00\x01not-text"),
+        )
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+    finally:
+        db.close()
+    return path.read_bytes()
+
+
+def _sqlite_bytes_with_fk_violation(path: Path) -> bytes:
+    """A fully valid, migrated DB except one station_observations row points
+    at a station_id that does not exist -- PRAGMA foreign_key_check must
+    catch this independent of the writing connection's own
+    PRAGMA foreign_keys setting, which is why it is disabled here.
+    """
+    db = Database(str(path))
+    db.close()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute(
+            """
+            INSERT INTO station_observations
+                (station_id, variable, valid_at, value, qc_flag)
+            VALUES (999999, 'temperature', '2026-01-01T00:00:00Z', 10.0, 'ok')
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path.read_bytes()
+
+
 def _build_invalid_upload(tmp_path: Path, case: str) -> bytes:
     target = tmp_path / "invalid.db"
     if case == "random_bytes":
@@ -1341,11 +1409,23 @@ def _build_invalid_upload(tmp_path: Path, case: str) -> bytes:
         return _sqlite_bytes_with_user_version(target, TARGET_USER_VERSION + 1)
     if case == "missing_table":
         return _sqlite_bytes_missing_required_table(target)
+    if case == "late_blob_variable":
+        return _sqlite_bytes_with_late_blob_variable(target)
+    if case == "fk_violation":
+        return _sqlite_bytes_with_fk_violation(target)
     raise ValueError(case)
 
 
 @pytest.mark.parametrize(
-    "case", ["random_bytes", "version_zero", "version_too_new", "missing_table"]
+    "case",
+    [
+        "random_bytes",
+        "version_zero",
+        "version_too_new",
+        "missing_table",
+        "late_blob_variable",
+        "fk_violation",
+    ],
 )
 def test_import_rejects_invalid_upload_live_db_untouched(
     case: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

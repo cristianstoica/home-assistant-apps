@@ -655,6 +655,91 @@ def test_queue_dedupe_and_stale_reclaim(tmp_path: Path) -> None:
     complete(conn, reclaimed.id)
 
 
+def test_claim_next_job_dispositions_unreadable_row_instead_of_returning_it(
+    tmp_path: Path,
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    site_id = conn.execute(
+        """
+        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
+        VALUES ('Q', 47, 25, 900, 'UTC')
+        """
+    ).lastrowid
+    bad_id = int(
+        conn.execute(
+            """
+            INSERT INTO jobs (type, site_id, job_key, payload, status)
+            VALUES ('fetch_feed', ?, 'fetch:bad', 'not json', 'pending')
+            """,
+            (site_id,),
+        ).lastrowid
+    )
+    good = enqueue_if_absent(conn, "fetch_feed", site_id, "fetch:good", {"feed_id": 1})
+    assert good.created is True
+
+    # The bad row sorts first (ORDER BY created_at, id); claim_next_job claims
+    # and dispositions exactly one row per call, so the first call consumes
+    # the bad row and returns None rather than falling through to the good one.
+    assert claim_next_job(conn) is None, (
+        "unreadable row must not be handed to the worker"
+    )
+
+    row = conn.execute(
+        "SELECT status, last_error FROM jobs WHERE id = ?", (bad_id,)
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["last_error"] == "unreadable job row"
+
+    claimed = claim_next_job(conn)
+    assert claimed is not None
+    assert claimed.id == good.job_id, "the next claim call must reach the good job"
+    complete(conn, claimed.id)
+
+    assert claim_next_job(conn) is None, (
+        "the disposed row is terminal ('failed'), not 'pending' -- it must"
+        " never be re-claimed"
+    )
+
+
+def test_claim_next_job_dispositions_blob_retry_count_instead_of_returning_it(
+    tmp_path: Path,
+) -> None:
+    """A BLOB in retry_count is a distinct failure class from a malformed
+    payload: int(row["retry_count"]) raises ValueError, not JSONDecodeError
+    or TypeError. INTEGER affinity does not coerce a BLOB, so this is a
+    legitimate on-disk state. This pins that the except tuple in
+    claim_next_job actually covers ValueError -- narrowing it back to
+    (JSONDecodeError, TypeError) would let this row escape disposition and
+    be handed to the worker instead.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = conn.execute(
+        """
+        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
+        VALUES ('Q', 47, 25, 900, 'UTC')
+        """
+    ).lastrowid
+    bad_id = int(
+        conn.execute(
+            """
+            INSERT INTO jobs (type, site_id, job_key, payload, status, retry_count)
+            VALUES ('fetch_feed', ?, 'fetch:blob-retry', '{}', 'pending', ?)
+            """,
+            (site_id, b"\x00\x01"),
+        ).lastrowid
+    )
+
+    assert claim_next_job(conn) is None, (
+        "a BLOB in retry_count must not be handed to the worker"
+    )
+
+    row = conn.execute(
+        "SELECT status, last_error FROM jobs WHERE id = ?", (bad_id,)
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert row["last_error"] == "unreadable job row"
+
+
 def test_pws_parser_and_fetch_obs_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4060,6 +4145,65 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
         assert "catchup" not in job_types
         assert "backfill_site" not in job_types
         assert "pair_and_score" in job_types
+
+
+def test_operator_backfill_retry_ignores_recent_terminal_failure_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POST /api/sites/<id>/backfill must never be suppressed by a cooldown.
+
+    _enqueue_due_feeds/_enqueue_due_obs/_enqueue_due_current_obs opt into
+    enqueue_if_absent_with_cooldown for scheduler-driven retries; an
+    operator-initiated retry through this route must keep using
+    enqueue_if_absent directly, so a job that failed seconds ago can still
+    be retried on demand instead of silently dropping the click.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "operator-retry.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> int:
+            site_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO sites
+                        (name, forecast_lat, forecast_lon, elevation_m, timezone)
+                    VALUES ('OperatorRetry', 47.0, 25.0, 900.0, 'UTC')
+                    """
+                ).lastrowid
+            )
+            conn.execute(
+                """
+                INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+                VALUES ('backfill_site', ?, ?, '{}', 'failed', ?)
+                """,
+                (site_id, f"backfill:{site_id}", isoformat_utc()),
+            )
+            return site_id
+
+        site_id = db.write_sync(_seed)
+        csrf = client.get("/api/csrf").json()["csrf_token"]
+        headers = {"Origin": "http://testserver", "X-CSRF-Token": csrf}
+
+        resp = client.post(f"/api/sites/{site_id}/backfill", headers=headers)
+        assert resp.status_code == 200
+        assert resp.json()["created"] is True
+
+        rows = db.read_sync(
+            lambda conn: conn.execute(
+                "SELECT status FROM jobs WHERE type='backfill_site' AND site_id=?",
+                (site_id,),
+            ).fetchall()
+        )
+        statuses = sorted(str(row["status"]) for row in rows)
+        assert statuses == ["failed", "pending"], (
+            "the seconds-old failure must not block the operator's new job"
+        )
 
 
 def test_csrf_garbage_token_rejects(

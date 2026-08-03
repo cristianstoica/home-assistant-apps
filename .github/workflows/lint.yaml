@@ -150,7 +150,7 @@ jobs:
           python-version: "3.13"
 
       - name: Install uv
-        run: pip install uv
+        run: pip install --no-cache-dir uv==0.9.17
 
       - name: Check lockfile is fresh
         run: uv lock --check

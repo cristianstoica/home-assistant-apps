@@ -20,6 +20,7 @@ from wxverify.api.routes.health import (
     FORECAST_SAMPLES_COUNT_SQL,
 )
 from wxverify.db.migrations import run_migrations
+from wxverify.db.queue import ACTIVE_JOB_SQL, LATEST_JOB_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
     model_run_count_sql,
@@ -298,3 +299,62 @@ def test_worker_status_count_statements_stay_index_only_scans() -> None:
         "SCAN forecast_pairs_noidx" in line and "USING COVERING INDEX" not in line
         for line in degraded_pairs_plan
     ), degraded_pairs_plan
+
+
+def _seed_jobs_across_two_sites(conn: sqlite3.Connection, *, rows: int) -> int:
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanJobsA', 47, 25, 900, 'UTC')"
+        ).lastrowid
+    )
+    other_site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanJobsB', 48, 26, 900, 'UTC')"
+        ).lastrowid
+    )
+    base = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    for i in range(rows):
+        ts = (base + datetime.timedelta(minutes=i)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+            " created_at, updated_at, next_attempt_at)"
+            " VALUES ('fetch_obs', ?, 'obs', '{}', 'failed', ?, ?, NULL)",
+            (site_id if i % 2 == 0 else other_site_id, ts, ts),
+        )
+    conn.execute("ANALYZE")
+    return site_id
+
+
+def test_cooldown_job_lookups_seek_idx_jobs_type_key_site() -> None:
+    conn = _fresh_conn()
+    site_id = _seed_jobs_across_two_sites(conn, rows=50)
+    params = ("fetch_obs", "obs", site_id)
+
+    active_plan = _plan(conn, ACTIVE_JOB_SQL, params)
+    assert any(
+        "SEARCH jobs USING INDEX idx_jobs_type_key_site"
+        " (type=? AND job_key=? AND site_id=?)" in line
+        for line in active_plan
+    )
+    # No separate sort step: id is the index's trailing column and already
+    # ascending, so walking it backwards satisfies ORDER BY id DESC LIMIT 1.
+    latest_plan = _plan(conn, LATEST_JOB_SQL, params)
+    assert any(
+        "SEARCH jobs USING INDEX idx_jobs_type_key_site"
+        " (type=? AND job_key=? AND site_id=?)" in line
+        for line in latest_plan
+    )
+    assert not any("TEMP B-TREE" in line for line in latest_plan)
+
+    # Negative control: without idx_jobs_type_key_site, the active-probe
+    # falls back to a type-only partial-index seek (idx_jobs_active_dedupe
+    # can't bind site_id/job_key, per its COALESCE(site_id,-1) expression
+    # shape) and the latest-row lookup degrades to a full table scan --
+    # exactly the unindexed-scan regression this index exists to prevent.
+    conn.execute("DROP INDEX idx_jobs_type_key_site")
+    degraded_active_plan = _plan(conn, ACTIVE_JOB_SQL, params)
+    assert not any("idx_jobs_type_key_site" in line for line in degraded_active_plan)
+    degraded_latest_plan = _plan(conn, LATEST_JOB_SQL, params)
+    assert any("SCAN jobs" in line for line in degraded_latest_plan)
