@@ -113,7 +113,6 @@ def test_winrate_sql_seeks_idx_pairs_winrate_and_needs_no_extra_sort() -> None:
         " (site_id=? AND variable=? AND day_ahead=?)" in line
         for line in plan
     )
-    assert not any("LAST 2 TERMS OF ORDER BY" in line for line in plan)
 
     conn.execute("DROP INDEX idx_pairs_winrate")
     degraded_plan = _plan(conn, sql, params)
@@ -121,7 +120,19 @@ def test_winrate_sql_seeks_idx_pairs_winrate_and_needs_no_extra_sort() -> None:
         "SEARCH fp USING COVERING INDEX idx_pairs_winrate" in line
         for line in degraded_plan
     )
-    assert any("LAST 2 TERMS OF ORDER BY" in line for line in degraded_plan)
+
+    # idx_pairs_winrate's column order (site_id, variable, day_ahead, feed_id,
+    # valid_at, issued_at DESC) matches the window function's PARTITION BY
+    # fp.feed_id, fp.valid_at ORDER BY fp.issued_at DESC exactly, so seeking
+    # it needs no extra sort step to compute the window. Without it, some
+    # sort step is required to make up the missing ordering. The precise EQP
+    # wording for that ("...LAST N TERMS OF ORDER BY" vs a plain "...ORDER
+    # BY") is a SQLite-build-specific optimizer detail, not a stable
+    # contract, but the number of "TEMP B-TREE" sort steps the plan needs is:
+    # dropping the index must make the plan need strictly more of them.
+    sort_steps = sum("TEMP B-TREE" in line for line in plan)
+    degraded_sort_steps = sum("TEMP B-TREE" in line for line in degraded_plan)
+    assert degraded_sort_steps > sort_steps, (plan, degraded_plan)
 
 
 def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
