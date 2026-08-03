@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.1
+
+### Fixed
+
+- The provider-health API and the ops dashboard's provider panel returned a
+  server error whenever any stored forecast sample had a non-text variable
+  name. A restored database can legitimately carry such a row, since the
+  import validator checks integrity and table presence but not storage
+  classes, and a single one of these values broke the entire request. Those
+  values are now rendered in a hex-quoted form instead of failing the whole
+  response.
+
 ## 0.9.0
 
 ### Added
@@ -19,10 +31,10 @@
 - Provider health collects per-feed sample metrics in three index-covered
   statements instead of one query per feed, removing a long read-lock hold that
   delayed other API reads.
-- Win-rate scoring now selects the latest forecast per feed and valid time in
-  SQL instead of fetching every reissue and reducing in Python, and resolves the
-  active-feed set once per query instead of once per row. Roughly a 2x
-  reduction in win-rate query time on a 444k-row database.
+- Win-rate scoring now selects the latest forecast per feed and valid time in SQL instead of
+  fetching every reissue and reducing in Python, and resolves the active-feed set once per query
+  instead of once per row. Locally measured 1.6–2.2x faster depending on forecast lead time, ~2x for
+  the common case, on a 444k-row database.
 - New indexes are built on first start after this update, which adds a few
   seconds to that one startup and roughly 48 MB of database size at 444k
   forecast pairs.

@@ -10,6 +10,7 @@ it.
 
 from __future__ import annotations
 
+import datetime
 import sqlite3
 
 import pytest
@@ -46,10 +47,70 @@ def _plan(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> lis
     ]
 
 
+def _seed_meteoblue_package_with_16_members(
+    conn: sqlite3.Connection, *, site_id: int, rows_per_feed: int
+) -> tuple[int, ...]:
+    """Seed the meteoblue package feed plus 16 hand-inserted member feeds
+    (17 keys total -- the real production `feed_id IN (...)` list width,
+    per §2.7/§10.4), with rows and a following ANALYZE so the planner has
+    real statistics to work from rather than an empty, ANALYZE-free table.
+    """
+    package_row = conn.execute(
+        "SELECT id FROM feeds WHERE source='meteoblue' AND model='multimodel'"
+    ).fetchone()
+    assert package_row is not None
+    feed_ids = [int(package_row["id"])]
+    for i in range(16):
+        member_id = int(
+            conn.execute(
+                "INSERT INTO feeds (source, model, fetch_interval_minutes)"
+                " VALUES ('meteoblue', ?, 360)",
+                (f"member-{i}",),
+            ).lastrowid
+        )
+        feed_ids.append(member_id)
+
+    base = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    rows = [
+        (
+            site_id,
+            feed_id,
+            (base + datetime.timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        for feed_id in feed_ids
+        for hour in range(rows_per_feed)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO forecast_samples
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             value, source_raw, model_run_id)
+        VALUES (?, ?, 'temperature', ?, ?, 24, 10.0, '{}', 'run-1')
+        """,
+        [(site_id, feed_id, ts, ts) for site_id, feed_id, ts in rows],
+    )
+    conn.execute("ANALYZE")
+    return tuple(feed_ids)
+
+
 def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
     conn = _fresh_conn()
-    sql = sample_rollup_sql("?")
-    plan = _plan(conn, sql, (1, 1))
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanRollup', 47, 25, 900, 'UTC')"
+        ).lastrowid
+    )
+    # 17-key meteoblue IN list, per §2.7: "Run each EQP with the 17-key
+    # meteoblue IN list, not a single-key feed." Rows + ANALYZE so the
+    # planner sees real cardinality rather than an empty table.
+    feed_ids = _seed_meteoblue_package_with_16_members(
+        conn, site_id=site_id, rows_per_feed=200
+    )
+    placeholders = ", ".join("?" for _ in feed_ids)
+    params = (site_id, *feed_ids)
+    sql = sample_rollup_sql(placeholders)
+    plan = _plan(conn, sql, params)
     assert any(
         "SEARCH forecast_samples USING COVERING INDEX"
         " sqlite_autoindex_forecast_samples_1 (site_id=? AND feed_id=?)" in line
@@ -60,7 +121,7 @@ def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
     # site_id, proving the positive assertion is not trivially true here.
     degraded = sql.replace("WHERE site_id=?", "WHERE (site_id=? OR 1=1)")
     assert degraded != sql, "WHERE site_id=? not found; negative control is vacuous"
-    degraded_plan = _plan(conn, degraded, (1, 1))
+    degraded_plan = _plan(conn, degraded, params)
     assert not any(
         "SEARCH forecast_samples USING COVERING INDEX"
         " sqlite_autoindex_forecast_samples_1 (site_id=? AND feed_id=?)" in line
@@ -70,37 +131,71 @@ def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
 
 def test_model_run_count_sql_requires_idx_samples_runs() -> None:
     conn = _fresh_conn()
-    sql = model_run_count_sql("?")
-    plan = _plan(conn, sql, (1, 1))
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanRuns', 47, 25, 900, 'UTC')"
+        ).lastrowid
+    )
+    feed_ids = _seed_meteoblue_package_with_16_members(
+        conn, site_id=site_id, rows_per_feed=200
+    )
+    placeholders = ", ".join("?" for _ in feed_ids)
+    params = (site_id, *feed_ids)
+    sql = model_run_count_sql(placeholders)
+    plan = _plan(conn, sql, params)
     assert any(
         "SEARCH forecast_samples USING COVERING INDEX idx_samples_runs"
         " (site_id=? AND feed_id=?)" in line
         for line in plan
     )
 
-    # On this trivial, ANALYZE-free fixture the planner picks idx_samples_runs
-    # even without the INDEXED BY hint, so an EQP-text diff cannot show the
-    # hint is load-bearing. Dropping the index it names is a stronger proof:
-    # the statement, still carrying INDEXED BY, can no longer be satisfied at
-    # all.
+    # Measured at implementation time, with THIS 17-key/rows/ANALYZE
+    # fixture: stripping "INDEXED BY idx_samples_runs" does not change the
+    # chosen plan here -- the planner picks idx_samples_runs unprompted at
+    # this row count and key width, so an EQP-text diff has zero
+    # discriminating power for this statement on any fixture this suite can
+    # build (the architect measured the same on the 423k-row production
+    # snapshot; reproducing the divergence needs real production
+    # statistics this harness cannot synthesize). Recorded honestly rather
+    # than implied: dropping the index it names is the strictly stronger
+    # proof available -- the statement, still carrying INDEXED BY, can no
+    # longer be satisfied at all.
     conn.execute("DROP INDEX idx_samples_runs")
     with pytest.raises(sqlite3.OperationalError, match="no such index"):
-        conn.execute(sql, (1, 1)).fetchone()
+        conn.execute(sql, params).fetchone()
 
 
 def test_bad_sample_count_sql_requires_idx_samples_invalid() -> None:
     conn = _fresh_conn()
-    sql = bad_sample_count_sql("?")
-    plan = _plan(conn, sql, (1, 1))
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanBad', 47, 25, 900, 'UTC')"
+        ).lastrowid
+    )
+    feed_ids = _seed_meteoblue_package_with_16_members(
+        conn, site_id=site_id, rows_per_feed=200
+    )
+    placeholders = ", ".join("?" for _ in feed_ids)
+    params = (site_id, *feed_ids)
+    sql = bad_sample_count_sql(placeholders)
+    plan = _plan(conn, sql, params)
     assert any(
         "SEARCH forecast_samples USING INDEX idx_samples_invalid"
         " (site_id=? AND feed_id=?)" in line
         for line in plan
     )
 
+    # Same honest note as test_model_run_count_sql_requires_idx_samples_runs
+    # above: measured on this 17-key/rows/ANALYZE fixture, stripping
+    # "INDEXED BY idx_samples_invalid" does not move the plan away from
+    # idx_samples_invalid (it stays free at 0 matching rows regardless of
+    # the hint), so this fixture cannot reproduce the wrong-index selection
+    # §2.7 measured in production. DROP INDEX remains the available proof.
     conn.execute("DROP INDEX idx_samples_invalid")
     with pytest.raises(sqlite3.OperationalError, match="no such index"):
-        conn.execute(sql, (1, 1)).fetchone()
+        conn.execute(sql, params).fetchone()
 
 
 def test_winrate_sql_seeks_idx_pairs_winrate_and_needs_no_extra_sort() -> None:
@@ -168,3 +263,38 @@ def test_worker_status_count_statements_stay_index_only_scans() -> None:
     assert any(
         "SCAN forecast_pairs USING COVERING INDEX" in line for line in pairs_plan
     )
+
+    # Negative control: the two statements above are plain, unqualified
+    # `SELECT COUNT(*) FROM <table>` text with no table name baked into a
+    # pin, so simply DROPping the named indexes on forecast_samples/
+    # forecast_pairs would not discriminate -- each table's UNIQUE
+    # constraint still leaves a sqlite_autoindex_* behind for the planner to
+    # cover with. Prove the assertion actually distinguishes "index-only"
+    # from "full scan" by running the identical SQL text against index-free
+    # replica tables (same column shape, no UNIQUE constraint, no CREATE
+    # INDEX): there, COUNT(*) has nothing to cover with and must fall back
+    # to a bare table scan.
+    conn.execute(
+        "CREATE TABLE forecast_samples_noidx (site_id INTEGER, feed_id INTEGER)"
+    )
+    conn.execute("CREATE TABLE forecast_pairs_noidx (site_id INTEGER, feed_id INTEGER)")
+    degraded_samples_plan = _plan(
+        conn,
+        FORECAST_SAMPLES_COUNT_SQL.replace(
+            "forecast_samples", "forecast_samples_noidx"
+        ),
+        (),
+    )
+    degraded_pairs_plan = _plan(
+        conn,
+        FORECAST_PAIRS_COUNT_SQL.replace("forecast_pairs", "forecast_pairs_noidx"),
+        (),
+    )
+    assert any(
+        "SCAN forecast_samples_noidx" in line and "USING COVERING INDEX" not in line
+        for line in degraded_samples_plan
+    ), degraded_samples_plan
+    assert any(
+        "SCAN forecast_pairs_noidx" in line and "USING COVERING INDEX" not in line
+        for line in degraded_pairs_plan
+    ), degraded_pairs_plan

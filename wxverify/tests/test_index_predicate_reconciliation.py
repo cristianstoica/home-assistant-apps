@@ -14,8 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from wxverify.collection.forecast_validation import FORECAST_VALUE_RANGES
-from wxverify.db.migrations import create_schema, run_migrations
+from wxverify.collection.forecast_validation import (
+    FORECAST_VALUE_RANGES,
+    invalid_forecast_sample_sql,
+)
+from wxverify.db.migrations import _index_predicate, create_schema, run_migrations
 from wxverify.provider_ops import bad_sample_count_sql
 
 
@@ -77,6 +80,27 @@ def test_stale_index_predicate_breaks_the_query_at_prepare_time_and_self_heals(
     # create_schema() is the reconciliation seam: it detects the predicate
     # mismatch, drops the stale index, and rebuilds it under the current bound.
     create_schema(conn)
+
+    # The rebuilt index's stored predicate must match what the current
+    # generator produces -- not merely "some index exists under this name"
+    # (a stale-but-different predicate could still let the query below run
+    # by coincidence if the newly-inserted row happened to fall outside the
+    # narrowed range too). This is the direct assertion for the reconciled
+    # predicate; the working-query check that follows is not redundant with
+    # it -- CREATE INDEX succeeding says nothing about whether INDEXED BY can
+    # actually be satisfied afterward.
+    stored_after = conn.execute(
+        "SELECT sql FROM sqlite_master"
+        " WHERE type='index' AND name='idx_samples_invalid'"
+    ).fetchone()
+    assert stored_after is not None
+    current_ddl = (
+        "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
+        "ON forecast_samples(site_id, feed_id) "
+        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+    )
+    assert _index_predicate(stored_after["sql"]) == _index_predicate(current_ddl)
+
     _insert_sample(conn, site_id=site_id, feed_id=feed_id, value=999.0)
     row = conn.execute(sql, (site_id, feed_id)).fetchone()
     assert int(row[0]) == 1
@@ -153,3 +177,27 @@ def test_reconciliation_rolls_back_a_fault_between_drop_and_create(
     create_schema(clean_conn)
     clean_conn.close()
     assert _stored_index_sql(db_path) != stale_sql
+
+
+def test_freshly_created_db_stores_the_current_generator_predicate(
+    tmp_path: Path,
+) -> None:
+    # A brand-new database never goes through the stale-predicate-vs-current
+    # comparison at all (there is no prior stored index to diff against) --
+    # this is a sanity check that _sync_invalid_sample_index's first-run
+    # CREATE branch stores the real generator output, not a hand-copied
+    # literal that could drift from invalid_forecast_sample_sql() over time.
+    db_path = tmp_path / "fresh.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    conn.close()
+
+    stored_sql = _stored_index_sql(db_path)
+    current_ddl = (
+        "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
+        "ON forecast_samples(site_id, feed_id) "
+        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+    )
+    assert _index_predicate(stored_sql) == _index_predicate(current_ddl)
