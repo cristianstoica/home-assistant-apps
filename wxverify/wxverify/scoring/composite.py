@@ -9,8 +9,7 @@ from datetime import timedelta
 from typing import Literal
 
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
-from wxverify.core.timeutil import parse_utc, utc_now
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.queue import enqueue_if_absent_with_cooldown
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import (
     MAX_DAY_AHEAD,
@@ -99,30 +98,14 @@ def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:
     outcome (not "any recent failed row") decides, so a later ``completed``
     job supersedes an older failure.
     """
-    row = conn.execute(
-        """
-        SELECT status, updated_at
-        FROM jobs
-        WHERE type = 'pair_and_score'
-          AND site_id = ?
-          AND job_key = 'score'
-        ORDER BY created_at DESC, id DESC
-        LIMIT 1
-        """,
-        (site_id,),
-    ).fetchone()
-    if row is not None and str(row["status"]) == "failed":
-        updated_at = parse_utc(str(row["updated_at"]))
-        if utc_now() - updated_at < _RESCORE_FAILURE_COOLDOWN:
-            logger.debug(
-                "rescore enqueue suppressed type=%s site=%s key=%s"
-                " (terminal failure within cooldown)",
-                "pair_and_score",
-                site_id,
-                "score",
-            )
-            return
-    enqueue_if_absent(conn, "pair_and_score", site_id, "score", {"site_id": site_id})
+    enqueue_if_absent_with_cooldown(
+        conn,
+        "pair_and_score",
+        site_id,
+        "score",
+        {"site_id": site_id},
+        cooldown=_RESCORE_FAILURE_COOLDOWN,
+    )
 
 
 def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:

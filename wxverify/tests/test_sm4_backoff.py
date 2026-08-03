@@ -17,6 +17,7 @@ pass when the other side is exercised.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -353,16 +354,17 @@ class TestTransportFailNoBackoff:
     """
 
     @pytest.mark.parametrize(
-        "exc_factory",
+        "exc_factory,refundable",
         [
-            lambda: httpx.TimeoutException("timeout"),
-            lambda: httpx.ConnectError("connection refused"),
+            (lambda: httpx.TimeoutException("timeout"), False),
+            (lambda: httpx.ConnectError("connection refused"), True),
         ],
         ids=["timeout", "connect-error"],
     )
     def test_transport_error_persists_transient_and_propagates(
         self,
         exc_factory: object,
+        refundable: bool,
     ) -> None:
         """Transport exceptions (timeout, connect-error) propagate and write TRANSIENT.
 
@@ -372,6 +374,10 @@ class TestTransportFailNoBackoff:
         3. station_poll_state.next_poll_at = now + MIN_INTERVAL_SECONDS (300 s floor).
         4. NO domain_backoffs row for api.weather.com.
         5. stations.* sentinel values are NOT touched.
+        6. The reserved budget call is refunded to net 0 for ConnectError (the
+           only refundable transport error here) and left consumed for a bare
+           TimeoutException, which is not in _REFUNDABLE_TRANSPORT_ERRORS --
+           both effects (persist AND refund) must land in the same write.
         """
         conn = _make_conn()
         site_id = _seed_site(conn)
@@ -443,4 +449,104 @@ class TestTransportFailNoBackoff:
         )
         assert st_after["last_run_at"] == st_before["last_run_at"], (
             "stations.last_run_at must not be modified on transport failure"
+        )
+
+        # 6. budget effect: refunded to net 0 for ConnectError, left consumed
+        # (net 1) for a bare TimeoutException -- exercises the SAME db.write
+        # as assertion 2/3, so this pins that persist and refund both landed.
+        budget = conn.execute(
+            "SELECT calls FROM api_budget WHERE source='weathercom'"
+        ).fetchone()
+        if refundable:
+            assert budget is None or int(budget["calls"]) == 0, (
+                "ConnectError must refund the reserved call back to net 0"
+            )
+        else:
+            assert budget is not None and int(budget["calls"]) == 1, (
+                "a non-refundable transport error must leave the call consumed"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Bucket-E2E-C: malformed 2xx JSON body → TRANSIENT persisted at the floor
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedJsonBodyEscapesToTransientFloor:
+    """A malformed 2xx body must not escape _fetch_current_obs uncaught.
+
+    Before the fix, classify_current_obs(response) was called AFTER the
+    try/except in _fetch_current_obs, so response.json() raising
+    JSONDecodeError on a malformed-but-non-empty 2xx body propagated straight
+    out of the function: no persist_poll_result call, next_poll_at left
+    untouched, and the job-level retry ladder (which never touches
+    station_poll_state) took over instead of the transient-floor path. The
+    fix moves the classify_current_obs call inside the try, so the
+    JSONDecodeError still propagates to the caller (same as before), but only
+    after the same TRANSIENT-persist write a transport error takes. This is
+    the same TRANSIENT + floor destination as a transport error, so it is the
+    paired sibling of TestTransportFailNoBackoff's connect-error case --
+    except the HTTP call itself succeeded, so the budget reservation must NOT
+    be refunded (is_refundable_transport_error only covers ConnectError /
+    ConnectTimeout; a JSONDecodeError never qualifies).
+    """
+
+    def test_malformed_json_persists_transient_at_floor_without_refund(self) -> None:
+        conn = _make_conn()
+        site_id = _seed_site(conn)
+        station_id = _seed_station(conn, site_id)
+        _seed_poll_state(conn, station_id)
+
+        assert _domain_backoff_row(conn, _WEATHER_COM_HOST) is None, (
+            "precondition: no domain_backoffs row must exist before the call"
+        )
+
+        malformed_response = httpx.Response(
+            status_code=200,
+            content=b"not json",
+            request=httpx.Request("GET", _WEATHER_COM_URL),
+        )
+        mock_fetch = AsyncMock(return_value=malformed_response)
+
+        with (
+            patch(_PATCH_TARGET, mock_fetch),
+            patch(
+                "wxverify.worker.processor.resolve_secret",
+                return_value="SYNTHETIC",
+            ),
+            _patched_now(_NOW),
+        ):
+            db = _RealDb(conn)
+            # response.json() raises JSONDecodeError; the except block still
+            # re-raises the original exception, but only after routing it
+            # through the same TRANSIENT-persist path a transport error takes.
+            with pytest.raises(json.JSONDecodeError):
+                asyncio.run(_fetch_current_obs(db, site_id, station_id))
+
+        mock_fetch.assert_called_once()
+
+        ps = _poll_state(conn, station_id)
+        assert ps is not None
+        assert ps["health_state"] == "transient", (
+            "a malformed 2xx body must land on the TRANSIENT path, not escape"
+            f" uncaught, got {ps['health_state']!r}"
+        )
+
+        expected_floor = _NOW + timedelta(seconds=MIN_INTERVAL_SECONDS)
+        expected_iso = expected_floor.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        assert ps["next_poll_at"] == expected_iso, (
+            f"next_poll_at must be the MIN_INTERVAL floor ({MIN_INTERVAL_SECONDS} s), "
+            f"got {ps['next_poll_at']!r}"
+        )
+
+        assert _domain_backoff_row(conn, _WEATHER_COM_HOST) is None, (
+            "no HTTP status warrants a domain backoff for a malformed body"
+        )
+
+        budget = conn.execute(
+            "SELECT calls FROM api_budget WHERE source='weathercom'"
+        ).fetchone()
+        assert budget is not None and int(budget["calls"]) == 1, (
+            "the HTTP call succeeded and reached the provider, so a"
+            " JSON-parse failure must NOT refund the reserved call"
         )

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import cast
 
-from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,12 @@ def _job_from_row(row: sqlite3.Row) -> Job:
     payload_raw = str(row["payload"])
     payload_obj: object = json.loads(payload_raw) if payload_raw else {}
     if not isinstance(payload_obj, dict):
-        payload_obj = {}
+        # Same "can't trust this payload" class as a JSON parse failure below:
+        # a syntactically valid but wrong-shaped payload must not silently run
+        # as {} (e.g. it would walk backfill_site straight into a window
+        # clamp that can skip days). Raise so claim_next_job's disposition
+        # catches it instead of substituting a default.
+        raise TypeError("job payload is not a JSON object")
     payload = cast(dict[str, object], payload_obj)
     return Job(
         id=int(row["id"]),
@@ -115,7 +120,74 @@ def enqueue_if_absent(
     return EnqueueResult(created=True, job_id=job_id)
 
 
+ACTIVE_JOB_SQL = """
+    SELECT 1 FROM jobs
+    WHERE type = ? AND job_key = ? AND site_id IS ?
+      AND status IN ('pending','running')
+    LIMIT 1
+"""
+
+LATEST_JOB_SQL = """
+    SELECT status, updated_at FROM jobs
+    WHERE type = ? AND job_key = ? AND site_id IS ?
+    ORDER BY id DESC
+    LIMIT 1
+"""
+
+
+def enqueue_if_absent_with_cooldown(
+    conn: sqlite3.Connection,
+    job_type: str,
+    site_id: int | None,
+    job_key: str,
+    payload: dict[str, object] | None,
+    *,
+    cooldown: timedelta,
+) -> EnqueueResult | None:
+    """Like ``enqueue_if_absent``, but suppressed while the latest job for
+    this (type, site_id, job_key) is a terminal failure inside ``cooldown``.
+
+    Opt-in wrapper for automatic/scheduled call sites only (scheduler due-job
+    checks, post-read rescore triggers) -- never call this from an
+    operator-initiated path (an API route or CLI command): a manual retry
+    must never be silently dropped by a stale cooldown. Those callers keep
+    using ``enqueue_if_absent`` directly.
+
+    The cooldown lookup (``LATEST_JOB_SQL``) only runs when no active row
+    already exists: on the dedupe-hit path (the common case) this early-out
+    skips just that query, not all extra work -- the wrapper's own
+    ``ACTIVE_JOB_SQL`` probe plus ``enqueue_if_absent``'s own dedupe select
+    still cost two index seeks. ``jobs(type, job_key, site_id, id)`` keeps
+    each of those seeks an index seek rather than a scan (``id`` is
+    monotonic, so ``ORDER BY id DESC LIMIT 1`` needs no separate sort step).
+    """
+    active = conn.execute(ACTIVE_JOB_SQL, (job_type, job_key, site_id)).fetchone()
+    if active is None:
+        latest = conn.execute(LATEST_JOB_SQL, (job_type, job_key, site_id)).fetchone()
+        if latest is not None and str(latest["status"]) == "failed":
+            updated_at = parse_utc(str(latest["updated_at"]))
+            if utc_now() - updated_at < cooldown:
+                logger.debug(
+                    "enqueue suppressed type=%s site=%s key=%s"
+                    " (terminal failure within cooldown)",
+                    job_type,
+                    site_id,
+                    job_key,
+                )
+                return None
+    return enqueue_if_absent(conn, job_type, site_id, job_key, payload)
+
+
 def claim_next_job(conn: sqlite3.Connection) -> Job | None:
+    """Claim and disposition exactly one pending row.
+
+    Design goal: no unreadable row may ever be re-claimed. An unreadable
+    ``jobs`` row (corrupt payload, or a BLOB surviving into a TEXT/INTEGER
+    column) must never be handed to the worker, since it would fail the same
+    way on every claim and drive the process into a restart loop rather than
+    a single failed job -- so the disposition happens here, not in the
+    dispatcher.
+    """
     now = isoformat_utc()
     row = conn.execute(
         """
@@ -132,7 +204,26 @@ def claim_next_job(conn: sqlite3.Connection) -> Job | None:
         """,
         (now, now),
     ).fetchone()
-    return None if row is None else _job_from_row(row)
+    if row is None:
+        return None
+    try:
+        return _job_from_row(row)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        # A row that can't be read back at all (corrupt payload, or a BLOB
+        # surviving an INTEGER-affinity column) is dispositioned here, in the
+        # same transaction as the claim; row["id"] stays safe to read even
+        # when every other column is corrupt, since id is a rowid alias and
+        # SQLite guarantees it's an integer. Never route this through
+        # fail() — fail() reads retry_count/max_retries from the same row we
+        # just declared unreadable, so corruption there could keep the row
+        # re-claimed forever instead of going terminal.
+        job_id = int(row["id"])
+        logger.error("unreadable job row id=%s; marking failed", job_id, exc_info=True)
+        conn.execute(
+            "UPDATE jobs SET status='failed', last_error=?, updated_at=? WHERE id=?",
+            ("unreadable job row", isoformat_utc(), job_id),
+        )
+        return None
 
 
 def complete(conn: sqlite3.Connection, job_id: int, result: str | None = None) -> None:

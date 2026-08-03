@@ -1403,6 +1403,59 @@ class TestEnqueueDueCurrentObs:
         assert job is not None
         assert job["job_key"] == f"curobs:{station_id}"
 
+    def test_recent_terminal_failure_suppresses_reenqueue(self) -> None:
+        """A 'failed' job updated within the cooldown blocks a new enqueue."""
+        from wxverify.core.timeutil import isoformat_utc, utc_now
+
+        conn, site_id, station_id = self._setup_db_with_station()
+        job_key = f"curobs:{station_id}"
+        recent_failure = isoformat_utc(utc_now() - timedelta(minutes=5))
+        conn.execute(
+            """
+            INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+            VALUES ('fetch_current_obs', ?, ?, '{}', 'failed', ?)
+            """,
+            (site_id, job_key, recent_failure),
+        )
+
+        with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
+            _enqueue_due_current_obs(conn)
+
+        count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
+            (site_id,),
+        ).fetchone()[0]
+        assert count == 1, (
+            "a terminal failure inside the cooldown must suppress re-enqueue"
+        )
+
+    def test_terminal_failure_past_cooldown_reenqueues(self) -> None:
+        """A 'failed' job updated outside the cooldown allows a new enqueue."""
+        from wxverify.core.timeutil import isoformat_utc, utc_now
+
+        conn, site_id, station_id = self._setup_db_with_station()
+        job_key = f"curobs:{station_id}"
+        stale_failure = isoformat_utc(utc_now() - timedelta(hours=2))
+        conn.execute(
+            """
+            INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+            VALUES ('fetch_current_obs', ?, ?, '{}', 'failed', ?)
+            """,
+            (site_id, job_key, stale_failure),
+        )
+
+        with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
+            _enqueue_due_current_obs(conn)
+
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM jobs"
+            " WHERE type='fetch_current_obs' AND site_id=? AND status='pending'",
+            (site_id,),
+        ).fetchone()[0]
+        assert pending == 1, (
+            "a terminal failure past the cooldown must allow re-enqueue"
+        )
+
 
 # ---------------------------------------------------------------------------
 # End-to-end ONLINE flow: classify → persist on a cold DB

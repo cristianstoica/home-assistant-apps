@@ -175,6 +175,7 @@ _BASE_WORKER_STATUS_KEYS = frozenset(
         "worker_started_at",
         "worker_last_loop_at",
         "scheduler_last_tick_at",
+        "import_rebuild_done_at",
         "last_completed_fetch_feed_at",
         "last_completed_fetch_obs_at",
         "last_completed_pair_and_score_at",
@@ -241,6 +242,48 @@ def test_worker_status_default_response_gains_read_timing_unconditionally(
     }
     assert isinstance(body["read_timing"], dict)
     assert isinstance(body["read_timing_since"], str)
+
+
+def test_worker_status_import_rebuild_done_at_present_and_none_before_any_import(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key is present-and-None before any import, not absent entirely."""
+    close_db()
+    config.db_path = str(tmp_path / "worker-status-rebuild-none.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        response = client.get("/api/worker/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert "import_rebuild_done_at" in body
+    assert body["import_rebuild_done_at"] is None
+
+
+def test_worker_status_import_rebuild_done_at_stamped_after_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once a rebuild has run, the key surfaces a timestamp, not None."""
+    from wxverify.db.runtime_state import set_runtime_state_now
+
+    close_db()
+    config.db_path = str(tmp_path / "worker-status-rebuild-stamped.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        db.write_sync(
+            lambda conn: set_runtime_state_now(conn, "import_rebuild_done_at")
+        )
+        response = client.get("/api/worker/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["import_rebuild_done_at"] is not None
+    assert isinstance(body["import_rebuild_done_at"], str)
 
 
 def test_worker_status_counts_exact_adds_the_two_row_counts(

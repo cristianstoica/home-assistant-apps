@@ -426,7 +426,9 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
     # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
     # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
     # design (plan §3).
-    await db.write(lambda conn: _reserve_current_obs_call(conn, site_id, station_id))
+    reservation = await db.write(
+        lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
+    )
 
     # Operator-configurable read timeout (plan §10); default 30s, floored at 1s to
     # match the config.yaml int(1,300) schema.
@@ -438,19 +440,26 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
         response = await fetch_current_observation(
             pws_station_id, api_key, timeout_seconds=timeout_seconds
         )
+        # Classifying inside the try, not after: a malformed 2xx body raises
+        # from classify_current_obs (response.json()), and that failure must
+        # land on the same transient-floor path as a transport error rather
+        # than escape uncaught to the job-level retry, which never touches
+        # station_poll_state.next_poll_at.
+        outcome = classify_current_obs(response)
     except Exception as exc:
-        # Transport-level failure (timeout / connect / read): transient, retry
-        # at the floor. Do not record a domain backoff (no HTTP status to key on).
+        # Transport-level failure (timeout / connect / read) or a malformed
+        # response body: transient, retry at the floor. Do not record a
+        # domain backoff (no reliable HTTP status to key on here).
         error = sanitized_exception(exc)
         transient = PollOutcome(Health.TRANSIENT, error=error)
+        refund = reservation if is_refundable_transport_error(exc) else None
         await db.write(
-            lambda conn, out=transient: persist_poll_result(
-                conn, site_id, station_id, out
+            lambda conn, out=transient, res=refund: _persist_poll_result_and_refund(
+                conn, site_id, station_id, out, res
             )
         )
         raise
 
-    outcome = classify_current_obs(response)
     status = response.status_code
 
     # 429 / >=500: record the shared domain backoff (single write with the
@@ -472,11 +481,13 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
 
 def _reserve_current_obs_call(
     conn: sqlite3.Connection, site_id: int, station_id: int
-) -> None:
+) -> Reservation:
     """Domain-backoff gate then budget reservation (mirrors _reserve_obs_call).
 
     Raises ``JobDeferred`` if the shared weather.com backoff is active or the
     daily budget is exhausted; ``JobCancelled`` if the station is gone/disabled.
+    Returns the ``Reservation`` so a refundable transport failure can refund it
+    (mirrors ``_fetch_obs``'s pattern; this call site previously discarded it).
     """
     row = conn.execute(
         """
@@ -490,7 +501,20 @@ def _reserve_current_obs_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
-    reserve_budget(conn, "weathercom", 1)
+    return reserve_budget(conn, "weathercom", 1)
+
+
+def _persist_poll_result_and_refund(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    outcome: PollOutcome,
+    reservation: Reservation | None,
+) -> None:
+    """Persist the transient poll-state and refund a phantom reservation."""
+    persist_poll_result(conn, site_id, station_id, outcome)
+    if reservation is not None:
+        refund_budget(conn, reservation)
 
 
 def _record_current_obs_backoff(

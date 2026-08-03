@@ -54,6 +54,20 @@ _MAX_IMPORT_BYTES = 256 * 1024 * 1024
 # guard) and the compress copy buffer.
 _DECOMP_CHUNK = 1 * 1024 * 1024
 _REQUIRED_TABLES = ("sites", "stations", "station_observations")
+# Every TEXT NOT NULL `variable` column in the schema. SQLite's type affinity
+# lets a BLOB survive an insert into a TEXT column unconverted, so
+# `PRAGMA integrity_check` (which validates storage-format consistency, not
+# per-column type) accepts such a row silently; typeof()='blob' is the only
+# check that catches it. Each table already carries an index covering
+# `variable` (the UNIQUE/PRIMARY KEY constraint or an explicit CREATE INDEX),
+# so this is an index scan rather than a table scan.
+_BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("station_observations", "variable"),
+    ("observations", "variable"),
+    ("forecast_samples", "variable"),
+    ("forecast_pairs", "variable"),
+    ("score_cache", "variable"),
+)
 # Anchored: only this producer's own output shapes are ever a sweep
 # candidate. The token group is optional on purpose -- it spans BOTH
 # `_new_backup_path`'s suffixed name and the pre-0.9 bare-timestamp name,
@@ -584,6 +598,12 @@ def _validate_upload(tmp: Path) -> None:
             raise ApiError(422, "not a valid SQLite database") from exc
         if row is None or str(row[0]) != "ok":
             raise ApiError(422, "database failed integrity check")
+        try:
+            fk_violation = conn.execute("PRAGMA foreign_key_check").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise ApiError(422, "not a valid SQLite database") from exc
+        if fk_violation is not None:
+            raise ApiError(422, "database failed foreign key check")
         version_row = conn.execute("PRAGMA user_version").fetchone()
         version = 0 if version_row is None else int(version_row[0])
         if version == 0:
@@ -599,6 +619,17 @@ def _validate_upload(tmp: Path) -> None:
         for table in _REQUIRED_TABLES:
             if table not in names:
                 raise ApiError(422, f"missing required table: {table}")
+        for table, column in _BLOB_GUARDED_COLUMNS:
+            if table not in names:
+                continue
+            try:
+                blob_row = conn.execute(
+                    f"SELECT 1 FROM {table} WHERE typeof({column}) = 'blob' LIMIT 1"
+                ).fetchone()
+            except sqlite3.DatabaseError as exc:
+                raise ApiError(422, "not a valid SQLite database") from exc
+            if blob_row is not None:
+                raise ApiError(422, f"invalid data in {table}.{column}")
     finally:
         conn.close()
 
