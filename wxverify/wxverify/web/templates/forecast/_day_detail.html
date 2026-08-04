@@ -14,12 +14,15 @@
       id="forecast-hourly-chart"
       class="chart tall"
       data-chart="forecast-hourly"
-      data-src="{{ url('/api/forecast/hourly?site=' ~ site.id ~ '&day=' ~ day) }}">
-      <svg viewBox="0 0 780 320" role="img" aria-label="Hourly forecast fallback">
+      data-src="{{ url('/api/forecast/hourly?site=' ~ site.id ~ '&day=' ~ day) }}"
+      data-summary="forecast-hourly-summary"
+      data-timezone="{{ site.timezone }}">
+      <svg viewBox="0 0 780 320" aria-hidden="true">
         <line x1="44" y1="278" x2="738" y2="278"></line>
         <line x1="44" y1="24" x2="44" y2="278"></line>
       </svg>
     </div>
+    <div id="forecast-hourly-summary"></div>
     <p class="panel-hint">Blend of the top-performing feeds for this day. Temperature and wind are lines; precipitation is bars (right axis). Toggle individual feeds to see how much the members disagree.</p>
   </section>
 {% else %}

@@ -31,12 +31,14 @@
     <div
       class="chart tall"
       data-chart="overlay"
-      data-src="{{ url('/api/timeseries?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id) }}">
-      <svg viewBox="0 0 780 320" role="img" aria-label="Forecast overlay fallback">
+      data-src="{{ url('/api/timeseries?site=' ~ site.id ~ '&variable=' ~ variable ~ '&feed_id=' ~ feed_id) }}"
+      data-summary="overlay-summary">
+      <svg viewBox="0 0 780 320" aria-hidden="true">
         <line x1="44" y1="278" x2="738" y2="278"></line>
         <line x1="44" y1="24" x2="44" y2="278"></line>
       </svg>
     </div>
+    <div id="overlay-summary"></div>
   </section>
 {% else %}
   <p class="empty">No overlay data source is available.</p>

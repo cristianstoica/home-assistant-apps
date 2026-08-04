@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import assert_summary_mount_not_nested_in_chart, collect_tags
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
@@ -57,15 +58,17 @@ def _make_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     return create_app(root_path="")
 
 
-def _make_site(conn: sqlite3.Connection, name: str = "Test Site") -> int:
+def _make_site(
+    conn: sqlite3.Connection, name: str = "Test Site", *, timezone: str = "UTC"
+) -> int:
     return int(
         conn.execute(
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', 1)
+            VALUES (?, 47.0, 25.0, 900.0, ?, 1)
             """,
-            (name,),
+            (name, timezone),
         ).lastrowid
     )
 
@@ -373,3 +376,57 @@ def test_forecast_degrades_to_low_confidence_without_score_cache_no_enqueue(
             ).fetchone()["n"]
         )
         assert job_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Chart accessibility: fallback SVG hidden, summary mount outside container.
+# ---------------------------------------------------------------------------
+
+
+def test_forecast_hourly_chart_fallback_svg_hidden_and_summary_mount_outside_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    # Non-UTC so a template that hardcoded "UTC" (or read the wrong field)
+    # cannot pass the data-timezone assertion below by accident -- it must
+    # observe this SITE's configured zone, not any default.
+    site_id = _make_site(conn, "Hourly Chart Site", timezone="America/Denver")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get(f"/forecast/day?site={site_id}&day=0")
+    assert response.status_code == 200
+    html = response.text
+
+    svgs = collect_tags(html, "svg")
+    assert len(svgs) == 1, (
+        f"expected exactly one <svg> on /forecast/day, found {len(svgs)}"
+    )
+    assert svgs[0].get("aria-hidden") == "true"
+    assert "aria-label" not in svgs[0]
+    assert "role" not in svgs[0]
+
+    chart_divs = [
+        a for a in collect_tags(html, "div") if a.get("data-chart") == "forecast-hourly"
+    ]
+    assert len(chart_divs) == 1
+    assert "role" not in chart_divs[0], (
+        "the [data-chart] container must carry no ARIA role -- it flattens "
+        "uPlot's own legend table out of the accessibility tree"
+    )
+    # Same reasoning as the role check above, for aria-hidden: uPlot mounts
+    # its own canvas + legend INSIDE this container, so hiding the container
+    # itself would defeat the whole point of leaving it role-less.
+    assert "aria-hidden" not in chart_divs[0]
+    # A typo'd data-summary (e.g. "forecast-hourly-sumary") would make the
+    # client's summaryEl() -> getElementById(id) return null and silently
+    # disable the whole feature with no error -- pin the attribute's VALUE,
+    # not just the existence of a same-named div (checked below).
+    assert chart_divs[0].get("data-summary") == "forecast-hourly-summary"
+    # hourFormatter() reads el.dataset.timezone to format every hour label in
+    # the SITE's local time; a missing/wrong value silently degrades every
+    # label to the BROWSER's local time with no error. Must equal the site's
+    # actual configured zone, not merely be present.
+    assert chart_divs[0].get("data-timezone") == "America/Denver"
+
+    assert_summary_mount_not_nested_in_chart(html, summary_id="forecast-hourly-summary")

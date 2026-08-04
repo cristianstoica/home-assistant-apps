@@ -29,6 +29,93 @@
     node.className = "empty";
     node.textContent = text;
     el.appendChild(node);
+    var summary = summaryEl(el);
+    if (summary) {
+      summaryStatus(summary, text);
+      summaryDetail(summary);
+    }
+  }
+
+  // The chart container's innerHTML is wiped and rebuilt on every render (see
+  // emptyChart above and the new uPlot(...) call in each render* function
+  // below), but the text/table equivalent must survive that: it lives in a
+  // sibling mounted once by the server template (data-summary on the
+  // [data-chart] element names its id) and is only ever populated in place,
+  // never removed and recreated.
+  function summaryEl(el) {
+    var id = el.dataset.summary;
+    return id ? document.getElementById(id) : null;
+  }
+
+  // A screen reader announces a text change inside an aria-live node that
+  // was already present, not the appearance of a brand-new node -- so this
+  // status paragraph is created once per mount and only its text is updated
+  // on every later call.
+  function summaryStatus(summary, text) {
+    var node = summary.querySelector(".summary-status");
+    if (!node) {
+      node = document.createElement("p");
+      node.className = "summary-status visually-hidden";
+      node.setAttribute("role", "status");
+      node.setAttribute("aria-live", "polite");
+      summary.appendChild(node);
+    }
+    node.textContent = text;
+    return node;
+  }
+
+  // Companion to summaryStatus: the non-live detail (a collapsible table)
+  // that gets replaced wholesale each render, kept in its own child so
+  // rebuilding it never touches the persistent live-region node above.
+  function summaryDetail(summary) {
+    var node = summary.querySelector(".summary-detail");
+    if (!node) {
+      node = document.createElement("div");
+      node.className = "summary-detail";
+      summary.appendChild(node);
+    }
+    node.innerHTML = "";
+    return node;
+  }
+
+  function appendCell(row, text, isHeader) {
+    var cell = document.createElement(isHeader ? "th" : "td");
+    if (isHeader) {
+      cell.setAttribute("scope", "row");
+    }
+    cell.textContent = text;
+    row.appendChild(cell);
+  }
+
+  function appendColumnHeaders(row, labels) {
+    labels.forEach(function (text) {
+      var th = document.createElement("th");
+      th.setAttribute("scope", "col");
+      th.textContent = text;
+      row.appendChild(th);
+    });
+  }
+
+  function buildDetailsTable(detail, summaryLabel, captionText) {
+    var wrap = document.createElement("details");
+    wrap.className = "help";
+    var label = document.createElement("summary");
+    label.textContent = summaryLabel;
+    wrap.appendChild(label);
+    var tableWrap = document.createElement("div");
+    tableWrap.className = "table-wrap";
+    var table = document.createElement("table");
+    var caption = document.createElement("caption");
+    caption.textContent = captionText;
+    table.appendChild(caption);
+    tableWrap.appendChild(table);
+    wrap.appendChild(tableWrap);
+    detail.appendChild(wrap);
+    return table;
+  }
+
+  function pad2(n) {
+    return (n < 10 ? "0" : "") + n;
   }
 
   function renderOverlay(el, payload) {
@@ -66,6 +153,169 @@
         { label: "Observed", stroke: cssVar("--chart-2"), width: 2 }
       ]
     }, [xs, forecast, observed], el);
+    var summary = summaryEl(el);
+    if (summary) {
+      renderOverlaySummary(summary, payload, xs, forecast, observed);
+    }
+  }
+
+  // Wind is m/s here (/api/timeseries returns the raw stored value, no
+  // conversion) but km/h in the forecast-hourly table further below
+  // (build_hourly converts server-side) -- the two summaries deliberately
+  // use different wind units for that reason.
+  var VARIABLE_UNITS = {
+    temperature: "°C",
+    precip: " mm",
+    wind: " m/s"
+  };
+
+  function roundTo1(value) {
+    return Math.round(value * 10) / 10;
+  }
+
+  function formatSigned(value, unit) {
+    var rounded = roundTo1(value);
+    if (rounded > 0) {
+      return "+" + rounded.toFixed(1) + unit;
+    }
+    if (rounded < 0) {
+      return rounded.toFixed(1) + unit;
+    }
+    return "0.0" + unit;
+  }
+
+  function biasSentence(value, unit, highWord, lowWord, evenWord) {
+    var rounded = roundTo1(value);
+    var word = evenWord;
+    if (rounded > 0) {
+      word = highWord;
+    } else if (rounded < 0) {
+      word = lowWord;
+    }
+    return formatSigned(value, unit) + " (" + word + ")";
+  }
+
+  function formatLocal(epochSeconds) {
+    var d = new Date(epochSeconds * 1000);
+    return (
+      d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()) +
+      " " + pad2(d.getHours()) + ":" + pad2(d.getMinutes())
+    );
+  }
+
+  function localDayKey(epochSeconds) {
+    var d = new Date(epochSeconds * 1000);
+    return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
+  }
+
+  // Computed strictly from xs/forecast/observed -- the same parseTime-
+  // filtered arrays renderOverlay just plotted, not payload.valid_at -- so
+  // the summary can never describe a row the chart itself dropped. Error
+  // statistics (MAE, bias, worst interval) use the subset where both sides
+  // are non-null; today /api/timeseries float()-casts both columns so that
+  // subset is everything, but the guard stays for a short/malformed array.
+  function renderOverlaySummary(summary, payload, xs, forecast, observed) {
+    var unit = VARIABLE_UNITS[payload.variable] || "";
+    var pairs = [];
+    for (var i = 0; i < xs.length; i++) {
+      if (forecast[i] !== null && observed[i] !== null) {
+        pairs.push({ t: xs[i], error: forecast[i] - observed[i] });
+      }
+    }
+    if (pairs.length === 0) {
+      summaryStatus(summary, "No overlay pairs.");
+      summaryDetail(summary);
+      return;
+    }
+    var sumAbs = 0;
+    var sum = 0;
+    var worstIndex = 0;
+    var worstAbs = -1;
+    pairs.forEach(function (pair, index) {
+      var abs = Math.abs(pair.error);
+      sumAbs += abs;
+      sum += pair.error;
+      if (abs > worstAbs) {
+        worstAbs = abs;
+        worstIndex = index;
+      }
+    });
+    var mae = sumAbs / pairs.length;
+    var bias = sum / pairs.length;
+    var worst = pairs[worstIndex];
+
+    // error = forecast - observed (matches forecast_pairs.error's sign
+    // convention), so a positive bias means the forecast ran high.
+    summaryStatus(
+      summary,
+      xs.length + " pair" + (xs.length === 1 ? "" : "s") + " from " + formatLocal(xs[0]) + " to " +
+        formatLocal(xs[xs.length - 1]) + ", local time. Mean absolute error " +
+        mae.toFixed(1) + unit + ", bias " +
+        biasSentence(bias, unit, "forecast ran high", "forecast ran low", "no net bias") +
+        ". Worst interval " + formatLocal(worst.t) + ", off by " +
+        biasSentence(worst.error, unit, "forecast was high", "forecast was low", "no error") +
+        "."
+    );
+
+    // Bucketed by browser-local calendar day (renderOverlay's x scale has no
+    // tzDate override, so the chart itself is already browser-local) -- a
+    // DST fall-back day buckets 25 hourly rows, spring-forward 23; nothing
+    // here assumes 24.
+    var days = {};
+    var dayOrder = [];
+    xs.forEach(function (t) {
+      var key = localDayKey(t);
+      if (!days[key]) {
+        days[key] = { count: 0, errors: [] };
+        dayOrder.push(key);
+      }
+      days[key].count += 1;
+    });
+    pairs.forEach(function (pair) {
+      days[localDayKey(pair.t)].errors.push(pair.error);
+    });
+    var totalDays = dayOrder.length;
+    var shown = totalDays > 30 ? dayOrder.slice(totalDays - 30) : dayOrder;
+    var captionText = totalDays > 30
+      ? "Most recent 30 of " + totalDays + " days, local time."
+      : totalDays + " day" + (totalDays === 1 ? "" : "s") + ", local time.";
+
+    var detail = summaryDetail(summary);
+    var table = buildDetailsTable(detail, "Per-day breakdown", captionText);
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    appendColumnHeaders(headRow, ["Day", "N", "MAE", "Bias", "Max abs error"]);
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    shown.forEach(function (key) {
+      var day = days[key];
+      var tr = document.createElement("tr");
+      appendCell(tr, key, true);
+      appendCell(tr, String(day.count));
+      if (day.errors.length === 0) {
+        appendCell(tr, "n/a");
+        appendCell(tr, "n/a");
+        appendCell(tr, "n/a");
+      } else {
+        var daySumAbs = 0;
+        var daySum = 0;
+        var dayWorst = 0;
+        day.errors.forEach(function (error) {
+          var abs = Math.abs(error);
+          daySumAbs += abs;
+          daySum += error;
+          if (abs > dayWorst) {
+            dayWorst = abs;
+          }
+        });
+        appendCell(tr, (daySumAbs / day.errors.length).toFixed(1) + unit);
+        appendCell(tr, formatSigned(daySum / day.errors.length, unit));
+        appendCell(tr, dayWorst.toFixed(1) + unit);
+      }
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
   }
 
   var SKILL_PALETTE = [
@@ -126,7 +376,60 @@
       axes: [xAxis, yAxis],
       series: uplotSeries
     }, data, el);
+    var summary = summaryEl(el);
+    if (summary) {
+      renderSkillSummary(summary, payload);
+    }
   }
+
+  // Naturally tabular already -- one row per lead, one column per feed --
+  // so unlike overlay, whose announcement states computed statistics, this
+  // one just states the data's shape (leads x feeds) with no headline stat.
+  // leadLabel is the same function the chart's own x-axis uses, so the row
+  // labels can never drift from what the chart shows.
+  function renderSkillSummary(summary, payload) {
+    var leads = payload.leads || [];
+    var series = payload.series || [];
+    summaryStatus(
+      summary,
+      leads.length + " lead day" + (leads.length === 1 ? "" : "s") + ", " +
+        series.length + " feed" + (series.length === 1 ? "" : "s") + "."
+    );
+    var detail = summaryDetail(summary);
+    var table = buildDetailsTable(
+      detail,
+      "Skill data table",
+      "Skill by lead day, one row per lead and one column per feed. Higher is better."
+    );
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    var leadHeader = document.createElement("th");
+    leadHeader.setAttribute("scope", "col");
+    leadHeader.textContent = "Lead";
+    headRow.appendChild(leadHeader);
+    appendColumnHeaders(headRow, series.map(function (s) {
+      return s.label;
+    }));
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    leads.forEach(function (lead, leadIndex) {
+      var tr = document.createElement("tr");
+      appendCell(tr, leadLabel(lead), true);
+      series.forEach(function (s) {
+        var value = (s.skill || [])[leadIndex];
+        appendCell(tr, value === null || value === undefined ? "n/a" : value.toFixed(2));
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  // Shared between the chart's own series/legend labels and the summary
+  // table's column headers below, so the two can never drift apart.
+  var HOURLY_TEMP_LABEL = "Temp °C";
+  var HOURLY_PRECIP_LABEL = "Precip mm";
+  var HOURLY_WIND_LABEL = "Wind km/h";
 
   // Blended hourly drill-down: temp line (left axis), precip bars (right
   // axis), wind line (legend-only scale). Per-feed series are created hidden
@@ -156,14 +459,14 @@
     var series = [{}];
     var data = [xs];
     series.push({
-      label: "Temp °C",
+      label: HOURLY_TEMP_LABEL,
       scale: "t",
       stroke: cssVar("--chart-1"),
       width: 2
     });
     data.push(pick(blend.temp_c));
     series.push({
-      label: "Precip mm",
+      label: HOURLY_PRECIP_LABEL,
       scale: "p",
       stroke: cssVar("--chart-2"),
       fill: cssVar("--chart-2"),
@@ -173,7 +476,7 @@
     });
     data.push(pick(blend.precip_mm));
     series.push({
-      label: "Wind km/h",
+      label: HOURLY_WIND_LABEL,
       scale: "w",
       stroke: cssVar("--chart-3"),
       width: 2
@@ -223,8 +526,159 @@
     }, data, el);
     el.uplotInstance = chart;
     el.feedSeriesIdx = feedSeriesIdx;
+    var summary = summaryEl(el);
+    if (summary) {
+      renderForecastHourlySummary(summary, payload, xs, pick, el);
+    }
   }
 
+  // Renders a site-local-time-of-day label for an epoch second, using the
+  // site's IANA zone (not the browser's -- this table's "day" is the site's
+  // local day per build_hourly, a different zone than the viewer's, which is
+  // exactly why every label here is explicit about whose clock it is on).
+  // Falls back to the browser's own local time if the zone is missing or
+  // Intl rejects it, rather than throwing.
+  function hourFormatter(timezone) {
+    if (!timezone) {
+      return null;
+    }
+    try {
+      return new Intl.DateTimeFormat("en-GB", {
+        timeZone: timezone,
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false
+      });
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function dayDateText(epochSeconds, timezone) {
+    if (!timezone) {
+      return null;
+    }
+    try {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: timezone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+      }).format(new Date(epochSeconds * 1000));
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function formatHour(epochSeconds, formatter) {
+    var d = new Date(epochSeconds * 1000);
+    if (formatter) {
+      return formatter.format(d);
+    }
+    return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+  }
+
+  function formatCell(value, unit) {
+    return value === null || value === undefined ? "n/a" : value.toFixed(1) + unit;
+  }
+
+  // The accessible equivalent of the N faint per-feed lines the toggle
+  // reveals: how far apart the feeds are at this hour, not each one listed
+  // separately (that would be 3N columns instead of 3).
+  function spreadAt(feedArrays, key, index) {
+    var min = null;
+    var max = null;
+    feedArrays.forEach(function (feed) {
+      var v = feed[key][index];
+      if (v === null || v === undefined) {
+        return;
+      }
+      if (min === null || v < min) {
+        min = v;
+      }
+      if (max === null || v > max) {
+        max = v;
+      }
+    });
+    return { min: min, max: max };
+  }
+
+  function formatRange(range, unit) {
+    if (range.min === null) {
+      return "n/a";
+    }
+    if (range.min === range.max) {
+      return range.min.toFixed(1) + unit;
+    }
+    return range.min.toFixed(1) + "–" + range.max.toFixed(1) + unit;
+  }
+
+  // xs/pick are the exact closures renderForecastHourly built from this same
+  // payload (parseTime-filtered, keep-aligned), so the table can never show
+  // an hour the chart itself dropped or misalign a value to the wrong hour.
+  function renderForecastHourlySummary(summary, payload, xs, pick, el) {
+    var timezone = el.dataset.timezone || "";
+    var timeFormatter = hourFormatter(timezone);
+    var dateText = dayDateText(xs[0], timezone);
+
+    var captionText = payload.label || "Selected day";
+    if (dateText) {
+      captionText += " (" + dateText + ")";
+    }
+    if (timeFormatter) {
+      captionText += ", site time " + timezone;
+    } else {
+      captionText += ", browser local time";
+    }
+    captionText += ". " + xs.length + " hour" + (xs.length === 1 ? "" : "s") + ".";
+
+    summaryStatus(summary, captionText);
+    var detail = summaryDetail(summary);
+    var table = buildDetailsTable(detail, "Hourly data table", captionText);
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    var hourHeader = document.createElement("th");
+    hourHeader.setAttribute("scope", "col");
+    hourHeader.textContent = "Hour";
+    headRow.appendChild(hourHeader);
+    appendColumnHeaders(headRow, [
+      HOURLY_TEMP_LABEL, HOURLY_WIND_LABEL, HOURLY_PRECIP_LABEL,
+      "Temp range", "Wind range", "Precip range"
+    ]);
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    var blend = payload.blend || {};
+    var blendTemp = pick(blend.temp_c);
+    var blendWind = pick(blend.wind_kmh);
+    var blendPrecip = pick(blend.precip_mm);
+    var feedPicked = (payload.feeds || []).map(function (feed) {
+      return {
+        temp_c: pick(feed.temp_c),
+        wind_kmh: pick(feed.wind_kmh),
+        precip_mm: pick(feed.precip_mm)
+      };
+    });
+
+    var tbody = document.createElement("tbody");
+    xs.forEach(function (t, index) {
+      var tr = document.createElement("tr");
+      appendCell(tr, formatHour(t, timeFormatter), true);
+      appendCell(tr, formatCell(blendTemp[index], "°C"));
+      appendCell(tr, formatCell(blendWind[index], " km/h"));
+      appendCell(tr, formatCell(blendPrecip[index], " mm"));
+      appendCell(tr, formatRange(spreadAt(feedPicked, "temp_c", index), "°C"));
+      appendCell(tr, formatRange(spreadAt(feedPicked, "wind_kmh", index), " km/h"));
+      appendCell(tr, formatRange(spreadAt(feedPicked, "precip_mm", index), " mm"));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+  }
+
+  // [data-chart] containers must never carry role="img" or aria-hidden: uPlot
+  // mounts a real <table class="u-legend"> inside them, and role="img" is
+  // children-presentational, so it would flatten that legend out of the
+  // accessibility tree.
   function loadChart(el) {
     if (el.dataset.loaded === "true") {
       return;

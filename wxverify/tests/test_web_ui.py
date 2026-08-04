@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import assert_summary_mount_not_nested_in_chart, collect_tags
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
@@ -1511,3 +1512,107 @@ def test_enabled_site_zero_pairs_renders_empty_verdict(
     assert "verdict-empty" in html
     assert "No scored data yet for this selection" in html
     assert "No scored pairs." in html
+
+
+# ===========================================================================
+# Chart accessibility: fallback SVG hidden, summary mount outside container
+# ===========================================================================
+
+
+def test_skill_chart_fallback_svg_hidden_and_summary_mount_outside_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Skill Chart Site")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        html = _get_dashboard(client, site_id)
+
+    svgs = collect_tags(html, "svg")
+    assert len(svgs) == 1, (
+        f"expected exactly one <svg> on /dashboard, found {len(svgs)}"
+    )
+    assert svgs[0].get("aria-hidden") == "true"
+    assert "aria-label" not in svgs[0]
+    assert "role" not in svgs[0]
+
+    chart_divs = [
+        a for a in collect_tags(html, "div") if a.get("data-chart") == "skill"
+    ]
+    assert len(chart_divs) == 1
+    assert "role" not in chart_divs[0], (
+        "the [data-chart] container must carry no ARIA role -- it flattens "
+        "uPlot's own legend table out of the accessibility tree"
+    )
+    # Same reasoning as the role check above, for aria-hidden: uPlot mounts
+    # its own canvas + legend INSIDE this container, so hiding the container
+    # itself would defeat the whole point of leaving it role-less.
+    assert "aria-hidden" not in chart_divs[0]
+    # A typo'd data-summary (e.g. "skill-sumary") would make the client's
+    # summaryEl() -> getElementById(id) return null and silently disable the
+    # whole feature with no error -- pin the attribute's VALUE, not just the
+    # existence of a same-named div (checked below).
+    assert chart_divs[0].get("data-summary") == "skill-summary"
+
+    assert_summary_mount_not_nested_in_chart(html, summary_id="skill-summary")
+
+
+def test_overlay_chart_fallback_svg_hidden_and_summary_mount_outside_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Overlay Chart Site")
+    feed_id = _feed_id(conn, "ecmwf_ifs")
+    # load_overlay only lists a feed once it has forecast_pairs for the
+    # requested variable -- without this, feed_id resolves to None and the
+    # chart div (behind the template's `{% if site and feed_id %}` guard)
+    # never renders at all.
+    _seed_cell(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        day_ahead=1,
+        skill=0.5,
+        n=5,
+    )
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        resp = client.get(
+            "/overlay",
+            params={
+                "site": str(site_id),
+                "variable": "temperature",
+                "feed_id": str(feed_id),
+            },
+        )
+    assert resp.status_code == 200
+    html = resp.text
+
+    svgs = collect_tags(html, "svg")
+    assert len(svgs) == 1, f"expected exactly one <svg> on /overlay, found {len(svgs)}"
+    assert svgs[0].get("aria-hidden") == "true"
+    assert "aria-label" not in svgs[0]
+    assert "role" not in svgs[0]
+
+    chart_divs = [
+        a for a in collect_tags(html, "div") if a.get("data-chart") == "overlay"
+    ]
+    assert len(chart_divs) == 1
+    assert "role" not in chart_divs[0], (
+        "the [data-chart] container must carry no ARIA role -- it flattens "
+        "uPlot's own legend table out of the accessibility tree"
+    )
+    # Same reasoning as the role check above, for aria-hidden: uPlot mounts
+    # its own canvas + legend INSIDE this container, so hiding the container
+    # itself would defeat the whole point of leaving it role-less.
+    assert "aria-hidden" not in chart_divs[0]
+    # A typo'd data-summary (e.g. "overlay-sumary") would make the client's
+    # summaryEl() -> getElementById(id) return null and silently disable the
+    # whole feature with no error -- pin the attribute's VALUE, not just the
+    # existence of a same-named div (checked below).
+    assert chart_divs[0].get("data-summary") == "overlay-summary"
+
+    assert_summary_mount_not_nested_in_chart(html, summary_id="overlay-summary")
