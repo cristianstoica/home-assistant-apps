@@ -55,8 +55,35 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
         last_run_at = row["last_run_at"]
         due = last_run_at is None
         if last_run_at is not None:
-            minutes = (now - parse_utc(str(last_run_at))).total_seconds() / 60
-            due = minutes >= int(row["fetch_interval_minutes"])
+            try:
+                last_run_dt = parse_utc(str(last_run_at))
+            except ValueError:
+                # Foreign/corrupt last_run_at: fail open (treat as due) so a
+                # single unreadable row cannot kill the tick. Self-healing --
+                # the next successful run rewrites this column.
+                logger.warning(
+                    "scheduler: unreadable last_run_at site=%s feed=%s;"
+                    " treating feed as due",
+                    int(row["site_id"]),
+                    int(row["feed_id"]),
+                )
+                due = True
+            else:
+                try:
+                    interval = int(row["fetch_interval_minutes"])
+                except (ValueError, OverflowError):
+                    # Foreign/corrupt cadence: fail closed (skip this feed for
+                    # this tick) rather than invent a schedule for paid
+                    # provider calls. Every other feed still runs.
+                    logger.warning(
+                        "scheduler: unreadable fetch_interval_minutes site=%s"
+                        " feed=%s; skipping feed this tick",
+                        int(row["site_id"]),
+                        int(row["feed_id"]),
+                    )
+                    continue
+                minutes = (now - last_run_dt).total_seconds() / 60
+                due = minutes >= interval
         if due:
             logger.debug(
                 "scheduler due feed site=%s feed=%s",
@@ -90,22 +117,24 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
     ).fetchall()
     for row in rows:
         last = row["last_obs_at"]
-        if last is None:
-            logger.debug("scheduler due obs site=%s", int(row["id"]))
-            enqueue_if_absent_with_cooldown(
-                conn,
-                "fetch_obs",
-                int(row["id"]),
-                "obs",
-                {},
-                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-            )
-            continue
-        last_dt = parse_utc(str(last))
-        cycle_bucket = int(last_dt.timestamp() // (interval * 60))
-        jitter = obs_jitter_minutes(int(row["id"]), cycle_bucket, jitter_cap)
-        elapsed = (now - last_dt).total_seconds() / 60
-        if elapsed >= interval + jitter:
+        due = last is None
+        if last is not None:
+            try:
+                last_dt = parse_utc(str(last))
+            except ValueError:
+                # Foreign/corrupt last_obs_at: fail open (treat as due), same
+                # rationale as the due-feed loop's last_run_at guard above.
+                logger.warning(
+                    "scheduler: unreadable last_obs_at site=%s; treating obs as due",
+                    int(row["id"]),
+                )
+                due = True
+            else:
+                cycle_bucket = int(last_dt.timestamp() // (interval * 60))
+                jitter = obs_jitter_minutes(int(row["id"]), cycle_bucket, jitter_cap)
+                elapsed = (now - last_dt).total_seconds() / 60
+                due = elapsed >= interval + jitter
+        if due:
             logger.debug("scheduler due obs site=%s", int(row["id"]))
             enqueue_if_absent_with_cooldown(
                 conn,
@@ -131,15 +160,25 @@ def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
     ).fetchall()
     for row in rows:
         station_id = int(row["id"])
+        try:
+            site_id = int(row["site_id"])
+        except (ValueError, OverflowError):
+            # Foreign/corrupt site_id: fail closed (skip this station this
+            # tick). site_id is the job's identity, not a schedule hint --
+            # inventing one would attach a station's observations to whatever
+            # site now owns that id. Every other station still runs.
+            logger.warning(
+                "scheduler: unreadable site_id station=%s; skipping station this tick",
+                station_id,
+            )
+            continue
         logger.debug(
-            "scheduler due current_obs site=%s station=%s",
-            int(row["site_id"]),
-            station_id,
+            "scheduler due current_obs site=%s station=%s", site_id, station_id
         )
         enqueue_if_absent_with_cooldown(
             conn,
             "fetch_current_obs",
-            int(row["site_id"]),
+            site_id,
             f"curobs:{station_id}",
             {"station_id": station_id},
             cooldown=_DUE_JOB_FAILURE_COOLDOWN,

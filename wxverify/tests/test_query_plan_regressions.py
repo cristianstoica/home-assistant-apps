@@ -11,6 +11,7 @@ it.
 from __future__ import annotations
 
 import datetime
+import os
 import sqlite3
 
 import pytest
@@ -94,6 +95,11 @@ def _seed_meteoblue_package_with_16_members(
     return tuple(feed_ids)
 
 
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pins are a contract with the shipping SQLite build;"
+    " enforced by the wxverify-shipping-sqlite-plan CI job",
+)
 def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
     conn = _fresh_conn()
     site_id = int(
@@ -327,6 +333,11 @@ def _seed_jobs_across_two_sites(conn: sqlite3.Connection, *, rows: int) -> int:
     return site_id
 
 
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pins are a contract with the shipping SQLite build;"
+    " enforced by the wxverify-shipping-sqlite-plan CI job",
+)
 def test_cooldown_job_lookups_seek_idx_jobs_type_key_site() -> None:
     conn = _fresh_conn()
     site_id = _seed_jobs_across_two_sites(conn, rows=50)

@@ -206,3 +206,4 @@ jobs:
           tests/test_index_predicate_reconciliation.py
         env:
           WXV_WEATHERCOM_KEY: "ci-placeholder"
+          WXV_EQP_SHIPPING: "1"

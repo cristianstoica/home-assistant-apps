@@ -165,8 +165,23 @@ def enqueue_if_absent_with_cooldown(
     if active is None:
         latest = conn.execute(LATEST_JOB_SQL, (job_type, job_key, site_id)).fetchone()
         if latest is not None and str(latest["status"]) == "failed":
-            updated_at = parse_utc(str(latest["updated_at"]))
-            if utc_now() - updated_at < cooldown:
+            try:
+                updated_at = parse_utc(str(latest["updated_at"]))
+            except ValueError:
+                # Foreign/corrupt updated_at (e.g. a BLOB surviving into this
+                # TEXT column via an imported or restored database): a
+                # cooldown disposition must not depend on unreadable data, so
+                # fail open -- proceed as if no cooldown applied. Self-healing,
+                # since the next run rewrites this column with a valid stamp.
+                logger.warning(
+                    "cooldown: unreadable updated_at on latest job type=%s"
+                    " site=%s key=%s; proceeding without cooldown",
+                    job_type,
+                    site_id,
+                    job_key,
+                )
+                updated_at = None
+            if updated_at is not None and utc_now() - updated_at < cooldown:
                 logger.debug(
                     "enqueue suppressed type=%s site=%s key=%s"
                     " (terminal failure within cooldown)",
@@ -208,7 +223,15 @@ def claim_next_job(conn: sqlite3.Connection) -> Job | None:
         return None
     try:
         return _job_from_row(row)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except Exception:
+        # Broad on purpose: _job_from_row does no I/O -- it only parses a row
+        # already fetched -- so this cannot mask a database error, a lock
+        # timeout, or a cancellation (CancelledError derives from
+        # BaseException, not Exception). An enumerated allowlist here has
+        # twice missed a real carrier (OverflowError from int() on a REAL
+        # infinity, then RecursionError from json.loads on a deeply nested
+        # payload); a third enumeration would just leak a fourth.
+        #
         # A row that can't be read back at all (corrupt payload, or a BLOB
         # surviving an INTEGER-affinity column) is dispositioned here, in the
         # same transaction as the claim; row["id"] stays safe to read even
