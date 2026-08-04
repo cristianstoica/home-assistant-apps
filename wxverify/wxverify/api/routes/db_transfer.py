@@ -23,11 +23,17 @@ from starlette.responses import JSONResponse
 
 from wxverify import config
 from wxverify.api.errors import ApiError
+from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import reclaim_all_stale
-from wxverify.db.runtime_state import set_runtime_state_now
+from wxverify.db.runtime_state import (
+    delete_runtime_state,
+    ensure_runtime_state_table,
+    set_runtime_state,
+    set_runtime_state_now,
+)
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -483,12 +489,20 @@ async def import_db(request: Request) -> JSONResponse:
             if received == 0:
                 raise ApiError(422, "empty upload")
             _validate_upload(tmp)
+            _stage_pending_rebuild_state(tmp)
             backup = _new_backup_path(db_dir)
             # COMMIT POINT: past a successful replace_from the live DB has
             # been overwritten, so the success response must go out
             # regardless of any downstream outcome -- reclaim and rebuild
             # run post-response. The guard, unlike the response, is held
             # across that post-response work (see _rebuild_derived_and_release).
+            # Nothing may write runtime_state after this point: a write here
+            # would be caught by `except BaseException` below and reported as
+            # a 500 for an import that already committed. That is why the
+            # `pending` stamp above happens on the STAGED file, before the
+            # swap, not here -- any later rebuild outcome is only ever
+            # logged and recorded through run_rebuild_all, never turned into
+            # a failed response for a request that has already succeeded.
             await get_db().replace_from(tmp, backup)
         finally:
             _unlink(tmp)
@@ -634,6 +648,49 @@ def _validate_upload(tmp: Path) -> None:
         conn.close()
 
 
+def _stage_pending_rebuild_state(tmp: Path) -> None:
+    """Mark the staged upload's rebuild state ``pending`` before promotion.
+
+    ``replace_from``'s rename is atomic (db/connection.py), so writing this
+    into the staged file -- never into the live DB after the swap -- makes
+    the promoted database carry `pending` by construction: there is no
+    window where the rename has committed and the state has not. Also drops
+    any `import_rebuild_done_at`/`import_rebuild_error` rows the upload
+    carries -- they describe the EXPORTING machine's own past rebuild, not
+    this one, and nothing else clears them.
+
+    `_validate_upload` only requires `_REQUIRED_TABLES` (sites, stations,
+    station_observations) plus an in-range `user_version`; it never checks
+    for `runtime_state`. A genuine prior export always has it -- this app's
+    own `create_schema` creates it unconditionally, ahead of any version
+    gate, on every boot of the exporting instance -- but `_validate_upload`
+    cannot distinguish a genuine export from a file that was merely built to
+    satisfy those same checks without ever passing through this app's
+    `create_schema` (e.g. hand-assembled from the three required tables plus
+    a plausible `user_version`). `ensure_runtime_state_table` guards that
+    reachable gap. The checkpoint after commit is defensive: every export
+    this app produces is VACUUM INTO output, already in rollback-journal
+    mode, but a hand-copied WAL-mode upload may still carry a `-wal`
+    sidecar; SQLite's own close-time checkpoint would flush it into the
+    main file regardless, so this call just makes that flush explicit ahead
+    of the rename.
+    """
+    conn = sqlite3.connect(str(tmp))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ensure_runtime_state_table(conn)
+            set_runtime_state(conn, "import_rebuild_state", "pending")
+            delete_runtime_state(conn, "import_rebuild_done_at", "import_rebuild_error")
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
 async def _rebuild_derived(backup: Path) -> None:
     """Post-import background task: reclaim imported jobs, rebuild derived.
 
@@ -651,10 +708,7 @@ async def _rebuild_derived(backup: Path) -> None:
         await db.write(reclaim_all_stale)
     except Exception:
         logger.exception("import: job reclaim failed")
-    try:
-        await db.write(_rebuild_all)
-    except Exception:
-        logger.exception("import: derived rebuild failed")
+    await run_rebuild_all()
     try:
         await asyncio.to_thread(sweep_bak_files, backup.parent, keep=backup)
     except Exception:
@@ -673,6 +727,41 @@ async def _rebuild_derived_and_release(backup: Path) -> None:
         await _rebuild_derived(backup)
     finally:
         _release_import_guard()
+
+
+async def run_rebuild_all() -> None:
+    """Run ``_rebuild_all``, committing ``done`` or -- on failure --
+    separately committing ``failed`` plus a sanitized reason.
+
+    Shared by the post-import background task and the boot-time resume: a
+    rebuild that raises must never leave ``import_rebuild_state`` hung at
+    ``pending``, whichever caller ran it. ``_rebuild_all``'s own transaction
+    rolls back on failure (so it never reaches its own ``done`` write); the
+    failed transition is committed here, in a separate write, so it survives
+    even though the attempt that triggered it did not.
+    """
+    db = get_db()
+    try:
+        await db.write(_rebuild_all)
+    except Exception as exc:
+        logger.exception("import: derived rebuild failed")
+
+        try:
+            reason = sanitized_exception(exc)
+
+            def _mark_failed(conn: sqlite3.Connection) -> None:
+                set_runtime_state(conn, "import_rebuild_state", "failed")
+                set_runtime_state(conn, "import_rebuild_error", reason)
+
+            await db.write(_mark_failed)
+        except Exception:
+            # The state stays `pending`, so a later boot retries -- correct,
+            # since the failure that broke the rebuild also broke recording
+            # it -- whether that's `_mark_failed`'s write, or sanitizing
+            # `exc` into `reason` beforehand. What must not happen is taking
+            # the process down with it: this runs inside `lifespan` on the
+            # boot-resume path.
+            logger.exception("import: recording rebuild failure failed")
 
 
 def _rebuild_all(conn: sqlite3.Connection) -> None:
@@ -712,3 +801,4 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
         )
     pair_and_score(conn, site_id=None)
     set_runtime_state_now(conn, "import_rebuild_done_at")
+    set_runtime_state(conn, "import_rebuild_state", "done")

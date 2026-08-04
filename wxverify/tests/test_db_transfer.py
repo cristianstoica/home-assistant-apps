@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import gzip
 import json
+import logging
 import os
 import re
 import secrets
@@ -593,13 +594,19 @@ def test_export_snapshot_failure_surfaces_error_not_hung_preparing(
     """
     _init_tmp_db(tmp_path)
 
-    async def _read_raises(self: Database, fn: Any) -> None:
+    async def _read_raises(fn: Any) -> None:
         raise sqlite3.OperationalError("synthetic snapshot failure")
 
-    monkeypatch.setattr(Database, "read", _read_raises)
     app = _make_app(monkeypatch)
     db_dir = Path(config.db_path).parent
     with TestClient(app, raise_server_exceptions=False) as client:
+        # Patched on the live instance, AFTER lifespan startup, so only the
+        # export path's own snapshot read fails. `lifespan` (0.9.3) makes its
+        # own db.read() to check for an interrupted import rebuild; a
+        # class-level patch applied before the app starts would break that
+        # unrelated boot read too and fail startup itself rather than the
+        # snapshot.
+        monkeypatch.setattr(get_db(), "read", _read_raises)
         resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
         assert resp.status_code == 202
         export_id = resp.json()["export_id"]
@@ -1915,6 +1922,601 @@ def test_import_fails_cleanly_when_backup_path_already_exists(
     db_dir = Path(config.db_path).parent
     assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
         "upload temp must still be cleaned up on this failure path"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Part B (cont'd) -- durable import-rebuild state (pending/done/failed).
+# ---------------------------------------------------------------------------
+#
+# `_stage_pending_rebuild_state` marks the STAGED upload `pending` before
+# the atomic rename in `replace_from`, so the promoted DB carries that
+# marker by construction -- there is no window where the swap committed and
+# the state did not. Boot resumes a `pending` rebuild before the worker
+# starts; a rebuild that raises -- from either entry point -- is recorded
+# `failed` with a sanitized reason rather than left `pending` forever or
+# retried on every subsequent boot.
+
+
+def _seed_foreign_rebuild_state(path: Path) -> None:
+    """Seed a completed-then-failed rebuild history onto a standalone DB
+    file, as if it were exported from a DIFFERENT wxverify instance. None
+    of this describes the importing instance's own data, and none of it
+    may survive promotion.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+            ("import_rebuild_state", "failed"),
+        )
+        conn.execute(
+            "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+            ("import_rebuild_done_at", "2030-01-01T00:00:00.000000Z"),
+        )
+        conn.execute(
+            "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+            ("import_rebuild_error", "synthetic foreign export-machine error"),
+        )
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+def test_import_clears_foreign_completion_stamp_and_promoted_db_reads_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An uploaded DB's own runtime_state describes the EXPORTING machine's
+    rebuild history, never this one. The promoted DB must read `pending`
+    -- not the foreign state it shipped with -- and must not carry the
+    foreign completion stamp or error forward. The background rebuild is
+    suppressed so this observes the promoted file exactly as
+    `_stage_pending_rebuild_state` left it, not whatever a completed
+    rebuild would leave behind.
+    """
+    _init_tmp_db(tmp_path)
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Foreign State Site B")
+    _seed_foreign_rebuild_state(b_path)
+    payload = b_path.read_bytes()
+
+    async def _rebuild_derived_noop(_backup: Path) -> None:
+        return None
+
+    monkeypatch.setattr(db_transfer, "_rebuild_derived", _rebuild_derived_noop)
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 200
+
+    direct = sqlite3.connect(config.db_path)
+    try:
+        state = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
+        ).fetchone()
+        done_at = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_done_at'"
+        ).fetchone()
+        error = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_error'"
+        ).fetchone()
+    finally:
+        direct.close()
+
+    assert state is not None and state[0] == "pending", (
+        "the promoted DB must read pending, not the foreign 'failed' it "
+        "shipped with (mutation check: dropping the "
+        "_stage_pending_rebuild_state call must turn this red)"
+    )
+    assert done_at is None, (
+        "a foreign completion stamp must not survive promotion -- it "
+        "describes the exporting machine's own rebuild, not this one"
+    )
+    assert error is None, "a foreign error must not survive promotion either"
+
+
+def test_boot_resumes_interrupted_import_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild interrupted before its post-response background task ever
+    ran must resume on the next boot, not stay stuck `pending` forever --
+    and the resumed rebuild must actually recompute derived data, not just
+    flip the state string.
+    """
+    _init_tmp_db(tmp_path)
+
+    b_path = tmp_path / "source-b.db"
+    b_db = Database(str(b_path))
+    try:
+        conn_b = b_db._conn  # noqa: SLF001
+        site_b = _make_site(conn_b, "Boot Resume Site B")
+        station_b = int(
+            conn_b.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'SYN-STATION-BOOT1', 47.0, 25.0, 900.0, 1)
+                """,
+                (site_b,),
+            ).lastrowid
+        )
+        conn_b.execute(
+            """
+            INSERT INTO station_observations
+                (station_id, variable, valid_at, value, qc_flag, source_raw)
+            VALUES (?, 'temperature', '2035-06-01T00:00:00Z', 10.0, 'ok',
+                    'synthetic-test')
+            """,
+            (station_b,),
+        )
+        # Stale/wrong observations row, inserted directly (bypassing
+        # materialize_consensus) -- only a real rebuild recomputes this to
+        # 10.0; the state string alone can't tell "done" from "marked done
+        # without rebuilding."
+        conn_b.execute(
+            """
+            INSERT INTO observations
+                (site_id, variable, valid_at, value, n_stations,
+                 rejected_stations, computed_at)
+            VALUES (?, 'temperature', '2035-06-01T00:00:00Z', 999.0, 1, 0,
+                    '2020-01-01T00:00:00Z')
+            """,
+            (site_b,),
+        )
+        conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn_b.commit()
+    finally:
+        b_db.close()
+    payload = b_path.read_bytes()
+
+    async def _rebuild_derived_noop(_backup: Path) -> None:
+        return None
+
+    monkeypatch.setattr(db_transfer, "_rebuild_derived", _rebuild_derived_noop)
+    app1 = _make_app(monkeypatch)
+    with TestClient(app1) as client1:
+        headers = _csrf_headers(client1)
+        resp = client1.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 200
+
+    direct = sqlite3.connect(config.db_path)
+    try:
+        pending = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
+        ).fetchone()
+    finally:
+        direct.close()
+    assert pending is not None and pending[0] == "pending", (
+        "setup check: the background task must have been suppressed, "
+        "leaving the promoted DB at pending ahead of the second boot"
+    )
+
+    close_db()
+    app2 = _make_app(monkeypatch)
+    with TestClient(app2) as client2:
+        status = client2.get("/api/worker/status").json()
+
+    assert status["import_rebuild_state"] == "done", (
+        "boot must resume an interrupted rebuild rather than leave it "
+        "pending forever (mutation check: removing app.py's boot-resume "
+        "call must turn this red)"
+    )
+    direct = sqlite3.connect(config.db_path)
+    try:
+        recomputed = direct.execute(
+            """
+            SELECT value FROM observations
+            WHERE site_id=? AND variable='temperature'
+              AND valid_at='2035-06-01T00:00:00Z'
+            """,
+            (site_b,),
+        ).fetchone()
+    finally:
+        direct.close()
+    assert recomputed is not None and recomputed[0] == 10.0, (
+        "the boot-resumed rebuild must actually recompute derived data "
+        "(elevation-matched -> 10.0), not just mark done without rebuilding"
+    )
+
+
+def test_import_background_rebuild_failure_records_failed_and_is_not_retried_on_reboot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild that raises from the post-import background task must be
+    recorded `failed`, with a sanitized reason, visible on
+    `/api/worker/status` -- and a later boot must not retry it.
+    """
+    _init_tmp_db(tmp_path)
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Failing Rebuild Site B")
+    payload = b_path.read_bytes()
+
+    calls: list[None] = []
+
+    def _raise_rebuild(_conn: sqlite3.Connection) -> None:
+        calls.append(None)
+        raise RuntimeError("synthetic rebuild failure")
+
+    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+
+    app1 = _make_app(monkeypatch)
+    with TestClient(app1) as client1:
+        headers = _csrf_headers(client1)
+        resp = client1.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 200, (
+            "the commit already succeeded by the time the background "
+            "rebuild fails -- the response must not turn into a 500 for it"
+        )
+        status1 = client1.get("/api/worker/status").json()
+
+    assert status1["import_rebuild_state"] == "failed"
+    assert status1["import_rebuild_error"] == "synthetic rebuild failure"
+    assert len(calls) == 1
+
+    close_db()
+    app2 = _make_app(monkeypatch)
+    with TestClient(app2) as client2:
+        status2 = client2.get("/api/worker/status").json()
+
+    assert status2["import_rebuild_state"] == "failed", (
+        "a failed rebuild must not be silently reset or retried on reboot"
+    )
+    assert status2["import_rebuild_error"] == "synthetic rebuild failure"
+    assert len(calls) == 1, (
+        "a subsequent boot must not retry a failed rebuild (mutation "
+        "check: resuming on failed as well as pending must turn this red)"
+    )
+
+
+def test_boot_resume_rebuild_failure_records_failed_without_crashing_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same failure handling, exercised from the OTHER entry point: a
+    rebuild raising during the boot-time resume itself -- not the
+    background task -- must still land `failed`, must not crash app
+    startup, and must not be retried on a later boot either. This is the
+    path that would fail startup outright without run_rebuild_all's own
+    try/except around the rebuild.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Boot Failure Site A")
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+        ("import_rebuild_state", "pending"),
+    )
+    conn.commit()
+    close_db()
+
+    calls: list[None] = []
+
+    def _raise_rebuild(_conn: sqlite3.Connection) -> None:
+        calls.append(None)
+        raise RuntimeError("synthetic rebuild failure")
+
+    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+
+    app1 = _make_app(monkeypatch)
+    with TestClient(app1) as client1:
+        status1 = client1.get("/api/worker/status").json()
+
+    assert status1["import_rebuild_state"] == "failed", (
+        "a rebuild failing during boot-resume must still land failed, not "
+        "stay stuck pending"
+    )
+    assert status1["import_rebuild_error"] == "synthetic rebuild failure"
+    assert len(calls) == 1
+
+    close_db()
+    app2 = _make_app(monkeypatch)
+    with TestClient(app2) as client2:
+        status2 = client2.get("/api/worker/status").json()
+
+    assert status2["import_rebuild_state"] == "failed"
+    assert status2["import_rebuild_error"] == "synthetic rebuild failure"
+    assert len(calls) == 1, (
+        "a failed rebuild recorded by the boot path must not be retried "
+        "on yet another boot either"
+    )
+
+
+def test_promotion_interrupted_before_further_writes_boots_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between the atomic rename (connection.py's `os.replace`,
+    `_replace_sync`'s commit point) and anything that runs after it --
+    sidecar cleanup, reopen, migration -- must still leave the promoted DB
+    reading `pending` on the next boot, with no foreign completion stamp
+    trusted. `_stage_pending_rebuild_state` writes that marker into the
+    STAGED file before the rename, precisely so nothing after the rename
+    has to run for the guarantee to hold.
+    """
+    _init_tmp_db(tmp_path)
+    close_db()
+
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Crash Site B")
+    _seed_foreign_rebuild_state(b_path)
+    db_transfer._stage_pending_rebuild_state(b_path)
+
+    # The exact call connection.py's _replace_sync makes at its commit
+    # point, run directly and left there: nothing that normally follows it
+    # (sidecar unlink, reopen, migrate) is allowed to run before the
+    # assertions below.
+    os.replace(b_path, config.db_path)
+
+    direct = sqlite3.connect(config.db_path)
+    try:
+        state = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
+        ).fetchone()
+        done_at = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_done_at'"
+        ).fetchone()
+        error = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_error'"
+        ).fetchone()
+    finally:
+        direct.close()
+
+    assert state is not None and state[0] == "pending", (
+        "the promoted file must read pending even though nothing ran "
+        "after the rename -- the marker was staged before it, not after"
+    )
+    assert done_at is None, (
+        "no foreign completion stamp may be trusted, even across a crash "
+        "that skipped every step after the rename"
+    )
+    assert error is None
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        status = client.get("/api/worker/status").json()
+
+    assert status["import_rebuild_state"] == "done", (
+        "boot must still resume and complete the rebuild the crash "
+        "interrupted, from a promoted file that never saw a reopen or "
+        "migration pass before this boot's own"
+    )
+
+
+def _inject_correlated_rebuild_and_mark_failed_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[None]:
+    """Make `_rebuild_all` AND the separate mark-failed upsert raise the
+    SAME fault -- a genuinely correlated failure (disk full, an I/O error,
+    corruption) rather than two unrelated injected faults: whatever breaks
+    the rebuild transaction is exactly what then breaks the tiny write that
+    would otherwise record `failed`. The `set_runtime_state` wrapper only
+    intercepts the specific `("import_rebuild_state", "failed")` call the
+    mark-failed closure makes, so `_stage_pending_rebuild_state`'s own
+    `"pending"` write during upload keeps working -- an import must still
+    be able to reach the rebuild step in the first place.
+
+    Returns the list each `_rebuild_all` call appends to, so a caller that
+    cares about retry counts across repeated boots can assert on it; a
+    caller that only cares about survival can ignore the return value.
+    """
+    calls: list[None] = []
+
+    def _raise_rebuild(_conn: sqlite3.Connection) -> None:
+        calls.append(None)
+        raise sqlite3.OperationalError("database or disk is full")
+
+    real_set_runtime_state = db_transfer.set_runtime_state
+
+    def _set_runtime_state_or_raise(
+        conn: sqlite3.Connection, key: str, value: str
+    ) -> None:
+        if key == "import_rebuild_state" and value == "failed":
+            raise sqlite3.OperationalError("database or disk is full")
+        real_set_runtime_state(conn, key, value)
+
+    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+    monkeypatch.setattr(db_transfer, "set_runtime_state", _set_runtime_state_or_raise)
+    return calls
+
+
+def test_boot_resume_survives_when_rebuild_and_mark_failed_both_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A CORRELATED failure -- the same fault breaks both `_rebuild_all` and
+    the separate write that would record `failed` -- must not crash
+    startup. Before the fix, the second write's exception propagated out of
+    `lifespan`'s boot-resume call bare: the app never started, state stayed
+    `pending`, so the next boot resumed, hit the same fault, and died again
+    -- a permanent crash loop. The fix's `try/except` must leave
+    `import_rebuild_state` at `pending` (not `failed`, not absent) so a
+    boot after the underlying fault clears can still retry, and it must
+    survive a REPEATED boot under the same persisting fault, not just once
+    -- with the rebuild genuinely RE-ATTEMPTED each boot, not merely left
+    alone (state/error staying `pending`/`None` is also exactly what a
+    boot-resume that silently never fires would produce). The inner
+    failure must also be logged: on `/api/worker/status`, this correlated
+    failure reads identically to a rebuild that is simply in flight or not
+    yet started, so the log line is the only signal that distinguishes it.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Boot Correlated Failure Site A")
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+        ("import_rebuild_state", "pending"),
+    )
+    conn.commit()
+    close_db()
+
+    calls = _inject_correlated_rebuild_and_mark_failed_failure(monkeypatch)
+
+    app1 = _make_app(monkeypatch)
+    with (
+        caplog.at_level(logging.ERROR, logger="wxverify.api.routes.db_transfer"),
+        TestClient(app1) as client1,
+    ):
+        # Reaching here at all is the primary assertion -- pre-fix, the
+        # unprotected second write's exception propagated out of lifespan
+        # and startup never completed.
+        status1 = client1.get("/api/worker/status").json()
+
+    assert status1["import_rebuild_state"] == "pending", (
+        "state must stay pending when even the mark-failed write fails -- "
+        "not left at failed (which would never retry) and not absent"
+    )
+    assert status1["import_rebuild_error"] is None, (
+        "the mark-failed write is one transaction: since it raised before "
+        "committing, no partial reason may be recorded either"
+    )
+    assert len(calls) == 1, (
+        "the first boot must actually attempt the rebuild, not merely "
+        "leave the pre-seeded pending state untouched"
+    )
+
+    close_db()
+    app2 = _make_app(monkeypatch)
+    with (
+        caplog.at_level(logging.ERROR, logger="wxverify.api.routes.db_transfer"),
+        TestClient(app2) as client2,
+    ):
+        status2 = client2.get("/api/worker/status").json()
+
+    assert status2["import_rebuild_state"] == "pending", (
+        "a second boot under the same persisting fault must survive too -- "
+        "this is what closes the permanent crash-loop hazard, not a "
+        "one-time escape"
+    )
+    assert status2["import_rebuild_error"] is None
+    assert len(calls) == 2, (
+        "a second boot must RE-ATTEMPT the rebuild, not just survive with "
+        "state left untouched -- that retry is the entire justification "
+        "for leaving state at `pending` rather than `failed` (mutation "
+        "check: gating or removing app.py's boot-resume call must turn "
+        "this red while every assertion above still passes)"
+    )
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any(
+        r.getMessage() == "import: recording rebuild failure failed" for r in errors
+    ), (
+        "the mark-failed write's own failure must be logged -- it is the "
+        "only signal distinguishing this correlated failure from a "
+        "rebuild that is simply in flight or not yet started, since both "
+        "read identically as pending/None on /api/worker/status "
+        "(mutation check: reducing the inner except to `pass` must turn "
+        f"this red); got {[r.getMessage() for r in errors]}"
+    )
+
+
+def test_background_rebuild_sweeps_bak_files_when_rebuild_and_mark_failed_both_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same correlated failure, from the OTHER entry point: when the
+    post-import background task's rebuild AND its mark-failed write both
+    fail, `_rebuild_derived`'s background task must not raise -- otherwise
+    it skips the `sweep_bak_files` call that follows, leaking `.bak` files
+    unbounded across imports. This is silent: the import already returned
+    200 by the time the background task runs.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Site A")
+    conn.commit()
+    db_dir = Path(config.db_path).parent
+
+    # A stale .bak left by an earlier import cycle -- named to match
+    # `_BAK_RE` so a real sweep picks it up as a delete candidate.
+    stale_bak = db_dir / "wxverify-20200101-000000-deadbeefZ.db.bak"
+    stale_bak.write_bytes(b"stale backup from an earlier import cycle")
+
+    b_path = _build_replacement_db(tmp_path, "source-b.db", "Site B")
+    payload = b_path.read_bytes()
+
+    _inject_correlated_rebuild_and_mark_failed_failure(monkeypatch)
+
+    async def _run() -> None:
+        resp = await db_transfer.import_db(_stream_request([payload]))
+        assert resp.status_code == 200, (
+            "the swap already committed by the time the background "
+            "rebuild fails -- the response must not turn into a 500 for it"
+        )
+        # Must not raise: pre-fix, run_rebuild_all's unprotected second
+        # write propagated out of _rebuild_derived, which skipped the
+        # sweep_bak_files call below entirely.
+        await resp.background()
+
+    asyncio.run(_run())
+
+    direct = sqlite3.connect(config.db_path)
+    try:
+        state = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
+        ).fetchone()
+    finally:
+        direct.close()
+    assert state is not None and state[0] == "pending", (
+        "state must stay pending, matching the boot-resume path's contract"
+    )
+
+    assert not stale_bak.exists(), (
+        "sweep_bak_files must still run after a rebuild whose failure-"
+        "recording write also failed -- otherwise .bak files leak "
+        "unbounded across imports (mutation check: removing the fix's "
+        "try/except around the mark-failed write must turn this red, "
+        "since run_rebuild_all would then raise and _rebuild_derived "
+        "would skip the sweep call that deletes this stale file)"
+    )
+    backups = list(db_dir.glob("wxverify-*.db.bak"))
+    assert len(backups) == 1, (
+        f"exactly the new import's own backup should remain; got {backups}"
+    )
+
+
+def test_boot_resume_survives_when_sanitizing_the_rebuild_failure_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`sanitized_exception` itself can raise -- `urlsplit` rejects some
+    malformed strings that merely LOOK like a URL, e.g. a bracket that opens
+    an IPv6 host but never closes one, which a raw disk-I/O message could
+    plausibly contain. This is a DIFFERENT failure shape than the two tests
+    above: the mark-failed write itself is left fully working (the real
+    `set_runtime_state`, untouched), so the sanitizer call is unambiguously
+    the only thing that can break. Startup must still survive it, with
+    state left `pending` for a later retry, because `reason =
+    sanitized_exception(exc)` runs INSIDE the same inner try/except as the
+    write it feeds -- ahead of that write, not outside the guard.
+
+    Verified directly against error_sanitize.py:
+    ``sanitized_exception(sqlite3.OperationalError("disk I/O error near
+    http://[::1 while syncing"))`` raises ``ValueError: Invalid IPv6 URL``.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Boot Sanitizer Failure Site A")
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES (?, ?)",
+        ("import_rebuild_state", "pending"),
+    )
+    conn.commit()
+    close_db()
+
+    def _raise_rebuild(_conn: sqlite3.Connection) -> None:
+        raise sqlite3.OperationalError("disk I/O error near http://[::1 while syncing")
+
+    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        # Reaching here at all is the primary assertion -- if
+        # `sanitized_exception` ran outside the inner guard, its ValueError
+        # would propagate out of `lifespan`'s boot-resume call bare, same
+        # as an unprotected mark-failed write would.
+        status = client.get("/api/worker/status").json()
+
+    assert status["import_rebuild_state"] == "pending", (
+        "state must stay pending when the sanitizer itself raises -- the "
+        "mark-failed write is never reached, so nothing commits `failed` "
+        "(mutation check: moving the `sanitized_exception` call back "
+        "outside the inner try/except must turn this red, since its "
+        "ValueError would then escape run_rebuild_all entirely)"
+    )
+    assert status["import_rebuild_error"] is None, (
+        "no reason can have been recorded -- the write that would carry it never ran"
     )
 
 

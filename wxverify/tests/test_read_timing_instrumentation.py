@@ -378,6 +378,8 @@ _BASE_WORKER_STATUS_KEYS = frozenset(
         "worker_last_loop_at",
         "scheduler_last_tick_at",
         "import_rebuild_done_at",
+        "import_rebuild_state",
+        "import_rebuild_error",
         "last_completed_fetch_feed_at",
         "last_completed_fetch_obs_at",
         "last_completed_pair_and_score_at",

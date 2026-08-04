@@ -37,7 +37,7 @@ from wxverify.collection.budget import set_source_cap
 from wxverify.core.options import load_runtime_options
 from wxverify.db.connection import init_db
 from wxverify.db.queue import reclaim_all_stale
-from wxverify.db.runtime_state import set_runtime_state_now
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state_now
 from wxverify.settings.service import apply_plain_settings, set_rolling_window_days
 from wxverify.web.render import static_dir
 from wxverify.web.routes import router as web_router
@@ -132,6 +132,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             daily_call_limit=options.weathercom_daily_call_limit,
         )
     )
+    # An import's derived-table rebuild normally runs as a post-response
+    # background task; a process restart between the import response and
+    # that task's completion leaves it stuck at "pending". Resume it here,
+    # inline, before the worker starts -- never via the jobs queue, since
+    # the jobs queue itself depends on derived tables being rebuilt. It must
+    # also stay after the settings applied above (`set_rolling_window_days`,
+    # `apply_plain_settings`): the rebuild's `pair_and_score` reads `min_n`
+    # from settings, so resuming any earlier would rebuild against stale
+    # settings instead of this boot's configured values.
+    rebuild_state = await db.read(
+        lambda conn: get_runtime_state(conn, "import_rebuild_state")
+    )
+    if rebuild_state == "pending":
+        logger.info("startup: resuming interrupted import rebuild")
+        await db_transfer.run_rebuild_all()
     worker = asyncio.create_task(run_worker(db))
     logger.info("worker started")
     worker.add_done_callback(
