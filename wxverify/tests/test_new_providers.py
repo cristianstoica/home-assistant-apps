@@ -40,7 +40,7 @@ from wxverify.collection.forecast_fetcher import (
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.options import SECRET_ENV
 from wxverify.core.secrets import resolve_secret
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import (
     claim_next_job,
     complete,
@@ -310,8 +310,10 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
     assert job.status == "running"
 
     # Simulate run_worker's dispatch → complete/fail lifecycle
+    dispatch_db = get_db()
     try:
-        asyncio.run(dispatch(get_db(), job))
+        dispatch_writer = FencedWriter(dispatch_db, dispatch_db.generation)
+        asyncio.run(dispatch(dispatch_db, dispatch_writer, job))
         # dispatch returned normally → complete (correct impl)
         complete(conn, job.id)
     except Exception as exc:

@@ -12,7 +12,7 @@ from wxverify.api.errors import ApiError
 from wxverify.api.schemas import StationCreate, StationOut, StationUpdate
 from wxverify.collection.budget import reserve_budget
 from wxverify.core.secrets import resolve_secret
-from wxverify.db.connection import get_db
+from wxverify.db.connection import FencedWriter, get_db
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.obs.elevation import lookup_elevation_m
 from wxverify.obs.pws_adapter import validate_station
@@ -63,6 +63,14 @@ async def create_station(
     if not api_key:
         raise ApiError(503, "weathercom key is not configured")
 
+    # Bound to the generation this route's site_id read happens in, below:
+    # a database replace landing during either provider await (validate_station,
+    # lookup_elevation_m) is then rejected at the write instead of silently
+    # attaching this station to whatever now owns that site_id in the
+    # replacement database. Same disposition as the worker's (see
+    # worker.processor.run_worker).
+    writer = FencedWriter(get_db(), get_db().generation)
+
     def _reserve(conn: sqlite3.Connection) -> None:
         if (
             conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone()
@@ -72,10 +80,12 @@ async def create_station(
         check_domain_backoff(conn, source_domain("weathercom"))
         reserve_budget(conn, "weathercom", 1)
 
-    await get_db().write(_reserve)
+    await writer.write(_reserve)
     try:
         pws = await validate_station(body.pws_station_id, api_key)
     except httpx.HTTPStatusError as exc:
+        # Exempt: domain_backoffs is keyed by domain, not by site/station --
+        # no entity for a swap to contaminate, so this runs unfenced.
         next_attempt_at = await get_db().write(
             lambda conn, response=exc.response: record_http_backoff(conn, response)
         )
@@ -92,10 +102,12 @@ async def create_station(
         check_domain_backoff(conn, source_domain("open-meteo"))
         reserve_budget(conn, "open-meteo", 1)
 
-    await get_db().write(_reserve_elevation)
+    await writer.write(_reserve_elevation)
     try:
         dem = await lookup_elevation_m(pws.lat, pws.lon)
     except httpx.HTTPStatusError as exc:
+        # Exempt: domain_backoffs is keyed by domain, not by site/station --
+        # no entity for a swap to contaminate, so this runs unfenced.
         next_attempt_at = await get_db().write(
             lambda conn, response=exc.response: record_http_backoff(conn, response)
         )
@@ -130,7 +142,7 @@ async def create_station(
             raise RuntimeError("station insert failed")
         return _station_out(row)
 
-    station = await get_db().write(_write)
+    station = await writer.write(_write)
     if _wants_html(request):
         from wxverify.web.routes import render_station_cluster
 

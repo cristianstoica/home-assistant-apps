@@ -6,6 +6,7 @@ import logging
 import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar
 
 import httpx
 
@@ -14,6 +15,7 @@ from wxverify.collection.budget import (
     is_refundable_transport_error,
     refund_budget,
     reserve_budget,
+    write_after_reservation,
 )
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
@@ -21,7 +23,7 @@ from wxverify.collection.forecast_fetcher import (
 )
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import Database
+from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import (
@@ -39,6 +41,8 @@ from wxverify.worker.domain_backoff import (
 )
 
 AdapterBuilder = Callable[[str, httpx.AsyncClient], ForecastAdapter]
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -102,8 +106,24 @@ async def fetch_feed_once(
     site_id: int,
     feed_id: int,
     *,
+    writer: FencedWriter | None = None,
     adapter_builder: AdapterBuilder | None = None,
 ) -> FetchFeedOutcome:
+    """Fetch one feed's forecast and persist it.
+
+    ``writer`` fences every write here to the generation it was obtained at
+    (see ``worker.processor.run_worker``): a database replace landing
+    mid-fetch is then rejected instead of silently persisting against the
+    replacement database. ``writer=None`` (the CLI entry point's case) runs
+    plain, unfenced writes -- a one-shot operator command has no claimed
+    generation to fence against.
+    """
+
+    async def _write(fn: Callable[[sqlite3.Connection], T]) -> T:
+        if writer is not None:
+            return await writer.write(fn)
+        return await db.write(fn)
+
     adapter_builder = adapter_builder or build_adapter
     logger.debug("fetch_feed_once site=%s feed=%s", site_id, feed_id)
     target = await db.read(lambda conn: feed_fetch_target(conn, site_id, feed_id))
@@ -129,7 +149,7 @@ async def fetch_feed_once(
             cost.calls,
             cost.credits,
         )
-        reserve_outcome = await db.write(
+        reserve_outcome = await _write(
             lambda conn, tgt=target, estimate=cost: _reserve_feed_call(
                 conn, tgt, estimate
             )
@@ -160,10 +180,13 @@ async def fetch_feed_once(
         except httpx.HTTPStatusError as exc:
             error = sanitized_exception(exc)
             response = exc.response
-            next_attempt_at = await db.write(
+            next_attempt_at = await write_after_reservation(
+                db,
+                writer,
                 lambda conn, err=error, resp=response: mark_feed_error_and_backoff(
                     conn, target, err, resp
-                )
+                ),
+                reservation,
             )
             logger.debug(
                 "fetch http error site=%s feed=%s source=%s backoff=%s: %s",
@@ -179,10 +202,13 @@ async def fetch_feed_once(
         except Exception as exc:
             error = sanitized_exception(exc)
             refund = reservation if is_refundable_transport_error(exc) else None
-            await db.write(
+            await write_after_reservation(
+                db,
+                writer,
                 lambda conn, err=error, res=refund: _mark_feed_error_and_refund(
                     conn, target, err, res
-                )
+                ),
+                reservation,
             )
             logger.debug(
                 "fetch transport error site=%s feed=%s source=%s refund=%s: %s",
@@ -193,13 +219,16 @@ async def fetch_feed_once(
                 error,
             )
             raise
-    persist_outcome = await db.write(
+    persist_outcome = await write_after_reservation(
+        db,
+        writer,
         lambda conn, fetch_result=result: _persist_fetch_success(
             conn, target, fetch_result
-        )
+        ),
+        reservation,
     )
     if persist_outcome.inserted_count:
-        await db.write(
+        await _write(
             lambda conn: enqueue_if_absent(
                 conn, "pair_and_score", site_id, "score", {"site_id": site_id}
             )

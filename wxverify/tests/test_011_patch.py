@@ -16,7 +16,13 @@ from wxverify import config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.collection.budget import Reservation, refund_budget, reserve_budget
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import (
+    FencedWriter,
+    StaleGenerationError,
+    close_db,
+    get_db,
+    init_db,
+)
 from wxverify.db.queue import FailDisposition, Job
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobCancelled, JobDeferred
@@ -90,10 +96,15 @@ def _make_job(
 class _FakeDb:
     """Minimal shim for worker loop logging tests (passes None as conn)."""
 
+    generation = 0
+
     async def write(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]
+        return fn(None)
+
+    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
         return fn(None)
 
 
@@ -104,12 +115,41 @@ class _WriteCountDb:
         self._inner = inner
         self.count = 0
 
+    @property
+    def generation(self) -> int:
+        return self._inner.generation  # type: ignore[no-any-return]
+
     async def write(self, fn):  # type: ignore[no-untyped-def]
         self.count += 1
         return await self._inner.write(fn)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return await self._inner.read(fn)
+
+    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+        self.count += 1
+        return await self._inner.write_fenced(fn, generation=generation)
+
+
+class _GenerationFenceDb:
+    """Fake Database whose write_fenced enforces the same generation check
+    as the real one, with a `.generation` a test can bump mid-loop to
+    simulate a replace_from landing between a job's claim and its outcome
+    write -- without any real concurrency or a second sqlite file."""
+
+    def __init__(self) -> None:
+        self.generation = 0
+
+    async def write(self, fn):  # type: ignore[no-untyped-def]
+        return fn(None)
+
+    async def read(self, fn):  # type: ignore[no-untyped-def]
+        return fn(None)
+
+    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+        if generation != self.generation:
+            raise StaleGenerationError(generation, self.generation)
+        return fn(None)
 
 
 class _StopLoop(Exception):
@@ -478,7 +518,7 @@ def test_worker_generic_exception_logs_warning(
     """Dispatch raises → exactly one WARNING with job type and sanitized message."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _raise_runtime(db: Any, j: Job) -> None:
+    async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("synthetic provider failure")
 
     def _retry_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
@@ -513,7 +553,7 @@ def test_worker_terminal_failure_logs_error(
     """Retries exhausted → ERROR record (not WARNING)."""
     job = _make_job(job_type="fetch_feed", site_id=42, retry_count=5, max_retries=5)
 
-    async def _raise_runtime(db: Any, j: Job) -> None:
+    async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal failure")
 
     def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
@@ -553,7 +593,7 @@ def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _defer(db: Any, j: Job) -> None:
+    async def _defer(db: Any, writer: Any, j: Job) -> None:
         raise JobDeferred("2099-01-01T00:00:00.000Z")
 
     _patch_worker_infra(monkeypatch)
@@ -600,6 +640,79 @@ def test_worker_deferred_job_cycle_line_info_deferred_line_debug(
     )
 
 
+_STALE_GENERATION_OUTCOMES = ("success", "deferred", "cancelled", "failure")
+
+
+@pytest.mark.parametrize("outcome_kind", _STALE_GENERATION_OUTCOMES)
+def test_worker_loop_survives_a_stale_generation_on_every_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome_kind: str,
+) -> None:
+    """A database replace landing between a job's claim and its outcome
+    write must abandon only that one job, never the worker loop -- for
+    every one of the four ways dispatch can finish (plain return,
+    JobDeferred, JobCancelled, or an ordinary failure).
+
+    'failure' is the case that actually kills the loop if the fence's catch
+    is a sibling `except` arm instead of one wrapping the whole per-job
+    try/except: the write that trips the fence happens inside `except
+    Exception`'s own body, so only a handler around the entire statement --
+    never a sibling of it -- can ever see the exception it raises. 'success'
+    would misleadingly still pass under that same bug, since its triggering
+    write sits directly in the try body a sibling handler does reach.
+    """
+    job1 = _make_job(job_type="fetch_feed", site_id=42, job_id=1)
+    job2 = _make_job(job_type="fetch_feed", site_id=43, job_id=2)
+    pending_jobs = [job1, job2]
+
+    def _claim(conn: Any) -> Job | None:
+        if pending_jobs:
+            return pending_jobs.pop(0)
+        raise _StopLoop()
+
+    dispatched_ids: list[int] = []
+
+    async def _fake_dispatch(db_arg: Any, writer_arg: Any, job_arg: Job) -> None:
+        dispatched_ids.append(job_arg.id)
+        if job_arg.id == 1:
+            db_arg.generation += 1
+            if outcome_kind == "success":
+                return None
+            if outcome_kind == "deferred":
+                raise JobDeferred("2099-01-01T00:00:00.000Z")
+            if outcome_kind == "cancelled":
+                raise JobCancelled()
+            raise RuntimeError("synthetic failure for the generation-fence oracle")
+        return None
+
+    completed: list[int] = []
+    _patch_worker_infra(monkeypatch)
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim)
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _fake_dispatch)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.complete", lambda c, jid: completed.append(jid)
+    )
+
+    with (
+        caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
+        pytest.raises(_StopLoop),
+    ):
+        asyncio.run(run_worker(_GenerationFenceDb()))  # type: ignore[arg-type]
+
+    # The loop reached job 2 and completed it normally -- proof the stale
+    # write on job 1 abandoned only job 1, not the loop itself.
+    assert dispatched_ids == [1, 2]
+    assert completed == [2], (
+        "job 1's outcome write must never run once its generation is stale"
+    )
+
+    abandoned = [r for r in caplog.records if "job abandoned" in r.getMessage()]
+    assert len(abandoned) == 1
+    assert abandoned[0].levelno == logging.INFO
+    assert "id=1" in abandoned[0].getMessage()
+
+
 def test_domain_backoff_429_logs_warning_with_domain_and_retry(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -625,7 +738,7 @@ def test_worker_url_secrets_redacted_in_logs(
     """key= and appid= params must be redacted from all log records."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _raise_with_secret_url(db: Any, j: Job) -> None:
+    async def _raise_with_secret_url(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError(
             "Request to https://api.example.com/forecast"
             "?key=SYNTHETIC-SECRET&appid=SYNTHETIC-SECRET failed"
@@ -692,9 +805,10 @@ def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(
     site_id = _insert_site(conn)
     db = get_db()
     spy = _WriteCountDb(db)
+    writer = FencedWriter(spy, spy.generation)  # type: ignore[arg-type]
 
     job = _make_job(job_type="pair_and_score", site_id=site_id)
-    asyncio.run(dispatch(spy, job))  # type: ignore[arg-type]
+    asyncio.run(dispatch(spy, writer, job))  # type: ignore[arg-type]
 
     assert spy.count >= 4, f"Expected ≥4 write transactions, got {spy.count}"
 
@@ -722,8 +836,9 @@ def test_pair_and_score_stops_when_site_disabled_between_phases(
     )
 
     job = _make_job(job_type="pair_and_score", site_id=site_id)
+    writer = FencedWriter(db, db.generation)
     with pytest.raises(JobCancelled):
-        asyncio.run(dispatch(db, job))
+        asyncio.run(dispatch(db, writer, job))
 
     assert phases_called == [0], (
         "phase 0 must run; phase 1 must be blocked by the enabled gate"

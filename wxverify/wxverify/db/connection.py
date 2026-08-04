@@ -66,6 +66,25 @@ def _read_label(fn: object) -> str:
     return label if code is None else f"{label}:{code.co_firstlineno}"
 
 
+class StaleGenerationError(Exception):
+    """A fenced write's captured generation no longer matches the live database.
+
+    Raised by ``Database.write_fenced`` when the database has been replaced
+    (see ``replace_from``) since the caller captured ``Database.generation``.
+    Whatever the caller read before is no longer known to describe the
+    current database, so the write is rejected outright instead of risking
+    it landing against unrelated data.
+    """
+
+    def __init__(self, requested: int, current: int) -> None:
+        super().__init__(
+            f"write rejected: requested generation {requested}, "
+            f"database is now at generation {current}"
+        )
+        self.requested_generation = requested
+        self.current_generation = current
+
+
 class Database:
     def __init__(self, path: str) -> None:
         config.ensure_parent_dir(path)
@@ -177,6 +196,38 @@ class Database:
             # types, so a bare method reference loses the binding between
             # its own T and this T. Closing over the already-bound `fn`
             # here resolves `_run_immediate`'s T against it first.
+            def _call() -> T:
+                return self._run_immediate(fn)
+
+            return await run_to_completion(_call)
+
+    @property
+    def generation(self) -> int:
+        """Generation counter, bumped by ``replace_from`` after each reopen.
+
+        Safe to read from the event loop with no lock: it is only ever
+        mutated while ``_write_lock`` is held (inside ``_replace_sync``), and
+        ``write_fenced`` re-checks it again under that same lock at write
+        time. An unlocked read here is just an optimistic snapshot for the
+        caller's own bookkeeping -- the actual guarantee comes from the
+        locked recheck, not from this read.
+        """
+        return self._generation
+
+    async def write_fenced(
+        self, fn: Callable[[sqlite3.Connection], T], *, generation: int
+    ) -> T:
+        """Like ``write``, but rejects a write submitted against a generation
+        the database has since moved past.
+
+        The comparison happens after acquiring the write lock, not before:
+        a ``replace_from`` racing the caller between its generation read and
+        this call is exactly what the lock boundary is meant to close.
+        """
+        async with self._write_lock:
+            if generation != self._generation:
+                raise StaleGenerationError(generation, self._generation)
+
             def _call() -> T:
                 return self._run_immediate(fn)
 
@@ -472,6 +523,25 @@ class Database:
     def _unlink_sidecars(self) -> None:
         for suffix in ("-wal", "-shm"):
             Path(f"{self.path}{suffix}").unlink(missing_ok=True)
+
+
+class FencedWriter:
+    """A write handle bound to one ``Database`` generation.
+
+    Obtained once (via ``Database.generation``) at the point a caller's read
+    is known to be current, then threaded through everything downstream that
+    writes based on that read. Every write through this handle is rejected
+    with ``StaleGenerationError`` if the database has since been replaced;
+    reads are unaffected by generation and keep using ``Database.read``
+    directly.
+    """
+
+    def __init__(self, db: Database, generation: int) -> None:
+        self._db = db
+        self.generation = generation
+
+    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        return await self._db.write_fenced(fn, generation=self.generation)
 
 
 def init_db(path: str | None = None) -> Database:

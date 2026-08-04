@@ -23,7 +23,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Final
 
-from wxverify.db.connection import Database
+from wxverify.db.connection import FencedWriter
 from wxverify.scoring.engine import (
     ScoreCell,
     ScoreWindow,
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 
 async def run_batched_scoring(
-    db: Database,
+    writer: FencedWriter,
     site_id: int,
     on_batch_committed: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
@@ -71,7 +71,7 @@ async def run_batched_scoring(
     transaction commits; production callers leave it ``None``.
     """
     started = time.monotonic()
-    work = await db.write(lambda conn: discover_score_work(conn, site_id))
+    work = await writer.write(lambda conn: discover_score_work(conn, site_id))
     total_cells = sum(len(window.cells) for window in work.windows)
     logger.info(
         "score discovery site=%s cells=%s elapsed=%.1fs",
@@ -84,7 +84,7 @@ async def run_batched_scoring(
         batches = 0
         for start in range(0, len(window.cells), SCORE_BATCH_CELLS):
             batch = window.cells[start : start + SCORE_BATCH_CELLS]
-            await db.write(
+            await writer.write(
                 lambda conn, w=window, b=batch: _score_batch_if_enabled(
                     conn, site_id, work, w, b
                 )
@@ -101,7 +101,7 @@ async def run_batched_scoring(
             time.monotonic() - window_started,
         )
     sweep_started = time.monotonic()
-    removed = await db.write(
+    removed = await writer.write(
         lambda conn: _sweep_if_enabled(conn, site_id, work.run_stamp)
     )
     logger.info(

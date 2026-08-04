@@ -14,6 +14,7 @@ from wxverify.collection.budget import (
     is_refundable_transport_error,
     refund_budget,
     reserve_budget,
+    write_after_reservation,
 )
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
@@ -22,7 +23,7 @@ from wxverify.collection.forecast_fetcher import (
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
-from wxverify.db.connection import Database
+from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
@@ -81,8 +82,11 @@ class ForecastTarget:
 
 
 async def run_catchup(
-    db: Database, payload: dict[str, object]
+    db: Database, writer: FencedWriter, payload: dict[str, object]
 ) -> JobContinuation | None:
+    # Exempt: scheduler_tick reads its own due-queries fresh and writes them
+    # in the same transaction -- self-contained, not a read this job captured
+    # earlier that a swap could make stale.
     await db.write(scheduler_tick)
     plan = await db.read(lambda conn: _catchup_plan(conn, payload))
     sites, has_more = await db.read(
@@ -98,11 +102,13 @@ async def run_catchup(
     for site in sites:
         logger.debug("catchup site start site=%s", site.site_id)
         try:
-            changed = await _catchup_site(db, site, plan)
+            changed = await _catchup_site(db, writer, site, plan)
         except JobDeferred:
             raise
         except (JobCancelled, sqlite3.IntegrityError):
             continue
+        except StaleGenerationError:
+            raise
         except Exception:
             continue
         logger.debug("catchup site result site=%s changed=%s", site.site_id, changed)
@@ -122,8 +128,8 @@ async def run_catchup(
         # ensures one vanished site does not abort rescoring the others.
         try:
             for phase in PAIR_PHASES:
-                await db.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
-            await run_batched_scoring(db, site_id)
+                await writer.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
+            await run_batched_scoring(writer, site_id)
         except (JobCancelled, sqlite3.IntegrityError):
             continue
     if has_more and sites:
@@ -138,26 +144,33 @@ async def run_catchup(
             },
         )
     logger.debug("catchup complete through=%s", isoformat_utc(plan.window_end))
-    await db.write(
+    await writer.write(
         lambda conn: _mark_catchup_complete(conn, isoformat_utc(plan.window_end))
     )
     return None
 
 
-async def _catchup_site(db: Database, site: CatchupSite, plan: CatchupPlan) -> bool:
+async def _catchup_site(
+    db: Database, writer: FencedWriter, site: CatchupSite, plan: CatchupPlan
+) -> bool:
     window_start = isoformat_utc(plan.window_start)
     window_end = isoformat_utc(plan.window_end)
     station_changed = await _fetch_missing_station_history(
-        db, site, window_start=window_start, window_end=window_end
+        db, writer, site, window_start=window_start, window_end=window_end
     )
     forecast_written = await _fetch_due_open_meteo(
-        db, site, window_start=window_start, window_end=window_end
+        db, writer, site, window_start=window_start, window_end=window_end
     )
     return station_changed or forecast_written > 0
 
 
 async def _fetch_missing_station_history(
-    db: Database, site: CatchupSite, *, window_start: str, window_end: str
+    db: Database,
+    writer: FencedWriter,
+    site: CatchupSite,
+    *,
+    window_start: str,
+    window_end: str,
 ) -> bool:
     api_key = resolve_secret("weathercom")
     if not api_key:
@@ -181,7 +194,7 @@ async def _fetch_missing_station_history(
                     site.site_id,
                     station.id,
                 )
-                reservation = await db.write(
+                reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site.site_id, station_id
                     )
@@ -198,10 +211,13 @@ async def _fetch_missing_station_history(
                 except httpx.HTTPStatusError as exc:
                     error = sanitized_exception(exc)
                     response = exc.response
-                    next_attempt_at = await db.write(
+                    next_attempt_at = await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error, resp=response: (
                             _mark_station_error_and_backoff(conn, station_id, err, resp)
-                        )
+                        ),
+                        reservation,
                     )
                     if next_attempt_at is not None:
                         raise JobDeferred(next_attempt_at) from exc
@@ -209,25 +225,36 @@ async def _fetch_missing_station_history(
                 except Exception as exc:
                     error = sanitized_exception(exc)
                     refund = reservation if is_refundable_transport_error(exc) else None
-                    await db.write(
+                    await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error, res=refund: (
                             _mark_station_error_and_refund(conn, station_id, err, res)
-                        )
+                        ),
+                        reservation,
                     )
                     raise
-                station_changed = await db.write(
+                station_changed = await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, station_id=station.id, rows=observations: (
                         _persist_station_observations(
                             conn, site.site_id, station_id, rows
                         )
-                    )
+                    ),
+                    reservation,
                 )
                 changed = changed or station_changed
     return changed
 
 
 async def _fetch_due_open_meteo(
-    db: Database, site: CatchupSite, *, window_start: str, window_end: str
+    db: Database,
+    writer: FencedWriter,
+    site: CatchupSite,
+    *,
+    window_start: str,
+    window_end: str,
 ) -> int:
     targets = await db.read(
         lambda conn: _due_open_meteo_targets(
@@ -253,7 +280,7 @@ async def _fetch_due_open_meteo(
                 max_lead_hours=target.max_lead_hours,
             )
             cost = adapter.estimate_cost(req)
-            reservation = await db.write(
+            reservation = await writer.write(
                 lambda conn, feed=target, reserve=cost: _reserve_feed_call(
                     conn, feed, reserve
                 )
@@ -265,10 +292,13 @@ async def _fetch_due_open_meteo(
             except httpx.HTTPStatusError as exc:
                 error = sanitized_exception(exc)
                 response = exc.response
-                next_attempt_at = await db.write(
+                next_attempt_at = await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, feed=target, err=error, resp=response: (
                         _mark_feed_error_and_backoff(conn, feed, err, resp)
-                    )
+                    ),
+                    reservation,
                 )
                 if next_attempt_at is not None:
                     raise JobDeferred(next_attempt_at) from exc
@@ -276,18 +306,24 @@ async def _fetch_due_open_meteo(
             except Exception as exc:
                 error = sanitized_exception(exc)
                 refund = reservation if is_refundable_transport_error(exc) else None
-                await db.write(
+                await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, feed=target, err=error, res=refund: (
                         _mark_feed_error_and_refund(conn, feed, err, res)
-                    )
+                    ),
+                    reservation,
                 )
                 continue
             if result is None:
                 continue
-            outcome = await db.write(
+            outcome = await write_after_reservation(
+                db,
+                writer,
                 lambda conn, feed=target, fetched=result: (
                     _persist_historical_fetch_success(conn, feed, fetched)
-                )
+                ),
+                reservation,
             )
             written += outcome.inserted_count
     return written

@@ -130,7 +130,7 @@ def test_cancellation_reclaims_claimed_job(
 
     block = asyncio.Event()
 
-    async def _blocked_dispatch(_db: Any, _job: Any) -> None:
+    async def _blocked_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
         await block.wait()
 
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _blocked_dispatch)
@@ -168,7 +168,7 @@ def test_cancellation_reraises_not_swallowed(
 
     block = asyncio.Event()
 
-    async def _blocked_dispatch(_db: Any, _job: Any) -> None:
+    async def _blocked_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
         await block.wait()
 
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _blocked_dispatch)
@@ -292,7 +292,7 @@ def test_lifespan_shutdown_reclaims_claimed_job(
 
     block = asyncio.Event()
 
-    async def _blocked_dispatch(_db: Any, _job: Any) -> None:
+    async def _blocked_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
         await block.wait()
 
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _blocked_dispatch)

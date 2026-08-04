@@ -17,11 +17,12 @@ from wxverify.collection.budget import (
     is_refundable_transport_error,
     refund_budget,
     reserve_budget,
+    write_after_reservation,
 )
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import Database
+from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.queue import (
     Job,
     claim_next_job,
@@ -94,6 +95,10 @@ async def run_worker(db: Database) -> None:
             last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
                 db, "worker_last_loop_at", last_worker_heartbeat_at, now
             )
+            # Exempt: scheduler_tick, the housekeeping purge, and the claim
+            # itself all run once per loop iteration with no job-scoped read
+            # behind them yet -- there is no generation to fence any of this
+            # against until a job is actually claimed, below.
             await db.write(scheduler_tick)
             now = time.monotonic()
             last_scheduler_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
@@ -111,83 +116,111 @@ async def run_worker(db: Database) -> None:
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
             job_id = job.id
+            # Captured immediately after the claim, before any await that
+            # could let an import replace the database out from under this
+            # job: every write below goes through `writer`, fenced to this
+            # generation, so one that lands after a swap is rejected instead
+            # of silently landing against whatever now owns this job's rows.
+            writer = FencedWriter(db, db.generation)
             claimed_at = time.monotonic()
             logger.info(
                 "job claimed id=%s type=%s site=%s", job.id, job.type, job.site_id
             )
             outcome = "completed"
             try:
-                continuation = await dispatch(db, job)
-                await db.write(lambda conn, jid=job_id: complete(conn, jid))
-                logger.debug(
-                    "job completed id=%s type=%s site=%s", job.id, job.type, job.site_id
-                )
-                if continuation is not None:
-                    await db.write(
-                        lambda conn, cont=continuation: enqueue_if_absent(
-                            conn,
-                            cont.job_type,
-                            cont.site_id,
-                            cont.job_key,
-                            cont.payload,
+                try:
+                    continuation = await dispatch(db, writer, job)
+                    await writer.write(lambda conn, jid=job_id: complete(conn, jid))
+                    logger.debug(
+                        "job completed id=%s type=%s site=%s",
+                        job.id,
+                        job.type,
+                        job.site_id,
+                    )
+                    if continuation is not None:
+                        await writer.write(
+                            lambda conn, cont=continuation: enqueue_if_absent(
+                                conn,
+                                cont.job_type,
+                                cont.site_id,
+                                cont.job_key,
+                                cont.payload,
+                            )
+                        )
+                except JobDeferred as exc:
+                    outcome = "deferred"
+                    next_attempt_at = exc.next_attempt_at
+                    await writer.write(
+                        lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
+                            conn, jid, attempt
                         )
                     )
-            except JobDeferred as exc:
-                outcome = "deferred"
-                next_attempt_at = exc.next_attempt_at
-                await db.write(
-                    lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
-                        conn, jid, attempt
+                    logger.debug(
+                        "job deferred id=%s type=%s site=%s until=%s",
+                        job.id,
+                        job.type,
+                        job.site_id,
+                        next_attempt_at,
                     )
-                )
-                logger.debug(
-                    "job deferred id=%s type=%s site=%s until=%s",
+                except JobCancelled:
+                    outcome = "cancelled"
+                    await writer.write(lambda conn, jid=job_id: complete(conn, jid))
+                except StaleGenerationError:
+                    raise
+                except Exception as exc:
+                    if _is_process_fatal_permission_error(exc):
+                        logger.critical(
+                            "fatal OS permission error while processing job id=%s "
+                            "type=%s; terminating worker for process restart",
+                            job.id,
+                            job.type,
+                            exc_info=True,
+                        )
+                        raise
+                    message = sanitized_exception(exc)
+                    disposition = await writer.write(
+                        lambda conn, jid=job_id, err=message: fail(conn, jid, err)
+                    )
+                    if disposition is not None and disposition.terminal:
+                        outcome = "failed"
+                        logger.error(
+                            "job failed permanently id=%s type=%s site=%s "
+                            "attempts=%d/%d: %s",
+                            job.id,
+                            job.type,
+                            job.site_id,
+                            disposition.retry_count,
+                            disposition.max_retries,
+                            message,
+                        )
+                    else:
+                        outcome = "retry"
+                        logger.warning(
+                            "job failed id=%s type=%s site=%s attempt=%s/%s "
+                            "next=%s: %s",
+                            job.id,
+                            job.type,
+                            job.site_id,
+                            disposition.retry_count if disposition else "?",
+                            disposition.max_retries if disposition else "?",
+                            disposition.next_attempt_at if disposition else "?",
+                            message,
+                        )
+            except StaleGenerationError:
+                # The database was replaced (an import landed) after this
+                # job's data was read. Every row this job knows about
+                # belongs to the discarded generation, so no further write
+                # is safe here -- not even fail(): the job id itself may now
+                # belong to something else. The replacement database has its
+                # own jobs table and its own scheduler/reclaim to govern it.
+                outcome = "stale_generation"
+                logger.info(
+                    "job abandoned id=%s type=%s site=%s: database was "
+                    "replaced after this job's data was read",
                     job.id,
                     job.type,
                     job.site_id,
-                    next_attempt_at,
                 )
-            except JobCancelled:
-                outcome = "cancelled"
-                await db.write(lambda conn, jid=job_id: complete(conn, jid))
-            except Exception as exc:
-                if _is_process_fatal_permission_error(exc):
-                    logger.critical(
-                        "fatal OS permission error while processing job id=%s type=%s; "
-                        "terminating worker for process restart",
-                        job.id,
-                        job.type,
-                        exc_info=True,
-                    )
-                    raise
-                message = sanitized_exception(exc)
-                disposition = await db.write(
-                    lambda conn, jid=job_id, err=message: fail(conn, jid, err)
-                )
-                if disposition is not None and disposition.terminal:
-                    outcome = "failed"
-                    logger.error(
-                        "job failed permanently id=%s type=%s site=%s "
-                        "attempts=%d/%d: %s",
-                        job.id,
-                        job.type,
-                        job.site_id,
-                        disposition.retry_count,
-                        disposition.max_retries,
-                        message,
-                    )
-                else:
-                    outcome = "retry"
-                    logger.warning(
-                        "job failed id=%s type=%s site=%s attempt=%s/%s next=%s: %s",
-                        job.id,
-                        job.type,
-                        job.site_id,
-                        disposition.retry_count if disposition else "?",
-                        disposition.max_retries if disposition else "?",
-                        disposition.next_attempt_at if disposition else "?",
-                        message,
-                    )
             logger.info(
                 "cycle: job=%s type=%s site=%s outcome=%s elapsed=%.1fs",
                 job.id,
@@ -198,6 +231,8 @@ async def run_worker(db: Database) -> None:
             )
     except asyncio.CancelledError:
         try:
+            # Exempt: a shutdown-time bulk sweep over whatever jobs the
+            # live database currently holds, not tied to any one job's read.
             await db.write(reclaim_all_stale)
         except Exception:
             logger.warning("shutdown reclaim failed", exc_info=True)
@@ -210,6 +245,8 @@ async def _maybe_stamp_runtime_heartbeat(
     if last_stamp_at > 0 and now - last_stamp_at < RUNTIME_HEARTBEAT_INTERVAL_SECONDS:
         return last_stamp_at
     try:
+        # Exempt: a single global runtime_state heartbeat stamp, called from
+        # the loop between jobs -- no job-scoped read behind it.
         await db.write(
             lambda conn, state_key=key: set_runtime_state_now(conn, state_key)
         )
@@ -218,7 +255,9 @@ async def _maybe_stamp_runtime_heartbeat(
     return now
 
 
-async def dispatch(db: Database, job: Job) -> JobContinuation | None:
+async def dispatch(
+    db: Database, writer: FencedWriter, job: Job
+) -> JobContinuation | None:
     logger.debug("dispatch type=%s site=%s", job.type, job.site_id)
     if job.type == "pair_and_score":
         site_id = job.site_id
@@ -251,14 +290,16 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         #       are safe.
         # One writer lane sits outside (a)/(b): Database.replace_from
         # (POST /api/import/db) holds both locks and can swap the ENTIRE
-        # database file between any two transactions here — accepted, not a
-        # defect: the per-batch enabled guard covers the common
-        # site-vanished-after-import case (JobCancelled); the residue (site
-        # present in the imported DB but a feed_id absent) surfaces as an FK
-        # IntegrityError and fails the job; a sweep that strips imported
-        # export-time stamps merely leaves the affected windows 'rebuilding'.
-        # Every path heals through the import route's own _rebuild_derived
-        # background task.
+        # database file between any two transactions here. Every write in
+        # this split goes through `writer`, fenced to the generation this
+        # job's site_id was read in (see run_worker), so a swap landing here
+        # is caught deterministically at the next write attempt -- before it
+        # can run against the replacement database -- and StaleGenerationError
+        # propagates out of this job, which is then abandoned rather than
+        # completed, failed, or retried (see run_worker's outer handler). The
+        # importer's own _rebuild_derived background task rebuilds scoring
+        # from scratch, so an abandoned mid-split job leaves nothing for it
+        # to converge with.
         #
         # The batching subdivides only the LAST phase (scoring), whose inputs
         # are written by the earlier phases of the SAME job. Run-stamp/sweep
@@ -274,7 +315,7 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         # completes and does not affect the midnight staleness contract.
         for phase in PAIR_PHASES:
             phase_started = time.monotonic()
-            await db.write(
+            await writer.write(
                 lambda conn, run=phase: _run_score_phase_if_enabled(conn, site_id, run)
             )
             logger.info(
@@ -283,13 +324,13 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
                 site_id,
                 time.monotonic() - phase_started,
             )
-        await run_batched_scoring(db, site_id)
+        await run_batched_scoring(writer, site_id)
         return None
     if job.type == "fetch_obs":
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        await _fetch_obs(db, site_id)
+        await _fetch_obs(db, writer, site_id)
         return None
     if job.type == "fetch_current_obs":
         site_id = job.site_id
@@ -298,7 +339,7 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         station_id = _payload_int(job.payload, "station_id")
         if station_id is None:
             raise JobCancelled()
-        await _fetch_current_obs(db, site_id, station_id)
+        await _fetch_current_obs(db, writer, site_id, station_id)
         return None
     if job.type == "fetch_feed":
         site_id = job.site_id
@@ -307,15 +348,15 @@ async def dispatch(db: Database, job: Job) -> JobContinuation | None:
         feed_id = _payload_int(job.payload, "feed_id")
         if feed_id is None:
             raise JobCancelled()
-        await _fetch_feed(db, site_id, feed_id)
+        await _fetch_feed(db, writer, site_id, feed_id)
         return None
     if job.type == "backfill_site":
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        return await run_backfill_site(db, site_id, job.payload)
+        return await run_backfill_site(db, writer, site_id, job.payload)
     if job.type == "catchup":
-        return await run_catchup(db, job.payload)
+        return await run_catchup(db, writer, job.payload)
     raise RuntimeError(f"unknown job type {job.type}")
 
 
@@ -330,7 +371,7 @@ def _run_score_phase_if_enabled(
     phase(conn, site_id)
 
 
-async def _fetch_obs(db: Database, site_id: int) -> None:
+async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
     api_key = resolve_secret("weathercom")
     if not api_key:
         raise RuntimeError("weathercom key is not configured")
@@ -353,7 +394,7 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                 index,
             )
             async with limiter:
-                reservation = await db.write(
+                reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_obs_call(
                         conn, site_id, station_id
                     )
@@ -369,10 +410,13 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                 except httpx.HTTPStatusError as exc:
                     error = sanitized_exception(exc)
                     response = exc.response
-                    next_attempt_at = await db.write(
+                    next_attempt_at = await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error, resp=response: (
                             _mark_station_error_and_backoff(conn, station_id, err, resp)
-                        )
+                        ),
+                        reservation,
                     )
                     if next_attempt_at is not None:
                         raise JobDeferred(next_attempt_at) from exc
@@ -380,16 +424,22 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                 except Exception as exc:
                     error = sanitized_exception(exc)
                     refund = reservation if is_refundable_transport_error(exc) else None
-                    await db.write(
+                    await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error, res=refund: (
                             _mark_station_error_and_refund(conn, station_id, err, res)
-                        )
+                        ),
+                        reservation,
                     )
                     raise
-                station_changed = await db.write(
+                station_changed = await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, station_id=station.id, rows=observations: (
                         _persist_station_observations(conn, site_id, station_id, rows)
-                    )
+                    ),
+                    reservation,
                 )
                 logger.debug(
                     "fetch_obs station result site=%s station=%s changed=%s",
@@ -399,10 +449,12 @@ async def _fetch_obs(db: Database, site_id: int) -> None:
                 )
                 changed = changed or station_changed
     logger.debug("fetch_obs cycle done site=%s changed=%s", site_id, changed)
-    await db.write(lambda conn: _complete_obs_cycle(conn, site_id, changed))
+    await writer.write(lambda conn: _complete_obs_cycle(conn, site_id, changed))
 
 
-async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> None:
+async def _fetch_current_obs(
+    db: Database, writer: FencedWriter, site_id: int, station_id: int
+) -> None:
     """Poll ``/observations/current`` for one station, learn cadence, snapshot.
 
     Independent of the hourly ``_fetch_obs`` stream: touches only
@@ -426,7 +478,7 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
     # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
     # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
     # design (plan §3).
-    reservation = await db.write(
+    reservation = await writer.write(
         lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
     )
 
@@ -453,10 +505,13 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
         error = sanitized_exception(exc)
         transient = PollOutcome(Health.TRANSIENT, error=error)
         refund = reservation if is_refundable_transport_error(exc) else None
-        await db.write(
+        await write_after_reservation(
+            db,
+            writer,
             lambda conn, out=transient, res=refund: _persist_poll_result_and_refund(
                 conn, site_id, station_id, out, res
-            )
+            ),
+            reservation,
         )
         raise
 
@@ -466,16 +521,22 @@ async def _fetch_current_obs(db: Database, site_id: int, station_id: int) -> Non
     # transient poll-state) and defer, exactly as the hourly stream does.
     # Classification already returned TRANSIENT for these codes.
     if status == 429 or status >= 500:
-        next_attempt_at = await db.write(
+        next_attempt_at = await write_after_reservation(
+            db,
+            writer,
             lambda conn, resp=response, out=outcome: _record_current_obs_backoff(
                 conn, site_id, station_id, resp, out
-            )
+            ),
+            reservation,
         )
         # record_http_backoff always returns a next-attempt for 429/>=500.
         raise JobDeferred(next_attempt_at or isoformat_utc())
 
-    await db.write(
-        lambda conn, out=outcome: persist_poll_result(conn, site_id, station_id, out)
+    await write_after_reservation(
+        db,
+        writer,
+        lambda conn, out=outcome: persist_poll_result(conn, site_id, station_id, out),
+        reservation,
     )
 
 
@@ -544,9 +605,13 @@ def _pws_station_id(
     return None if row is None else str(row["pws_station_id"])
 
 
-async def _fetch_feed(db: Database, site_id: int, feed_id: int) -> None:
+async def _fetch_feed(
+    db: Database, writer: FencedWriter, site_id: int, feed_id: int
+) -> None:
     logger.debug("fetch_feed dispatch site=%s feed=%s", site_id, feed_id)
-    outcome = await fetch_feed_once(db, site_id, feed_id, adapter_builder=build_adapter)
+    outcome = await fetch_feed_once(
+        db, site_id, feed_id, writer=writer, adapter_builder=build_adapter
+    )
     if isinstance(outcome, BudgetExhausted):
         raise JobDeferred(outcome.next_window)
     if isinstance(outcome, BackoffActive):
@@ -561,7 +626,7 @@ async def _fetch_feed(db: Database, site_id: int, feed_id: int) -> None:
             outcome.target.source,
             outcome.error,
         )
-        await db.write(
+        await writer.write(
             lambda conn, result=outcome: mark_feed_unavailable(
                 conn, result.target, result.error
             )

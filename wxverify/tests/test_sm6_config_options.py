@@ -76,7 +76,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.collection.budget import _billing_day, reserve_budget
 from wxverify.core.options import RuntimeOptions, _from_env
-from wxverify.db.connection import close_db, get_db
+from wxverify.db.connection import FencedWriter, close_db, get_db
 from wxverify.db.migrations import (
     create_schema,
     seed_default_feeds,
@@ -188,6 +188,8 @@ class _RealDb:
     single-threaded asyncio.run() test context (no real file I/O needed).
     """
 
+    generation = 0
+
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
@@ -195,6 +197,11 @@ class _RealDb:
         return fn(self._conn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        return fn(self._conn)
+
+    async def write_fenced(
+        self, fn: Callable[[sqlite3.Connection], T], *, generation: int
+    ) -> T:
         return fn(self._conn)
 
 
@@ -724,12 +731,15 @@ def test_timeout_default_30_not_10() -> None:
         _patched_now(_NOW),
     ):
         db = _RealDb(conn)
+        writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
         # The response is a bare 2xx with no valid JSON obs body; classify_current_obs
         # will return OFFLINE ("empty body" or similar) and persist_poll_result will
         # write the transient/offline state.  That's fine — the assertion is on the
         # kwarg that was passed to the fake, not the outcome.
         with contextlib.suppress(Exception):
-            asyncio.run(_fetch_current_obs(db, site_id, station_id))
+            asyncio.run(
+                _fetch_current_obs(db, writer, site_id, station_id)  # type: ignore[arg-type]
+            )
 
     assert captured_timeout, (
         "fetch_current_observation fake was never called — "

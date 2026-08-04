@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from zoneinfo import ZoneInfo
@@ -10,7 +12,10 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.worker.control import JobDeferred
+
+logger = logging.getLogger(__name__)
 
 # Failures that provably occur before anything reaches the provider: DNS
 # resolution failure, connection refused/reset, or a timeout while still
@@ -128,6 +133,39 @@ def refund_budget(conn: sqlite3.Connection, reservation: Reservation) -> None:
             reservation.billing_day,
         ),
     )
+
+
+async def write_after_reservation[T](
+    db: Database,
+    writer: FencedWriter | None,
+    fn: Callable[[sqlite3.Connection], T],
+    reservation: Reservation,
+) -> T:
+    """Run a write that records the outcome of a provider call already made.
+
+    ``reservation`` was billed before this runs -- the provider call it paid
+    for has already happened by the time the caller gets here, win or lose.
+    If ``writer`` is fenced and rejects the write as stale, that call's cost
+    is real but its outcome is about to go unrecorded: an import replaces
+    the whole ``api_budget`` ledger wholesale, so the reservation itself is
+    moot, but log it here anyway, since this is the only place a discarded
+    paid call would otherwise be visible at all. ``writer=None`` (a CLI
+    caller with no generation to fence against) just runs the plain write.
+    """
+    try:
+        if writer is not None:
+            return await writer.write(fn)
+        return await db.write(fn)
+    except StaleGenerationError:
+        logger.warning(
+            "discarding result of a completed provider call: source=%s "
+            "calls=%s credits=%s -- reserved in a database generation that "
+            "no longer exists, so this call's outcome will not be recorded",
+            reservation.source,
+            reservation.calls,
+            reservation.credits,
+        )
+        raise
 
 
 def set_source_cap(

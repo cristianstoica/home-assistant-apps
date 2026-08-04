@@ -41,7 +41,7 @@ import uvicorn.config
 
 from wxverify import config
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobDeferred
@@ -149,10 +149,15 @@ def _make_job(
 class _FakeDb:
     """Minimal shim for worker loop logging tests (passes None as conn)."""
 
+    generation = 0
+
     async def write(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]
+        return fn(None)
+
+    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
         return fn(None)
 
 
@@ -369,7 +374,7 @@ def test_worker_url_secrets_still_redacted_in_logs_regression(
     """T5: regression guard — key= and appid= remain absent from worker log text."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _raise_with_secret_url(db: Any, j: Job) -> None:
+    async def _raise_with_secret_url(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError(
             "Request to https://api.example.com/forecast"
             "?key=SYNTHETIC-SECRET&appid=SYNTHETIC-SECRET failed"
@@ -502,7 +507,7 @@ def test_info_level_policy_only_sanctioned_milestones(
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _succeed(db: Any, j: Job) -> None:
+    async def _succeed(db: Any, writer: Any, j: Job) -> None:
         return None
 
     _patch_worker_infra(monkeypatch)
@@ -581,7 +586,7 @@ def test_deferred_job_cycle_line_is_info_deferred_line_is_debug(
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _defer(db: Any, j: Job) -> None:
+    async def _defer(db: Any, writer: Any, j: Job) -> None:
         raise JobDeferred("2099-01-01T00:00:00.000Z")
 
     _patch_worker_infra(monkeypatch)
@@ -913,7 +918,7 @@ def test_worker_cycle_debug_lines_at_debug(
     """T11-D: 'job claimed' is INFO (§4.1 promotion); 'job completed' stays DEBUG."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _succeed(db: Any, j: Job) -> None:
+    async def _succeed(db: Any, writer: Any, j: Job) -> None:
         return None
 
     _patch_worker_infra(monkeypatch)
@@ -966,6 +971,8 @@ def test_backfill_debug_lines_present(
     from wxverify.worker.backfill import run_backfill_site  # noqa: PLC0415
     from wxverify.worker.control import JobCancelled  # noqa: PLC0415
 
+    writer = FencedWriter(db, db.generation)
+
     # run_backfill_site emits its window/chunk debug lines before it tries to fetch
     # station history. With no stations configured, fetch_station_history_window
     # raises JobCancelled (no weathercom key / no enabled stations). We catch that
@@ -974,7 +981,7 @@ def test_backfill_debug_lines_present(
         caplog.at_level(logging.DEBUG, logger="wxverify.worker.backfill"),
         contextlib.suppress(JobCancelled),
     ):
-        asyncio.run(run_backfill_site(db, site_id, {}))
+        asyncio.run(run_backfill_site(db, writer, site_id, {}))
 
     backfill_debug = [
         r.getMessage()
@@ -1001,8 +1008,10 @@ def test_catchup_debug_lines_present(
 
     from wxverify.worker.catchup import run_catchup  # noqa: PLC0415
 
+    writer = FencedWriter(db, db.generation)
+
     with caplog.at_level(logging.DEBUG, logger="wxverify.worker.catchup"):
-        asyncio.run(run_catchup(db, {}))
+        asyncio.run(run_catchup(db, writer, {}))
 
     catchup_debug = [
         r.getMessage()
@@ -1132,7 +1141,7 @@ def test_bc1_cycle_info_line_present_for_completed_job(
     """T15-BC1 (completed): cycle: INFO line fires with outcome=completed at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7)
 
-    async def _succeed(db: Any, j: Job) -> None:
+    async def _succeed(db: Any, writer: Any, j: Job) -> None:
         return None
 
     _patch_worker_infra(monkeypatch)
@@ -1170,7 +1179,7 @@ def test_bc1_cycle_info_line_deferred_outcome(
     """T15-BC1 (deferred): cycle: INFO line fires with outcome=deferred at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7)
 
-    async def _defer(db: Any, j: Job) -> None:
+    async def _defer(db: Any, writer: Any, j: Job) -> None:
         raise JobDeferred("2099-01-01T00:00:00.000Z")
 
     _patch_worker_infra(monkeypatch)
@@ -1199,7 +1208,7 @@ def test_bc1_cycle_info_line_retry_outcome(
     """T15-BC1 (retry): cycle: INFO line fires with outcome=retry at INFO."""
     job = _make_job(job_type="fetch_feed", site_id=7, retry_count=1, max_retries=5)
 
-    async def _raise(db: Any, j: Job) -> None:
+    async def _raise(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("transient error")
 
     def _retry_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
@@ -1236,7 +1245,7 @@ def test_bc1_cycle_info_line_failed_outcome(
     """T15-BC1 (failed): cycle: INFO line fires with outcome=failed for terminal."""
     job = _make_job(job_type="fetch_feed", site_id=7, retry_count=5, max_retries=5)
 
-    async def _raise(db: Any, j: Job) -> None:
+    async def _raise(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal error")
 
     def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
@@ -1280,7 +1289,7 @@ def test_d5_terminal_error_from_processor_not_feed_fetch(
     """
     job = _make_job(job_type="fetch_feed", site_id=42, retry_count=5, max_retries=5)
 
-    async def _raise_runtime(db: Any, j: Job) -> None:
+    async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal failure")
 
     def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
@@ -1509,7 +1518,7 @@ def test_cycle_info_line_carries_elapsed_field(
     """
     job = _make_job(job_type="fetch_feed", site_id=42)
 
-    async def _succeed(db: Any, j: Job) -> None:
+    async def _succeed(db: Any, writer: Any, j: Job) -> None:
         return None
 
     _patch_worker_infra(monkeypatch)
@@ -1552,9 +1561,10 @@ def test_batched_scoring_orchestrator_info_lines_actually_emitted(
     feed_id = _open_meteo_feed_id(conn)
     _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
     db = get_db()
+    writer = FencedWriter(db, db.generation)
 
     with caplog.at_level(logging.DEBUG, logger="wxverify.worker.score_batches"):
-        asyncio.run(run_batched_scoring(db, site_id))
+        asyncio.run(run_batched_scoring(writer, site_id))
 
     info_records = [
         r
@@ -1599,9 +1609,10 @@ def test_score_batch_line_is_debug_only_never_info(
     feed_id = _open_meteo_feed_id(conn)
     _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
     db = get_db()
+    writer = FencedWriter(db, db.generation)
 
     with caplog.at_level(logging.DEBUG, logger="wxverify"):
-        asyncio.run(run_batched_scoring(db, site_id))
+        asyncio.run(run_batched_scoring(writer, site_id))
 
     engine_records = [r for r in caplog.records if r.name == "wxverify.scoring.engine"]
     batch_records = [r for r in engine_records if "score batch" in r.getMessage()]

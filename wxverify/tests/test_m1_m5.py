@@ -23,7 +23,7 @@ from wxverify.api.routes.feeds import _rebuild_mean_for_site
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import persist_fetch_result
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import (
     Job,
     claim_next_job,
@@ -441,13 +441,18 @@ def test_worker_permission_error_is_process_fatal(
     failed_jobs: list[int] = []
 
     class FakeDb:
+        generation = 0
+
         async def write(self, fn):  # type: ignore[no-untyped-def]
+            return fn(None)
+
+        async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
             return fn(None)
 
     def claim_once(conn: object) -> Job:
         return job
 
-    async def raise_permission_error(db: object, claimed: Job) -> None:
+    async def raise_permission_error(db: object, writer: object, claimed: Job) -> None:
         assert claimed == job
         raise PermissionError(errno.EPERM, "Operation not permitted")
 
@@ -891,9 +896,11 @@ def test_pws_parser_and_fetch_obs_refresh(
         ]
 
     monkeypatch.setattr("wxverify.worker.processor.fetch_hourly_history", fake_history)
+    dispatch_db = get_db()
     asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=1,
                 type="fetch_obs",
@@ -988,7 +995,8 @@ def test_pws_parser_and_fetch_obs_refresh(
     monkeypatch.setattr("wxverify.worker.processor.build_adapter", fake_build_adapter)
     asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=2,
                 type="fetch_feed",
@@ -1093,9 +1101,11 @@ def test_station_call_pacing_is_seeded_bounded_and_used_by_fetch_obs(
     monkeypatch.setattr("wxverify.worker.processor.pace_station_call", fake_pace)
     monkeypatch.setattr("wxverify.worker.processor.fetch_hourly_history", fake_history)
 
+    dispatch_db = get_db()
     asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=40,
                 type="fetch_obs",
@@ -1152,31 +1162,8 @@ def test_backfill_and_catchup_write_domain_state(
         "UPDATE feeds SET default_subscribed=0 WHERE source='open-meteo' AND id<>?",
         (feed_id,),
     )
-    recent_history_calls: list[int] = []
     station_history_windows: list[tuple[str, str]] = []
     historical_windows: list[tuple[str, str]] = []
-
-    async def fake_recent_history(
-        station_id_arg: str,
-        api_key: str,
-        *,
-        hours: int,
-        timezone: str | None = None,
-        client: httpx.AsyncClient | None = None,
-    ) -> list[PwsObservation]:
-        assert station_id_arg == "BF1"
-        assert api_key == "secret-weather"
-        assert timezone == "UTC"
-        assert client is not None
-        recent_history_calls.append(hours)
-        return [
-            PwsObservation(
-                variable="temperature",
-                valid_at="2026-06-23T00:00:00Z",
-                value=10.0,
-                source_raw="10.0 C",
-            )
-        ]
 
     async def fake_history_range(
         station_id_arg: str,
@@ -1243,18 +1230,17 @@ def test_backfill_and_catchup_write_domain_state(
         return FakeHistoricalAdapter()
 
     monkeypatch.setattr(
-        "wxverify.worker.backfill.fetch_hourly_history", fake_recent_history
-    )
-    monkeypatch.setattr(
         "wxverify.worker.backfill.fetch_hourly_history_range", fake_history_range
     )
     monkeypatch.setattr(
         "wxverify.worker.catchup.fetch_hourly_history_range", fake_history_range
     )
     monkeypatch.setattr("wxverify.worker.backfill.build_adapter", fake_build_adapter)
+    dispatch_db = get_db()
     continuation = asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=3,
                 type="backfill_site",
@@ -1330,7 +1316,8 @@ def test_backfill_and_catchup_write_domain_state(
     station_history_windows.clear()
     asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=4,
                 type="catchup",
@@ -1454,10 +1441,12 @@ def test_backfill_fetches_pws_history_once_across_forecast_chunks(
         "cursor_start": "2026-06-01T00:00:00Z",
     }
     continuations = 0
+    dispatch_db = get_db()
     for job_id in range(20, 23):
         continuation = asyncio.run(
             dispatch(
-                get_db(),
+                dispatch_db,
+                FencedWriter(dispatch_db, dispatch_db.generation),
                 Job(
                     id=job_id,
                     type="backfill_site",
@@ -1609,9 +1598,11 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
     )
     monkeypatch.setattr("wxverify.worker.catchup.build_adapter", fake_build_adapter)
 
+    dispatch_db = get_db()
     first = asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=30,
                 type="catchup",
@@ -1635,7 +1626,8 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
 
     second = asyncio.run(
         dispatch(
-            get_db(),
+            dispatch_db,
+            FencedWriter(dispatch_db, dispatch_db.generation),
             Job(
                 id=31,
                 type="catchup",
@@ -3128,10 +3120,12 @@ def test_provider_http_errors_are_redacted_before_persisting(
         return FailingAdapter()
 
     monkeypatch.setattr("wxverify.worker.processor.build_adapter", fake_build_adapter)
+    dispatch_db = get_db()
     with pytest.raises(httpx.HTTPStatusError):
         asyncio.run(
             dispatch(
-                get_db(),
+                dispatch_db,
+                FencedWriter(dispatch_db, dispatch_db.generation),
                 Job(
                     id=41,
                     type="fetch_feed",

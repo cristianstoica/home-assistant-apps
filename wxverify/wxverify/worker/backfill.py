@@ -9,7 +9,11 @@ from datetime import datetime, timedelta
 
 import httpx
 
-from wxverify.collection.budget import reserve_budget
+from wxverify.collection.budget import (
+    Reservation,
+    reserve_budget,
+    write_after_reservation,
+)
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
     persist_fetch_result,
@@ -17,13 +21,12 @@ from wxverify.collection.forecast_fetcher import (
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
-from wxverify.db.connection import Database
+from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import (
     PwsObservation,
-    fetch_hourly_history,
     fetch_hourly_history_range,
 )
 from wxverify.scoring.consensus import insert_station_observation
@@ -72,7 +75,7 @@ class HistoricalFeedTarget:
 
 
 async def run_backfill_site(
-    db: Database, site_id: int, payload: dict[str, object]
+    db: Database, writer: FencedWriter, site_id: int, payload: dict[str, object]
 ) -> JobContinuation | None:
     target = await db.read(lambda conn: _site_target(conn, site_id))
     if target is None:
@@ -89,11 +92,12 @@ async def run_backfill_site(
     )
     forecast_complete = target.backfill_status == "complete"
     if not forecast_complete:
-        await db.write(lambda conn: _mark_backfill_started(conn, site_id))
+        await writer.write(lambda conn: _mark_backfill_started(conn, site_id))
     obs_changed = False
     if not bool(payload.get("station_history_complete")):
         obs_changed = await fetch_station_history_window(
             db,
+            writer,
             site_id,
             window_start=isoformat_utc(window_start),
             window_end=isoformat_utc(window_end),
@@ -104,6 +108,7 @@ async def run_backfill_site(
     if not forecast_complete:
         forecast_written = await _fetch_historical_forecasts(
             db,
+            writer,
             target,
             window_start=isoformat_utc(chunk_start),
             window_end=isoformat_utc(chunk_end),
@@ -116,7 +121,7 @@ async def run_backfill_site(
         isoformat_utc(chunk_end),
         complete,
     )
-    await db.write(
+    await writer.write(
         lambda conn: _finish_backfill_chunk(
             conn,
             site_id=site_id,
@@ -142,65 +147,9 @@ async def run_backfill_site(
     )
 
 
-async def fetch_station_history(db: Database, site_id: int, *, hours: int) -> bool:
-    api_key = resolve_secret("weathercom")
-    if not api_key:
-        raise RuntimeError("weathercom key is not configured")
-    timezone = await db.read(lambda conn: _site_timezone(conn, site_id))
-    if timezone is None:
-        raise JobCancelled()
-    stations = await db.read(lambda conn: _enabled_stations(conn, site_id))
-    if not stations:
-        raise JobCancelled()
-    changed = False
-    async with httpx.AsyncClient() as client:
-        limiter = station_call_limiter()
-        for index, station in enumerate(stations):
-            await pace_station_call(site_id, station.id, index)
-            async with limiter:
-                await db.write(
-                    lambda conn, station_id=station.id: _reserve_station_history_call(
-                        conn, site_id, station_id
-                    )
-                )
-                try:
-                    observations = await fetch_hourly_history(
-                        station.pws_station_id,
-                        api_key,
-                        hours=hours,
-                        timezone=timezone,
-                        client=client,
-                    )
-                except httpx.HTTPStatusError as exc:
-                    error = sanitized_exception(exc)
-                    response = exc.response
-                    next_attempt_at = await db.write(
-                        lambda conn, station_id=station.id, err=error, resp=response: (
-                            _mark_station_error_and_backoff(conn, station_id, err, resp)
-                        )
-                    )
-                    if next_attempt_at is not None:
-                        raise JobDeferred(next_attempt_at) from exc
-                    raise
-                except Exception as exc:
-                    error = sanitized_exception(exc)
-                    await db.write(
-                        lambda conn, station_id=station.id, err=error: (
-                            _mark_station_error(conn, station_id, err)
-                        )
-                    )
-                    raise
-                station_changed = await db.write(
-                    lambda conn, station_id=station.id, rows=observations: (
-                        _persist_station_observations(conn, site_id, station_id, rows)
-                    )
-                )
-                changed = changed or station_changed
-    return changed
-
-
 async def fetch_station_history_window(
     db: Database,
+    writer: FencedWriter,
     site_id: int,
     *,
     window_start: str,
@@ -219,7 +168,7 @@ async def fetch_station_history_window(
         for index, station in enumerate(stations):
             await pace_station_call(site_id, station.id, index)
             async with limiter:
-                await db.write(
+                reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site_id, station_id
                     )
@@ -236,26 +185,35 @@ async def fetch_station_history_window(
                 except httpx.HTTPStatusError as exc:
                     error = sanitized_exception(exc)
                     response = exc.response
-                    next_attempt_at = await db.write(
+                    next_attempt_at = await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error, resp=response: (
                             _mark_station_error_and_backoff(conn, station_id, err, resp)
-                        )
+                        ),
+                        reservation,
                     )
                     if next_attempt_at is not None:
                         raise JobDeferred(next_attempt_at) from exc
                     raise
                 except Exception as exc:
                     error = sanitized_exception(exc)
-                    await db.write(
+                    await write_after_reservation(
+                        db,
+                        writer,
                         lambda conn, station_id=station.id, err=error: (
                             _mark_station_error(conn, station_id, err)
-                        )
+                        ),
+                        reservation,
                     )
                     raise
-                station_changed = await db.write(
+                station_changed = await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, station_id=station.id, rows=observations: (
                         _persist_station_observations(conn, site_id, station_id, rows)
-                    )
+                    ),
+                    reservation,
                 )
                 changed = changed or station_changed
     return changed
@@ -326,7 +284,12 @@ def _mark_backfill_started(conn: sqlite3.Connection, site_id: int) -> None:
 
 
 async def _fetch_historical_forecasts(
-    db: Database, target: SiteBackfillTarget, *, window_start: str, window_end: str
+    db: Database,
+    writer: FencedWriter,
+    target: SiteBackfillTarget,
+    *,
+    window_start: str,
+    window_end: str,
 ) -> int:
     feeds = await db.read(lambda conn: _historical_feed_targets(conn, target.site_id))
     written = 0
@@ -347,7 +310,9 @@ async def _fetch_historical_forecasts(
                 max_lead_hours=feed.max_lead_hours,
             )
             cost = adapter.estimate_cost(req)
-            await db.write(lambda conn, f=feed, c=cost: _reserve_feed_call(conn, f, c))
+            reservation = await writer.write(
+                lambda conn, f=feed, c=cost: _reserve_feed_call(conn, f, c)
+            )
             try:
                 result = await adapter.fetch_historical(
                     req, window_start=window_start, window_end=window_end
@@ -355,10 +320,13 @@ async def _fetch_historical_forecasts(
             except httpx.HTTPStatusError as exc:
                 error = sanitized_exception(exc)
                 response = exc.response
-                next_attempt_at = await db.write(
+                next_attempt_at = await write_after_reservation(
+                    db,
+                    writer,
                     lambda conn, f=feed, err=error, resp=response: (
                         _mark_feed_error_and_backoff(conn, f, err, resp)
-                    )
+                    ),
+                    reservation,
                 )
                 logger.debug(
                     "backfill feed http error site=%s feed=%s source=%s backoff=%s: %s",
@@ -373,8 +341,11 @@ async def _fetch_historical_forecasts(
                 raise
             except Exception as exc:
                 error = sanitized_exception(exc)
-                await db.write(
-                    lambda conn, f=feed, err=error: _mark_feed_error(conn, f, err)
+                await write_after_reservation(
+                    db,
+                    writer,
+                    lambda conn, f=feed, err=error: _mark_feed_error(conn, f, err),
+                    reservation,
                 )
                 logger.debug(
                     "backfill feed error site=%s feed=%s source=%s: %s",
@@ -386,10 +357,13 @@ async def _fetch_historical_forecasts(
                 raise
             if result is None:
                 continue
-            outcome = await db.write(
+            outcome = await write_after_reservation(
+                db,
+                writer,
                 lambda conn, f=feed, r=result: _persist_historical_fetch_success(
                     conn, f, r
-                )
+                ),
+                reservation,
             )
             written += outcome.inserted_count
     return written
@@ -432,7 +406,7 @@ def _historical_feed_targets(
 
 def _reserve_feed_call(
     conn: sqlite3.Connection, feed: HistoricalFeedTarget, cost: CostEstimate
-) -> None:
+) -> Reservation:
     active = conn.execute(
         """
         SELECT 1
@@ -452,7 +426,7 @@ def _reserve_feed_call(
     if active is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain(feed.source, historical=True))
-    reserve_budget(conn, feed.source, cost.calls, cost.credits)
+    return reserve_budget(conn, feed.source, cost.calls, cost.credits)
 
 
 def _mark_feed_error(
@@ -494,16 +468,9 @@ def _enabled_stations(
     ]
 
 
-def _site_timezone(conn: sqlite3.Connection, site_id: int) -> str | None:
-    row = conn.execute(
-        "SELECT timezone FROM sites WHERE id=? AND enabled=1", (site_id,)
-    ).fetchone()
-    return None if row is None else str(row["timezone"])
-
-
 def _reserve_station_history_call(
     conn: sqlite3.Connection, site_id: int, station_id: int
-) -> None:
+) -> Reservation:
     row = conn.execute(
         """
         SELECT 1
@@ -519,7 +486,7 @@ def _reserve_station_history_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
-    reserve_budget(conn, "weathercom", 1)
+    return reserve_budget(conn, "weathercom", 1)
 
 
 def _persist_station_observations(

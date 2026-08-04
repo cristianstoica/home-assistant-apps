@@ -29,7 +29,7 @@ import pytest
 from wxverify import config
 from wxverify.api.routes.dashboard import leaderboard
 from wxverify.core.timeutil import isoformat_utc_micro
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import Job
 from wxverify.scoring import rescore as rescore_module
 from wxverify.scoring.cache import upsert_score_cache
@@ -1194,7 +1194,7 @@ def test_catchup_routes_scoring_through_batched_lane_e8(
 
         calls: list[int] = []
 
-        async def _spy_run_batched_scoring(inner_db: Any, sid: int) -> None:
+        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
             calls.append(sid)
 
         monkeypatch.setattr(
@@ -1202,7 +1202,7 @@ def test_catchup_routes_scoring_through_batched_lane_e8(
         )
 
         db = get_db()
-        await run_catchup(db, {})
+        await run_catchup(db, FencedWriter(db, db.generation), {})
 
         assert sorted(calls) == sorted([site_a, site_b])
 
@@ -1227,7 +1227,7 @@ def test_catchup_continues_other_sites_after_one_cancelled_e8b(
 
         calls: list[int] = []
 
-        async def _spy_run_batched_scoring(inner_db: Any, sid: int) -> None:
+        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
             calls.append(sid)
             if sid == site_a:
                 raise JobCancelled()
@@ -1237,7 +1237,7 @@ def test_catchup_continues_other_sites_after_one_cancelled_e8b(
         )
 
         db = get_db()
-        await run_catchup(db, {})
+        await run_catchup(db, FencedWriter(db, db.generation), {})
 
         # Both sites were attempted despite site_a's cancellation.
         assert set(calls) == {site_a, site_b}

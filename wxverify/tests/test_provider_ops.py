@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from wxverify import config
 from wxverify.__main__ import main
 from wxverify.api.app import create_app
-from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import (
     claim_next_job,
     complete,
@@ -83,8 +83,9 @@ def _job_count(conn: sqlite3.Connection, job_type: str = "fetch_feed") -> int:
 def _run_claimed_job(conn: sqlite3.Connection) -> int:
     job = claim_next_job(conn)
     assert job is not None
+    db = get_db()
     try:
-        asyncio.run(dispatch(get_db(), job))
+        asyncio.run(dispatch(db, FencedWriter(db, db.generation), job))
         complete(conn, job.id)
     except JobDeferred as exc:
         defer_job(conn, job.id, exc.next_attempt_at)

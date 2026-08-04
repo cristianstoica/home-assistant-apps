@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from wxverify.db.connection import FencedWriter
 from wxverify.db.migrations import (
     create_schema,
     seed_default_feeds,
@@ -74,6 +75,8 @@ class _RealDb:
     single-threaded asyncio.run() test context and avoids a real file path.
     """
 
+    generation = 0
+
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
 
@@ -81,6 +84,11 @@ class _RealDb:
         return fn(self._conn)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        return fn(self._conn)
+
+    async def write_fenced(
+        self, fn: Callable[[sqlite3.Connection], T], *, generation: int
+    ) -> T:
         return fn(self._conn)
 
 
@@ -284,8 +292,9 @@ class TestHttpErrorBackoff:
             ),
         ):
             db = _RealDb(conn)
+            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
             with pytest.raises(JobDeferred):
-                asyncio.run(_fetch_current_obs(db, site_id, station_id))
+                asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
         mock_fetch.assert_called_once()
 
@@ -410,9 +419,10 @@ class TestTransportFailNoBackoff:
             _patched_now(_NOW),
         ):
             db = _RealDb(conn)
+            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
             # 1. Transport exception propagates (not swallowed, not wrapped).
             with pytest.raises(httpx.TransportError):
-                asyncio.run(_fetch_current_obs(db, site_id, station_id))
+                asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
         mock_fetch.assert_called_once()
 
@@ -517,11 +527,12 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
             _patched_now(_NOW),
         ):
             db = _RealDb(conn)
+            writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
             # response.json() raises JSONDecodeError; the except block still
             # re-raises the original exception, but only after routing it
             # through the same TRANSIENT-persist path a transport error takes.
             with pytest.raises(json.JSONDecodeError):
-                asyncio.run(_fetch_current_obs(db, site_id, station_id))
+                asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
         mock_fetch.assert_called_once()
 
