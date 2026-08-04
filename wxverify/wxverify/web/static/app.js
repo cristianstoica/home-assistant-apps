@@ -370,7 +370,7 @@
   // lives long enough to be cut — each ~4 MB Range chunk completes in seconds.
   // The status/download GETs are safe methods and carry no CSRF; begin sends
   // no body/Content-Type so the mutation guard's allowlist is not exercised.
-  document.body.addEventListener("click", function (event) {
+  document.body.addEventListener("click", async function (event) {
     var target = event.target;
     if (!target || !target.matches("#export-run")) {
       return;
@@ -382,6 +382,71 @@
       result.hidden = false;
       result.textContent = text;
     }
+
+    // Generates the same name shape the server assigns at snapshot time
+    // (wxverify-<UTC timestamp>Z.db.gz), because the save picker below needs
+    // a suggestedName before /begin is even sent -- long before the
+    // server's own name exists. The two names differ by the seconds between
+    // click and server-side snapshot; that is cosmetic.
+    function exportFilename() {
+      function pad(n) {
+        return (n < 10 ? "0" : "") + n;
+      }
+      var now = new Date();
+      return (
+        "wxverify-" +
+        now.getUTCFullYear() +
+        pad(now.getUTCMonth() + 1) +
+        pad(now.getUTCDate()) +
+        "-" +
+        pad(now.getUTCHours()) +
+        pad(now.getUTCMinutes()) +
+        pad(now.getUTCSeconds()) +
+        "Z.db.gz"
+      );
+    }
+
+    // The save picker must be called synchronously from the click handler,
+    // before /begin: showSaveFilePicker() requires transient user
+    // activation, which does not survive the prepare-and-poll wait below
+    // (seconds, sometimes minutes). Calling it after that wait works when a
+    // developer clicks and waits attentively, and fails in the field with
+    // "SecurityError: Must be handling a user gesture".
+    var handle = null;
+    if (typeof window.showSaveFilePicker === "function") {
+      try {
+        handle = await window.showSaveFilePicker({
+          suggestedName: exportFilename()
+        });
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          result.hidden = true;
+          return;
+        }
+        handle = null;
+      }
+    }
+
+    // The picker creates (or truncates) the file the instant the user
+    // confirms, before /begin is even sent. Every path below where the
+    // picker succeeded but the export's bytes never ended up in that file
+    // -- prepare failing, the writer never opening, a download failing
+    // after it did -- leaves that file behind at 0 bytes, and nothing on
+    // this page can remove it (removal needs a directory handle the save
+    // picker never returns). The disposition is always the same: name it
+    // and say so, never attempt cleanup.
+    function emptyFileNote(handle) {
+      return handle.name + " is empty; it is safe to delete.";
+    }
+
+    function showPrepareFailure(text) {
+      if (handle) {
+        show(text + " " + emptyFileNote(handle));
+      } else {
+        show(text);
+      }
+    }
+
     var token = document.querySelector('meta[name="csrf-token"]').content;
     show("Preparing export...");
     fetch(beginUrl, {
@@ -399,13 +464,19 @@
         pollStatus(payload.export_id, 0);
       })
       .catch(function () {
-        show("Export failed to start.");
+        showPrepareFailure("Export failed to start.");
       });
 
-    var MAX_POLLS = 240;
+    // 800 polls at 750 ms = 10 minutes. Local prepare (vacuum + gzip) scales
+    // to roughly 15 s at production database volume; production storage
+    // reads run several times slower than local elsewhere in this project's
+    // own measurements, which extrapolates to a prepare time close enough to
+    // the previous 180 s budget (240 polls) to risk the client giving up on
+    // a preparation the server is still doing.
+    var MAX_POLLS = 800;
     function pollStatus(exportId, attempts) {
       if (attempts >= MAX_POLLS) {
-        show("Export timed out.");
+        showPrepareFailure("Export timed out.");
         return;
       }
       fetch(base + "/status/" + exportId, { credentials: "same-origin" })
@@ -417,10 +488,20 @@
         })
         .then(function (payload) {
           if (payload.state === "ready") {
-            triggerDownload(base + "/download/" + exportId, payload.size);
+            // Deliberately not awaited: this call lives inside a .then(),
+            // and the .catch() below renders "Export failed." on rejection,
+            // which would clobber the fallback link if a download failure
+            // surfaced here. Safe only because triggerDownload never
+            // rejects -- every await inside it is guarded by its own
+            // try/catch, leaving only synchronous DOM updates unguarded.
+            triggerDownload(
+              base + "/download/" + exportId,
+              payload.size,
+              handle
+            );
             show("Download started.");
           } else if (payload.state === "error") {
-            show("Export failed.");
+            showPrepareFailure("Export failed.");
           } else {
             window.setTimeout(function () {
               pollStatus(exportId, attempts + 1);
@@ -428,7 +509,7 @@
           }
         })
         .catch(function () {
-          show("Export failed.");
+          showPrepareFailure("Export failed.");
         });
     }
 
@@ -499,11 +580,15 @@
     // (non-206, wrong length, network error) retries that chunk up to 3 times,
     // then falls through to showFallbackLink (the 0.8.3 retained file + the
     // browser's native download / Firefox Retry still survive).
-    function triggerDownload(downloadUrl, totalSize) {
+    async function triggerDownload(downloadUrl, totalSize, handle) {
       var total = Number(totalSize);
       if (!Number.isFinite(total) || total <= 0) {
+        var sizeUnknownMessage = "Export ready, but its size is unknown.";
+        if (handle) {
+          sizeUnknownMessage += " " + emptyFileNote(handle);
+        }
         showFallbackLink(
-          "Export ready, but its size is unknown. Use this link to save it:",
+          sizeUnknownMessage + " Use this link to save it:",
           downloadUrl,
           "wxverify-export.db.gz"
         );
@@ -515,7 +600,49 @@
       var received = 0;
       show("Downloading...");
 
-      function fail() {
+      // Guarded independently of the picker above: createWritable() can
+      // reject even after a successful pick (a revoked permission, a locked
+      // file, a full disk). A rejection here falls back to the in-memory
+      // Blob path rather than losing the export, but the user already chose
+      // a destination that will not receive it, so this says so rather than
+      // silently downgrading.
+      var writable = null;
+      if (handle) {
+        try {
+          writable = await handle.createWritable();
+        } catch (err) {
+          writable = null;
+          show(
+            "Could not open the chosen file for writing. " +
+              emptyFileNote(handle) +
+              " Downloading instead..."
+          );
+        }
+      }
+
+      // Aborts the writer (if one exists) before rendering the fallback, so
+      // a failure never leaves a partially-written file that looks like a
+      // complete backup -- createWritable() writes to a swap file that only
+      // replaces the destination at close(), so an abort discards that swap
+      // file; the destination never received the partial bytes.
+      async function fail() {
+        if (writable) {
+          try {
+            await writable.abort();
+          } catch (abortErr) {
+            // Best-effort: still render the fallback even if the abort
+            // itself fails, so a failure here can never suppress the one
+            // message the user has left to recover the export.
+          }
+          showFallbackLink(
+            "Download failed. " +
+              emptyFileNote(handle) +
+              " Use this link to save the retained file:",
+            downloadUrl,
+            filename
+          );
+          return;
+        }
         showFallbackLink(
           "Download failed. Use this link to save the retained file:",
           downloadUrl,
@@ -574,36 +701,57 @@
 
       // Sequential chunk loop, mirroring the recursive pump() reader: each
       // chunk is fetched only after the previous one lands, so at most one
-      // chunk is in flight and only one failure path can fire.
-      function nextChunk(start) {
+      // chunk is in flight and only one failure path can fire. The
+      // recursive call is returned rather than fire-and-forget, so a
+      // rejection at any depth -- a write, the completeness check, or
+      // close() itself -- propagates to the try/catch below instead of
+      // becoming an unhandled rejection.
+      async function nextChunk(start) {
         if (start >= total) {
-          var blob = new Blob(parts, { type: "application/gzip" });
-          if (blob.size !== total) {
-            fail();
+          if (writable) {
+            if (received !== total) {
+              throw new Error("received " + received + " != " + total);
+            }
+            await writable.close();
+            show("Download complete. Saved.");
             return;
           }
+          var blob = new Blob(parts, { type: "application/gzip" });
+          if (blob.size !== total) {
+            throw new Error("blob size " + blob.size + " != " + total);
+          }
           saveBlob(blob, filename);
-          show("Download complete. Saved.");
+          if (handle) {
+            show(
+              "Download complete. Saved to your downloads folder instead. " +
+                emptyFileNote(handle)
+            );
+          } else {
+            show("Download complete. Saved.");
+          }
           return;
         }
-        fetchChunk(start, 3)
-          .then(function (buffer) {
-            parts.push(buffer);
-            received += buffer.byteLength;
-            show(
-              "Downloading... " +
-                formatBytes(received) +
-                " / " +
-                formatBytes(total)
-            );
-            nextChunk(start + CHUNK_SIZE);
-          })
-          .catch(function () {
-            fail();
-          });
+        var buffer = await fetchChunk(start, 3);
+        if (writable) {
+          await writable.write(buffer);
+        } else {
+          parts.push(buffer);
+        }
+        received += buffer.byteLength;
+        show(
+          "Downloading... " +
+            formatBytes(received) +
+            " / " +
+            formatBytes(total)
+        );
+        return nextChunk(start + CHUNK_SIZE);
       }
 
-      nextChunk(0);
+      try {
+        await nextChunk(0);
+      } catch (err) {
+        await fail();
+      }
     }
   });
 

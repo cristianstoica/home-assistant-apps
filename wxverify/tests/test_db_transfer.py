@@ -539,6 +539,80 @@ def test_export_status_size_matches_full_download_length(
         )
 
 
+def test_export_chunked_range_fetch_size_and_bytes_stay_consistent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """X6d: a FULL chunked walk (mirroring the streaming browser assembler)
+    stays internally consistent end-to-end, across every chunk, not just one.
+
+    The browser's download assembler trusts exactly one arithmetic identity it
+    has no other way to verify: it reads `status.size` as the declared total,
+    issues successive bounded `Range` requests, accumulates `received +=
+    chunk.length`, and -- before closing the output file -- asserts `received
+    === total`, aborting a partial write on mismatch. X6b/X6c each pin a
+    single request in isolation (a midpoint resume, a bounded first chunk, a
+    no-Range full download); neither walks the WHOLE artifact or exercises a
+    short final chunk. This test does both: the chunk size is derived from the
+    actual artifact size so the split is deliberately NOT an exact multiple --
+    the final chunk is short, which is exactly where a tail off-by-one hides.
+    """
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app) as client:
+        _make_site(get_db()._conn, "Chunk Walk Site")  # noqa: SLF001
+        resp = client.post(f"{_EXPORT_BASE}/begin", headers=_begin_headers(client))
+        export_id = resp.json()["export_id"]
+        final = _await_ready(client, export_id)
+        total = final["size"]
+        assert isinstance(total, int) and total > 0, f"unexpected size: {total!r}"
+
+        gz_path = db_dir / f".wxverify-export-{export_id}.db.gz"
+        on_disk = gz_path.read_bytes()
+
+        chunk_size = max(1, total // 6)
+        if total % chunk_size == 0:
+            chunk_size += 1  # force a short final chunk (non-exact multiple)
+        assert total % chunk_size != 0, "test must exercise a short tail chunk"
+
+        received = bytearray()
+        pos = 0
+        chunks_seen = 0
+        while pos < total:
+            end = min(pos + chunk_size - 1, total - 1)
+            chunk_resp = client.get(
+                f"{_EXPORT_BASE}/download/{export_id}",
+                headers={"Range": f"bytes={pos}-{end}"},
+            )
+            assert chunk_resp.status_code == 206, (
+                f"chunk [{pos}-{end}] must be 206, got {chunk_resp.status_code}"
+            )
+            content_range = chunk_resp.headers.get("content-range", "")
+            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+            assert match, f"malformed Content-Range: {content_range!r}"
+            resp_start, resp_end, resp_total = (int(g) for g in match.groups())
+            assert resp_total == total, (
+                f"Content-Range total {resp_total} must equal the declared "
+                f"status size {total} (chunk [{pos}-{end}])"
+            )
+            assert (resp_start, resp_end) == (pos, end), (
+                f"Content-Range bounds {resp_start}-{resp_end} must equal the "
+                f"requested bounds {pos}-{end}"
+            )
+            received += chunk_resp.content
+            pos = end + 1
+            chunks_seen += 1
+
+    assert chunks_seen >= 2, "the walk must exercise more than one chunk"
+    assert len(received) == total, (
+        f"sum of delivered chunk lengths ({len(received)}) must equal the "
+        f"declared total ({total}) -- this is the client's own pre-close gate"
+    )
+    assert bytes(received) == on_disk, (
+        "concatenating the chunks must reproduce the served artifact exactly"
+    )
+
+
 def test_export_download_before_ready_returns_409(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
