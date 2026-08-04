@@ -1,4 +1,5 @@
-"""SQLite WAL connection facade with a single serialized writer."""
+"""SQLite WAL connection facade: a single serialized writer and a bounded
+pool of readers."""
 
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from pathlib import Path
 from typing import TypeVar
 
 from wxverify import config
+from wxverify.core.aio import run_to_completion
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 
@@ -23,19 +25,32 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 _db_instance: Database | None = None
 
-# Any single read-lock wait, executor dispatch or query execution at or above
-# this is worth a log line: /sites, the fastest page, is ~100 ms end to end
-# INCLUDING transport, so 250 ms of DB work alone is already an outlier.
+# Any single gate wait, pool wait, executor dispatch or query execution at
+# or above this is worth a log line: /sites, the fastest page, is ~100 ms
+# end to end INCLUDING transport, so 250 ms of DB work alone is already an
+# outlier.
 SLOW_READ_MS = 250.0
+
+# SQLite in WAL mode lets any number of readers run concurrently with no
+# reader blocking another, but this pool shares the interpreter's default
+# executor with every other asyncio.to_thread() call (writes, transfer
+# hops, the startup sweep) -- an oversized pool would just convert
+# connection contention into thread-dispatch contention rather than
+# removing it. Four covers the observed simultaneous-reader shape (the
+# worker's own job loop, the page request being served, and the handful of
+# chart JSON fetches a page kicks off) with one spare.
+_READ_POOL_SIZE = 4
 
 
 @dataclass
 class ReadTiming:
     calls: int = 0
     errors: int = 0
+    gate_ms: float = 0.0
     wait_ms: float = 0.0
     dispatch_ms: float = 0.0
     exec_ms: float = 0.0
+    max_gate_ms: float = 0.0
     max_wait_ms: float = 0.0
     max_dispatch_ms: float = 0.0
     max_exec_ms: float = 0.0
@@ -57,34 +72,74 @@ class Database:
         if sqlite3.sqlite_version_info < (3, 35, 0):
             raise RuntimeError("sqlite 3.35.0 or newer is required")
         self.path = path
-        # The locks are created exactly once, here, and are deliberately NOT
-        # part of _open(): replace_from() holds both locks across _open(), so
-        # recreating them there would let a coroutine that starts waiting
-        # during the swap window capture a different lock object than the one
-        # being held — two writers could then interleave on the shared write
-        # connection.
+        # The write lock, read gate, and read pool are created exactly once,
+        # here, and are deliberately NOT part of _open(): replace_from()
+        # holds the write lock and closes the gate across _open(), so
+        # recreating any of them there would let a coroutine that starts
+        # waiting during the swap window capture a different lock/event/queue
+        # object than the one being held — two writers could then interleave
+        # on the shared write connection, or a reader could queue on a gate
+        # nobody is watching. _open() only ever rebuilds their CONTENTS (the
+        # connections); publishing those into the pool is _stock_pool()'s job.
         self._write_lock = asyncio.Lock()
-        self._read_lock = asyncio.Lock()
+        self._read_gate = asyncio.Event()
+        self._read_gate.set()
+        self._read_pool: asyncio.Queue[sqlite3.Connection] = asyncio.Queue(
+            maxsize=_READ_POOL_SIZE
+        )
+        # Bumped once per (re)open the swap path performs, including a
+        # rollback-and-reopen of the untouched file: even that counts,
+        # because a job that read before the swap window and is about to
+        # write after it must be treated as spanning the swap, the same as
+        # if content had actually changed underneath it.
+        self._generation = 0
         # Written only from the event-loop thread (see `read`'s `finally`),
         # so it needs no lock of its own. Cumulative for the process lifetime
         # of this Database instance; never reset.
         self._read_stats: dict[str, ReadTiming] = {}
         self._read_stats_since = isoformat_utc()
         self._open()
+        self._stock_pool()
+
+    def _connect_reader(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        self._assert_reader_pragmas(conn)
+        return conn
 
     def _open(self) -> None:
-        """(Re)open both connections on ``self.path``; locks are untouched."""
+        """(Re)open the writer, sync reader, and pooled readers on
+        ``self.path``. Locks, the gate, and the pool object are untouched.
+
+        Creation only: callers MUST call ``_stock_pool()`` afterward to
+        publish the new pooled connections. ``_open()`` deliberately does
+        not do this itself -- see ``_stock_pool``'s own docstring for why.
+        """
         self._conn = sqlite3.connect(
             self.path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
         self._assert_pragmas(self._conn)
         self._run_immediate(run_migrations)
-        self._read_conn = sqlite3.connect(
-            self.path, check_same_thread=False, isolation_level=None
-        )
-        self._read_conn.row_factory = sqlite3.Row
-        self._assert_reader_pragmas(self._read_conn)
+        self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
+        self._read_sync_conn = self._connect_reader()
+
+    def _stock_pool(self) -> None:
+        """Publish ``self._read_conns`` into the pool queue.
+
+        Callable ONLY when every pooled connection is accounted for outside
+        the queue -- the two call sites are ``__init__`` (nothing has ever
+        been handed out yet) and ``replace_from`` (the drain took all
+        ``_READ_POOL_SIZE`` of them back before the swap ran). Emptying the
+        queue first does not make this safe to call at an arbitrary moment:
+        a connection a live reader currently holds is not IN the queue to be
+        emptied, so calling this while one is checked out publishes it a
+        second time.
+        """
+        while not self._read_pool.empty():
+            self._read_pool.get_nowait()
+        for conn in self._read_conns:
+            self._read_pool.put_nowait(conn)
 
     @staticmethod
     def _assert_pragmas(conn: sqlite3.Connection) -> None:
@@ -116,55 +171,85 @@ class Database:
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         async with self._write_lock:
-            return await asyncio.to_thread(self._run_immediate, fn)
+            # A nested zero-arg closure, not `self._run_immediate` passed
+            # directly: `_run_immediate` is itself generic, and
+            # run_to_completion's `Callable[..., T]` erases per-argument
+            # types, so a bare method reference loses the binding between
+            # its own T and this T. Closing over the already-bound `fn`
+            # here resolves `_run_immediate`'s T against it first.
+            def _call() -> T:
+                return self._run_immediate(fn)
+
+            return await run_to_completion(_call)
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         label = _read_label(fn)
         requested = time.perf_counter()
-        # None means "this phase was never reached": a read cancelled while
-        # still queued for the lock knows only its wait; a read that raises
-        # inside the thread knows its wait but not its exec time.
+        # None means "this phase was never reached": a read cancelled before
+        # the gate opens never sets `gated`; one cancelled while still queued
+        # for a pooled connection never sets `acquired`; one cancelled or
+        # failed inside the thread never sets `started`/`finished`.
+        gated: float | None = None
         acquired: float | None = None
         started: float | None = None
         finished: float | None = None
         try:
-            async with self._read_lock:
-                acquired = time.perf_counter()
+            # The gate is open unless an import swap is draining or
+            # rebuilding the pool; waiting on it here, before touching the
+            # pool at all, is what lets replace_from() take back every
+            # pooled connection without a new reader sneaking in ahead of it.
+            await self._read_gate.wait()
+            gated = time.perf_counter()
+            conn = await self._read_pool.get()
+            acquired = time.perf_counter()
 
-                # `started` is captured INSIDE the worker thread so executor
-                # dispatch delay is attributed separately from query cost —
-                # under a saturated thread pool the two are otherwise
-                # indistinguishable.
-                def _timed(conn: sqlite3.Connection) -> tuple[float, float, T]:
-                    started_at = time.perf_counter()
-                    result = fn(conn)
-                    return started_at, time.perf_counter(), result
+            # `started` is captured INSIDE the worker thread so executor
+            # dispatch delay is attributed separately from query cost —
+            # under a saturated thread pool the two are otherwise
+            # indistinguishable.
+            def _timed(conn: sqlite3.Connection) -> tuple[float, float, T]:
+                started_at = time.perf_counter()
+                result = fn(conn)
+                return started_at, time.perf_counter(), result
 
-                started, finished, result = await asyncio.to_thread(
-                    _timed, self._read_conn
-                )
+            try:
+                # A thread cannot be interrupted from the outside.
+                # run_to_completion holds this coroutine here until the
+                # thread actually stops, however many cancels arrive, so the
+                # connection is never returned to the pool while another
+                # task is still running a query against it.
+                started, finished, result = await run_to_completion(_timed, conn)
+            finally:
+                self._read_pool.put_nowait(conn)
             return result
         finally:
-            # The `finally` wraps the `async with`, so on BOTH paths the lock
-            # is already released when this runs: bookkeeping must never
-            # extend the hold it is measuring. This runs on the event-loop
-            # thread, which is single-threaded, so `_read_stats` needs no
-            # lock of its own.
-            self._record_read(label, requested, acquired, started, finished)
+            # This runs on the event-loop thread, which is single-threaded,
+            # so `_read_stats` needs no lock of its own.
+            self._record_read(label, requested, gated, acquired, started, finished)
 
     def _record_read(
         self,
         label: str,
         requested: float,
+        gated: float | None,
         acquired: float | None,
         started: float | None,
         finished: float | None,
     ) -> None:
-        # A read cancelled while still queued for the lock never sets
-        # `acquired`, so its wait is unknowable exactly; `now` stands in for
-        # it, making `wait_ms` a lower bound rather than missing entirely.
-        wait_end = acquired if acquired is not None else time.perf_counter()
-        wait_ms = (wait_end - requested) * 1000
+        # A read cancelled before the gate opens never sets `gated`; one
+        # cancelled while still queued for a pooled connection never sets
+        # `acquired`. Either boundary is unknowable exactly when it's
+        # missing, so `now` stands in for it, making `gate_ms`/`wait_ms` a
+        # lower bound rather than missing entirely. `wait_ms` is 0 when the
+        # gate itself was never passed: that phase never started.
+        now = time.perf_counter()
+        gate_end = gated if gated is not None else now
+        gate_ms = (gate_end - requested) * 1000
+        if gated is None:
+            wait_ms = 0.0
+        else:
+            wait_end = acquired if acquired is not None else now
+            wait_ms = (wait_end - gate_end) * 1000
         dispatch_ms = (
             None if acquired is None or started is None else (started - acquired) * 1000
         )
@@ -177,6 +262,8 @@ class Database:
         timing.calls += 1
         if failed:
             timing.errors += 1
+        timing.gate_ms += gate_ms
+        timing.max_gate_ms = max(timing.max_gate_ms, gate_ms)
         timing.wait_ms += wait_ms
         timing.max_wait_ms = max(timing.max_wait_ms, wait_ms)
         if dispatch_ms is not None:
@@ -188,28 +275,33 @@ class Database:
 
         if failed:
             logger.warning(
-                "db read failed or cancelled %s wait=%.0fms dispatch=%s exec=%s",
+                "db read failed or cancelled %s gate=%.0fms wait=%.0fms "
+                "dispatch=%s exec=%s",
                 label,
+                gate_ms,
                 wait_ms,
                 "---" if dispatch_ms is None else f"{dispatch_ms:.0f}ms",
                 "---" if exec_ms is None else f"{exec_ms:.0f}ms",
             )
         elif (
-            wait_ms >= SLOW_READ_MS
+            gate_ms >= SLOW_READ_MS
+            or wait_ms >= SLOW_READ_MS
             or (dispatch_ms or 0) >= SLOW_READ_MS
             or (exec_ms or 0) >= SLOW_READ_MS
         ):
             logger.warning(
-                "slow db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                "slow db read %s gate=%.0fms wait=%.0fms dispatch=%.0fms exec=%.0fms",
                 label,
+                gate_ms,
                 wait_ms,
                 dispatch_ms or 0,
                 exec_ms or 0,
             )
         else:
             logger.debug(
-                "db read %s wait=%.0fms dispatch=%.0fms exec=%.0fms",
+                "db read %s gate=%.0fms wait=%.0fms dispatch=%.0fms exec=%.0fms",
                 label,
+                gate_ms,
                 wait_ms,
                 dispatch_ms or 0,
                 exec_ms or 0,
@@ -224,14 +316,26 @@ class Database:
         (raised or were cancelled). A label whose ``errors`` tracks its
         ``calls`` is a read that is failing or being cancelled, not one that
         is slow.
+
+        ``gate_ms`` is time spent parked behind a closed import-swap gate,
+        tracked separately so it is never confused with ``wait_ms``, which
+        is now "every pooled connection was busy" rather than "queued
+        behind the one reader" -- a genuine saturation signal with a pool of
+        concurrent readers, rather than an artifact of whichever read
+        happened to be running. Because reads now overlap, a label's summed
+        ``exec_ms`` can exceed the wall-clock window it was measured over,
+        by up to the pool size -- never divide it by elapsed time and call
+        the result a share of wall time.
         """
         return {
             label: {
                 "calls": timing.calls,
                 "errors": timing.errors,
+                "gate_ms": timing.gate_ms,
                 "wait_ms": timing.wait_ms,
                 "dispatch_ms": timing.dispatch_ms,
                 "exec_ms": timing.exec_ms,
+                "max_gate_ms": timing.max_gate_ms,
                 "max_wait_ms": timing.max_wait_ms,
                 "max_dispatch_ms": timing.max_dispatch_ms,
                 "max_exec_ms": timing.max_exec_ms,
@@ -247,23 +351,49 @@ class Database:
         return self._run_immediate(fn)
 
     def read_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return fn(self._read_conn)
+        return fn(self._read_sync_conn)
 
     def close(self) -> None:
-        self._read_conn.close()
+        self._read_sync_conn.close()
+        for conn in self._read_conns:
+            conn.close()
         self._conn.close()
 
     async def replace_from(self, new_db: Path, backup: Path) -> None:
         """Replace the live DB file with ``new_db``, backing up the current DB.
 
-        Lock order is fixed: write lock, then read lock. No other code path
-        acquires both, so no deadlock ordering exists to violate. Holding
-        both locks quiesces every DB access for the swap window; the locks
-        themselves are never recreated (see ``__init__``), so mutual
-        exclusion across the swap holds by construction.
+        Lock order is fixed: write lock first. Closing the gate and draining
+        the pool then quiesces every reader for the swap window; neither the
+        lock, the gate, nor the pool object is ever recreated (see
+        ``__init__``), so mutual exclusion across the swap holds by
+        construction.
         """
-        async with self._write_lock, self._read_lock:
-            await asyncio.to_thread(self._replace_sync, new_db, backup)
+        async with self._write_lock:
+            self._read_gate.clear()
+            drained: list[sqlite3.Connection] = []
+            try:
+                for _ in range(_READ_POOL_SIZE):
+                    drained.append(await self._read_pool.get())
+            except BaseException:
+                # Cancelled mid-drain: return exactly what was taken, reopen
+                # the gate, and let the caller's cancellation propagate. The
+                # swap itself never started, so there is nothing else to
+                # unwind.
+                for conn in drained:
+                    self._read_pool.put_nowait(conn)
+                self._read_gate.set()
+                raise
+
+            # From here on, cancellation is deferred rather than honored:
+            # the drain succeeded, so every pooled connection is now
+            # unaccounted for until _stock_pool() runs. A cancellation that
+            # unwound this coroutine before that happened would leave the
+            # pool permanently short.
+            try:
+                await run_to_completion(self._replace_sync, new_db, backup)
+            finally:
+                self._stock_pool()
+                self._read_gate.set()
 
     def _replace_sync(self, new_db: Path, backup: Path) -> None:
         # 1. Flush the WAL into the main file. Fail -> raise; nothing changed.
@@ -282,8 +412,13 @@ class Database:
             backup.unlink(missing_ok=True)
             raise
         # 3. On the last close after a checkpoint, SQLite itself removes the
-        # -wal/-shm sidecars.
-        self._read_conn.close()
+        # -wal/-shm sidecars. Every open connection must close, not just the
+        # writer: a live pooled or sync reader still holding the file is
+        # what keeps a sidecar (or the file itself, on some platforms) from
+        # being replaceable underneath it.
+        self._read_sync_conn.close()
+        for conn in self._read_conns:
+            conn.close()
         self._conn.close()
         # 4. Atomic rename, same filesystem. Fail -> reopen the untouched
         # live file and re-raise.
@@ -292,6 +427,7 @@ class Database:
         except BaseException:
             try:
                 self._open()
+                self._generation += 1
             except BaseException:
                 self._close_quietly()
                 raise
@@ -304,17 +440,19 @@ class Database:
         # older-user_version import here.
         try:
             self._open()
+            self._generation += 1
         except BaseException:
             # 7. Rollback: close any half-open connection (after a failed
-            # _open(), _read_conn may already be closed — the suppressed
-            # double-close is expected), restore the backup by COPY (the
-            # backup must survive as the reversibility artifact), reopen,
-            # and re-raise the original error.
+            # _open(), some connections may already be closed — the
+            # suppressed double-close is expected), restore the backup by
+            # COPY (the backup must survive as the reversibility artifact),
+            # reopen, and re-raise the original error.
             self._close_quietly()
             try:
                 shutil.copy2(backup, self.path)
                 self._unlink_sidecars()
                 self._open()
+                self._generation += 1
             except BaseException as restore_exc:
                 logger.critical(
                     "database unrecoverable after failed import; "
@@ -327,7 +465,7 @@ class Database:
             raise
 
     def _close_quietly(self) -> None:
-        for conn in (self._conn, self._read_conn):
+        for conn in (self._conn, self._read_sync_conn, *self._read_conns):
             with contextlib.suppress(Exception):
                 conn.close()
 

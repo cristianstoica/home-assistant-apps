@@ -1555,15 +1555,19 @@ def test_replace_from_cleans_sidecars_and_preserves_lock_identity(
         )
 
         before_w = db._write_lock  # noqa: SLF001
-        before_r = db._read_lock  # noqa: SLF001
+        before_gate = db._read_gate  # noqa: SLF001
+        before_pool = db._read_pool  # noqa: SLF001
         backup_path = tmp_path / "unit-backup.db.bak"
         asyncio.run(db.replace_from(new_path, backup_path))
 
         assert db._write_lock is before_w, (  # noqa: SLF001
             "write lock must never be recreated across a swap"
         )
-        assert db._read_lock is before_r, (  # noqa: SLF001
-            "read lock must never be recreated across a swap"
+        assert db._read_gate is before_gate, (  # noqa: SLF001
+            "read gate must never be recreated across a swap"
+        )
+        assert db._read_pool is before_pool, (  # noqa: SLF001
+            "read pool must never be recreated across a swap"
         )
         # The reopened connection is itself an open WAL-mode session, so a
         # FRESH, legitimate -wal file is expected to exist again by now (that

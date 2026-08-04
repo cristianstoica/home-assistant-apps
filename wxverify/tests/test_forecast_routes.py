@@ -7,9 +7,9 @@ empty-state copy renders when a site has no forecast data yet.
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
 worker + ``TestClient`` (mirrors ``tests/test_web_ui.py``'s harness) — a
-tmp-file DB, not ``:memory:``, because the app's WAL-mode connection is a
-SEPARATE ``_read_conn`` from whatever writes the fixture rows; a real file is
-required for the read side to see the write side's committed data.
+tmp-file DB, not ``:memory:``, because the app's WAL-mode reads come from a
+SEPARATE pooled connection than whatever writes the fixture rows; a real
+file is required for the read side to see the write side's committed data.
 
 Synthetic fixtures only — fake site name/coords.
 """

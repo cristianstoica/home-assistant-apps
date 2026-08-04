@@ -32,7 +32,7 @@ from starlette.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import Database, close_db, get_db, init_db
-from wxverify.db.queue import claim_next_job, reclaim_all_stale
+from wxverify.db.queue import claim_next_job
 from wxverify.worker.processor import run_worker
 
 # ---------------------------------------------------------------------------
@@ -319,35 +319,50 @@ def test_lifespan_shutdown_reclaims_claimed_job(
     assert stopped == [], "the default hard-kill stop_process must never fire"
 
 
-def test_cancellation_inside_claim_transaction_logs_and_defers_to_boot_reclaim(
+def test_cancellation_inside_claim_transaction_reclaims_cleanly_without_a_boot_sweep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A cancellation delivered while the CLAIM's own write transaction is
-    still open (uncommitted) makes the loop-level handler's OWN
-    ``db.write(reclaim_all_stale)`` die on ``BEGIN IMMEDIATE`` -- the reclaim
-    tries to start a second transaction on the same connection while the
-    claim's is still open, because cancelling the ``asyncio.to_thread`` await
-    releases ``Database._write_lock`` the instant the coroutine is cancelled,
-    without waiting for the still-running executor thread to finish. This is
-    a documented, benign, expected failure path: the WARNING is the only
-    signal at the time, and the next-boot ``reclaim_all_stale`` sweep is the
-    backstop that actually recovers the row.
+    still open (uncommitted) no longer collides with the loop-level
+    handler's own ``db.write(reclaim_all_stale)``: the write lock is now
+    held until the claim's executor thread actually finishes (commits or
+    rolls back), so the reclaim can never start a second transaction against
+    a connection the claim is still using. The same construction that used
+    to produce a benign "shutdown reclaim failed" WARNING and defer recovery
+    to the next boot now reclaims the row cleanly, in place, during shutdown
+    itself.
 
     Construction: ``claim_next_job`` is wrapped to perform the REAL claim
     (which commits nothing yet -- ``_run_immediate`` commits only after the
     wrapped callable returns) and then block on a ``threading.Event`` INSIDE
     the executor thread, holding the transaction open. Cancelling the worker
-    task at that point lands the ``CancelledError`` in the loop-level handler
-    while the claim's transaction is still uncommitted -- an
-    ``asyncio.Event`` would not do here (it is not thread-safe to signal from
-    the executor thread), and blocking at the ``asyncio`` level (as
+    task at that point lands the ``CancelledError`` at the claim's own
+    deferred-cancellation await; it is not actually delivered to the caller
+    until the executor thread finishes, so the blocking event is released
+    from a background task after a deliberate delay, scheduled right after
+    the cancel rather than awaited immediately -- otherwise the test would
+    hang waiting on a thread nothing else would ever unblock. The delay
+    itself is deliberate, not incidental: releasing immediately would also
+    happen to avoid a regressed, pre-fix write (one that drops back to
+    releasing the write lock the instant its own await is cancelled, without
+    waiting for the thread) racing its collision to completion before the
+    thread wakes, which would make this test pass for the wrong reason
+    against exactly the regression it exists to catch. Holding the thread
+    blocked for a fixed, generous interval instead gives that regression's
+    reclaim every opportunity to reach its own ``BEGIN IMMEDIATE`` and
+    collide while the transaction is still open -- a loaded machine only
+    widens that margin, never narrows it, so this is not a flaky wait for
+    the "real" work to finish. An ``asyncio.Event`` would not do here (it is
+    not thread-safe to signal from the executor thread), and blocking at the
+    ``asyncio`` level (as
     ``test_cancellation_during_claim_write_leaves_no_running_row`` does)
     would let cancellation reach the block directly instead of leaving a
-    transaction open for the reclaim to collide with.
+    transaction open for the reclaim to (no longer) collide with.
 
-    Catches: the logging being downgraded to ``contextlib.suppress`` (or any
-    swallow that drops the warning), which would make this documented benign
-    failure silent.
+    Catches: any regression that goes back to releasing the write lock
+    before the claim's thread has actually committed or rolled back --
+    silently reintroducing the collision and the warning this asserts is
+    now absent.
     """
     conn = _init_tmp_db(tmp_path)
     _patch_worker_infra(monkeypatch)
@@ -388,8 +403,17 @@ def test_cancellation_inside_claim_transaction_logs_and_defers_to_boot_reclaim(
         finally:
             check_conn.close()
 
+    async def _release_after_a_delay() -> None:
+        # 50 ms is a large margin over the microsecond-scale, purely
+        # in-process chain a regressed write's cancellation propagation and
+        # its reclaim's dispatch would need -- see the docstring above for
+        # why this delay is deliberate rather than incidental.
+        await asyncio.sleep(0.05)
+        release.set()
+
     async def _run() -> None:
         task = asyncio.create_task(run_worker(db))
+        delayed_release: asyncio.Task[None] | None = None
         try:
             while not claimed.is_set():
                 await asyncio.sleep(0.01)
@@ -400,32 +424,38 @@ def test_cancellation_inside_claim_transaction_logs_and_defers_to_boot_reclaim(
 
             with caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"):
                 task.cancel()
+                delayed_release = asyncio.create_task(_release_after_a_delay())
                 with pytest.raises(asyncio.CancelledError):
                     await task
             warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-            assert any("shutdown reclaim failed" in r.getMessage() for r in warnings), (
-                f"expected a 'shutdown reclaim failed' warning; got "
+            assert not any(
+                "shutdown reclaim failed" in r.getMessage() for r in warnings
+            ), (
+                f"the write lock now defers to the claim's thread finishing, so "
+                f"the reclaim must never collide with it: "
                 f"{[r.getMessage() for r in warnings]}"
             )
         finally:
-            # Unblock thread A no matter what happens above: it is parked in
-            # `release.wait()` inside a leaked `asyncio.to_thread` worker, and
-            # `asyncio.run()` joins that worker on teardown. Skipping this on
-            # an assertion failure would hang the whole test process instead
-            # of reporting a clean failure.
+            # Belt and braces: release is already set on every path above,
+            # but re-set it, cancel the delayed-release task if it is still
+            # pending, and make sure the worker task is not left running if
+            # an assertion above failed before reaching that point --
+            # skipping this would hang the whole test process on teardown
+            # instead of reporting a clean failure.
             release.set()
+            if delayed_release is not None and not delayed_release.done():
+                delayed_release.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await delayed_release
             if not task.done():
                 task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        # The claim's transaction now commits (thread A was released above).
-        await _await_committed("running")
-        assert _job_status(conn, job_id) == "running"
-
-        # The next-boot backstop: a fresh reclaim now succeeds (no open
-        # transaction stands in its way) and returns the row to pending.
-        await db.write(reclaim_all_stale)
+        # The claim commits, and the shutdown-time reclaim -- no longer
+        # blocked out by a collision -- reaches the row directly: no
+        # next-boot sweep is needed to recover it.
+        await _await_committed("pending")
         assert _job_status(conn, job_id) == "pending"
 
     asyncio.run(_run())

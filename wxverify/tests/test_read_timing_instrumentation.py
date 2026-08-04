@@ -9,8 +9,11 @@ with and without ``?counts=exact``.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -18,7 +21,12 @@ from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.db.connection import Database, close_db, get_db
+from wxverify.db.connection import (  # noqa: SLF001
+    _READ_POOL_SIZE,
+    Database,
+    close_db,
+    get_db,
+)
 
 
 def _shared_read(conn: sqlite3.Connection) -> int:
@@ -137,19 +145,23 @@ def test_read_cancelled_while_waiting_for_the_lock_still_records_a_lower_bound_w
     async def _drive() -> dict[str, dict[str, float]]:
         db = Database(str(tmp_path / "db.sqlite"))
         try:
-            await db._read_lock.acquire()  # noqa: SLF001
+            # Drain every pooled connection so the read below has none left to
+            # acquire and must queue -- the pool's equivalent of holding the
+            # old single lock.
+            held = [db._read_pool.get_nowait() for _ in range(_READ_POOL_SIZE)]  # noqa: SLF001
             task = asyncio.create_task(
                 db.read(lambda conn: conn.execute("SELECT 1").fetchone())
             )
-            await asyncio.sleep(0)  # let the task run up to the held lock
-            assert not task.done(), "read must still be queued for the lock"
-            # Hold the lock a measurable interval before cancelling so wait_ms
-            # has something to lower-bound: a hard 0.0 would prove nothing.
+            await asyncio.sleep(0)  # let the task run up to the empty pool
+            assert not task.done(), "read must still be queued for a pooled connection"
+            # Hold the pool empty a measurable interval before cancelling so
+            # wait_ms has something to lower-bound: a hard 0.0 would prove nothing.
             await asyncio.sleep(0.02)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            db._read_lock.release()  # noqa: SLF001
+            for conn in held:
+                db._read_pool.put_nowait(conn)  # noqa: SLF001
             return db.read_timing_snapshot()
         finally:
             db.close()
@@ -157,9 +169,10 @@ def test_read_cancelled_while_waiting_for_the_lock_still_records_a_lower_bound_w
     snapshot = asyncio.run(_drive())
     assert len(snapshot) == 1
     timing = next(iter(snapshot.values()))
-    # A read cancelled before the lock is even acquired never reaches the
-    # dispatch or exec phases, but it is still recorded as a failed call with
-    # a (lower-bound) wait rather than dropped from the snapshot entirely.
+    # A read cancelled before a pooled connection is even acquired never
+    # reaches the dispatch or exec phases, but it is still recorded as a
+    # failed call with a (lower-bound) wait rather than dropped from the
+    # snapshot entirely.
     assert timing["calls"] == 1
     assert timing["errors"] == 1
     assert timing["dispatch_ms"] == 0.0
@@ -167,6 +180,195 @@ def test_read_cancelled_while_waiting_for_the_lock_still_records_a_lower_bound_w
     # 5 ms margin below the 20 ms hold: one-sided (a loaded machine only
     # makes the sleep longer, never shorter), so this should not be flaky.
     assert timing["wait_ms"] >= 15.0
+
+
+def test_gate_ms_is_near_zero_normally_and_bounded_below_during_a_swap(
+    tmp_path: Path,
+) -> None:
+    """gate_ms must track time parked behind a closed import-swap gate
+    separately from wait_ms: a read served while the gate is already open
+    should show ~0 gate_ms, and a read parked behind an in-progress swap
+    should show a bounded-below gate_ms without that same time leaking
+    into wait_ms once it reaches the (by then fully restocked) pool.
+    """
+
+    def _build_replacement_db(path: Path) -> Path:
+        placeholder = Database(str(path))
+        placeholder.close()
+        return path
+
+    async def _drive() -> tuple[dict[str, float], dict[str, float]]:
+        db = Database(str(tmp_path / "db.sqlite"))
+        try:
+            await db.read(lambda conn: conn.execute("SELECT 1").fetchone())
+            before_labels = set(db.read_timing_snapshot())
+
+            real_replace_sync = Database._replace_sync  # noqa: SLF001
+
+            def _slow_replace_sync(self: Database, new_db: Path, backup: Path) -> None:
+                # A fixed, deterministic hold so the gate-closed interval
+                # has a known lower bound to check gate_ms against.
+                time.sleep(0.02)
+                real_replace_sync(self, new_db, backup)
+
+            Database._replace_sync = _slow_replace_sync  # type: ignore[method-assign]  # noqa: SLF001
+            try:
+                new_path = _build_replacement_db(tmp_path / "new.db")
+                backup_path = tmp_path / "backup.db.bak"
+                swap_task = asyncio.create_task(db.replace_from(new_path, backup_path))
+                await asyncio.sleep(0)
+                assert db._read_gate.is_set() is False, (  # noqa: SLF001
+                    "the gate must already be closed before the gated "
+                    "read below is dispatched, or it proves nothing"
+                )
+
+                await db.read(lambda conn: conn.execute("SELECT 2").fetchone())
+                await swap_task
+            finally:
+                Database._replace_sync = real_replace_sync  # type: ignore[method-assign]  # noqa: SLF001
+
+            snapshot = db.read_timing_snapshot()
+            normal_label = next(iter(before_labels))
+            gated_label = next(iter(set(snapshot) - before_labels))
+            return snapshot[normal_label], snapshot[gated_label]
+        finally:
+            db.close()
+
+    normal, gated = asyncio.run(_drive())
+    assert normal["gate_ms"] < 15.0, (
+        "a read served while the gate is already open must not show a "
+        "meaningful gate_ms"
+    )
+    # 5 ms margin below the 20 ms hold: one-sided (a loaded machine only
+    # makes the sleep longer, never shorter), so this should not be flaky.
+    assert gated["gate_ms"] >= 15.0, (
+        "a read parked behind an in-progress swap must show that wait in gate_ms"
+    )
+    assert gated["wait_ms"] < 15.0, (
+        "gate time must not leak into wait_ms -- by the time the gated "
+        "read passes the gate, the pool has already been restocked, so "
+        "its pool wait should stay near zero"
+    )
+
+
+def test_wait_ms_is_near_zero_within_pool_capacity_and_bounded_below_beyond_it(
+    tmp_path: Path,
+) -> None:
+    """wait_ms tracks time spent queued for a pooled connection once past
+    the gate. The first _READ_POOL_SIZE concurrent reads should each get a
+    connection immediately (near-zero wait); a read dispatched once the
+    pool is fully checked out must queue and show a bounded-below wait.
+    """
+    entered = [threading.Event() for _ in range(_READ_POOL_SIZE)]
+    counter = itertools.count()
+    release = threading.Event()
+
+    def _held(conn: sqlite3.Connection) -> None:
+        entered[next(counter)].set()
+        # Held until the test releases it, NOT for a fixed interval: the
+        # measured interval has to start AFTER the extra read is already
+        # queued, or the setup can consume it and the extra read finds a
+        # free connection.
+        assert release.wait(timeout=5.0)
+
+    async def _drive() -> tuple[dict[str, float], dict[str, float]]:
+        db = Database(str(tmp_path / "db.sqlite"))
+        try:
+            holder_tasks = [
+                asyncio.create_task(db.read(_held)) for _ in range(_READ_POOL_SIZE)
+            ]
+            for event in entered:
+                assert await asyncio.to_thread(event.wait, 5.0), (
+                    "every holder must actually check out a pooled "
+                    "connection and start running, or the pool is not "
+                    "genuinely saturated yet"
+                )
+
+            extra_task = asyncio.create_task(
+                db.read(lambda conn: conn.execute("SELECT 1").fetchone())
+            )
+            await asyncio.sleep(0)
+            assert not extra_task.done(), (
+                "with the pool fully checked out, the extra read must "
+                "queue rather than complete immediately"
+            )
+            assert db._read_pool.qsize() == 0, (  # noqa: SLF001
+                "the pool must be genuinely empty for the extra read's "
+                "wait to mean anything"
+            )
+            # The lower bound starts HERE -- after the extra read is
+            # confirmed queued -- so load can only lengthen it.
+            await asyncio.sleep(0.02)
+            release.set()
+
+            await asyncio.gather(*holder_tasks, extra_task)
+            snapshot = db.read_timing_snapshot()
+            assert len(snapshot) == 2
+            held_label = next(
+                label
+                for label, timing in snapshot.items()
+                if timing["calls"] == _READ_POOL_SIZE
+            )
+            extra_label = next(
+                label for label, timing in snapshot.items() if timing["calls"] == 1
+            )
+            return snapshot[held_label], snapshot[extra_label]
+        finally:
+            db.close()
+
+    held, extra = asyncio.run(_drive())
+    assert held["wait_ms"] < 15.0, (
+        "each of the first _READ_POOL_SIZE reads must get a pooled "
+        "connection immediately -- their combined wait should stay near "
+        "zero"
+    )
+    # 5 ms margin below the 20 ms hold: the interval starts only after the
+    # extra read is confirmed queued (see release.set() above), so load
+    # can only lengthen it, never shorten it -- this should not be flaky.
+    assert extra["wait_ms"] >= 15.0, (
+        "a read dispatched while the pool is fully checked out must queue "
+        "for a connection, and that queueing time belongs in wait_ms"
+    )
+
+
+def test_read_cancelled_while_waiting_for_the_gate_still_records_an_error(
+    tmp_path: Path,
+) -> None:
+    """A read cancelled while parked behind a closed gate -- the new
+    failure phase this pool introduces -- must still be counted as a
+    failed call, exactly like a read cancelled while queued for a pooled
+    connection already is.
+    """
+
+    async def _drive() -> dict[str, dict[str, float]]:
+        db = Database(str(tmp_path / "db.sqlite"))
+        try:
+            db._read_gate.clear()  # noqa: SLF001
+            task = asyncio.create_task(
+                db.read(lambda conn: conn.execute("SELECT 1").fetchone())
+            )
+            await asyncio.sleep(0)
+            assert not task.done(), "read must be parked behind the closed gate"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return db.read_timing_snapshot()
+        finally:
+            db._read_gate.set()  # noqa: SLF001
+            db.close()
+
+    snapshot = asyncio.run(_drive())
+    assert len(snapshot) == 1
+    timing = next(iter(snapshot.values()))
+    assert timing["calls"] == 1
+    assert timing["errors"] == 1
+    assert timing["dispatch_ms"] == 0.0
+    assert timing["exec_ms"] == 0.0
+    assert timing["wait_ms"] == 0.0, (
+        "a read cancelled before ever passing the gate never reached the "
+        "pool-wait phase, so wait_ms must stay at its untouched default "
+        "rather than borrowing time from the gate phase"
+    )
 
 
 _BASE_WORKER_STATUS_KEYS = frozenset(
