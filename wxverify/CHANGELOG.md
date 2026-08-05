@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.9.3
+
+### Fixed
+
+- A restored database that contains a value the app itself would never
+  write — for example a corrupted timestamp, station cadence, or site
+  reference — could previously crash the background worker on every
+  scheduling pass, with no way out short of editing the database
+  directly. Such rows are now read defensively and either skipped or
+  treated safely by default, with a warning logged instead of a crash.
+- Interrupting a database operation — for instance while shutting down
+  mid-job — could previously let a second operation start against the
+  same connection before the first had actually finished. This most
+  visibly showed up as a "shutdown reclaim failed" warning that
+  deferred job recovery to the next restart instead of completing it
+  immediately. Database operations now always finish before their
+  connection or lock is released, closing that race entirely.
+- Database reads — page loads, the worker's own background checks, and
+  chart data requests — previously queued behind one another one at a
+  time. They now run concurrently against a small pool of connections,
+  which should reduce wait times when several things are happening at
+  once.
+- Restoring a database while a worker job or a new-station request was
+  still in progress could let that job's write land in the
+  newly-restored database against rows that no longer meant the same
+  thing, corrupting unrelated data. Such writes are now detected and
+  rejected, and the affected job or request is safely abandoned
+  instead.
+- After restoring a database, the app rebuilds its derived scoring
+  tables in the background. Previously, restarting the app while that
+  rebuild was still running could leave it permanently half-finished,
+  while the restored file's own leftover completion marker made the
+  app trust incomplete data. The rebuild's progress is now tracked
+  durably and automatically resumes on the next start if it was
+  interrupted.
+- Downloading a database export previously had to fit entirely in the
+  browser tab's memory before any of it reached disk, which could
+  crash the tab when exporting a large database on a
+  memory-constrained device. In browsers that support it, the download
+  now streams directly to the file you choose as it arrives; other
+  browsers keep the previous behavior unchanged.
+- The dashboard skill-curve chart, the overlay chart, and the
+  forecast's hourly chart previously rendered only as a graphic, with
+  nothing for a screen reader to read once the page loaded. Each chart
+  now also shows a plain-language summary and a data table with the
+  same numbers, visible to every visitor.
+- A forecast feed whose endpoint kept failing could retry on the
+  standard backoff schedule fast enough to burn through a metered
+  provider's small daily call budget well before that feed's own poll
+  interval would normally allow. Retries for a persistently-failing
+  feed are now spaced no closer together than the feed's own poll
+  interval, after an initial fast retry that still recovers quickly
+  from a one-off blip.
+
 ## 0.9.2
 
 ### Fixed
