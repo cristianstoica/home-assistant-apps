@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.9.5
+
+### Fixed
+
+- Feeds that had never successfully run bypassed the fetch-interval
+  validation added in 0.9.4, so a corrupt or imported interval could
+  still schedule provider calls at an invented rate. The interval is
+  now validated before the due decision in both the scheduler and the
+  catchup path; a feed whose interval cannot be read is skipped with a
+  warning and left for the operator to repair.
+- Updating a feed through the API now rejects an interval above the
+  30-day maximum the scheduler enforces, instead of accepting it and
+  silently never applying it.
+- The feed list and forecast freshness endpoints no longer fail when a
+  stored interval cannot be read; they report the feed as having no
+  usable interval, and forecast freshness marks it stale.
+
+### API
+
+- `fetch_interval_minutes` in the `/api/feeds` response can now be
+  `null` for a feed whose stored interval is unreadable, where earlier
+  versions returned an error. Existing stored values above the maximum
+  are left untouched — there is no migration or clamp.
+
 ## 0.9.4
 
 ### Fixed

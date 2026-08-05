@@ -544,6 +544,12 @@ def _due_open_meteo_targets(
     for row in rows:
         site_id = int(row["site_id"])
         feed_id = int(row["feed_id"])
+        interval = parse_fetch_interval_minutes(
+            row["fetch_interval_minutes"],
+            context=f"catchup site={site_id} feed={feed_id}",
+        )
+        if interval is None:
+            continue
         last_run_at = row["last_run_at"]
         due = last_run_at is None
         if last_run_at is not None:
@@ -563,12 +569,6 @@ def _due_open_meteo_targets(
                     site_id,
                     feed_id,
                 )
-                continue
-            interval = parse_fetch_interval_minutes(
-                row["fetch_interval_minutes"],
-                context=f"catchup site={site_id} feed={feed_id}",
-            )
-            if interval is None:
                 continue
             elapsed = (window_end - last_run_dt).total_seconds() / 60
             due = elapsed >= interval

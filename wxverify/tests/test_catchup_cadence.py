@@ -65,8 +65,8 @@ def _subscribe(
 
 @pytest.mark.parametrize(
     "literal",
-    ["9e999", "x'0001'", "0", "-60"],
-    ids=["real_infinity", "blob", "zero", "negative"],
+    ["9e999", "x'0001'", "0", "-60", "43201"],
+    ids=["real_infinity", "blob", "zero", "negative", "over_max"],
 )
 def test_hostile_fetch_interval_minutes_skips_only_that_feed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, literal: str
@@ -102,6 +102,39 @@ def test_hostile_fetch_interval_minutes_skips_only_that_feed(
     )
     assert "fetch_interval_minutes" in warnings[0].getMessage()
     assert f"feed={bad_feed_id}" in warnings[0].getMessage()
+
+
+def test_hostile_fetch_interval_minutes_with_null_last_run_at_skips_that_feed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A never-run feed (NULL last_run_at) with a hostile cadence must not
+    be treated as due unconditionally -- the cadence guard has to run BEFORE
+    the due decision, not only inside the elapsed-time branch that a NULL
+    last_run_at never reaches.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    bad_feed_id = _feed_id(conn, "open-meteo", "gfs_global")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 9e999 WHERE id = ?",
+        (bad_feed_id,),
+    )
+    # No site_feed_state row for either feed -> both have NULL last_run_at.
+
+    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.cadence"):
+        targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
+
+    target_feed_ids = {t.feed_id for t in targets}
+    assert control_feed_id in target_feed_ids, (
+        "the healthy never-run sibling feed must still be scheduled this tick"
+    )
+    assert bad_feed_id not in target_feed_ids, (
+        "a never-run feed with a rejected fetch_interval_minutes must not be "
+        "scheduled unconditionally -- inventing a cadence would charge a "
+        "metered provider call"
+    )
 
 
 def test_unparseable_last_run_at_skips_only_that_feed(
@@ -173,7 +206,8 @@ def test_valid_interval_and_null_last_run_at_are_due(tmp_path: Path) -> None:
     far_past = isoformat_utc(utc_now() - timedelta(days=30))
     _subscribe(conn, site_id, elapsed_feed_id, last_run_at=far_past)
     # never_run_feed_id: no site_feed_state row at all -> last_run_at is NULL
-    # via the LEFT JOIN, so it must be due regardless of cadence.
+    # via the LEFT JOIN, so it must be due regardless of elapsed time, given
+    # a parseable cadence.
 
     site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
     targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())

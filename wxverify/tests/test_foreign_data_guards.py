@@ -172,6 +172,63 @@ def _setup_fetch_interval_minutes_blob(conn: sqlite3.Connection) -> _ExpectedJob
     return _setup_fetch_interval_minutes_hostile(conn, "x'0001'")
 
 
+def _setup_fetch_interval_minutes_hostile_null_last_run_at(
+    conn: sqlite3.Connection, literal: str
+) -> _ExpectedJobs:
+    """A never-run feed (site_feed_state row with last_run_at NULL) must not
+    be treated as due unconditionally when its cadence is hostile -- the
+    cadence guard has to run BEFORE the due decision, not only inside the
+    elapsed-time branch that a NULL last_run_at never reaches."""
+    site_id = _insert_site(conn)
+    control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    bad_feed_id = _feed_id(conn, "meteoblue", "multimodel")
+    conn.execute(
+        """
+        INSERT INTO site_feed_state (site_id, feed_id, enabled, last_run_at)
+        VALUES (?, ?, 1, NULL)
+        """,
+        (site_id, bad_feed_id),
+    )
+    conn.execute(
+        f"UPDATE feeds SET fetch_interval_minutes = {literal} WHERE id = ?",
+        (bad_feed_id,),
+    )
+    return _ExpectedJobs(
+        must_exist=(("fetch_feed", site_id, f"fetch:{control_feed_id}"),),
+        must_not_exist=(("fetch_feed", site_id, f"fetch:{bad_feed_id}"),),
+    )
+
+
+def _setup_fetch_interval_minutes_blob_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "x'0001'")
+
+
+def _setup_fetch_interval_minutes_real_infinity_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "9e999")
+
+
+def _setup_fetch_interval_minutes_zero_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "0")
+
+
+def _setup_fetch_interval_minutes_negative_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "-1")
+
+
+def _setup_fetch_interval_minutes_over_max_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "43201")
+
+
 def _setup_sites_last_obs_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     site_id = _insert_site(conn)
     _insert_station(conn, site_id, "PWS-CASE-OBS")
@@ -229,6 +286,36 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         logger_name="wxverify.worker.scheduler",
         warning_substring="fetch_interval_minutes",
         setup=_setup_fetch_interval_minutes_blob,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_blob_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_blob_null_last_run_at,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_real_infinity_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_real_infinity_null_last_run_at,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_zero_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_zero_null_last_run_at,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_negative_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_negative_null_last_run_at,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_over_max_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_over_max_null_last_run_at,
     ),
     _TickCarrierCase(
         case_id="sites_last_obs_at_blob",

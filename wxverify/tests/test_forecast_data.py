@@ -333,6 +333,31 @@ def test_freshness_excludes_virtual_feed_includes_member_feed() -> None:
     assert member_id in freshness
 
 
+def test_freshness_survives_hostile_stored_cadence() -> None:
+    """A feed with a rejected ``fetch_interval_minutes`` must still surface
+    in the freshness map -- as ``stale`` with ``fetch_interval_minutes=None``
+    -- rather than raising or silently dropping the row."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    bad_feed = _feed_id(conn, "open-meteo", "gfs_global")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 0 WHERE id = ?", (bad_feed,)
+    )
+    _insert_sample(
+        conn,
+        feed_id=bad_feed,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[bad_feed].stale is True
+    assert freshness[bad_feed].fetch_interval_minutes is None
+
+
 # ---------------------------------------------------------------------------
 # samples_fingerprint
 # ---------------------------------------------------------------------------

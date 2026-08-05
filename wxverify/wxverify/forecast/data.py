@@ -25,6 +25,7 @@ from wxverify.collection.forecast_validation import (
 )
 from wxverify.core.timeutil import parse_utc
 from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard
+from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 _EXCLUDED_FEEDS_SQL = (
     "f.is_virtual = 0 AND NOT (f.source = 'meteoblue' AND f.model = 'multimodel')"
@@ -50,7 +51,7 @@ class FeedFreshness:
 
     feed_id: int
     latest_issued_at: str
-    fetch_interval_minutes: int
+    fetch_interval_minutes: int | None
     stale: bool
 
 
@@ -146,11 +147,26 @@ def load_feed_freshness(
     ).fetchall()
     out: dict[int, FeedFreshness] = {}
     for row in rows:
+        feed_id = int(row["feed_id"])
         latest = str(row["latest_issued_at"])
-        interval = int(row["fetch_interval_minutes"])
+        interval = parse_fetch_interval_minutes(
+            row["fetch_interval_minutes"],
+            context=f"feed freshness feed_id={feed_id}",
+        )
+        if interval is None:
+            # Foreign/corrupt or out-of-range cadence: fail closed (stale)
+            # rather than silently dropping the feed from the freshness map
+            # or inventing a cadence to judge it against.
+            out[feed_id] = FeedFreshness(
+                feed_id=feed_id,
+                latest_issued_at=latest,
+                fetch_interval_minutes=None,
+                stale=True,
+            )
+            continue
         stale = parse_utc(latest) < now - timedelta(minutes=2 * interval)
-        out[int(row["feed_id"])] = FeedFreshness(
-            feed_id=int(row["feed_id"]),
+        out[feed_id] = FeedFreshness(
+            feed_id=feed_id,
             latest_issued_at=latest,
             fetch_interval_minutes=interval,
             stale=stale,

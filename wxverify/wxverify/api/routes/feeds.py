@@ -17,6 +17,7 @@ from wxverify.provider_ops import (
 from wxverify.provider_ops import (
     rebuild_mean_for_site as _rebuild_mean_for_site,
 )
+from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 router = APIRouter(tags=["feeds"])
 
@@ -31,7 +32,9 @@ def _feed_out(row: sqlite3.Row) -> FeedOut:
         if row["disabled_reason"] is None
         else str(row["disabled_reason"]),
         default_subscribed=bool(row["default_subscribed"]),
-        fetch_interval_minutes=int(row["fetch_interval_minutes"]),
+        fetch_interval_minutes=parse_fetch_interval_minutes(
+            row["fetch_interval_minutes"], context=f"feed_out id={int(row['id'])}"
+        ),
         max_lead_hours=int(row["max_lead_hours"]),
         is_virtual=bool(row["is_virtual"]),
     )

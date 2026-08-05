@@ -55,6 +55,19 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
     ).fetchall()
     now = utc_now()
     for row in rows:
+        site_id = int(row["site_id"])
+        feed_id = int(row["feed_id"])
+        interval = parse_fetch_interval_minutes(
+            row["fetch_interval_minutes"],
+            context=f"scheduler site={site_id} feed={feed_id}",
+        )
+        if interval is None:
+            # Foreign/corrupt or out-of-range cadence: fail closed (skip
+            # this feed for this tick) BEFORE any due decision -- a
+            # never-run feed would otherwise be due unconditionally and get
+            # paid provider calls on an invented schedule. Every other feed
+            # still runs.
+            continue
         last_run_at = row["last_run_at"]
         due = last_run_at is None
         if last_run_at is not None:
@@ -67,24 +80,11 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
                 logger.warning(
                     "scheduler: unreadable last_run_at site=%s feed=%s;"
                     " treating feed as due",
-                    int(row["site_id"]),
-                    int(row["feed_id"]),
+                    site_id,
+                    feed_id,
                 )
                 due = True
             else:
-                interval = parse_fetch_interval_minutes(
-                    row["fetch_interval_minutes"],
-                    context=(
-                        f"scheduler site={int(row['site_id'])}"
-                        f" feed={int(row['feed_id'])}"
-                    ),
-                )
-                if interval is None:
-                    # Foreign/corrupt or out-of-range cadence: fail closed
-                    # (skip this feed for this tick) rather than invent a
-                    # schedule for paid provider calls. Every other feed
-                    # still runs.
-                    continue
                 minutes = (now - last_run_dt).total_seconds() / 60
                 due = minutes >= interval
         if due:

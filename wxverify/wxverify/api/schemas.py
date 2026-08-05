@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from wxverify.worker.cadence import MAX_FETCH_INTERVAL_MINUTES
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -45,7 +47,9 @@ class StationUpdate(StrictModel):
 
 class FeedUpdate(StrictModel):
     enabled: bool | None = None
-    fetch_interval_minutes: int | None = Field(default=None, ge=1)
+    fetch_interval_minutes: int | None = Field(
+        default=None, ge=1, le=MAX_FETCH_INTERVAL_MINUTES
+    )
     default_subscribed: bool | None = None
     disabled_reason: str | None = None
 
@@ -82,7 +86,7 @@ class FeedOut(BaseModel):
     enabled: bool
     disabled_reason: str | None
     default_subscribed: bool
-    fetch_interval_minutes: int
+    fetch_interval_minutes: int | None
     max_lead_hours: int
     is_virtual: bool
 
