@@ -65,6 +65,7 @@ from wxverify.worker.feed_fetch import (
     Ineligible,
     Unavailable,
     fetch_feed_once,
+    fetch_feed_retry_floor_seconds,
     mark_feed_unavailable,
 )
 from wxverify.worker.scheduler import scheduler_tick
@@ -179,7 +180,12 @@ async def run_worker(db: Database) -> None:
                         raise
                     message = sanitized_exception(exc)
                     disposition = await writer.write(
-                        lambda conn, jid=job_id, err=message: fail(conn, jid, err)
+                        lambda conn, j=job, err=message: fail(
+                            conn,
+                            j.id,
+                            err,
+                            min_delay_seconds=fetch_feed_retry_floor_seconds(conn, j),
+                        )
                     )
                     if disposition is not None and disposition.terminal:
                         outcome = "failed"

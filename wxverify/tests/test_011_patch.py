@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,7 @@ from wxverify import config
 from wxverify.api.csrf import issue_csrf_pair, set_csrf_cookie
 from wxverify.api.ingress import IngressPathMiddleware
 from wxverify.collection.budget import Reservation, refund_budget, reserve_budget
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import (
     FencedWriter,
     StaleGenerationError,
@@ -23,12 +25,24 @@ from wxverify.db.connection import (
     get_db,
     init_db,
 )
-from wxverify.db.queue import FailDisposition, Job
+from wxverify.db.queue import (
+    FailDisposition,
+    Job,
+    claim_next_job,
+    enqueue_if_absent,
+    fail,
+)
 from wxverify.feeds.seam import CostEstimate, FetchResult
+from wxverify.provider_ops import enqueue_fetch_for_feed
 from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
-from wxverify.worker.feed_fetch import BackoffActive, fetch_feed_once
+from wxverify.worker.feed_fetch import (
+    BackoffActive,
+    fetch_feed_once,
+    fetch_feed_retry_floor_seconds,
+)
 from wxverify.worker.processor import dispatch, run_worker
+from wxverify.worker.scheduler import scheduler_tick
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -62,6 +76,22 @@ def _open_meteo_feed_id(conn: sqlite3.Connection) -> int:
             " WHERE source='open-meteo' AND is_virtual=0"
             " ORDER BY id LIMIT 1"
         ).fetchone()["id"]
+    )
+
+
+def _google_feed_id(conn: sqlite3.Connection) -> int:
+    return int(
+        conn.execute(
+            "SELECT id FROM feeds WHERE source='google' ORDER BY id LIMIT 1"
+        ).fetchone()["id"]
+    )
+
+
+def _subscribe(conn: sqlite3.Connection, site_id: int, feed_id: int) -> None:
+    conn.execute(
+        "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
+        " VALUES (?, ?, 1, 0)",
+        (site_id, feed_id),
     )
 
 
@@ -167,6 +197,32 @@ def _claim_once(job: Job):  # type: ignore[no-untyped-def]
         raise _StopLoop()
 
     return claim
+
+
+class _FakeClock:
+    """Mutable clock for wxverify.db.queue's utc_now/isoformat_utc.
+
+    isoformat_utc's real no-arg branch resolves utc_now() against
+    core.timeutil's own namespace, not queue.py's -- so patching queue.py's
+    utc_now alone would leave claim_next_job's bare isoformat_utc() call
+    (the value compared against next_attempt_at) reading the real wall
+    clock. Both names are patched together, mirroring the pattern already
+    used for current_obs/domain_backoff clock freezing.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def utc_now(self) -> datetime:
+        return self.now
+
+    def isoformat_utc(self, value: datetime | None = None) -> str:
+        dt = value if value is not None else self.now
+        return dt.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+    def patch(self, monkeypatch: pytest.MonkeyPatch, module: str) -> None:
+        monkeypatch.setattr(f"{module}.utc_now", self.utc_now)
+        monkeypatch.setattr(f"{module}.isoformat_utc", self.isoformat_utc)
 
 
 def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -507,6 +563,623 @@ def test_fetch_feed_success_consumes_budget_exactly_once(tmp_path: Path) -> None
     assert budget is not None and budget["calls"] == 1
 
 
+def test_fetch_feed_readtimeout_total_calls_capped_at_max_retries_plus_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A metered feed whose endpoint always times out must still go terminal
+    after max_retries automatic retries: total budget burn across the whole
+    retry sequence stays capped at (1 + max_retries) calls, not an uncapped
+    short generic ladder that can blow through a small daily call budget.
+
+    The fake clock here advances past the cadence floor on EVERY cycle, so
+    the floor never binds and this test cannot observe whether it is wired
+    in at all -- it only exercises the retry CAP. The floor's own spacing is
+    pinned separately by
+    test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor, below.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _google_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    interval_row = conn.execute(
+        "SELECT fetch_interval_minutes FROM feeds WHERE id=?", (feed_id,)
+    ).fetchone()
+    floor_seconds = int(interval_row["fetch_interval_minutes"]) * 60
+    db = get_db()
+
+    class _GoogleReadTimeoutAdapter:
+        supports_historical = False
+
+        def estimate_cost(self, req: Any) -> CostEstimate:
+            return CostEstimate(calls=1)
+
+        async def fetch_forecast(self, req: Any) -> FetchResult:
+            raise httpx.ReadTimeout("synthetic read timeout")
+
+    def _build(source: str, client: httpx.AsyncClient) -> _GoogleReadTimeoutAdapter:
+        return _GoogleReadTimeoutAdapter()
+
+    monkeypatch.setattr("wxverify.worker.processor.build_adapter", _build)
+    _patch_worker_infra(monkeypatch)
+
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    enqueue_if_absent(
+        conn,
+        "fetch_feed",
+        site_id,
+        f"fetch:{feed_id}",
+        {"feed_id": feed_id},
+        max_retries=3,
+    )
+
+    cycles = {"n": 0}
+    max_cycles = 7
+
+    def _advancing_claim(claim_conn: sqlite3.Connection) -> Job | None:
+        cycles["n"] += 1
+        if cycles["n"] > max_cycles:
+            raise _StopLoop()
+        if cycles["n"] > 1:
+            clock.now = clock.now + timedelta(seconds=floor_seconds + 1)
+        return claim_next_job(claim_conn)
+
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _advancing_claim)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(run_worker(db))
+
+    budget = conn.execute(
+        "SELECT calls FROM api_budget WHERE source='google'"
+    ).fetchone()
+    assert budget is not None and budget["calls"] == 4, (
+        "budget burn across automatic retries must stay capped at"
+        f" 1 + max_retries calls; got {budget['calls'] if budget else None}"
+    )
+
+    job_row = conn.execute(
+        "SELECT status, retry_count FROM jobs WHERE site_id=? AND type='fetch_feed'",
+        (site_id,),
+    ).fetchone()
+    assert job_row is not None and job_row["status"] == "failed"
+
+
+def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the composition at run_worker's failure-handling call site --
+    fail(..., min_delay_seconds=fetch_feed_retry_floor_seconds(conn, job))
+    (worker/processor.py) -- by running the real worker loop and asserting
+    the exact next_attempt_at spacing it produces, not just a call count. A
+    call-count assertion alone cannot tell a spaced retry from an unspaced
+    one that merely stops for an unrelated reason (e.g. max_retries): the
+    cap test above (test_fetch_feed_readtimeout_total_calls_capped_at_
+    max_retries_plus_one) passes unchanged even if min_delay_seconds is
+    silently dropped from that call site, because 1 + max_retries calls
+    still happen -- just sooner than the feed's cadence allows.
+
+    Two claim cycles, matching fetch_feed_retry_floor_seconds's own
+    contract: the floor is None (skipped) on the first automatic retry
+    (job.retry_count == 0 at claim time) and only starts binding from the
+    second retry onward, so a single-cycle test cannot observe it either.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _google_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    interval_row = conn.execute(
+        "SELECT fetch_interval_minutes FROM feeds WHERE id=?", (feed_id,)
+    ).fetchone()
+    floor_seconds = int(interval_row["fetch_interval_minutes"]) * 60
+    db = get_db()
+
+    class _GoogleReadTimeoutAdapter:
+        supports_historical = False
+
+        def estimate_cost(self, req: Any) -> CostEstimate:
+            return CostEstimate(calls=1)
+
+        async def fetch_forecast(self, req: Any) -> FetchResult:
+            raise httpx.ReadTimeout("synthetic read timeout")
+
+    def _build(source: str, client: httpx.AsyncClient) -> _GoogleReadTimeoutAdapter:
+        return _GoogleReadTimeoutAdapter()
+
+    monkeypatch.setattr("wxverify.worker.processor.build_adapter", _build)
+    _patch_worker_infra(monkeypatch)
+
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    enqueue_if_absent(
+        conn,
+        "fetch_feed",
+        site_id,
+        f"fetch:{feed_id}",
+        {"feed_id": feed_id},
+        max_retries=3,
+    )
+
+    cycles = {"n": 0}
+
+    def _advancing_claim(claim_conn: sqlite3.Connection) -> Job | None:
+        cycles["n"] += 1
+        if cycles["n"] > 2:
+            raise _StopLoop()
+        if cycles["n"] > 1:
+            # Jump past the FIRST retry's short exponential delay (2s) so the
+            # SECOND claim can happen at all -- this advance is unrelated to
+            # the floor under test, which only starts binding once this
+            # second failure is itself recorded, below.
+            clock.now = clock.now + timedelta(seconds=floor_seconds + 1)
+        return claim_next_job(claim_conn)
+
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _advancing_claim)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(run_worker(db))
+
+    row = conn.execute(
+        "SELECT retry_count, next_attempt_at FROM jobs"
+        " WHERE type='fetch_feed' AND site_id=?",
+        (site_id,),
+    ).fetchone()
+    assert row is not None and row["retry_count"] == 2
+    assert row["next_attempt_at"] == clock.isoformat_utc(
+        clock.now + timedelta(seconds=floor_seconds)
+    ), (
+        "the second automatic retry must be spaced at the feed's own fetch"
+        " cadence by the min_delay_seconds=fetch_feed_retry_floor_seconds(...)"
+        " composition in run_worker -- a dropped/broken composition would"
+        " retry far sooner than the feed's cadence allows"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug 4 — Fetch-feed retry ladder: cadence floor, retry cap, cooldown wiring
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "missing_feed_id",
+        "invalid_feed_id_type",
+        "feed_row_missing",
+        "unparseable_interval",
+        "interval_overflow",
+        "interval_out_of_range_high",
+        "interval_zero",
+        "interval_negative",
+    ],
+)
+def test_fetch_feed_retry_floor_seconds_fails_closed_to_fallback_ceiling(
+    case: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Any lookup/parse miss in the cadence-derived floor must fail closed to
+    the fallback ceiling, never fall through to the short generic ladder --
+    and each fallback branch must log a warning, not fail silently.
+    """
+    conn = _init_tmp_db(tmp_path)
+    feed_id = _google_feed_id(conn)
+
+    if case == "missing_feed_id":
+        payload: dict[str, object] = {}
+        expected_fragment = "missing/invalid feed_id"
+    elif case == "invalid_feed_id_type":
+        payload = {"feed_id": "not-a-number"}
+        expected_fragment = "missing/invalid feed_id"
+    elif case == "feed_row_missing":
+        payload = {"feed_id": 999999}
+        expected_fragment = "feed row missing"
+    elif case == "unparseable_interval":
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes='not-a-number' WHERE id=?",
+            (feed_id,),
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "unreadable fetch_interval_minutes"
+    elif case == "interval_overflow":
+        # OverflowError sub-case, distinct from the ValueError above: a REAL
+        # affinity column can hold an IEEE754 infinity, and int() on that
+        # raises OverflowError rather than ValueError -- this codebase has
+        # hit exactly that carrier before (see _job_from_row in db/queue.py),
+        # so the except clause deliberately catches both.
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes=? WHERE id=?",
+            (float("inf"), feed_id),
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "unreadable fetch_interval_minutes"
+    elif case == "interval_out_of_range_high":
+        # int() succeeds here (unlike interval_overflow above): a large but
+        # finite value, e.g. a millisecond epoch stamp pasted into a minutes
+        # field. It clears the API schema's ge=1 bound cleanly -- the
+        # overflow this guards against happens later, in queue.fail()'s
+        # utc_now() + timedelta(seconds=...) -- the datetime addition, not
+        # the timedelta itself -- rather than in this function's own int()
+        # parse.
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes=? WHERE id=?",
+            (4_300_000_000, feed_id),
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "out-of-range fetch_interval_minutes"
+    elif case == "interval_zero":
+        conn.execute("UPDATE feeds SET fetch_interval_minutes=0 WHERE id=?", (feed_id,))
+        payload = {"feed_id": feed_id}
+        expected_fragment = "out-of-range fetch_interval_minutes"
+    else:
+        assert case == "interval_negative"
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes=-60 WHERE id=?", (feed_id,)
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "out-of-range fetch_interval_minutes"
+
+    job = Job(
+        id=1,
+        type="fetch_feed",
+        site_id=1,
+        job_key="test-key",
+        payload=payload,
+        status="running",
+        retry_count=0,
+        max_retries=5,
+    )
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.feed_fetch"):
+        result = fetch_feed_retry_floor_seconds(conn, job)
+    assert result == 3600  # fallback ceiling
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, (
+        f"expected exactly one warning; got: {[r.getMessage() for r in warnings]}"
+    )
+    assert expected_fragment in warnings[0].getMessage()
+
+
+def test_fetch_feed_astronomically_large_feed_id_does_not_crash_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch_feed job whose payload feed_id is an unbounded Python int (a
+    foreign/imported row, the same threat model the payload `feed_id` guard
+    already accepts) must not crash-loop the worker. _payload_feed_id has no
+    range check, so the feeds lookup SELECT inside the retry-floor helper
+    raises OverflowError binding it -- a raise that sits OUTSIDE the
+    helper's own try/except, inside the failure-recording write itself.
+    Pre-fix this escapes run_worker entirely (nothing narrower than
+    asyncio.CancelledError catches it there), so retry_count never advances
+    and the job would crash-loop forever across process restarts instead of
+    going through the ordinary fail()/retry ladder. Also pins that the
+    broad-catch fallback fails CLOSED to the fixed 3600s ceiling rather than
+    open (None): a bare crash-avoidance/call-count check cannot tell those
+    apart.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    huge_feed_id = int("9" * 400)
+
+    # Patch the clock BEFORE enqueue_if_absent: patching after would leave
+    # this row's next_attempt_at stamped on the real wall clock, and
+    # claim_next_job would then never claim it -- the test would pass
+    # vacuously (job never dispatched, no assertion below ever exercised).
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    enqueue_result = enqueue_if_absent(
+        conn,
+        "fetch_feed",
+        site_id,
+        f"fetch:{huge_feed_id}",
+        {"feed_id": huge_feed_id},
+    )
+    job_id = enqueue_result.job_id
+    assert job_id is not None
+
+    db = get_db()
+    _patch_worker_infra(monkeypatch)
+
+    cycles = {"n": 0}
+
+    def _claim_real_once(claim_conn: sqlite3.Connection) -> Job | None:
+        cycles["n"] += 1
+        if cycles["n"] > 1:
+            raise _StopLoop()
+        return claim_next_job(claim_conn)
+
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_real_once)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(run_worker(db))
+
+    row = conn.execute(
+        "SELECT status, retry_count, last_error, next_attempt_at FROM jobs WHERE id=?",
+        (job_id,),
+    ).fetchone()
+    assert row is not None
+    assert row["retry_count"] == 1, (
+        "the failure must be recorded through the normal fail() path, not"
+        " lost to a crash escaping run_worker"
+    )
+    assert row["status"] == "pending"
+    assert row["last_error"] is not None
+    assert row["next_attempt_at"] == clock.isoformat_utc(
+        clock.now + timedelta(seconds=3600)
+    ), (
+        "the broad-catch wrapper in fetch_feed_retry_floor_seconds must fail"
+        " CLOSED to the fixed fallback ceiling, not open (None) -- failing"
+        " open here would let a foreign/corrupt feed_id retry on the short"
+        " generic exponential ladder instead of the fallback ceiling"
+    )
+
+
+def test_fetch_feed_retry_floor_seconds_happy_path_and_non_fetch_feed_type(
+    tmp_path: Path,
+) -> None:
+    """Valid feed_id with a parseable cadence returns it unclamped from the
+    second automatic retry onward (job.retry_count >= 1 at claim time); the
+    first automatic retry (retry_count == 0) always skips the floor, and
+    every other job type is untouched (returns None) regardless of
+    retry_count.
+    """
+    conn = _init_tmp_db(tmp_path)
+    feed_id = _google_feed_id(conn)
+    interval_minutes = int(
+        conn.execute(
+            "SELECT fetch_interval_minutes FROM feeds WHERE id=?", (feed_id,)
+        ).fetchone()["fetch_interval_minutes"]
+    )
+
+    first_retry_job = Job(
+        id=1,
+        type="fetch_feed",
+        site_id=1,
+        job_key="test-key",
+        payload={"feed_id": feed_id},
+        status="running",
+        retry_count=0,
+        max_retries=5,
+    )
+    assert fetch_feed_retry_floor_seconds(conn, first_retry_job) is None
+
+    second_retry_job = Job(
+        id=1,
+        type="fetch_feed",
+        site_id=1,
+        job_key="test-key",
+        payload={"feed_id": feed_id},
+        status="running",
+        retry_count=1,
+        max_retries=5,
+    )
+    assert (
+        fetch_feed_retry_floor_seconds(conn, second_retry_job) == interval_minutes * 60
+    )
+
+    other_job = Job(
+        id=2,
+        type="backfill_site",
+        site_id=1,
+        job_key="test-key",
+        payload={"feed_id": feed_id},
+        status="running",
+        retry_count=1,
+        max_retries=5,
+    )
+    assert fetch_feed_retry_floor_seconds(conn, other_job) is None
+
+
+def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
+    tmp_path: Path,
+) -> None:
+    """A fetch_feed job that failed minutes ago must not be re-enqueued by
+    the next scheduler tick -- the same cooldown that already protects
+    fetch_obs/fetch_current_obs must also protect fetch_feed.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _google_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    job_key = f"fetch:{feed_id}"
+    recent_failure = isoformat_utc(utc_now() - timedelta(minutes=5))
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES ('fetch_feed', ?, ?, '{}', 'failed', ?)
+        """,
+        (site_id, job_key, recent_failure),
+    )
+
+    scheduler_tick(conn)
+
+    count = conn.execute(
+        "SELECT COUNT(*) FROM jobs"
+        " WHERE type='fetch_feed' AND site_id=? AND job_key=? AND status='pending'",
+        (site_id, job_key),
+    ).fetchone()[0]
+    assert count == 0, "a terminal failure inside the cooldown must suppress re-enqueue"
+
+
+def test_scheduler_tick_enqueues_fetch_feed_with_reduced_retry_cap(
+    tmp_path: Path,
+) -> None:
+    """The scheduler's automatic due-feed path must cap fetch_feed retries at
+    3, not the schema default of 5 -- a metered provider job that keeps
+    failing must not fall back to the longer generic retry cap.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _google_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+
+    scheduler_tick(conn)
+
+    row = conn.execute(
+        "SELECT max_retries FROM jobs"
+        " WHERE type='fetch_feed' AND site_id=? AND job_key=?",
+        (site_id, f"fetch:{feed_id}"),
+    ).fetchone()
+    assert row is not None and row["max_retries"] == 3
+
+
+@pytest.mark.parametrize(
+    "job_type", ["backfill_site", "pair_and_score", "fetch_obs", "fetch_current_obs"]
+)
+def test_fail_generic_ladder_unchanged_for_non_fetch_feed_types(
+    job_type: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fail() with no min_delay_seconds keeps the unmodified schema-default
+    max_retries and the plain 2**retry_count backoff -- the retry ladder
+    changes only for fetch_feed, composed by its own caller.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    result = enqueue_if_absent(conn, job_type, site_id, "test-key", {})
+    assert result.job_id is not None
+
+    disposition = fail(conn, result.job_id, "synthetic failure")
+    assert disposition is not None
+    assert disposition.max_retries == 5
+    assert disposition.terminal is False
+
+    row = conn.execute(
+        "SELECT next_attempt_at FROM jobs WHERE id=?", (result.job_id,)
+    ).fetchone()
+    expected = clock.isoformat_utc(clock.now + timedelta(seconds=2))
+    assert row["next_attempt_at"] == expected
+
+
+def test_enqueue_fetch_for_feed_ignores_cooldown_and_caps_retries(
+    tmp_path: Path,
+) -> None:
+    """The operator-initiated manual-retry route must never be silently
+    dropped by the scheduler's terminal-failure cooldown, and must still get
+    the same reduced retry cap as the automatic path.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _google_feed_id(conn)
+    _subscribe(conn, site_id, feed_id)
+    job_key = f"fetch:{feed_id}"
+    recent_failure = isoformat_utc(utc_now() - timedelta(minutes=5))
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES ('fetch_feed', ?, ?, '{}', 'failed', ?)
+        """,
+        (site_id, job_key, recent_failure),
+    )
+
+    result = enqueue_fetch_for_feed(conn, site_id, feed_id)
+
+    assert result.created is True, (
+        "a manual retry must never be silently dropped by the cooldown"
+    )
+    row = conn.execute(
+        "SELECT max_retries FROM jobs WHERE id=?", (result.job_id,)
+    ).fetchone()
+    assert row is not None and row["max_retries"] == 3
+
+
+def test_claim_next_job_skips_pending_row_with_future_next_attempt_at(
+    tmp_path: Path,
+) -> None:
+    """A pending row scheduled for the future must not be claimed early --
+    the retry-floor/backoff delay this whole ladder relies on is enforced by
+    this WHERE gate, not by caller discipline.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    future = isoformat_utc(utc_now() + timedelta(hours=1))
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, next_attempt_at)
+        VALUES ('fetch_feed', ?, 'future-key', '{}', 'pending', ?)
+        """,
+        (site_id, future),
+    )
+
+    assert claim_next_job(conn) is None
+
+
+def test_fail_min_delay_seconds_floor_dominates_small_exponential_term(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the caller-supplied floor exceeds the exponential term, the floor
+    must win -- a max()-vs-min() composition bug would silently let the much
+    shorter exponential delay through instead.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    conn.execute(
+        """
+        INSERT INTO jobs
+            (type, site_id, job_key, payload, status, retry_count, max_retries)
+        VALUES ('fetch_feed', ?, 'floor-key', '{}', 'running', 0, 5)
+        """,
+        (site_id,),
+    )
+    job_id = conn.execute("SELECT id FROM jobs WHERE job_key='floor-key'").fetchone()[
+        "id"
+    ]
+
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    # retry_count 0 -> 1: exponential term is min(3600, 2**1) == 2s, far below
+    # a realistic multi-hour cadence floor -- the floor must dominate.
+    disposition = fail(conn, job_id, "boom", min_delay_seconds=21600)
+
+    assert disposition is not None and disposition.terminal is False
+    expected = isoformat_utc(
+        datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=21600)
+    )
+    assert disposition.next_attempt_at == expected, (
+        "min_delay_seconds must act as a floor (max), not be overridden by"
+        " the much shorter exponential term"
+    )
+
+
+def test_fail_exponential_term_dominates_small_min_delay_seconds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the exponential term exceeds a small caller-supplied floor, the
+    floor must not pull the delay down -- guards both a min()/max() swap and
+    an accidental override/replace of the exponential term entirely.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    conn.execute(
+        """
+        INSERT INTO jobs
+            (type, site_id, job_key, payload, status, retry_count, max_retries)
+        VALUES ('fetch_feed', ?, 'exp-key', '{}', 'running', 9, 15)
+        """,
+        (site_id,),
+    )
+    job_id = conn.execute("SELECT id FROM jobs WHERE job_key='exp-key'").fetchone()[
+        "id"
+    ]
+
+    clock = _FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.db.queue")
+
+    # retry_count 9 -> 10: exponential term is min(3600, 2**10) == 1024s,
+    # comfortably above a small 10s floor.
+    disposition = fail(conn, job_id, "boom", min_delay_seconds=10)
+
+    assert disposition is not None and disposition.terminal is False
+    expected = isoformat_utc(datetime(2026, 1, 1, tzinfo=UTC) + timedelta(seconds=1024))
+    assert disposition.next_attempt_at == expected, (
+        "a small min_delay_seconds must not shorten the exponential term"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Bug 3 — Worker logging (caplog oracles)
 # ---------------------------------------------------------------------------
@@ -521,7 +1194,9 @@ def test_worker_generic_exception_logs_warning(
     async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("synthetic provider failure")
 
-    def _retry_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _retry_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=False,
             retry_count=1,
@@ -533,6 +1208,9 @@ def test_worker_generic_exception_logs_warning(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_runtime)
     monkeypatch.setattr("wxverify.worker.processor.fail", _retry_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"),
@@ -556,7 +1234,9 @@ def test_worker_terminal_failure_logs_error(
     async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal failure")
 
-    def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _terminal_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=True, retry_count=6, max_retries=5, next_attempt_at=None
         )
@@ -565,6 +1245,9 @@ def test_worker_terminal_failure_logs_error(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_runtime)
     monkeypatch.setattr("wxverify.worker.processor.fail", _terminal_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.ERROR, logger="wxverify.worker.processor"),
@@ -744,7 +1427,9 @@ def test_worker_url_secrets_redacted_in_logs(
             "?key=SYNTHETIC-SECRET&appid=SYNTHETIC-SECRET failed"
         )
 
-    def _retry(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _retry(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=False,
             retry_count=1,
@@ -756,6 +1441,9 @@ def test_worker_url_secrets_redacted_in_logs(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_with_secret_url)
     monkeypatch.setattr("wxverify.worker.processor.fail", _retry)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"),

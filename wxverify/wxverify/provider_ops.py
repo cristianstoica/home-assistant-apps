@@ -208,6 +208,7 @@ def enqueue_fetch_for_feed(
         site_id,
         f"fetch:{feed_id}",
         {"feed_id": feed_id},
+        max_retries=3,
     )
     return FetchQueueResult(
         feed_id=feed_id,

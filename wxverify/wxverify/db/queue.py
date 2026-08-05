@@ -71,6 +71,8 @@ def enqueue_if_absent(
     site_id: int | None,
     job_key: str,
     payload: dict[str, object] | None = None,
+    *,
+    max_retries: int | None = None,
 ) -> EnqueueResult:
     params = (job_type, job_key, site_id, site_id)
     row = conn.execute(
@@ -96,8 +98,9 @@ def enqueue_if_absent(
     try:
         cur = conn.execute(
             """
-            INSERT INTO jobs (type, site_id, job_key, payload, status, next_attempt_at)
-            VALUES (?, ?, ?, ?, 'pending', ?)
+            INSERT INTO jobs
+                (type, site_id, job_key, payload, status, next_attempt_at, max_retries)
+            VALUES (?, ?, ?, ?, 'pending', ?, ?)
             """,
             (
                 job_type,
@@ -105,6 +108,7 @@ def enqueue_if_absent(
                 job_key,
                 json.dumps(payload or {}, separators=(",", ":")),
                 isoformat_utc(),
+                max_retries if max_retries is not None else 5,
             ),
         )
     except sqlite3.IntegrityError:
@@ -143,6 +147,7 @@ def enqueue_if_absent_with_cooldown(
     payload: dict[str, object] | None,
     *,
     cooldown: timedelta,
+    max_retries: int | None = None,
 ) -> EnqueueResult | None:
     """Like ``enqueue_if_absent``, but suppressed while the latest job for
     this (type, site_id, job_key) is a terminal failure inside ``cooldown``.
@@ -190,7 +195,9 @@ def enqueue_if_absent_with_cooldown(
                     job_key,
                 )
                 return None
-    return enqueue_if_absent(conn, job_type, site_id, job_key, payload)
+    return enqueue_if_absent(
+        conn, job_type, site_id, job_key, payload, max_retries=max_retries
+    )
 
 
 def claim_next_job(conn: sqlite3.Connection) -> Job | None:
@@ -261,7 +268,13 @@ def complete(conn: sqlite3.Connection, job_id: int, result: str | None = None) -
     logger.debug("job row completed id=%s", job_id)
 
 
-def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition | None:
+def fail(
+    conn: sqlite3.Connection,
+    job_id: int,
+    error: str,
+    *,
+    min_delay_seconds: int | None = None,
+) -> FailDisposition | None:
     """Record a job failure; returns the disposition, or None if the job is gone."""
     row = conn.execute(
         "SELECT retry_count, max_retries FROM jobs WHERE id = ?", (job_id,)
@@ -289,6 +302,8 @@ def fail(conn: sqlite3.Connection, job_id: int, error: str) -> FailDisposition |
             next_attempt_at=None,
         )
     delay = min(3600, 2 ** min(retry_count, 10))
+    if min_delay_seconds is not None:
+        delay = max(delay, min_delay_seconds)
     next_attempt = isoformat_utc(utc_now() + timedelta(seconds=delay))
     conn.execute(
         """

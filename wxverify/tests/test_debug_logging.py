@@ -380,7 +380,9 @@ def test_worker_url_secrets_still_redacted_in_logs_regression(
             "?key=SYNTHETIC-SECRET&appid=SYNTHETIC-SECRET failed"
         )
 
-    def _retry(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _retry(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=False,
             retry_count=1,
@@ -392,6 +394,9 @@ def test_worker_url_secrets_still_redacted_in_logs_regression(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_with_secret_url)
     monkeypatch.setattr("wxverify.worker.processor.fail", _retry)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"),
@@ -1211,7 +1216,9 @@ def test_bc1_cycle_info_line_retry_outcome(
     async def _raise(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("transient error")
 
-    def _retry_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _retry_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=False,
             retry_count=2,
@@ -1223,6 +1230,9 @@ def test_bc1_cycle_info_line_retry_outcome(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise)
     monkeypatch.setattr("wxverify.worker.processor.fail", _retry_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
@@ -1248,7 +1258,9 @@ def test_bc1_cycle_info_line_failed_outcome(
     async def _raise(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal error")
 
-    def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _terminal_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=True, retry_count=6, max_retries=5, next_attempt_at=None
         )
@@ -1257,6 +1269,9 @@ def test_bc1_cycle_info_line_failed_outcome(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise)
     monkeypatch.setattr("wxverify.worker.processor.fail", _terminal_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
@@ -1292,7 +1307,9 @@ def test_d5_terminal_error_from_processor_not_feed_fetch(
     async def _raise_runtime(db: Any, writer: Any, j: Job) -> None:
         raise RuntimeError("terminal failure")
 
-    def _terminal_disposition(conn: Any, job_id: int, error: str) -> FailDisposition:
+    def _terminal_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
         return FailDisposition(
             terminal=True, retry_count=6, max_retries=5, next_attempt_at=None
         )
@@ -1301,6 +1318,9 @@ def test_d5_terminal_error_from_processor_not_feed_fetch(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_runtime)
     monkeypatch.setattr("wxverify.worker.processor.fail", _terminal_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
 
     with (
         caplog.at_level(logging.ERROR, logger="wxverify"),

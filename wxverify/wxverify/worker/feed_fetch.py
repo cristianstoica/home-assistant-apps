@@ -24,7 +24,7 @@ from wxverify.collection.forecast_fetcher import (
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.queue import Job, enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import (
     CostEstimate,
@@ -293,6 +293,107 @@ def feed_fetch_target(
         model=model,
         max_lead_hours=int(row["max_lead_hours"]),
     )
+
+
+def _payload_feed_id(payload: dict[str, object]) -> int | None:
+    value = payload.get("feed_id")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
+
+
+_RETRY_FLOOR_FALLBACK_SECONDS = 3600
+
+# Cap: this value feeds timedelta(seconds=...) in queue.fail(). An
+# out-of-range cadence (a foreign/imported row, or a ms epoch stamp pasted
+# into a minutes field -- the API schema bounds it below at 1 but not above)
+# would raise OverflowError inside the failure-recording write and crash-loop
+# the worker before retry_count can ever advance.
+_RETRY_FLOOR_MAX_SECONDS = 30 * 24 * 3600
+
+
+def fetch_feed_retry_floor_seconds(conn: sqlite3.Connection, job: Job) -> int | None:
+    """Minimum automatic-retry delay for a fetch_feed job, derived from the
+    feed's own configured fetch cadence so a hard-failing feed cannot retry
+    faster than it would ever have been polled -- important for a metered
+    provider, where each retry spends part of a fixed daily call budget.
+    Returns None for every other job type, and for the first automatic retry
+    of a fetch_feed job (job.retry_count == 0 at claim time): a single
+    transient failure should still recover on the order of seconds, so the
+    floor only starts bounding retry spacing from the second retry onward.
+    Note job.retry_count == 0 means no RECORDED failure yet, not no prior
+    attempt: reclaim_all_stale re-pends a running job without touching
+    retry_count, so a job abandoned mid-attempt (process kill, a fatal
+    permission path, or a StaleGenerationError abandon) can reach this
+    function again with retry_count still 0 and skip the floor a second
+    time -- bounded and pre-existing.
+    Any lookup or parse miss, or an interval too small or too large to be a
+    real cadence, fails closed to a fixed fallback ceiling regardless of
+    retry_count, rather than let a missing/foreign value fall through to the
+    short generic retry ladder.
+    """
+    if job.type != "fetch_feed":
+        return None
+    try:
+        return _fetch_feed_retry_floor_seconds(conn, job)
+    except Exception:
+        # Broad on purpose: this runs INSIDE queue.fail()'s failure-recording
+        # write. Anything escaping here aborts that write before retry_count
+        # advances, so reclaim_all_stale re-pends the job at the same count and
+        # it crash-loops with max_retries structurally unable to end it --
+        # strictly worse than any wrong-but-bounded floor. CancelledError is
+        # BaseException, so cancellation still propagates.
+        logger.warning(
+            "fetch_feed retry floor: unexpected error job=%s; using fallback",
+            job.id,
+            exc_info=True,
+        )
+        return _RETRY_FLOOR_FALLBACK_SECONDS
+
+
+def _fetch_feed_retry_floor_seconds(conn: sqlite3.Connection, job: Job) -> int | None:
+    feed_id = _payload_feed_id(job.payload)
+    if feed_id is None:
+        logger.warning(
+            "fetch_feed retry floor: missing/invalid feed_id in payload job=%s",
+            job.id,
+        )
+        return _RETRY_FLOOR_FALLBACK_SECONDS
+    feed_row = conn.execute(
+        "SELECT fetch_interval_minutes FROM feeds WHERE id = ?", (feed_id,)
+    ).fetchone()
+    if feed_row is None:
+        logger.warning(
+            "fetch_feed retry floor: feed row missing feed_id=%s job=%s",
+            feed_id,
+            job.id,
+        )
+        return _RETRY_FLOOR_FALLBACK_SECONDS
+    try:
+        interval_minutes = int(feed_row["fetch_interval_minutes"])
+    except (ValueError, OverflowError):
+        logger.warning(
+            "fetch_feed retry floor: unreadable fetch_interval_minutes"
+            " feed_id=%s job=%s",
+            feed_id,
+            job.id,
+        )
+        return _RETRY_FLOOR_FALLBACK_SECONDS
+    interval_seconds = interval_minutes * 60
+    if interval_minutes <= 0 or interval_seconds > _RETRY_FLOOR_MAX_SECONDS:
+        logger.warning(
+            "fetch_feed retry floor: out-of-range fetch_interval_minutes=%s"
+            " feed_id=%s job=%s",
+            interval_minutes,
+            feed_id,
+            job.id,
+        )
+        return _RETRY_FLOOR_FALLBACK_SECONDS
+    if job.retry_count == 0:
+        return None
+    return interval_seconds
 
 
 def mark_feed_error(

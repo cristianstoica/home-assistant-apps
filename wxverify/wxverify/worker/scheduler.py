@@ -18,12 +18,14 @@ logger = logging.getLogger(__name__)
 # quota. One hour keeps the suppression inside the default 180-minute obs
 # cadence and only bites the shorter-interval fetch_feed/fetch_current_obs
 # paths, and only after several consecutive failures -- a strong signal the
-# endpoint is genuinely down, not a blip. This does not fully close the
-# quota-exhaustion risk for a provider with a small daily budget and a short
-# poll interval: it delays exhaustion, it does not prevent it. Closing that
-# residual needs a longer retry ladder inside each failure episode
-# (max_retries is tuned for a transient blip, not a dead provider) -- a
-# separate change, recorded here rather than silently absorbed into this one.
+# endpoint is genuinely down, not a blip. Three layers now bound quota
+# exhaustion for a provider with a small daily budget and a short poll
+# interval, each closing a different part of the risk: this cooldown bounds
+# how often a new failure episode can start at all; max_retries (reduced to
+# 3 at the fetch_feed enqueue sites) bounds how many calls one episode can
+# spend; and the cadence floor derived in fetch_feed_retry_floor_seconds
+# bounds the spacing between retries inside an episode, so a hard-failing
+# feed cannot retry faster than it would ever have been polled.
 _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
 
@@ -97,6 +99,7 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
                 f"fetch:{int(row['feed_id'])}",
                 {"feed_id": int(row["feed_id"])},
                 cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+                max_retries=3,
             )
 
 
