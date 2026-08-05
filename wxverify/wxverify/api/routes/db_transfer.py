@@ -34,6 +34,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
     set_runtime_state_now,
 )
+from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -674,14 +675,20 @@ def _stage_pending_rebuild_state(tmp: Path) -> None:
     sidecar; SQLite's own close-time checkpoint would flush it into the
     main file regardless, so this call just makes that flush explicit ahead
     of the rename.
+
+    Also runs ``sanitize_wedge_prone_timestamps`` here for the same reason:
+    on the staged file, before promotion, so the promoted database carries
+    the fix-up by construction rather than racing a live write against it.
     """
     conn = sqlite3.connect(str(tmp))
+    conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
             ensure_runtime_state_table(conn)
             set_runtime_state(conn, "import_rebuild_state", "pending")
             delete_runtime_state(conn, "import_rebuild_done_at", "import_rebuild_error")
+            sanitize_wedge_prone_timestamps(conn)
         except BaseException:
             conn.rollback()
             raise

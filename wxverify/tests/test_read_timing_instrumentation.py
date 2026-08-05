@@ -14,6 +14,7 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -251,6 +252,106 @@ def test_gate_ms_is_near_zero_normally_and_bounded_below_during_a_swap(
     )
 
 
+def test_last_import_swap_at_and_generation_stamped_on_replace_from(
+    tmp_path: Path,
+) -> None:
+    """A fresh ``Database`` starts at generation 0 with no swap stamp; each
+    completed ``replace_from`` bumps generation and stamps
+    ``last_import_swap_at`` with the current UTC time -- in-memory process
+    state, never a value the replacement file itself could carry.
+    """
+
+    def _build_replacement_db(path: Path) -> Path:
+        placeholder = Database(str(path))
+        placeholder.close()
+        return path
+
+    async def _drive() -> tuple[int, str | None, int, str | None]:
+        db = Database(str(tmp_path / "db.sqlite"))
+        try:
+            before_generation = db.generation
+            before_stamp = db.last_import_swap_at
+
+            new_path = _build_replacement_db(tmp_path / "new.db")
+            backup_path = tmp_path / "backup.db.bak"
+            await db.replace_from(new_path, backup_path)
+
+            return (
+                before_generation,
+                before_stamp,
+                db.generation,
+                db.last_import_swap_at,
+            )
+        finally:
+            db.close()
+
+    before_generation, before_stamp, after_generation, after_stamp = asyncio.run(
+        _drive()
+    )
+    assert before_generation == 0
+    assert before_stamp is None
+    assert after_generation == before_generation + 1
+    assert after_stamp is not None
+    # Must be a parseable ISO-8601 UTC stamp, not just any non-None value.
+    datetime.fromisoformat(after_stamp.replace("Z", "+00:00"))
+
+
+def test_last_import_swap_at_and_generation_stamped_on_rollback_restore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rollback-restore branch of ``_replace_sync`` -- reopen-on-new-file
+    fails, so the backup is restored and reopened -- must ALSO bump
+    ``generation`` and stamp ``last_import_swap_at``, not only the
+    happy-path reopen. It must also NOT be whatever an imported/restored
+    database's own file could carry -- the value observed after recovery
+    always traces to this process's own ``isoformat_utc()`` call, never a
+    stamp copied in from the backup file's content.
+    """
+
+    def _build_replacement_db(path: Path) -> Path:
+        placeholder = Database(str(path))
+        placeholder.close()
+        return path
+
+    real_open = Database._open  # noqa: SLF001
+    call_count = 0
+
+    def _open_fails_once_after_rename(self: Database) -> None:
+        nonlocal call_count
+        call_count += 1
+        # Patch is installed only for the replace_from() call below, so the
+        # 1st call it ever sees is the reopen-on-new-file step inside
+        # _replace_sync, right after the atomic rename -- fail here to
+        # force the rollback-restore branch. The 2nd call is the rollback
+        # branch's own reopen, on the restored backup -- must succeed so
+        # the test can inspect the recovered state.
+        if call_count == 1:
+            raise RuntimeError("synthetic reopen-on-new-file failure")
+        real_open(self)
+
+    async def _drive() -> tuple[int, str | None]:
+        db = Database(str(tmp_path / "db.sqlite"))
+        try:
+            before_generation = db.generation
+            new_path = _build_replacement_db(tmp_path / "new.db")
+            backup_path = tmp_path / "backup.db.bak"
+            with monkeypatch.context() as mp:
+                mp.setattr(Database, "_open", _open_fails_once_after_rename)
+                with pytest.raises(RuntimeError, match="synthetic reopen"):
+                    await db.replace_from(new_path, backup_path)
+            return before_generation, db.last_import_swap_at
+        finally:
+            db.close()
+
+    before_generation, after_stamp = asyncio.run(_drive())
+    assert before_generation == 0
+    assert after_stamp is not None, (
+        "the rollback-restore reopen must also stamp last_import_swap_at, "
+        "not only the straight-through success path"
+    )
+    datetime.fromisoformat(after_stamp.replace("Z", "+00:00"))
+
+
 def test_wait_ms_is_near_zero_within_pool_capacity_and_bounded_below_beyond_it(
     tmp_path: Path,
 ) -> None:
@@ -443,9 +544,13 @@ def test_worker_status_default_response_gains_read_timing_unconditionally(
     assert set(body.keys()) == _BASE_WORKER_STATUS_KEYS | {
         "read_timing",
         "read_timing_since",
+        "generation",
+        "last_import_swap_at",
     }
     assert isinstance(body["read_timing"], dict)
     assert isinstance(body["read_timing_since"], str)
+    assert body["generation"] == 0
+    assert body["last_import_swap_at"] is None
 
 
 def test_worker_status_import_rebuild_done_at_present_and_none_before_any_import(
@@ -510,6 +615,8 @@ def test_worker_status_counts_exact_adds_the_two_row_counts(
         | {
             "read_timing",
             "read_timing_since",
+            "generation",
+            "last_import_swap_at",
             "forecast_samples_rows",
             "forecast_pairs_rows",
         }

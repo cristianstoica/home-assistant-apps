@@ -32,6 +32,7 @@ from wxverify.feeds.seam import (
     ForecastAdapter,
     ForecastRequest,
 )
+from wxverify.worker.cadence import parse_fetch_interval_minutes
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -306,13 +307,6 @@ def _payload_feed_id(payload: dict[str, object]) -> int | None:
 
 _RETRY_FLOOR_FALLBACK_SECONDS = 3600
 
-# Cap: this value feeds timedelta(seconds=...) in queue.fail(). An
-# out-of-range cadence (a foreign/imported row, or a ms epoch stamp pasted
-# into a minutes field -- the API schema bounds it below at 1 but not above)
-# would raise OverflowError inside the failure-recording write and crash-loop
-# the worker before retry_count can ever advance.
-_RETRY_FLOOR_MAX_SECONDS = 30 * 24 * 3600
-
 
 def fetch_feed_retry_floor_seconds(conn: sqlite3.Connection, job: Job) -> int | None:
     """Minimum automatic-retry delay for a fetch_feed job, derived from the
@@ -371,26 +365,13 @@ def _fetch_feed_retry_floor_seconds(conn: sqlite3.Connection, job: Job) -> int |
             job.id,
         )
         return _RETRY_FLOOR_FALLBACK_SECONDS
-    try:
-        interval_minutes = int(feed_row["fetch_interval_minutes"])
-    except (ValueError, OverflowError):
-        logger.warning(
-            "fetch_feed retry floor: unreadable fetch_interval_minutes"
-            " feed_id=%s job=%s",
-            feed_id,
-            job.id,
-        )
+    interval_minutes = parse_fetch_interval_minutes(
+        feed_row["fetch_interval_minutes"],
+        context=f"fetch_feed retry floor feed_id={feed_id} job={job.id}",
+    )
+    if interval_minutes is None:
         return _RETRY_FLOOR_FALLBACK_SECONDS
     interval_seconds = interval_minutes * 60
-    if interval_minutes <= 0 or interval_seconds > _RETRY_FLOOR_MAX_SECONDS:
-        logger.warning(
-            "fetch_feed retry floor: out-of-range fetch_interval_minutes=%s"
-            " feed_id=%s job=%s",
-            interval_minutes,
-            feed_id,
-            job.id,
-        )
-        return _RETRY_FLOOR_FALLBACK_SECONDS
     if job.retry_count == 0:
         return None
     return interval_seconds

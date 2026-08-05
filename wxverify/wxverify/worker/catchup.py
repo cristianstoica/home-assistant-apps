@@ -32,6 +32,7 @@ from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
+from wxverify.worker.cadence import parse_fetch_interval_minutes
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -541,17 +542,42 @@ def _due_open_meteo_targets(
     ).fetchall()
     targets: list[ForecastTarget] = []
     for row in rows:
+        site_id = int(row["site_id"])
+        feed_id = int(row["feed_id"])
         last_run_at = row["last_run_at"]
         due = last_run_at is None
         if last_run_at is not None:
-            elapsed = (window_end - parse_utc(str(last_run_at))).total_seconds() / 60
-            due = elapsed >= int(row["fetch_interval_minutes"])
+            try:
+                last_run_dt = parse_utc(str(last_run_at))
+            except Exception:  # a near-datetime.max/.min
+                # value with a UTC offset raises OverflowError, not
+                # ValueError, from parse_utc's astimezone; a value shaped
+                # like a timestamp is not guaranteed to parse as one.
+                #
+                # Foreign/corrupt last_run_at: fail closed (skip this feed
+                # for this tick) rather than invent a schedule for a metered
+                # provider call. Every other feed still runs.
+                logger.warning(
+                    "catchup: unreadable last_run_at site=%s feed=%s;"
+                    " skipping feed this tick",
+                    site_id,
+                    feed_id,
+                )
+                continue
+            interval = parse_fetch_interval_minutes(
+                row["fetch_interval_minutes"],
+                context=f"catchup site={site_id} feed={feed_id}",
+            )
+            if interval is None:
+                continue
+            elapsed = (window_end - last_run_dt).total_seconds() / 60
+            due = elapsed >= interval
         if not due:
             continue
         targets.append(
             ForecastTarget(
-                site_id=int(row["site_id"]),
-                feed_id=int(row["feed_id"]),
+                site_id=site_id,
+                feed_id=feed_id,
                 lat=float(row["forecast_lat"]),
                 lon=float(row["forecast_lon"]),
                 source=str(row["source"]),

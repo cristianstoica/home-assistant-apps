@@ -19,6 +19,7 @@ from wxverify import config
 from wxverify.core.aio import run_to_completion
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,12 @@ class Database:
         # write after it must be treated as spanning the swap, the same as
         # if content had actually changed underneath it.
         self._generation = 0
+        # In-memory only, deliberately not a runtime_state row: a value that
+        # cannot be imported cannot be foreign. Stamped at each of the three
+        # generation bumps inside replace_from -- never reset elsewhere, so
+        # it always reflects this PROCESS's most recent replace_from, not
+        # anything a restored database could carry.
+        self._last_import_swap_at: str | None = None
         # Written only from the event-loop thread (see `read`'s `finally`),
         # so it needs no lock of its own. Cumulative for the process lifetime
         # of this Database instance; never reset.
@@ -140,6 +147,28 @@ class Database:
         self._conn.row_factory = sqlite3.Row
         self._assert_pragmas(self._conn)
         self._run_immediate(run_migrations)
+        # Runs on every open, not just first boot: a database swapped in by
+        # hand outside the app (bypassing the import route's own staged-file
+        # pass in api/routes/db_transfer.py) is caught here instead. Cheap
+        # and idempotent when there is nothing to fix.
+        #
+        # Best-effort: this is a repair, not a requirement to open the
+        # database. Its worst-case failure must degrade to the pre-repair
+        # status quo (a row that may still wedge, which monitor's overdue-job
+        # scan now surfaces to the operator) rather than to an unbootable
+        # process -- a sanitize bug must never be worse than not sanitizing.
+        try:
+            self._run_immediate(sanitize_wedge_prone_timestamps)
+        except Exception:
+            logger.exception("sanitize_wedge_prone_timestamps failed; continuing open")
+            # _run_immediate's commit() is outside its own try, so a
+            # commit-time failure leaves this connection inside an open
+            # IMMEDIATE transaction. Swallowing that without clearing it
+            # would hold the write lock for the process lifetime and make
+            # every later _run_immediate fail with "cannot start a
+            # transaction within a transaction".
+            if self._conn.in_transaction:
+                self._conn.rollback()
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
         self._read_sync_conn = self._connect_reader()
 
@@ -213,6 +242,15 @@ class Database:
         locked recheck, not from this read.
         """
         return self._generation
+
+    @property
+    def last_import_swap_at(self) -> str | None:
+        """UTC stamp of this process's most recent ``replace_from`` reopen.
+
+        ``None`` if this process has never run ``replace_from``. In-memory
+        only -- see the field's own comment in ``__init__`` for why.
+        """
+        return self._last_import_swap_at
 
     async def write_fenced(
         self, fn: Callable[[sqlite3.Connection], T], *, generation: int
@@ -479,6 +517,7 @@ class Database:
             try:
                 self._open()
                 self._generation += 1
+                self._last_import_swap_at = isoformat_utc()
             except BaseException:
                 self._close_quietly()
                 raise
@@ -492,6 +531,7 @@ class Database:
         try:
             self._open()
             self._generation += 1
+            self._last_import_swap_at = isoformat_utc()
         except BaseException:
             # 7. Rollback: close any half-open connection (after a failed
             # _open(), some connections may already be closed — the
@@ -504,6 +544,7 @@ class Database:
                 self._unlink_sidecars()
                 self._open()
                 self._generation += 1
+                self._last_import_swap_at = isoformat_utc()
             except BaseException as restore_exc:
                 logger.critical(
                     "database unrecoverable after failed import; "

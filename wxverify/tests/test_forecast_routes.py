@@ -25,7 +25,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import assert_summary_mount_not_nested_in_chart, collect_tags
+from tests.helpers import (
+    assert_summary_mount_not_nested_in_chart,
+    assert_summary_status_pre_mounted_empty,
+    collect_tags,
+)
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
@@ -430,3 +434,4 @@ def test_forecast_hourly_chart_fallback_svg_hidden_and_summary_mount_outside_con
     assert chart_divs[0].get("data-timezone") == "America/Denver"
 
     assert_summary_mount_not_nested_in_chart(html, summary_id="forecast-hourly-summary")
+    assert_summary_status_pre_mounted_empty(html, summary_id="forecast-hourly-summary")

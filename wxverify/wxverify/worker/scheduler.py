@@ -10,6 +10,7 @@ from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.queue import enqueue_if_absent_with_cooldown
 from wxverify.settings.keys import get_number_setting
+from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +72,18 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
                 )
                 due = True
             else:
-                try:
-                    interval = int(row["fetch_interval_minutes"])
-                except (ValueError, OverflowError):
-                    # Foreign/corrupt cadence: fail closed (skip this feed for
-                    # this tick) rather than invent a schedule for paid
-                    # provider calls. Every other feed still runs.
-                    logger.warning(
-                        "scheduler: unreadable fetch_interval_minutes site=%s"
-                        " feed=%s; skipping feed this tick",
-                        int(row["site_id"]),
-                        int(row["feed_id"]),
-                    )
+                interval = parse_fetch_interval_minutes(
+                    row["fetch_interval_minutes"],
+                    context=(
+                        f"scheduler site={int(row['site_id'])}"
+                        f" feed={int(row['feed_id'])}"
+                    ),
+                )
+                if interval is None:
+                    # Foreign/corrupt or out-of-range cadence: fail closed
+                    # (skip this feed for this tick) rather than invent a
+                    # schedule for paid provider calls. Every other feed
+                    # still runs.
                     continue
                 minutes = (now - last_run_dt).total_seconds() / 60
                 due = minutes >= interval

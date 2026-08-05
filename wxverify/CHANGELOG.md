@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.9.4
+
+### Fixed
+
+- Timestamps that could not be parsed in the job queue or station poll
+  state previously caused the affected work to stall silently forever.
+  Such values are now repaired when the database is opened, including
+  in imported or hand-swapped databases.
+- Feed fetch intervals are now validated through one shared check and
+  fail closed on an unusable value, instead of risking a paid provider
+  call being scheduled at an invented cadence.
+- Charts now carry an accessible name, and their status regions exist
+  in the page before their content updates, so screen readers announce
+  them correctly.
+- The version-coherence test now also checks the lockfile, so the
+  package metadata, the module version, and the lockfile can no longer
+  drift apart unnoticed.
+- The health endpoint now reports the most recent database import
+  swap.
+- Fixed a version mismatch between the package metadata and the module
+  that shipped in 0.9.3.
+
 ## 0.9.3
 
 ### Fixed

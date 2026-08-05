@@ -29,7 +29,11 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import assert_summary_mount_not_nested_in_chart, collect_tags
+from tests.helpers import (
+    assert_summary_mount_not_nested_in_chart,
+    assert_summary_status_pre_mounted_empty,
+    collect_tags,
+)
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
@@ -1556,6 +1560,7 @@ def test_skill_chart_fallback_svg_hidden_and_summary_mount_outside_container(
     assert chart_divs[0].get("data-summary") == "skill-summary"
 
     assert_summary_mount_not_nested_in_chart(html, summary_id="skill-summary")
+    assert_summary_status_pre_mounted_empty(html, summary_id="skill-summary")
 
 
 def test_overlay_chart_fallback_svg_hidden_and_summary_mount_outside_container(
@@ -1616,3 +1621,4 @@ def test_overlay_chart_fallback_svg_hidden_and_summary_mount_outside_container(
     assert chart_divs[0].get("data-summary") == "overlay-summary"
 
     assert_summary_mount_not_nested_in_chart(html, summary_id="overlay-summary")
+    assert_summary_status_pre_mounted_empty(html, summary_id="overlay-summary")

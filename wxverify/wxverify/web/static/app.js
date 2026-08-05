@@ -23,6 +23,18 @@
     };
   }
 
+  // uPlot's canvas carries no accessible name of its own; the headline
+  // sentence already lives in the sibling .summary-status live region (see
+  // summaryStatus below), so this is a short orienting label, not a repeat
+  // of that sentence -- putting the same text in both would double-announce.
+  function labelChartCanvas(chart, label) {
+    if (!chart || !chart.ctx || !chart.ctx.canvas) {
+      return;
+    }
+    chart.ctx.canvas.setAttribute("role", "img");
+    chart.ctx.canvas.setAttribute("aria-label", label);
+  }
+
   function emptyChart(el, text) {
     el.innerHTML = "";
     var node = document.createElement("p");
@@ -48,9 +60,11 @@
   }
 
   // A screen reader announces a text change inside an aria-live node that
-  // was already present, not the appearance of a brand-new node -- so this
-  // status paragraph is created once per mount and only its text is updated
-  // on every later call.
+  // was already present, not the appearance of a brand-new node -- so the
+  // server template mounts this node once, empty, and every later call only
+  // updates its text. The create branch is a fallback for a summary target
+  // the template didn't pre-mount one into (id targeted without going
+  // through the standard chart-panel markup).
   function summaryStatus(summary, text) {
     var node = summary.querySelector(".summary-status");
     if (!node) {
@@ -142,7 +156,7 @@
       return;
     }
     el.innerHTML = "";
-    new uPlot({
+    var chart = new uPlot({
       width: Math.max(el.clientWidth, 320),
       height: el.classList.contains("tall") ? 300 : 220,
       scales: { x: { time: true } },
@@ -153,6 +167,7 @@
         { label: "Observed", stroke: cssVar("--chart-2"), width: 2 }
       ]
     }, [xs, forecast, observed], el);
+    labelChartCanvas(chart, "Forecast vs. observed overlay chart");
     var summary = summaryEl(el);
     if (summary) {
       renderOverlaySummary(summary, payload, xs, forecast, observed);
@@ -369,13 +384,14 @@
     var yAxis = themedAxis();
     yAxis.label = "Skill";
     el.innerHTML = "";
-    new uPlot({
+    var chart = new uPlot({
       width: Math.max(el.clientWidth, 320),
       height: 260,
       scales: { x: { time: false } },
       axes: [xAxis, yAxis],
       series: uplotSeries
     }, data, el);
+    labelChartCanvas(chart, "Skill by lead day chart");
     var summary = summaryEl(el);
     if (summary) {
       renderSkillSummary(summary, payload);
@@ -524,6 +540,7 @@
       axes: [xAxis, tAxis, pAxis],
       series: series
     }, data, el);
+    labelChartCanvas(chart, "Hourly forecast chart");
     el.uplotInstance = chart;
     el.feedSeriesIdx = feedSeriesIdx;
     var summary = summaryEl(el);

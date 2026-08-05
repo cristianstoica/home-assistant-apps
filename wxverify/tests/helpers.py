@@ -83,6 +83,72 @@ class _DivNestingParser(HTMLParser):
             self._open_ancestor_flags.pop()
 
 
+class _SummaryStatusParser(HTMLParser):
+    """Finds the ``<p class="summary-status">`` inside ``<div id=summary_id>``
+    and captures its attributes and text content.
+    """
+
+    def __init__(self, summary_id: str) -> None:
+        super().__init__()
+        self._summary_id = summary_id
+        self._in_summary_div = False
+        self._summary_div_depth = 0
+        self._div_depth = 0
+        self.attrs: dict[str, str] | None = None
+        self.text = ""
+        self._in_status_p = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = {key: value or "" for key, value in attrs}
+        if tag == "div":
+            self._div_depth += 1
+            if attr_map.get("id") == self._summary_id:
+                self._in_summary_div = True
+                self._summary_div_depth = self._div_depth
+        elif (
+            tag == "p"
+            and self._in_summary_div
+            and "summary-status" in (attr_map.get("class", ""))
+        ):
+            self.attrs = attr_map
+            self._in_status_p = True
+
+    def handle_data(self, data: str) -> None:
+        if self._in_status_p:
+            self.text += data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "p":
+            self._in_status_p = False
+        elif tag == "div":
+            if self._in_summary_div and self._div_depth == self._summary_div_depth:
+                self._in_summary_div = False
+            self._div_depth -= 1
+
+
+def assert_summary_status_pre_mounted_empty(html: str, *, summary_id: str) -> None:
+    """Assert ``<div id=summary_id>`` already contains an EMPTY
+    ``role="status" aria-live="polite"`` paragraph in the server-rendered
+    HTML, not just something the client mounts after its first render.
+
+    A live region created only by client-side JS on first update announces
+    nothing on that very first update, because screen readers only pick up
+    changes inside a region that already existed when the update happened --
+    the template must render this node itself, empty, from the start.
+    """
+    parser = _SummaryStatusParser(summary_id)
+    parser.feed(html)
+    assert parser.attrs is not None, (
+        f'no <p class="summary-status" ...> pre-mounted inside <div id="{summary_id}">'
+    )
+    assert parser.attrs.get("role") == "status"
+    assert parser.attrs.get("aria-live") == "polite"
+    assert parser.text == "", (
+        f"summary-status node inside #{summary_id} must render EMPTY, "
+        f"found text {parser.text!r}"
+    )
+
+
 def assert_summary_mount_not_nested_in_chart(html: str, *, summary_id: str) -> None:
     """Assert ``<div id=summary_id>`` exists in ``html`` and is never a
     descendant of a ``[data-chart]`` container.

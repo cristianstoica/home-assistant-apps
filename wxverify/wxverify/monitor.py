@@ -175,7 +175,18 @@ def _pipeline_conditions(
     # so a stuck pending job can carry next_attempt_at=NULL. COALESCE(...,
     # updated_at) folds that NULL case in (a NULL-attempt pending job is overdue
     # once its updated_at is older than the cutoff), where a bare
-    # `next_attempt_at <= ?` would silently miss it.
+    # `next_attempt_at <= ?` would silently miss it. The typeof/GLOB clause
+    # folds in the sibling blind spot: a non-ISO next_attempt_at (e.g. 'zzzz')
+    # sorts AFTER every cutoff string, so a plain `<=` comparison would never
+    # flag it either -- this surfaces that row as overdue instead of letting
+    # it go uncounted forever. db.sanitize's boot/import passes fix such rows
+    # going forward; this is the operator-visible net for one that slips in
+    # between those passes (a live write racing the pass, or a value crafted
+    # to sort before "now" and pass the pass's own `parse_utc` check trivially
+    # while still confusing some other consumer). Guarded by `IS NOT NULL`:
+    # typeof(NULL) is 'NULL', not 'text', so without that guard this arm
+    # would also match every NULL-attempt row unconditionally -- NULL is
+    # already handled, on its own recency cutoff, by the COALESCE arm above.
     failed_cutoff = isoformat_utc(now - timedelta(hours=FAILED_JOB_AGE_HOURS))
     stuck_cutoff = isoformat_utc(now - timedelta(minutes=STUCK_RUNNING_MINUTES))
     pending_cutoff = isoformat_utc(now - timedelta(minutes=PENDING_OVERDUE_MINUTES))
@@ -186,7 +197,11 @@ def _pipeline_conditions(
         WHERE (status='failed' AND updated_at <= ?)
            OR (status='running' AND updated_at <= ?)
            OR (status='pending'
-               AND COALESCE(next_attempt_at, updated_at) <= ?)
+               AND (COALESCE(next_attempt_at, updated_at) <= ?
+                    OR (next_attempt_at IS NOT NULL
+                        AND (typeof(next_attempt_at) != 'text'
+                             OR next_attempt_at
+                                NOT GLOB '[0-9][0-9][0-9][0-9]-*'))))
         """,
         (failed_cutoff, stuck_cutoff, pending_cutoff),
     )

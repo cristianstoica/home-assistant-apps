@@ -936,6 +936,44 @@ def test_problem_jobs_pending_null_next_attempt_at_recent_does_not_trip(
         assert _cond(body, "problem_jobs")["ok"] is True
 
 
+def test_problem_jobs_pending_non_iso_next_attempt_at_counts_as_stuck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A pending job with a non-ISO next_attempt_at (e.g. imported/hand-edited
+    # from a foreign database) sorts after every real ISO stamp, so the plain
+    # `next_attempt_at <= now` comparison never selects it and it is never
+    # claimed again. The typeof/GLOB arm folds this sibling blind spot into
+    # the same stuck-pending detection as the NULL-attempt case above, even
+    # with a RECENT updated_at (so COALESCE alone would not have caught it).
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-non-iso-attempt.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            _seed_job(
+                conn,
+                site_id=site_id,
+                status="pending",
+                updated_at="2035-01-01T00:00:00Z",
+                next_attempt_at="zzzz-not-a-timestamp",
+                job_key="fetch:non-iso-attempt",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] >= 1
+
+
 def test_problem_jobs_failed_old_only_trips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

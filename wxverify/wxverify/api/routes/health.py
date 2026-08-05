@@ -325,6 +325,10 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
     # not run under the read lock it is reporting on.
     result["read_timing"] = db.read_timing_snapshot()
     result["read_timing_since"] = db.read_timing_since
+    # Also process state, not DB state -- same reasoning as read_timing
+    # above, must not run inside _read under the read lock.
+    result["generation"] = db.generation
+    result["last_import_swap_at"] = db.last_import_swap_at
     return result
 
 
