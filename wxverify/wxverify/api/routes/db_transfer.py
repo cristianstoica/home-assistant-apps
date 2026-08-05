@@ -152,7 +152,7 @@ def _unlink(path: Path) -> None:
 
 
 def _looks_like_valid_sqlite(path: Path) -> bool:
-    """Allowlist gate mirroring ``_validate_upload``'s shape (plan §3.2).
+    """Allowlist gate mirroring ``_validate_upload``'s shape.
 
     ``quick_check`` alone is not enough: SQLite treats a zero-length file
     (the shape a SIGKILL mid-``VACUUM INTO`` leaves behind, since that call
@@ -214,7 +214,7 @@ def _unlink_bak(path: Path) -> None:
 
 
 def sweep_bak_files(db_dir: Path, *, keep: Path | None = None) -> None:
-    """Keep exactly the newest ``.bak`` file, delete the rest (plan §3.2).
+    """Keep exactly the newest ``.bak`` file, delete the rest.
 
     ``keep``, when given, is the file just created by this import cycle and
     is unconditionally excluded from the delete candidate set and treated as
@@ -447,7 +447,7 @@ _import_in_progress = False
 
 
 def _acquire_import_guard() -> None:
-    """Reject a second import while one is in flight (plan: rare, destructive,
+    """Reject a second import while one is in flight (rare, destructive,
     operator-driven action -> reject, don't queue)."""
     global _import_in_progress
     if _import_in_progress:

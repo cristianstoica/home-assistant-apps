@@ -1,8 +1,8 @@
 """Integration tests for ``wxverify.forecast.data`` against a real SQLite DB.
 
-Spec build-sequence step 1 verify hook: "unit tests for ... latest-run pick,
-[...] and that excluded feeds never appear." This file owns the SQL-facing
-half of that hook (the fallback-ladder half is pure and lives in
+This file covers unit tests for ... latest-run pick,
+[...] and that excluded feeds never appear. This file owns the SQL-facing
+half of that (the fallback-ladder half is pure and lives in
 test_forecast_selection.py).
 
 Isolation: every test opens its own fresh ``sqlite3.connect(":memory:")`` and

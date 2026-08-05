@@ -1,6 +1,6 @@
 """Contract tests for the five new commercial forecast providers.
 
-Covers the items enumerated in the plan's "Contract tests" section:
+Covers the items enumerated below:
   1. resolve_secret resolves via env var (_from_env path)
   2. resolve_secret resolves via options.json (_from_options_json path)
   3. build_adapter raises when provider key is unset

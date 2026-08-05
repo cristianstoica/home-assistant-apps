@@ -337,7 +337,7 @@ def test_passthrough_none_client() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Oracle 6 (hoare's note) — bare /static/app.css → 404 under both shapes
+# Oracle 6 — bare /static/app.css → 404 under both shapes
 #
 # Since 0.4.1 the bare /static mount has been removed; assets are served only
 # at /static/<version>/…. A bare GET /static/app.css must return 404 so that

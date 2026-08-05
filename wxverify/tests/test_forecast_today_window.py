@@ -186,7 +186,7 @@ def test_today_high_without_elapsed_sample_is_future_only() -> None:
 
 
 def test_partial_badge_clears_after_local_morning_with_full_day_coverage() -> None:
-    """Headline regression (architect-verified differential). At 10:00 local
+    """Headline regression (verified differential). At 10:00 local
     the pre-fix window (floor_hour) only sees hours 10..23 -- 14 distinct
     hours, under MIN_COVERAGE_HOURS (18) -- so `partial` reads True pre-fix.
     Post-fix the window starts at local midnight, so all 24 hours are in
@@ -443,8 +443,8 @@ def test_local_day_start_spring_forward_at_midnight_resolves_forward() -> None:
 def test_local_day_start_fall_back_ambiguous_midnight_resolves_earlier() -> None:
     """America/Havana falls back AT local midnight on 2026-11-01, so wall-clock
     00:00-00:59 occurs TWICE (00:00:00-04:00, then again as 00:00:00-05:00 an
-    hour of UTC-time later) -- an ambiguous midnight. (Substituted for the
-    architect's suggested America/Sao_Paulo: independently scanning every
+    hour of UTC-time later) -- an ambiguous midnight. (Substituted for
+    America/Sao_Paulo: independently scanning every
     Sao Paulo DST-end transition from 2000-2019 with zoneinfo shows its
     fall-back always lands on the PRIOR day's 23:00 hour, never on an
     ambiguous midnight, so it can't pin this branch -- Havana's own fall-back

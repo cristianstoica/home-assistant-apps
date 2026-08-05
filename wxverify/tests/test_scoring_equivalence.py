@@ -2,7 +2,7 @@
 
 ``_ref_*`` below are verbatim copies of the 0.1.0 ``pair_real_models``,
 ``materialize_persistence`` (delete + full rebuild, no anti-join) and the
-0.1.0 score tail. Bug 2 of the 0.1.1 patch replaces the live implementations
+0.1.0 score tail. The 0.1.1 patch replaces the live implementations
 with an anti-joined pairing pass and an incremental persistence
 materializer; this oracle asserts full end-state equivalence of
 ``forecast_pairs`` and ``score_cache`` between the frozen reference pipeline

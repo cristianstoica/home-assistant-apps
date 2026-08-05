@@ -237,7 +237,7 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bug 1 — IngressPathMiddleware
+# IngressPathMiddleware
 # ---------------------------------------------------------------------------
 
 
@@ -353,7 +353,7 @@ def test_csrf_cookie_root_path_emits_single_cookie_at_slash() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bug 4 — Budget refund: unit tests
+# Budget refund: unit tests
 # ---------------------------------------------------------------------------
 
 
@@ -435,7 +435,7 @@ def test_budget_refund_targets_own_billing_day_not_today(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
-# Bug 4 — Budget refund: flow tests via fetch_feed_once
+# Budget refund: flow tests via fetch_feed_once
 # ---------------------------------------------------------------------------
 
 
@@ -737,7 +737,7 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
 
 
 # ---------------------------------------------------------------------------
-# Bug 4 — Fetch-feed retry ladder: cadence floor, retry cap, cooldown wiring
+# Fetch-feed retry ladder: cadence floor, retry cap, cooldown wiring
 # ---------------------------------------------------------------------------
 
 
@@ -1181,7 +1181,7 @@ def test_fail_exponential_term_dominates_small_min_delay_seconds(
 
 
 # ---------------------------------------------------------------------------
-# Bug 3 — Worker logging (caplog oracles)
+# Worker logging (caplog oracles)
 # ---------------------------------------------------------------------------
 
 
@@ -1457,7 +1457,7 @@ def test_worker_url_secrets_redacted_in_logs(
 
 
 # ---------------------------------------------------------------------------
-# Bug 2 residuals — idx_pairs_cell index + phase-split write discipline
+# idx_pairs_cell index + phase-split write discipline
 # ---------------------------------------------------------------------------
 
 
@@ -1468,7 +1468,7 @@ def test_idx_pairs_cell_created_on_fresh_db(tmp_path: Path) -> None:
 
 
 def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
-    """idx_pairs_cell is added to a user_version=2 DB that lacks it; S-M1 bumps to 3."""
+    """idx_pairs_cell is added to a v2 DB that lacks it; the migration bumps to 3."""
     # Build a full-migration DB, then drop the index to simulate the old 0.1.0 schema.
     conn = _init_tmp_db(tmp_path)
     assert _index_exists(conn, "idx_pairs_cell")
@@ -1482,7 +1482,7 @@ def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
 
     assert _index_exists(conn2, "idx_pairs_cell"), "idx_pairs_cell must be re-created"
     version = conn2.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 3, "user_version must reach 3 after S-M1 migration"
+    assert version == 3, "user_version must reach 3 after the migration"
 
 
 def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(

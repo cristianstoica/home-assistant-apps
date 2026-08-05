@@ -6,11 +6,11 @@ SEPARATE, independent per-station poll of ``/observations/current`` whose only
 job is to learn each station's upload cadence and keep a last-good display
 snapshot in ``station_current_obs``, with liveness tracked on
 ``station_poll_state``'s OWN diagnostic columns. The two streams never touch each
-other's diagnostics — that separation is load-bearing (plan §6): the read route
+other's diagnostics — that separation is load-bearing: the read route
 surfaces the current-obs terminal reason, and the hourly stream's success reset
 must not wipe it.
 
-The classification ordering in ``classify_current_obs`` is load-bearing (§5.6):
+The classification ordering in ``classify_current_obs`` is load-bearing:
 429 is checked BEFORE the 4xx-terminal branch (a rate-limit must never flip a
 station terminal), and the 204 / empty-body / empty-``observations`` OFFLINE check
 runs BEFORE ``response.json()`` (a 204 is 2xx, so ``raise_for_status`` won't fire,
@@ -35,9 +35,9 @@ from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
 
-# Defaults + floors for the settings-backed poll intervals (plan §5.6/§10). The
+# Defaults + floors for the settings-backed poll intervals. The
 # live values come from the ``min_interval_seconds`` / ``max_backoff_seconds``
-# settings rows (written from options at boot, §10 site (b)); these constants are
+# settings rows (written from options at boot); these constants are
 # the fallback when the row is absent and the ``get_number_setting`` floor.
 
 # The floor poll interval and cold-start learned interval, in seconds. Also the
@@ -46,13 +46,13 @@ MIN_INTERVAL_SECONDS = 300
 # The terminal / offline park interval: a dead or auth-rejected station is
 # re-polled at most once a day.
 MAX_BACKOFF_SECONDS = 86400
-# get_number_setting floors, matching the config.yaml int() schema bounds (§10).
+# get_number_setting floors, matching the config.yaml int() schema bounds.
 _MIN_INTERVAL_FLOOR = 60
 _MAX_BACKOFF_FLOOR = 60
 
 
 class Health(Enum):
-    """The four terminal states of a single current-obs poll (plan §5.6)."""
+    """The four terminal states of a single current-obs poll."""
 
     ONLINE = "online"
     OFFLINE = "offline"
@@ -77,7 +77,7 @@ class PollOutcome:
 def classify_current_obs(response: httpx.Response) -> PollOutcome:
     """Classify a ``/observations/current`` response into a ``PollOutcome``.
 
-    Ordering is load-bearing (plan §5.6) and must not be reordered:
+    Ordering is load-bearing and must not be reordered:
 
     1. 429 → TRANSIENT (checked FIRST, before any 4xx-terminal branch).
     2. Other non-429 4xx (401/403/404/...) → TERMINAL.
@@ -150,7 +150,7 @@ def _online_cadence(
     now_ts: float,
     min_interval: int,
 ) -> tuple[tuple[str, ...], int, int]:
-    """Advance cadence learning for an ONLINE poll (plan §5.7).
+    """Advance cadence learning for an ONLINE poll.
 
     Appends ``obs_instant`` to the window only when it DIFFERS from the stored
     ``last_obstime`` (a repeat upload carries no new gap), truncates to the newest
@@ -185,7 +185,7 @@ def persist_poll_result(
     unseeded row would no-op and leave ``next_poll_at`` NULL ⇒ a tight re-poll
     loop). ``station_current_obs`` is written ONLY on ONLINE (last-good retention
     on every other state). Diagnostics land on ``station_poll_state``'s own
-    columns; ``stations`` is never touched here (plan §6/§7).
+    columns; ``stations`` is never touched here.
     """
     # Station may have been deleted/disabled between enqueue and run.
     row = conn.execute(
@@ -198,7 +198,7 @@ def persist_poll_result(
     now = utc_now()
     now_iso = isoformat_utc(now)
 
-    # Settings-backed intervals (written from options at boot, §10); fall back to
+    # Settings-backed intervals (written from options at boot); fall back to
     # the module defaults when the row is absent, floored to the config.yaml
     # schema bounds.
     min_interval = get_number_setting(

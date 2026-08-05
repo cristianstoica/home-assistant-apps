@@ -1,7 +1,6 @@
-"""HTTP-level tests for the ``/forecast/tiles`` auto-poll route (plan
-2026-08-01-read-path-latency, §8.3, Change 6): the fingerprint is computed
-BEFORE the view is built, so a matching fingerprint short-circuits without
-ever calling ``build_forecast``.
+"""HTTP-level tests for the ``/forecast/tiles`` auto-poll route: the
+fingerprint is computed BEFORE the view is built, so a matching fingerprint
+short-circuits without ever calling ``build_forecast``.
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
 worker + ``TestClient`` (mirrors ``tests/test_forecast_routes.py``'s
@@ -139,7 +138,7 @@ def _high_low_values(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# The point of Change 6: a matching fingerprint never builds the view.
+# The point: a matching fingerprint never builds the view.
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +246,7 @@ def test_tiles_empty_state_site_polls_without_error(
 
 
 # ---------------------------------------------------------------------------
-# §7.4 accepted contract: a durable settings write with no new sample must
+# Accepted contract: a durable settings write with no new sample must
 # still 204 on an unchanged fingerprint -- paired with the non-vacuity half
 # (ii), which proves the setting genuinely reaches rendering, or the 204
 # above would also pass against a build that ignores it entirely.

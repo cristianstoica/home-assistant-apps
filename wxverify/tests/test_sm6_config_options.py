@@ -1,26 +1,26 @@
-"""S-M6 tests: config.yaml options + settings/sources wiring (0.3.0 py-weather merge).
+"""Tests: config.yaml options + settings/sources wiring (0.3.0 py-weather merge).
 
-Hoare oracle map
-----------------
+Oracle map
+----------
 Test 1 (test_configured_cap_lands_settings_land_budget_defers_at_cap)
-    Bucket-1-F oracle 1: boot with weathercom_daily_call_limit=4200 and distinct
+    Oracle 1: boot with weathercom_daily_call_limit=4200 and distinct
     min_interval / max_backoff → sources.daily_call_limit == 4200 (overrides seeded
     1000), the two settings rows land, and reserve_budget defers at cap.
 
 Test 2 (test_absent_key_rescues_to_3000)
-    Bucket-1-F oracle 2: options JSON omits the key entirely → sources cap == 3000.
-    Fails if the Field default reverts from 3000 to None (LD-M8 breach).
+    Oracle 2: options JSON omits the key entirely → sources cap == 3000.
+    Fails if the Field default reverts from 3000 to None (a breach).
 
 Test 3 (test_zero_value_rescues_to_3000)
-    Bucket-1-F oracle 3: options JSON carries weathercom_daily_call_limit=0 →
+    Oracle 3: options JSON carries weathercom_daily_call_limit=0 →
     sources cap == 3000 (the ``or 3000`` falsy-rescue fires).
 
 Test 4 (test_from_env_no_var_defaults_to_3000)
-    Bucket-1-F oracle 4: unit-level _from_env parse with no env var set →
+    Oracle 4: unit-level _from_env parse with no env var set →
     RuntimeOptions.weathercom_daily_call_limit == 3000.
 
 Test 5 (test_negative_cap_raises_validation_error)
-    Bucket-1-F oracle 5: weathercom_daily_call_limit=-5 → pydantic ValidationError
+    Oracle 5: weathercom_daily_call_limit=-5 → pydantic ValidationError
     (ge=1 hard floor, not a silent clamp).
 
 Test 6 (test_settings_backed_intervals_drive_cadence)
@@ -36,7 +36,7 @@ Test 7 (test_timeout_default_30_not_10)
     default — this is the gate.
 
 Test 8 (test_t08_new_option_keys_in_config_and_translations)
-    Bucket-1-G / T08: targeted assertion that the four new option keys appear in
+    T08: targeted assertion that the four new option keys appear in
     BOTH config.yaml options: and translations/en.yaml configuration:.  The existing
     generic test_translations_key_parity in test_m1_m5.py performs a full set-equality
     check; this test pins the four new keys by name so a targeted regression (a future
@@ -409,7 +409,7 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
 
 
 # ---------------------------------------------------------------------------
-# Oracle 2 — Absent key → 3000 (LD-M8 breach guard)
+# Oracle 2 — Absent key → 3000 (breach guard)
 # ---------------------------------------------------------------------------
 
 
@@ -419,7 +419,7 @@ def test_absent_key_rescues_to_3000(
     """options.json omits weathercom_daily_call_limit → sources cap == 3000.
 
     Fails if the `or 3000` fallback in `_from_options_json` is removed (the
-    LD-M8 breach vector — a None reaching set_source_cap would leave the
+    breach vector — a None reaching set_source_cap would leave the
     seeded 1000 cap in force).  The Field(default=…) value is irrelevant here:
     the constructor passes `options.get("weathercom_daily_call_limit") or 3000`
     explicitly, so the field default is never consulted on any real boot path.
@@ -451,7 +451,7 @@ def test_absent_key_rescues_to_3000(
     assert cap == 3000, (
         f"Absent key must rescue to 3000 via RuntimeOptions.Field(default=3000), "
         f"got {cap!r}; if this is 1000 the Field reverted to None "
-        f"and set_source_cap no-oped (LD-M8 breach)"
+        f"and set_source_cap no-oped (a breach)"
     )
 
 
@@ -507,14 +507,14 @@ def test_zero_value_rescues_to_3000(
 def test_from_env_no_var_defaults_to_3000(monkeypatch: pytest.MonkeyPatch) -> None:
     """_from_env with no WXV_WEATHERCOM_DAILY_CALL_LIMIT set → field == 3000.
 
-    Fails if the `or 3000` fallback in `_from_env` is removed (the LD-M8
+    Fails if the `or 3000` fallback in `_from_env` is removed (the
     breach vector — a None reaching set_source_cap would leave the seeded 1000
     cap in force).  The Field(default=…) value is irrelevant here: _from_env
     passes `_env_int(...) or 3000` explicitly, so the field default is never
     consulted on any real boot path.
 
     Unit-level test of the parse path in options.py:88.  Pairs with oracle 2's
-    boot-level check: both must hold for the LD-M8 guard to be complete.
+    boot-level check: both must hold for the guard to be complete.
 
     Precondition (injected): env var absent (monkeypatched out to guarantee no
     ambient value leaks in from CI or the developer's shell).
@@ -772,7 +772,7 @@ def test_t08_new_option_keys_in_config_and_translations() -> None:
     a regression (e.g. reverting just these four lines) produces a focused, readable
     failure instead of a set-diff error.
 
-    The four new keys added in the 0.3.0 py-weather merge (plan §10):
+    The four new keys added in the 0.3.0 py-weather merge:
     - min_interval_seconds
     - max_backoff_seconds
     - request_timeout_seconds

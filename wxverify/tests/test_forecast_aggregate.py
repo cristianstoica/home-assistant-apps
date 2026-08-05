@@ -1,15 +1,15 @@
 """Unit tests for ``wxverify.forecast.aggregate`` and ``core.units.ms_to_kmh``.
 
-Spec build-sequence step 2 verify hook: "tests incl. ms_to_kmh conversion,
+This file covers ms_to_kmh conversion,
 precip total (with a stray negative filtered out), chance-of-rain at the
-threshold boundary, and a partially-covered day flagged 'partial'."
+threshold boundary, and a partially-covered day flagged 'partial'.
 
-The stray-negative-filtered and partial-day-flagged parts of that hook are
+The stray-negative-filtered and partial-day-flagged parts of that are
 DB-facing (the negative is dropped by `invalid_forecast_sample_sql` in the
 data layer, and the "partial" badge is assembled in the service layer from
 `clears_coverage`) — those live in test_forecast_data.py / test_forecast_service.py.
 This file owns everything pure: `ms_to_kmh`, `display_day_index` (the display
-half of the B2 day-boundary gate), `covered_hours`, `clears_coverage` (pinned
+half of the day-boundary gate), `covered_hours`, `clears_coverage` (pinned
 against `MIN_COVERAGE_HOURS`, not a hardcoded 18), `blend_mean`, `wet_share`
 (the rain-threshold inclusive boundary), and `chance_of_rain` (per-feed
 average, proven distinct from a naive pooled share).
@@ -158,8 +158,8 @@ def test_wet_share_empty_is_none() -> None:
 
 # ---------------------------------------------------------------------------
 # chance_of_rain — equal-weight average of PER-FEED shares, proven distinct
-# from a naive pooled share (spec: "keeps one feed's longer horizon from
-# out-voting a shorter one").
+# from a naive pooled share (this keeps one feed's longer horizon from
+# out-voting a shorter one).
 # ---------------------------------------------------------------------------
 
 

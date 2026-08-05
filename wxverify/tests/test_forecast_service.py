@@ -1,12 +1,12 @@
 """Integration tests for ``wxverify.forecast.service`` against a real SQLite DB.
 
-Spec build-sequence step 1 verify hook (B2 audit gate): "...the skill-cell-
+This file covers the skill-cell-
 vs-display-tile mapping at a local-day boundary (a run issued the prior local
 day landing in today's display tile must still rank by its ISSUE-relative
-day_ahead, not the display day index)." This file's centerpiece,
+day_ahead, not the display day index). This file's centerpiece,
 ``test_b2_...``, is that gate.
 
-Also covers build-sequence step 5 (tile state precedence: empty(global) >
+Also covers tile state precedence (empty(global) >
 not-available > low-confidence > normal, plus orthogonal stale/partial
 badges) end-to-end through the service layer, since the individual pieces
 (``select_cell_feeds``, ``clears_coverage``) are already unit-pinned
@@ -349,7 +349,7 @@ def _seed_complete_score_cache(
 
 
 # ---------------------------------------------------------------------------
-# B2 audit gate: a run issued the PRIOR local day, landing in TODAY's display
+# A run issued the PRIOR local day, landing in TODAY's display
 # tile, must rank by its issue-relative day_ahead (1), not the display day
 # index (0).
 # ---------------------------------------------------------------------------
@@ -894,7 +894,7 @@ def test_coverage_gate_is_variable_agnostic_precip_and_wind() -> None:
 
 
 def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
-    """hoare correction: far tile where the BEST-covered feed is only 8h (below
+    """Far tile where the BEST-covered feed is only 8h (below
     the 12h adequate floor) and a 1-sample feed OUT-skills it. This pins the
     second (multipoint) tier of the pool.
 

@@ -1,7 +1,7 @@
-"""Tests for S-M1: schema v3 migration (jobs CHECK widening + station poll-state).
+"""Tests for schema v3 migration (jobs CHECK widening + station poll-state).
 
-Bucket-1-E: schema-migration happy-path (v2→v3) and crash-recovery regression.
-Bucket-1-H: fetch_current_obs enqueue on a migrated v3 DB.
+Schema-migration happy-path (v2→v3) and crash-recovery regression.
+fetch_current_obs enqueue on a migrated v3 DB.
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def _jobs_check_admits(conn: sqlite3.Connection, job_type: str, site_id: int) ->
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-E, test 1: happy-path v2→v3 upgrade
+# Test 1: happy-path v2→v3 upgrade
 # ---------------------------------------------------------------------------
 
 
@@ -177,10 +177,10 @@ def test_v2_to_v3_migration_happy_path(tmp_path: Path) -> None:
 
     # 2. New tables exist.
     assert _table_exists(conn, "station_poll_state"), (
-        "station_poll_state must be created by S-M1"
+        "station_poll_state must be created by the migration"
     )
     assert _table_exists(conn, "station_current_obs"), (
-        "station_current_obs must be created by S-M1"
+        "station_current_obs must be created by the migration"
     )
 
     # 3. Widened CHECK admits fetch_current_obs (positive).
@@ -263,7 +263,7 @@ def test_v2_to_v3_stagger_is_monotonic_for_multiple_stations(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-E, test 2: crash-recovery regression (SAVEPOINT correctness)
+# Test 2: crash-recovery regression (SAVEPOINT correctness)
 # ---------------------------------------------------------------------------
 
 
@@ -427,7 +427,7 @@ def test_migrate_v3_crash_recovery_regression(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-H, test 3: fetch_current_obs enqueue on a migrated v3 DB
+# Test 3: fetch_current_obs enqueue on a migrated v3 DB
 # ---------------------------------------------------------------------------
 
 

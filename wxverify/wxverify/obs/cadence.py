@@ -9,12 +9,12 @@ so scheduling is reproducible in tests with no RNG injection.
 The derivation is: parsed obstime gaps → median → ``* FACTOR`` → clamp to
 ``[min_interval, MAX_INTERVAL_SECONDS]`` → deterministic ±``JITTER_FRACTION``
 jitter. No I/O, no clock reads inside the math: ``events`` and ``min_interval``
-are parameters, and ``is_stale`` takes ``now`` as an argument. The caller (S-M3)
+are parameters, and ``is_stale`` takes ``now`` as an argument. The caller
 owns the settings-backed ``min_interval`` and the wall-clock ``now``.
 
 ``parse_obstime`` is the STRICT parser: it operates only on the already-normalized
 stored cadence events. The tolerant normalization of raw upstream payloads lives
-in S-M3's ``pws_adapter`` normalizer, NOT here (plan §5.7).
+in the ``pws_adapter`` normalizer, NOT here.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ MAX_INTERVAL_SECONDS = 1800
 # py-weather N).
 WINDOW_N = 6
 # Stale-advisory multiplier: the last obs is "stale" past this many learned
-# intervals. Advisory only — it does NOT gate scheduling (plan §5.7).
+# intervals. Advisory only — it does NOT gate scheduling.
 STALE_FACTOR = 3
 # The deterministic jitter half-width as a fraction of the base interval:
 # the scheduled value lands in ``base * [1 - f, 1 + f]`` (py-weather's ±15%).
@@ -49,7 +49,7 @@ def parse_obstime(value: str | None) -> datetime | None:
     ``Z`` and ``+00:00`` offset forms (3.11+ ``fromisoformat``). A None, naive
     (offset-less), or unparseable value returns ``None`` — the offline / no-event
     signal. Pure: no clock. Operates only on already-normalized stored cadence
-    events; tolerance of raw payloads lives in S-M3's normalizer, not here.
+    events; tolerance of raw payloads lives in the ``pws_adapter`` normalizer, not here.
     """
     if value is None:
         return None
@@ -103,7 +103,7 @@ def obs_cadence_jitter(station_id: int, cycle_bucket: int, base_interval: int) -
     (add it to ``base_interval`` to get the scheduled value); a zero ``base_interval``
     yields ``0``.
 
-    ``cycle_bucket`` is a monotonic poll-cycle counter the caller (S-M3) supplies
+    ``cycle_bucket`` is a monotonic poll-cycle counter the caller supplies
     (e.g. ``int(last_obs_epoch // base_interval)``, as ``scheduler._enqueue_due_obs``
     already derives it): successive polls of the SAME station fall in different
     buckets and so draw different offsets, spreading load without an RNG seam.
@@ -123,7 +123,7 @@ def is_stale(events: tuple[str, ...], now: datetime, learned_interval: int) -> b
     Ported from py-weather ``cadence.is_stale`` (lines 90-99). Pure boolean:
     ``now`` is passed in (no clock). No parseable event ⇒ ``False`` (no signal).
     The threshold is strict ``>`` ``STALE_FACTOR`` × ``learned_interval``. Advisory
-    only — it does NOT gate scheduling (plan §5.7); the caller emits a WARNING.
+    only — it does NOT gate scheduling; the caller emits a WARNING.
     """
     parsed = [p for p in (parse_obstime(e) for e in events) if p is not None]
     if not parsed:

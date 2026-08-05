@@ -1,6 +1,6 @@
 """HTTP-level tests for the Forecast home page routes.
 
-Spec build-sequence step 6 verify hook: "/" returns 200, "/forecast/tiles"
+Covers: "/" returns 200, "/forecast/tiles"
 returns 204 vs a fragment depending on the fingerprint, "/api/forecast/hourly"
 404s for an unknown site and clamps an out-of-range day, and the exact
 empty-state copy renders when a site has no forecast data yet.
@@ -230,8 +230,8 @@ def test_forecast_day_clamps_and_embeds_clamped_day_in_chart_src(
 
 
 # ---------------------------------------------------------------------------
-# New Forecast degradation test (deliberate no-score_cache case): pins §2.3
-# approach (a). This is the intentional counterpart to the score_cache
+# New Forecast degradation test (deliberate no-score_cache case): pins the
+# degrade-gracefully behaviour. This is the intentional counterpart to the score_cache
 # seeding migration required elsewhere -- a rebuilding-empty ranking must
 # degrade gracefully (low_confidence, never a crash or a silent stale
 # "normal"), and only this test may run Forecast against an unseeded cache.
@@ -244,7 +244,7 @@ def test_forecast_degrades_to_low_confidence_without_score_cache_no_enqueue(
     """forecast_pairs + future_samples exist -- enough for a live skill
     computation to be genuinely confident -- but `score_cache` is left
     EMPTY. Pre-fix, `leaderboard()`'s live-fallback on a cache miss makes
-    this cell confident/`normal` regardless of the cache; post-fix (§2), an
+    this cell confident/`normal` regardless of the cache; post-fix, an
     absent cache-backed rolling-window snapshot degrades to a
     `rebuilding`-empty ranking, so every candidate is unconfident/unscored
     and the selection ladder falls to the future-sample-count rung ->

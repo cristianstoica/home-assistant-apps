@@ -1248,7 +1248,7 @@ def test_export_begin_survives_bodyless_chunked_ingress_framing(
 
 
 # ---------------------------------------------------------------------------
-# Part B -- Import (I1-I9 + the post-plan backup.exists() guard).
+# Part B -- Import (I1-I9 + the backup.exists() guard).
 # ---------------------------------------------------------------------------
 
 
@@ -1365,7 +1365,7 @@ def test_import_round_trip_rebuilds_derived_tables(
         ).fetchone()
         assert orphan is None, (
             "orphaned forecast_pairs row must be cleared by the rebuild's "
-            "from-scratch DELETE (F-I2; mutation check: dropping that DELETE "
+            "from-scratch DELETE (mutation check: dropping that DELETE "
             "must turn this specific assertion red)"
         )
         recomputed = direct.execute(
@@ -1953,9 +1953,9 @@ def test_import_reclaim_failure_does_not_abort_rebuild(
 def test_import_fails_cleanly_when_backup_path_already_exists(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Pins peters' post-plan backup.exists() guard in _replace_sync.
+    """Pins the backup.exists() guard in _replace_sync.
 
-    Not in the original plan: a same-second import colliding on the
+    A same-second import colliding on the
     timestamped backup name must fail loudly rather than let VACUUM INTO's
     own failure unlink a COMPLETE prior backup out from under the operator.
     """
@@ -3069,7 +3069,7 @@ def test_export_produces_ready_gzip_snapshot_round_trips(
 def test_export_download_gzip_media_type_and_filename(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G2 (surface 7): download of a ready gz job carries `application/gzip`,
+    """G2: download of a ready gz job carries `application/gzip`,
     a `.db.gz` filename, and gzip magic in its body."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
@@ -3093,7 +3093,7 @@ def test_export_download_gzip_media_type_and_filename(
 def test_gzip_export_round_trips_end_to_end_through_http_import(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G3 (surface 1, end-to-end): the exact gz an export emits imports cleanly
+    """G3 (end-to-end): the exact gz an export emits imports cleanly
     over HTTP and the imported DB serves the exported site."""
     _init_tmp_db(tmp_path)
     app = _make_app(monkeypatch)
@@ -3118,7 +3118,7 @@ def test_gzip_export_round_trips_end_to_end_through_http_import(
 
 
 def test_stream_to_sniffs_gzip_and_raw_branches(tmp_path: Path) -> None:
-    """G4 (surfaces 2 + 3): a gzip body inflates to its source; a raw SQLite
+    """G4: a gzip body inflates to its source; a raw SQLite
     body passes through byte-for-byte with the inflate branch NOT taken.
 
     The raw fixture is a real SQLite DB (magic bytes ``SQLite format 3\\x00``,
@@ -3140,7 +3140,7 @@ def test_stream_to_sniffs_gzip_and_raw_branches(tmp_path: Path) -> None:
 
 
 def test_stream_to_buffers_sub_two_byte_first_chunk(tmp_path: Path) -> None:
-    """G5 (surface 3, R3 boundary): a gzip upload whose FIRST chunk is the
+    """G5 (boundary): a gzip upload whose FIRST chunk is the
     single magic byte ``\\x1f`` must still be detected and round-trip.
 
     Proves the <2-byte prefix is BUFFERED, not written raw: if the lone
@@ -3175,7 +3175,7 @@ def test_stream_to_buffers_sub_two_byte_first_chunk(tmp_path: Path) -> None:
 def test_gzip_zip_bomb_rejected_413_and_disk_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G6 (surface 4): a gzip whose DECOMPRESSED size crosses the cap -> 413,
+    """G6: a gzip whose DECOMPRESSED size crosses the cap -> 413,
     and the on-disk tmp never exceeds the cap (the 413 fires before full
     expansion). Paired with a gzip UNDER the same cap that inflates fully."""
     cap = 4096
@@ -3204,7 +3204,7 @@ def test_gzip_zip_bomb_rejected_413_and_disk_bounded(
 def test_import_corrupt_gzip_returns_422_not_500(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G7 (surface 5, R2): magic present but a corrupt payload -> 422 "not a
+    """G7: magic present but a corrupt payload -> 422 "not a
     valid gzip" (NOT a 500), live DB untouched, no leaked import temp.
 
     Uses a deterministic corrupt payload (magic + an invalid compression-method
@@ -3235,7 +3235,7 @@ def test_import_corrupt_gzip_returns_422_not_500(
 def test_import_truncated_gzip_returns_422(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G8 (surface 6, A2): a valid gzip cut off before its 8-byte trailer ->
+    """G8: a valid gzip cut off before its 8-byte trailer ->
     422 "truncated gzip stream". Paired positive: the full gzip imports (200).
 
     Truncation drops only the trailer, so the deflate body decodes without a
@@ -3270,7 +3270,7 @@ def test_import_truncated_gzip_returns_422(
 def test_import_empty_upload_returns_422_both_branches(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G9 (surface 10): a raw empty body AND a gzip-of-empty (decompresses to
+    """G9: a raw empty body AND a gzip-of-empty (decompresses to
     zero bytes) both -> 422 "empty upload". Paired positive: a non-empty valid
     import returns 200, so the 422 is not a blanket rejection."""
     _init_tmp_db(tmp_path)
@@ -3349,7 +3349,7 @@ def test_import_multi_member_gzip_is_not_a_validation_bypass(
 def test_export_compress_failure_terminal_error_cleans_temps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G11 (surface 8a): `_compress` raising -> job terminal `error`
+    """G11: `_compress` raising -> job terminal `error`
     ("compress failed"), NOT hung `preparing`; both the raw temp and any gz are
     cleaned; download -> 409 with the error."""
     _init_tmp_db(tmp_path)
@@ -3379,7 +3379,7 @@ def test_export_compress_failure_terminal_error_cleans_temps(
 def test_export_compress_cancelled_marks_error_reraises_cleans(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G12 (surface 8b): a CancelledError during compress must mark the entry
+    """G12: a CancelledError during compress must mark the entry
     terminal `error`/"cancelled", re-raise the CancelledError, and unlink both
     temps -- never leave the entry hung in `preparing` (the sweep skips
     `preparing` forever).
@@ -3418,7 +3418,7 @@ def test_export_compress_cancelled_marks_error_reraises_cleans(
 def test_export_begin_sweeps_stale_gz_keeps_fresh_gz(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G13 (surface 9): `_TMP_GLOBS` now covers `.wxverify-export-*.db.gz`, so
+    """G13: `_TMP_GLOBS` now covers `.wxverify-export-*.db.gz`, so
     begin's sweep unlinks an aged orphaned gz and keeps a fresh one.
 
     Paired on mtime alone (both unregistered): the stale gz (mtime past

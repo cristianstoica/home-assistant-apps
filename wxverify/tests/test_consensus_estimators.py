@@ -1,4 +1,4 @@
-"""Part A per-variable estimator oracles (plan section A6).
+"""Part A per-variable estimator oracles.
 
 Covers the pure estimator functions (`_p90`, `_low_trim`, `_mean`), the
 allowlist dispatch inside `compute_consensus`, the wind anti-regression
@@ -6,8 +6,8 @@ discriminator that proves p90 is actually wired (not silently routed back to
 median/MAD), the temperature no-op regression pin, the precip gate pin, and
 one `materialize_consensus` integration path over a real tmp SQLite DB.
 
-Every expected value below is hand-derived from the arithmetic in the plan
-(§A6), not read off the implementation.
+Every expected value below is hand-derived arithmetic,
+not read off the implementation.
 """
 
 from __future__ import annotations
@@ -106,7 +106,7 @@ def test_wind_dispatch_uses_p90_where_it_differs_from_median() -> None:
 
 
 def test_wind_anti_regression_p90_keeps_high_exposure_station() -> None:
-    """Load-bearing discriminator (plan A6): a monotonic set alone cannot
+    """Load-bearing discriminator: a monotonic set alone cannot
     catch a silent regression back to median/MAD, because nothing in it
     exceeds the MAD band. This asymmetric fixture does: 20 m/s is far
     outside the MAD band of [3,3,3,3] and would be REJECTED by median/MAD
@@ -133,7 +133,7 @@ def test_wind_anti_regression_p90_keeps_high_exposure_station() -> None:
 
 
 def test_temperature_dispatch_unchanged_lapse_normalization_pin() -> None:
-    """Regression pin (plan A6): reuses the exact scenario from
+    """Regression pin: reuses the exact scenario from
     ``test_consensus_lapse_normalization_oracle`` (tests/test_m1_m5.py:1766+)
     to prove temperature still routes through the same lapse-adjusted
     median/MAD path, byte-identical to 0.6.0.
@@ -201,14 +201,15 @@ def _precip_readings() -> list[StationReading]:
 
 
 def test_precip_gate_pins_median_mad_not_low_trim() -> None:
-    """Precip GATE pin (plan A4, load-bearing): fails loudly if someone
-    wires low_trim into _precip_estimator before the B6 gate clears.
+    """Precip GATE pin (load-bearing): fails loudly if someone
+    wires low_trim into _precip_estimator before the precip low-trim
+    follow-up lands.
 
     median/MAD arithmetic: sorted=[1,2,3,4]; median=2.5;
       deviations=[1.5,0.5,0.5,1.5]; MAD=1.0; floor(0.3) -> effective 1.0;
       band=3*1.4826*1.0=4.4478; all 4 inliers -> median([1,2,3,4])=2.5.
     low_trim([1,2,3,4]) would instead give mean(2,3,4)=3.0 with
-    n_stations=3, rejected=1 (per plan A2 post-gate formula) -- neither of
+    n_stations=3, rejected=1 (per the post-gate formula) -- neither of
     which this asserts.
     """
     result = compute_consensus(
@@ -225,13 +226,13 @@ def test_precip_gate_pins_median_mad_not_low_trim() -> None:
     assert result.value != pytest.approx(_low_trim([1.0, 2.0, 3.0, 4.0]))
 
 
-@pytest.mark.xfail(reason="precip low_trim wired in Part B / B6", strict=True)
+@pytest.mark.xfail(reason="precip low_trim wired in the follow-up phase", strict=True)
 def test_precip_post_gate_low_trim_value_documents_intended_b6_behavior() -> None:
-    """Documents the intended post-gate behavior (plan A4/A2): once B6 wires
-    low_trim into _precip_estimator, this flips from xfail to xpass -- that
+    """Documents the intended post-gate behavior: once low_trim is wired
+    into _precip_estimator, this flips from xfail to xpass -- that
     flip is the signal the gated pin above needs updating alongside it.
 
-    low_trim([1,2,3,4]) = mean(2,3,4) = 3.0; per A2's post-gate formula,
+    low_trim([1,2,3,4]) = mean(2,3,4) = 3.0; per the post-gate formula,
     n_stations=len(values)-1=3, rejected_stations=1.
     """
     result = compute_consensus(

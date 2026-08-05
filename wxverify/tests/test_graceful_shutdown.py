@@ -1,4 +1,4 @@
-"""Tests for the 0.8.9 graceful-shutdown job-reclaim fix (plan §2.4).
+"""Tests for the 0.8.9 graceful-shutdown job-reclaim fix.
 
 `run_worker`'s loop is wrapped in a single loop-level
 ``except asyncio.CancelledError`` that runs ``reclaim_all_stale`` and

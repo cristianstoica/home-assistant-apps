@@ -1,4 +1,4 @@
-"""Route-latency-during-rebuild benchmark gate (0.8.8 plan §5).
+"""Route-latency-during-rebuild benchmark gate.
 
 Measures dashboard route latency WHILE a scoring rebuild is running — the
 exact contended scenario behind the 2026-07-26/27 stalls. The 0.8.6 hot-path
@@ -387,7 +387,7 @@ def main() -> int:
     if args.out is not None:
         args.out.write_text(rendered + "\n", encoding="utf-8")
     print(rendered)
-    print(f"\n§5 gate [{mode}]: {verdict}", file=sys.stderr)
+    print(f"\nroute gate [{mode}]: {verdict}", file=sys.stderr)
     if verdict == "FAIL":
         return 1
     if verdict.startswith("PARTIAL"):

@@ -1,4 +1,4 @@
-"""Behavioral suite for the wxverify web-UI overhaul (plan 2026-07-17 §10).
+"""Behavioral suite for the wxverify web-UI overhaul.
 
 Covers the pure verdict logic, the presentation-layer leaderboard sort, the
 rendered verdict/leaderboard DOM states, the neutral-copy metric-boundary
@@ -196,7 +196,7 @@ def _item(
 
 
 # ===========================================================================
-# §10.1 — compute_verdict unit (states + counterexamples)
+# compute_verdict unit (states + counterexamples)
 # ===========================================================================
 
 
@@ -290,7 +290,7 @@ def test_compute_verdict_high_n_but_skill_none_is_withheld_not_winner() -> None:
 
 
 # ===========================================================================
-# §10.2 — Leaderboard sort (presentation layer, via load_dashboard)
+# Leaderboard sort (presentation layer, via load_dashboard)
 # ===========================================================================
 
 
@@ -353,7 +353,7 @@ def test_leaderboard_sort_eligible_first_then_withheld_high_skill_last(
 
 
 # ===========================================================================
-# §10.3 — Rendered verdict / leaderboard DOM states
+# Rendered verdict / leaderboard DOM states
 # ===========================================================================
 
 
@@ -410,7 +410,7 @@ def test_render_insufficient_state(
     # All rows withheld -> rank cells are em dashes, no highlight, no rank digit.
     assert "<td>—</td>" in html
     assert "is-top" not in html
-    # STRENGTHEN §10 oracle: every withheld row carries an em-dash rank — not
+    # STRENGTHEN oracle: every withheld row carries an em-dash rank — not
     # just ≥1 row.  Two feeds were seeded, so exactly 2 em-dash rank cells must
     # appear.  The rank cell is uniquely `<td>—</td>` (the skill cell for
     # withheld rows contains both `—` and a `<span>`, never the bare pattern).
@@ -658,7 +658,7 @@ def test_render_precip_d2_ok_uses_display_labels_and_callable_global(
 def test_render_single_eligible_candidate_no_runner_up_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Oracle §10.3: one confident feed → runner-up line absent from rendered HTML.
+    """Oracle: one confident feed → runner-up line absent from rendered HTML.
 
     The precondition is injected (one confident, one withheld — n < min_n),
     not ambient.  A paired positive follows to make the negative non-vacuous.
@@ -750,7 +750,7 @@ def test_render_two_eligible_candidates_runner_up_line_present(
 def test_render_high_skill_withheld_row_never_gets_is_top(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Oracle §10.3: a withheld feed (high skill but n < min_n) must never
+    """Oracle: a withheld feed (high skill but n < min_n) must never
     receive the ``is-top`` leaderboard highlight.
 
     ``is-top`` follows the verdict winner; a withheld feed cannot be the
@@ -811,7 +811,7 @@ def test_render_high_skill_withheld_row_never_gets_is_top(
 
 
 # ===========================================================================
-# §10.4 — Neutral-copy metric-boundary regressions (live strategies)
+# Neutral-copy metric-boundary regressions (live strategies)
 # ===========================================================================
 
 
@@ -864,7 +864,7 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
     assert result.skill_score is None
     assert result.confident is False
 
-    # Cache-backed windows never live-recompute (§2 SWR migration): the
+    # Cache-backed windows never live-recompute (SWR migration): the
     # dashboard's `window=all` read serves exclusively from score_cache, so
     # the fixture seeds a COMPLETE `w:all` snapshot of the expected active
     # feed universe (the feed AND virtual/_persistence, both of which have
@@ -938,7 +938,7 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
     assert result.skill_score is None
     assert result.confident is False
 
-    # §2 SWR migration (see the temperature boundary test above): the
+    # SWR migration (see the temperature boundary test above): the
     # cache-backed `window=all` read never live-recomputes, so seed the
     # complete `w:all` snapshot (this feed is the whole expected universe —
     # no persistence pairs exist for precip here) from the asserted aggregate.
@@ -963,7 +963,7 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
 
 
 # ===========================================================================
-# §10.5 — LEAD_OPTIONS
+# LEAD_OPTIONS
 # ===========================================================================
 
 
@@ -978,7 +978,7 @@ def test_lead_options_shape_words_and_roundtrip() -> None:
 
 
 # ===========================================================================
-# §10.6 — /api/curve contract
+# /api/curve contract
 # ===========================================================================
 
 
@@ -1122,7 +1122,7 @@ def test_curve_top_clamp_at_both_bounds(
 def test_curve_lead_guard_unparseable_and_out_of_range(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Oracle §10.6: invalid/garbage lead → D+1 ordering; D+99 → deterministic
+    """Oracle: invalid/garbage lead → D+1 ordering; D+99 → deterministic
     nulls-last / label-ASC order distinct from D+1 skill-ranked order.
 
     (a) ``lead=foo`` (unparseable) coerces to D+1 via ``_coerce_lead_day``'s
@@ -1398,7 +1398,7 @@ def test_curve_all_null_feed_does_not_displace_drawable_feeds(
 
 
 # ===========================================================================
-# §10.7 — Unknown-variable route graceful fallback
+# Unknown-variable route graceful fallback
 # ===========================================================================
 
 
@@ -1426,7 +1426,7 @@ def test_variable_label_for_totality() -> None:
 
 
 # ===========================================================================
-# §10.8 — Render smoke: standalone + Ingress with active-nav oracle
+# Render smoke: standalone + Ingress with active-nav oracle
 # ===========================================================================
 
 _PAGES: list[tuple[str, str]] = [
@@ -1479,7 +1479,7 @@ def test_render_smoke_all_pages_under_ingress_with_active_nav(
 
 
 # ===========================================================================
-# §10.9 — Empty states, two distinct oracles
+# Empty states, two distinct oracles
 # ===========================================================================
 
 

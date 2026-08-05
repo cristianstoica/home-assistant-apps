@@ -1,6 +1,6 @@
 """Tests for the ``forecast_blend_depth`` option's touch points.
 
-Spec build-sequence step 4 verify hook: the option's 6 touch points
+Covers the option's 6 touch points
 (config.yaml + schema, ``RuntimeOptions`` Field, ``_from_options_json``,
 ``_from_env``, guarded ``apply_plain_settings`` write, resolved read at the
 selection consuming site).

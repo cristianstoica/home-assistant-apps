@@ -1,4 +1,4 @@
-"""S-M4 integration tests: _fetch_current_obs end-to-end backoff coverage.
+"""Integration tests: _fetch_current_obs end-to-end backoff coverage.
 
 Bucket-E2E-A: 429 / >=500 HTTP status → domain_backoffs row written + JobDeferred.
 Bucket-E2E-B: transport exception (TimeoutException / ConnectError) → TRANSIENT
@@ -44,7 +44,7 @@ from wxverify.worker.processor import _fetch_current_obs  # noqa: PLC2701
 
 _STATION_PWS_ID = "ISTATION01"
 
-# Fixed "now" for wall-clock patches — matches the S-M3 fixture clock.
+# Fixed "now" for wall-clock patches — matches the current-obs poller fixture clock.
 _NOW = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
 _NOW_ISO = "2026-07-10T12:00:00Z"
 
@@ -251,7 +251,7 @@ class TestHttpErrorBackoff:
            called from _record_current_obs_backoff).
         4. station_poll_state.last_error is non-None and contains the status.
         5. stations.last_error / error_count / last_run_at are NOT touched
-           (diagnostics-isolation contract, plan §6).
+           (diagnostics-isolation contract).
         """
         conn = _make_conn()
         site_id = _seed_site(conn)
@@ -328,7 +328,7 @@ class TestHttpErrorBackoff:
         )
         assert int(ps["error_count"]) >= 1, "error_count must be >= 1"
 
-        # 5. stations.* sentinel values UNCHANGED (plan §6 diagnostics isolation)
+        # 5. stations.* sentinel values UNCHANGED (diagnostics isolation)
         st_after = _station_row(conn, station_id)
         assert st_after is not None
         assert st_after["last_error"] == st_before["last_error"], (

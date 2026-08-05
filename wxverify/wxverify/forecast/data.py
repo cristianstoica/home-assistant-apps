@@ -1,7 +1,7 @@
 """Read-side queries for the Forecast page.
 
 All queries here are read-only and run on the read connection. Three shared
-exclusions apply to every sample-facing query (spec: applied explicitly, not
+exclusions apply to every sample-facing query (applied explicitly, not
 incidentally via intersections):
 
 * virtual feeds (``is_virtual = 1``) never surface on the Forecast page —
@@ -114,7 +114,7 @@ def load_feed_freshness(
     """Per-feed freshest ``issued_at`` vs 2x that feed's own fetch interval.
 
     Staleness is judged per feed against its OWN ``fetch_interval_minutes``
-    (spec: never a global constant) so a slow-cadence feed is not falsely
+    (never a global constant) so a slow-cadence feed is not falsely
     flagged and a fast one is not silently excused.
     """
     invalid = invalid_forecast_sample_sql("fs")
@@ -183,9 +183,9 @@ def forecast_ranking(
     """Skill ranking for one (variable, day_ahead) cell, keyed by feed id.
 
     Reuses the leaderboard skill computation, then applies the Forecast-page
-    exclusions AT the ranking step (spec requirement): virtual feeds and the
-    meteoblue package feed are removed here explicitly, not left to the
-    intersection with fresh samples.
+    exclusions AT the ranking step by design: virtual feeds and the meteoblue
+    package feed are removed here explicitly, not left to the intersection
+    with fresh samples. Keep the filter here even if it looks redundant.
     """
     excluded = {
         int(row["id"])

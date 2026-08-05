@@ -1,5 +1,4 @@
-"""Verification suite for the composite cache-backed read path (plan
-"ground-yourself-in-home-assistant-apps-mutable-blanket", 0.4.2).
+"""Verification suite for the composite cache-backed read path.
 
 Covers ``composite_with_status``/``enqueue_score_rescore`` in
 ``wxverify/scoring/composite.py``: the cached/live equivalence linchpin, the
@@ -554,7 +553,7 @@ def test_cached_composite_matches_live_composite_all_window(tmp_path: Path) -> N
 # ---------------------------------------------------------------------------
 # Areas 2+3 -- perf property (hit AND stale never recompute live) plus the
 # deterministic stale-row construction. This is the single most load-bearing
-# test in the suite per the plan: asserting `hit` alone would let a
+# test in the suite: asserting `hit` alone would let a
 # stale-triggers-live-recompute regression ship green.
 # ---------------------------------------------------------------------------
 
@@ -1279,7 +1278,7 @@ def test_api_composite_repeated_polls_during_cooldown_do_not_spawn_jobs(
 def test_api_leaderboard_enqueue_shares_composite_cooldown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression guard (post-§3.2): /api/leaderboard's enqueue now goes
+    """Regression guard: /api/leaderboard's enqueue now goes
     through the SAME cooldown-guarded function as /api/composite (the
     generic score-rescore enqueue), so a recent terminal failure suppresses
     the leaderboard-driven enqueue exactly as it would a composite one --

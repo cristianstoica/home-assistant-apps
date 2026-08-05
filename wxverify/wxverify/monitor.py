@@ -281,7 +281,7 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
         ):
             credits_tripped += 1
 
-    # domain_backoffs: any active backoff (no active-provider filter — see spec).
+    # domain_backoffs: any active backoff (no active-provider filter, by design).
     now_iso = isoformat_utc(now)
     backoffs_n = _count(
         conn,

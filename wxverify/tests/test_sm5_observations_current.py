@@ -1,6 +1,6 @@
-"""S-M5 Bucket-1-D contract tests: GET /api/observations/current.
+"""Contract tests: GET /api/observations/current.
 
-Six oracles from the hoare ruling:
+Six oracles:
 
 1. Cold station (sps.health_state='cold', no station_current_obs row)
    → all obs fields null; health_state == "cold".
@@ -274,7 +274,7 @@ def test_offline_station_retains_last_good_obs(
 ) -> None:
     """Offline station with an existing station_current_obs row → obs retained.
 
-    Anti-conflation oracle (§13-D): the route must NOT null out obs fields based
+    Anti-conflation oracle: the route must NOT null out obs fields based
     on health_state. This test goes red if someone later adds "if health_state !=
     'online': zero/null the obs fields" to the route.
 
@@ -476,7 +476,7 @@ def test_wind_pressure_precip_returned_in_native_units(
 ) -> None:
     """Route returns stored native units (km/h, hPa, mm) WITHOUT conversion.
 
-    Pins the ratified ruling: obs values are stored in units='m' form (km/h
+    Pins this oracle: obs values are stored in units='m' form (km/h
     wind, hPa pressure, mm precip) and the route must pass them through as-is.
     A future accidental `kmh_to_ms` in the route would produce 5.0 for
     wind_speed and 7.5 for wind_gust instead of the seeded 18.0 / 27.0 — this

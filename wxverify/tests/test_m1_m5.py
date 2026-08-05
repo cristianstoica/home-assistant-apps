@@ -3960,7 +3960,7 @@ def test_options_boot_apply_bad_options_and_packaging_files(tmp_path: Path) -> N
     assert "--only-binary=:all:" in dockerfile
     assert "uvicorn[standard]" not in dockerfile
 
-    # wxverify is wired into monorepo CI in the bundled de-nest PR (§5.2/§5.3).
+    # wxverify is wired into monorepo CI in the bundled de-nest PR.
     # builder.yaml MONITORED_FILES includes wxverify, pyproject.toml, and uv.lock;
     # lint.yaml carries a wxverify-gates job.
     workflow_dir = repo.parent / ".github" / "workflows"
@@ -3973,7 +3973,7 @@ def test_options_boot_apply_bad_options_and_packaging_files(tmp_path: Path) -> N
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1 add-on contract / oracle net (§11a)
+# Add-on contract / oracle net
 # ---------------------------------------------------------------------------
 
 
@@ -3981,7 +3981,7 @@ def test_health_backoffs_contract(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """GET /api/health/backoffs: empty→[], single row returned exactly, multiple rows
-    ordered by next_attempt_at ASC (§7.1 / §11a-A)."""
+    ordered by next_attempt_at ASC."""
     close_db()
     config.db_path = str(tmp_path / "backoffs.db")
     config.options_path = str(tmp_path / "missing-options.json")
@@ -4027,7 +4027,7 @@ def test_health_backoffs_contract(
 def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Worker-status regression pins (§11a-A / S03):
+    """Worker-status regression pins (S03):
     - /worker/status (no /api prefix) → 404
     - empty jobs table → {"jobs": {}} (keys absent, not 0)
     - no completed pair_and_score → last_completed_pair_and_score_at is null
@@ -4048,7 +4048,7 @@ def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
 def test_button_typed_job_oracle_and_leaderboard_negative(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Button typed-job oracle + paired negative (§11a-B / T01 / S02):
+    """Button typed-job oracle + paired negative (T01 / S02):
     - POST /api/catchup → 'catchup' typed row in jobs (not just pending count)
     - POST /api/sites/<id>/backfill → 'backfill_site' row for that site_id
     - GET /api/leaderboard (rebuilding: applicable input, absent cache) →
@@ -4203,7 +4203,7 @@ def test_operator_backfill_retry_ignores_recent_terminal_failure_cooldown(
 def test_csrf_garbage_token_rejects(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CSRF negative triple item (2): wrong/garbage token → 403 (§11a-C / T06).
+    """CSRF negative triple item (2): wrong/garbage token → 403 (T06).
 
     Items (1) no header and (3) correct token are already pinned in
     test_api_guard_and_routes. This test closes the gap for item (2).
@@ -4227,7 +4227,7 @@ def test_csrf_garbage_token_rejects(
 
 
 def test_translations_key_parity() -> None:
-    """translations/en.yaml configuration keys == config.yaml options keys (§11a-F).
+    """translations/en.yaml configuration keys == config.yaml options keys.
 
     Uses a minimal line parser; PyYAML is not a project dependency.
     """

@@ -2,7 +2,7 @@
 
 Pure logic — no SQLite. The service layer builds :class:`CellCandidate`
 values from the sample query plus the skill ranking; this module applies the
-fallback ladder from the spec / ADR 0001.
+fallback ladder below.
 
 Before the ladder ranks, candidates are first restricted to a coverage pool:
 those clearing ``MIN_SPREAD_HOURS`` when any do, else multi-point feeds

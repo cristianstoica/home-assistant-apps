@@ -863,12 +863,12 @@ def test_problem_jobs_all_three_arms_trip_and_each_counted(
 def test_problem_jobs_pending_null_next_attempt_at_counts_as_stuck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # HARDENING (diverges from the plan's literal `next_attempt_at IS NOT NULL`):
+    # HARDENING (diverges from the literal `next_attempt_at IS NOT NULL`):
     # claim_next_job treats `next_attempt_at IS NULL OR next_attempt_at <= now`
     # as claimable, so a STUCK pending job can carry next_attempt_at=NULL. Such a
     # job — old updated_at, NULL attempt — is claimable-but-unclaimed and MUST be
     # counted. The COALESCE(next_attempt_at, updated_at) predicate catches it;
-    # the plan's `IS NOT NULL` arm would silently miss it. This test pins that.
+    # the literal `IS NOT NULL` arm would silently miss it. This test pins that.
     close_db()
     config.db_path = str(tmp_path / "problem-jobs-null-attempt.db")
     config.options_path = str(tmp_path / "missing-options.json")

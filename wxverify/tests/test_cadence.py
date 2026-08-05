@@ -1,4 +1,4 @@
-"""Bucket-1-A cadence oracle: pin the S-M2 pure cadence estimator behaviour.
+"""Cadence oracle: pin the pure cadence estimator behaviour.
 
 Ported from py-weather's ``pyweather/check/cadence_checks.py`` oracle and
 ``pyweather/fixtures.py`` fixture builders.  The numeric expected values and
@@ -87,12 +87,12 @@ def _obstime_irregular(inter_gaps: list[int]) -> tuple[str, ...]:
 
 
 # ---------------------------------------------------------------------------
-# Constants: exported contract for the S-M3 caller
+# Constants: exported contract for the caller
 # ---------------------------------------------------------------------------
 
 
 def test_window_n_exported() -> None:
-    """WINDOW_N==6 is exported so the S-M3 caller can truncate events to it."""
+    """WINDOW_N==6 is exported so the caller can truncate events to it."""
     assert WINDOW_N == 6
 
 
@@ -149,7 +149,7 @@ def test_parse_obstime_paired_positive_negative() -> None:
 # ---------------------------------------------------------------------------
 # base_interval — ported from cadence_checks.check_cadence_estimator
 # Numbers below are the py-weather oracle values, verified live against the
-# wxverify port by hoare this pass.
+# wxverify port.
 # ---------------------------------------------------------------------------
 
 
@@ -231,7 +231,7 @@ def test_base_interval_clamp_invariant_high() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §13-A cadence-math half: sub-hour-resolution gap (plan note)
+# Cadence-math half of the sub-hour-resolution contract: gap resolution
 # Two obstimes exactly 5 minutes apart → 300s gap → base_interval == 300.
 # (Not 1800 — the cadence math sees the real 300s gap, not a floored hour.)
 # ---------------------------------------------------------------------------
@@ -240,10 +240,10 @@ def test_base_interval_clamp_invariant_high() -> None:
 def test_base_interval_sub_hour_resolution() -> None:
     """Two obstimes 300s apart (within the same hour) → base_interval == 300.
 
-    §13-A cadence-math half: 0.8×300=240 clamps up to the 300 floor.
+    Cadence-math half of that contract: 0.8×300=240 clamps up to the 300 floor.
     This pins that the cadence math sees the real 300s gap — not 1800.
-    (The other §13-A half — that S-M3's _obs_instant emits two distinct
-    non-floored events — is an S-M3 concern and is not tested here.)
+    (The other half — that pws_adapter's _obs_instant emits two distinct
+    non-floored events — is a pws_adapter concern and is not tested here.)
     """
     events = _obstime_series(300, 2)
     result = base_interval(events, 300)

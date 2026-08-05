@@ -1,16 +1,16 @@
 """Tests for the 0.8.8 write-lock-serialization fix.
 
-Two families, per the write-lock-serialization plan:
+Two families:
 
-- R1-R4 (S2): the leaderboard route's fire-and-forget rescore scheduling no
+- R1-R4: the leaderboard route's fire-and-forget rescore scheduling no
   longer blocks the read behind a held write lock.
-- E1-E8 (S3): ``run_batched_scoring`` (bounded per-window write transactions)
+- E1-E8: ``run_batched_scoring`` (bounded per-window write transactions)
   reaches the same end state as the monolithic ``_score_all_windows`` run it
   replaces, never exposes a half-populated cache mid-run, and survives a
   mid-run crash, site-disable, or an in-flight concurrent writer.
 
-R5 (cooldown) and the E1-E8 plan's composite_with_status cross-check are out
-of scope for this file; see the final report for both calls.
+R5 (cooldown) and the E1-E8 composite_with_status cross-check are out
+of scope for this file.
 """
 
 from __future__ import annotations
@@ -190,7 +190,7 @@ def _dump_score_cache(conn: sqlite3.Connection) -> list[dict[str, object]]:
 
 async def _start_write_hold(db: Any, seconds: float) -> asyncio.Task[None]:
     """Start a task holding the write lock for ``seconds``; return once the
-    lock is confirmed actually held (bounded poll, per plan's R1 wording)."""
+    lock is confirmed actually held (bounded poll)."""
     task = asyncio.create_task(db.write(lambda conn: time.sleep(seconds)))
     deadline = time.monotonic() + 2.0
     while not db._write_lock.locked():  # noqa: SLF001 - the seam under test

@@ -1,10 +1,10 @@
 """Pure daily aggregation and blending for the Forecast page.
 
 Everything here is arithmetic over already-selected samples — no SQLite, no
-clock reads — so each rule from the spec (daily quantities, the coverage
+clock reads — so each rule (daily quantities, the coverage
 guard, chance-of-rain) is an independently testable unit.
 
-Methodology (ADR 0001, "aggregate per feed, then blend"):
+Methodology (aggregate per feed, then blend):
 
 * each feed's hourly samples are reduced to daily quantities first
   (high/low/max/total/wet-share), THEN the per-feed daily values are blended
@@ -22,7 +22,7 @@ from wxverify.core.timeutil import parse_utc
 
 # A feed's day counts as fully covered at >= 18 of 24 local hours. DST days
 # have 23 or 25 local hours; the threshold stays a fixed 18 distinct covered
-# hours rather than a fraction, per the spec.
+# hours rather than a fraction.
 MIN_COVERAGE_HOURS = 18
 
 # A feed needs enough distinct local hours for its daily high/low to be
@@ -91,7 +91,7 @@ def wet_share(values: Sequence[float], *, threshold_mm: float) -> float | None:
 def chance_of_rain(per_feed_shares: Sequence[float]) -> float | None:
     """Blend per-feed wet shares (equal weights) into the displayed chance.
 
-    Per the spec this is a coverage-of-the-day estimate, not a calibrated
+    This is a coverage-of-the-day estimate, not a calibrated
     probability of precipitation: each feed contributes ITS share of wet
     slots, and the shares are averaged across feeds.
     """

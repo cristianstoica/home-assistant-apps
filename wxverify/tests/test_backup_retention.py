@@ -1,5 +1,5 @@
-"""Tests for the 0.8.9 `.bak` retention sweep (plan §3.5) + `backup_exclude`
-static config content (§4).
+"""Tests for the 0.8.9 `.bak` retention sweep + `backup_exclude`
+static config content.
 
 Harness idioms are copied from ``tests/test_db_transfer.py`` (``_init_tmp_db``,
 ``_make_app``/``_idle_worker``, ``_csrf_headers``, ``_build_replacement_db``,
@@ -466,7 +466,7 @@ def test_startup_sweep_failure_does_not_abort_startup(
 
 
 # ---------------------------------------------------------------------------
-# §4: backup_exclude static content.
+# backup_exclude static content.
 # ---------------------------------------------------------------------------
 
 

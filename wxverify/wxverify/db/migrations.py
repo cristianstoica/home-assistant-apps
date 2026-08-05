@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 TARGET_USER_VERSION = 3
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
-# so cold-start polls fan out instead of bursting all at once (plan §5.5).
+# so cold-start polls fan out instead of bursting all at once.
 POLL_SEED_STAGGER_SECONDS = 10
 
 
@@ -470,7 +470,7 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
     applies cleanly. The two new tables (``station_poll_state``,
     ``station_current_obs``) are created by :func:`create_schema`; this function
     rebuilds ``jobs`` to admit ``fetch_current_obs`` and backfills a staggered
-    poll-state row per existing station (plan §5.3, §5.5).
+    poll-state row per existing station.
     """
     # The whole v3 step (jobs rebuild + poll-state seed) must be all-or-nothing.
     # The outer BEGIN IMMEDIATE in Database._run_immediate does NOT protect us:

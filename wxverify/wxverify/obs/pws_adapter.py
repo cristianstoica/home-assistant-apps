@@ -399,7 +399,7 @@ async def fetch_current_observation(
 
     ``timeout_seconds`` is the overall/read timeout (the connect timeout stays at
     5.0s); the caller passes the operator-configured ``request_timeout_seconds``
-    setting (plan §10), defaulting to the previous 10.0s literal.
+    setting, defaulting to the previous 10.0s literal.
     """
     if client is None:
         async with httpx.AsyncClient() as owned_client:

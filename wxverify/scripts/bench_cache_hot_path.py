@@ -1,6 +1,6 @@
-"""Cache hot-path benchmark harness (plan §4, measure-first gate).
+"""Cache hot-path benchmark harness (measure-first gate).
 
-Two measurement environments, kept separate per the plan:
+Two measurement environments, kept separate:
 
 1. ``queries`` — opens the exported database READ-ONLY (no enqueue calls, no
    writes) and measures ``EXPLAIN QUERY PLAN`` plus repeated wall-clock timings
@@ -27,7 +27,7 @@ Run from the add-on directory (``uv sync`` does not install the package)::
         --db /path/to/exported-wxverify.db --out bench-report.json
 
 The production RPi run against a copy of the live DB export is the one that
-counts for the §4.2 gate (each DISTINCT query < 2.0 s; composite cold and
+counts for the latency gate (each DISTINCT query < 2.0 s; composite cold and
 warm max < 20.0 s). A workstation run helps query-plan diagnosis only; its
 hardware delta is recorded separately by the operator.
 
@@ -270,7 +270,7 @@ def _endpoint_measurements(db_path: Path, site_id: int, warm: int) -> dict[str, 
     cold_s = float(samples[0]["duration_s"])
     warm_max = max(warm_durations) if warm_durations else 0.0
     # Belt-and-braces alongside the argparse floor: a run with fewer than ten
-    # warm samples cannot certify the warm gate (plan §4.1).
+    # warm samples cannot certify the warm gate.
     run_valid = consistent and http_all_200 and len(warm_samples) >= 10
     return {
         "note": (
@@ -323,7 +323,7 @@ def main() -> int:
         "--warm",
         type=int,
         default=10,
-        help="warm endpoint samples (default 10, minimum 10 per plan §4.1)",
+        help="warm endpoint samples (default 10, minimum 10)",
     )
     parser.add_argument(
         "--out", type=Path, default=None, help="write the JSON report here"
@@ -335,9 +335,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     if args.warm < 10:
-        parser.error(
-            "--warm must be >= 10 (plan §4.1 requires at least ten warm samples)"
-        )
+        parser.error("--warm must be >= 10 (at least ten warm samples are required)")
 
     if not args.db.exists():
         raise SystemExit(f"database not found: {args.db}")
@@ -387,7 +385,7 @@ def main() -> int:
     else:
         verdict = "PASS"
     print(
-        f"\n§4.2 gate: {verdict} (queries<{_QUERY_GATE_S}s: {query_pass};"
+        f"\nlatency gate: {verdict} (queries<{_QUERY_GATE_S}s: {query_pass};"
         f" endpoint{endpoint_note})",
         file=sys.stderr,
     )

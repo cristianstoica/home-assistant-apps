@@ -53,8 +53,8 @@ def _seed_meteoblue_package_with_16_members(
     conn: sqlite3.Connection, *, site_id: int, rows_per_feed: int
 ) -> tuple[int, ...]:
     """Seed the meteoblue package feed plus 16 hand-inserted member feeds
-    (17 keys total -- the real production `feed_id IN (...)` list width,
-    per §2.7/§10.4), with rows and a following ANALYZE so the planner has
+    (17 keys total -- the real production `feed_id IN (...)` list width),
+    with rows and a following ANALYZE so the planner has
     real statistics to work from rather than an empty, ANALYZE-free table.
     """
     package_row = conn.execute(
@@ -108,9 +108,9 @@ def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
             " timezone) VALUES ('QueryPlanRollup', 47, 25, 900, 'UTC')"
         ).lastrowid
     )
-    # 17-key meteoblue IN list, per §2.7: "Run each EQP with the 17-key
-    # meteoblue IN list, not a single-key feed." Rows + ANALYZE so the
-    # planner sees real cardinality rather than an empty table.
+    # 17-key meteoblue IN list, not a single-key feed — the real production
+    # width. Rows + ANALYZE so the planner sees real cardinality rather than
+    # an empty table.
     feed_ids = _seed_meteoblue_package_with_16_members(
         conn, site_id=site_id, rows_per_feed=200
     )
@@ -162,7 +162,7 @@ def test_model_run_count_sql_requires_idx_samples_runs() -> None:
     # chosen plan here -- the planner picks idx_samples_runs unprompted at
     # this row count and key width, so an EQP-text diff has zero
     # discriminating power for this statement on any fixture this suite can
-    # build (the architect measured the same on the 423k-row production
+    # build (measured the same on the 423k-row production
     # snapshot; reproducing the divergence needs real production
     # statistics this harness cannot synthesize). Recorded honestly rather
     # than implied: dropping the index it names is the strictly stronger
@@ -199,7 +199,7 @@ def test_bad_sample_count_sql_requires_idx_samples_invalid() -> None:
     # "INDEXED BY idx_samples_invalid" does not move the plan away from
     # idx_samples_invalid (it stays free at 0 matching rows regardless of
     # the hint), so this fixture cannot reproduce the wrong-index selection
-    # §2.7 measured in production. DROP INDEX remains the available proof.
+    # measured in production. DROP INDEX remains the available proof.
     conn.execute("DROP INDEX idx_samples_invalid")
     with pytest.raises(sqlite3.OperationalError, match="no such index"):
         conn.execute(sql, params).fetchone()

@@ -8,7 +8,7 @@ scan), not the competitor predicate itself, which is exercised elsewhere
 (``test_composite_cache_backed.py``, ``test_leaderboard_cache_backed.py``).
 Also pins the drift-guard invariant that ``cell_grid_cte()``'s variable axis
 covers every variable value the pairing writers actually emit, and the two
-paired stray-cell/wedge regressions for Change 1(b)'s allowlist filter.
+paired stray-cell/wedge regressions for the allowlist filter.
 
 Isolation: every test opens its own fresh ``sqlite3.connect(":memory:")`` and
 runs ``run_migrations`` (mirrors ``tests/test_forecast_data.py``).
@@ -462,7 +462,7 @@ def test_cell_grid_lead_bound_matches_schema_check() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Change 1(b): stray/out-of-range score_cache rows must not wedge the
+# Stray/out-of-range score_cache rows must not wedge the
 # composite window forever. Both tests carry a paired negative: without it,
 # "adding a stray row and still getting `hit`" could just mean the drop
 # logic is a no-op that never gets exercised.

@@ -465,7 +465,7 @@ async def _fetch_current_obs(
 
     Independent of the hourly ``_fetch_obs`` stream: touches only
     ``station_poll_state`` (diagnostics + cadence) and ``station_current_obs``
-    (last-good snapshot), never ``stations`` (plan §6). One station per job, one
+    (last-good snapshot), never ``stations``. One station per job, one
     provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
     recorded and the job is deferred; on transport failure the poll is marked
     transient and deferred to the floor.
@@ -483,12 +483,12 @@ async def _fetch_current_obs(
     # gate first (raises JobDeferred if active), then budget (raises JobDeferred
     # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
     # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
-    # design (plan §3).
+    # design.
     reservation = await writer.write(
         lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
     )
 
-    # Operator-configurable read timeout (plan §10); default 30s, floored at 1s to
+    # Operator-configurable read timeout; default 30s, floored at 1s to
     # match the config.yaml int(1,300) schema.
     timeout_seconds = await db.read(
         lambda conn: get_number_setting(conn, "request_timeout_seconds", 30, minimum=1)

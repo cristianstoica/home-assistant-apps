@@ -16,9 +16,9 @@ Covers:
 - T15    BC1: cycle INFO line present with correct outcome; DEBUG per-op lines absent
 - T16    D5: terminal ERROR comes from processor, NOT from feed_fetch.py
 - T17/T7b BC2: job deferred moved INFO → DEBUG (paired positive + negative)
-- L1     Plan §4: _configure_logging's handler streams to sys.stdout by identity
-- L2     Plan §4: _uvicorn_log_config overrides only handlers.default.stream
-- L3     Plan §4: cycle:/score discovery/score window=/score sweep INFO lines
+- L1     _configure_logging's handler streams to sys.stdout by identity
+- L2     _uvicorn_log_config overrides only handlers.default.stream
+- L3     cycle:/score discovery/score window=/score sweep INFO lines
          are actually emitted (not just whitelisted); score batch stays DEBUG
 """
 
@@ -920,7 +920,7 @@ def test_scoring_run_complete_cells_count_is_accurate(
 def test_worker_cycle_debug_lines_at_debug(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T11-D: 'job claimed' is INFO (§4.1 promotion); 'job completed' stays DEBUG."""
+    """T11-D: 'job claimed' is INFO; 'job completed' stays DEBUG."""
     job = _make_job(job_type="fetch_feed", site_id=42)
 
     async def _succeed(db: Any, writer: Any, j: Job) -> None:
@@ -947,7 +947,7 @@ def test_worker_cycle_debug_lines_at_debug(
         for r in caplog.records
         if r.name == "wxverify.worker.processor" and r.levelno == logging.INFO
     ]
-    # §4.1 promotes the claim line to INFO; 'job completed' remains at DEBUG.
+    # Promotes the claim line to INFO; 'job completed' remains at DEBUG.
     assert any("job claimed" in m for m in proc_info), (
         f"'job claimed' INFO line missing; got: {proc_info}"
     )
@@ -1453,7 +1453,7 @@ def test_d5_feed_fetch_transport_error_emits_no_error_record(
 
 
 # ---------------------------------------------------------------------------
-# L1 — plan §4: _configure_logging's handler streams to sys.stdout by identity
+# L1 — _configure_logging's handler streams to sys.stdout by identity
 # ---------------------------------------------------------------------------
 
 
@@ -1489,7 +1489,7 @@ def test_configure_logging_handler_streams_to_sys_stdout_by_identity(
 
 
 # ---------------------------------------------------------------------------
-# L2 — plan §4: _uvicorn_log_config overrides only handlers.default.stream
+# L2 — _uvicorn_log_config overrides only handlers.default.stream
 # ---------------------------------------------------------------------------
 
 
@@ -1521,7 +1521,7 @@ def test_uvicorn_log_config_overrides_only_default_stream() -> None:
 
 
 # ---------------------------------------------------------------------------
-# L3 — plan §4: cycle:/score discovery/score window=/score sweep INFO lines
+# L3 — cycle:/score discovery/score window=/score sweep INFO lines
 # are actually EMITTED (the T7 whitelist only permits them); score batch
 # stays DEBUG-only, never promoted to INFO.
 # ---------------------------------------------------------------------------

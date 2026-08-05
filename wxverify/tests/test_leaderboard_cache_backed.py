@@ -1,5 +1,4 @@
-"""Verification suite for the leaderboard cache-backed read path (plan
-"cache-miss-latency-and-coordinator-observability", 2026-07-25).
+"""Verification suite for the leaderboard cache-backed read path.
 
 Covers ``leaderboard_with_status``/``_cached_leaderboard`` in
 ``wxverify/scoring/leaderboard.py``: the stale-while-revalidate status matrix
@@ -7,7 +6,7 @@ Covers ``leaderboard_with_status``/``_cached_leaderboard`` in
 ``composite_with_status``'s state model, the no-input applicability gate
 (availability vs applicability), the loop-completion pin for mixed-freshness
 snapshots, the feed-set mismatch guard, the live custom-window bypass, the
-shared terminal-failure enqueue cooldown (`enqueue_score_rescore`, §3), and
+shared terminal-failure enqueue cooldown (`enqueue_score_rescore`), and
 the best-effort enqueue contract at both the leaderboard API route and the
 dashboard HTML route.
 
@@ -24,14 +23,14 @@ a fixed past date (``2020-01-01T00:00:00Z``) for stale rows -- never the
 ``w:all``/2035-style always-fresh convention, which would silently skip the
 staleness branch entirely for a rolling-window row.
 
-Failing-test-first: T1, T2a, and T2c are written against the post-§2 API
+Failing-test-first: T1, T2a, and T2c are written against the target API
 shape (``LeaderboardResult.status``) and are confirmed to FAIL on current
 (pre-implementation) code -- current code always falls through to
 ``_live_leaderboard`` on a cache miss/stale read, so monkeypatching it to
 raise makes that fallthrough loud rather than silently wrong. T8's two
 sub-tests monkeypatch a not-yet-existing ``enqueue_score_rescore`` symbol
-(the §3.1 rename target) and are expected to fail with an ``AttributeError``
-on the missing attribute until §3 lands -- they are NOT part of the
+(the rename target) and are expected to fail with an ``AttributeError``
+on the missing attribute until it lands -- they are NOT part of the
 failing-test-first set.
 
 Synthetic fixtures only -- fake site names and the repo's existing 47/25
@@ -580,7 +579,7 @@ def test_api_leaderboard_custom_window_never_enqueues(
 def test_stale_read_enqueue_cooldown_suppresses_then_fires_after_expiry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T6 -- pins §3: the leaderboard-driven enqueue now shares the same
+    """T6 -- pins: the leaderboard-driven enqueue now shares the same
     terminal-failure cooldown as composite. A stale complete cache with a
     RECENT terminally-failed job suppresses the read's rescore enqueue (job
     count stays at 1); the paired positive ages that failure past the
@@ -823,15 +822,15 @@ def test_api_curve_enqueues_once_for_the_stale_lead_only(
 # ---------------------------------------------------------------------------
 # T8 -- enqueue failure is best-effort, never fails the read.
 # NOT part of the failing-test-first set: both sub-tests monkeypatch a
-# not-yet-existing ``enqueue_score_rescore`` symbol (the §3.1 rename target)
-# and are expected to fail with AttributeError until §3 lands.
+# not-yet-existing ``enqueue_score_rescore`` symbol (the rename target)
+# and are expected to fail with AttributeError until it lands.
 # ---------------------------------------------------------------------------
 
 
 def test_api_leaderboard_enqueue_failure_is_best_effort_still_returns_200(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T8 API route sub-test. Post-§2/§3, ``/api/leaderboard`` no longer calls
+    """T8 API route sub-test. ``/api/leaderboard`` no longer calls
     ``enqueue_score_rescore`` directly -- it calls the synchronous
     ``schedule_score_rescore``, which schedules a fire-and-forget task that
     reaches ``enqueue_score_rescore`` via a further ``db.write`` hop inside

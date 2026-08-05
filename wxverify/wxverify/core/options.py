@@ -36,7 +36,7 @@ class RuntimeOptions(BaseModel):
     # Explicit non-None default: set_source_cap no-ops on daily_call_limit is
     # None, so a None here would leave the seeded 1000 weathercom cap in force on
     # any boot path that omits the key — below the ~2368/day natural total,
-    # deferring both weather.com streams (the LD-M8 breach this option prevents).
+    # deferring both weather.com streams (the breach this option prevents).
     weathercom_daily_call_limit: int = Field(default=3000, ge=1, le=20000)
     monitor_pipeline: bool = True
     monitor_budget: bool = True

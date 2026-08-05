@@ -1,8 +1,8 @@
 """Unit tests for ``wxverify.forecast.selection`` — pure, no SQLite.
 
-Spec build-sequence step 1 verify hook: "unit tests for selection, the
-fallback ladder (>=N / 1 / 0 confident / no-reach), ... and that excluded
-feeds never appear" (the excluded-feeds half of that hook is a data-layer
+This file covers unit tests for selection, the
+fallback ladder (>=N / 1 / 0 confident / no-reach), and that excluded
+feeds never appear (the excluded-feeds half of that is a data-layer
 concern, covered in ``test_forecast_data.py`` — this file owns everything
 `select_cell_feeds` and `representative_day_ahead` decide on their own,
 given already-built ``CellCandidate`` rows).
@@ -245,7 +245,7 @@ def test_min_spread_hours_boundary_pins_adequate_tier() -> None:
 
 
 def test_multipoint_floor_selects_multipoint_over_single_slot() -> None:
-    # hoare correction #2 (degeneracy floor): every feed below MIN_SPREAD_HOURS,
+    # Degeneracy floor: every feed below MIN_SPREAD_HOURS,
     # but a >= MULTIPOINT_MIN_HOURS multi-point feed present alongside a
     # 1-sample feed -> the multi-point feed is selected, the single-slot feed
     # absent, even though the single-slot out-skills it. Pins BOTH sides of the

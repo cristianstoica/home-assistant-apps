@@ -1,9 +1,9 @@
-"""S-M3 current-obs poller: state-machine contract, parser, scheduler, and normalizer.
+"""current-obs poller: state-machine contract, parser, scheduler, and normalizer.
 
-Bucket-1-B: poll state-machine (classify_current_obs + persist_poll_result).
-Bucket-1-C: current_obs_from_payload field mapping.
-Bucket-1-I: post-migration station scheduling via _enqueue_due_current_obs.
-§13-A (second half): _obs_instant sub-hour resolution vs _valid_at hour-flooring.
+Poll state-machine (classify_current_obs + persist_poll_result).
+current_obs_from_payload field mapping.
+Post-migration station scheduling via _enqueue_due_current_obs.
+_obs_instant sub-hour resolution vs _valid_at hour-flooring.
 
 All wall-clock reads are patched; DB isolation is per-test :memory: SQLite.
 The domain-backoff row write (record_http_backoff for 429/>=500) lives in
@@ -59,7 +59,7 @@ _STATION_PWS_ID2 = "ISTATION02"
 _NOW = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
 _NOW_ISO = "2026-07-10T12:00:00Z"
 
-# Two obs instants 5 min apart, within the same clock hour — for §13-A
+# Two obs instants 5 min apart, within the same clock hour
 _OBS_T0 = "2026-07-10T11:45:00Z"
 _OBS_T1 = "2026-07-10T11:50:00Z"  # 300 s after T0
 
@@ -282,7 +282,7 @@ def _patched_now(now: datetime = _NOW):  # type: ignore[no-untyped-def]
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-B: poll state-machine via classify_current_obs
+# Poll state-machine via classify_current_obs
 # ---------------------------------------------------------------------------
 
 
@@ -423,7 +423,7 @@ class TestClassifyCurrentObs:
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-B: persist_poll_result — DB-level contract
+# persist_poll_result — DB-level contract
 # ---------------------------------------------------------------------------
 
 
@@ -496,7 +496,7 @@ class TestPersistPollResult:
     def test_online_clears_diagnostics_and_stations_untouched(self) -> None:
         """ONLINE poll: last_error/error_count cleared; stations.* never modified.
 
-        Diagnostic isolation (plan §5.9): stations.last_error, stations.error_count,
+        Diagnostic isolation: stations.last_error, stations.error_count,
         and stations.last_run_at are seeded to sentinel values and must be unchanged
         after persist_poll_result, whether online or failing.
         """
@@ -1059,7 +1059,7 @@ class TestPersistPollResult:
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-C: current_obs_from_payload field mapping
+# current_obs_from_payload field mapping
 # ---------------------------------------------------------------------------
 
 
@@ -1184,14 +1184,14 @@ class TestCurrentObsFromPayload:
 
 
 # ---------------------------------------------------------------------------
-# §13-A (second half): _obs_instant sub-hour resolution vs _valid_at
+# _obs_instant sub-hour resolution vs _valid_at
 # ---------------------------------------------------------------------------
 
 
 class TestObsInstantSubHourResolution:
     """_obs_instant preserves sub-hour precision; _valid_at hour-floors.
 
-    §13-A second half: two payloads 5 min apart within the same clock hour
+    Two payloads 5 min apart within the same clock hour
     must produce two DISTINCT _obs_instant values but the SAME _valid_at value.
     This regression guard ensures cadence learning receives real inter-obs gaps.
     """
@@ -1260,7 +1260,7 @@ class TestObsInstantSubHourResolution:
 
 
 # ---------------------------------------------------------------------------
-# Bucket-1-I: post-migration station scheduling
+# Post-migration station scheduling
 # ---------------------------------------------------------------------------
 
 
@@ -1352,8 +1352,9 @@ class TestEnqueueDueCurrentObs:
     def test_persist_after_enqueue_writes_poll_state_row(self) -> None:
         """Enqueue + persist → poll-state row exists with non-NULL next_poll_at.
 
-        This closes the Bucket-1-I loop: station is picked up due-immediately,
-        and after a persist the UPSERT writes a row with non-NULL next_poll_at.
+        This closes the post-migration-scheduling loop: station is picked up
+        due-immediately, and after a persist the UPSERT writes a row with
+        non-NULL next_poll_at.
         """
         conn = _make_conn()
         site_id = _seed_site(conn)
@@ -1502,7 +1503,7 @@ class TestOnlineEndToEnd:
 # is reachable at the classify_current_obs / persist_poll_result unit layer.
 # Handoff: a seam into _record_current_obs_backoff (or integration-level tests
 # for _fetch_current_obs) is required to assert the domain_backoffs row is
-# written. That seam should be raised with the implementer/architect.
+# written. That seam remains open for follow-up work.
 #
 # Transport-fail (httpx timeout/connect error) is also above this layer:
 # processor._fetch_current_obs catches the exception, constructs

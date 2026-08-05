@@ -1,6 +1,6 @@
-"""Tests for the read-path latency rewrite's forecast/data.py changes (plan
-2026-08-01-read-path-latency, §8.2): ``load_future_samples``'s ROW_NUMBER()
-latest-run pick and ``load_feed_freshness``'s candidate-grid rewrite.
+"""Tests for the read-path latency rewrite's forecast/data.py changes:
+``load_future_samples``'s ROW_NUMBER() latest-run pick and
+``load_feed_freshness``'s candidate-grid rewrite.
 
 Isolation: every test opens its own fresh ``sqlite3.connect(":memory:")`` and
 runs ``run_migrations`` (mirrors ``tests/test_forecast_data.py``).
@@ -301,7 +301,7 @@ def test_load_feed_freshness_reports_the_newest_run_across_variables() -> None:
     only the FIRST or LAST grid row) would still report the middle element's
     issued_at only if the GROUP BY genuinely spans variables, not merely
     return SOME dict entry for the feed (the untestable "exactly one entry"
-    the plan explicitly forbids asserting).
+    property is deliberately not asserted here).
 
     Insert order is deliberately precip, temperature, wind -- NOT sorted by
     issued_at -- so this also cannot pass by coincidentally picking
