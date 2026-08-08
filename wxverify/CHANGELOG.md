@@ -16,6 +16,10 @@
 - The feed list and forecast freshness endpoints no longer fail when a
   stored interval cannot be read; they report the feed as having no
   usable interval, and forecast freshness marks it stale.
+- A stored fetch interval with a fractional part is now rejected instead of
+  being truncated to a whole minute, so a corrupt or imported value such as
+  `1.9` is no longer silently scheduled as a 1-minute cadence. Whole-number
+  intervals are unaffected.
 
 ### API
 

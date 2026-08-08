@@ -24,14 +24,22 @@ MAX_FETCH_INTERVAL_MINUTES = 30 * 24 * 60
 def parse_fetch_interval_minutes(value: object, *, context: str) -> int | None:
     """Convert and range-check a ``fetch_interval_minutes`` value.
 
-    Returns ``None`` for anything not convertible to ``int``, ``<= 0``, or
-    beyond the 30-day ceiling, logging a warning that identifies the caller
-    via ``context``. Callers must treat ``None`` as "this feed cannot be
-    scheduled right now" and fail closed (skip/continue), never invent a
-    fallback cadence.
+    Returns ``None`` for anything that does not denote a whole number of
+    minutes, is ``<= 0``, or is beyond the 30-day ceiling, logging a warning
+    that identifies the caller via ``context``. Any carrier ``float()``
+    accepts is read -- an INTEGER, a REAL, or a TEXT/BLOB spelling such as
+    ``'360'``, ``'360.0'`` or ``'1e3'`` -- and is accepted only if it denotes
+    an exact whole number: a stored ``1.9`` or ``43200.9`` is rejected rather
+    than truncated, never silently scheduled at the floored whole-minute
+    value. Callers must treat ``None`` as "this feed cannot be scheduled
+    right now" and fail closed (skip/continue), never invent a fallback
+    cadence.
     """
     try:
-        minutes = int(value)  # type: ignore[arg-type]
+        as_float = float(value)  # type: ignore[arg-type]
+        if as_float != int(as_float):
+            raise ValueError("non-integral fetch_interval_minutes")
+        minutes = int(as_float)
     except (TypeError, ValueError, OverflowError):
         logger.warning(
             "cadence: unreadable fetch_interval_minutes=%r (%s)", value, context

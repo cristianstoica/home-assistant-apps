@@ -752,6 +752,8 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
         "interval_out_of_range_high",
         "interval_zero",
         "interval_negative",
+        "interval_non_integral_fraction",
+        "interval_non_integral_large_in_range",
     ],
 )
 def test_fetch_feed_retry_floor_seconds_fails_closed_to_fallback_ceiling(
@@ -810,13 +812,25 @@ def test_fetch_feed_retry_floor_seconds_fails_closed_to_fallback_ceiling(
         conn.execute("UPDATE feeds SET fetch_interval_minutes=0 WHERE id=?", (feed_id,))
         payload = {"feed_id": feed_id}
         expected_fragment = "out-of-range fetch_interval_minutes"
-    else:
-        assert case == "interval_negative"
+    elif case == "interval_negative":
         conn.execute(
             "UPDATE feeds SET fetch_interval_minutes=-60 WHERE id=?", (feed_id,)
         )
         payload = {"feed_id": feed_id}
         expected_fragment = "out-of-range fetch_interval_minutes"
+    elif case == "interval_non_integral_fraction":
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes=1.9 WHERE id=?", (feed_id,)
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "unreadable fetch_interval_minutes"
+    else:
+        assert case == "interval_non_integral_large_in_range"
+        conn.execute(
+            "UPDATE feeds SET fetch_interval_minutes=43199.5 WHERE id=?", (feed_id,)
+        )
+        payload = {"feed_id": feed_id}
+        expected_fragment = "unreadable fetch_interval_minutes"
 
     job = Job(
         id=1,
@@ -968,6 +982,31 @@ def test_fetch_feed_retry_floor_seconds_happy_path_and_non_fetch_feed_type(
         max_retries=5,
     )
     assert fetch_feed_retry_floor_seconds(conn, other_job) is None
+
+
+def test_fetch_feed_retry_floor_seconds_accepts_exact_integral_real(
+    tmp_path: Path,
+) -> None:
+    """Regression pin: a whole-number cadence written via a REAL literal
+    (e.g. 360.0) still stores as INTEGER under this column's affinity and
+    must produce a floor, not fall through to the fallback ceiling. The
+    genuine REAL-carrier acceptance is pinned at the unit layer in
+    test_cadence_parse.py::test_accepts_exact_integral_real."""
+    conn = _init_tmp_db(tmp_path)
+    feed_id = _google_feed_id(conn)
+    conn.execute("UPDATE feeds SET fetch_interval_minutes=360.0 WHERE id=?", (feed_id,))
+
+    second_retry_job = Job(
+        id=1,
+        type="fetch_feed",
+        site_id=1,
+        job_key="test-key",
+        payload={"feed_id": feed_id},
+        status="running",
+        retry_count=1,
+        max_retries=5,
+    )
+    assert fetch_feed_retry_floor_seconds(conn, second_retry_job) == 360 * 60
 
 
 def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(

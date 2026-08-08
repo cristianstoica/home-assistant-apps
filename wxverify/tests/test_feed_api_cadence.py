@@ -125,3 +125,43 @@ def test_get_feeds_survives_hostile_stored_cadence(
     assert response.status_code == 200
     by_id = {row["id"]: row for row in response.json()}
     assert by_id[feed_id]["fetch_interval_minutes"] is None
+
+
+def test_get_feeds_survives_non_integral_real_stored_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fractional REAL (e.g. an imported/hand-edited 1.9) must surface as
+    ``None``, not be silently floored to 1."""
+    conn = _init_tmp_db(tmp_path)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 1.9 WHERE id = ?", (feed_id,)
+    )
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/api/feeds")
+    assert response.status_code == 200
+    by_id = {row["id"]: row for row in response.json()}
+    assert by_id[feed_id]["fetch_interval_minutes"] is None
+
+
+def test_get_feeds_accepts_exact_integral_real_stored_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression pin: a whole-number cadence written via a REAL literal
+    (e.g. 360.0) -- stored as the integer 360 by this INTEGER-affinity
+    column -- is a legitimate cadence and must surface as its integer
+    value, not be rejected. The genuine REAL-carrier acceptance is pinned
+    at the unit layer in
+    test_cadence_parse.py::test_accepts_exact_integral_real."""
+    conn = _init_tmp_db(tmp_path)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
+    )
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get("/api/feeds")
+    assert response.status_code == 200
+    by_id = {row["id"]: row for row in response.json()}
+    assert by_id[feed_id]["fetch_interval_minutes"] == 360
