@@ -358,6 +358,59 @@ def test_freshness_survives_hostile_stored_cadence() -> None:
     assert freshness[bad_feed].fetch_interval_minutes is None
 
 
+def test_freshness_survives_non_integral_real_stored_cadence() -> None:
+    """A fractional REAL (e.g. an imported/hand-edited 1.9) must surface as
+    stale with ``fetch_interval_minutes=None``, not be silently floored."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    bad_feed = _feed_id(conn, "open-meteo", "gfs_global")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 1.9 WHERE id = ?", (bad_feed,)
+    )
+    _insert_sample(
+        conn,
+        feed_id=bad_feed,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[bad_feed].stale is True
+    assert freshness[bad_feed].fetch_interval_minutes is None
+
+
+def test_freshness_accepts_exact_integral_real_stored_cadence() -> None:
+    """Regression pin: a whole-number cadence written via a REAL literal
+    (e.g. 360.0) -- stored as the integer 360 by this INTEGER-affinity
+    column -- is a legitimate cadence and must surface with that interval,
+    using it for the stale boundary rather than being rejected. The
+    genuine REAL-carrier acceptance is pinned at the unit layer in
+    test_cadence_parse.py::test_accepts_exact_integral_real."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    feed_id = _feed_id(conn, "open-meteo", "gfs_global")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
+    )
+    at_threshold = isoformat_utc(now - timedelta(minutes=720))
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=at_threshold,
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[feed_id].fetch_interval_minutes == 360
+    assert freshness[feed_id].stale is False
+
+
 # ---------------------------------------------------------------------------
 # samples_fingerprint
 # ---------------------------------------------------------------------------

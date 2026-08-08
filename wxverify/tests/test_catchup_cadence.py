@@ -65,8 +65,16 @@ def _subscribe(
 
 @pytest.mark.parametrize(
     "literal",
-    ["9e999", "x'0001'", "0", "-60", "43201"],
-    ids=["real_infinity", "blob", "zero", "negative", "over_max"],
+    ["9e999", "x'0001'", "0", "-60", "43201", "1.9", "43199.5"],
+    ids=[
+        "real_infinity",
+        "blob",
+        "zero",
+        "negative",
+        "over_max",
+        "non_integral_fraction",
+        "non_integral_large_in_range",
+    ],
 )
 def test_hostile_fetch_interval_minutes_skips_only_that_feed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, literal: str
@@ -135,6 +143,65 @@ def test_hostile_fetch_interval_minutes_with_null_last_run_at_skips_that_feed(
         "scheduled unconditionally -- inventing a cadence would charge a "
         "metered provider call"
     )
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["1.9", "43199.5"],
+    ids=["non_integral_fraction", "non_integral_large_in_range"],
+)
+def test_hostile_non_integral_fetch_interval_minutes_with_null_last_run_at_skips(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, literal: str
+) -> None:
+    """Same NULL-``last_run_at`` guard-ordering requirement as the blob/
+    infinity cases, exercised for a non-integral REAL specifically."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    bad_feed_id = _feed_id(conn, "open-meteo", "gfs_global")
+    conn.execute(
+        f"UPDATE feeds SET fetch_interval_minutes = {literal} WHERE id = ?",
+        (bad_feed_id,),
+    )
+    # No site_feed_state row for either feed -> both have NULL last_run_at.
+
+    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.cadence"):
+        targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
+
+    target_feed_ids = {t.feed_id for t in targets}
+    assert control_feed_id in target_feed_ids, (
+        "the healthy never-run sibling feed must still be scheduled this tick"
+    )
+    assert bad_feed_id not in target_feed_ids, (
+        "a never-run feed with a rejected fetch_interval_minutes must not be "
+        "scheduled unconditionally -- inventing a cadence would charge a "
+        "metered provider call"
+    )
+
+
+def test_exact_integral_real_fetch_interval_minutes_is_accepted(
+    tmp_path: Path,
+) -> None:
+    """Regression pin: a whole-number cadence written via a REAL literal
+    (e.g. 360.0) -- which this INTEGER-affinity column stores losslessly as
+    the integer 360 -- is a legitimate cadence and must still schedule the
+    feed, not be swept up by the non-integral rejection. The genuine
+    REAL-carrier acceptance is pinned at the unit layer in
+    test_cadence_parse.py::test_accepts_exact_integral_real."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    far_past = isoformat_utc(utc_now() - timedelta(days=30))
+    _subscribe(conn, site_id, feed_id, last_run_at=far_past)
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
+    )
+
+    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
+
+    assert feed_id in {t.feed_id for t in targets}
 
 
 def test_unparseable_last_run_at_skips_only_that_feed(

@@ -229,6 +229,30 @@ def _setup_fetch_interval_minutes_over_max_null_last_run_at(
     return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "43201")
 
 
+def _setup_fetch_interval_minutes_non_integral_fraction(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile(conn, "1.9")
+
+
+def _setup_fetch_interval_minutes_non_integral_large_in_range(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile(conn, "43199.5")
+
+
+def _setup_fetch_interval_minutes_non_integral_fraction_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "1.9")
+
+
+def _setup_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "43199.5")
+
+
 def _setup_sites_last_obs_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     site_id = _insert_site(conn)
     _insert_station(conn, site_id, "PWS-CASE-OBS")
@@ -318,6 +342,34 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         setup=_setup_fetch_interval_minutes_over_max_null_last_run_at,
     ),
     _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_non_integral_fraction",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_non_integral_fraction,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_non_integral_large_in_range",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_non_integral_large_in_range,
+    ),
+    _TickCarrierCase(
+        case_id="feeds_fetch_interval_minutes_non_integral_fraction_null_last_run_at",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=_setup_fetch_interval_minutes_non_integral_fraction_null_last_run_at,
+    ),
+    _TickCarrierCase(
+        case_id=(
+            "feeds_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at"
+        ),
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="fetch_interval_minutes",
+        setup=(
+            _setup_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at
+        ),
+    ),
+    _TickCarrierCase(
         case_id="sites_last_obs_at_blob",
         logger_name="wxverify.worker.scheduler",
         warning_substring="last_obs_at",
@@ -364,6 +416,43 @@ def test_scheduler_tick_survives_hostile_reader_values(
         f"expected exactly one WARNING, got {[r.getMessage() for r in warnings]}"
     )
     assert case.warning_substring in warnings[0].getMessage()
+
+
+def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Regression pin: a whole-number cadence written via a REAL literal
+    (e.g. 360.0) -- stored as the integer 360 by this INTEGER-affinity
+    column -- is a legitimate cadence and must schedule the feed with no
+    warning. The non-integral rejection's fractional-part specificity, and
+    the genuine REAL-carrier acceptance, are pinned at the unit layer in
+    test_cadence_parse.py::test_rejects_non_integral_real and
+    test_accepts_exact_integral_real."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "meteoblue", "multimodel")
+    past = isoformat_utc(utc_now() - timedelta(days=30))
+    conn.execute(
+        """
+        INSERT INTO site_feed_state (site_id, feed_id, enabled, last_run_at)
+        VALUES (?, ?, 1, ?)
+        """,
+        (site_id, feed_id, past),
+    )
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
+        scheduler_tick(conn)  # must not raise
+
+    assert _pending_job_exists(conn, "fetch_feed", site_id, f"fetch:{feed_id}"), (
+        "an exact-integral REAL cadence must still schedule the feed"
+    )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not warnings, (
+        f"expected no warnings, got: {[r.getMessage() for r in warnings]}"
+    )
 
 
 def test_enqueue_if_absent_with_cooldown_direct_call_fails_open_on_blob_updated_at(
