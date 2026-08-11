@@ -84,10 +84,11 @@ def test_missing_optional_tables_do_not_raise() -> None:
 
 
 # ---------------------------------------------------------------------------
-# OverflowError, not ValueError: a well-formed near-datetime.max/.min stamp
-# carrying a UTC offset is accepted by datetime.fromisoformat, and it is
-# parse_utc's own .astimezone(UTC) call that overflows. A narrow
-# `except ValueError` misses this shape entirely.
+# Boundary carrier: a well-formed near-datetime.max/.min stamp carrying a
+# non-UTC offset is accepted by datetime.fromisoformat and overflows on the
+# UTC conversion. parse_utc normalizes that to ValueError, so the sanitizer's
+# broad catch handles it -- the catch stays broad because the carrier set
+# here is not enumerable, not because this shape needs it.
 # ---------------------------------------------------------------------------
 
 

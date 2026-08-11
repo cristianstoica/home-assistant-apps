@@ -16,10 +16,25 @@ from wxverify.collection.forecast_validation import (
 )
 from wxverify.core.options import SECRET_ENV
 from wxverify.core.secrets import key_status
+from wxverify.core.timeutil import window_cutoff
 from wxverify.db.migrations import seed_default_feeds, seed_default_sources
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.scoring.engine import pair_and_score
 from wxverify.worker.feed_fetch import feed_fetch_target
+
+# Days of history the provider-health route aggregates per feed. A display
+# bound, not an operator-tunable analysis parameter (the settings row
+# `rolling_window_days` is the unrelated *scoring* window): 7 days is 28
+# seeded 6-hour poll cycles and ~5.6x the worst-case retry-exhaustion span,
+# so a feed surviving a multi-day outage still shows recent activity. A feed
+# configured slower than this legitimately reports zero recent samples while
+# healthy; `status` stays anchored to lifetime existence, never this window.
+HEALTH_METRICS_WINDOW_DAYS = 7
+
+# Contract marker published on every per-feed dict of /api/health/providers
+# (and `providers doctor --json`) so a consumer can branch on the response
+# shape directly instead of inferring it from which keys are present.
+HEALTH_METRICS_SCHEMA = 2
 
 NEW_PROVIDER_SOURCES: tuple[str, ...] = (
     "visualcrossing",
@@ -84,6 +99,28 @@ class SampleMetrics:
     valid_from: str | None
     valid_to: str | None
     bad_sample_count: int
+
+
+@dataclass(frozen=True)
+class RecentSampleMetrics:
+    """Per-feed sample metrics over a bounded recent window.
+
+    ``bad_sample_count`` and ``has_any_samples`` are deliberately lifetime
+    figures: the invalid-sample count backs the doctor's integrity verdict
+    (hiding old corruption behind a window would silence it), and the
+    existence flag anchors the status ladder so a healthy feed that has been
+    quiet longer than the window is not reported as producing no data.
+    """
+
+    window_start: str
+    sample_count: int
+    variables: tuple[str, ...]
+    model_run_count: int
+    latest_issued_at: str | None
+    valid_from: str | None
+    valid_to: str | None
+    bad_sample_count: int
+    has_any_samples: bool
 
 
 @dataclass(frozen=True)
@@ -263,7 +300,17 @@ def provider_health(
     *,
     site_id: int | None = None,
     sources: Sequence[str] = (),
+    window_start: str | None = None,
 ) -> list[dict[str, object]]:
+    """Per-source provider health with bounded recent-window sample metrics.
+
+    ``window_start`` is computed exactly once per call when not supplied, so
+    every feed in one response shares the same ``metrics_window_start`` and
+    the response cannot disagree with itself; tests pass it explicitly to
+    stay deterministic against fixed fixture timestamps.
+    """
+    if window_start is None:
+        window_start = window_cutoff(HEALTH_METRICS_WINDOW_DAYS)
     source_filter = tuple(dict.fromkeys(sources))
     where = ["f.is_virtual = 0", "NOT (f.source='meteoblue' AND f.model!='multimodel')"]
     params: list[object] = []
@@ -304,7 +351,12 @@ def provider_health(
             else row["default_subscribed"]
         )
         applicable = _feed_applicable(row)
-        metrics = sample_metrics(conn, int(row["site_id"]), int(row["feed_id"]))
+        metrics = recent_sample_metrics(
+            conn,
+            int(row["site_id"]),
+            int(row["feed_id"]),
+            window_start=window_start,
+        )
         last_error = None if row["last_error"] is None else str(row["last_error"])
         feed: dict[str, object] = {
             "site_id": int(row["site_id"]),
@@ -323,17 +375,19 @@ def provider_health(
                 if row["last_run_at"] is None
                 else str(row["last_run_at"]),
                 last_error=last_error,
-                sample_count=metrics.sample_count,
+                has_any_samples=metrics.has_any_samples,
             ),
             "last_run_at": row["last_run_at"],
             "last_error": last_error,
             "error_count": int(row["error_count"] or 0),
-            "sample_count": metrics.sample_count,
-            "variables": list(metrics.variables),
-            "model_run_count": metrics.model_run_count,
-            "latest_issued_at": metrics.latest_issued_at,
-            "valid_from": metrics.valid_from,
-            "valid_to": metrics.valid_to,
+            "metrics_schema": HEALTH_METRICS_SCHEMA,
+            "metrics_window_start": metrics.window_start,
+            "recent_sample_count": metrics.sample_count,
+            "recent_variables": list(metrics.variables),
+            "recent_model_run_count": metrics.model_run_count,
+            "recent_latest_issued_at": metrics.latest_issued_at,
+            "recent_valid_from": metrics.valid_from,
+            "recent_valid_to": metrics.valid_to,
             "bad_sample_count": metrics.bad_sample_count,
         }
         feeds = cast(list[dict[str, object]], group["feeds"])
@@ -438,6 +492,131 @@ def sample_metrics(
         else str(count_row["valid_from"]),
         valid_to=None if count_row["valid_to"] is None else str(count_row["valid_to"]),
         bad_sample_count=0 if bad_row is None else int(bad_row["bad_sample_count"]),
+    )
+
+
+def recent_sample_rollup_sql(placeholders: str) -> str:
+    """Windowed count / min-max / distinct-variables statement for a feed.
+
+    The lifetime statement (``sample_rollup_sql``) plus an ``issued_at``
+    cutoff, pinned to idx_samples_recent whose leading (site_id, feed_id,
+    issued_at) columns seek the window and whose trailing (valid_at,
+    variable, model_run_id) columns make the read index-only. INDEXED BY is
+    load-bearing: if the index is missing or its stored definition failed to
+    reconcile, this fails loudly at prepare time instead of silently
+    reverting to a full-history read.
+
+    The BLOB-quoting CASE is carried over verbatim from the lifetime
+    statement: a restored database can legitimately contain a BLOB
+    ``variable``, ``json_group_array`` raises on BLOBs, and that would 500
+    the whole provider-health route over one bad row.
+    """
+    return f"""
+        SELECT COUNT(*) AS sample_count,
+               MAX(issued_at) AS latest_issued_at,
+               MIN(valid_at) AS valid_from,
+               MAX(valid_at) AS valid_to,
+               json_group_array(DISTINCT CASE WHEN typeof(variable)='blob'
+                   THEN quote(variable) ELSE variable END) AS variables
+        FROM forecast_samples INDEXED BY idx_samples_recent
+        WHERE site_id=? AND feed_id IN ({placeholders})
+          AND issued_at >= ?
+        """
+
+
+def recent_model_run_count_sql(placeholders: str) -> str:
+    """Windowed distinct-model-run-count statement for a feed partition.
+
+    The pin moves from idx_samples_runs to idx_samples_recent: the runs
+    index is (site_id, feed_id, model_run_id) and cannot seek an issued_at
+    range, so keeping it would leave this statement reading the entire
+    (site_id, feed_id) history and the cutoff would buy nothing.
+    model_run_id is a trailing column of idx_samples_recent, so the windowed
+    read stays index-only.
+    """
+    return f"""
+        SELECT COUNT(DISTINCT CASE
+                 WHEN TRIM(model_run_id) != '' THEN model_run_id
+               END) AS model_run_count
+        FROM forecast_samples INDEXED BY idx_samples_recent
+        WHERE site_id=? AND feed_id IN ({placeholders})
+          AND issued_at >= ?
+        """
+
+
+def sample_exists_sql(placeholders: str) -> str:
+    """Lifetime O(1) existence probe for a feed partition.
+
+    Feeds the status ladder's has-any-samples branch so status stays
+    anchored to all of history at constant cost. Unpinned deliberately: it
+    seeks whichever covering index leads with (site_id, feed_id); the UNIQUE
+    autoindex is always available as a floor and cannot be dropped without
+    dropping the constraint, so a pin would add no failure-oracle value.
+    LIMIT 1
+    stops at the first row per key regardless of history size.
+    """
+    return f"""
+        SELECT 1 FROM forecast_samples
+        WHERE site_id=? AND feed_id IN ({placeholders})
+        LIMIT 1
+        """
+
+
+def recent_sample_metrics(
+    conn: sqlite3.Connection, site_id: int, feed_id: int, *, window_start: str
+) -> RecentSampleMetrics:
+    """Windowed per-feed metrics plus the two lifetime integrity figures.
+
+    ``window_start`` is required and caller-supplied -- there is no default
+    and no clock call here, so one request-level cutoff is shared by every
+    feed of a response by construction.
+    """
+    sample_feed_ids = sample_feed_ids_for_metrics(conn, feed_id)
+    placeholders = _placeholders(sample_feed_ids)
+    lifetime_params = (site_id, *sample_feed_ids)
+    windowed_params = (site_id, *sample_feed_ids, window_start)
+
+    count_row = conn.execute(
+        recent_sample_rollup_sql(placeholders), windowed_params
+    ).fetchone()
+    run_row = conn.execute(
+        recent_model_run_count_sql(placeholders), windowed_params
+    ).fetchone()
+    bad_row = conn.execute(
+        bad_sample_count_sql(placeholders), lifetime_params
+    ).fetchone()
+    exists_row = conn.execute(
+        sample_exists_sql(placeholders), lifetime_params
+    ).fetchone()
+
+    bad_sample_count = 0 if bad_row is None else int(bad_row["bad_sample_count"])
+    has_any_samples = exists_row is not None
+    if count_row is None:
+        return RecentSampleMetrics(
+            window_start=window_start,
+            sample_count=0,
+            variables=(),
+            model_run_count=0,
+            latest_issued_at=None,
+            valid_from=None,
+            valid_to=None,
+            bad_sample_count=bad_sample_count,
+            has_any_samples=has_any_samples,
+        )
+    return RecentSampleMetrics(
+        window_start=window_start,
+        sample_count=int(count_row["sample_count"]),
+        variables=tuple(sorted(json.loads(count_row["variables"] or "[]"))),
+        model_run_count=0 if run_row is None else int(run_row["model_run_count"] or 0),
+        latest_issued_at=None
+        if count_row["latest_issued_at"] is None
+        else str(count_row["latest_issued_at"]),
+        valid_from=None
+        if count_row["valid_from"] is None
+        else str(count_row["valid_from"]),
+        valid_to=None if count_row["valid_to"] is None else str(count_row["valid_to"]),
+        bad_sample_count=bad_sample_count,
+        has_any_samples=has_any_samples,
     )
 
 
@@ -591,7 +770,7 @@ def _provider_status(
     subscribed: bool,
     last_run_at: str | None,
     last_error: str | None,
-    sample_count: int,
+    has_any_samples: bool,
 ) -> str:
     if not site_enabled:
         return "site disabled"
@@ -605,7 +784,9 @@ def _provider_status(
         return "error"
     if last_run_at is None:
         return "never run / due"
-    if sample_count == 0:
+    # Lifetime existence, never the windowed count: a healthy feed that has
+    # been quiet longer than the metrics window must not flip to this status.
+    if not has_any_samples:
         return "ran / no usable data"
     return "ok"
 

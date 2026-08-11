@@ -13,6 +13,13 @@ from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 
 logger = logging.getLogger(__name__)
 
+# The largest value SQLite's 64-bit signed INTEGER can store. A foreign or
+# hand-edited row can already sit at this value; incrementing past it raises
+# on the bind and leaves the row undispositioned, so the count saturates here
+# instead. A saturated count is approximate by construction — it is a retry
+# ladder position, not an audited total.
+MAX_RETRY_COUNT = 2**63 - 1
+
 
 @dataclass(frozen=True)
 class Job:
@@ -281,9 +288,9 @@ def fail(
     ).fetchone()
     if row is None:
         return None
-    retry_count = int(row["retry_count"]) + 1
+    retry_count = min(int(row["retry_count"]) + 1, MAX_RETRY_COUNT)
     max_retries = int(row["max_retries"])
-    if retry_count > max_retries:
+    if retry_count > max_retries or retry_count >= MAX_RETRY_COUNT:
         conn.execute(
             """
             UPDATE jobs

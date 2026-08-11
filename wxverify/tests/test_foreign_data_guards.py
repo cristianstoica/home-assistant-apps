@@ -9,23 +9,29 @@ exception that takes the whole worker loop down with it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, utc_now
-from wxverify.db.connection import close_db, init_db
+from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.queue import (
+    MAX_RETRY_COUNT,
     EnqueueResult,
     claim_next_job,
     enqueue_if_absent_with_cooldown,
+    fail,
 )
+from wxverify.worker.processor import run_worker
 from wxverify.worker.scheduler import scheduler_tick
 
 
@@ -119,6 +125,24 @@ def _setup_jobs_updated_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     return _ExpectedJobs(must_exist=(("fetch_feed", site_id, job_key),))
 
 
+def _setup_jobs_updated_at_boundary_offset(conn: sqlite3.Connection) -> _ExpectedJobs:
+    """A well-formed near-``datetime.min`` stamp with a non-UTC offset: it
+    parses via ``fromisoformat`` but overflows on UTC conversion, so it only
+    reaches the cooldown wrapper's fail-open path if ``parse_utc`` normalizes
+    the overflow to ``ValueError``."""
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    job_key = f"fetch:{feed_id}"
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES ('fetch_feed', ?, ?, '{}', 'failed', '0001-01-01T00:00:00+05:00')
+        """,
+        (site_id, job_key),
+    )
+    return _ExpectedJobs(must_exist=(("fetch_feed", site_id, job_key),))
+
+
 def _setup_site_feed_state_last_run_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     """google/blend is default_subscribed=0, so this row would silently vanish
     from the tick (COALESCE falls back to default_subscribed) if `enabled`
@@ -133,6 +157,33 @@ def _setup_site_feed_state_last_run_at_blob(conn: sqlite3.Connection) -> _Expect
         (site_id, feed_id),
     )
     return _ExpectedJobs(must_exist=(("fetch_feed", site_id, f"fetch:{feed_id}"),))
+
+
+def _setup_site_feed_state_last_run_at_boundary_offset(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    """A well-formed near-``datetime.max`` stamp with a non-UTC offset in
+    last_run_at: the scheduler's narrow ``except ValueError`` fail-open only
+    holds if ``parse_utc`` normalizes the UTC-conversion overflow to
+    ``ValueError`` -- otherwise the exception escapes ``scheduler_tick``
+    entirely and halts the worker. The default-subscribed control feed
+    (open-meteo/ecmwf_ifs, no site_feed_state row) must still be scheduled."""
+    site_id = _insert_site(conn)
+    control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    bad_feed_id = _feed_id(conn, "google", "blend")
+    conn.execute(
+        """
+        INSERT INTO site_feed_state (site_id, feed_id, enabled, last_run_at)
+        VALUES (?, ?, 1, '9999-12-31T23:59:59-14:00')
+        """,
+        (site_id, bad_feed_id),
+    )
+    return _ExpectedJobs(
+        must_exist=(
+            ("fetch_feed", site_id, f"fetch:{bad_feed_id}"),
+            ("fetch_feed", site_id, f"fetch:{control_feed_id}"),
+        )
+    )
 
 
 def _setup_fetch_interval_minutes_hostile(
@@ -292,6 +343,18 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         logger_name="wxverify.db.queue",
         warning_substring="updated_at",
         setup=_setup_jobs_updated_at_blob,
+    ),
+    _TickCarrierCase(
+        case_id="jobs_updated_at_boundary_offset_via_cooldown_wrapper",
+        logger_name="wxverify.db.queue",
+        warning_substring="updated_at",
+        setup=_setup_jobs_updated_at_boundary_offset,
+    ),
+    _TickCarrierCase(
+        case_id="site_feed_state_last_run_at_boundary_offset",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="last_run_at",
+        setup=_setup_site_feed_state_last_run_at_boundary_offset,
     ),
     _TickCarrierCase(
         case_id="site_feed_state_last_run_at_blob",
@@ -480,6 +543,38 @@ def test_enqueue_if_absent_with_cooldown_direct_call_fails_open_on_blob_updated_
     assert result.job_id is not None
 
 
+def test_enqueue_cooldown_fails_open_on_boundary_offset_updated_at(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A well-formed near-``datetime.min`` stamp with a non-UTC offset in the
+    latest failed job's updated_at overflows on UTC conversion inside
+    parse_utc; the wrapper's narrow ``except ValueError`` must still take the
+    existing fail-open path (enqueue + the unreadable-updated_at warning)
+    rather than let the exception escape into the caller."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    job_type, job_key = "fetch_feed", "fetch:1"
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES (?, ?, ?, '{}', 'failed', '0001-01-01T00:00:00+05:00')
+        """,
+        (job_type, site_id, job_key),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.db.queue"):
+        result = enqueue_if_absent_with_cooldown(
+            conn, job_type, site_id, job_key, {}, cooldown=timedelta(hours=1)
+        )
+
+    assert isinstance(result, EnqueueResult)
+    assert result.created is True
+    assert result.job_id is not None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "unreadable updated_at" in warnings[0].getMessage()
+
+
 # ---------------------------------------------------------------------------
 # claim_next_job: the disposition must be a total catch, not an allowlist
 # ---------------------------------------------------------------------------
@@ -536,3 +631,178 @@ def test_claim_next_job_dispositions_carriers_an_allowlist_would_miss(
         row["last_error"],
         row["updated_at"],
     ), "a second claim call must not touch the already-dispositioned row"
+
+
+# ---------------------------------------------------------------------------
+# fail(): an int64-max retry_count must saturate, not raise at the bind
+# ---------------------------------------------------------------------------
+
+
+def _insert_catchup_job(conn: sqlite3.Connection, *, job_key: str = "k-sat") -> int:
+    """Minimal synthetic job row (no site needed for a catchup job)."""
+    cur = conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status)
+        VALUES ('catchup', NULL, ?, '{}', 'pending')
+        """,
+        (job_key,),
+    )
+    job_id = cur.lastrowid
+    assert job_id is not None, "INSERT must produce a rowid"
+    return int(job_id)
+
+
+def _set_retry_columns(
+    conn: sqlite3.Connection, job_id: int, *, retry_count: int, max_retries: int
+) -> None:
+    conn.execute(
+        "UPDATE jobs SET retry_count = ?, max_retries = ? WHERE id = ?",
+        (retry_count, max_retries, job_id),
+    )
+
+
+def test_max_retry_count_is_exactly_the_sqlite_integer_bound(
+    tmp_path: Path,
+) -> None:
+    """Sanity pin on the constant itself: MAX_RETRY_COUNT binds into an
+    INTEGER column, and one past it does not -- so a constant chosen one
+    power of two wrong fails here even where every behavioural test would
+    still pass."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    conn.execute(
+        "UPDATE jobs SET retry_count = ? WHERE id = ?", (MAX_RETRY_COUNT, job_id)
+    )  # must not raise
+    with pytest.raises(OverflowError):
+        conn.execute(
+            "UPDATE jobs SET retry_count = ? WHERE id = ?",
+            (MAX_RETRY_COUNT + 1, job_id),
+        )
+
+
+def test_fail_saturates_int64_max_retry_count_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A foreign/hand-edited row already at the INTEGER bound must still be
+    dispositioned: fail() saturates the count and goes terminal instead of
+    raising OverflowError at the bind and leaving the row 'running'."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=5)
+
+    disposition = fail(conn, job_id, "e")  # must not raise
+
+    assert disposition is not None
+    assert disposition.terminal is True
+    assert disposition.retry_count == MAX_RETRY_COUNT
+    row = conn.execute(
+        "SELECT status, retry_count FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert int(row["retry_count"]) == MAX_RETRY_COUNT
+
+
+def test_saturated_retry_count_is_terminal_even_at_int64_max_max_retries(
+    tmp_path: Path,
+) -> None:
+    """retry_count AND max_retries both at the INTEGER bound: saturation
+    lands exactly on max_retries, so the strict retry_count > max_retries
+    test alone would schedule another attempt forever -- a silent infinite
+    retry ladder instead of a crash loop. Saturation must imply terminal."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(
+        conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=MAX_RETRY_COUNT
+    )
+
+    disposition = fail(conn, job_id, "e")
+
+    assert disposition is not None
+    assert disposition.terminal is True
+    row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    assert row["status"] == "failed"
+
+
+def test_fail_ordinary_retry_arithmetic_is_unchanged(tmp_path: Path) -> None:
+    """The saturation clamp must not disturb normal increments: 0 -> 1
+    retries with a scheduled next attempt, 4 -> 5 at max_retries=5 is the
+    last permitted retry, and 5 -> 6 is terminal."""
+    conn = _init_tmp_db(tmp_path)
+
+    job_a = _insert_catchup_job(conn, job_key="k-a")
+    _set_retry_columns(conn, job_a, retry_count=0, max_retries=5)
+    d_a = fail(conn, job_a, "e")
+    assert d_a is not None
+    assert (d_a.terminal, d_a.retry_count) == (False, 1)
+    assert d_a.next_attempt_at is not None
+    row_a = conn.execute(
+        "SELECT status, next_attempt_at FROM jobs WHERE id = ?", (job_a,)
+    ).fetchone()
+    assert row_a["status"] == "pending"
+    assert row_a["next_attempt_at"] == d_a.next_attempt_at
+
+    job_b = _insert_catchup_job(conn, job_key="k-b")
+    _set_retry_columns(conn, job_b, retry_count=4, max_retries=5)
+    d_b = fail(conn, job_b, "e")
+    assert d_b is not None
+    assert (d_b.terminal, d_b.retry_count) == (False, 5)
+
+    job_c = _insert_catchup_job(conn, job_key="k-c")
+    _set_retry_columns(conn, job_c, retry_count=5, max_retries=5)
+    d_c = fail(conn, job_c, "e")
+    assert d_c is not None
+    assert (d_c.terminal, d_c.retry_count) == (True, 6)
+
+
+def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same row driven through the real dispatcher path that calls
+    fail(): the pass completes, the row ends 'failed', and a second claim
+    does not hand it out again. Catches a fix that swallows the bind error
+    without dispositioning the row, which the helper-level test alone
+    cannot distinguish."""
+    conn = _init_tmp_db(tmp_path)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
+    )
+    monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda _c: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.purge_failed_jobs_older_than", lambda _c, _h: None
+    )
+
+    async def _raising_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
+        raise RuntimeError("synthetic dispatch failure")
+
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _raising_dispatch)
+
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=5)
+    conn.commit()
+    db = get_db()
+
+    def _status() -> str:
+        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row is not None, "job row vanished"
+        return str(row["status"])
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))
+        deadline = time.monotonic() + 5.0
+        while _status() != "failed":
+            if time.monotonic() > deadline:
+                task.cancel()
+                raise TimeoutError(
+                    f"job never reached status='failed' (last={_status()!r})"
+                )
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+
+    assert _status() == "failed"
+    assert claim_next_job(conn) is None, (
+        "the dispositioned row must never be re-claimed"
+    )

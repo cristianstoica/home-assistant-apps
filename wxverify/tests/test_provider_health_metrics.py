@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -24,6 +26,9 @@ from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.provider_ops import (
     SampleMetrics,
     _provider_status,  # noqa: SLF001
+    provider_doctor_failures,
+    provider_health,
+    recent_sample_metrics,
     sample_metrics,
     smoke_stored_sample_check,
 )
@@ -300,16 +305,20 @@ def test_model_run_count_excludes_empty_model_run_id(tmp_path: Path) -> None:
 def test_zero_sample_feed_status_reports_never_run_and_ran_no_data(
     tmp_path: Path,
 ) -> None:
-    """A zero-sample feed's SampleMetrics feeds into _provider_status, which
-    must still distinguish "never run" (no last_run_at) from "ran but got
-    nothing" (last_run_at set, sample_count still 0) -- both reachable from
-    the same zero-sample metrics, distinguished only by last_run_at.
+    """A zero-sample feed feeds into _provider_status, which must still
+    distinguish "never run" (no last_run_at) from "ran but got nothing"
+    (last_run_at set, still no stored sample anywhere in history) -- both
+    reachable from the same sample-free state, distinguished only by
+    last_run_at.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    metrics = sample_metrics(conn, site_id, feed_id)
+    metrics = recent_sample_metrics(
+        conn, site_id, feed_id, window_start="2026-01-01T00:00:00Z"
+    )
     assert metrics.sample_count == 0
+    assert metrics.has_any_samples is False
 
     never_run = _provider_status(
         site_enabled=True,
@@ -317,7 +326,7 @@ def test_zero_sample_feed_status_reports_never_run_and_ran_no_data(
         subscribed=True,
         last_run_at=None,
         last_error=None,
-        sample_count=metrics.sample_count,
+        has_any_samples=metrics.has_any_samples,
     )
     assert never_run == "never run / due"
 
@@ -327,7 +336,7 @@ def test_zero_sample_feed_status_reports_never_run_and_ran_no_data(
         subscribed=True,
         last_run_at="2026-01-01T00:00:00Z",
         last_error=None,
-        sample_count=metrics.sample_count,
+        has_any_samples=metrics.has_any_samples,
     )
     assert ran_no_data == "ran / no usable data"
 
@@ -390,13 +399,30 @@ _PUBLISHED_HEALTH_PROVIDERS_FEED_KEYS = frozenset(
         "last_run_at",
         "last_error",
         "error_count",
+        "metrics_schema",
+        "metrics_window_start",
+        "recent_sample_count",
+        "recent_variables",
+        "recent_model_run_count",
+        "recent_latest_issued_at",
+        "recent_valid_from",
+        "recent_valid_to",
+        "bad_sample_count",
+    }
+)
+
+# The lifetime-scoped spellings the bounded-window rename removed. A consumer
+# still reading one of these must fail loudly on a missing key, never receive
+# a silently re-scoped value under the old name -- so their absence is
+# asserted explicitly, not merely implied by the exact-set equality above.
+_REMOVED_HEALTH_PROVIDERS_FEED_KEYS = frozenset(
+    {
         "sample_count",
         "variables",
         "model_run_count",
         "latest_issued_at",
         "valid_from",
         "valid_to",
-        "bad_sample_count",
     }
 )
 
@@ -446,22 +472,28 @@ def test_health_providers_route_publishes_its_documented_key_set(
         for feed in group["feeds"]:
             saw_a_feed = True
             assert set(feed.keys()) == _PUBLISHED_HEALTH_PROVIDERS_FEED_KEYS
+            assert not (set(feed.keys()) & _REMOVED_HEALTH_PROVIDERS_FEED_KEYS)
+            assert feed["metrics_schema"] == 2
             assert "source" not in feed
     assert saw_a_feed, "no group carried any feed; the contract check is vacuous"
 
 
 def _insert_blob_variable_sample(
-    conn: sqlite3.Connection, *, site_id: int, feed_id: int
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    issued_at: str = "2026-01-01T00:00:00Z",
+    valid_at: str = "2026-01-01T06:00:00Z",
 ) -> None:
     conn.execute(
         """
         INSERT INTO forecast_samples
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
              value, source_raw, model_run_id)
-        VALUES (?, ?, ?, '2026-01-01T00:00:00Z', '2026-01-01T06:00:00Z', 24,
-                10.0, '{}', 'run-1')
+        VALUES (?, ?, ?, ?, ?, 24, 10.0, '{}', 'run-1')
         """,
-        (site_id, feed_id, b"temperature"),
+        (site_id, feed_id, b"temperature", issued_at, valid_at),
     )
 
 
@@ -507,7 +539,15 @@ def test_health_providers_route_returns_200_with_a_blob_variable_row(
         assert site_row is not None
         feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
         seeded_feed_id.append(feed_id)
-        _insert_blob_variable_sample(conn, site_id=int(site_row["id"]), feed_id=feed_id)
+        # Far-future stamps keep the row inside the route's recent metrics
+        # window regardless of the real clock the route computes it from.
+        _insert_blob_variable_sample(
+            conn,
+            site_id=int(site_row["id"]),
+            feed_id=feed_id,
+            issued_at="2035-01-01T00:00:00Z",
+            valid_at="2035-01-01T06:00:00Z",
+        )
 
     with TestClient(app) as client:
         get_db().write_sync(_seed)
@@ -527,4 +567,303 @@ def test_health_providers_route_returns_200_with_a_blob_variable_row(
     # Pins the BLOB path all the way through JSON serialization to the
     # response body the Home Assistant consumer reads, not merely that the
     # route didn't raise -- b"temperature" hex-quoted by quote().
-    assert matches[0]["variables"] == ["X'74656D7065726174757265'"]
+    assert matches[0]["recent_variables"] == ["X'74656D7065726174757265'"]
+
+
+def test_recent_metrics_include_the_boundary_row_at_window_start(
+    tmp_path: Path,
+) -> None:
+    """The window filter is inclusive (issued_at >= window_start): a row
+    issued exactly at the cutoff instant belongs to the window, a row one
+    day earlier does not, and a later row does. Pinning all three keeps an
+    off-by-one drift to a strict `>` from passing silently.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at="2026-01-04T00:00:00Z",
+        valid_at="2026-01-04T06:00:00Z",
+        value=1.0,
+        model_run_id="run-old",
+    )
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="wind",
+        issued_at="2026-01-05T00:00:00Z",
+        valid_at="2026-01-05T06:00:00Z",
+        value=2.0,
+        model_run_id="run-boundary",
+    )
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="precip",
+        issued_at="2026-01-06T00:00:00Z",
+        valid_at="2026-01-06T06:00:00Z",
+        value=3.0,
+        model_run_id="run-new",
+    )
+
+    metrics = recent_sample_metrics(
+        conn, site_id, feed_id, window_start="2026-01-05T00:00:00Z"
+    )
+
+    assert metrics.sample_count == 2
+    assert metrics.variables == ("precip", "wind")
+    assert metrics.model_run_count == 2
+    assert metrics.latest_issued_at == "2026-01-06T00:00:00Z"
+    assert metrics.valid_from == "2026-01-05T06:00:00Z"
+    assert metrics.valid_to == "2026-01-06T06:00:00Z"
+    assert metrics.window_start == "2026-01-05T00:00:00Z"
+    assert metrics.has_any_samples is True
+
+
+def test_provider_health_shares_one_window_start_across_all_feeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cutoff is computed once per call, not once per feed. The patched
+    clock advances a full day on every read, so a per-feed recomputation
+    would leak distinct metrics_window_start values across one response.
+    """
+    ticks = iter(range(1, 1000))
+
+    def _advancing_now() -> datetime:
+        return datetime(2026, 1, 1, tzinfo=UTC) + timedelta(days=next(ticks))
+
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", _advancing_now)
+    conn = _init_tmp_db(tmp_path)
+    _insert_site(conn)
+
+    health = provider_health(conn)
+
+    feeds = [
+        feed
+        for group in health
+        for feed in cast(list[dict[str, object]], group["feeds"])
+    ]
+    assert len(feeds) >= 2, "single-feed fixture cannot detect per-feed recomputation"
+    window_starts = {feed["metrics_window_start"] for feed in feeds}
+    assert len(window_starts) == 1
+
+
+def test_smoke_check_sees_samples_older_than_the_metrics_window(
+    tmp_path: Path,
+) -> None:
+    """smoke_stored_sample_check stays lifetime-scoped: a sample far older
+    than any plausible recent window still counts as stored data there, even
+    while the windowed metrics for the same feed report an empty window.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T06:00:00Z",
+        value=5.0,
+    )
+
+    check = smoke_stored_sample_check(conn, site_id, feed_id)
+    assert "no stored samples" not in check.reasons
+    assert check.metrics.sample_count == 1
+
+    metrics = recent_sample_metrics(
+        conn, site_id, feed_id, window_start="2026-02-01T00:00:00Z"
+    )
+    assert metrics.sample_count == 0
+    assert metrics.has_any_samples is True
+
+
+def test_quiet_but_healthy_feed_reports_ok_with_empty_recent_metrics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A feed that ran successfully and stored data, but has been quiet
+    longer than the metrics window, publishes empty recent metrics while its
+    status stays "ok" (status reads lifetime existence, not the windowed
+    count) and the doctor raises no failure for it.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "health-providers-quiet.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+
+    seeded_feed_id: list[int] = []
+
+    def _seed(conn: sqlite3.Connection) -> None:
+        _seed_a_site(conn)
+        site_row = conn.execute(
+            "SELECT id FROM sites WHERE name='HealthProvidersRoute'"
+        ).fetchone()
+        assert site_row is not None
+        site_id = int(site_row["id"])
+        feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+        seeded_feed_id.append(feed_id)
+        # Stored data well in the past -- outside any real-clock 7-day
+        # window -- plus a clean successful-run record.
+        _insert_sample(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            variable="temperature",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-01-01T06:00:00Z",
+            value=5.0,
+        )
+        conn.execute(
+            """
+            INSERT INTO site_feed_state
+                (site_id, feed_id, enabled, last_run_at, error_count)
+            VALUES (?, ?, 1, '2026-01-01T00:05:00Z', 0)
+            """,
+            (site_id, feed_id),
+        )
+
+    with TestClient(app) as client:
+        get_db().write_sync(_seed)
+        response = client.get("/api/health/providers")
+    assert response.status_code == 200
+    groups = response.json()
+    assert len(seeded_feed_id) == 1
+    matches = [
+        feed
+        for group in groups
+        for feed in group["feeds"]
+        if feed["feed_id"] == seeded_feed_id[0]
+    ]
+    assert len(matches) == 1
+    feed = matches[0]
+    assert feed["recent_sample_count"] == 0
+    assert feed["recent_variables"] == []
+    assert feed["recent_latest_issued_at"] is None
+    assert feed["status"] == "ok"
+
+    failures = provider_doctor_failures(groups)
+    prefix = f"open-meteo site={feed['site_id']} feed={feed['feed_id']}"
+    assert not any(failure.startswith(prefix) for failure in failures)
+
+
+def test_bad_sample_count_stays_lifetime_and_still_fails_the_doctor(
+    tmp_path: Path,
+) -> None:
+    """bad_sample_count keeps its lifetime scope: an invalid stored row
+    older than the metrics window still counts, and the doctor still raises
+    "invalid stored samples" for the feed -- integrity findings must not age
+    out of the report just because the row left the display window.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T06:00:00Z",
+        value=999.0,
+    )
+
+    metrics = recent_sample_metrics(
+        conn, site_id, feed_id, window_start="2026-02-01T00:00:00Z"
+    )
+    assert metrics.sample_count == 0
+    assert metrics.bad_sample_count == 1
+
+    health = provider_health(conn, window_start="2026-02-01T00:00:00Z")
+    failures = provider_doctor_failures(health)
+    prefix = f"open-meteo site={site_id} feed={feed_id}"
+    assert f"{prefix}: invalid stored samples" in failures
+
+
+def test_recent_metrics_roll_up_only_in_window_meteoblue_members(
+    tmp_path: Path,
+) -> None:
+    """The meteoblue package roll-up and the window filter compose: a member
+    sample inside the window counts toward the package's recent metrics, a
+    member sample outside it does not -- but both still register lifetime
+    existence.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    member_a = _insert_meteoblue_member(conn, "ecmwf")
+    member_b = _insert_meteoblue_member(conn, "gfs")
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=member_a,
+        variable="temperature",
+        issued_at="2026-01-10T00:00:00Z",
+        valid_at="2026-01-10T06:00:00Z",
+        value=5.0,
+        model_run_id="run-in",
+    )
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=member_b,
+        variable="wind",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T06:00:00Z",
+        value=10.0,
+        model_run_id="run-out",
+    )
+
+    metrics = recent_sample_metrics(
+        conn, site_id, package_id, window_start="2026-01-05T00:00:00Z"
+    )
+
+    assert metrics.sample_count == 1
+    assert metrics.variables == ("temperature",)
+    assert metrics.model_run_count == 1
+    assert metrics.latest_issued_at == "2026-01-10T00:00:00Z"
+    assert metrics.has_any_samples is True
+
+
+def test_empty_window_reports_zeroed_metrics_without_forgetting_history(
+    tmp_path: Path,
+) -> None:
+    """A window that contains no rows at all yields the zero/None/() shape
+    for every windowed field while both lifetime fields keep reporting the
+    stored history: existence stays True and bad_sample_count keeps its
+    lifetime tally.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T06:00:00Z",
+        value=5.0,
+    )
+
+    metrics = recent_sample_metrics(
+        conn, site_id, feed_id, window_start="2027-01-01T00:00:00Z"
+    )
+
+    assert metrics.sample_count == 0
+    assert metrics.variables == ()
+    assert metrics.model_run_count == 0
+    assert metrics.latest_issued_at is None
+    assert metrics.valid_from is None
+    assert metrics.valid_to is None
+    assert metrics.window_start == "2027-01-01T00:00:00Z"
+    assert metrics.bad_sample_count == 0
+    assert metrics.has_any_samples is True

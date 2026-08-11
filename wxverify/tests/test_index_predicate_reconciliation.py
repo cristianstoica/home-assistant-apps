@@ -1,6 +1,6 @@
 """Tests for the partial-index reconciliation seam in ``create_schema``.
 
-``_sync_invalid_sample_index`` drops and rebuilds ``idx_samples_invalid``
+``_sync_forecast_sample_index`` drops and rebuilds ``idx_samples_invalid``
 whenever the stored predicate no longer matches the current
 ``FORECAST_VALUE_RANGES``-derived predicate, so a schema built under an old
 bound self-heals on the next ``create_schema`` call rather than leaving a
@@ -14,11 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from wxverify.collection.forecast_validation import (
-    FORECAST_VALUE_RANGES,
-    invalid_forecast_sample_sql,
+from wxverify.collection.forecast_validation import FORECAST_VALUE_RANGES
+from wxverify.db.migrations import (
+    SAMPLES_RECENT_INDEX_DDL,
+    _index_predicate,
+    create_schema,
+    invalid_sample_index_ddl,
+    run_migrations,
 )
-from wxverify.db.migrations import _index_predicate, create_schema, run_migrations
 from wxverify.provider_ops import bad_sample_count_sql
 
 
@@ -94,12 +97,9 @@ def test_stale_index_predicate_breaks_the_query_at_prepare_time_and_self_heals(
         " WHERE type='index' AND name='idx_samples_invalid'"
     ).fetchone()
     assert stored_after is not None
-    current_ddl = (
-        "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
-        "ON forecast_samples(site_id, feed_id) "
-        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+    assert _index_predicate(stored_after["sql"]) == _index_predicate(
+        invalid_sample_index_ddl()
     )
-    assert _index_predicate(stored_after["sql"]) == _index_predicate(current_ddl)
 
     _insert_sample(conn, site_id=site_id, feed_id=feed_id, value=999.0)
     row = conn.execute(sql, (site_id, feed_id)).fetchone()
@@ -121,12 +121,12 @@ class _FaultConn(sqlite3.Connection):
         return super().execute(sql, parameters)  # type: ignore[call-arg]
 
 
-def _stored_index_sql(db_path: Path) -> str:
+def _stored_index_sql(db_path: Path, name: str = "idx_samples_invalid") -> str:
     conn = sqlite3.connect(str(db_path))
     try:
         row = conn.execute(
-            "SELECT sql FROM sqlite_master"
-            " WHERE type='index' AND name='idx_samples_invalid'"
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            (name,),
         ).fetchone()
         return str(row[0])
     finally:
@@ -184,7 +184,7 @@ def test_freshly_created_db_stores_the_current_generator_predicate(
 ) -> None:
     # A brand-new database never goes through the stale-predicate-vs-current
     # comparison at all (there is no prior stored index to diff against) --
-    # this is a sanity check that _sync_invalid_sample_index's first-run
+    # this is a sanity check that _sync_forecast_sample_index's first-run
     # CREATE branch stores the real generator output, not a hand-copied
     # literal that could drift from invalid_forecast_sample_sql() over time.
     db_path = tmp_path / "fresh.db"
@@ -195,9 +195,84 @@ def test_freshly_created_db_stores_the_current_generator_predicate(
     conn.close()
 
     stored_sql = _stored_index_sql(db_path)
-    current_ddl = (
-        "CREATE INDEX IF NOT EXISTS idx_samples_invalid "
-        "ON forecast_samples(site_id, feed_id) "
-        f"WHERE {invalid_forecast_sample_sql('forecast_samples')}"
+    assert _index_predicate(stored_sql) == _index_predicate(invalid_sample_index_ddl())
+
+
+def _make_db_with_stale_recent_index(db_path: Path) -> str:
+    """Build a real schema, then swap idx_samples_recent's on-disk definition
+    for a narrower one under the same name -- the state a database carries
+    after the index's column list changes in a release.
+    """
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    conn.execute("DROP INDEX idx_samples_recent")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_samples_recent "
+        "ON forecast_samples(site_id, feed_id, issued_at)"
     )
-    assert _index_predicate(stored_sql) == _index_predicate(current_ddl)
+    conn.commit()
+    conn.close()
+    return _stored_index_sql(db_path, "idx_samples_recent")
+
+
+def test_stale_recent_index_definition_is_rebuilt_by_create_schema(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "recent-stale.db"
+    stale_sql = _make_db_with_stale_recent_index(db_path)
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    create_schema(conn)
+    conn.close()
+
+    rebuilt_sql = _stored_index_sql(db_path, "idx_samples_recent")
+    assert rebuilt_sql != stale_sql
+    assert _index_predicate(rebuilt_sql) == _index_predicate(SAMPLES_RECENT_INDEX_DDL)
+
+
+def test_recent_index_rebuild_rolls_back_a_fault_between_drop_and_create(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "recent-fault.db"
+    stale_sql = _make_db_with_stale_recent_index(db_path)
+
+    fault_conn = _open_fault_conn(
+        db_path, fault_on="CREATE INDEX IF NOT EXISTS idx_samples_recent"
+    )
+    with pytest.raises(sqlite3.OperationalError, match="injected fault"):
+        create_schema(fault_conn)
+    fault_conn.close()
+
+    # The SAVEPOINT rollback must leave the stale index intact, never a
+    # schema with the index half-dropped.
+    assert _stored_index_sql(db_path, "idx_samples_recent") == stale_sql
+
+    clean_conn = sqlite3.connect(str(db_path))
+    clean_conn.row_factory = sqlite3.Row
+    create_schema(clean_conn)
+    clean_conn.close()
+    assert _stored_index_sql(db_path, "idx_samples_recent") != stale_sql
+
+
+def test_missing_recent_index_is_created_by_create_schema(tmp_path: Path) -> None:
+    """A database predating the index entirely (no stored definition to diff
+    against) gets it created by the reconciliation helper's first-run CREATE
+    branch, and what lands on disk is the module's own DDL, not a copy that
+    could drift from it.
+    """
+    db_path = tmp_path / "recent-missing.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    conn.execute("DROP INDEX idx_samples_recent")
+    conn.commit()
+
+    create_schema(conn)
+    conn.close()
+
+    stored_sql = _stored_index_sql(db_path, "idx_samples_recent")
+    assert _index_predicate(stored_sql) == _index_predicate(SAMPLES_RECENT_INDEX_DDL)

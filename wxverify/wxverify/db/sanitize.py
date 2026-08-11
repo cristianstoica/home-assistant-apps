@@ -61,10 +61,12 @@ def _sanitize_jobs_next_attempt_at(conn: sqlite3.Connection) -> None:
         try:
             parse_utc(str(row["next_attempt_at"]))
         except Exception:  # see db.queue.claim_next_job's
-            # comment: an enumerated allowlist here has already missed
-            # OverflowError (near-datetime.max/.min with a UTC offset,
-            # `.astimezone` overflows) once; a value shaped like a
-            # timestamp is not guaranteed to parse as one.
+            # comment: the carrier set here is not enumerable -- a value
+            # shaped like a timestamp is not guaranteed to parse as one
+            # (an enumerated allowlist has already missed a carrier once),
+            # and this pass must not abort on one row. Kept broad
+            # deliberately even though parse_utc now raises ValueError for
+            # every str input.
             #
             # NULL is already the claimable state (claim_next_job's WHERE
             # clause), so the row goes straight back through that function's
@@ -119,9 +121,9 @@ def _sanitize_station_poll_next_poll_at(
     for row in rows:
         try:
             parse_utc(str(row["next_poll_at"]))
-        except Exception:  # see the jobs pass above; a
-            # near-datetime.max/.min value with a UTC offset raises
-            # OverflowError, not ValueError, from parse_utc's astimezone.
+        except Exception:  # see the jobs pass above; the
+            # carrier set is not enumerable, so the catch stays broad even
+            # though parse_utc now raises ValueError for every str input.
             #
             # NULL would make the station instantly due on every future scan
             # (the current-obs due query treats NULL as due-now), so this

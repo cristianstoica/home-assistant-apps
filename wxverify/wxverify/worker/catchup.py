@@ -555,10 +555,11 @@ def _due_open_meteo_targets(
         if last_run_at is not None:
             try:
                 last_run_dt = parse_utc(str(last_run_at))
-            except Exception:  # a near-datetime.max/.min
-                # value with a UTC offset raises OverflowError, not
-                # ValueError, from parse_utc's astimezone; a value shaped
-                # like a timestamp is not guaranteed to parse as one.
+            except Exception:  # the carrier set here is
+                # not enumerable -- a value shaped like a timestamp is not
+                # guaranteed to parse as one -- so the catch stays broad
+                # even though parse_utc now raises ValueError for every
+                # str input; this pass must not abort on one row.
                 #
                 # Foreign/corrupt last_run_at: fail closed (skip this feed
                 # for this tick) rather than invent a schedule for a metered

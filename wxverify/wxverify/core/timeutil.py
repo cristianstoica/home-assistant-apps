@@ -35,11 +35,25 @@ def isoformat_utc_micro(value: datetime | None = None) -> str:
 
 
 def parse_utc(value: str) -> datetime:
+    """Parse an ISO-8601 stamp (``Z`` accepted) into a UTC-aware datetime.
+
+    Raises ``ValueError`` for any ``str`` that does not denote a representable
+    UTC instant -- including a syntactically valid ISO-8601 stamp whose offset
+    conversion falls outside ``datetime``'s range (``fromisoformat`` accepts
+    e.g. ``'9999-12-31T23:59:59-05:00'``, but ``.astimezone(UTC)`` overflows).
+    Normalizing that carrier here keeps the contract total for every caller's
+    narrow ``except ValueError``.
+    """
     normalized = value.replace("Z", "+00:00")
     dt = datetime.fromisoformat(normalized)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC)
+    try:
+        return dt.astimezone(UTC)
+    except OverflowError as exc:
+        raise ValueError(
+            f"timestamp out of range after UTC conversion: {value!r}"
+        ) from exc
 
 
 def floor_hour(value: datetime) -> datetime:

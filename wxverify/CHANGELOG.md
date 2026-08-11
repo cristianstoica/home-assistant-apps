@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.10.0
+
+### Changed
+
+- `GET /api/health/providers` (and `providers doctor`) now report a 7-day
+  recent window per feed instead of a lifetime total: `sample_count`,
+  `variables`, `model_run_count`, `latest_issued_at`, `valid_from` and
+  `valid_to` are renamed to `recent_sample_count`, `recent_variables`,
+  `recent_model_run_count`, `recent_latest_issued_at`, `recent_valid_from`
+  and `recent_valid_to`, and each feed now also carries a
+  `metrics_window_start` timestamp and a `metrics_schema` marker (currently
+  `2`). `bad_sample_count`, `status`, and every other field, including
+  `/api/health/feeds`' own lifetime `sample_count`, are unchanged. Any
+  integration reading the six renamed fields must switch to the `recent_`
+  names; a consumer that needs a true lifetime per-feed count should read
+  `/api/health/feeds` instead. The first boot after upgrading builds a new
+  database index and is slower than usual — seconds on fast storage,
+  possibly longer on SD or eMMC card storage — and happens only once; an
+  INFO log line reports when the build finishes.
+
+### Fixed
+
+- A timestamp near the limits of the supported date range could raise an
+  unexpected error instead of being reported as unreadable, which could
+  blank the monitor page, interrupt a scheduling pass, or, if it reached
+  the scheduler, stop the add-on outright on every start until the stored
+  value was corrected by hand.
+- A job whose retry counter had reached the maximum storable value could
+  not be marked failed and would be retried forever, restarting the
+  worker each time.
+- The stuck-job monitor now recognizes a wider range of malformed
+  scheduling timestamps, so a job that cannot be scheduled is surfaced
+  instead of going uncounted.
+
 ## 0.9.5
 
 ### Fixed

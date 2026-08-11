@@ -232,11 +232,12 @@ def test_unparseable_last_run_at_skips_only_that_feed(
 def test_overflowing_last_run_at_skips_only_that_feed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A well-formed near-``datetime.max`` stamp carrying a UTC offset is not
-    a ``ValueError`` -- ``datetime.fromisoformat`` accepts it, and it is
-    ``parse_utc``'s own ``.astimezone(UTC)`` that raises ``OverflowError``.
-    The catch here must be broad enough to still fail closed on this shape,
-    not just on ``'not-a-timestamp'``-style garbage.
+    """A well-formed near-``datetime.max`` stamp carrying a non-UTC offset:
+    ``datetime.fromisoformat`` accepts it, and it is the ``.astimezone(UTC)``
+    conversion that overflows -- a carrier ``parse_utc`` now normalizes to
+    ``ValueError``. The broad catch here is retained deliberately anyway:
+    the carrier set is not enumerable, and this reader must fail closed on
+    any unreadable shape, not just ``'not-a-timestamp'``-style garbage.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)

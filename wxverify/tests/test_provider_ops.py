@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
@@ -355,9 +356,9 @@ def test_provider_health_aggregates_meteoblue_member_samples(
         assert payload[0]["source"] == "meteoblue"
         feed = payload[0]["feeds"][0]
         assert feed["feed_id"] == package_id
-        assert feed["sample_count"] == 3
-        assert feed["variables"] == ["precip", "temperature", "wind"]
-        assert feed["model_run_count"] == 1
+        assert feed["recent_sample_count"] == 3
+        assert feed["recent_variables"] == ["precip", "temperature", "wind"]
+        assert feed["recent_model_run_count"] == 1
         assert feed["bad_sample_count"] == 0
         assert feed["status"] == "ok"
 
@@ -426,6 +427,85 @@ def test_doctor_redacts_present_key(
     assert rc == 1
     assert "key: present" in out
     assert "sentinel-value-99999" not in out
+
+
+def test_doctor_json_publishes_recent_scoped_metric_keys(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The doctor's --json payload carries the same per-feed contract as the
+    health route: window-scoped names plus the window/schema markers, and
+    none of the retired lifetime spellings.
+    """
+    conn = _init_tmp_db(tmp_path)
+    db_path = config.db_path
+    _insert_site(conn)
+
+    rc = main(["--db", db_path, "providers", "doctor", "--source", "open-meteo"])
+    capsys.readouterr()
+    rc_json = main(
+        ["--db", db_path, "providers", "doctor", "--source", "open-meteo", "--json"]
+    )
+    out = capsys.readouterr().out
+    # CLI logging is configured onto stdout, so log lines precede the JSON
+    # document; the payload starts at the first brace.
+    payload = json.loads(out[out.index("{") :])
+
+    assert rc_json == rc  # --json must not change exit-code semantics
+    feeds = [feed for group in payload["providers"] for feed in group["feeds"]]
+    assert feeds, "fixture produced no feeds; the contract check is vacuous"
+    new_keys = {
+        "metrics_schema",
+        "metrics_window_start",
+        "recent_sample_count",
+        "recent_variables",
+        "recent_model_run_count",
+        "recent_latest_issued_at",
+        "recent_valid_from",
+        "recent_valid_to",
+    }
+    old_keys = {
+        "sample_count",
+        "variables",
+        "model_run_count",
+        "latest_issued_at",
+        "valid_from",
+        "valid_to",
+    }
+    for feed in feeds:
+        assert new_keys <= set(feed.keys())
+        assert not (set(feed.keys()) & old_keys)
+        assert feed["metrics_schema"] == 2
+
+
+def test_doctor_text_prints_recent_samples_and_keeps_failure_exit_code(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The human-readable doctor line labels the windowed count
+    recent_samples=, and an integrity failure (invalid stored sample) still
+    drives exit code 1 exactly as before the rename.
+    """
+    conn = _init_tmp_db(tmp_path)
+    db_path = config.db_path
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn)
+    conn.execute(
+        """
+        INSERT INTO forecast_samples
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             value, source_raw, model_run_id)
+        VALUES (?, ?, 'temperature', '2026-01-01T00:00:00Z',
+                '2026-01-01T06:00:00Z', 6, 999.0, '{}', 'run-1')
+        """,
+        (site_id, feed_id),
+    )
+
+    rc = main(["--db", db_path, "providers", "doctor", "--source", "open-meteo"])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "recent_samples=" in out
+    assert "samples=" not in out.replace("recent_samples=", "")
+    assert "invalid stored samples" in out
 
 
 def test_worker_dispatch_defers_budget_and_backoff_as_pending_jobs(
