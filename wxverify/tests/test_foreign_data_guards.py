@@ -9,23 +9,29 @@ exception that takes the whole worker loop down with it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, utc_now
-from wxverify.db.connection import close_db, init_db
+from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.queue import (
+    MAX_RETRY_COUNT,
     EnqueueResult,
     claim_next_job,
     enqueue_if_absent_with_cooldown,
+    fail,
 )
+from wxverify.worker.processor import run_worker
 from wxverify.worker.scheduler import scheduler_tick
 
 
@@ -625,3 +631,178 @@ def test_claim_next_job_dispositions_carriers_an_allowlist_would_miss(
         row["last_error"],
         row["updated_at"],
     ), "a second claim call must not touch the already-dispositioned row"
+
+
+# ---------------------------------------------------------------------------
+# fail(): an int64-max retry_count must saturate, not raise at the bind
+# ---------------------------------------------------------------------------
+
+
+def _insert_catchup_job(conn: sqlite3.Connection, *, job_key: str = "k-sat") -> int:
+    """Minimal synthetic job row (no site needed for a catchup job)."""
+    cur = conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status)
+        VALUES ('catchup', NULL, ?, '{}', 'pending')
+        """,
+        (job_key,),
+    )
+    job_id = cur.lastrowid
+    assert job_id is not None, "INSERT must produce a rowid"
+    return int(job_id)
+
+
+def _set_retry_columns(
+    conn: sqlite3.Connection, job_id: int, *, retry_count: int, max_retries: int
+) -> None:
+    conn.execute(
+        "UPDATE jobs SET retry_count = ?, max_retries = ? WHERE id = ?",
+        (retry_count, max_retries, job_id),
+    )
+
+
+def test_max_retry_count_is_exactly_the_sqlite_integer_bound(
+    tmp_path: Path,
+) -> None:
+    """Sanity pin on the constant itself: MAX_RETRY_COUNT binds into an
+    INTEGER column, and one past it does not -- so a constant chosen one
+    power of two wrong fails here even where every behavioural test would
+    still pass."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    conn.execute(
+        "UPDATE jobs SET retry_count = ? WHERE id = ?", (MAX_RETRY_COUNT, job_id)
+    )  # must not raise
+    with pytest.raises(OverflowError):
+        conn.execute(
+            "UPDATE jobs SET retry_count = ? WHERE id = ?",
+            (MAX_RETRY_COUNT + 1, job_id),
+        )
+
+
+def test_fail_saturates_int64_max_retry_count_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A foreign/hand-edited row already at the INTEGER bound must still be
+    dispositioned: fail() saturates the count and goes terminal instead of
+    raising OverflowError at the bind and leaving the row 'running'."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=5)
+
+    disposition = fail(conn, job_id, "e")  # must not raise
+
+    assert disposition is not None
+    assert disposition.terminal is True
+    assert disposition.retry_count == MAX_RETRY_COUNT
+    row = conn.execute(
+        "SELECT status, retry_count FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    assert row["status"] == "failed"
+    assert int(row["retry_count"]) == MAX_RETRY_COUNT
+
+
+def test_saturated_retry_count_is_terminal_even_at_int64_max_max_retries(
+    tmp_path: Path,
+) -> None:
+    """retry_count AND max_retries both at the INTEGER bound: saturation
+    lands exactly on max_retries, so the strict retry_count > max_retries
+    test alone would schedule another attempt forever -- a silent infinite
+    retry ladder instead of a crash loop. Saturation must imply terminal."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(
+        conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=MAX_RETRY_COUNT
+    )
+
+    disposition = fail(conn, job_id, "e")
+
+    assert disposition is not None
+    assert disposition.terminal is True
+    row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    assert row["status"] == "failed"
+
+
+def test_fail_ordinary_retry_arithmetic_is_unchanged(tmp_path: Path) -> None:
+    """The saturation clamp must not disturb normal increments: 0 -> 1
+    retries with a scheduled next attempt, 4 -> 5 at max_retries=5 is the
+    last permitted retry, and 5 -> 6 is terminal."""
+    conn = _init_tmp_db(tmp_path)
+
+    job_a = _insert_catchup_job(conn, job_key="k-a")
+    _set_retry_columns(conn, job_a, retry_count=0, max_retries=5)
+    d_a = fail(conn, job_a, "e")
+    assert d_a is not None
+    assert (d_a.terminal, d_a.retry_count) == (False, 1)
+    assert d_a.next_attempt_at is not None
+    row_a = conn.execute(
+        "SELECT status, next_attempt_at FROM jobs WHERE id = ?", (job_a,)
+    ).fetchone()
+    assert row_a["status"] == "pending"
+    assert row_a["next_attempt_at"] == d_a.next_attempt_at
+
+    job_b = _insert_catchup_job(conn, job_key="k-b")
+    _set_retry_columns(conn, job_b, retry_count=4, max_retries=5)
+    d_b = fail(conn, job_b, "e")
+    assert d_b is not None
+    assert (d_b.terminal, d_b.retry_count) == (False, 5)
+
+    job_c = _insert_catchup_job(conn, job_key="k-c")
+    _set_retry_columns(conn, job_c, retry_count=5, max_retries=5)
+    d_c = fail(conn, job_c, "e")
+    assert d_c is not None
+    assert (d_c.terminal, d_c.retry_count) == (True, 6)
+
+
+def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same row driven through the real dispatcher path that calls
+    fail(): the pass completes, the row ends 'failed', and a second claim
+    does not hand it out again. Catches a fix that swallows the bind error
+    without dispositioning the row, which the helper-level test alone
+    cannot distinguish."""
+    conn = _init_tmp_db(tmp_path)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
+    )
+    monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda _c: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.purge_failed_jobs_older_than", lambda _c, _h: None
+    )
+
+    async def _raising_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
+        raise RuntimeError("synthetic dispatch failure")
+
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _raising_dispatch)
+
+    job_id = _insert_catchup_job(conn)
+    _set_retry_columns(conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=5)
+    conn.commit()
+    db = get_db()
+
+    def _status() -> str:
+        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row is not None, "job row vanished"
+        return str(row["status"])
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))
+        deadline = time.monotonic() + 5.0
+        while _status() != "failed":
+            if time.monotonic() > deadline:
+                task.cancel()
+                raise TimeoutError(
+                    f"job never reached status='failed' (last={_status()!r})"
+                )
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+
+    assert _status() == "failed"
+    assert claim_next_job(conn) is None, (
+        "the dispositioned row must never be re-claimed"
+    )
