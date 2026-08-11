@@ -119,6 +119,24 @@ def _setup_jobs_updated_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     return _ExpectedJobs(must_exist=(("fetch_feed", site_id, job_key),))
 
 
+def _setup_jobs_updated_at_boundary_offset(conn: sqlite3.Connection) -> _ExpectedJobs:
+    """A well-formed near-``datetime.min`` stamp with a non-UTC offset: it
+    parses via ``fromisoformat`` but overflows on UTC conversion, so it only
+    reaches the cooldown wrapper's fail-open path if ``parse_utc`` normalizes
+    the overflow to ``ValueError``."""
+    site_id = _insert_site(conn)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    job_key = f"fetch:{feed_id}"
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES ('fetch_feed', ?, ?, '{}', 'failed', '0001-01-01T00:00:00+05:00')
+        """,
+        (site_id, job_key),
+    )
+    return _ExpectedJobs(must_exist=(("fetch_feed", site_id, job_key),))
+
+
 def _setup_site_feed_state_last_run_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
     """google/blend is default_subscribed=0, so this row would silently vanish
     from the tick (COALESCE falls back to default_subscribed) if `enabled`
@@ -133,6 +151,33 @@ def _setup_site_feed_state_last_run_at_blob(conn: sqlite3.Connection) -> _Expect
         (site_id, feed_id),
     )
     return _ExpectedJobs(must_exist=(("fetch_feed", site_id, f"fetch:{feed_id}"),))
+
+
+def _setup_site_feed_state_last_run_at_boundary_offset(
+    conn: sqlite3.Connection,
+) -> _ExpectedJobs:
+    """A well-formed near-``datetime.max`` stamp with a non-UTC offset in
+    last_run_at: the scheduler's narrow ``except ValueError`` fail-open only
+    holds if ``parse_utc`` normalizes the UTC-conversion overflow to
+    ``ValueError`` -- otherwise the exception escapes ``scheduler_tick``
+    entirely and halts the worker. The default-subscribed control feed
+    (open-meteo/ecmwf_ifs, no site_feed_state row) must still be scheduled."""
+    site_id = _insert_site(conn)
+    control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    bad_feed_id = _feed_id(conn, "google", "blend")
+    conn.execute(
+        """
+        INSERT INTO site_feed_state (site_id, feed_id, enabled, last_run_at)
+        VALUES (?, ?, 1, '9999-12-31T23:59:59-14:00')
+        """,
+        (site_id, bad_feed_id),
+    )
+    return _ExpectedJobs(
+        must_exist=(
+            ("fetch_feed", site_id, f"fetch:{bad_feed_id}"),
+            ("fetch_feed", site_id, f"fetch:{control_feed_id}"),
+        )
+    )
 
 
 def _setup_fetch_interval_minutes_hostile(
@@ -292,6 +337,18 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         logger_name="wxverify.db.queue",
         warning_substring="updated_at",
         setup=_setup_jobs_updated_at_blob,
+    ),
+    _TickCarrierCase(
+        case_id="jobs_updated_at_boundary_offset_via_cooldown_wrapper",
+        logger_name="wxverify.db.queue",
+        warning_substring="updated_at",
+        setup=_setup_jobs_updated_at_boundary_offset,
+    ),
+    _TickCarrierCase(
+        case_id="site_feed_state_last_run_at_boundary_offset",
+        logger_name="wxverify.worker.scheduler",
+        warning_substring="last_run_at",
+        setup=_setup_site_feed_state_last_run_at_boundary_offset,
     ),
     _TickCarrierCase(
         case_id="site_feed_state_last_run_at_blob",
@@ -478,6 +535,38 @@ def test_enqueue_if_absent_with_cooldown_direct_call_fails_open_on_blob_updated_
     assert isinstance(result, EnqueueResult)
     assert result.created is True
     assert result.job_id is not None
+
+
+def test_enqueue_cooldown_fails_open_on_boundary_offset_updated_at(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A well-formed near-``datetime.min`` stamp with a non-UTC offset in the
+    latest failed job's updated_at overflows on UTC conversion inside
+    parse_utc; the wrapper's narrow ``except ValueError`` must still take the
+    existing fail-open path (enqueue + the unreadable-updated_at warning)
+    rather than let the exception escape into the caller."""
+    conn = _init_tmp_db(tmp_path)
+    site_id = _insert_site(conn)
+    job_type, job_key = "fetch_feed", "fetch:1"
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
+        VALUES (?, ?, ?, '{}', 'failed', '0001-01-01T00:00:00+05:00')
+        """,
+        (job_type, site_id, job_key),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.db.queue"):
+        result = enqueue_if_absent_with_cooldown(
+            conn, job_type, site_id, job_key, {}, cooldown=timedelta(hours=1)
+        )
+
+    assert isinstance(result, EnqueueResult)
+    assert result.created is True
+    assert result.job_id is not None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "unreadable updated_at" in warnings[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
