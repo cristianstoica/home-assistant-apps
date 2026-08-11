@@ -375,7 +375,7 @@ def _providers_doctor(args: argparse.Namespace) -> int:
                         "  "
                         f"site={feed['site_id']} feed={feed['feed_id']} "
                         f"model={feed['model']} status={feed['status']} "
-                        f"samples={feed['sample_count']} "
+                        f"recent_samples={feed['recent_sample_count']} "
                         f"bad={feed['bad_sample_count']}"
                     )
         for failure in failures:

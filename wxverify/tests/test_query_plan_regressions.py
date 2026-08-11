@@ -25,6 +25,8 @@ from wxverify.db.queue import ACTIVE_JOB_SQL, LATEST_JOB_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
     model_run_count_sql,
+    recent_model_run_count_sql,
+    recent_sample_rollup_sql,
     sample_rollup_sql,
 )
 from wxverify.scoring.winrate import winrate_sql
@@ -118,22 +120,24 @@ def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
     params = (site_id, *feed_ids)
     sql = sample_rollup_sql(placeholders)
     plan = _plan(conn, sql, params)
-    assert any(
+    # The statement is deliberately unpinned, and two indexes now cover every
+    # column it reads -- the UNIQUE autoindex and idx_samples_recent, whose
+    # leading (site_id, feed_id) prefix seeks identically. Either is an
+    # equally good plan; what must hold is a covering seek binding both keys.
+    covering_seek = (
         "SEARCH forecast_samples USING COVERING INDEX"
-        " sqlite_autoindex_forecast_samples_1 (site_id=? AND feed_id=?)" in line
-        for line in plan
+        " sqlite_autoindex_forecast_samples_1 (site_id=? AND feed_id=?)",
+        "SEARCH forecast_samples USING COVERING INDEX"
+        " idx_samples_recent (site_id=? AND feed_id=?)",
     )
+    assert any(pin in line for pin in covering_seek for line in plan), plan
 
     # Negative control: widen the WHERE so the planner can no longer bind
     # site_id, proving the positive assertion is not trivially true here.
     degraded = sql.replace("WHERE site_id=?", "WHERE (site_id=? OR 1=1)")
     assert degraded != sql, "WHERE site_id=? not found; negative control is vacuous"
     degraded_plan = _plan(conn, degraded, params)
-    assert not any(
-        "SEARCH forecast_samples USING COVERING INDEX"
-        " sqlite_autoindex_forecast_samples_1 (site_id=? AND feed_id=?)" in line
-        for line in degraded_plan
-    )
+    assert not any(pin in line for pin in covering_seek for line in degraded_plan)
 
 
 def test_model_run_count_sql_requires_idx_samples_runs() -> None:
@@ -369,3 +373,101 @@ def test_cooldown_job_lookups_seek_idx_jobs_type_key_site() -> None:
     assert not any("idx_jobs_type_key_site" in line for line in degraded_active_plan)
     degraded_latest_plan = _plan(conn, LATEST_JOB_SQL, params)
     assert any("SCAN jobs" in line for line in degraded_latest_plan)
+
+
+def _seeded_recent_metrics_fixture() -> tuple[
+    sqlite3.Connection, tuple[object, ...], str
+]:
+    """17-key/rows/ANALYZE fixture plus a mid-range window cutoff -- the
+    parameter tuple the windowed statements take: (site_id, feeds..., cutoff).
+    """
+    conn = _fresh_conn()
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanRecent', 47, 25, 900, 'UTC')"
+        ).lastrowid
+    )
+    feed_ids = _seed_meteoblue_package_with_16_members(
+        conn, site_id=site_id, rows_per_feed=200
+    )
+    placeholders = ", ".join("?" for _ in feed_ids)
+    params = (site_id, *feed_ids, "2020-01-05T00:00:00Z")
+    return conn, params, placeholders
+
+
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pins are a contract with the shipping SQLite build;"
+    " enforced by the wxverify-shipping-sqlite-plan CI job",
+)
+def test_recent_metric_statements_seek_idx_samples_recent_with_issued_at() -> None:
+    conn, params, placeholders = _seeded_recent_metrics_fixture()
+    pinned = (
+        "SEARCH forecast_samples USING COVERING INDEX idx_samples_recent"
+        " (site_id=? AND feed_id=? AND issued_at>?)"
+    )
+    for sql in (
+        recent_sample_rollup_sql(placeholders),
+        recent_model_run_count_sql(placeholders),
+    ):
+        plan = _plan(conn, sql, params)
+        assert any(pinned in line for line in plan), plan
+
+        # Negative control: widen the WHERE so site_id can no longer bind,
+        # proving the positive pin is not trivially true on this fixture.
+        degraded = sql.replace("WHERE site_id=?", "WHERE (site_id=? OR 1=1)")
+        assert degraded != sql, "WHERE site_id=? not found; control is vacuous"
+        degraded_plan = _plan(conn, degraded, params)
+        assert not any(pinned in line for line in degraded_plan), degraded_plan
+
+
+def test_recent_metric_statements_never_bare_scan_forecast_samples() -> None:
+    """Build-independent floor under the guarded exact pins above: whatever
+    the optimizer's wording, neither windowed statement may fall back to a
+    full scan of forecast_samples, and each needs at most the one TEMP
+    B-TREE its DISTINCT aggregate always requires.
+    """
+    conn, params, placeholders = _seeded_recent_metrics_fixture()
+    for sql in (
+        recent_sample_rollup_sql(placeholders),
+        recent_model_run_count_sql(placeholders),
+    ):
+        plan = _plan(conn, sql, params)
+        assert not any(
+            "SCAN forecast_samples" in line and "USING COVERING INDEX" not in line
+            for line in plan
+        ), plan
+        assert sum("TEMP B-TREE" in line for line in plan) <= 1, plan
+
+
+def test_recent_metric_statements_require_idx_samples_recent() -> None:
+    """Both windowed statements carry INDEXED BY idx_samples_recent, so with
+    the index gone they must refuse to prepare at all rather than silently
+    re-plan onto a worse access path.
+    """
+    conn, params, placeholders = _seeded_recent_metrics_fixture()
+    conn.execute("DROP INDEX idx_samples_recent")
+    for sql in (
+        recent_sample_rollup_sql(placeholders),
+        recent_model_run_count_sql(placeholders),
+    ):
+        with pytest.raises(sqlite3.OperationalError, match="no such index"):
+            conn.execute(sql, params).fetchone()
+
+
+def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
+    conn = _fresh_conn()
+    columns = [
+        (row["name"], row["desc"])
+        for row in conn.execute("PRAGMA index_xinfo(idx_samples_recent)")
+        if row["key"]
+    ]
+    assert columns == [
+        ("site_id", 0),
+        ("feed_id", 0),
+        ("issued_at", 0),
+        ("valid_at", 0),
+        ("variable", 0),
+        ("model_run_id", 0),
+    ]
