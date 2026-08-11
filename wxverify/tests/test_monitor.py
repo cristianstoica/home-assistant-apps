@@ -15,6 +15,7 @@ from wxverify.core.options import (
     _env_bool,
     load_runtime_options,
 )
+from wxverify.core.timeutil import parse_utc
 from wxverify.db.connection import close_db, get_db
 from wxverify.monitor import Condition, _grace_active
 
@@ -972,6 +973,260 @@ def test_problem_jobs_pending_non_iso_next_attempt_at_counts_as_stuck(
         body = client.get("/api/health/monitor").json()
         assert _cond(body, "problem_jobs")["ok"] is False
         assert _cond(body, "problem_jobs")["count"] >= 1
+
+
+def test_problem_jobs_year_prefixed_garbage_next_attempt_at_is_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # '9999-not-a-timestamp' starts with four digits and a dash, so a shape
+    # check anchored on the year prefix alone accepts it -- while the value
+    # still sorts after every real cutoff. next_attempt_at is non-NULL, so
+    # the COALESCE arm never reads updated_at, and the future stamp cannot
+    # trip the overdue arm -- only the shape check can produce the count.
+    # Such a row escapes both arms and wedges invisibly; the
+    # full canonical-prefix check must surface it.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-year-prefix-garbage.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            _seed_job(
+                conn,
+                site_id=site_id,
+                status="pending",
+                updated_at="2035-01-01T00:00:00Z",
+                next_attempt_at="9999-not-a-timestamp",
+                job_key="fetch:year-prefix-garbage",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] == 1
+
+
+@pytest.mark.parametrize(
+    "next_attempt_at",
+    [
+        "2099-01-01T00:00:00Z",
+        "2099-01-01T00:00:00.123456Z",
+        "2099-01-01T00:00:00+00:00",
+    ],
+    ids=["whole_second_z", "fractional_second_z", "utc_offset_spelling"],
+)
+def test_problem_jobs_canonical_future_next_attempt_at_is_not_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, next_attempt_at: str
+) -> None:
+    # Every stamp shape a live write path (or a legitimate foreign import)
+    # produces -- whole-second, fractional-second, and the +00:00 offset
+    # spelling -- must pass the shape check: a freshly deferred pending job
+    # is healthy, not a problem. The fractional case is the sharp edge --
+    # a pattern without the trailing wildcard would flag every stamp the
+    # microsecond formatter writes.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-canonical-shape.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            _seed_job(
+                conn,
+                site_id=site_id,
+                status="pending",
+                updated_at="2035-01-01T00:00:00Z",
+                next_attempt_at=next_attempt_at,
+                job_key="fetch:canonical-shape",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is True
+
+
+def test_problem_jobs_blob_next_attempt_at_still_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The typeof() disjunct must survive any rewrite of the shape check:
+    # GLOB on a BLOB does not behave like the type test, so replacing the
+    # typeof half with the GLOB alone would let a BLOB carrier through.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-blob-attempt.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            conn.execute(
+                """
+                INSERT INTO jobs (type, site_id, job_key, payload, status,
+                                  next_attempt_at, updated_at)
+                VALUES ('fetch_feed', ?, 'fetch:blob-attempt', '{}', 'pending',
+                        x'0001', '2035-01-01T00:00:00Z')
+                """,
+                (site_id,),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] == 1
+
+
+def test_problem_jobs_blob_shaped_like_a_canonical_stamp_still_counted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The typeof() disjunct earns its keep only against a BLOB whose bytes
+    # happen to spell a canonical timestamp: GLOB compares raw bytes, so a
+    # BLOB carrying the ASCII bytes of '2099-01-01T00:00:00Z' matches the
+    # shape pattern (NOT GLOB is false) even though it is not TEXT -- an
+    # arbitrary short BLOB (e.g. x'0001') never exercises this, since it
+    # fails the GLOB regardless of typeof. Only typeof(...) != 'text' can
+    # still flag this row if the GLOB half is dropped.
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-blob-canonical-shape.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            conn.execute(
+                """
+                INSERT INTO jobs (type, site_id, job_key, payload, status,
+                                  next_attempt_at, updated_at)
+                VALUES ('fetch_feed', ?, 'fetch:blob-canonical-shape', '{}',
+                        'pending', ?, '2035-01-01T00:00:00Z')
+                """,
+                (site_id, b"2099-01-01T00:00:00Z"),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] == 1
+
+
+def test_problem_jobs_malformed_and_overdue_row_counted_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A single pending row whose next_attempt_at both fails the shape check
+    # AND sorts before the overdue cutoff satisfies both OR-ed disjuncts of
+    # the pending arm. The arms form one row predicate, not a sum, so the
+    # count must be exactly 1 -- a restructuring into a UNION or summed
+    # subcounts would report 2.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-single-count.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # '1999-bogus' fails the shape check and also sorts before the
+            # pending cutoff (fixed_now - 15m), so both disjuncts hold.
+            _seed_job(
+                conn,
+                site_id=site_id,
+                status="pending",
+                updated_at="2026-07-09T11:59:00Z",
+                next_attempt_at="1999-bogus",
+                job_key="fetch:both-disjuncts",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] == 1
+
+
+def test_problem_jobs_flags_parseable_non_canonical_future_stamp_by_design(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Accepted behaviour, pinned on purpose: a space-separated stamp
+    ('2026-08-09 12:00:00+00:00') is parseable -- parse_utc reads it, and
+    the claim comparison still claims it no later than the canonical
+    spelling of the same instant, since a space sorts before 'T' -- but it
+    is NOT a shape the app itself ever writes, so the shape check counts it
+    for the remaining window of the job's own delay. Over-flagging a stamp
+    only a foreign database can carry is the chosen trade against never
+    flagging a genuinely wedged row. Loosening the check to admit every
+    shape parse_utc accepts is a design change and must not slip through as
+    a bug fix."""
+    assert parse_utc("2026-08-09 12:00:00+00:00") == datetime(
+        2026, 8, 9, 12, 0, tzinfo=UTC
+    )
+
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "problem-jobs-non-canonical-parseable.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            site_id = _seed_site(conn)
+            # Well in the future relative to fixed_now, recent updated_at:
+            # neither the COALESCE arm nor staleness can be what counts it.
+            _seed_job(
+                conn,
+                site_id=site_id,
+                status="pending",
+                updated_at="2026-07-09T11:59:00Z",
+                next_attempt_at="2026-08-09 12:00:00+00:00",
+                job_key="fetch:space-separated",
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "problem_jobs")["ok"] is False
+        assert _cond(body, "problem_jobs")["count"] == 1
 
 
 def test_problem_jobs_failed_old_only_trips(

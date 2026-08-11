@@ -187,6 +187,15 @@ def _pipeline_conditions(
     # typeof(NULL) is 'NULL', not 'text', so without that guard this arm
     # would also match every NULL-attempt row unconditionally -- NULL is
     # already handled, on its own recency cutoff, by the COALESCE arm above.
+    # The shape check is deliberately the full canonical prefix (date, 'T',
+    # time) rather than the year alone: a year-prefixed garbage value like
+    # '9999-not-a-timestamp' passes the loose check yet still sorts after
+    # every cutoff, escaping both arms. The trailing wildcard admits both
+    # live stamp shapes (with and without fractional seconds) and the +00:00
+    # offset a foreign database can carry; the accepted cost is that a
+    # parseable-but-non-canonical stamp (e.g. a space in place of the `T` separator,
+    # which the sanitizer leaves in place because it parses) is over-flagged
+    # for the remaining window of the job's own delay.
     failed_cutoff = isoformat_utc(now - timedelta(hours=FAILED_JOB_AGE_HOURS))
     stuck_cutoff = isoformat_utc(now - timedelta(minutes=STUCK_RUNNING_MINUTES))
     pending_cutoff = isoformat_utc(now - timedelta(minutes=PENDING_OVERDUE_MINUTES))
@@ -200,8 +209,8 @@ def _pipeline_conditions(
                AND (COALESCE(next_attempt_at, updated_at) <= ?
                     OR (next_attempt_at IS NOT NULL
                         AND (typeof(next_attempt_at) != 'text'
-                             OR next_attempt_at
-                                NOT GLOB '[0-9][0-9][0-9][0-9]-*'))))
+                             OR next_attempt_at NOT GLOB
+                                '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'))))
         """,
         (failed_cutoff, stuck_cutoff, pending_cutoff),
     )
