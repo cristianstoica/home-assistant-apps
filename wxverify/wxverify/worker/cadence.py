@@ -24,16 +24,17 @@ MAX_FETCH_INTERVAL_MINUTES = 30 * 24 * 60
 def parse_fetch_interval_minutes(value: object, *, context: str) -> int | None:
     """Convert and range-check a ``fetch_interval_minutes`` value.
 
-    Returns ``None`` for anything that does not denote a whole number of
+    Returns ``None`` for anything that does not read as a whole number of
     minutes, is ``<= 0``, or is beyond the 30-day ceiling, logging a warning
     that identifies the caller via ``context``. Any carrier ``float()``
     accepts is read -- an INTEGER, a REAL, or a TEXT/BLOB spelling such as
-    ``'360'``, ``'360.0'`` or ``'1e3'`` -- and is accepted only if it denotes
-    an exact whole number: a stored ``1.9`` or ``43200.9`` is rejected rather
-    than truncated, never silently scheduled at the floored whole-minute
-    value. Callers must treat ``None`` as "this feed cannot be scheduled
-    right now" and fail closed (skip/continue), never invent a fallback
-    cadence.
+    ``'360'``, ``'360.0'`` or ``'1e3'`` -- and is accepted when that
+    ``float()`` reading is integral: a decimal spelling within half an ulp
+    of an integer rounds onto it and is accepted, while a genuinely
+    fractional value like ``1.9`` or ``43200.9`` is rejected rather than
+    truncated, never silently scheduled at the floored whole-minute value.
+    Callers must treat ``None`` as "this feed cannot be scheduled right now"
+    and fail closed (skip/continue), never invent a fallback cadence.
     """
     try:
         as_float = float(value)  # type: ignore[arg-type]

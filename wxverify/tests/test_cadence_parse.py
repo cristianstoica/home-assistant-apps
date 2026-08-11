@@ -1,9 +1,11 @@
 """Direct unit tests for ``worker.cadence.parse_fetch_interval_minutes``.
 
 Every hostile carrier the module's docstring promises to fail closed on,
-plus the lossless-conversion contract: a REAL with a fractional component
-must be rejected (not floored), while an exact-integral REAL is a legitimate
-whole-number representation and must still be accepted.
+plus the integral-``float()``-reading contract: a REAL with a fractional
+component must be rejected (not floored), while an exact-integral REAL is a
+legitimate whole-number representation and must still be accepted. A decimal
+spelling within half an ulp of an integer rounds onto it in the ``float()``
+read and is therefore accepted -- pinned below as documented behaviour.
 
 Synthetic values only -- this is a PUBLIC repo.
 """
@@ -148,3 +150,12 @@ def test_accepts_at_ceiling() -> None:
         parse_fetch_interval_minutes(MAX_FETCH_INTERVAL_MINUTES, context="t")
         == MAX_FETCH_INTERVAL_MINUTES
     )
+
+
+def test_accepts_text_within_half_ulp_of_an_integer() -> None:
+    """Documents the float-rounding boundary as accepted behaviour: the
+    integrality test runs on the ``float()`` reading, so a decimal spelling
+    the binary conversion snaps onto an integer is accepted at that integer.
+    A future silent tightening of this boundary must fail here, visibly."""
+    assert float("360.0000000000000001") == 360.0  # sanity: the snap itself
+    assert parse_fetch_interval_minutes("360.0000000000000001", context="t") == 360
