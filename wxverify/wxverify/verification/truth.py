@@ -241,6 +241,42 @@ def regenerate_marked_truth(
     return len(groups)
 
 
+def regenerate_marked_truth_chunk(
+    conn: sqlite3.Connection, *, site_id: int, limit: int
+) -> int:
+    """Regenerate up to ``limit`` stale (local day, generation) groups.
+
+    Chunked variant of :func:`regenerate_marked_truth` for the nightly
+    verification chain (§14): each chain chunk rebuilds a bounded number of
+    marked day-groups in ONE short write transaction instead of holding the
+    write lock across every marked day at once. Same generation policy as
+    the full pass (published/building only — retired and failed generations
+    are the correction chain's cleanup problem). Returns the number of
+    regenerated groups; a return < ``limit`` means no stale group remains.
+    """
+    groups = conn.execute(
+        """
+        SELECT DISTINCT dt.site_id, dt.local_date, dt.tz_generation_id
+        FROM daily_truth dt
+        JOIN timezone_generations tg ON tg.id = dt.tz_generation_id
+        WHERE dt.stale = 1
+          AND tg.state IN ('published', 'building')
+          AND dt.site_id = ?
+        ORDER BY dt.local_date, dt.tz_generation_id
+        LIMIT ?
+        """,
+        (site_id, limit),
+    ).fetchall()
+    for group in groups:
+        materialize_daily_truth(
+            conn,
+            site_id=site_id,
+            local_date=str(group["local_date"]),
+            tz_generation_id=int(group["tz_generation_id"]),
+        )
+    return len(groups)
+
+
 def load_daily_truth(
     conn: sqlite3.Connection, *, site_id: int, local_date: str
 ) -> list[sqlite3.Row]:

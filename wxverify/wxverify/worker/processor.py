@@ -78,6 +78,10 @@ from wxverify.worker.tz_correction import (
     build_continuation,
     mark_correction_failed,
 )
+from wxverify.worker.verification_run import (
+    mark_verification_failed,
+    run_verification_chunk,
+)
 
 POLL_INTERVAL = 1.0
 FAILED_JOB_RETENTION_HOURS = 168
@@ -276,12 +280,11 @@ def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition
         error,
         min_delay_seconds=fetch_feed_retry_floor_seconds(conn, job),
     )
-    if (
-        disposition is not None
-        and disposition.terminal
-        and job.type == "timezone_correction"
-    ):
-        mark_correction_failed(conn, job)
+    if disposition is not None and disposition.terminal:
+        if job.type == "timezone_correction":
+            mark_correction_failed(conn, job)
+        elif job.type == "verification_run":
+            mark_verification_failed(conn, job)
     return disposition
 
 
@@ -440,6 +443,14 @@ async def dispatch(
         return JobContinuation(
             "record_gap_scan", site_id, f"gapscan:cont:{site_id}", remainder
         )
+    if job.type == "verification_run":
+        site_id = job.site_id
+        if site_id is None:
+            raise JobCancelled()
+        # One chunk per claim, chain state in runtime_state (same shape as
+        # timezone_correction); the bootstrap phase runs its CPU work in a
+        # thread, never inside a write transaction.
+        return await run_verification_chunk(db, writer, site_id, job.payload)
     raise RuntimeError(f"unknown job type {job.type}")
 
 

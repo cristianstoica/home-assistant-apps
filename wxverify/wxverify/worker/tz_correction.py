@@ -433,9 +433,14 @@ def _cleanup_chunk(
     blob: dict[str, object],
     payload: dict[str, object],
 ) -> bool:
-    """Chunked post-flip deletion of the site's retired-generation rows —
+    """Chunked post-flip deletion of the site's dead-generation rows —
     forecast_pairs AND daily_truth (including rows ``mark_daily_truth_stale``
     flagged on retired generations, dissolving the wasted-regen window).
+
+    'failed' generations are swept alongside 'retired' ones: a failed
+    attempt that never restarts would otherwise strand its building rows
+    forever (a restart's ``delete_building_rows`` only runs if the chain
+    starts again), and the truth regenerators already skip both states.
     """
     limit = _chunk_size(payload, "cleanup_chunk_rows", CLEANUP_CHUNK_ROWS)
     deleted = 0
@@ -446,7 +451,7 @@ def _cleanup_chunk(
             WHERE id IN (
                 SELECT t.id FROM {table} t
                 JOIN timezone_generations tg ON tg.id = t.tz_generation_id
-                WHERE t.site_id = ? AND tg.state = 'retired'
+                WHERE t.site_id = ? AND tg.state IN ('retired', 'failed')
                 LIMIT ?
             )
             """,

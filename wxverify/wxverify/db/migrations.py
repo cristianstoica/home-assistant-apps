@@ -328,6 +328,138 @@ def create_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
             ON jobs(type, job_key, site_id, id);
 
+        CREATE TABLE IF NOT EXISTS verification_runs (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            tz_generation_id INTEGER NOT NULL
+                REFERENCES timezone_generations(id),
+            methodology_version INTEGER NOT NULL,
+            app_version TEXT NOT NULL,
+            state TEXT NOT NULL
+                CHECK(state IN ('running','published','failed')),
+            attempt INTEGER NOT NULL,
+            config_snapshot TEXT NOT NULL,
+            period_start TEXT,
+            period_end TEXT,
+            settled_through TEXT,
+            bootstrap_seed INTEGER NOT NULL,
+            bootstrap_resamples INTEGER NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            aggregate_state TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            published_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_verification_runs_site
+            ON verification_runs(site_id, state, id);
+
+        CREATE TABLE IF NOT EXISTS verification_evidence (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL
+                REFERENCES verification_runs(id) ON DELETE CASCADE,
+            snapshot_local_date TEXT NOT NULL,
+            target_local_date TEXT NOT NULL,
+            lead INTEGER NOT NULL CHECK(lead BETWEEN 0 AND 7),
+            variable TEXT NOT NULL
+                CHECK(variable IN ('temperature','wind','precip')),
+            quantity TEXT NOT NULL CHECK(quantity IN
+                ('temperature_high','temperature_low','wind_max',
+                 'precip_total','precip_occurrence')),
+            entity_type TEXT NOT NULL CHECK(entity_type IN
+                ('depth','feed','baseline_persistence',
+                 'baseline_all_feed_mean','baseline_always_dry',
+                 'daily_rank_depth')),
+            entity_key TEXT NOT NULL,
+            predicted REAL,
+            forecast_eligible INTEGER NOT NULL
+                CHECK(forecast_eligible IN (0,1)),
+            forecast_exclusion_reason TEXT,
+            covered_hours INTEGER,
+            realized_contributors INTEGER,
+            truth_value REAL,
+            truth_eligible INTEGER NOT NULL CHECK(truth_eligible IN (0,1)),
+            truth_exclusion_reason TEXT,
+            truth_covered_hours INTEGER,
+            truth_wet_hours INTEGER,
+            truth_dry_hours INTEGER,
+            abs_error REAL,
+            occurrence_outcome TEXT
+                CHECK(occurrence_outcome IS NULL OR occurrence_outcome IN
+                    ('hit','miss','false_alarm','correct_negative')),
+            UNIQUE(run_id, snapshot_local_date, lead, variable, quantity,
+                   entity_type, entity_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_verification_evidence_cell
+            ON verification_evidence(run_id, entity_type, quantity, lead,
+                                     target_local_date);
+
+        CREATE TABLE IF NOT EXISTS verification_day_context (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL
+                REFERENCES verification_runs(id) ON DELETE CASCADE,
+            snapshot_local_date TEXT NOT NULL,
+            snapshot_utc TEXT NOT NULL,
+            knowability_exclusions TEXT NOT NULL,
+            null_availability_samples INTEGER NOT NULL,
+            UNIQUE(run_id, snapshot_local_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_results (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL
+                REFERENCES verification_runs(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            lead INTEGER NOT NULL,
+            quantity TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            headline INTEGER NOT NULL CHECK(headline IN (0,1)),
+            common_days INTEGER NOT NULL,
+            mae REAL,
+            bias REAL,
+            rmse REAL,
+            hits INTEGER,
+            misses INTEGER,
+            false_alarms INTEGER,
+            correct_negatives INTEGER,
+            ets REAL,
+            availability_rate REAL,
+            delta_vs_incumbent REAL,
+            detail TEXT,
+            UNIQUE(run_id, variable, lead, quantity, entity_type, entity_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_verdicts (
+            id INTEGER PRIMARY KEY,
+            run_id INTEGER NOT NULL
+                REFERENCES verification_runs(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN
+                ('recommend','retain_incumbent','mixed_by_lead',
+                 'mixed_by_quantity','insufficient_evidence')),
+            recommended_depth INTEGER,
+            incumbent_depth INTEGER NOT NULL,
+            tested_family TEXT NOT NULL,
+            UNIQUE(run_id, variable)
+        );
+
+        CREATE TABLE IF NOT EXISTS verification_trigger_decisions (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            trigger_date TEXT NOT NULL,
+            decided_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            decision TEXT NOT NULL CHECK(decision IN
+                ('run_started','no_change_skip','suppressed_because_active',
+                 'skipped')),
+            reason TEXT,
+            input_fingerprint TEXT,
+            run_id INTEGER REFERENCES verification_runs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
+            ON verification_trigger_decisions(site_id, trigger_date, id);
+
         CREATE TABLE IF NOT EXISTS station_poll_state (
             station_id INTEGER PRIMARY KEY REFERENCES stations(id) ON DELETE CASCADE,
             cadence_events TEXT NOT NULL DEFAULT '[]',

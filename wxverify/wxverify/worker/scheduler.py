@@ -37,6 +37,79 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_obs(conn)
     _enqueue_due_current_obs(conn)
     _enqueue_due_forecast_records(conn)
+    _enqueue_due_verification_runs(conn)
+
+
+# Site-local wall-clock time at/after which the nightly verification trigger
+# fires (§14). A scheduling default, not §17 methodology — it cannot change
+# any score. Late (02:00) so the day's record and truth writes land first.
+VERIFICATION_TRIGGER_LOCAL_TIME = "02:00"
+
+
+def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
+    """Enqueue the nightly verification chain per site (§14).
+
+    Due when the site's local time has passed the trigger time and no
+    trigger decision exists yet for (site, local today). An active chain
+    suppresses the trigger with a DURABLE ``suppressed_because_active``
+    decision row — that row also gates re-enqueue for the rest of the day.
+    Bad tz config fails closed per site, like the record trigger above.
+    """
+    from wxverify.verification.record import resolve_snapshot_utc
+    from wxverify.verification.runs import (
+        record_trigger_decision,
+        trigger_decision_exists,
+    )
+    from wxverify.worker.verification_run import verification_job_key
+
+    now = utc_now()
+    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
+    for row in rows:
+        site_id = int(row["id"])
+        timezone = str(row["timezone"])
+        try:
+            tz = ZoneInfo(timezone)
+            local_today = now.astimezone(tz).date()
+            trigger_utc = resolve_snapshot_utc(
+                timezone, local_today, VERIFICATION_TRIGGER_LOCAL_TIME
+            )
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "scheduler: unusable verification trigger config site=%s; skipping",
+                site_id,
+            )
+            continue
+        if now < trigger_utc:
+            continue
+        day_iso = local_today.isoformat()
+        if trigger_decision_exists(conn, site_id, day_iso):
+            continue
+        active = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE type = 'verification_run' AND site_id = ? AND job_key = ?
+              AND status IN ('pending', 'running')
+            LIMIT 1
+            """,
+            (site_id, verification_job_key(site_id)),
+        ).fetchone()
+        if active is not None:
+            record_trigger_decision(
+                conn,
+                site_id,
+                trigger_date=day_iso,
+                decision="suppressed_because_active",
+                reason="verification chain already active",
+            )
+            continue
+        enqueue_if_absent_with_cooldown(
+            conn,
+            "verification_run",
+            site_id,
+            verification_job_key(site_id),
+            {"trigger_date": day_iso},
+            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+        )
 
 
 def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:

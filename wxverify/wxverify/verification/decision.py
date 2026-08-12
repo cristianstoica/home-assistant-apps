@@ -1,0 +1,698 @@
+"""Pure §12 gatekeeping: bootstrap CIs, gates, and the per-variable verdict.
+
+No SQLite, no clock — the engine hands this module already-joined
+common-core paired series (candidate vs incumbent and candidate vs each
+baseline, per lead and quantity) and gets back one verdict per variable
+plus a JSON-able evidence record for ``verification_verdicts.tested_family``.
+
+Clustering unit: the TARGET DATE. One moving-block bootstrap resample draws
+a date multiset from the comparison's date universe; every lead and
+quantity re-weights its paired days by those date multiplicities, so
+same-date dependence across leads survives resampling (§12).
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
+from wxverify.verification.methodology import (
+    ADEQUATE_LEAD_MIN_DAYS,
+    BASELINE_GATE_CI_LEVEL,
+    BOOTSTRAP_BLOCK_LENGTH_DAYS,
+    CANDIDATE_CI_LEVEL,
+    LEAD_STABILITY_DENOMINATOR,
+    LEAD_STABILITY_NUMERATOR,
+    MIN_ADEQUATE_LEADS_PER_VARIABLE,
+    NON_INFERIORITY_ETS_MARGIN,
+    NON_INFERIORITY_MAE_MARGIN,
+    OCCURRENCE_MIN_DRY_DAYS,
+    OCCURRENCE_MIN_WET_DAYS,
+    PRACTICAL_FLOOR_ETS,
+    PRACTICAL_FLOOR_RELATIVE_MAE,
+    PRECIP_IMPROVEMENT_CI_LEVEL,
+)
+from wxverify.verification.stats import (
+    Contingency,
+    ets,
+    moving_block_indices,
+    percentile_ci,
+)
+
+#: Decision leads: D1..D7 (§12 — day 0 is display-only diagnostics).
+DECISION_LEADS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7)
+
+#: date -> (candidate abs error, opponent abs error) on one lead's common core.
+ContinuousLead = dict[str, tuple[float, float]]
+#: date -> ((cand_high, opp_high), (cand_low, opp_low)) on the high∩low core.
+TempLead = dict[str, tuple[tuple[float, float], tuple[float, float]]]
+#: date -> (candidate class, opponent class); classes are contingency labels.
+OccurrenceLead = dict[str, tuple[str, str]]
+
+_WET_CLASSES = frozenset({"hit", "miss"})
+
+
+@dataclass(frozen=True)
+class CandidateSeries:
+    """One candidate entity's paired common-core series for one variable.
+
+    ``vs_incumbent*`` drive conditions 1-3 and 5-6; ``vs_baseline*`` drive
+    condition 4 (keys: baseline entity_type). Temperature uses ``temp``;
+    wind and precip-total use ``continuous`` keyed by quantity.
+    """
+
+    key: str
+    continuous: dict[str, dict[int, ContinuousLead]] = field(
+        default_factory=dict[str, dict[int, ContinuousLead]]
+    )
+    temp: dict[int, TempLead] = field(default_factory=dict[int, TempLead])
+    occurrence: dict[int, OccurrenceLead] = field(
+        default_factory=dict[int, OccurrenceLead]
+    )
+    baseline_continuous: dict[str, dict[str, dict[int, ContinuousLead]]] = field(
+        default_factory=dict[str, dict[str, dict[int, ContinuousLead]]]
+    )
+    baseline_occurrence: dict[str, dict[int, OccurrenceLead]] = field(
+        default_factory=dict[str, dict[int, OccurrenceLead]]
+    )
+
+
+@dataclass(frozen=True)
+class VariableInputs:
+    """Everything §12 needs to decide one variable."""
+
+    variable: str
+    incumbent_key: str
+    candidates: tuple[CandidateSeries, ...]
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """One variable's decision plus its JSON-able evidence record."""
+
+    variable: str
+    outcome: str
+    recommended_key: str | None
+    detail: dict[str, object]
+
+
+def _required_lead_agreement(adequate: int) -> int:
+    return math.ceil(adequate * LEAD_STABILITY_NUMERATOR / LEAD_STABILITY_DENOMINATOR)
+
+
+def _weighted_mae(
+    pairs: list[tuple[int, float, float]], counts: Counter[int] | None, side: int
+) -> float | None:
+    """Weighted MAE of one side of a paired series; None on zero weight."""
+    total = 0.0
+    weight = 0
+    for idx, cand, opp in pairs:
+        w = 1 if counts is None else counts.get(idx, 0)
+        if w == 0:
+            continue
+        total += w * (cand if side == 0 else opp)
+        weight += w
+    if weight == 0:
+        return None
+    return total / weight
+
+
+def _rel_improvement(
+    pairs: list[tuple[int, float, float]], counts: Counter[int] | None
+) -> float | None:
+    """(MAE_opp - MAE_cand) / MAE_opp on the weighted common core."""
+    cand = _weighted_mae(pairs, counts, 0)
+    opp = _weighted_mae(pairs, counts, 1)
+    if cand is None or opp is None or opp == 0:
+        return None
+    return (opp - cand) / opp
+
+
+def _temp_headline_improvement(
+    pairs: list[tuple[int, tuple[float, float], tuple[float, float]]],
+    counts: Counter[int] | None,
+) -> float | None:
+    """Relative improvement of mean(high MAE, low MAE) on the h∩l core (§12.5)."""
+    hi = [(idx, h[0], h[1]) for idx, h, _ in pairs]
+    lo = [(idx, low[0], low[1]) for idx, _, low in pairs]
+    cand_h = _weighted_mae(hi, counts, 0)
+    opp_h = _weighted_mae(hi, counts, 1)
+    cand_l = _weighted_mae(lo, counts, 0)
+    opp_l = _weighted_mae(lo, counts, 1)
+    if None in (cand_h, opp_h, cand_l, opp_l):
+        return None
+    assert cand_h is not None and opp_h is not None
+    assert cand_l is not None and opp_l is not None
+    cand = (cand_h + cand_l) / 2.0
+    opp = (opp_h + opp_l) / 2.0
+    if opp == 0:
+        return None
+    return (opp - cand) / opp
+
+
+def _weighted_contingency(
+    pairs: list[tuple[int, str, str]], counts: Counter[int] | None, side: int
+) -> Contingency:
+    hits = misses = fas = cns = 0
+    for idx, cand, opp in pairs:
+        w = 1 if counts is None else counts.get(idx, 0)
+        if w == 0:
+            continue
+        label = cand if side == 0 else opp
+        if label == "hit":
+            hits += w
+        elif label == "miss":
+            misses += w
+        elif label == "false_alarm":
+            fas += w
+        else:
+            cns += w
+    return Contingency(
+        hits=hits, misses=misses, false_alarms=fas, correct_negatives=cns
+    )
+
+
+def _ets_diff(
+    pairs: list[tuple[int, str, str]], counts: Counter[int] | None
+) -> float | None:
+    """ETS(candidate) - ETS(opponent), recomputed from full tables (§12)."""
+    cand = ets(_weighted_contingency(pairs, counts, 0))
+    opp = ets(_weighted_contingency(pairs, counts, 1))
+    if cand is None or opp is None:
+        return None
+    return cand - opp
+
+
+@dataclass(frozen=True)
+class _Endpoint:
+    """One comparison endpoint's indexed per-lead series + effect function."""
+
+    kind: str  # 'continuous' | 'temp' | 'occurrence'
+    leads: dict[int, list[tuple[int, object, object]]]
+    universe: list[str]
+
+    def lead_effect(self, lead: int, counts: Counter[int] | None) -> float | None:
+        pairs = self.leads.get(lead)
+        if not pairs:
+            return None
+        if self.kind == "continuous":
+            typed_c = [(i, float(a), float(b)) for i, a, b in pairs]  # pyright: ignore[reportArgumentType]
+            return _rel_improvement(typed_c, counts)
+        if self.kind == "temp":
+            typed_t: list[tuple[int, tuple[float, float], tuple[float, float]]] = pairs  # pyright: ignore[reportAssignmentType]
+            return _temp_headline_improvement(typed_t, counts)
+        typed_o = [(i, str(a), str(b)) for i, a, b in pairs]
+        return _ets_diff(typed_o, counts)
+
+    def pooled_effect(
+        self, adequate: tuple[int, ...], counts: Counter[int] | None
+    ) -> float | None:
+        effects = [
+            e
+            for e in (self.lead_effect(lead, counts) for lead in adequate)
+            if e is not None
+        ]
+        if not effects:
+            return None
+        return sum(effects) / len(effects)
+
+
+def _index_endpoint(
+    kind: str, series_by_lead: Mapping[int, Mapping[str, tuple[object, object]]]
+) -> _Endpoint:
+    universe = sorted({d for lead in series_by_lead.values() for d in lead})
+    date_idx = {d: i for i, d in enumerate(universe)}
+    leads: dict[int, list[tuple[int, object, object]]] = {}
+    for lead, days in series_by_lead.items():
+        leads[lead] = [
+            (date_idx[d], pair[0], pair[1]) for d, pair in sorted(days.items())
+        ]
+    return _Endpoint(kind=kind, leads=leads, universe=universe)
+
+
+def _adequate_leads(endpoint: _Endpoint, *, occurrence: bool) -> tuple[int, ...]:
+    """§12 adequacy: >= 20 strict-common days; occurrence also needs the
+    minimum wet/dry event counts on the OBSERVED side of the common core."""
+    out: list[int] = []
+    for lead in DECISION_LEADS:
+        pairs = endpoint.leads.get(lead, [])
+        if len(pairs) < ADEQUATE_LEAD_MIN_DAYS:
+            continue
+        if occurrence:
+            wet = sum(1 for _, cand, _ in pairs if str(cand) in _WET_CLASSES)
+            dry = len(pairs) - wet
+            if wet < OCCURRENCE_MIN_WET_DAYS or dry < OCCURRENCE_MIN_DRY_DAYS:
+                continue
+        out.append(lead)
+    return tuple(out)
+
+
+def _bootstrap_ci(
+    endpoint: _Endpoint,
+    adequate: tuple[int, ...],
+    *,
+    level: float,
+    seed: int,
+    resamples: int,
+    block: int = BOOTSTRAP_BLOCK_LENGTH_DAYS,
+) -> tuple[float, float] | None:
+    """Percentile CI of the pooled effect under the date-clustered bootstrap.
+
+    Resamples with an undefined pooled effect (e.g. degenerate ETS tables)
+    are dropped; the CI is undefined when fewer than half the resamples
+    survive — a deliberately conservative fail-closed rule.
+    """
+    n = len(endpoint.universe)
+    if n == 0 or not adequate:
+        return None
+    rng = random.Random(seed)
+    draws: list[float] = []
+    for _ in range(resamples):
+        counts = Counter(moving_block_indices(rng, n, block))
+        effect = endpoint.pooled_effect(adequate, counts)
+        if effect is not None:
+            draws.append(effect)
+    if len(draws) < resamples / 2:
+        return None
+    return percentile_ci(draws, level)
+
+
+@dataclass(frozen=True)
+class _EndpointEvaluation:
+    adequate: tuple[int, ...]
+    point: float | None
+    ci: tuple[float, float] | None
+    per_lead: dict[int, float | None]
+
+    def as_json(self) -> dict[str, object]:
+        return {
+            "adequate_leads": list(self.adequate),
+            "pooled_point": self.point,
+            "ci": None if self.ci is None else list(self.ci),
+            "per_lead": {str(k): v for k, v in self.per_lead.items()},
+        }
+
+
+def _evaluate_endpoint(
+    endpoint: _Endpoint,
+    *,
+    occurrence: bool,
+    level: float,
+    seed: int,
+    resamples: int,
+) -> _EndpointEvaluation:
+    adequate = _adequate_leads(endpoint, occurrence=occurrence)
+    point = endpoint.pooled_effect(adequate, None) if adequate else None
+    ci = _bootstrap_ci(endpoint, adequate, level=level, seed=seed, resamples=resamples)
+    per_lead = {lead: endpoint.lead_effect(lead, None) for lead in adequate}
+    return _EndpointEvaluation(adequate=adequate, point=point, ci=ci, per_lead=per_lead)
+
+
+def _lead_stability(evaluation: _EndpointEvaluation) -> bool:
+    beneficial = sum(1 for e in evaluation.per_lead.values() if e is not None and e > 0)
+    return beneficial >= _required_lead_agreement(len(evaluation.adequate))
+
+
+def _beats(evaluation: _EndpointEvaluation) -> bool:
+    return evaluation.ci is not None and evaluation.ci[0] > 0
+
+
+def _baseline_gate(
+    candidate: CandidateSeries,
+    *,
+    quantity: str | None,
+    occurrence: bool,
+    seed: int,
+    resamples: int,
+) -> tuple[bool, dict[str, object]]:
+    """Condition 4: beat every applicable baseline at 95% on the same core."""
+    detail: dict[str, object] = {}
+    passed = True
+    if occurrence:
+        sources: dict[str, dict[int, OccurrenceLead]] = candidate.baseline_occurrence
+        for baseline, series in sorted(sources.items()):
+            endpoint = _index_endpoint(
+                "occurrence",
+                {
+                    ld: {d: (c, o) for d, (c, o) in days.items()}
+                    for ld, days in series.items()
+                },
+            )
+            evaluation = _evaluate_endpoint(
+                endpoint,
+                occurrence=True,
+                level=BASELINE_GATE_CI_LEVEL,
+                seed=seed,
+                resamples=resamples,
+            )
+            ok = _beats(evaluation)
+            passed = passed and ok
+            detail[baseline] = {"passed": ok, **evaluation.as_json()}
+    else:
+        assert quantity is not None
+        for baseline, per_quantity in sorted(candidate.baseline_continuous.items()):
+            series = per_quantity.get(quantity, {})
+            endpoint = _index_endpoint(
+                "continuous",
+                {
+                    ld: {d: (c, o) for d, (c, o) in days.items()}
+                    for ld, days in series.items()
+                },
+            )
+            evaluation = _evaluate_endpoint(
+                endpoint,
+                occurrence=False,
+                level=BASELINE_GATE_CI_LEVEL,
+                seed=seed,
+                resamples=resamples,
+            )
+            ok = _beats(evaluation)
+            passed = passed and ok
+            detail[baseline] = {"passed": ok, **evaluation.as_json()}
+    if not detail:
+        # No baseline series at all means the gate cannot be demonstrated.
+        passed = False
+    return passed, detail
+
+
+@dataclass(frozen=True)
+class _CandidateResult:
+    key: str
+    passed: bool
+    insufficient: bool
+    mixed_by_lead: bool
+    mixed_by_quantity: bool
+    pooled: float | None
+    ci: tuple[float, float] | None
+    record: dict[str, object]
+
+
+def _decide_wind_or_temp(
+    inputs: VariableInputs, candidate: CandidateSeries, *, seed: int, resamples: int
+) -> _CandidateResult:
+    if inputs.variable == "temperature":
+        endpoint = _index_endpoint(
+            "temp",
+            {
+                ld: {d: (h, low) for d, (h, low) in days.items()}
+                for ld, days in candidate.temp.items()
+            },
+        )
+    else:
+        series = candidate.continuous.get("wind_max", {})
+        endpoint = _index_endpoint(
+            "continuous",
+            {
+                ld: {d: (c, o) for d, (c, o) in days.items()}
+                for ld, days in series.items()
+            },
+        )
+    evaluation = _evaluate_endpoint(
+        endpoint,
+        occurrence=False,
+        level=CANDIDATE_CI_LEVEL,
+        seed=seed,
+        resamples=resamples,
+    )
+    record: dict[str, object] = {"headline": evaluation.as_json()}
+    if len(evaluation.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE:
+        return _CandidateResult(
+            key=candidate.key,
+            passed=False,
+            insufficient=True,
+            mixed_by_lead=False,
+            mixed_by_quantity=False,
+            pooled=evaluation.point,
+            ci=evaluation.ci,
+            record=record,
+        )
+    c1 = _beats(evaluation)
+    c2 = _lead_stability(evaluation)
+    c3 = (
+        evaluation.point is not None
+        and evaluation.point >= PRACTICAL_FLOOR_RELATIVE_MAE
+    )
+    quantity = "temperature_high" if inputs.variable == "temperature" else "wind_max"
+    c4, baseline_detail = _baseline_gate(
+        candidate,
+        quantity=quantity,
+        occurrence=False,
+        seed=seed + 1,
+        resamples=resamples,
+    )
+    c5 = True
+    if inputs.variable == "temperature":
+        components: dict[str, object] = {}
+        for component in ("temperature_high", "temperature_low"):
+            comp_series = candidate.continuous.get(component, {})
+            comp_endpoint = _index_endpoint(
+                "continuous",
+                {
+                    ld: {d: (c, o) for d, (c, o) in days.items()}
+                    for ld, days in comp_series.items()
+                },
+            )
+            comp_point = comp_endpoint.pooled_effect(evaluation.adequate, None)
+            degraded = (
+                comp_point is not None and comp_point < -NON_INFERIORITY_MAE_MARGIN
+            )
+            components[component] = {"pooled_point": comp_point, "degraded": degraded}
+            if degraded:
+                c5 = False
+        record["components"] = components
+    record["conditions"] = {
+        "ci_excludes_zero": c1,
+        "lead_stability": c2,
+        "practical_floor": c3,
+        "beats_baselines": c4,
+        "components_non_inferior": c5,
+    }
+    record["baselines"] = baseline_detail
+    return _CandidateResult(
+        key=candidate.key,
+        passed=c1 and c2 and c3 and c4 and c5,
+        insufficient=False,
+        mixed_by_lead=c1 and c3 and c4 and c5 and not c2,
+        mixed_by_quantity=False,
+        pooled=evaluation.point,
+        ci=evaluation.ci,
+        record=record,
+    )
+
+
+def _decide_precip(
+    candidate: CandidateSeries, *, seed: int, resamples: int
+) -> _CandidateResult:
+    total_series = candidate.continuous.get("precip_total", {})
+    total = _evaluate_endpoint(
+        _index_endpoint(
+            "continuous",
+            {
+                ld: {d: (c, o) for d, (c, o) in days.items()}
+                for ld, days in total_series.items()
+            },
+        ),
+        occurrence=False,
+        level=PRECIP_IMPROVEMENT_CI_LEVEL,
+        seed=seed,
+        resamples=resamples,
+    )
+    occ = _evaluate_endpoint(
+        _index_endpoint(
+            "occurrence",
+            {
+                ld: {d: (c, o) for d, (c, o) in days.items()}
+                for ld, days in candidate.occurrence.items()
+            },
+        ),
+        occurrence=True,
+        level=PRECIP_IMPROVEMENT_CI_LEVEL,
+        seed=seed,
+        resamples=resamples,
+    )
+    record: dict[str, object] = {
+        "total": total.as_json(),
+        "occurrence": occ.as_json(),
+    }
+    if (
+        len(total.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE
+        and len(occ.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE
+    ):
+        return _CandidateResult(
+            key=candidate.key,
+            passed=False,
+            insufficient=True,
+            mixed_by_lead=False,
+            mixed_by_quantity=False,
+            pooled=None,
+            ci=None,
+            record=record,
+        )
+    total_material = (
+        len(total.adequate) >= MIN_ADEQUATE_LEADS_PER_VARIABLE
+        and _beats(total)
+        and total.point is not None
+        and total.point >= PRACTICAL_FLOOR_RELATIVE_MAE
+        and _lead_stability(total)
+    )
+    occ_material = (
+        len(occ.adequate) >= MIN_ADEQUATE_LEADS_PER_VARIABLE
+        and _beats(occ)
+        and occ.point is not None
+        and occ.point >= PRACTICAL_FLOOR_ETS
+        and _lead_stability(occ)
+    )
+    total_non_inferior = (
+        total.point is None or total.point >= -NON_INFERIORITY_MAE_MARGIN
+    )
+    occ_non_inferior = occ.point is None or occ.point >= -NON_INFERIORITY_ETS_MARGIN
+    improved: list[str] = []
+    if total_material and occ_non_inferior:
+        improved.append("total")
+    if occ_material and total_non_inferior:
+        improved.append("occurrence")
+    c4 = True
+    baseline_detail: dict[str, object] = {}
+    if "total" in improved:
+        ok, detail = _baseline_gate(
+            candidate,
+            quantity="precip_total",
+            occurrence=False,
+            seed=seed + 1,
+            resamples=resamples,
+        )
+        c4 = c4 and ok
+        baseline_detail["total"] = detail
+    if "occurrence" in improved:
+        ok, detail = _baseline_gate(
+            candidate,
+            quantity=None,
+            occurrence=True,
+            seed=seed + 2,
+            resamples=resamples,
+        )
+        c4 = c4 and ok
+        baseline_detail["occurrence"] = detail
+    record["conditions"] = {
+        "total_material": total_material,
+        "occurrence_material": occ_material,
+        "total_non_inferior": total_non_inferior,
+        "occurrence_non_inferior": occ_non_inferior,
+        "improved_endpoints": improved,
+        "beats_baselines": c4,
+    }
+    record["baselines"] = baseline_detail
+    mixed_by_quantity = (total_material or occ_material) and not improved
+    mixed_by_lead = (
+        not improved
+        and not mixed_by_quantity
+        and (
+            (_beats(total) and not _lead_stability(total))
+            or (_beats(occ) and not _lead_stability(occ))
+        )
+    )
+    pooled_candidates = [
+        e
+        for e in (
+            total.point if "total" in improved or not improved else None,
+            occ.point if "occurrence" in improved else None,
+        )
+        if e is not None
+    ]
+    pooled = max(pooled_candidates) if pooled_candidates else total.point
+    ci = total.ci if "occurrence" not in improved else occ.ci
+    return _CandidateResult(
+        key=candidate.key,
+        passed=bool(improved) and c4,
+        insufficient=False,
+        mixed_by_lead=mixed_by_lead,
+        mixed_by_quantity=mixed_by_quantity,
+        pooled=pooled,
+        ci=ci,
+        record=record,
+    )
+
+
+def _ci_overlaps(a: tuple[float, float] | None, b: tuple[float, float] | None) -> bool:
+    if a is None or b is None:
+        return False
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def decide_variable(inputs: VariableInputs, *, seed: int, resamples: int) -> Verdict:
+    """Run every §12 gate for one variable and produce its verdict.
+
+    Deterministic: each candidate's bootstrap streams derive from ``seed``
+    plus a stable per-candidate offset, so identical inputs reproduce the
+    verdict bit-for-bit (§18.6).
+    """
+    results: list[_CandidateResult] = []
+    for offset, candidate in enumerate(inputs.candidates):
+        candidate_seed = seed + 1000 * (offset + 1)
+        if inputs.variable == "precip":
+            results.append(
+                _decide_precip(candidate, seed=candidate_seed, resamples=resamples)
+            )
+        else:
+            results.append(
+                _decide_wind_or_temp(
+                    inputs, candidate, seed=candidate_seed, resamples=resamples
+                )
+            )
+    detail: dict[str, object] = {
+        "incumbent": inputs.incumbent_key,
+        "candidates": {r.key: r.record for r in results},
+    }
+    passers = [r for r in results if r.passed and r.pooled is not None]
+    if passers:
+        best = max(passers, key=lambda r: (r.pooled or 0.0, r.key))
+        overlapping = [
+            r for r in passers if r is not best and _ci_overlaps(best.ci, r.ci)
+        ]
+        chosen = best
+        if overlapping:
+            # Material CI overlap: prefer the depth closest to the incumbent;
+            # the others are reported statistically unresolved (§12).
+            def distance(r: _CandidateResult) -> tuple[float, str]:
+                try:
+                    return (
+                        abs(int(r.key) - int(inputs.incumbent_key)),
+                        r.key,
+                    )
+                except ValueError:
+                    return (math.inf, r.key)
+
+            pool = [best, *overlapping]
+            chosen = min(pool, key=distance)
+            detail["statistically_unresolved"] = [
+                r.key for r in pool if r is not chosen
+            ]
+        detail["tie_break"] = {
+            "best_by_pooled": best.key,
+            "chosen": chosen.key,
+        }
+        return Verdict(
+            variable=inputs.variable,
+            outcome="recommend",
+            recommended_key=chosen.key,
+            detail=detail,
+        )
+    if results and all(r.insufficient for r in results):
+        outcome = "insufficient_evidence"
+    elif any(r.mixed_by_quantity for r in results):
+        outcome = "mixed_by_quantity"
+    elif any(r.mixed_by_lead for r in results):
+        outcome = "mixed_by_lead"
+    elif not results:
+        outcome = "insufficient_evidence"
+    else:
+        outcome = "retain_incumbent"
+    return Verdict(
+        variable=inputs.variable,
+        outcome=outcome,
+        recommended_key=None,
+        detail=detail,
+    )
