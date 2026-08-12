@@ -608,7 +608,9 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
                     (type = 'catchup' AND site_id IS NULL)
                     OR (
                         type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                                 'pair_and_score','backfill_site')
+                                 'pair_and_score','backfill_site',
+                                 'forecast_record','record_gap_scan',
+                                 'verification_run','timezone_correction')
                         AND site_id IS NOT NULL
                     )
                 )

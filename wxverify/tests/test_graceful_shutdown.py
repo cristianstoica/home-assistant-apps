@@ -287,6 +287,17 @@ def test_lifespan_shutdown_reclaims_claimed_job(
 
     Catches: the reclaim being correct in isolation but never actually
     reached through the production shutdown path.
+
+    Harness note: unlike every other test in this file, the worker loop is
+    LIVE here (running real `BEGIN IMMEDIATE`/`commit` transactions on the
+    shared writer connection from executor threads) while the test thread
+    also wants to write and poll. `Database._write_lock` is an asyncio lock,
+    so raw access to `db._conn` from the test thread bypasses it entirely —
+    two threads then race pysqlite's not-atomic "txn open? -> COMMIT"
+    sequence and the loser dies with "cannot commit - no transaction is
+    active" (observed as a rare full-suite flake). All test-side SQL
+    therefore uses a DEDICATED side connection to the same file DB; the
+    shared writer connection is never touched from this thread.
     """
     _init_tmp_db(tmp_path)
 
@@ -299,24 +310,27 @@ def test_lifespan_shutdown_reclaims_claimed_job(
 
     stopped: list[None] = []
     app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
-    with TestClient(app) as client:
-        conn = get_db()._conn  # noqa: SLF001 - fresh conn opened by lifespan startup
-        job_id = _insert_job(conn)
-        deadline = time.monotonic() + 2.0
-        while _job_status(conn, job_id) != "running":
-            if time.monotonic() > deadline:
-                raise TimeoutError("job never reached status=running")
-            time.sleep(0.02)
-        del client  # unused past this point; the `with` block drives shutdown
-    # Exiting the `with` block above drove ASGI lifespan shutdown through the
-    # real `finally:` (`worker.cancel()` + `await worker`). `lifespan()` never
-    # closes the DB connection, so `conn` is still valid to inspect here.
-    row = conn.execute(
-        "SELECT status, next_attempt_at FROM jobs WHERE id = ?", (job_id,)
-    ).fetchone()
-    assert row is not None
-    assert row["status"] == "pending"
-    assert stopped == [], "the default hard-kill stop_process must never fire"
+    side = sqlite3.connect(config.db_path, timeout=5.0)
+    side.row_factory = sqlite3.Row
+    try:
+        with TestClient(app) as client:
+            job_id = _insert_job(side)
+            deadline = time.monotonic() + 2.0
+            while _job_status(side, job_id) != "running":
+                if time.monotonic() > deadline:
+                    raise TimeoutError("job never reached status=running")
+                time.sleep(0.02)
+            del client  # unused past this point; the `with` drives shutdown
+        # Exiting the `with` block above drove ASGI lifespan shutdown through
+        # the real `finally:` (`worker.cancel()` + `await worker`).
+        row = side.execute(
+            "SELECT status, next_attempt_at FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "pending"
+        assert stopped == [], "the default hard-kill stop_process must never fire"
+    finally:
+        side.close()
 
 
 def test_cancellation_inside_claim_transaction_reclaims_cleanly_without_a_boot_sweep(

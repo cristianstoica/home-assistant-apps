@@ -12,6 +12,7 @@ from typing import Final
 from pydantic import BaseModel, ConfigDict
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
 from wxverify.verification.truth import mark_daily_truth_stale
 
@@ -316,8 +317,19 @@ def _invalidate_consensus_dependents(
     # persistence pairs where the hour is the pair's SOURCE (issued_at), plus
     # the affected score-cache rows. Part of the load-bearing contract
     # documented on materialize_consensus.
+    #
+    # PUBLISHED generation only (§13): a building correction generation's
+    # rows are owned by the correction chain — deleting them here mid-chain
+    # would corrupt the rebuild; the chain's rescan phase (and the final
+    # in-flip check) re-derives any day whose observations mutated during
+    # the build, so building rows made stale by this mutation are rebuilt,
+    # not leaked. Retired rows are removed by the chain's post-flip cleanup.
     conn.execute(
-        "DELETE FROM forecast_pairs WHERE site_id=? AND variable=? AND valid_at=?",
+        f"""
+        DELETE FROM forecast_pairs
+        WHERE site_id=? AND variable=? AND valid_at=?
+          AND {published_generation_clause("forecast_pairs")}
+        """,
         (site_id, variable, valid_at),
     )
     _delete_future_persistence_pairs(
@@ -346,7 +358,7 @@ def _delete_future_persistence_pairs(
     for lead in range(1, int(feed["max_lead_hours"]) + 1):
         target_valid_at = isoformat_utc(source_valid + timedelta(hours=lead))
         conn.execute(
-            """
+            f"""
             DELETE FROM forecast_pairs
             WHERE site_id=?
               AND feed_id=?
@@ -354,6 +366,7 @@ def _delete_future_persistence_pairs(
               AND issued_at=?
               AND valid_at=?
               AND lead_hours=?
+              AND {published_generation_clause("forecast_pairs")}
             """,
             (site_id, feed_id, variable, source_valid_at, target_valid_at, lead),
         )

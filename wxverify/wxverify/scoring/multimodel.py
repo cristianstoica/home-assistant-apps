@@ -20,15 +20,31 @@ def materialize_multimodel_mean(
     ).fetchone()
     if feed is None:
         return 0
+    # Delete-and-recreate is scoped to the PUBLISHED generation (§13): a
+    # building correction generation's mean rows belong to the correction
+    # chain (scoring.tz_rebuild derives them per rebuilt day) and must not
+    # be deleted out from under it mid-chain; retired rows are removed by
+    # the chain's post-flip cleanup, not here.
     if site_id is not None:
         conn.execute(
-            "DELETE FROM forecast_pairs WHERE site_id=? AND feed_id=?",
+            f"""
+            DELETE FROM forecast_pairs
+            WHERE site_id=? AND feed_id=?
+              AND {published_generation_clause("forecast_pairs")}
+            """,
             (site_id, int(feed["id"])),
         )
         params: tuple[object, ...] = (site_id,)
         site_filter = "AND fp.site_id = ?"
     else:
-        conn.execute("DELETE FROM forecast_pairs WHERE feed_id=?", (int(feed["id"]),))
+        conn.execute(
+            f"""
+            DELETE FROM forecast_pairs
+            WHERE feed_id=?
+              AND {published_generation_clause("forecast_pairs")}
+            """,
+            (int(feed["id"]),),
+        )
         params = ()
         site_filter = ""
     groups = conn.execute(

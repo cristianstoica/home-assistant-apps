@@ -22,12 +22,29 @@ This module is the single shared accessor for that binding:
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
 _POINTER_KEY_PREFIX = "tz_generation_published:"
+
+#: job_key prefix for timezone_correction chain jobs (``tzcorr:<generation>``).
+CORRECTION_JOB_KEY_PREFIX = "tzcorr:"
+
+
+def correction_job_key(generation_id: int) -> str:
+    """``jobs.job_key`` for the correction chain building ``generation_id``."""
+    return f"{CORRECTION_JOB_KEY_PREFIX}{generation_id}"
+
+
+def _validate_timezone(timezone: str) -> None:
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"unknown IANA timezone {timezone!r}") from exc
 
 
 def published_pointer_key(site_id: int) -> str:
@@ -83,3 +100,157 @@ def published_generation_clause(alias: str) -> str:
         "SELECT CAST(rs.value AS INTEGER) FROM runtime_state rs "
         f"WHERE rs.key = '{_POINTER_KEY_PREFIX}' || {alias}.site_id)"
     )
+
+
+def resolve_generation_for_instant(
+    conn: sqlite3.Connection, site_id: int, instant_utc: str
+) -> int | None:
+    """The published-state generation whose effective interval contains
+    ``instant_utc`` (§14: derivation-time timezone resolution).
+
+    A NULL ``effective_from`` is an open lower bound and a NULL
+    ``effective_to`` an open upper bound. The live pairs-read binding stays
+    the pointer (:func:`published_generation_clause`); this resolver is the
+    seam for derivations (records, backtest) that must honor a prospective
+    change's history split. Returns None for an unseeded site.
+    """
+    instant = parse_utc(instant_utc)  # normalizes/validates the probe instant
+    rows = conn.execute(
+        """
+        SELECT id, effective_from, effective_to
+        FROM timezone_generations
+        WHERE site_id = ? AND state = 'published'
+        ORDER BY id
+        """,
+        (site_id,),
+    ).fetchall()
+    for row in rows:
+        lower = row["effective_from"]
+        upper = row["effective_to"]
+        if lower is not None and instant < parse_utc(str(lower)):
+            continue
+        if upper is not None and instant >= parse_utc(str(upper)):
+            continue
+        return int(row["id"])
+    return None
+
+
+def start_retrospective_correction(
+    conn: sqlite3.Connection, site_id: int, timezone: str
+) -> int:
+    """Create a BUILDING retrospective-correction generation and enqueue its
+    chain job (§13). Returns the new generation id.
+
+    The whole history is rebuilt under ``timezone`` alongside the published
+    generation; readers keep serving the published generation until the
+    chain's flip transaction. Refuses while another correction is already
+    building for the site (one build-alongside at a time).
+    """
+    from wxverify.db.queue import enqueue_if_absent
+
+    _validate_timezone(timezone)
+    site = conn.execute("SELECT timezone FROM sites WHERE id=?", (site_id,)).fetchone()
+    if site is None:
+        raise ValueError(f"site {site_id} does not exist")
+    building = conn.execute(
+        """
+        SELECT id FROM timezone_generations
+        WHERE site_id = ? AND state = 'building'
+        LIMIT 1
+        """,
+        (site_id,),
+    ).fetchone()
+    if building is not None:
+        raise ValueError(
+            f"site {site_id} already has a correction building "
+            f"(generation {int(building['id'])})"
+        )
+    ensure_published_generation(conn, site_id)
+    provenance = json.dumps(
+        {
+            "previous_timezone": str(site["timezone"]),
+            "target_timezone": timezone,
+        },
+        separators=(",", ":"),
+    )
+    cur = conn.execute(
+        """
+        INSERT INTO timezone_generations
+            (site_id, timezone, mode, state, provenance)
+        VALUES (?, ?, 'retrospective_correction', 'building', ?)
+        """,
+        (site_id, timezone, provenance),
+    )
+    if cur.lastrowid is None:
+        raise RuntimeError("timezone generation insert failed")
+    generation_id = int(cur.lastrowid)
+    enqueue_if_absent(
+        conn,
+        "timezone_correction",
+        site_id,
+        correction_job_key(generation_id),
+        {"generation_id": generation_id},
+    )
+    return generation_id
+
+
+def apply_prospective_change(
+    conn: sqlite3.Connection, site_id: int, timezone: str, effective_from: str
+) -> int:
+    """Apply a prospective timezone change (§13): close the current published
+    generation at ``effective_from``, publish a new effective-dated
+    generation, flip the pointer, and update ``sites.timezone`` — all in the
+    caller's write transaction. No rebuild: earlier history stays under its
+    former generation (retained rows, resolvable per-instant via
+    :func:`resolve_generation_for_instant`); live pointer-bound reads serve
+    the new generation, which accrues pairs going forward.
+    """
+    _validate_timezone(timezone)
+    effective = isoformat_utc(parse_utc(effective_from))
+    current_id = ensure_published_generation(conn, site_id)
+    current = conn.execute(
+        "SELECT timezone, effective_from FROM timezone_generations WHERE id = ?",
+        (current_id,),
+    ).fetchone()
+    if current is None:
+        raise RuntimeError(f"published generation {current_id} missing")
+    if str(current["timezone"]) == timezone:
+        raise ValueError(f"site {site_id} is already on timezone {timezone!r}")
+    lower = current["effective_from"]
+    if lower is not None and parse_utc(effective) <= parse_utc(str(lower)):
+        raise ValueError(
+            "effective_from must be after the current generation's own effective_from"
+        )
+    now = isoformat_utc()
+    conn.execute(
+        "UPDATE timezone_generations SET effective_to = ? WHERE id = ?",
+        (effective, current_id),
+    )
+    cur = conn.execute(
+        """
+        INSERT INTO timezone_generations
+            (site_id, timezone, mode, state, effective_from, published_at,
+             provenance)
+        VALUES (?, ?, 'prospective_change', 'published', ?, ?, ?)
+        """,
+        (
+            site_id,
+            timezone,
+            effective,
+            now,
+            json.dumps(
+                {
+                    "previous_timezone": str(current["timezone"]),
+                    "target_timezone": timezone,
+                    "effective_from": effective,
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    )
+    if cur.lastrowid is None:
+        raise RuntimeError("timezone generation insert failed")
+    new_id = int(cur.lastrowid)
+    set_runtime_state(conn, published_pointer_key(site_id), str(new_id))
+    conn.execute("UPDATE sites SET timezone = ? WHERE id = ?", (timezone, site_id))
+    return new_id

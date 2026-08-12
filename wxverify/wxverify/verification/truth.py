@@ -78,6 +78,11 @@ def materialize_daily_truth(
     )
     timezone = _generation_timezone(conn, generation_id)
     day = date.fromisoformat(local_date)
+    # Bind the CANONICAL extended-format date, never the caller's raw
+    # string: Python 3.11's date.fromisoformat accepts basic-format input
+    # ("20260610"), which would defeat the UNIQUE(site, quantity,
+    # local_date, generation) dedup and the DELETE below.
+    local_date = day.isoformat()
     bounds = local_day_bounds(day, timezone)
     start = isoformat_utc(bounds.start_utc)
     end = isoformat_utc(bounds.end_utc)
@@ -208,14 +213,21 @@ def regenerate_marked_truth(
     params: tuple[object, ...] = ()
     site_clause = ""
     if site_id is not None:
-        site_clause = "AND site_id = ?"
+        site_clause = "AND dt.site_id = ?"
         params = (site_id,)
+    # Only published/building generations regenerate: a RETIRED (or failed)
+    # generation's stale rows are awaiting the correction chain's chunked
+    # post-flip cleanup — recreating them here would resurrect rows the
+    # cleanup already deleted and waste a full day materialization per row.
     groups = conn.execute(
         f"""
-        SELECT DISTINCT site_id, local_date, tz_generation_id
-        FROM daily_truth
-        WHERE stale = 1 {site_clause}
-        ORDER BY site_id, local_date, tz_generation_id
+        SELECT DISTINCT dt.site_id, dt.local_date, dt.tz_generation_id
+        FROM daily_truth dt
+        JOIN timezone_generations tg ON tg.id = dt.tz_generation_id
+        WHERE dt.stale = 1
+          AND tg.state IN ('published', 'building')
+          {site_clause}
+        ORDER BY dt.site_id, dt.local_date, dt.tz_generation_id
         """,
         params,
     ).fetchall()

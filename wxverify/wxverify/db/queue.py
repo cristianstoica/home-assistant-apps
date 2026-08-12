@@ -216,6 +216,14 @@ def claim_next_job(conn: sqlite3.Connection) -> Job | None:
     way on every claim and drive the process into a restart loop rather than
     a single failed job -- so the disposition happens here, not in the
     dispatcher.
+
+    Ordering is a type-priority tier, then FIFO within the tier (§14):
+    ``forecast_record`` / ``record_gap_scan`` claim ahead of everything,
+    and the resumable chain chunks (``verification_run`` /
+    ``timezone_correction``) claim LAST -- each chunk re-enqueues its own
+    continuation, so under plain FIFO a long chain would monopolize the
+    single worker and starve record derivation; the tier lets other work
+    interleave between chunks by construction.
     """
     now = isoformat_utc()
     row = conn.execute(
@@ -226,7 +234,13 @@ def claim_next_job(conn: sqlite3.Connection) -> Job | None:
             SELECT id FROM jobs
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-            ORDER BY created_at, id
+            ORDER BY
+                CASE
+                    WHEN type IN ('forecast_record','record_gap_scan') THEN 0
+                    WHEN type IN ('verification_run','timezone_correction') THEN 2
+                    ELSE 1
+                END,
+                created_at, id
             LIMIT 1
         )
         RETURNING *

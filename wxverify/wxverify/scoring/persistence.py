@@ -214,7 +214,7 @@ def _materialize_group(
             lead = (epoch - source_epoch) // 3600
             issued_at = isoformat_utc(valid_dt - timedelta(hours=lead))
             source_value, source_computed_at = group.sources[source_epoch]
-            written += _insert_persistence_pair(
+            written += insert_persistence_pair(
                 conn,
                 site_id=site_id,
                 feed_id=feed_id,
@@ -262,7 +262,7 @@ def _materialize_target_fallback(
         bucket = day_ahead(issued_at, valid_at, timezone)
         if bucket < 0 or bucket > _MAX_DAY_AHEAD:
             continue
-        written += _insert_persistence_pair(
+        written += insert_persistence_pair(
             conn,
             site_id=site_id,
             feed_id=feed_id,
@@ -282,7 +282,7 @@ def _materialize_target_fallback(
     return written
 
 
-def _insert_persistence_pair(
+def insert_persistence_pair(
     conn: sqlite3.Connection,
     *,
     site_id: int,
@@ -299,6 +299,10 @@ def _insert_persistence_pair(
     generation_id: int,
 ) -> int:
     """Insert one persistence pair.
+
+    Public: also the insert primitive for the timezone-correction rebuild
+    (``scoring.tz_rebuild``), which re-derives persistence pairs under a
+    building generation.
 
     ``first_known_at`` is the SOURCE observation's ``computed_at`` — the
     lagged observation serving as the persistence forecast defines when this

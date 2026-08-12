@@ -24,6 +24,7 @@ from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.queue import (
+    FailDisposition,
     Job,
     claim_next_job,
     complete,
@@ -71,6 +72,11 @@ from wxverify.worker.feed_fetch import (
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import run_batched_scoring
 from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
+from wxverify.worker.tz_correction import (
+    advance_correction,
+    build_continuation,
+    mark_correction_failed,
+)
 
 POLL_INTERVAL = 1.0
 FAILED_JOB_RETENTION_HOURS = 168
@@ -131,23 +137,21 @@ async def run_worker(db: Database) -> None:
             try:
                 try:
                     continuation = await dispatch(db, writer, job)
-                    await writer.write(lambda conn, jid=job_id: complete(conn, jid))
+                    # Complete + continuation in ONE write transaction: a
+                    # crash between the two would otherwise drop a resumable
+                    # chain (the chunk completes but its continuation is
+                    # never enqueued).
+                    await writer.write(
+                        lambda conn, jid=job_id, cont=continuation: (
+                            _complete_and_continue(conn, jid, cont)
+                        )
+                    )
                     logger.debug(
                         "job completed id=%s type=%s site=%s",
                         job.id,
                         job.type,
                         job.site_id,
                     )
-                    if continuation is not None:
-                        await writer.write(
-                            lambda conn, cont=continuation: enqueue_if_absent(
-                                conn,
-                                cont.job_type,
-                                cont.site_id,
-                                cont.job_key,
-                                cont.payload,
-                            )
-                        )
                 except JobDeferred as exc:
                     outcome = "deferred"
                     next_attempt_at = exc.next_attempt_at
@@ -180,12 +184,7 @@ async def run_worker(db: Database) -> None:
                         raise
                     message = sanitized_exception(exc)
                     disposition = await writer.write(
-                        lambda conn, j=job, err=message: fail(
-                            conn,
-                            j.id,
-                            err,
-                            min_delay_seconds=fetch_feed_retry_floor_seconds(conn, j),
-                        )
+                        lambda conn, j=job, err=message: _fail_job(conn, j, err)
                     )
                     if disposition is not None and disposition.terminal:
                         outcome = "failed"
@@ -243,6 +242,46 @@ async def run_worker(db: Database) -> None:
         except Exception:
             logger.warning("shutdown reclaim failed", exc_info=True)
         raise
+
+
+def _complete_and_continue(
+    conn: sqlite3.Connection, job_id: int, continuation: JobContinuation | None
+) -> None:
+    """Complete the job row and, atomically, enqueue its continuation.
+
+    ``complete`` runs first so the finished row is no longer 'running' when
+    ``enqueue_if_absent`` dedupes -- a chain's continuation must never be
+    swallowed by its own just-finished chunk.
+    """
+    complete(conn, job_id)
+    if continuation is not None:
+        enqueue_if_absent(
+            conn,
+            continuation.job_type,
+            continuation.site_id,
+            continuation.job_key,
+            continuation.payload,
+        )
+
+
+def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition | None:
+    """Record the failure; on a TERMINAL disposition of a chain job, mark
+    the chain's carrier failed in the same transaction (§14: a mid-chain
+    chunk failure fails the run under the existing retry rules).
+    """
+    disposition = fail(
+        conn,
+        job.id,
+        error,
+        min_delay_seconds=fetch_feed_retry_floor_seconds(conn, job),
+    )
+    if (
+        disposition is not None
+        and disposition.terminal
+        and job.type == "timezone_correction"
+    ):
+        mark_correction_failed(conn, job)
+    return disposition
 
 
 async def _maybe_stamp_runtime_heartbeat(
@@ -363,6 +402,17 @@ async def dispatch(
         return await run_backfill_site(db, writer, site_id, job.payload)
     if job.type == "catchup":
         return await run_catchup(db, writer, job.payload)
+    if job.type == "timezone_correction":
+        site_id = job.site_id
+        if site_id is None:
+            raise JobCancelled()
+        # One chunk = one write transaction (chain state persisted inside
+        # it); the continuation re-enqueues the chain, and claim_next_job's
+        # priority tier lets other job types interleave between chunks.
+        more = await writer.write(
+            lambda conn: advance_correction(conn, site_id, job.payload)
+        )
+        return build_continuation(site_id, job.payload) if more else None
     raise RuntimeError(f"unknown job type {job.type}")
 
 
