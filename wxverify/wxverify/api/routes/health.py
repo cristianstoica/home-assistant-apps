@@ -184,6 +184,20 @@ async def health_backfill() -> list[dict[str, object]]:
     return await get_db().read(_read)
 
 
+def _readable_int(value: object) -> int | None:
+    """Diagnostic coercion: an unreadable stored integer renders as null.
+
+    A TEXT, BLOB or REAL-infinity carrier binds into an INTEGER column and raises
+    here. This route exists to SHOW the operator the backoff table, so one bad
+    row must not 500 the whole read -- and reporting 0 would invent a value the
+    database does not contain.
+    """
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 @router.get("/health/backoffs")
 async def health_backoffs() -> list[dict[str, object]]:
     def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -191,7 +205,7 @@ async def health_backoffs() -> list[dict[str, object]]:
             {
                 "domain": str(row["domain"]),
                 "next_attempt_at": str(row["next_attempt_at"]),
-                "retry_count": int(row["retry_count"]),
+                "retry_count": _readable_int(row["retry_count"]),
             }
             for row in conn.execute(
                 """

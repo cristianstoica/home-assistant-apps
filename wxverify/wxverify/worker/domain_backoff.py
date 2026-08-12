@@ -61,7 +61,22 @@ def check_domain_backoff(conn: sqlite3.Connection, domain: str) -> None:
     if row is None:
         return
     next_attempt_at = str(row["next_attempt_at"])
-    if parse_utc(next_attempt_at) > utc_now():
+    try:
+        due = parse_utc(next_attempt_at)
+    except ValueError:
+        # An unreadable stamp can only arrive from an imported, restored or
+        # hand-edited database. Failing OPEN is self-healing: the attempt
+        # proceeds, and either it succeeds and clear_domain_backoff deletes the
+        # row, or it is throttled again and record_http_backoff rewrites a
+        # well-formed one. Failing closed would wedge this domain permanently,
+        # because the fetch that would clear the row never runs.
+        logger.warning(
+            "unreadable domain backoff stamp ignored domain=%s value=%r",
+            domain,
+            next_attempt_at,
+        )
+        return
+    if due > utc_now():
         raise JobDeferred(next_attempt_at)
 
 
@@ -103,7 +118,16 @@ def _retry_count(conn: sqlite3.Connection, domain: str) -> int:
     row = conn.execute(
         "SELECT retry_count FROM domain_backoffs WHERE domain=?", (domain,)
     ).fetchone()
-    return 0 if row is None else int(row["retry_count"])
+    if row is None:
+        return 0
+    try:
+        return int(row["retry_count"])
+    except (TypeError, ValueError, OverflowError):
+        # TEXT, BLOB and REAL-infinity carriers all bind into this INTEGER
+        # column and all three raise here. There is no streak to preserve in an
+        # unreadable value; returning 0 restarts the ladder and the caller's
+        # UPSERT immediately overwrites the row with a well-formed integer.
+        return 0
 
 
 def _next_attempt(response: httpx.Response, retry_count: int) -> str:

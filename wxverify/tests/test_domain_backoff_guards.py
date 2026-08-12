@@ -23,7 +23,12 @@ import pytest
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import create_schema
 from wxverify.worker import domain_backoff
-from wxverify.worker.domain_backoff import _next_attempt, record_http_backoff
+from wxverify.worker.control import JobDeferred
+from wxverify.worker.domain_backoff import (
+    _next_attempt,
+    check_domain_backoff,
+    record_http_backoff,
+)
 
 _NOW = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
 
@@ -216,3 +221,78 @@ def test_shift_cap_derivation_cannot_truncate_the_ladder() -> None:
         domain_backoff._DEFAULT_DELAY_SECONDS * 2**domain_backoff._MAX_BACKOFF_SHIFT
         >= domain_backoff._MAX_DELAY_SECONDS
     )
+
+
+def test_unreadable_stored_stamp_does_not_defer_or_raise(
+    conn: sqlite3.Connection, frozen_now: datetime
+) -> None:
+    """A stored ``next_attempt_at`` that does not parse must not take the
+    domain down: the check treats the row as no backoff (fail open) instead
+    of letting ValueError escape into every caller.  Failing closed would
+    wedge the domain permanently -- the successful fetch that clears the row
+    can never run, because the check itself raises first."""
+    unreadable_domain = "unreadable-stamp.example"
+    conn.execute(
+        "INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)"
+        " VALUES (?, ?, ?)",
+        (unreadable_domain, "not-a-timestamp", 1),
+    )
+    assert check_domain_backoff(conn, unreadable_domain) is None
+
+
+def test_well_formed_stamps_still_defer_and_expire(
+    conn: sqlite3.Connection, frozen_now: datetime
+) -> None:
+    """Negative control for the stamp guard: a real future stamp still
+    defers -- carrying that exact stamp on the exception -- and a real past
+    stamp still lets the attempt proceed.  A guard written broadly enough to
+    swallow the deferral, the one way the fail-open fix could silently
+    disable provider backoff altogether, fails here."""
+    future_domain = "still-backed-off.example"
+    past_domain = "backoff-expired.example"
+    future_stamp = _stamp(3600)
+    past_stamp = isoformat_utc(_NOW - timedelta(seconds=3600))
+    conn.executemany(
+        "INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)"
+        " VALUES (?, ?, ?)",
+        [(future_domain, future_stamp, 1), (past_domain, past_stamp, 1)],
+    )
+    with pytest.raises(JobDeferred) as excinfo:
+        check_domain_backoff(conn, future_domain)
+    assert excinfo.value.next_attempt_at == future_stamp
+    assert check_domain_backoff(conn, past_domain) is None
+
+
+def test_unreadable_stored_count_restarts_ladder_and_self_heals(
+    conn: sqlite3.Connection, frozen_now: datetime
+) -> None:
+    """Every carrier shape that binds into the INTEGER column but does not
+    read back as an int -- TEXT, REAL infinity, BLOB -- restarts the ladder:
+    the next throttle returns the 60 s first-rung stamp and stores
+    ``retry_count == 1`` as a plain int, so the row heals on the very call
+    that found it broken.  There is no streak to preserve in an unreadable
+    value."""
+    carriers: list[tuple[str, object]] = [
+        ("text", "abc"),
+        ("real", float("inf")),
+        ("blob", b"\x00\x01"),
+    ]
+    for expected_typeof, carrier in carriers:
+        carrier_domain = f"{expected_typeof}-count.example"
+        _seed_backoff_row(conn, carrier_domain, carrier)
+        # The seed bind must itself land with the carrier's own storage
+        # class: if a future SQLite rejects or coerces one of these, the
+        # oracle turns red here rather than passing vacuously.
+        typeof = conn.execute(
+            "SELECT typeof(retry_count) FROM domain_backoffs WHERE domain = ?",
+            (carrier_domain,),
+        ).fetchone()[0]
+        assert typeof == expected_typeof, carrier
+        response = _response(429, f"https://{carrier_domain}/v1")
+
+        stamp = record_http_backoff(conn, response)
+
+        assert stamp == _stamp(60), carrier
+        stored = _stored_retry_count(conn, carrier_domain)
+        assert stored == 1, carrier
+        assert type(stored) is int, carrier

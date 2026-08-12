@@ -1964,6 +1964,42 @@ def test_domain_backoffs_expired_does_not_trip(
         assert cond.get("count", 0) == 0
 
 
+def test_domain_backoffs_unreadable_stamp_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pins the active-backoff count against a stored next_attempt_at that does
+    # not parse (only an imported or hand-edited database carries one).  A
+    # lexical SQL comparison (`next_attempt_at > ?`) sorts 'not-a-timestamp'
+    # above every ISO stamp and reports an active backoff that the worker's own
+    # check deliberately ignores — a monitor verdict that disagrees with the
+    # worker on the surface whose job is to explain the system's state.  The
+    # unreadable row must count as nothing: ok=True, count=0.  The paired tests
+    # (test_domain_backoffs_active_trips, test_domain_backoffs_expired_does_not_trip)
+    # pin that real future stamps still trip and real past stamps still do not,
+    # so this cannot pass by counting nothing at all.
+    close_db()
+    config.db_path = str(tmp_path / "domain-backoffs-unreadable.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)
+                VALUES ('unreadable-stamp.example', 'not-a-timestamp', 1)
+                """
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        cond = _cond(body, "domain_backoffs")
+        assert cond["ok"] is True
+        assert cond.get("count", 0) == 0
+
+
 def test_feed_errors_sentinel_does_not_trip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
