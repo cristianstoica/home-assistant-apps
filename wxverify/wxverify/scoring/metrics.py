@@ -9,6 +9,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict
 
 from wxverify.db.tz_generations import published_generation_clause
+from wxverify.verification.asof import knowable_pair_predicate
 
 
 class MetricResult(BaseModel):
@@ -38,6 +39,7 @@ class MetricStrategy(Protocol):
         day_ahead: int,
         window_cutoff: str | None,
         min_n: int,
+        as_of: str | None = None,
     ) -> MetricResult: ...
 
 
@@ -45,6 +47,19 @@ def _window_clause(window_cutoff: str | None) -> tuple[str, tuple[object, ...]]:
     if window_cutoff is None:
         return "", ()
     return "AND valid_at >= ?", (window_cutoff,)
+
+
+def _asof_clause(alias: str, as_of: str | None) -> tuple[str, tuple[object, ...]]:
+    """Knowability clause for the as-of path; empty on the live path.
+
+    With ``as_of=None`` the composed SQL is byte-identical to the production
+    statement — the as-of path is pure parameterization, never a fork
+    (plan §6, §18.6 live-equivalence).
+    """
+    if as_of is None:
+        return "", ()
+    sql, params = knowable_pair_predicate(alias, as_of=as_of)
+    return f"AND {sql}", params
 
 
 class ContinuousStrategy:
@@ -58,8 +73,10 @@ class ContinuousStrategy:
         day_ahead: int,
         window_cutoff: str | None,
         min_n: int,
+        as_of: str | None = None,
     ) -> MetricResult:
         clause, extra = _window_clause(window_cutoff)
+        asof_clause, asof_params = _asof_clause("forecast_pairs", as_of)
         row = conn.execute(
             f"""
             SELECT COUNT(*) AS n, AVG(error) AS bias, AVG(abs_error) AS mae,
@@ -68,8 +85,9 @@ class ContinuousStrategy:
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
               AND {published_generation_clause("forecast_pairs")}
               {clause}
+              {asof_clause}
             """,
-            (site_id, feed_id, variable, day_ahead, *extra),
+            (site_id, feed_id, variable, day_ahead, *extra, *asof_params),
         ).fetchone()
         if row is None:
             return MetricResult(n=0, confident=False)
@@ -78,7 +96,7 @@ class ContinuousStrategy:
             return MetricResult(n=0, confident=False)
         mse = float(row["mse"])
         skill = _paired_skill(
-            conn, site_id, feed_id, variable, day_ahead, window_cutoff
+            conn, site_id, feed_id, variable, day_ahead, window_cutoff, as_of=as_of
         )
         return MetricResult(
             n=n,
@@ -101,8 +119,10 @@ class PrecipStrategy:
         day_ahead: int,
         window_cutoff: str | None,
         min_n: int,
+        as_of: str | None = None,
     ) -> MetricResult:
         clause, extra = _window_clause(window_cutoff)
+        asof_clause, asof_params = _asof_clause("forecast_pairs", as_of)
         row = conn.execute(
             f"""
             SELECT COUNT(*) AS n,
@@ -113,8 +133,9 @@ class PrecipStrategy:
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
               AND {published_generation_clause("forecast_pairs")}
               {clause}
+              {asof_clause}
             """,
-            (site_id, feed_id, variable, day_ahead, *extra),
+            (site_id, feed_id, variable, day_ahead, *extra, *asof_params),
         ).fetchone()
         if row is None:
             return MetricResult(n=0, confident=False)
@@ -161,6 +182,8 @@ def _paired_skill(
     variable: str,
     day_ahead: int,
     window_cutoff: str | None,
+    *,
+    as_of: str | None = None,
 ) -> float | None:
     persistence = conn.execute(
         "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
@@ -168,6 +191,11 @@ def _paired_skill(
     if persistence is None:
         return None
     clause = "" if window_cutoff is None else "AND fp.valid_at >= ?"
+    # Knowability applies to BOTH sides of the paired-skill join — the
+    # candidate (fp) AND the persistence reference (pp) — never fp alone
+    # (plan §6). An unknowable reference drops the whole paired row.
+    asof_fp, asof_fp_params = _asof_clause("fp", as_of)
+    asof_pp, asof_pp_params = _asof_clause("pp", as_of)
     params: tuple[object, ...] = (
         site_id,
         feed_id,
@@ -177,6 +205,7 @@ def _paired_skill(
     )
     if window_cutoff is not None:
         params = (*params, window_cutoff)
+    params = (*params, *asof_fp_params, *asof_pp_params)
     row = conn.execute(
         f"""
         SELECT AVG(fp.sq_error) AS feed_mse,
@@ -194,6 +223,8 @@ def _paired_skill(
           AND {published_generation_clause("fp")}
           AND {published_generation_clause("pp")}
           {clause}
+          {asof_fp}
+          {asof_pp}
         """,
         params,
     ).fetchone()
