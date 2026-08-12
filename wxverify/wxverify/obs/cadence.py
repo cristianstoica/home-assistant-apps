@@ -48,8 +48,10 @@ def parse_obstime(value: str | None) -> datetime | None:
     STRICT parser (py-weather ``cadence.parse_obstime``, lines 38-53): accepts the
     ``Z`` and ``+00:00`` offset forms (3.11+ ``fromisoformat``). A None, naive
     (offset-less), or unparseable value returns ``None`` — the offline / no-event
-    signal. Pure: no clock. Operates only on already-normalized stored cadence
-    events; tolerance of raw payloads lives in the ``pws_adapter`` normalizer, not here.
+    signal. A stamp whose non-UTC offset pushes the conversion past the year-1 or
+    year-9999 boundary also returns ``None``. Pure: no clock. Operates only on
+    already-normalized stored cadence events; tolerance of raw payloads lives in
+    the ``pws_adapter`` normalizer, not here.
     """
     if value is None:
         return None
@@ -59,7 +61,14 @@ def parse_obstime(value: str | None) -> datetime | None:
         return None
     if parsed.tzinfo is None:
         return None
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:
+        # A syntactically valid stamp with a non-UTC offset at the year-1 or
+        # year-9999 boundary overflows on conversion. This parser's contract is
+        # total-with-None, so the carrier joins the other unreadable forms rather
+        # than escaping into the cadence math, which has no handler for it.
+        return None
 
 
 def _gaps(events: tuple[str, ...]) -> list[float]:
