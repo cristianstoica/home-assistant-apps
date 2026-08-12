@@ -146,6 +146,103 @@ def test_parse_obstime_paired_positive_negative() -> None:
     assert parse_obstime(bad) is None, "naive form must be rejected"
 
 
+# A syntactically valid stamp whose non-UTC offset pushes the UTC conversion
+# past datetime.max — the boundary-offset carrier. Synthetic by construction.
+_OBSTIME_HIGH_BOUNDARY = "9999-12-31T23:59:59-05:00"
+# The mirror carrier at the low boundary: the +05:00 offset pushes the UTC
+# conversion below datetime.min.
+_OBSTIME_LOW_BOUNDARY = "0001-01-01T00:00:00+05:00"
+
+
+def test_parse_obstime_high_boundary_offset_returns_none() -> None:
+    """A max-year stamp with a non-UTC offset → None, not an escaping error.
+
+    The -05:00 offset pushes the UTC conversion past datetime.max; the strict
+    parser's contract is total-with-None, so the carrier joins the other
+    unreadable forms instead of raising out of the cadence math.
+    """
+    assert parse_obstime(_OBSTIME_HIGH_BOUNDARY) is None
+
+
+def test_parse_obstime_low_boundary_offset_returns_none() -> None:
+    """A min-year stamp with a non-UTC offset → None, not an escaping error.
+
+    The +05:00 offset pushes the UTC conversion below datetime.min — the low
+    mirror of the high-boundary carrier; the guard must cover both directions.
+    """
+    assert parse_obstime(_OBSTIME_LOW_BOUNDARY) is None
+
+
+def test_parse_obstime_totality_no_input_raises() -> None:
+    """Every unreadable form returns None and NOTHING raises.
+
+    Pins the total-with-None contract as a whole: a design that raised
+    (ValueError or otherwise) on any of these, or a boundary guard covering
+    only one direction, goes red here.
+    """
+    unreadable: tuple[str | None, ...] = (
+        None,
+        "2026-06-23T19:27:26",  # naive (offset-less)
+        "not-a-timestamp",  # garbage
+        _OBSTIME_HIGH_BOUNDARY,
+        _OBSTIME_LOW_BOUNDARY,
+    )
+    for value in unreadable:
+        assert parse_obstime(value) is None, f"expected None for {value!r}"
+
+
+def test_parse_obstime_in_range_offsets_unaffected_by_boundary_guard() -> None:
+    """Valid inputs — including an in-range non-UTC offset — parse to exact instants.
+
+    Negative control for the boundary guard: the one way it could silently
+    break working input is by swallowing a legitimate offset conversion.
+    """
+    assert parse_obstime("2026-06-21T00:00:00Z") == datetime(
+        2026, 6, 21, 0, 0, 0, tzinfo=UTC
+    )
+    assert parse_obstime("2026-06-21T12:30:00+00:00") == datetime(
+        2026, 6, 21, 12, 30, 0, tzinfo=UTC
+    )
+    # In-range non-UTC offset: 12:30 at +05:00 is 07:30 UTC.
+    assert parse_obstime("2026-06-21T12:30:00+05:00") == datetime(
+        2026, 6, 21, 7, 30, 0, tzinfo=UTC
+    )
+
+
+def test_base_interval_skips_boundary_offset_event() -> None:
+    """base_interval over (good, boundary carrier, good+600s) → interval from the pair.
+
+    The carrier is skipped exactly like any other unparseable event, so the
+    window degrades to two parseable events with one 600 s gap:
+    clamp(600 * FACTOR, 60, MAX) = 480. This is the production consumer the
+    guard protects — an escaping error here fails the poll on every attempt.
+    """
+    good_t0 = _OBSTIME_T0
+    good_t1 = (_OBSTIME_EPOCH + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    events = (good_t0, _OBSTIME_HIGH_BOUNDARY, good_t1)
+    assert base_interval(events, min_interval=60) == 480
+
+
+def test_is_stale_skips_boundary_offset_event() -> None:
+    """is_stale over (boundary carrier, good) computes from the parseable event only.
+
+    With learned_interval=60 the threshold is 180 s: now at good+1000 s is
+    stale, now at good+10 s is not — both derived solely from the good event,
+    never from the skipped carrier.
+    """
+    good = "2026-06-21T00:00:00Z"
+    events = (_OBSTIME_HIGH_BOUNDARY, good)
+    good_dt = datetime(2026, 6, 21, 0, 0, 0, tzinfo=UTC)
+    result_old = is_stale(
+        events, now=good_dt + timedelta(seconds=1000), learned_interval=60
+    )
+    assert result_old is True
+    result_fresh = is_stale(
+        events, now=good_dt + timedelta(seconds=10), learned_interval=60
+    )
+    assert result_fresh is False
+
+
 # ---------------------------------------------------------------------------
 # base_interval — ported from cadence_checks.check_cadence_estimator
 # Numbers below are the py-weather oracle values, verified live against the

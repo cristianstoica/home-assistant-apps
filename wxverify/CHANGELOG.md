@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.10.1
+
+### Fixed
+
+- An observation timestamp near the limits of the supported date range,
+  carried in a restored or imported database, could interrupt a station's
+  observation poll instead of being skipped as unreadable, leaving that
+  station's polling schedule stuck.
+- A provider backoff counter carried at an extreme value from a restored
+  or imported database could stall or fail the retry-delay calculation
+  instead of holding at the one-hour maximum.
+- A background job whose attempt counter was carried at an extreme value
+  from a restored or imported database could stop the add-on outright when
+  that job next failed, and start it stopping again after every restart;
+  the counter is now brought back into range and the job simply retries or
+  gives up as usual.
+- A provider backoff record carrying an unreadable retry time or attempt
+  count, again only from a restored or imported database, could block
+  every future request to that provider with no way to recover, could fail
+  the add-station request outright, could make the backoff diagnostic fail
+  for every provider at once, and could be reported on the system health
+  page as an active backoff the add-on was not in fact applying; such a
+  record is now ignored and replaced on the next provider response, the
+  diagnostic lists it with an empty attempt count instead of failing, and
+  the system health count no longer includes it.
+
 ## 0.10.0
 
 ### Changed

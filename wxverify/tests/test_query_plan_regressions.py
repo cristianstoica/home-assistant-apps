@@ -422,15 +422,29 @@ def test_recent_metric_statements_seek_idx_samples_recent_with_issued_at() -> No
         assert not any(pinned in line for line in degraded_plan), degraded_plan
 
 
+def _degrades_forecast_samples_access(plan: list[str]) -> bool:
+    """True when a plan reads forecast_samples by anything other than a seek
+    that binds the index's leading column: a SCAN in any form (including a
+    scan *of* the covering index), or a skip-scan, which SQLite reports as a
+    SEARCH carrying ANY(<column>) rather than as a SCAN.
+    """
+    return any(
+        "SCAN forecast_samples" in line
+        or ("ANY(" in line and "forecast_samples" in line)
+        for line in plan
+    )
+
+
 def test_recent_metric_statements_never_bare_scan_forecast_samples() -> None:
     """Build-independent floor under the guarded exact pins above: whatever
     the optimizer's wording, neither windowed statement's plan may contain a
     SCAN of forecast_samples in any form -- both statements carry INDEXED BY
     idx_samples_recent, so an unindexed scan cannot occur at all, and the
-    only reachable degradation, a scan *of* that index instead of a seek
-    into it, is rejected too. Each windowed statement also needs no more
-    TEMP B-TREE steps than its own lifetime counterpart -- the window must
-    not make the plan costlier, not merely stay under some fixed count.
+    reachable degradations -- a scan *of* that index instead of a seek into
+    it, and a skip-scan that reads it without binding site_id -- are
+    rejected too. Each windowed statement also needs no more TEMP B-TREE
+    steps than its own lifetime counterpart -- the window must not make the
+    plan costlier, not merely stay under some fixed count.
     """
     conn, params, placeholders = _seeded_recent_metrics_fixture()
     lifetime_params = params[:-1]
@@ -440,9 +454,7 @@ def test_recent_metric_statements_never_bare_scan_forecast_samples() -> None:
     )
     for windowed_sql, lifetime_sql in pairs:
         windowed_plan = _plan(conn, windowed_sql, params)
-        assert not any("SCAN forecast_samples" in line for line in windowed_plan), (
-            windowed_plan
-        )
+        assert not _degrades_forecast_samples_access(windowed_plan), windowed_plan
 
         lifetime_plan = _plan(conn, lifetime_sql, lifetime_params)
         windowed_btree_steps = sum("TEMP B-TREE" in line for line in windowed_plan)
@@ -470,6 +482,24 @@ def test_bare_scan_predicate_rejects_a_genuine_scan_of_the_covering_index() -> N
         "SCAN forecast_samples USING COVERING INDEX idx_samples_recent" in line
         for line in plan
     ), plan
+
+
+def test_windowed_floor_rejects_a_skip_scan_of_the_covering_index() -> None:
+    """Negative control for the skip-scan half of the floor predicate. Dropping
+    the site_id binding from either real windowed statement -- the exact edit
+    the floor exists to catch -- makes SQLite skip-scan idx_samples_recent
+    rather than seek into it, and the floor must reject that plan. Observed on
+    CPython 3.13.14 / SQLite 3.53.1 as
+    "SEARCH forecast_samples USING COVERING INDEX idx_samples_recent
+    (ANY(site_id) AND feed_id=? AND issued_at>?)".
+    """
+    conn, params, placeholders = _seeded_recent_metrics_fixture()
+    for builder in (recent_sample_rollup_sql, recent_model_run_count_sql):
+        sql = builder(placeholders)
+        degraded = sql.replace("WHERE site_id=? AND ", "WHERE ")
+        assert degraded != sql, "WHERE site_id=? AND not found; control is vacuous"
+        plan = _plan(conn, degraded, params[1:])
+        assert _degrades_forecast_samples_access(plan), plan
 
 
 def test_recent_metric_statements_require_idx_samples_recent() -> None:

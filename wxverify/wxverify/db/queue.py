@@ -288,7 +288,7 @@ def fail(
     ).fetchone()
     if row is None:
         return None
-    retry_count = min(int(row["retry_count"]) + 1, MAX_RETRY_COUNT)
+    retry_count = min(max(int(row["retry_count"]), 0) + 1, MAX_RETRY_COUNT)
     max_retries = int(row["max_retries"])
     if retry_count > max_retries or retry_count >= MAX_RETRY_COUNT:
         conn.execute(

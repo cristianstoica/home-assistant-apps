@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -306,12 +306,19 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
             credits_tripped += 1
 
     # domain_backoffs: any active backoff (no active-provider filter, by design).
-    now_iso = isoformat_utc(now)
-    backoffs_n = _count(
-        conn,
-        "SELECT COUNT(*) FROM domain_backoffs WHERE next_attempt_at > ?",
-        (now_iso,),
-    )
+    # Counted in Python, not with SQL `next_attempt_at > ?`: that comparison is
+    # lexical, so an unreadable carrier from an imported database ('abc', a BLOB)
+    # sorts above every ISO stamp and would be reported as an active backoff that
+    # check_domain_backoff deliberately ignores. One row per provider domain, so
+    # the row-by-row read is bounded by the provider count.
+    backoffs_n = 0
+    for row in conn.execute("SELECT next_attempt_at FROM domain_backoffs"):
+        try:
+            due = parse_utc(str(row["next_attempt_at"]))
+        except ValueError:
+            continue
+        if due > now:
+            backoffs_n += 1
 
     # feed_errors: active feed with last_error set and != sentinel.
     feed_errors_n = _count(
@@ -551,12 +558,17 @@ def error_verdict(now: datetime, detail: str) -> dict[str, object]:
 
     Returned when ANY unexpected exception escapes ``build_verdict`` or the
     options load — e.g. a malformed ``/data/options.json`` (``json.JSONDecodeError``
-    / ``ValueError``) from ``load_runtime_options``, a ``resolve_secret`` failure
-    inside ``_key_missing_count``, or a non-ISO ``worker_started_at`` (``ValueError``)
-    inside ``_grace_active``. Reports ``overall:critical`` via a dedicated
-    ``unexpected_error`` condition — kept DISTINCT from ``db_readable`` so an
-    internal error is not misreported as a DB-read failure and the narrow inner
-    ``except sqlite3.Error`` need never be widened.
+    / ``ValueError``) from ``load_runtime_options``, or a later re-read of that
+    same file failing inside ``_key_missing_count``'s ``resolve_secret``, which
+    sits outside the narrow ``except sqlite3.Error`` and so is not caught there.
+    Reports ``overall:critical`` via a dedicated ``unexpected_error`` condition —
+    kept DISTINCT from ``db_readable`` so an internal error is not misreported as
+    a DB-read failure and the narrow inner ``except sqlite3.Error`` need never be
+    widened.
+
+    A non-ISO ``worker_started_at`` is NOT one of these: ``_grace_active``
+    catches the ``ValueError`` itself and degrades to grace-inactive, which
+    deliberately keeps every other condition reportable.
     """
     return {
         "overall": "critical",

@@ -4024,6 +4024,48 @@ def test_health_backoffs_contract(
         }
 
 
+def test_health_backoffs_survives_unreadable_stored_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /api/health/backoffs with one well-formed row and one whose stored
+    retry_count is TEXT (bindable into an INTEGER column; only an imported or
+    hand-edited database carries it): 200, BOTH rows in the body, the readable
+    count exact and the unreadable one null.  The two-row assertion rejects the
+    tempting wrong fix of filtering the malformed row out of the response --
+    this route exists to show the operator the broken record, and null (not a
+    fabricated 0) is the honest rendering of a value the database does not
+    contain."""
+    close_db()
+    config.db_path = str(tmp_path / "backoffs-unreadable.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.executemany(
+                """
+                INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    ("api.example.com", "2035-01-01T01:00:00Z", 3),
+                    ("weather.example.com", "2035-01-01T02:00:00Z", "abc"),
+                ],
+            )
+
+        db.write_sync(_seed)
+
+        resp = client.get("/api/health/backoffs")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert len(rows) == 2
+        by_domain = {row["domain"]: row for row in rows}
+        assert by_domain["api.example.com"]["retry_count"] == 3
+        assert by_domain["weather.example.com"]["retry_count"] is None
+
+
 def test_worker_status_pins_api_prefix_empty_queue_and_null_pair_score(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -754,6 +754,38 @@ def test_fail_ordinary_retry_arithmetic_is_unchanged(tmp_path: Path) -> None:
     assert (d_c.terminal, d_c.retry_count) == (True, 6)
 
 
+def test_fail_clamps_below_range_retry_count_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """The mirror of the int64-max saturation at the other bound: a REAL
+    retry_count far below the column's range is readable (int() returns a
+    huge negative integer, so claim_next_job's disposition never fires) but
+    not bindable. fail() must clamp it to the ladder's floor and record
+    retry 1 instead of raising OverflowError at the UPDATE bind and leaving
+    the row 'running'."""
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_catchup_job(conn, job_key="k-below")
+    # Deliberately NOT _set_retry_columns (it exists to seed an in-range
+    # int); the carrier only exists if the bound value survives INTEGER
+    # affinity as a REAL, which the typeof assertion pins.
+    conn.execute("UPDATE jobs SET retry_count = ? WHERE id = ?", (-1e100, job_id))
+    stored = conn.execute(
+        "SELECT typeof(retry_count) AS t FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    assert stored["t"] == "real", (
+        "the seed must land as a REAL or this oracle tests nothing"
+    )
+
+    disposition = fail(conn, job_id, "e")  # must not raise
+
+    assert disposition is not None
+    assert disposition.retry_count == 1
+    row = conn.execute(
+        "SELECT retry_count FROM jobs WHERE id = ?", (job_id,)
+    ).fetchone()
+    assert int(row["retry_count"]) == 1
+
+
 def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -778,6 +810,64 @@ def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
 
     job_id = _insert_catchup_job(conn)
     _set_retry_columns(conn, job_id, retry_count=MAX_RETRY_COUNT, max_retries=5)
+    conn.commit()
+    db = get_db()
+
+    def _status() -> str:
+        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row is not None, "job row vanished"
+        return str(row["status"])
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))
+        deadline = time.monotonic() + 5.0
+        while _status() != "failed":
+            if time.monotonic() > deadline:
+                task.cancel()
+                raise TimeoutError(
+                    f"job never reached status='failed' (last={_status()!r})"
+                )
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(_run())
+
+    assert _status() == "failed"
+    assert claim_next_job(conn) is None, (
+        "the dispositioned row must never be re-claimed"
+    )
+
+
+def test_worker_loop_dispositions_below_range_retry_count_without_a_crash_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The below-range REAL carrier driven through the real dispatcher path
+    that calls fail(): with max_retries=0 the clamped count (1) is terminal,
+    so the pass completes, the row ends 'failed', and a second claim does not
+    hand it out again -- instead of the bind error escaping fail() inside the
+    dispatch-failure handler and killing the worker task with the row left
+    'running', where every restart reclaims it and dies again."""
+    conn = _init_tmp_db(tmp_path)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
+    )
+    monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda _c: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.purge_failed_jobs_older_than", lambda _c, _h: None
+    )
+
+    async def _raising_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
+        raise RuntimeError("synthetic dispatch failure")
+
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _raising_dispatch)
+
+    job_id = _insert_catchup_job(conn)
+    conn.execute(
+        "UPDATE jobs SET retry_count = ?, max_retries = 0 WHERE id = ?",
+        (-1e100, job_id),
+    )
     conn.commit()
     db = get_db()
 
