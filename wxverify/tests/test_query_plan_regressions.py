@@ -424,21 +424,52 @@ def test_recent_metric_statements_seek_idx_samples_recent_with_issued_at() -> No
 
 def test_recent_metric_statements_never_bare_scan_forecast_samples() -> None:
     """Build-independent floor under the guarded exact pins above: whatever
-    the optimizer's wording, neither windowed statement may fall back to a
-    full scan of forecast_samples, and each needs at most the one TEMP
-    B-TREE its DISTINCT aggregate always requires.
+    the optimizer's wording, neither windowed statement's plan may contain a
+    SCAN of forecast_samples in any form -- both statements carry INDEXED BY
+    idx_samples_recent, so an unindexed scan cannot occur at all, and the
+    only reachable degradation, a scan *of* that index instead of a seek
+    into it, is rejected too. Each windowed statement also needs no more
+    TEMP B-TREE steps than its own lifetime counterpart -- the window must
+    not make the plan costlier, not merely stay under some fixed count.
     """
     conn, params, placeholders = _seeded_recent_metrics_fixture()
-    for sql in (
-        recent_sample_rollup_sql(placeholders),
-        recent_model_run_count_sql(placeholders),
-    ):
-        plan = _plan(conn, sql, params)
-        assert not any(
-            "SCAN forecast_samples" in line and "USING COVERING INDEX" not in line
-            for line in plan
-        ), plan
-        assert sum("TEMP B-TREE" in line for line in plan) <= 1, plan
+    lifetime_params = params[:-1]
+    pairs = (
+        (recent_sample_rollup_sql(placeholders), sample_rollup_sql(placeholders)),
+        (recent_model_run_count_sql(placeholders), model_run_count_sql(placeholders)),
+    )
+    for windowed_sql, lifetime_sql in pairs:
+        windowed_plan = _plan(conn, windowed_sql, params)
+        assert not any("SCAN forecast_samples" in line for line in windowed_plan), (
+            windowed_plan
+        )
+
+        lifetime_plan = _plan(conn, lifetime_sql, lifetime_params)
+        windowed_btree_steps = sum("TEMP B-TREE" in line for line in windowed_plan)
+        lifetime_btree_steps = sum("TEMP B-TREE" in line for line in lifetime_plan)
+        assert windowed_btree_steps <= lifetime_btree_steps, (
+            windowed_plan,
+            lifetime_plan,
+        )
+
+
+def test_bare_scan_predicate_rejects_a_genuine_scan_of_the_covering_index() -> None:
+    """Negative control for the strict "no SCAN forecast_samples in any
+    form" predicate above: a statement that reads forecast_samples through
+    idx_samples_recent without binding site_id/feed_id genuinely plans as a
+    SCAN of that index rather than a SEARCH, proving the strict predicate is
+    not vacuously true on this fixture -- it would reject this plan.
+    """
+    conn, _params, _placeholders = _seeded_recent_metrics_fixture()
+    unbound_sql = """
+        SELECT COUNT(*) FROM forecast_samples INDEXED BY idx_samples_recent
+        WHERE 1 = 1
+        """
+    plan = _plan(conn, unbound_sql, ())
+    assert any(
+        "SCAN forecast_samples USING COVERING INDEX idx_samples_recent" in line
+        for line in plan
+    ), plan
 
 
 def test_recent_metric_statements_require_idx_samples_recent() -> None:

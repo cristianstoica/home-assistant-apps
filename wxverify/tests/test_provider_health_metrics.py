@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
+from wxverify.core.options import SECRET_ENV
 from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.provider_ops import (
     SampleMetrics,
@@ -478,6 +479,66 @@ def test_health_providers_route_publishes_its_documented_key_set(
     assert saw_a_feed, "no group carried any feed; the contract check is vacuous"
 
 
+def _health_providers_groups(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, db_name: str
+) -> list[dict[str, object]]:
+    close_db()
+    config.db_path = str(tmp_path / db_name)
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        get_db().write_sync(_seed_a_site)
+        response = client.get("/api/health/providers")
+    assert response.status_code == 200
+    groups = response.json()
+    assert isinstance(groups, list)
+    return groups
+
+
+def test_missing_required_key_predicate_matches_the_real_response_shape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Downstream consumers of /api/health/providers flag a source needing
+    attention by reading exactly two group-level fields -- key_required and
+    key_present. The predicate is reimplemented here inline, not imported,
+    so a rename of either field or a demotion of either to per-feed scope
+    breaks this test instead of silently tracking the source.
+    """
+
+    def _missing_required_key(group: dict[str, object] | None) -> bool | None:
+        if group is None:
+            return None
+        return bool(group["key_required"]) and not bool(group["key_present"])
+
+    assert _missing_required_key(None) is None
+
+    for env_name in SECRET_ENV.values():
+        monkeypatch.delenv(env_name, raising=False)
+    unsatisfied_groups = _health_providers_groups(
+        tmp_path, monkeypatch, "health-providers-no-keys.db"
+    )
+    assert unsatisfied_groups, "fixture produced no groups; the check is vacuous"
+    for group in unsatisfied_groups:
+        assert "key_required" in group
+        assert "key_present" in group
+    assert any(_missing_required_key(group) is True for group in unsatisfied_groups), (
+        "no group required a missing key; the positive case is vacuous"
+    )
+
+    for env_name in SECRET_ENV.values():
+        monkeypatch.setenv(env_name, "synthetic-test-key")
+    satisfied_groups = _health_providers_groups(
+        tmp_path, monkeypatch, "health-providers-all-keys.db"
+    )
+    assert satisfied_groups, "fixture produced no groups; the check is vacuous"
+    for group in satisfied_groups:
+        assert "key_required" in group
+        assert "key_present" in group
+        assert _missing_required_key(group) is False
+
+
 def _insert_blob_variable_sample(
     conn: sqlite3.Connection,
     *,
@@ -657,26 +718,30 @@ def test_provider_health_shares_one_window_start_across_all_feeds(
 def test_smoke_check_sees_samples_older_than_the_metrics_window(
     tmp_path: Path,
 ) -> None:
-    """smoke_stored_sample_check stays lifetime-scoped: a sample far older
-    than any plausible recent window still counts as stored data there, even
-    while the windowed metrics for the same feed report an empty window.
+    """smoke_stored_sample_check stays lifetime-scoped: samples far older
+    than any plausible recent window still count as stored, complete data
+    there -- ok is True and there are no reasons at all -- even while the
+    windowed metrics for the same feed report an empty window.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    _insert_sample(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T06:00:00Z",
-        value=5.0,
-    )
+    for variable in ("temperature", "wind", "precip"):
+        _insert_sample(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            variable=variable,
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-01-01T06:00:00Z",
+            value=5.0,
+        )
 
     check = smoke_stored_sample_check(conn, site_id, feed_id)
     assert "no stored samples" not in check.reasons
-    assert check.metrics.sample_count == 1
+    assert check.metrics.sample_count == 3
+    assert check.ok is True
+    assert check.reasons == ()
 
     metrics = recent_sample_metrics(
         conn, site_id, feed_id, window_start="2026-02-01T00:00:00Z"
