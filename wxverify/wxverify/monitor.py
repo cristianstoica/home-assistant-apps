@@ -558,12 +558,17 @@ def error_verdict(now: datetime, detail: str) -> dict[str, object]:
 
     Returned when ANY unexpected exception escapes ``build_verdict`` or the
     options load — e.g. a malformed ``/data/options.json`` (``json.JSONDecodeError``
-    / ``ValueError``) from ``load_runtime_options``, a ``resolve_secret`` failure
-    inside ``_key_missing_count``, or a non-ISO ``worker_started_at`` (``ValueError``)
-    inside ``_grace_active``. Reports ``overall:critical`` via a dedicated
-    ``unexpected_error`` condition — kept DISTINCT from ``db_readable`` so an
-    internal error is not misreported as a DB-read failure and the narrow inner
-    ``except sqlite3.Error`` need never be widened.
+    / ``ValueError``) from ``load_runtime_options``, or a later re-read of that
+    same file failing inside ``_key_missing_count``'s ``resolve_secret``, which
+    sits outside the narrow ``except sqlite3.Error`` and so is not caught there.
+    Reports ``overall:critical`` via a dedicated ``unexpected_error`` condition —
+    kept DISTINCT from ``db_readable`` so an internal error is not misreported as
+    a DB-read failure and the narrow inner ``except sqlite3.Error`` need never be
+    widened.
+
+    A non-ISO ``worker_started_at`` is NOT one of these: ``_grace_active``
+    catches the ``ValueError`` itself and degrades to grace-inactive, which
+    deliberately keeps every other condition reportable.
     """
     return {
         "overall": "critical",
