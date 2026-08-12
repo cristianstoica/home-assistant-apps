@@ -17,6 +17,23 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_DELAY_SECONDS = 60
 _MAX_DELAY_SECONDS = 3600
+# The ladder saturates at _MAX_DELAY_SECONDS once the shift reaches this
+# value, so shifting further can only produce an enormous intermediate that
+# min() immediately discards. Capping the EXPONENT rather than the result
+# keeps every existing delay identical -- verified equal for retry_count
+# 0..10000 -- while bounding the work. DERIVED, not chosen: bit_length() of
+# the ceiling-to-base ratio is always strictly greater than the ratio, so
+# _DEFAULT_DELAY_SECONDS << this shift always exceeds _MAX_DELAY_SECONDS and
+# the ladder can never be truncated by a future change to either constant.
+_MAX_BACKOFF_SHIFT = (_MAX_DELAY_SECONDS // _DEFAULT_DELAY_SECONDS).bit_length()
+# The largest value SQLite's 64-bit signed INTEGER can store. A foreign or
+# hand-edited row can already sit here; incrementing past it raises on the
+# bind. The count saturates instead: it is a backoff ladder position, not an
+# audited total, and the ladder is already at its ceiling well below this.
+# A carrier BELOW the column's range (a negative integer, or a finite
+# out-of-int64 negative REAL that int() accepts) restarts the ladder at 0
+# instead -- coercibility is not the same as bindability.
+_MAX_RETRY_COUNT = 2**63 - 1
 
 SOURCE_DOMAINS: dict[str, str] = {
     "open-meteo": "api.open-meteo.com",
@@ -60,7 +77,7 @@ def record_http_backoff(
     domain = response.url.host or _domain_from_url(str(response.url))
     if domain is None:
         return None
-    retry_count = _retry_count(conn, domain) + 1
+    retry_count = min(max(_retry_count(conn, domain), 0) + 1, _MAX_RETRY_COUNT)
     next_attempt_at = _next_attempt(response, retry_count)
     conn.execute(
         """
@@ -94,10 +111,8 @@ def _next_attempt(response: httpx.Response, retry_count: int) -> str:
     parsed = _parse_retry_after(retry_after)
     if parsed is not None:
         return parsed
-    seconds = min(
-        _MAX_DELAY_SECONDS,
-        _DEFAULT_DELAY_SECONDS * (2 ** max(0, retry_count - 1)),
-    )
+    shift = min(max(0, retry_count - 1), _MAX_BACKOFF_SHIFT)
+    seconds = min(_MAX_DELAY_SECONDS, _DEFAULT_DELAY_SECONDS * (2**shift))
     return isoformat_utc(utc_now() + timedelta(seconds=seconds))
 
 
