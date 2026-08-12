@@ -200,6 +200,37 @@ def create_schema(conn: sqlite3.Connection) -> None:
                               valid_at, issued_at DESC, abs_error,
                               tz_generation_id);
 
+        CREATE TABLE IF NOT EXISTS daily_truth (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            quantity TEXT NOT NULL CHECK(quantity IN
+                ('temperature_high','temperature_low','wind_max',
+                 'precip_total','precip_occurrence')),
+            value REAL,
+            eligible INTEGER NOT NULL CHECK(eligible IN (0,1)),
+            exclusion_reason TEXT,
+            covered_hours INTEGER NOT NULL,
+            expected_slots INTEGER NOT NULL,
+            peak_window_ok INTEGER
+                CHECK(peak_window_ok IS NULL OR peak_window_ok IN (0,1)),
+            wet_hours INTEGER,
+            dry_hours INTEGER,
+            rain_threshold_mm REAL,
+            day_start_utc TEXT NOT NULL,
+            day_end_utc TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            source_max_computed_at TEXT,
+            stale INTEGER NOT NULL DEFAULT 0 CHECK(stale IN (0,1)),
+            generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            tz_generation_id INTEGER NOT NULL
+                REFERENCES timezone_generations(id),
+            UNIQUE(site_id, quantity, local_date, tz_generation_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_daily_truth_stale
+            ON daily_truth(site_id, local_date, tz_generation_id)
+            WHERE stale = 1;
+
         CREATE TABLE IF NOT EXISTS score_cache (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
             feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
+from wxverify.verification.truth import mark_daily_truth_stale
 
 LAPSE: Final[float] = 0.0065
 MAD_TO_SIGMA: Final[float] = 1.4826
@@ -272,6 +273,11 @@ def materialize_consensus(
     _invalidate_consensus_dependents(
         conn, site_id=site_id, variable=variable, valid_at=valid_at
     )
+    # Plan §4: every consensus mutation (rescore, catch-up, backfill — all
+    # of which funnel through here, the sole `observations` writer) marks
+    # the affected local day's daily_truth rows for regeneration. Runs for
+    # BOTH the upsert and the delete branch below.
+    mark_daily_truth_stale(conn, site_id=site_id, variable=variable, valid_at=valid_at)
     if result is None:
         conn.execute(
             "DELETE FROM observations WHERE site_id=? AND variable=? AND valid_at=?",
