@@ -19,7 +19,8 @@ No SQLite anywhere in this module — nothing to isolate.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from wxverify.core.units import kmh_to_ms, ms_to_kmh
 from wxverify.forecast.aggregate import (
@@ -85,24 +86,67 @@ def test_display_day_index_past_local_day_is_negative() -> None:
 
 
 # ---------------------------------------------------------------------------
-# covered_hours — distinct local wall-clock hours.
+# covered_hours — distinct UTC hour instants.
 # ---------------------------------------------------------------------------
 
 
 def test_covered_hours_dedupes_same_clock_hour() -> None:
-    hours = covered_hours(
-        ["2026-07-20T05:00:00Z", "2026-07-20T05:45:00Z"], timezone="UTC"
-    )
+    hours = covered_hours(["2026-07-20T05:00:00Z", "2026-07-20T05:45:00Z"])
     assert hours == 1
 
 
 def test_covered_hours_counts_24_distinct_hours() -> None:
     valid_ats = [f"2026-07-20T{h:02d}:00:00Z" for h in range(24)]
-    assert covered_hours(valid_ats, timezone="UTC") == 24
+    assert covered_hours(valid_ats) == 24
 
 
 def test_covered_hours_empty_is_zero() -> None:
-    assert covered_hours([], timezone="UTC") == 0
+    assert covered_hours([]) == 0
+
+
+def test_covered_hours_counts_both_instants_of_the_autumn_fold() -> None:
+    # Europe/Bucharest 2026 fall-back: 00:00Z and 01:00Z both map to local
+    # 03:xx on 2026-10-25. Counting local wall-clock hours collapses them
+    # (aware datetimes differing only in `fold` compare equal); counting UTC
+    # hour instants keeps both real hours.
+    assert covered_hours(["2026-10-25T00:00:00Z", "2026-10-25T01:00:00Z"]) == 2
+
+
+def _local_day_hourly_utc_instants(day: datetime, tz: ZoneInfo) -> list[str]:
+    """Every whole-hour UTC instant inside `day`'s local calendar day.
+
+    Walked in UTC (never local wall-clock) so the fold cannot collapse two
+    instants into one while building the fixture itself.
+    """
+    start = day.replace(tzinfo=tz).astimezone(UTC)
+    end = (day + timedelta(days=1)).replace(tzinfo=tz).astimezone(UTC)
+    instants: list[str] = []
+    cursor = start
+    while cursor < end:
+        instants.append(cursor.strftime("%Y-%m-%dT%H:%M:%SZ"))
+        cursor += timedelta(hours=1)
+    return instants
+
+
+def test_covered_hours_full_fall_back_local_day_is_25() -> None:
+    # Europe/Bucharest 2026-10-25 is 25 real hours long. A localize-then-
+    # dedupe implementation collapses the repeated 03:xx wall-clock hour
+    # and reports 24.
+    instants = _local_day_hourly_utc_instants(
+        datetime(2026, 10, 25), ZoneInfo("Europe/Bucharest")
+    )
+    assert len(instants) == 25  # fixture guard: the local day really has 25
+    assert covered_hours(instants) == 25
+
+
+def test_covered_hours_spring_forward_local_day_is_23() -> None:
+    # Europe/Bucharest 2026-03-29 is 23 real hours long (03:00 EET jumps to
+    # 04:00 EEST). Anything assuming 24 hours per local day overcounts.
+    instants = _local_day_hourly_utc_instants(
+        datetime(2026, 3, 29), ZoneInfo("Europe/Bucharest")
+    )
+    assert len(instants) == 23  # fixture guard: the skipped hour is absent
+    assert covered_hours(instants) == 23
 
 
 # ---------------------------------------------------------------------------

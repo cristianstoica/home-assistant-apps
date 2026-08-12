@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_clause,
+)
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.pair_flags import precip_flags
 
@@ -39,6 +43,7 @@ def materialize_multimodel_mean(
           ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
         WHERE f.is_virtual = 0
           AND {active_competitor_clause(site_expr="fp.site_id")}
+          AND {published_generation_clause("fp")}
           {site_filter}
         GROUP BY fp.site_id, fp.variable, fp.issued_at, fp.valid_at, fp.lead_hours,
                  fp.day_ahead, fp.observed, s.rain_threshold_mm
@@ -47,6 +52,7 @@ def materialize_multimodel_mean(
         params,
     ).fetchall()
     written = 0
+    generation_ids: dict[int, int] = {}
     for row in groups:
         forecast = float(row["forecast"])
         observed = float(row["observed"])
@@ -57,17 +63,25 @@ def materialize_multimodel_mean(
         hit, false, miss, correct_neg = precip_flags(
             variable, forecast, observed, rain_threshold
         )
+        row_site_id = int(row["site_id"])
+        generation_id = generation_ids.get(row_site_id)
+        if generation_id is None:
+            generation_id = ensure_published_generation(conn, row_site_id)
+            generation_ids[row_site_id] = generation_id
+        # first_known_at is intentionally NULL for the virtual mean: its
+        # availability is not defined by a single source sample, and NULL is
+        # never invented — as-of reads exclude it with a recorded reason.
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
                  cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 rain_threshold_mm, contributors)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 rain_threshold_mm, contributors, tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(row["site_id"]),
+                row_site_id,
                 int(feed["id"]),
                 variable,
                 str(row["issued_at"]),
@@ -85,6 +99,7 @@ def materialize_multimodel_mean(
                 correct_neg,
                 rain_threshold,
                 int(row["contributors"]),
+                generation_id,
             ),
         )
         written += cur.rowcount

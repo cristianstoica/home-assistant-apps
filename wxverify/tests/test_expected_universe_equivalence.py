@@ -25,6 +25,7 @@ import sqlite3
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
 from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.cache import upsert_score_cache
@@ -107,10 +108,20 @@ def _add_pair(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 11.0, 10.0, 1.0, 1.0, 1.0)
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 11.0, 10.0, 1.0, 1.0, 1.0, ?)
         """,
-        (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead),
+        (
+            site_id,
+            feed_id,
+            variable,
+            issued_at,
+            valid_at,
+            lead_hours,
+            day_ahead,
+            ensure_published_generation(conn, site_id),
+        ),
     )
 
 
@@ -496,8 +507,9 @@ def _seed_persistence_and_feed_pairs(
             """
             INSERT OR IGNORE INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -509,14 +521,16 @@ def _seed_persistence_and_feed_pairs(
                 persistence_error,
                 abs(persistence_error),
                 persistence_sq_error,
+                ensure_published_generation(conn, site_id),
             ),
         )
         conn.execute(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -528,6 +542,7 @@ def _seed_persistence_and_feed_pairs(
                 feed_error,
                 abs(feed_error),
                 feed_sq_error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 

@@ -24,6 +24,7 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import persist_fetch_result
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
+from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import (
     Job,
     claim_next_job,
@@ -31,6 +32,7 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     reclaim_all_stale,
 )
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.feeds.meteoblue import MeteoblueAdapter
 from wxverify.feeds.open_meteo import (
     OpenMeteoAdapter,
@@ -120,7 +122,7 @@ def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
 def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     conn = _init_tmp_db(tmp_path)
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
     assert (
         conn.execute(
             """
@@ -304,16 +306,17 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     feed_id = conn.execute(
         "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
     ).fetchone()["id"]
+    generation_id = ensure_published_generation(conn, site_id)
     try:
         conn.execute(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed)
+                 day_ahead, forecast, observed, tz_generation_id)
             VALUES (?, ?, 'temperature', '2026-01-01T00:00:00Z',
-                    '2026-01-01T01:00:00Z', 1, 8, 7.0, 6.0)
+                    '2026-01-01T01:00:00Z', 1, 8, 7.0, 6.0, ?)
             """,
-            (site_id, feed_id),
+            (site_id, feed_id, generation_id),
         )
     except sqlite3.IntegrityError:
         pass
@@ -623,7 +626,7 @@ def test_v1_migration_adds_backfill_columns(tmp_path: Path) -> None:
     row = conn.execute("SELECT backfill_status, backfill_through FROM sites").fetchone()
     assert row["backfill_status"] == "pending"
     assert row["backfill_through"] is None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
 
 
 def test_database_rejects_sqlite_without_returning(
@@ -2051,8 +2054,9 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg, rain_threshold_mm)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cat_hit, cat_false, cat_miss, cat_correct_neg, rain_threshold_mm,
+                 tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2072,6 +2076,7 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
                 cat_miss,
                 cat_correct_neg,
                 rain_threshold_mm,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2243,8 +2248,9 @@ def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2256,6 +2262,7 @@ def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
                 error,
                 abs(error),
                 error * error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2357,8 +2364,9 @@ def test_winrate_applies_window_to_canonical_cells(tmp_path: Path) -> None:
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, 'temperature', ?, ?, 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2370,6 +2378,7 @@ def test_winrate_applies_window_to_canonical_cells(tmp_path: Path) -> None:
                 error,
                 abs(error),
                 error * error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2471,8 +2480,9 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
             """
             INSERT OR IGNORE INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2486,14 +2496,16 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
                 persistence_error,
                 abs(persistence_error),
                 persistence_sq_error,
+                ensure_published_generation(conn, site_id),
             ),
         )
         conn.execute(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
-            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2507,6 +2519,7 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
                 feed_error,
                 abs(feed_error),
                 feed_sq_error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2578,9 +2591,10 @@ def test_composite_custom_window_computes_live_without_cache(tmp_path: Path) -> 
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?)
+                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2590,6 +2604,7 @@ def test_composite_custom_window_computes_live_without_cache(tmp_path: Path) -> 
                 error,
                 abs(error),
                 error * error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2636,9 +2651,10 @@ def test_subscription_rebuilds_multimodel_mean(tmp_path: Path) -> None:
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?)
+                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 site_id,
@@ -2648,6 +2664,7 @@ def test_subscription_rebuilds_multimodel_mean(tmp_path: Path) -> None:
                 error,
                 abs(error),
                 error * error,
+                ensure_published_generation(conn, site_id),
             ),
         )
 
@@ -2749,11 +2766,21 @@ def test_meteoblue_package_gates_members_for_leaderboard_and_mean(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?)
+                    '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
             """,
-            (site_id, feed_id, forecast, observed, error, abs(error), error * error),
+            (
+                site_id,
+                feed_id,
+                forecast,
+                observed,
+                error,
+                abs(error),
+                error * error,
+                ensure_published_generation(conn, site_id),
+            ),
         )
 
     conn.execute(
@@ -2842,9 +2869,10 @@ def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
                 """
                 INSERT INTO forecast_pairs
                     (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error)
+                     day_ahead, forecast, observed, error, abs_error, sq_error,
+                     tz_generation_id)
                 VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                        '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?)
+                        '2035-01-02T00:00:00Z', 24, 1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     site_id,
@@ -2854,6 +2882,7 @@ def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
                     error,
                     abs(error),
                     error * error,
+                    ensure_published_generation(conn, site_id),
                 ),
             )
             return site_id
@@ -2915,11 +2944,20 @@ def test_cached_leaderboard_misses_when_active_feed_cache_is_incomplete(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                    '2035-01-02T00:00:00Z', 24, 1, ?, 10.0, ?, ?, ?)
+                    '2035-01-02T00:00:00Z', 24, 1, ?, 10.0, ?, ?, ?, ?)
             """,
-            (site_id, feed_id, forecast, error, abs(error), error * error),
+            (
+                site_id,
+                feed_id,
+                forecast,
+                error,
+                abs(error),
+                error * error,
+                ensure_published_generation(conn, site_id),
+            ),
         )
     conn.execute(
         """
@@ -4125,11 +4163,19 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
                 """
                 INSERT INTO forecast_pairs
                     (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error)
+                     day_ahead, forecast, observed, error, abs_error, sq_error,
+                     tz_generation_id)
                 VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z',
-                        '2035-01-02T00:00:00Z', 24, 1, 11.0, 10.0, ?, ?, ?)
+                        '2035-01-02T00:00:00Z', 24, 1, 11.0, 10.0, ?, ?, ?, ?)
                 """,
-                (site_id, feed_id, error, abs(error), error * error),
+                (
+                    site_id,
+                    feed_id,
+                    error,
+                    abs(error),
+                    error * error,
+                    ensure_published_generation(conn, site_id),
+                ),
             )
             return site_id
 

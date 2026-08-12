@@ -5,6 +5,10 @@ from __future__ import annotations
 import sqlite3
 
 from wxverify.core.timeutil import day_ahead
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_clause,
+)
 from wxverify.scoring.pair_flags import precip_flags
 
 
@@ -19,8 +23,8 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
     rows = conn.execute(
         f"""
         SELECT fs.site_id, fs.feed_id, fs.variable, fs.issued_at, fs.valid_at,
-               fs.lead_hours, fs.value AS forecast, obs.value AS observed,
-               s.timezone, s.rain_threshold_mm
+               fs.lead_hours, fs.value AS forecast, fs.fetched_at,
+               obs.value AS observed, s.timezone, s.rain_threshold_mm
         FROM forecast_samples fs
         JOIN observations obs
           ON obs.site_id = fs.site_id
@@ -37,12 +41,14 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
                 AND fp.variable = fs.variable
                 AND fp.issued_at = fs.issued_at
                 AND fp.valid_at = fs.valid_at
+                AND {published_generation_clause("fp")}
           )
           {where_site}
         """,
         params,
     ).fetchall()
     written = 0
+    generation_ids: dict[int, int] = {}
     for row in rows:
         bucket = day_ahead(
             str(row["issued_at"]), str(row["valid_at"]), str(row["timezone"])
@@ -58,17 +64,26 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
         hit, false, miss, correct_neg = precip_flags(
             variable, forecast, observed, rain_threshold
         )
+        row_site_id = int(row["site_id"])
+        generation_id = generation_ids.get(row_site_id)
+        if generation_id is None:
+            generation_id = ensure_published_generation(conn, row_site_id)
+            generation_ids[row_site_id] = generation_id
+        # Availability (outcome knowability): the source sample's ingestion
+        # time. NULL fetched_at stays NULL — never invented; downstream as-of
+        # reads exclude NULL-availability pairs with a recorded reason.
+        first_known_at = None if row["fetched_at"] is None else str(row["fetched_at"])
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
                  cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 rain_threshold_mm)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 rain_threshold_mm, first_known_at, tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(row["site_id"]),
+                row_site_id,
                 int(row["feed_id"]),
                 variable,
                 str(row["issued_at"]),
@@ -85,6 +100,8 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
                 miss,
                 correct_neg,
                 rain_threshold,
+                first_known_at,
+                generation_id,
             ),
         )
         written += cur.rowcount

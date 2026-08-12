@@ -20,9 +20,9 @@ from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import parse_utc
 
-# A feed's day counts as fully covered at >= 18 of 24 local hours. DST days
-# have 23 or 25 local hours; the threshold stays a fixed 18 distinct covered
-# hours rather than a fraction.
+# A feed's day counts as fully covered at >= 18 of 24 covered hours (distinct
+# UTC hour instants). DST days have 23 or 25 local hours; the threshold stays
+# a fixed 18 distinct covered hours rather than a fraction.
 MIN_COVERAGE_HOURS = 18
 
 # A feed needs enough distinct local hours for its daily high/low to be
@@ -53,11 +53,17 @@ def display_day_index(valid_at: str, *, timezone: str, now: datetime) -> int:
     return (valid_day - today).days
 
 
-def covered_hours(valid_ats: Iterable[str], *, timezone: str) -> int:
-    """Distinct local wall-clock hours covered by a feed's samples in a day."""
-    tz = ZoneInfo(timezone)
+def covered_hours(valid_ats: Iterable[str]) -> int:
+    """Distinct UTC hour instants covered by a feed's samples in a day.
+
+    Counted in UTC deliberately: local wall-clock hours collapse the autumn
+    DST fold (aware datetimes differing only in ``fold`` compare and hash
+    equal), undercounting the fall-back day by one real hour. Truncating the
+    UTC instant to the hour BEFORE any local conversion counts every real
+    hour exactly once on 23-, 24- and 25-local-hour days alike.
+    """
     hours = {
-        parse_utc(valid_at).astimezone(tz).replace(minute=0, second=0, microsecond=0)
+        parse_utc(valid_at).replace(minute=0, second=0, microsecond=0)
         for valid_at in valid_ats
     }
     return len(hours)

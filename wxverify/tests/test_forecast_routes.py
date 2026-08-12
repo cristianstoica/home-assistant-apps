@@ -34,6 +34,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.settings.keys import set_setting
 
@@ -328,11 +329,18 @@ def test_forecast_degrades_to_low_confidence_without_score_cache_no_enqueue(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    11.0, 10.0, 1.0, 1.0, 1.0)
+                    11.0, 10.0, 1.0, 1.0, 1.0, ?)
             """,
-            (site_id, feed_id, valid_at, i + 1),
+            (
+                site_id,
+                feed_id,
+                valid_at,
+                i + 1,
+                ensure_published_generation(conn, site_id),
+            ),
         )
     for i, valid_at in enumerate(
         ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z", "2035-06-30T02:00:00Z")
@@ -346,11 +354,18 @@ def test_forecast_degrades_to_low_confidence_without_score_cache_no_enqueue(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1,
-                    15.0, 10.0, 5.0, 5.0, 25.0)
+                    15.0, 10.0, 5.0, 5.0, 25.0, ?)
             """,
-            (site_id, persistence_id, valid_at, i + 1),
+            (
+                site_id,
+                persistence_id,
+                valid_at,
+                i + 1,
+                ensure_published_generation(conn, site_id),
+            ),
         )
     # Deliberately NO upsert_score_cache call -- the point of this fixture.
 

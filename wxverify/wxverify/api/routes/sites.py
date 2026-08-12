@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from wxverify.api.errors import ApiError
 from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
 from wxverify.db.connection import get_db
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.engine import pair_and_score
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
@@ -64,6 +65,10 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         ).fetchone()
         if row is None:
             raise RuntimeError("site insert failed")
+        # New sites get their initial published timezone generation and
+        # published-pointer row immediately — the same seed migrate_v4
+        # applies to pre-existing sites.
+        ensure_published_generation(conn, int(row["id"]))
         return _site_out(row)
 
     site = await get_db().write(_write)

@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from wxverify.api.errors import ApiError
 from wxverify.api.schemas import FeedOut, FeedUpdate, SubscriptionUpdate
 from wxverify.db.connection import get_db
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.provider_ops import (
     ProviderOpsError,
     set_site_subscription,
@@ -146,6 +147,7 @@ def _affected_sites_for_feed_change(
         LEFT JOIN site_feed_state sfs
           ON sfs.site_id = fp.site_id AND sfs.feed_id = ?
         WHERE fp.feed_id = ?
+          AND {published_generation_clause("fp")}
           {_inheriting_filter("sfs") if inherited_only else ""}
         """,
         (feed_id, feed_id),
@@ -164,6 +166,7 @@ def _affected_sites_for_meteoblue_package(
             JOIN feeds member ON member.id = fp.feed_id
             WHERE member.source = 'meteoblue'
               AND member.model != 'multimodel'
+              AND {published_generation_clause("fp")}
             UNION
             SELECT site_id
             FROM site_feed_state

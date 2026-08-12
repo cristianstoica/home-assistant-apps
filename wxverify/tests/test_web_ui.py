@@ -38,6 +38,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import close_db, init_db
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import set_setting
@@ -155,11 +156,19 @@ def _seed_cell(
         INSERT OR IGNORE INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
              day_ahead, forecast, observed, error, abs_error, sq_error,
-             cat_hit, cat_false, cat_miss, cat_correct_neg)
+             cat_hit, cat_false, cat_miss, cat_correct_neg, tz_generation_id)
         VALUES (?, ?, ?, '2035-01-01T00:00:00Z', ?, ?, ?, 12.0, 10.0,
-                2.0, 2.0, 4.0, 1, 0, 0, 0)
+                2.0, 2.0, 4.0, 1, 0, 0, 0, ?)
         """,
-        (site_id, feed_id, variable, valid_at, lead_hours, day_ahead),
+        (
+            site_id,
+            feed_id,
+            variable,
+            valid_at,
+            lead_hours,
+            day_ahead,
+            ensure_published_generation(conn, site_id),
+        ),
     )
     conn.execute(
         """
@@ -836,21 +845,28 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-02-01T00:00:00Z', ?, 24, 1,
-                    12.0, 10.0, 2.0, 2.0, 4.0)
+                    12.0, 10.0, 2.0, 2.0, 4.0, ?)
             """,
-            (site_id, feed, valid_at),
+            (site_id, feed, valid_at, ensure_published_generation(conn, site_id)),
         )
         conn.execute(
             """
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error)
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 tz_generation_id)
             VALUES (?, ?, 'temperature', '2035-02-01T00:00:00Z', ?, 24, 1,
-                    10.0, 10.0, 0.0, 0.0, 0.0)
+                    10.0, 10.0, 0.0, 0.0, 0.0, ?)
             """,
-            (site_id, persistence, valid_at),
+            (
+                site_id,
+                persistence,
+                valid_at,
+                ensure_published_generation(conn, site_id),
+            ),
         )
     conn.commit()
 
@@ -921,11 +937,12 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg)
+                 cat_hit, cat_false, cat_miss, cat_correct_neg,
+                 tz_generation_id)
             VALUES (?, ?, 'precip', '2035-03-01T00:00:00Z', ?, 24, 1,
-                    0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 1)
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 1, ?)
             """,
-            (site_id, feed, valid_at),
+            (site_id, feed, valid_at, ensure_published_generation(conn, site_id)),
         )
     conn.commit()
 

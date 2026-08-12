@@ -256,7 +256,35 @@ def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
         ("valid_at", 0),
         ("issued_at", 1),
         ("abs_error", 0),
+        ("tz_generation_id", 0),
     ]
+
+
+def test_winrate_published_pointer_resolves_as_a_runtime_state_key_probe() -> None:
+    # The published-generation binding embeds a correlated scalar subquery on
+    # runtime_state ('tz_generation_published:' || fp.site_id). It runs once
+    # per candidate pairs row, so it must stay a key probe of runtime_state's
+    # primary key -- a per-row SCAN of runtime_state would make every
+    # pairs-reading statement O(pairs x runtime_state). Asserted as a
+    # structural relationship (probe present, scan absent), not exact EQP
+    # phrasing, which is build-specific.
+    conn = _fresh_conn()
+    sql = winrate_sql("")
+    params = (1, 1, 1, "temperature", 1)
+    plan = _plan(conn, sql, params)
+    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
+    assert not any("SCAN rs" in line for line in plan), plan
+
+    # Negative control: defeat the key probe (CAST strips the equality from
+    # the primary key) and the very same statement degrades to SCAN rs --
+    # proving the healthy assertion above is discriminating, not vacuous.
+    degraded_sql = sql.replace(
+        "rs.key = 'tz_generation_published:' || fp.site_id",
+        "CAST(rs.key AS TEXT) = 'tz_generation_published:' || fp.site_id",
+    )
+    assert degraded_sql != sql, "clause text drifted; update this control"
+    degraded_plan = _plan(conn, degraded_sql, params)
+    assert any("SCAN rs" in line for line in degraded_plan), degraded_plan
 
 
 def test_worker_status_count_statements_stay_index_only_scans() -> None:

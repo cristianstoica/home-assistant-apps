@@ -53,6 +53,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import (
     _live_leaderboard,  # noqa: F401 - referenced by qualified monkeypatch path only
@@ -146,11 +147,18 @@ def _add_temperature_cell(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error)
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             tz_generation_id)
         VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z', ?, 24, ?,
-                11.0, 10.0, 1.0, 1.0, 1.0)
+                11.0, 10.0, 1.0, 1.0, 1.0, ?)
         """,
-        (site_id, feed_id, valid_at, day_ahead),
+        (
+            site_id,
+            feed_id,
+            valid_at,
+            day_ahead,
+            ensure_published_generation(conn, site_id),
+        ),
     )
 
 

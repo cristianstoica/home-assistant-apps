@@ -27,6 +27,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.data import samples_fingerprint
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
@@ -296,9 +297,10 @@ def test_tiles_204_when_only_non_sample_state_changed(
                 """
                 INSERT INTO forecast_pairs
                     (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error)
+                     day_ahead, forecast, observed, error, abs_error, sq_error,
+                     tz_generation_id)
                 VALUES (?, ?, 'temperature', '2035-06-29T00:00:00Z', ?, ?, 1, ?,
-                        10.0, ?, ?, ?)
+                        10.0, ?, ?, ?, ?)
                 """,
                 (
                     site_id,
@@ -309,6 +311,7 @@ def test_tiles_204_when_only_non_sample_state_changed(
                     error,
                     abs(error),
                     error * error,
+                    ensure_published_generation(conn, site_id),
                 ),
             )
 

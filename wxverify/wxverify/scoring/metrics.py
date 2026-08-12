@@ -8,6 +8,8 @@ from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
+from wxverify.db.tz_generations import published_generation_clause
+
 
 class MetricResult(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -64,6 +66,7 @@ class ContinuousStrategy:
                    AVG(sq_error) AS mse
             FROM forecast_pairs
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
+              AND {published_generation_clause("forecast_pairs")}
               {clause}
             """,
             (site_id, feed_id, variable, day_ahead, *extra),
@@ -108,6 +111,7 @@ class PrecipStrategy:
                    AVG(error) AS bias, AVG(abs_error) AS mae, AVG(sq_error) AS mse
             FROM forecast_pairs
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
+              AND {published_generation_clause("forecast_pairs")}
               {clause}
             """,
             (site_id, feed_id, variable, day_ahead, *extra),
@@ -187,6 +191,8 @@ def _paired_skill(
         WHERE fp.site_id=? AND fp.feed_id=?
           AND pp.feed_id=?
           AND fp.variable=? AND fp.day_ahead=?
+          AND {published_generation_clause("fp")}
+          AND {published_generation_clause("pp")}
           {clause}
         """,
         params,

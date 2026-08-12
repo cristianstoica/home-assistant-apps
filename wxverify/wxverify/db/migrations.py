@@ -13,7 +13,7 @@ from wxverify.core.timeutil import isoformat_utc, utc_now
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 3
+TARGET_USER_VERSION = 4
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -143,6 +143,27 @@ def create_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY(source, billing_day)
         );
 
+        CREATE TABLE IF NOT EXISTS timezone_generations (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            timezone TEXT NOT NULL,
+            mode TEXT NOT NULL CHECK(mode IN
+                ('initial','retrospective_correction','prospective_change')),
+            effective_from TEXT,
+            effective_to TEXT,
+            state TEXT NOT NULL DEFAULT 'building'
+                CHECK(state IN ('building','published','retired','failed')),
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            published_at TEXT,
+            examined_count INTEGER,
+            changed_count INTEGER,
+            unchanged_count INTEGER,
+            excluded_count INTEGER,
+            provenance TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_tz_generations_site
+            ON timezone_generations(site_id, state);
+
         CREATE TABLE IF NOT EXISTS forecast_pairs (
             id INTEGER PRIMARY KEY,
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -164,7 +185,11 @@ def create_schema(conn: sqlite3.Connection) -> None:
             rain_threshold_mm REAL,
             contributors INTEGER,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            UNIQUE(site_id, feed_id, variable, issued_at, valid_at)
+            first_known_at TEXT,
+            tz_generation_id INTEGER NOT NULL
+                REFERENCES timezone_generations(id),
+            UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
+                   tz_generation_id)
         );
         CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
             ON forecast_pairs(site_id, variable, day_ahead, valid_at);
@@ -172,7 +197,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
         CREATE INDEX IF NOT EXISTS idx_pairs_winrate
             ON forecast_pairs(site_id, variable, day_ahead, feed_id,
-                              valid_at, issued_at DESC, abs_error);
+                              valid_at, issued_at DESC, abs_error,
+                              tz_generation_id);
 
         CREATE TABLE IF NOT EXISTS score_cache (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -213,7 +239,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 (type = 'catchup' AND site_id IS NULL)
                 OR (
                     type IN ('fetch_feed','fetch_obs','fetch_current_obs',
-                             'pair_and_score','backfill_site')
+                             'pair_and_score','backfill_site',
+                             'forecast_record','record_gap_scan',
+                             'verification_run','timezone_correction')
                     AND site_id IS NOT NULL
                 )
             )
@@ -435,6 +463,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 3:
         logger.debug("migrations applying v3 station poll-state")
         migrate_v3(conn)
+    if current < 4:
+        logger.debug("migrations applying v4 timezone generations")
+        migrate_v4(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)
@@ -595,6 +626,201 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
         conn.execute("RELEASE migrate_v3")
         raise
     conn.execute("RELEASE migrate_v3")
+
+
+def migrate_v4(conn: sqlite3.Connection) -> None:
+    """Timezone generations: widen the jobs CHECK, generation-tag pairs.
+
+    Mirrors :func:`migrate_v3`'s SAVEPOINT-wrapped rebuild pattern (same
+    atomicity rationale — see that function's comment). Steps, all inside one
+    savepoint:
+
+    1. rebuild ``jobs`` with the CHECK widened for the 0.11.0 job types
+       (``forecast_record``, ``record_gap_scan``, ``verification_run``,
+       ``timezone_correction`` — all per-site) and recreate its two indexes;
+    2. seed one ``initial`` timezone generation per existing site (state
+       ``published``, NULL-bounded effective interval — covers the whole
+       history) plus the per-site published-pointer ``runtime_state`` row
+       (``tz_generation_published:<site_id>``);
+    3. rebuild ``forecast_pairs`` with ``first_known_at`` (left NULL for
+       pre-existing rows — availability is defined by the pair producers
+       going forward, never invented retroactively) and
+       ``tz_generation_id NOT NULL`` inside the widened unique key,
+       backfilling every existing row to its site's seeded ``initial``
+       generation, then recreate the three pairs indexes.
+
+    ``timezone_generations`` itself comes from :func:`create_schema`, as in
+    v3. On a fresh database (user_version 0) both rebuilds copy zero rows
+    from the already-new-shape tables created by :func:`create_schema`, so
+    running the whole chain is harmless.
+    """
+    # Re-run guard: run_migrations writes PRAGMA user_version only AFTER the
+    # RELEASE below commits, so a crash between the two leaves the v4 body
+    # committed with user_version still 3. The SAVEPOINT makes the body
+    # all-or-nothing, so this column's presence <=> the whole body (jobs
+    # rebuild + seed + backfill) already committed; without the guard a
+    # re-entry would seed duplicate initial generations and the pairs rebuild
+    # would crash-loop on its UNIQUE(id). Precedent:
+    # :func:`migrate_v2_backfill_status`'s column-probed idempotence.
+    if "tz_generation_id" in _table_columns(conn, "forecast_pairs"):
+        return
+    conn.execute("SAVEPOINT migrate_v4")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE jobs_new (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+                job_key TEXT,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','running','completed','failed')),
+                next_attempt_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT,
+                result TEXT,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (
+                    (type = 'catchup' AND site_id IS NULL)
+                    OR (
+                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
+                                 'pair_and_score','backfill_site',
+                                 'forecast_record','record_gap_scan',
+                                 'verification_run','timezone_correction')
+                        AND site_id IS NOT NULL
+                    )
+                )
+            )
+            """
+        )
+        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
+                ON jobs(type, COALESCE(site_id, -1), job_key)
+                WHERE status IN ('pending','running') AND job_key IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+                ON jobs(type, job_key, site_id, id)
+            """
+        )
+        # Seed the initial published generation per existing site, then the
+        # published-pointer runtime_state row. Mirrors
+        # wxverify.db.tz_generations.ensure_published_generation's seed shape
+        # (kept in SQL here so the whole step stays inside this savepoint).
+        now = isoformat_utc(utc_now())
+        conn.execute(
+            """
+            INSERT INTO timezone_generations
+                (site_id, timezone, mode, state, published_at)
+            SELECT id, timezone, 'initial', 'published', ?
+            FROM sites
+            ORDER BY id
+            """,
+            (now,),
+        )
+        conn.execute(
+            """
+            INSERT INTO runtime_state (key, value)
+            SELECT 'tz_generation_published:' || tg.site_id,
+                   CAST(tg.id AS TEXT)
+            FROM timezone_generations tg
+            WHERE tg.mode = 'initial' AND tg.state = 'published'
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE forecast_pairs_new (
+                id INTEGER PRIMARY KEY,
+                site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+                variable TEXT NOT NULL,
+                issued_at TEXT NOT NULL,
+                valid_at TEXT NOT NULL,
+                lead_hours INTEGER NOT NULL CHECK(lead_hours >= 1),
+                day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+                forecast REAL NOT NULL,
+                observed REAL NOT NULL,
+                error REAL,
+                abs_error REAL,
+                sq_error REAL,
+                cat_hit INTEGER,
+                cat_false INTEGER,
+                cat_miss INTEGER,
+                cat_correct_neg INTEGER,
+                rain_threshold_mm REAL,
+                contributors INTEGER,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                first_known_at TEXT,
+                tz_generation_id INTEGER NOT NULL
+                    REFERENCES timezone_generations(id),
+                UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
+                       tz_generation_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO forecast_pairs_new
+                (id, site_id, feed_id, variable, issued_at, valid_at,
+                 lead_hours, day_ahead, forecast, observed, error, abs_error,
+                 sq_error, cat_hit, cat_false, cat_miss, cat_correct_neg,
+                 rain_threshold_mm, contributors, created_at, first_known_at,
+                 tz_generation_id)
+            SELECT fp.id, fp.site_id, fp.feed_id, fp.variable, fp.issued_at,
+                   fp.valid_at, fp.lead_hours, fp.day_ahead, fp.forecast,
+                   fp.observed, fp.error, fp.abs_error, fp.sq_error,
+                   fp.cat_hit, fp.cat_false, fp.cat_miss, fp.cat_correct_neg,
+                   fp.rain_threshold_mm, fp.contributors, fp.created_at,
+                   NULL, tg.id
+            FROM forecast_pairs fp
+            JOIN timezone_generations tg
+              ON tg.site_id = fp.site_id
+             AND tg.mode = 'initial' AND tg.state = 'published'
+            """
+        )
+        conn.execute("DROP TABLE forecast_pairs")
+        conn.execute("ALTER TABLE forecast_pairs_new RENAME TO forecast_pairs")
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
+                ON forecast_pairs(site_id, variable, day_ahead, valid_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairs_cell
+                ON forecast_pairs(site_id, feed_id, variable, day_ahead,
+                                  valid_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pairs_winrate
+                ON forecast_pairs(site_id, variable, day_ahead, feed_id,
+                                  valid_at, issued_at DESC, abs_error,
+                                  tz_generation_id)
+            """
+        )
+    except BaseException:
+        conn.execute("ROLLBACK TO migrate_v4")
+        conn.execute("RELEASE migrate_v4")
+        raise
+    conn.execute("RELEASE migrate_v4")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

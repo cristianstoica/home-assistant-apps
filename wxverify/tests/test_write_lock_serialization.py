@@ -31,6 +31,7 @@ from wxverify.api.routes.dashboard import leaderboard
 from wxverify.core.timeutil import isoformat_utc_micro
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import Job
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring import rescore as rescore_module
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.engine import (
@@ -114,8 +115,8 @@ def _seed_pair(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,
-             forecast, observed, error, abs_error, sq_error)
-        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?)
+             forecast, observed, error, abs_error, sq_error, tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -129,6 +130,7 @@ def _seed_pair(
             error,
             abs(error),
             error * error,
+            ensure_published_generation(conn, site_id),
         ),
     )
 

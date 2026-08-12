@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from wxverify.core.timeutil import window_cutoff
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import active_competitor_clause, active_feed_cte
 from wxverify.scoring.metrics import strategy_for
@@ -173,6 +174,7 @@ def _live_leaderboard(
           AND fp.variable = ?
           AND fp.day_ahead = ?
           AND {active_competitor_clause(site_expr="fp.site_id")}
+          AND {published_generation_clause("fp")}
         ORDER BY f.source, f.model
         """,
         (site_id, variable, day_ahead),
@@ -311,6 +313,7 @@ def _expected_active_feed_ids(
               AND fp.feed_id = a.feed_id
               AND fp.variable = ?
               AND fp.day_ahead = ?
+              AND {published_generation_clause("fp")}
               {window_clause}
         )
         """,

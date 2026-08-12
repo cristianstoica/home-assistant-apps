@@ -186,7 +186,6 @@ def build_forecast(
             meta, values = _cell_meta_and_values(
                 selection,
                 feeds_samples=feeds_samples,
-                timezone=timezone,
                 stale_ids=stale_ids,
             )
             cells[variable] = (meta, selection, values)
@@ -385,9 +384,7 @@ def _select(
                 pair_n=row.n if row is not None else 0,
                 mae=row.mae if row is not None else None,
                 future_sample_count=len(feed_samples),
-                covered_hours=covered_hours(
-                    (s.valid_at for s in feed_samples), timezone=timezone
-                ),
+                covered_hours=covered_hours(s.valid_at for s in feed_samples),
             )
         )
     return select_cell_feeds(candidates, blend_depth=blend_depth)
@@ -397,7 +394,6 @@ def _cell_meta_and_values(
     selection: CellSelection,
     *,
     feeds_samples: dict[int, list[FutureSampleRow]],
-    timezone: str,
     stale_ids: set[int],
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage guard; return cell meta + per-feed value lists.
@@ -415,10 +411,7 @@ def _cell_meta_and_values(
         candidate
         for candidate in selection.feeds
         if clears_coverage(
-            covered_hours(
-                (s.valid_at for s in feeds_samples[candidate.feed_id]),
-                timezone=timezone,
-            )
+            covered_hours(s.valid_at for s in feeds_samples[candidate.feed_id])
         )
     ]
     partial = not clearing
