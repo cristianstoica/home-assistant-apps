@@ -16,6 +16,7 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.verification.record import sites_with_record_gap
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -215,6 +216,13 @@ def _pipeline_conditions(
         (failed_cutoff, stuck_cutoff, pending_cutoff),
     )
 
+    # forecast_record_gap (§16): enabled sites whose record log has begun
+    # but which have no record/missed row for the most recent expected
+    # snapshot day under the current published generation.
+    record_gap_n = sites_with_record_gap(
+        conn, now, slack=timedelta(minutes=PENDING_OVERDUE_MINUTES)
+    )
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -271,6 +279,12 @@ def _pipeline_conditions(
             problem_jobs_n > 0,
             problem_jobs_n,
             f"{problem_jobs_n} stuck/failed/overdue jobs",
+        ),
+        _cond(
+            "forecast_record_gap",
+            record_gap_n > 0,
+            record_gap_n,
+            f"{record_gap_n} sites missing the latest forecast record",
         ),
     ]
 
@@ -494,6 +508,7 @@ def build_verdict(
                 "fetch_feed_live",
                 "pair_score_live",
                 "problem_jobs",
+                "forecast_record_gap",
             )
         )
 

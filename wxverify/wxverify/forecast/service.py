@@ -27,11 +27,10 @@ from wxverify.core.timeutil import (
 from wxverify.core.units import ms_to_kmh
 from wxverify.forecast.aggregate import (
     blend_mean,
-    chance_of_rain,
-    clears_coverage,
+    clearing_subset,
     covered_hours,
     display_day_index,
-    wet_share,
+    displayed_daily,
 )
 from wxverify.forecast.data import (
     FutureSampleRow,
@@ -407,15 +406,16 @@ def _cell_meta_and_values(
             CellMeta(state="not_available", feeds=[], partial=False, stale=False),
             {},
         )
-    clearing = [
-        candidate
-        for candidate in selection.feeds
-        if clears_coverage(
-            covered_hours(s.valid_at for s in feeds_samples[candidate.feed_id])
-        )
-    ]
-    partial = not clearing
-    agg_feeds = clearing if clearing else selection.feeds
+    agg_ids, partial = clearing_subset(
+        [candidate.feed_id for candidate in selection.feeds],
+        {
+            candidate.feed_id: covered_hours(
+                s.valid_at for s in feeds_samples[candidate.feed_id]
+            )
+            for candidate in selection.feeds
+        },
+    )
+    agg_feeds = [c for c in selection.feeds if c.feed_id in set(agg_ids)]
     values = {
         candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
         for candidate in agg_feeds
@@ -447,28 +447,30 @@ def _build_tile(
     wind_meta, _, wind_values = cells["wind"]
     precip_meta, _, precip_values = cells["precip"]
 
+    temp_daily = displayed_daily(
+        "temperature", list(temp_values.values()), rain_threshold_mm=rain_threshold_mm
+    )
     temp = TempCell(
         meta=temp_meta,
-        high_c=blend_mean([max(v) for v in temp_values.values() if v]),
-        low_c=blend_mean([min(v) for v in temp_values.values() if v]),
+        high_c=temp_daily["high_c"],
+        low_c=temp_daily["low_c"],
     )
-    wind_max_ms = blend_mean([max(v) for v in wind_values.values() if v])
+    wind_daily = displayed_daily(
+        "wind", list(wind_values.values()), rain_threshold_mm=rain_threshold_mm
+    )
+    wind_max_ms = wind_daily["max_ms"]
     wind = WindCell(
         meta=wind_meta,
         max_kmh=None if wind_max_ms is None else ms_to_kmh(wind_max_ms),
     )
-    shares = [
-        share
-        for share in (
-            wet_share(v, threshold_mm=rain_threshold_mm) for v in precip_values.values()
-        )
-        if share is not None
-    ]
-    chance = chance_of_rain(shares)
+    precip_daily = displayed_daily(
+        "precip", list(precip_values.values()), rain_threshold_mm=rain_threshold_mm
+    )
+    chance = precip_daily["chance"]
     chance_pct = None if chance is None else round(chance * 100)
     precip = PrecipCell(
         meta=precip_meta,
-        total_mm=blend_mean([sum(v) for v in precip_values.values() if v]),
+        total_mm=precip_daily["total_mm"],
         chance_pct=chance_pct,
         show_rain_glyph=chance_pct is not None
         and chance_pct >= RAIN_GLYPH_MIN_CHANCE_PCT,

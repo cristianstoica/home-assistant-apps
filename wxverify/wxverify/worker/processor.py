@@ -45,6 +45,7 @@ from wxverify.obs.pws_adapter import (
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_number_setting
+from wxverify.verification.record import build_forecast_record, run_record_gap_scan
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -413,6 +414,32 @@ async def dispatch(
             lambda conn: advance_correction(conn, site_id, job.payload)
         )
         return build_continuation(site_id, job.payload) if more else None
+    if job.type == "forecast_record":
+        site_id = job.site_id
+        if site_id is None:
+            raise JobCancelled()
+        snapshot_local_date = job.payload.get("snapshot_local_date")
+        if not isinstance(snapshot_local_date, str):
+            raise JobCancelled()
+        await writer.write(
+            lambda conn: build_forecast_record(conn, site_id, snapshot_local_date)
+        )
+        return None
+    if job.type == "record_gap_scan":
+        site_id = job.site_id
+        if site_id is None:
+            raise JobCancelled()
+        # One chunk of dates per write transaction; the continuation
+        # re-enqueues the scan so record-tier chunks interleave with other
+        # job types instead of holding the write lock across a long gap.
+        remainder = await writer.write(
+            lambda conn: run_record_gap_scan(conn, site_id, job.payload)
+        )
+        if remainder is None:
+            return None
+        return JobContinuation(
+            "record_gap_scan", site_id, f"gapscan:cont:{site_id}", remainder
+        )
     raise RuntimeError(f"unknown job type {job.type}")
 
 

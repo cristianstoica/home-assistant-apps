@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
@@ -35,6 +36,75 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
     _enqueue_due_current_obs(conn)
+    _enqueue_due_forecast_records(conn)
+
+
+def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
+    """Enqueue the daily forecast_record job (and gap scan) per site (§14).
+
+    Due when the site's local time has reached today's snapshot time T and
+    no record/missed row exists yet for (site, current generation, today).
+    The date-scoped ``job_key`` plus ``idx_jobs_active_dedupe`` guarantees
+    one active job per day even across the doubled autumn hour. The gap
+    scan is enqueued once per local day after T; a completed jobs row for
+    the day's key gates re-enqueue.
+    """
+    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.verification.record import (
+        record_rows_exist,
+        resolve_snapshot_utc,
+        snapshot_wall_clock,
+    )
+
+    now = utc_now()
+    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
+    for row in rows:
+        site_id = int(row["id"])
+        timezone = str(row["timezone"])
+        try:
+            tz = ZoneInfo(timezone)
+            local_today = now.astimezone(tz).date()
+            wall_clock = snapshot_wall_clock(conn, site_id)
+            snapshot_utc = resolve_snapshot_utc(timezone, local_today, wall_clock)
+        except (ZoneInfoNotFoundError, ValueError):
+            # Foreign/corrupt timezone or wall clock: fail closed (skip this
+            # site for this tick) -- inventing a snapshot instant would stamp
+            # records on an invented schedule. Every other site still runs.
+            logger.warning(
+                "scheduler: unusable snapshot config site=%s; skipping", site_id
+            )
+            continue
+        if now < snapshot_utc:
+            continue
+        day_iso = local_today.isoformat()
+        generation_id = ensure_published_generation(conn, site_id)
+        if not record_rows_exist(conn, site_id, generation_id, day_iso):
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "forecast_record",
+                site_id,
+                f"record:{day_iso}",
+                {"snapshot_local_date": day_iso},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
+        gap_key = f"gapscan:{day_iso}"
+        done = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE type = 'record_gap_scan' AND site_id = ? AND job_key = ?
+            LIMIT 1
+            """,
+            (site_id, gap_key),
+        ).fetchone()
+        if done is None:
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "record_gap_scan",
+                site_id,
+                gap_key,
+                {},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
 
 
 def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:

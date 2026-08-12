@@ -14,7 +14,7 @@ Methodology (aggregate per feed, then blend):
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -92,6 +92,59 @@ def wet_share(values: Sequence[float], *, threshold_mm: float) -> float | None:
         return None
     wet = sum(1 for value in values if value >= threshold_mm)
     return wet / len(values)
+
+
+def clearing_subset(
+    selected_ids: Sequence[int], covered_by_feed: Mapping[int, int]
+) -> tuple[list[int], bool]:
+    """The feed subset whose values aggregate for display, plus ``partial``.
+
+    Feeds clearing the >= 18-hour coverage guard aggregate alone; when NO
+    selected feed clears it, ALL selected feeds still aggregate (the tile
+    stays populated) and the cell carries the orthogonal ``partial`` badge.
+    Shared by the Forecast page and the forecast-of-record builder so the
+    two cannot drift.
+    """
+    clearing = [fid for fid in selected_ids if clears_coverage(covered_by_feed[fid])]
+    if clearing:
+        return clearing, False
+    return list(selected_ids), True
+
+
+def displayed_daily(
+    variable: str,
+    per_feed_values: Sequence[Sequence[float]],
+    *,
+    rain_threshold_mm: float,
+) -> dict[str, float | None]:
+    """The DISPLAYED daily quantities for one cell, aggregate-per-feed-then-blend.
+
+    Each inner sequence is one feed's hourly values for the day (already
+    restricted to the :func:`clearing_subset`). Native units throughout
+    (wind in m/s; chance as a 0..1 fraction) — unit conversion and percent
+    rounding are presentational. Shared by the Forecast page and the
+    forecast-of-record builder so the two cannot drift.
+    """
+    if variable == "temperature":
+        return {
+            "high_c": blend_mean([max(v) for v in per_feed_values if v]),
+            "low_c": blend_mean([min(v) for v in per_feed_values if v]),
+        }
+    if variable == "wind":
+        return {"max_ms": blend_mean([max(v) for v in per_feed_values if v])}
+    if variable == "precip":
+        shares = [
+            share
+            for share in (
+                wet_share(v, threshold_mm=rain_threshold_mm) for v in per_feed_values
+            )
+            if share is not None
+        ]
+        return {
+            "total_mm": blend_mean([sum(v) for v in per_feed_values if v]),
+            "chance": chance_of_rain(shares),
+        }
+    raise ValueError(f"unknown variable {variable!r}")
 
 
 def chance_of_rain(per_feed_shares: Sequence[float]) -> float | None:

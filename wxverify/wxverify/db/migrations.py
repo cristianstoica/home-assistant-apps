@@ -231,6 +231,51 @@ def create_schema(conn: sqlite3.Connection) -> None:
             ON daily_truth(site_id, local_date, tz_generation_id)
             WHERE stale = 1;
 
+        CREATE TABLE IF NOT EXISTS forecast_of_record (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            tz_generation_id INTEGER NOT NULL
+                REFERENCES timezone_generations(id),
+            timezone TEXT NOT NULL,
+            tz_rebuild_in_progress INTEGER NOT NULL DEFAULT 0
+                CHECK(tz_rebuild_in_progress IN (0,1)),
+            snapshot_local_date TEXT NOT NULL,
+            snapshot_local_time TEXT NOT NULL,
+            snapshot_utc TEXT NOT NULL,
+            target_local_date TEXT NOT NULL,
+            variable TEXT NOT NULL
+                CHECK(variable IN ('temperature','wind','precip')),
+            display_lead INTEGER NOT NULL
+                CHECK(display_lead BETWEEN 0 AND 7),
+            status TEXT NOT NULL CHECK(status IN ('recorded','missed')),
+            missed_reason TEXT,
+            write_path TEXT
+                CHECK(write_path IS NULL
+                      OR write_path IN ('on_time','late_reconstruction')),
+            write_latency_seconds INTEGER,
+            policy TEXT,
+            methodology_version INTEGER NOT NULL,
+            app_version TEXT NOT NULL,
+            candidates TEXT,
+            selected_feed_ids TEXT,
+            feed_weights TEXT,
+            effective_cells TEXT,
+            source_runs TEXT,
+            hourly_values TEXT,
+            daily_quantities TEXT,
+            leaderboard_status TEXT,
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK(
+                (status = 'missed'
+                 AND missed_reason IS NOT NULL AND write_path IS NULL)
+                OR (status = 'recorded'
+                    AND missed_reason IS NULL AND write_path IS NOT NULL)
+            ),
+            UNIQUE(site_id, tz_generation_id, snapshot_local_date,
+                   variable, target_local_date)
+        );
+
         CREATE TABLE IF NOT EXISTS score_cache (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
             feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
