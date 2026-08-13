@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+{% block title %}Verification - {{ app_title }}{% endblock %}
+{% block content %}
+<section class="page-heading">
+  <div>
+    <h1>Verification</h1>
+    {% if site %}
+      <p>{{ site.name }} - published backtest results</p>
+    {% endif %}
+  </div>
+  {% if sites %}
+    <div class="control-row">
+      {% for item in sites %}
+        <a class="pill {{ 'active' if site and item.id == site.id else '' }}" href="{{ url('/verification?site=' ~ item.id) }}">{{ item.name }}</a>
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+
+{% if not site %}
+  <p class="empty">No sites configured.</p>
+{% else %}
+
+  {# --- Status banner + warnings --- #}
+  {% if warnings.no_publishable_run %}
+    <p class="notice">No published verification run for this site yet.</p>
+  {% else %}
+    <section class="card">
+      <h2>Run #{{ run.id }}</h2>
+      <p class="muted">
+        Period {{ run.period_start or '—' }} to {{ run.period_end or '—' }}
+        &middot; settled through {{ run.settled_through or '—' }}
+        &middot; published {{ run.published_at or '—' }}
+      </p>
+      {% if warnings.stale_inputs %}
+        <p class="notice">Inputs have changed since this run was published &mdash; results reflect the pinned snapshot, not current data.</p>
+      {% endif %}
+      {% if warnings.failed_newer_attempt %}
+        <p class="notice">A newer verification attempt failed; the results below are from the last successful run.</p>
+      {% endif %}
+    </section>
+
+    {# --- Verdict cards --- #}
+    <section class="card">
+      <h2>Verdicts</h2>
+      <div class="tile-grid">
+        {% for v in verdicts %}
+          <div class="tile verdict-{{ v.outcome }}">
+            <h3>{{ v.variable }}</h3>
+            <p><strong>{{ v.label }}</strong></p>
+            <p class="muted">
+              Incumbent depth {{ v.incumbent_depth }}
+              {% if v.recommended_depth is not none %}
+                &middot; recommended depth {{ v.recommended_depth }}
+              {% endif %}
+            </p>
+          </div>
+        {% endfor %}
+      </div>
+      {% if depths %}
+        <p class="muted depth-line">
+          Effective blend depth:
+          {% for variable, d in depths.items() %}
+            {{ variable }} {{ d.depth }} ({{ d.source }}){{ '' if loop.last else ' · ' }}
+          {% endfor %}
+        </p>
+      {% endif %}
+    </section>
+
+    {# --- Headline results --- #}
+    <section class="card">
+      <h2>Headline results</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Variable</th><th>Quantity</th><th>Lead</th><th>Entity</th>
+            <th>Days</th><th>MAE</th><th>Bias</th><th>RMSE</th><th>ETS</th>
+            <th>Availability</th><th>&Delta; vs incumbent</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in headline %}
+            <tr>
+              <td>{{ r.variable }}</td>
+              <td>{{ r.quantity }}</td>
+              <td>{{ r.lead }}</td>
+              <td>{{ r.entity_type }}:{{ r.entity_key }}</td>
+              <td>{{ r.common_days }}</td>
+              <td>{{ '%.3f'|format(r.mae) if r.mae is not none else '—' }}</td>
+              <td>{{ '%.3f'|format(r.bias) if r.bias is not none else '—' }}</td>
+              <td>{{ '%.3f'|format(r.rmse) if r.rmse is not none else '—' }}</td>
+              <td>{{ '%.3f'|format(r.ets) if r.ets is not none else '—' }}</td>
+              <td>{{ '%.0f%%'|format(r.availability_rate * 100) if r.availability_rate is not none else '—' }}</td>
+              <td>{{ '%.3f'|format(r.delta_vs_incumbent) if r.delta_vs_incumbent is not none else '—' }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+
+    {# --- Diagnostics --- #}
+    {% if day_context %}
+      <section class="card">
+        <h2>Diagnostics</h2>
+        <p>
+          {{ day_context.snapshot_days }} snapshot days
+          &middot; {{ day_context.days_with_exclusions }} with knowability exclusions
+          &middot; {{ day_context.null_availability_samples }} null-availability samples
+        </p>
+      </section>
+    {% endif %}
+
+    {# --- Methodology / provenance --- #}
+    <section class="card">
+      <h2>Methodology</h2>
+      <p class="muted">
+        Methodology v{{ run.methodology_version }}
+        &middot; app {{ run.app_version }}
+        &middot; seed {{ run.bootstrap_seed }}
+        &middot; {{ run.bootstrap_resamples }} resamples
+        &middot; fingerprint {{ run.input_fingerprint[:12] }}&hellip;
+      </p>
+      <p class="muted">
+        Candidate CI {{ '%.4f'|format(methodology.candidate_ci_level) }}
+        &middot; precip-improvement CI {{ '%.4f'|format(methodology.precip_improvement_ci_level) }}
+        &middot; baseline-gate CI {{ '%.2f'|format(methodology.baseline_gate_ci_level) }}
+        &middot; non-inferiority margins {{ methodology.non_inferiority_mae_margin }} / {{ methodology.non_inferiority_ets_margin }}
+      </p>
+    </section>
+  {% endif %}
+{% endif %}
+{% endblock %}

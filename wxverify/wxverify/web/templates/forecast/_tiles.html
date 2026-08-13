@@ -34,7 +34,7 @@
                   <strong class="muted">&mdash;</strong>
                 {% endif %}
               </div>
-              <div class="tile-row" {% if tile.precip.meta.available %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Chance of rain is the share of hours at or above this site's rain threshold, not a true probability."{% endif %}>
+              <div class="tile-row" {% if tile.precip.meta.available %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Predicted wet-hour share: the share of forecast hours at or above this site's rain threshold, not a true probability."{% endif %}>
                 <span>Rain</span>
                 {% if tile.precip.meta.available and tile.precip.total_mm is not none %}
                   <strong>

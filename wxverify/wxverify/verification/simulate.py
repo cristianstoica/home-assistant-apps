@@ -285,25 +285,43 @@ def _daily_rank_order(
     *,
     quantity: str,
     knowable_through: str,
+    as_of: str,
 ) -> list[int]:
     """§10 diagnostic ranking: feeds by mean daily |error| on this quantity.
 
     Ranks over THIS run's already-persisted per-feed evidence at lead 1,
     restricted to target days knowable at T; a feed needs
     ``DAILY_RANK_MIN_HISTORY_DAYS`` scorable days to rank. Ties break by
-    (source, model), as production ranking does.
+    (source, model), as production ranking does. F-2: like
+    ``_persistence_predictions``, a target day whose truth was REVISED
+    after T is excluded — the as-of ranker could not have known the
+    revised value, and a post-T revision must not flip the rank order.
     """
     rows = conn.execute(
         """
-        SELECT entity_key, COUNT(*) AS n, AVG(abs_error) AS mean_abs
-        FROM verification_evidence
-        WHERE run_id = ? AND entity_type = 'feed' AND quantity = ?
-          AND lead = 1 AND forecast_eligible = 1 AND truth_eligible = 1
-          AND abs_error IS NOT NULL AND target_local_date <= ?
-        GROUP BY entity_key
+        SELECT e.entity_key, COUNT(*) AS n, AVG(e.abs_error) AS mean_abs
+        FROM verification_evidence e
+        JOIN daily_truth dt
+          ON dt.site_id = ? AND dt.tz_generation_id = ?
+         AND dt.quantity = e.quantity
+         AND dt.local_date = e.target_local_date
+        WHERE e.run_id = ? AND e.entity_type = 'feed' AND e.quantity = ?
+          AND e.lead = 1 AND e.forecast_eligible = 1 AND e.truth_eligible = 1
+          AND e.abs_error IS NOT NULL AND e.target_local_date <= ?
+          AND (dt.source_max_computed_at IS NULL
+               OR julianday(dt.source_max_computed_at) <= julianday(?))
+        GROUP BY e.entity_key
         HAVING COUNT(*) >= ?
         """,
-        (cfg.run_id, quantity, knowable_through, DAILY_RANK_MIN_HISTORY_DAYS),
+        (
+            cfg.site_id,
+            cfg.tz_generation_id,
+            cfg.run_id,
+            quantity,
+            knowable_through,
+            as_of,
+            DAILY_RANK_MIN_HISTORY_DAYS,
+        ),
     ).fetchall()
     by_feed = {f.feed_id: f for f in cfg.roster}
     ranked: list[tuple[float, str, str, int]] = []
@@ -575,6 +593,7 @@ def simulate_snapshot_day(
                         cfg,
                         quantity=quantity,
                         knowable_through=knowable_through,
+                        as_of=as_of,
                     )
                 order = daily_rank_cache[quantity]
                 for depth in SIM_DEPTHS:

@@ -650,6 +650,13 @@ def test_aggregate_strict_common_core_and_availability_floor() -> None:
         rain_threshold_mm=0.2,
         wall_clock="wc",
         blend_depth=2,
+        # Divergent on purpose: only `wind` evidence exists, so every anchor
+        # below is unchanged, but temperature/precip now differ from both
+        # each other and the global `blend_depth=2`. A mutant that resolved
+        # the incumbent from the global (or from the first/any variable's
+        # entry) instead of the cell's OWN variable would pick 1 or 4 here
+        # and break the hand-derived deltas (0.5 and 5/6).
+        blend_depths={"temperature": 1, "wind": 2, "precip": 4},
         min_n=30,
         window_days=30,
         tz_generation_id=generation,

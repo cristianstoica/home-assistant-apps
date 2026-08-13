@@ -6,6 +6,7 @@ import sqlite3
 
 from wxverify.core.options import RuntimeOptions
 from wxverify.db.connection import get_db
+from wxverify.settings.depth import DEPTH_VARIABLES, depth_override_key
 from wxverify.settings.keys import set_setting
 
 
@@ -38,6 +39,17 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
             set_setting(conn, "min_n", str(options.min_n))
         if options.forecast_blend_depth is not None:
             set_setting(conn, "forecast_blend_depth", str(options.forecast_blend_depth))
+        # §15 clearing rule — scoped to the three per-variable depth keys
+        # only: a key absent from this apply DELETES its settings row, so
+        # the global fallback takes effect and provenance reads "global".
+        # The plain keys above keep their apply-when-present semantics.
+        for variable in DEPTH_VARIABLES:
+            value = getattr(options, f"forecast_blend_depth_{variable}")
+            key = depth_override_key(variable)
+            if value is not None:
+                set_setting(conn, key, str(int(value)))
+            else:
+                conn.execute("DELETE FROM settings WHERE key = ?", (key,))
         if options.obs_interval_minutes is not None:
             set_setting(conn, "obs_interval_minutes", str(options.obs_interval_minutes))
         if options.obs_jitter_minutes is not None:

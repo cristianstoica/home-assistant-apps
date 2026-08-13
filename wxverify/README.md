@@ -229,6 +229,7 @@ Main pages:
 /sites
 /ops
 /overlay
+/verification
 ```
 
 The UI uses CSRF-protected HTMX JSON actions. Mutating actions are not plain HTML
@@ -343,6 +344,10 @@ code.
   `last_obs_at`.
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
+- Audit queries against `verification_trigger_decisions` must select
+  `MAX(id)` per `(site_id, trigger_date)`: a retried trigger appends a new
+  decision row for the same site and day rather than updating the old one,
+  so the highest `id` is the decision that actually stood.
 
 ## Database Export and Import
 

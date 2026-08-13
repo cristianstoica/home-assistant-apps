@@ -45,6 +45,7 @@ from wxverify.forecast.selection import (
     select_cell_feeds,
 )
 from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard_with_status
+from wxverify.settings.depth import effective_blend_depths
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.verification.coverage import evaluate_variable, local_day_bounds
 from wxverify.verification.methodology import (
@@ -74,7 +75,7 @@ def _dumps(obj: object) -> str:
     return json.dumps(obj, separators=(",", ":"))
 
 
-def _parse_wall_clock(raw: str) -> tuple[int, int] | None:
+def parse_wall_clock(raw: str) -> tuple[int, int] | None:
     parts = raw.strip().split(":")
     if len(parts) != 2:
         return None
@@ -96,7 +97,7 @@ def snapshot_wall_clock(conn: sqlite3.Connection, site_id: int) -> str:
     """
     for key in (f"{SNAPSHOT_TIME_KEY}:{site_id}", SNAPSHOT_TIME_KEY):
         raw = get_setting(conn, key)
-        if raw is not None and _parse_wall_clock(raw) is not None:
+        if raw is not None and parse_wall_clock(raw) is not None:
             return raw.strip()
     return SNAPSHOT_LOCAL_TIME
 
@@ -111,7 +112,7 @@ def resolve_snapshot_utc(timezone: str, local_date: date, wall_clock: str) -> da
     (03:00) — within the hour, deterministic, and identical for the default
     07:00 snapshot time, which no real-world DST gap touches.
     """
-    parsed = _parse_wall_clock(wall_clock)
+    parsed = parse_wall_clock(wall_clock)
     if parsed is None:
         raise ValueError(f"invalid snapshot wall clock {wall_clock!r}")
     hour, minute = parsed
@@ -290,14 +291,20 @@ def build_forecast_record(
     )
     grouped = _group_samples(samples, timezone=timezone, now=snapshot_utc)
 
-    blend_depth = get_number_setting(conn, "forecast_blend_depth", 2, minimum=1)
+    # §15 lockstep: the record resolves depth through the SAME per-variable
+    # helper the live Forecast page and the run snapshot use.
+    depths = effective_blend_depths(conn)
     declared_min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     declared_window_days = get_number_setting(
         conn, "rolling_window_days", 30, minimum=1
     )
     policy = _dumps(
         {
-            "blend_depth": blend_depth,
+            "blend_depth": get_number_setting(
+                conn, "forecast_blend_depth", 2, minimum=1
+            ),
+            "blend_depths": {v: d.depth for v, d in depths.items()},
+            "blend_depth_sources": {v: d.source for v, d in depths.items()},
             "min_n": declared_min_n,
             "window_days": declared_window_days,
             "rain_threshold_mm": rain_threshold_mm,
@@ -352,7 +359,9 @@ def build_forecast_record(
                         covered_hours=covered_hours(s.valid_at for s in feed_samples),
                     )
                 )
-            selection = select_cell_feeds(candidates, blend_depth=blend_depth)
+            selection = select_cell_feeds(
+                candidates, blend_depth=depths[variable].depth
+            )
             selected_ids = [c.feed_id for c in selection.feeds]
             weight = 1.0 / len(selected_ids) if selected_ids else None
             hourly = _blend_hourly(selection, feeds_samples)

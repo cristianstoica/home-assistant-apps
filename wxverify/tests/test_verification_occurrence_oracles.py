@@ -266,8 +266,20 @@ def test_occurrence_min_event_boundaries(
     hits: int, misses: int, false_alarms: int, expected: str
 ) -> None:
     vs_incumbent, vs_always_dry = _occ_series(hits, misses, false_alarms)
+    # F-1: recommending on the occurrence endpoint requires a MEASURED
+    # non-inferior total endpoint; a flat equal-error series (effect = 0)
+    # keeps the recommend cases about the wet/dry minimums, not about F-1.
+    # The insufficient cases stay occurrence-only so BOTH endpoints are
+    # unmeasurable — the run-level insufficient_evidence condition.
+    flat_total = {d: (2.0, 2.0) for d in _OCC_DATES}
+    continuous = (
+        {"precip_total": {lead: dict(flat_total) for lead in range(1, 8)}}
+        if expected == "recommend"
+        else {}
+    )
     candidate = CandidateSeries(
         key="3",
+        continuous=continuous,
         occurrence={lead: dict(vs_incumbent) for lead in range(1, 8)},
         baseline_occurrence={
             "baseline_always_dry": {lead: dict(vs_always_dry) for lead in range(1, 8)}
@@ -278,8 +290,28 @@ def test_occurrence_min_event_boundaries(
     )
     verdict = decide_variable(inputs, seed=20260713, resamples=400)
     assert verdict.outcome == expected
+    # The min-event floor is pinned DIRECTLY on the occurrence endpoint's
+    # adequate-lead set, not only through the outcome string: the fixture
+    # is 25 days on every lead, comfortably over the 20-day adequacy floor,
+    # so an empty adequate set can only come from the wet/dry minimums.
+    # This assertion is independent of the F-1 fixture asymmetry above
+    # (flat total present only on the recommend rows) — a mutant that
+    # dropped the wet/dry floor entirely would populate adequate_leads here
+    # and go red even if the outcome string happened to survive.
+    record = verdict.detail["candidates"]["3"]  # type: ignore[index]
+    occ = record["occurrence"]  # type: ignore[index]
+    assert len(vs_incumbent) == 25  # > ADEQUATE_LEAD_MIN_DAYS (20)
     if expected == "recommend":
         assert verdict.recommended_key == "3"
+        assert occ["adequate_leads"] == list(range(1, 8))  # type: ignore[index]
+        # ...and the flat, equal-error total endpoint (effect exactly 0) is
+        # only PERMISSIVE: the recommendation is attributed to occurrence
+        # alone, so the F-1 fixture addition cannot be what carries it.
+        conditions = record["conditions"]  # type: ignore[index]
+        assert conditions["improved_endpoints"] == ["occurrence"]  # type: ignore[index]
+        assert conditions["total_material"] is False  # type: ignore[index]
+    else:
+        assert occ["adequate_leads"] == []  # type: ignore[index]
 
 
 def test_occurrence_recommend_case_ets_point_is_hand_derived() -> None:

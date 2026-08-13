@@ -46,7 +46,7 @@ from wxverify.forecast.selection import (
     select_cell_feeds,
 )
 from wxverify.scoring.leaderboard import LeaderboardRow
-from wxverify.settings.keys import get_number_setting
+from wxverify.settings.depth import effective_blend_depths
 from wxverify.web.context import feed_label
 
 DAY_COUNT = 8
@@ -163,7 +163,7 @@ def build_forecast(
     grouped = _group_samples(samples, timezone=timezone, now=at)
     freshness = load_feed_freshness(conn, site_id=site_id, now=at)
     stale_ids = {feed_id for feed_id, row in freshness.items() if row.stale}
-    blend_depth = get_number_setting(conn, "forecast_blend_depth", 2, minimum=1)
+    depths = effective_blend_depths(conn)
     rank_cache: _RankCache = {}
 
     tz = ZoneInfo(timezone)
@@ -179,7 +179,7 @@ def build_forecast(
                 variable=variable,
                 timezone=timezone,
                 feeds_samples=feeds_samples,
-                blend_depth=blend_depth,
+                blend_depth=depths[variable].depth,
                 rank_cache=rank_cache,
             )
             meta, values = _cell_meta_and_values(
@@ -234,7 +234,7 @@ def build_hourly(
         since_valid_at=isoformat_utc(local_day_start(at, timezone)),
     )
     grouped = _group_samples(samples, timezone=timezone, now=at)
-    blend_depth = get_number_setting(conn, "forecast_blend_depth", 2, minimum=1)
+    depths = effective_blend_depths(conn)
     rank_cache: _RankCache = {}
 
     selections: dict[str, CellSelection] = {}
@@ -246,7 +246,7 @@ def build_hourly(
             variable=variable,
             timezone=timezone,
             feeds_samples=feeds_samples,
-            blend_depth=blend_depth,
+            blend_depth=depths[variable].depth,
             rank_cache=rank_cache,
         )
 

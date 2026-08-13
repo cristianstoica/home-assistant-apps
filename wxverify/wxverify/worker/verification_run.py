@@ -45,6 +45,7 @@ from wxverify.verification.engine import (
     aggregate_run,
     finalize_verdicts,
     prepare_bootstrap_inputs,
+    preskipped_verdicts,
     publish_verified_run,
 )
 from wxverify.verification.runs import (
@@ -129,6 +130,11 @@ async def run_verification_chunk(
         verdicts = await asyncio.to_thread(
             _compute_verdicts, inputs, cfg.bootstrap_seed, resamples
         )
+        # §15/F-3: variables whose incumbent depth is outside SIM_DEPTHS
+        # were skipped by prepare_bootstrap_inputs; persist their explicit
+        # 'skipped' verdicts so publish integrity still sees one per
+        # variable and nothing all-insufficient publishes silently.
+        verdicts.extend(preskipped_verdicts(cfg))
         await writer.write(lambda conn: _persist_verdicts(conn, site_id, cfg, verdicts))
         return _continuation(site_id, payload)
     more = await writer.write(lambda conn: advance_verification(conn, site_id, payload))

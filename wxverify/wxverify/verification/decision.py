@@ -545,10 +545,18 @@ def _decide_precip(
         and occ.point >= PRACTICAL_FLOOR_ETS
         and _lead_stability(occ)
     )
+    # F-1: non-inferiority must be MEASURED, never vacuous. An endpoint with
+    # zero adequate leads has point=None; treating that as non-inferior
+    # would let a candidate reach 'recommend' with the other endpoint
+    # unmeasurable (the wet-day-starved case). Fail closed: an unmeasurable
+    # endpoint blocks the other endpoint's improvement, and the outcome
+    # falls through to mixed_by_quantity below.
     total_non_inferior = (
-        total.point is None or total.point >= -NON_INFERIORITY_MAE_MARGIN
+        total.point is not None and total.point >= -NON_INFERIORITY_MAE_MARGIN
     )
-    occ_non_inferior = occ.point is None or occ.point >= -NON_INFERIORITY_ETS_MARGIN
+    occ_non_inferior = (
+        occ.point is not None and occ.point >= -NON_INFERIORITY_ETS_MARGIN
+    )
     improved: list[str] = []
     if total_material and occ_non_inferior:
         improved.append("total")
@@ -594,6 +602,13 @@ def _decide_precip(
             or (_beats(occ) and not _lead_stability(occ))
         )
     )
+    # F-4 (documented unit mix): total.point is a RELATIVE-MAE improvement
+    # while occ.point is an ETS DIFFERENCE — different units, deliberately
+    # NOT normalized. `pooled` only orders passing candidates for the §12
+    # tie-break (and CI overlap then prefers the depth nearest the
+    # incumbent), so a cross-unit max is an ordering heuristic, not a
+    # reported effect size; the per-endpoint effects in `record` stay in
+    # their own units.
     pooled_candidates = [
         e
         for e in (

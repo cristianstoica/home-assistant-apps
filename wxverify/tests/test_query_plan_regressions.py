@@ -11,11 +11,13 @@ it.
 from __future__ import annotations
 
 import datetime
+import inspect
 import os
 import sqlite3
 
 import pytest
 
+import wxverify.api.routes.verification
 from wxverify.api.routes.health import (
     FORECAST_PAIRS_COUNT_SQL,
     FORECAST_SAMPLES_COUNT_SQL,
@@ -559,4 +561,156 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
         ("valid_at", 0),
         ("variable", 0),
         ("model_run_id", 0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# §18.12 — query-plan expectations for the 0.11.0 verification indexes.
+#
+# Every /api/verification/* collection read must SEEK into an index on its
+# scoping key (run_id or site_id); a plan that SCANs one of these tables is
+# unbounded across runs/sites and is exactly the regression this family
+# exists to fail on. Each positive is paired with an empirically degrading
+# negative control: dropping the index, or dropping the scoping conjunct.
+#
+# The statements are retyped here because the route builds them as f-strings
+# around an optional filter clause rather than exporting a constant; a
+# source-text tripwire below fails if the production text drifts away from
+# what is pinned.
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_PAGE_SQL = """
+            SELECT * FROM verification_evidence
+            WHERE run_id = ?
+            ORDER BY id LIMIT ? OFFSET ?
+            """
+
+_RUNS_PAGE_SQL = """
+            SELECT * FROM verification_runs
+            ORDER BY id DESC LIMIT ? OFFSET ?
+            """
+
+_FAILED_NEWER_SQL = """
+        SELECT 1 FROM verification_runs
+        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1
+        """
+
+
+def test_verification_route_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire: the route composes its statements inline, so the
+    pinned copies above are only trustworthy while the production text
+    still contains them."""
+    source = inspect.getsource(wxverify.api.routes.verification)
+    assert "SELECT * FROM verification_evidence\n            WHERE run_id = ?" in source
+    assert "ORDER BY id LIMIT ? OFFSET ?" in source
+    assert "SELECT * FROM verification_runs {where}\n            ORDER BY id DESC" in (
+        source
+    )
+    assert (
+        "SELECT 1 FROM verification_runs\n"
+        "        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1" in source
+    )
+
+
+def test_evidence_page_seeks_by_run_id_never_scans() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
+    assert any("SEARCH verification_evidence" in line for line in plan), plan
+    assert any("(run_id=?)" in line for line in plan), plan
+    assert not any(line.startswith("SCAN verification_evidence") for line in plan), plan
+    # The run-scoping survives even without the secondary cell index: the
+    # UNIQUE(run_id, ...) autoindex leads on run_id too. Pinning both
+    # configurations records WHY the page can never scan all runs.
+    conn.execute("DROP INDEX idx_verification_evidence_cell")
+    fallback = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
+    assert any(
+        "SEARCH verification_evidence USING INDEX"
+        " sqlite_autoindex_verification_evidence_1 (run_id=?)" in line
+        for line in fallback
+    ), fallback
+
+
+def test_evidence_page_without_run_scoping_degrades_to_a_scan() -> None:
+    """Negative control: the exact regression §18.12 names — a detailed
+    evidence read that loses its run_id binding — plans as a full scan, so
+    the positive above is not vacuously true on this schema."""
+    conn = _fresh_conn()
+    degraded = _EVIDENCE_PAGE_SQL.replace("WHERE run_id = ?", "WHERE variable = ?")
+    assert degraded != _EVIDENCE_PAGE_SQL
+    plan = _plan(conn, degraded, ("wind", 10, 0))
+    assert plan == ["SCAN verification_evidence"], plan
+
+
+def test_runs_page_and_failed_newer_probe_use_idx_verification_runs_site() -> None:
+    conn = _fresh_conn()
+    site_sql = _RUNS_PAGE_SQL.replace(
+        "FROM verification_runs", "FROM verification_runs WHERE site_id = ?"
+    )
+    plan = _plan(conn, site_sql, (1, 10, 0))
+    assert any(
+        "SEARCH verification_runs USING INDEX idx_verification_runs_site (site_id=?)"
+        in line
+        for line in plan
+    ), plan
+    # The status banner's "a newer attempt failed" probe binds all three
+    # index columns and never touches the table.
+    probe = _plan(conn, _FAILED_NEWER_SQL, (1, 0))
+    assert probe == [
+        "SEARCH verification_runs USING COVERING INDEX"
+        " idx_verification_runs_site (site_id=? AND state=? AND id>?)"
+    ], probe
+
+    # Negative control: without the index the site page scans every run and
+    # the status probe falls back to a rowid range over all sites.
+    conn.execute("DROP INDEX idx_verification_runs_site")
+    assert _plan(conn, site_sql, (1, 10, 0)) == ["SCAN verification_runs"]
+    assert _plan(conn, _FAILED_NEWER_SQL, (1, 0)) == [
+        "SEARCH verification_runs USING INTEGER PRIMARY KEY (rowid>?)"
+    ]
+
+
+def test_trigger_decision_lookup_uses_its_site_date_index() -> None:
+    conn = _fresh_conn()
+    sql = """
+        SELECT * FROM verification_trigger_decisions
+        WHERE site_id = ? AND trigger_date = ? ORDER BY id DESC LIMIT 1
+        """
+    plan = _plan(conn, sql, (1, "2026-05-01"))
+    assert plan == [
+        "SEARCH verification_trigger_decisions USING INDEX"
+        " idx_verification_trigger_site_date (site_id=? AND trigger_date=?)"
+    ], plan
+    conn.execute("DROP INDEX idx_verification_trigger_site_date")
+    assert _plan(conn, sql, (1, "2026-05-01")) == [
+        "SCAN verification_trigger_decisions"
+    ]
+
+
+def test_new_verification_index_column_order_matches_the_query_shapes() -> None:
+    """Structure asserted via PRAGMA index_xinfo, never a DDL string copy."""
+    conn = _fresh_conn()
+
+    def keyed(index: str) -> list[tuple[str, int]]:
+        return [
+            (str(row["name"]), int(row["desc"]))
+            for row in conn.execute(f"PRAGMA index_xinfo({index})")  # noqa: S608
+            if row["key"]
+        ]
+
+    assert keyed("idx_verification_runs_site") == [
+        ("site_id", 0),
+        ("state", 0),
+        ("id", 0),
+    ]
+    assert keyed("idx_verification_evidence_cell") == [
+        ("run_id", 0),
+        ("entity_type", 0),
+        ("quantity", 0),
+        ("lead", 0),
+        ("target_local_date", 0),
+    ]
+    assert keyed("idx_verification_trigger_site_date") == [
+        ("site_id", 0),
+        ("trigger_date", 0),
+        ("id", 0),
     ]

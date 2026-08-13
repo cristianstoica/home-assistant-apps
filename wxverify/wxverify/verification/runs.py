@@ -24,6 +24,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.effective import active_competitor_clause
+from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.methodology import (
     BOOTSTRAP_RESAMPLES,
@@ -65,6 +66,7 @@ class RunConfig:
     rain_threshold_mm: float
     wall_clock: str
     blend_depth: int
+    blend_depths: dict[str, int]
     min_n: int
     window_days: int
     tz_generation_id: int
@@ -73,6 +75,10 @@ class RunConfig:
     period_end: str
     bootstrap_seed: int
     bootstrap_resamples: int
+
+    def incumbent_depth(self, variable: str) -> int:
+        """The variable's pinned effective depth (§15 lockstep)."""
+        return self.blend_depths.get(variable, self.blend_depth)
 
 
 def _dumps(obj: object) -> str:
@@ -120,11 +126,16 @@ def capture_config_snapshot(
     ).fetchone()
     if site is None:
         raise ValueError(f"site {site_id} does not exist")
+    depths = effective_blend_depths(conn)
     return {
         "timezone": str(site["timezone"]),
         "rain_threshold_mm": float(site["rain_threshold_mm"]),
         "wall_clock": snapshot_wall_clock(conn, site_id),
         "blend_depth": get_number_setting(conn, "forecast_blend_depth", 2, minimum=1),
+        # §15: per-variable effective depth + provenance, resolved through
+        # the same helper the live page and the record builder use.
+        "blend_depths": {v: d.depth for v, d in depths.items()},
+        "blend_depth_sources": {v: d.source for v, d in depths.items()},
         "min_n": get_number_setting(conn, "min_n", 30, minimum=0),
         "window_days": get_number_setting(conn, "rolling_window_days", 30, minimum=1),
         "tz_generation_id": ensure_published_generation(conn, site_id),
@@ -356,6 +367,20 @@ def _parse_roster(raw: object) -> tuple[RosterFeed, ...]:
     return tuple(roster)
 
 
+def _parse_blend_depths(raw: object, blend_depth: int) -> dict[str, int]:
+    """Rehydrate the pinned per-variable depth map from JSON-shaped data.
+
+    A snapshot written before §15 lacks the key; synthesizing the map from
+    the pinned global depth preserves the pre-§15 incumbent semantics.
+    """
+    out: dict[str, int] = dict.fromkeys(DEPTH_VARIABLES, blend_depth)
+    if isinstance(raw, dict):
+        for key, value in cast("dict[object, object]", raw).items():
+            if str(key) in out:
+                out[str(key)] = int(str(value))
+    return out
+
+
 def run_config_from_row(conn: sqlite3.Connection, run_id: int) -> RunConfig:
     """Rehydrate the pinned :class:`RunConfig` from a run row."""
     row = conn.execute(
@@ -370,13 +395,15 @@ def run_config_from_row(conn: sqlite3.Connection, run_id: int) -> RunConfig:
         str(k): v for k, v in cast("dict[object, object]", snapshot_raw).items()
     }
     roster = _parse_roster(snapshot.get("roster"))
+    blend_depth = int(str(snapshot["blend_depth"]))
     return RunConfig(
         site_id=int(row["site_id"]),
         run_id=run_id,
         timezone=str(snapshot["timezone"]),
         rain_threshold_mm=float(str(snapshot["rain_threshold_mm"])),
         wall_clock=str(snapshot["wall_clock"]),
-        blend_depth=int(str(snapshot["blend_depth"])),
+        blend_depth=blend_depth,
+        blend_depths=_parse_blend_depths(snapshot.get("blend_depths"), blend_depth),
         min_n=int(str(snapshot["min_n"])),
         window_days=int(str(snapshot["window_days"])),
         tz_generation_id=int(row["tz_generation_id"]),
@@ -405,6 +432,11 @@ def assert_inputs_unpinned_unchanged(conn: sqlite3.Connection, cfg: RunConfig) -
     mismatches: list[str] = []
     if current_roster != cfg.roster:
         mismatches.append("roster")
+    # Per-variable effective depths (§15): compare depths only — a
+    # provenance flip that leaves every effective depth unchanged (e.g. an
+    # override set equal to the global) cannot change results mid-run.
+    if current.get("blend_depths") != cfg.blend_depths:
+        mismatches.append("blend_depths")
     for key, pinned in (
         ("timezone", cfg.timezone),
         ("rain_threshold_mm", cfg.rain_threshold_mm),

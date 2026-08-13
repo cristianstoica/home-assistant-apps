@@ -437,7 +437,7 @@ def create_schema(conn: sqlite3.Connection) -> None:
             variable TEXT NOT NULL,
             outcome TEXT NOT NULL CHECK(outcome IN
                 ('recommend','retain_incumbent','mixed_by_lead',
-                 'mixed_by_quantity','insufficient_evidence')),
+                 'mixed_by_quantity','insufficient_evidence','skipped')),
             recommended_depth INTEGER,
             incumbent_depth INTEGER NOT NULL,
             tested_family TEXT NOT NULL,

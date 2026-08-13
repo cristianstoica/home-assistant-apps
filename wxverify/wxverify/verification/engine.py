@@ -129,18 +129,27 @@ def _resolve_cell(
 def _continuous_metrics(
     rows: dict[str, sqlite3.Row], dates: list[str]
 ) -> tuple[float, float, float] | None:
+    # §15/F-3: an out-of-range (depth-5/6) incumbent has no simulated rows,
+    # so a date can be absent from `rows` even on a headline core — the
+    # comparison is then unmeasurable and must fail closed to None, never
+    # crash or fabricate a zero.
+    if not dates or any(d not in rows for d in dates):
+        return None
     errors = [
         float(rows[d]["predicted"]) - float(rows[d]["truth_value"]) for d in dates
     ]
-    if not errors:
-        return None
     return mae(errors), bias(errors), rmse(errors)
 
 
 def _contingency(rows: dict[str, sqlite3.Row], dates: list[str]) -> Contingency:
     table = Contingency()
     for d in dates:
-        outcome = rows[d]["occurrence_outcome"]
+        row = rows.get(d)
+        if row is None:
+            # Same F-3 guard as _continuous_metrics: absent incumbent rows
+            # contribute nothing rather than crashing.
+            continue
+        outcome = row["occurrence_outcome"]
         if outcome is not None:
             table = table.add(str(outcome))
     return table
@@ -154,9 +163,10 @@ def _pairwise_core(cell: _CellRows, entity: EntityId, incumbent: EntityId) -> li
 
 def aggregate_run(conn: sqlite3.Connection, cfg: RunConfig) -> None:
     """Resolve every cell, write ``verification_results`` + aggregate_state."""
-    incumbent: EntityId = ("depth", str(cfg.blend_depth))
     state: dict[str, object] = {}
     for variable in SIM_VARIABLES:
+        # §15: the incumbent is the variable's pinned effective depth.
+        incumbent: EntityId = ("depth", str(cfg.incumbent_depth(variable)))
         for lead in range(SIM_DAY_COUNT):
             for quantity in VARIABLE_QUANTITIES[variable]:
                 cell = _load_cell(conn, cfg.run_id, variable, lead, quantity)
@@ -325,9 +335,15 @@ def prepare_bootstrap_inputs(
     """Rebuild the §12 paired series from evidence + the persisted cell
     resolution — read-only; safe on a read connection."""
     state = _aggregate_state(conn, cfg.run_id)
-    incumbent: EntityId = ("depth", str(cfg.blend_depth))
     out: list[VariableInputs] = []
     for variable in SIM_VARIABLES:
+        incumbent_depth = cfg.incumbent_depth(variable)
+        if incumbent_depth not in SIM_DEPTHS:
+            # §15/F-3: a depth-5/6 incumbent has no simulated entity, so
+            # every comparison would be vacuous. preskipped_verdicts()
+            # supplies the explicit 'skipped' verdict for this variable.
+            continue
+        incumbent: EntityId = ("depth", str(incumbent_depth))
         cells: dict[tuple[int, str], _CellRows] = {}
         cores: dict[tuple[int, str], list[str]] = {}
         for lead in DECISION_LEADS:
@@ -340,7 +356,7 @@ def prepare_bootstrap_inputs(
                 )
         candidates: list[CandidateSeries] = []
         for depth in SIM_DEPTHS:
-            if depth == cfg.blend_depth:
+            if depth == incumbent_depth:
                 continue
             entity: EntityId = ("depth", str(depth))
             continuous: dict[str, dict[int, ContinuousLead]] = {}
@@ -402,10 +418,38 @@ def prepare_bootstrap_inputs(
         out.append(
             VariableInputs(
                 variable=variable,
-                incumbent_key=str(cfg.blend_depth),
+                incumbent_key=str(incumbent_depth),
                 candidates=tuple(candidates),
             )
         )
+    return out
+
+
+def preskipped_verdicts(cfg: RunConfig) -> list[Verdict]:
+    """Explicit 'skipped' verdicts for incumbents outside SIM_DEPTHS (§15).
+
+    A depth-5/6 incumbent is a valid setting but has no simulated entity —
+    every headline comparison would be vacuously insufficient. Rather than
+    silently publishing an all-insufficient run, the variable is skipped
+    with an explicit machine-readable reason; publish integrity still
+    requires one verdict per variable, and these rows satisfy it.
+    """
+    out: list[Verdict] = []
+    for variable in SIM_VARIABLES:
+        depth = cfg.incumbent_depth(variable)
+        if depth not in SIM_DEPTHS:
+            out.append(
+                Verdict(
+                    variable=variable,
+                    outcome="skipped",
+                    recommended_key=None,
+                    detail={
+                        "incumbent": str(depth),
+                        "reason": "incumbent_depth_out_of_simulated_range",
+                        "simulated_depths": list(SIM_DEPTHS),
+                    },
+                )
+            )
     return out
 
 
@@ -430,7 +474,7 @@ def finalize_verdicts(
                 verdict.variable,
                 verdict.outcome,
                 recommended,
-                cfg.blend_depth,
+                cfg.incumbent_depth(verdict.variable),
                 json.dumps(verdict.detail, separators=(",", ":"), sort_keys=True),
             ),
         )

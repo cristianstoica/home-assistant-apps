@@ -11,6 +11,7 @@ from wxverify.db.connection import get_db
 from wxverify.forecast.data import samples_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
+from wxverify.settings.depth import effective_blend_depths
 from wxverify.web.context import (
     SiteView,
     load_backfill,
@@ -21,6 +22,7 @@ from wxverify.web.context import (
     load_sites,
 )
 from wxverify.web.render import render, render_fragment
+from wxverify.web.verification import load_verification
 
 router = APIRouter(include_in_schema=False)
 
@@ -66,7 +68,14 @@ def _load_forecast_context(
             timezone=site.timezone,
             rain_threshold_mm=site.rain_threshold_mm,
         )
-    return {"sites": sites, "site": site, "view": view}
+    # §15 ride-along: per-variable effective blend depth + provenance,
+    # resolved through the same helper the blend and the record use.
+    return {
+        "sites": sites,
+        "site": site,
+        "view": view,
+        "depths": effective_blend_depths(conn),
+    }
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -160,6 +169,12 @@ async def dashboard_page(
     ):
         schedule_score_rescore(resolved_site.id)
     return render(request, "dashboard/show.html", **context)
+
+
+@router.get("/verification", response_class=HTMLResponse)
+async def verification_page(request: Request, site: int | None = None) -> HTMLResponse:
+    context = await get_db().read(lambda conn: load_verification(conn, site))
+    return render(request, "verification/show.html", **context)
 
 
 @router.get("/ops", response_class=HTMLResponse)

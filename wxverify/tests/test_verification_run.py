@@ -21,6 +21,7 @@ from tests.helpers import asof_conn, asof_insert_pair, asof_make_real_feed
 from wxverify.db.queue import Job
 from wxverify.db.runtime_state import get_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.settings.keys import set_setting
 from wxverify.verification.decision import (
     CandidateSeries,
     ContinuousLead,
@@ -28,7 +29,7 @@ from wxverify.verification.decision import (
     VariableInputs,
     decide_variable,
 )
-from wxverify.verification.engine import prepare_bootstrap_inputs
+from wxverify.verification.engine import prepare_bootstrap_inputs, preskipped_verdicts
 from wxverify.verification.runs import (
     capture_config_snapshot,
     input_fingerprint,
@@ -195,8 +196,14 @@ def test_decision_precip_occurrence_path() -> None:
         else:
             occ[d] = ("correct_negative", "false_alarm")
             base[d] = ("correct_negative", "correct_negative")
+    # F-1: the total endpoint must be MEASURED non-inferior (a candidate
+    # with no precip_total series can no longer recommend vacuously), so
+    # the fixture carries a flat, equal-error total series (effect = 0).
     candidate = CandidateSeries(
         key="1",
+        continuous={
+            "precip_total": {lead: _flat_continuous(2.0, 2.0) for lead in range(1, 8)}
+        },
         occurrence={lead: dict(occ) for lead in range(1, 8)},
         baseline_occurrence={
             "baseline_always_dry": {lead: dict(base) for lead in range(1, 8)}
@@ -208,6 +215,32 @@ def test_decision_precip_occurrence_path() -> None:
     verdict = decide_variable(inputs, seed=9, resamples=60)
     assert verdict.outcome == "recommend"
     assert verdict.recommended_key == "1"
+
+
+def test_decision_wet_day_starved_total_alone_cannot_recommend() -> None:
+    """F-1 dedicated oracle: a materially improved precip_total with an
+    UNMEASURED occurrence endpoint must not recommend — the vacuous
+    non-inferiority read (absent point treated as non-inferior) is the
+    exact bug F-1 fixed, so pre-fix this fixture recommends and post-fix
+    it lands in mixed_by_quantity."""
+    leads = {lead: _flat_continuous(1.0, 2.0) for lead in range(1, 8)}
+    base_leads = {lead: _flat_continuous(1.0, 3.0) for lead in range(1, 8)}
+    candidate = CandidateSeries(
+        key="1",
+        continuous={"precip_total": leads},
+        baseline_continuous={
+            "baseline_persistence": {"precip_total": base_leads},
+            "baseline_all_feed_mean": {"precip_total": base_leads},
+        },
+        # Wet-day-starved: no occurrence series at all -> the occurrence
+        # endpoint has no measurable effect at any lead.
+    )
+    inputs = VariableInputs(
+        variable="precip", incumbent_key="2", candidates=(candidate,)
+    )
+    verdict = decide_variable(inputs, seed=7, resamples=60)
+    assert verdict.outcome != "recommend"
+    assert verdict.outcome == "mixed_by_quantity"
 
 
 def test_decision_is_deterministic() -> None:
@@ -321,6 +354,9 @@ def _drive_chain(
             cfg = run_config_from_row(conn, run_id)
             inputs = prepare_bootstrap_inputs(conn, cfg)
             verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
+            # Mirror the async worker exactly (§15/F-3): out-of-range
+            # incumbents get explicit 'skipped' verdicts appended.
+            verdicts.extend(preskipped_verdicts(cfg))
             _persist_verdicts(conn, site_id, cfg, verdicts)
             continue
         if not advance_verification(conn, site_id, payload):
@@ -451,6 +487,83 @@ def test_chain_publishes_a_complete_run() -> None:
 
     # Chain state fully cleared after publish.
     assert get_runtime_state(conn, verification_state_key(site_id)) is None
+
+
+def test_preskipped_verdicts_only_for_out_of_range_incumbents() -> None:
+    """F-3 unit: depth-5/6 incumbents yield explicit 'skipped' verdicts."""
+    conn = asof_conn()
+    site_id, _feeds = _make_verification_site(conn)
+    set_setting(conn, "forecast_blend_depth_precip", "5")
+    snapshot = capture_config_snapshot(conn, site_id)
+    assert snapshot["blend_depths"] == {"temperature": 2, "wind": 2, "precip": 5}
+    # Build a config through the real snapshot path.
+    from wxverify.verification.runs import RunConfig, _parse_blend_depths
+
+    cfg = RunConfig(
+        site_id=site_id,
+        run_id=1,
+        timezone="UTC",
+        rain_threshold_mm=0.2,
+        wall_clock="07:00",
+        blend_depth=2,
+        blend_depths=_parse_blend_depths(snapshot["blend_depths"], 2),
+        min_n=30,
+        window_days=30,
+        tz_generation_id=1,
+        roster=(),
+        period_start="2026-06-01",
+        period_end="2026-06-05",
+        bootstrap_seed=1,
+        bootstrap_resamples=40,
+    )
+    skipped = preskipped_verdicts(cfg)
+    assert [v.variable for v in skipped] == ["precip"]
+    assert skipped[0].outcome == "skipped"
+    assert skipped[0].recommended_key is None
+    assert skipped[0].detail == {
+        "incumbent": "5",
+        "reason": "incumbent_depth_out_of_simulated_range",
+        "simulated_depths": [1, 2, 3, 4],
+    }
+
+
+def test_chain_depth5_incumbent_publishes_explicit_skip() -> None:
+    """F-3 end-to-end: a depth-5 precip incumbent never yields a silent
+    all-insufficient publish — the run publishes with precip = 'skipped'
+    (incumbent_depth 5) while the in-range variables decide normally."""
+    conn = asof_conn()
+    site_id, _feeds = _make_verification_site(conn)
+    set_setting(conn, "forecast_blend_depth_precip", "5")
+    conn.commit()
+    _drive_chain(conn, site_id, {"trigger_date": "2026-06-06"})
+
+    run_id = published_run_id(conn, site_id)
+    assert run_id is not None
+    run = conn.execute(
+        "SELECT state FROM verification_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    assert run["state"] == "published"
+    verdicts = {
+        str(r["variable"]): r
+        for r in conn.execute(
+            """
+            SELECT variable, outcome, incumbent_depth, tested_family
+            FROM verification_verdicts WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+    }
+    assert set(verdicts) == {"temperature", "wind", "precip"}
+    assert str(verdicts["precip"]["outcome"]) == "skipped"
+    assert int(verdicts["precip"]["incumbent_depth"]) == 5
+    # In-range variables still decide through the normal path (five settled
+    # days -> insufficient), never inherit the skip.
+    assert str(verdicts["temperature"]["outcome"]) == "insufficient_evidence"
+    assert str(verdicts["wind"]["outcome"]) == "insufficient_evidence"
+    # prepare_bootstrap_inputs excludes the out-of-range variable entirely.
+    cfg = run_config_from_row(conn, run_id)
+    inputs = prepare_bootstrap_inputs(conn, cfg)
+    assert {i.variable for i in inputs} == {"temperature", "wind"}
 
 
 def test_chain_skips_when_fingerprint_unchanged() -> None:
