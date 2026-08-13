@@ -325,6 +325,7 @@ def _baseline_gate(
     *,
     quantity: str | None,
     occurrence: bool,
+    temp: bool = False,
     seed: int,
     resamples: int,
 ) -> tuple[bool, dict[str, object]]:
@@ -344,6 +345,36 @@ def _baseline_gate(
             evaluation = _evaluate_endpoint(
                 endpoint,
                 occurrence=True,
+                level=BASELINE_GATE_CI_LEVEL,
+                seed=seed,
+                resamples=resamples,
+            )
+            ok = _beats(evaluation)
+            passed = passed and ok
+            detail[baseline] = {"passed": ok, **evaluation.as_json()}
+    elif temp:
+        for baseline, per_quantity in sorted(candidate.baseline_continuous.items()):
+            high_by_lead = per_quantity.get("temperature_high", {})
+            low_by_lead = per_quantity.get("temperature_low", {})
+            joint_by_lead: dict[int, TempLead] = {}
+            for lead in high_by_lead.keys() & low_by_lead.keys():
+                high = high_by_lead[lead]
+                low = low_by_lead[lead]
+                joint: TempLead = {
+                    d: (high[d], low[d]) for d in high.keys() & low.keys()
+                }
+                if joint:
+                    joint_by_lead[lead] = joint
+            endpoint = _index_endpoint(
+                "temp",
+                {
+                    ld: {d: (h, low_pair) for d, (h, low_pair) in days.items()}
+                    for ld, days in joint_by_lead.items()
+                },
+            )
+            evaluation = _evaluate_endpoint(
+                endpoint,
+                occurrence=False,
                 level=BASELINE_GATE_CI_LEVEL,
                 seed=seed,
                 resamples=resamples,
@@ -435,14 +466,23 @@ def _decide_wind_or_temp(
         evaluation.point is not None
         and evaluation.point >= PRACTICAL_FLOOR_RELATIVE_MAE
     )
-    quantity = "temperature_high" if inputs.variable == "temperature" else "wind_max"
-    c4, baseline_detail = _baseline_gate(
-        candidate,
-        quantity=quantity,
-        occurrence=False,
-        seed=seed + 1,
-        resamples=resamples,
-    )
+    if inputs.variable == "temperature":
+        c4, baseline_detail = _baseline_gate(
+            candidate,
+            quantity=None,
+            occurrence=False,
+            temp=True,
+            seed=seed + 1,
+            resamples=resamples,
+        )
+    else:
+        c4, baseline_detail = _baseline_gate(
+            candidate,
+            quantity="wind_max",
+            occurrence=False,
+            seed=seed + 1,
+            resamples=resamples,
+        )
     c5 = True
     if inputs.variable == "temperature":
         components: dict[str, object] = {}

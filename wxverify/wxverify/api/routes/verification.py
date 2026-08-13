@@ -19,60 +19,24 @@ from fastapi.responses import RedirectResponse
 
 from wxverify.api.errors import ApiError
 from wxverify.db.connection import get_db
-from wxverify.verification import methodology
+from wxverify.verification.contract import (
+    CONTRACT,
+    VERIFICATION_SCHEMA,
+    methodology_constants,
+)
 from wxverify.verification.runs import (
-    capture_config_snapshot,
-    input_fingerprint,
+    current_input_fingerprint,
     published_run_id,
 )
-from wxverify.verification.simulate import SIM_DEPTHS, SIM_VARIABLES
 
 router = APIRouter(prefix="/api/verification", tags=["verification"])
 
-#: Response-contract version for every /api/verification/* payload (§16).
-VERIFICATION_SCHEMA = 1
+__all__ = ["CONTRACT", "VERIFICATION_SCHEMA", "router"]
 
 _EVIDENCE_PAGE_DEFAULT = 200
 _EVIDENCE_PAGE_MAX = 500
 _RUNS_PAGE_DEFAULT = 50
 _RUNS_PAGE_MAX = 200
-
-#: Machine-readable measurement contract (§16): units, metric direction,
-#: confidence levels, sample definition, and null semantics.
-CONTRACT: dict[str, object] = {
-    "units": {
-        "temperature_high": "degC",
-        "temperature_low": "degC",
-        "wind_max": "m/s",
-        "precip_total": "mm",
-        "precip_occurrence": "wet_day_class",
-    },
-    "metric_direction": {
-        "mae": "lower_is_better",
-        "rmse": "lower_is_better",
-        "bias": "zero_is_best",
-        "ets": "higher_is_better",
-        "delta_vs_incumbent": "higher_is_better",
-    },
-    "confidence_levels": {
-        "candidate_ci": methodology.CANDIDATE_CI_LEVEL,
-        "precip_improvement_ci": methodology.PRECIP_IMPROVEMENT_CI_LEVEL,
-        "baseline_gate_ci": methodology.BASELINE_GATE_CI_LEVEL,
-    },
-    "sample_definition": (
-        "one local target day on the cell's strict common core; pairwise "
-        "cores for non-headline entities"
-    ),
-    "null_semantics": (
-        "insufficient, not-applicable and failed values are null, never 0"
-    ),
-    "null_reasons": [
-        "no_samples",
-        "no_prior_truth",
-        "insufficient_rank_history",
-        "truth_missing",
-    ],
-}
 
 
 def _parse_json(raw: object) -> object:
@@ -129,13 +93,10 @@ def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
         published = _run_out(row, include_snapshot=False)
         # Cheap staleness check: recompute the input fingerprint against
         # live tables and compare with the published run's pinned one.
-        # Safe on a read connection: capture_config_snapshot only writes
-        # when a site has no published tz generation, which cannot happen
-        # for a site that has a published run.
-        current = input_fingerprint(
-            conn, site_id, capture_config_snapshot(conn, site_id)
-        )
-        stale = current != str(row["input_fingerprint"])
+        # Read-only by construction (NB-9) — None means the timezone
+        # pointer is absent, so staleness is unknown, not true.
+        current = current_input_fingerprint(conn, site_id)
+        stale = current is not None and current != str(row["input_fingerprint"])
     failed_newer = conn.execute(
         """
         SELECT 1 FROM verification_runs
@@ -411,38 +372,7 @@ async def run_methodology(run_id: int) -> dict[str, object]:
             "verification_schema": VERIFICATION_SCHEMA,
             "run_id": run_id,
             "contract": CONTRACT,
-            "constants": {
-                "methodology_version": methodology.METHODOLOGY_VERSION,
-                "snapshot_local_time_default": methodology.SNAPSHOT_LOCAL_TIME,
-                "late_write_window_hours": methodology.LATE_WRITE_WINDOW_HOURS,
-                "consensus_lag_hours": methodology.CONSENSUS_LAG_HOURS,
-                "temp_truth_min_hours": methodology.TEMP_TRUTH_MIN_HOURS,
-                "near_complete_slot_allowance": (
-                    methodology.NEAR_COMPLETE_SLOT_ALLOWANCE
-                ),
-                "roster_availability_floor": methodology.ROSTER_AVAILABILITY_FLOOR,
-                "adequate_lead_min_days": methodology.ADEQUATE_LEAD_MIN_DAYS,
-                "min_adequate_leads_per_variable": (
-                    methodology.MIN_ADEQUATE_LEADS_PER_VARIABLE
-                ),
-                "bootstrap_block_length_days": (
-                    methodology.BOOTSTRAP_BLOCK_LENGTH_DAYS
-                ),
-                "bootstrap_resamples": methodology.BOOTSTRAP_RESAMPLES,
-                "practical_floor_relative_mae": (
-                    methodology.PRACTICAL_FLOOR_RELATIVE_MAE
-                ),
-                "practical_floor_ets": methodology.PRACTICAL_FLOOR_ETS,
-                "non_inferiority_mae_margin": (methodology.NON_INFERIORITY_MAE_MARGIN),
-                "non_inferiority_ets_margin": (methodology.NON_INFERIORITY_ETS_MARGIN),
-                "occurrence_min_wet_days": methodology.OCCURRENCE_MIN_WET_DAYS,
-                "occurrence_min_dry_days": methodology.OCCURRENCE_MIN_DRY_DAYS,
-                "daily_rank_min_history_days": (
-                    methodology.DAILY_RANK_MIN_HISTORY_DAYS
-                ),
-                "simulated_depths": list(SIM_DEPTHS),
-                "simulated_variables": list(SIM_VARIABLES),
-            },
+            "constants": methodology_constants(),
             "provenance": _run_out(row, include_snapshot=True),
         }
 

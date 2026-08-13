@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 {% block title %}Verification - {{ app_title }}{% endblock %}
+{# §16 content contract. Every §16-enumerated element carries a stable
+   data-v16 attribute (subsection.element) so the §18.11 API/UI consistency
+   oracle can assert presence without scraping prose. #}
+{% macro num(value, spec='%.3f') %}{% if value is none %}—{% else %}{{ spec|format(value) }}{% endif %}{% endmacro %}
+{% macro ci(bounds) %}{% if bounds is none %}—{% else %}[{{ '%.3f'|format(bounds[0]) }}, {{ '%.3f'|format(bounds[1]) }}]{% endif %}{% endmacro %}
+{% macro gates(items) %}
+  {% if items %}
+    {% for gate in items %}<span class="badge {{ 'ok' if gate.state == 'pass' else ('warn' if gate.state == 'fail' else 'muted') }}" data-gate="{{ gate.key }}" data-gate-state="{{ gate.state }}" title="{{ gate.label }}: {{ gate.state }}">{{ gate.label }}: {{ gate.state }}</span> {% endfor %}
+  {% else %}—{% endif %}
+{% endmacro %}
 {% block content %}
 <section class="page-heading">
   <div>
@@ -19,114 +29,436 @@
 
 {% if not site %}
   <p class="empty">No sites configured.</p>
+{% elif warnings.no_publishable_run %}
+  <p class="notice" data-v16="16.1.no_publishable_run">No published verification run for this site yet.</p>
 {% else %}
 
-  {# --- Status banner + warnings --- #}
-  {% if warnings.no_publishable_run %}
-    <p class="notice">No published verification run for this site yet.</p>
-  {% else %}
-    <section class="card">
-      <h2>Run #{{ run.id }}</h2>
-      <p class="muted">
-        Period {{ run.period_start or '—' }} to {{ run.period_end or '—' }}
-        &middot; settled through {{ run.settled_through or '—' }}
-        &middot; published {{ run.published_at or '—' }}
-      </p>
-      {% if warnings.stale_inputs %}
-        <p class="notice">Inputs have changed since this run was published &mdash; results reflect the pinned snapshot, not current data.</p>
-      {% endif %}
-      {% if warnings.failed_newer_attempt %}
-        <p class="notice">A newer verification attempt failed; the results below are from the last successful run.</p>
-      {% endif %}
-    </section>
+  {# ------------------------------------------------------------------ #}
+  {# §16.1 Run-status banner                                            #}
+  {# ------------------------------------------------------------------ #}
+  <section class="panel wide" id="verification-run-banner" data-run-id="{{ run.id }}">
+    <h2>Run #{{ run.id }}</h2>
+    <p class="panel-hint" data-v16="16.1.declared_configuration">
+      All results below hold <strong>under the run&rsquo;s declared configuration</strong> —
+      the pinned snapshot shown here, not current settings.
+      <a href="{{ url('/api/verification/runs/' ~ run.id) }}" data-v16="16.1.run_link">Immutable run #{{ run.id }}</a>
+    </p>
+    <dl class="facts">
+      <div data-v16="16.1.run_id"><dt>Run</dt><dd>#{{ run.id }} (attempt {{ run.attempt }}, {{ run.state }})</dd></div>
+      <div data-v16="16.1.period"><dt>Evaluation period</dt><dd>{{ run.period_start or '—' }} to {{ run.period_end or '—' }}</dd></div>
+      <div data-v16="16.1.data_cutoff"><dt>Data cutoff</dt><dd>{{ run.settled_through or '—' }}</dd></div>
+      <div data-v16="16.1.created_at"><dt>Created</dt><dd>{{ run.created_at or '—' }}</dd></div>
+      <div data-v16="16.1.published_at"><dt>Published</dt><dd>{{ run.published_at or '—' }}</dd></div>
+      <div data-v16="16.1.tz_generation"><dt>Timezone generation</dt><dd>#{{ run.tz_generation_id }}{% if snapshot and snapshot.timezone %} ({{ snapshot.timezone }}){% endif %}</dd></div>
+      <div data-v16="16.1.methodology_version"><dt>Methodology version</dt><dd>v{{ run.methodology_version }}</dd></div>
+      <div data-v16="16.1.app_version"><dt>Application version</dt><dd>{{ run.app_version }}</dd></div>
+    </dl>
 
-    {# --- Verdict cards --- #}
-    <section class="card">
-      <h2>Verdicts</h2>
-      <div class="tile-grid">
-        {% for v in verdicts %}
-          <div class="tile verdict-{{ v.outcome }}">
-            <h3>{{ v.variable }}</h3>
-            <p><strong>{{ v.label }}</strong></p>
-            <p class="muted">
-              Incumbent depth {{ v.incumbent_depth }}
-              {% if v.recommended_depth is not none %}
-                &middot; recommended depth {{ v.recommended_depth }}
-              {% endif %}
-            </p>
-          </div>
-        {% endfor %}
+    {% if snapshot %}
+      <div class="subsection" data-v16="16.1.config_snapshot">
+        <h3>Pinned configuration snapshot</h3>
+        <dl class="facts">
+          <div><dt>Timezone</dt><dd>{{ snapshot.timezone or '—' }}</dd></div>
+          <div><dt>Snapshot wall clock</dt><dd>{{ snapshot.wall_clock or '—' }}</dd></div>
+          <div><dt>Rain threshold</dt><dd>{{ num(snapshot.rain_threshold_mm, '%.1f') }} mm</dd></div>
+          <div><dt>Global blend depth</dt><dd>{{ snapshot.blend_depth if snapshot.blend_depth is not none else '—' }}</dd></div>
+          <div><dt>Minimum pairs</dt><dd>{{ snapshot.min_n if snapshot.min_n is not none else '—' }}</dd></div>
+          <div><dt>Rolling window</dt><dd>{{ snapshot.window_days if snapshot.window_days is not none else '—' }} days</dd></div>
+        </dl>
+        <p class="muted" data-v16="16.1.pinned_depths">
+          Pinned per-variable depth:
+          {% for d in snapshot.blend_depths %}{{ d.variable }} {{ d.depth }} ({{ d.source }}){{ '' if loop.last else ' · ' }}{% else %}—{% endfor %}
+        </p>
+        <div class="table-wrap" data-v16="16.1.roster_snapshot">
+          <table class="cardify">
+            <caption class="muted">Pinned roster ({{ snapshot.roster_size }} feeds)</caption>
+            <thead><tr><th>Feed</th><th>Source</th><th>Model</th></tr></thead>
+            <tbody>
+              {% for feed in snapshot.roster %}
+                <tr>
+                  <td data-label="Feed">#{{ feed.feed_id }}</td>
+                  <td data-label="Source">{{ feed.source }}</td>
+                  <td data-label="Model">{{ feed.model }}</td>
+                </tr>
+              {% else %}
+                <tr><td data-label="Feed" colspan="3">No roster feeds pinned.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
       </div>
-      {% if depths %}
-        <p class="muted depth-line">
-          Effective blend depth:
-          {% for variable, d in depths.items() %}
-            {{ variable }} {{ d.depth }} ({{ d.source }}){{ '' if loop.last else ' · ' }}
-          {% endfor %}
-        </p>
-      {% endif %}
-    </section>
-
-    {# --- Headline results --- #}
-    <section class="card">
-      <h2>Headline results</h2>
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th>Variable</th><th>Quantity</th><th>Lead</th><th>Entity</th>
-            <th>Days</th><th>MAE</th><th>Bias</th><th>RMSE</th><th>ETS</th>
-            <th>Availability</th><th>&Delta; vs incumbent</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for r in headline %}
-            <tr>
-              <td>{{ r.variable }}</td>
-              <td>{{ r.quantity }}</td>
-              <td>{{ r.lead }}</td>
-              <td>{{ r.entity_type }}:{{ r.entity_key }}</td>
-              <td>{{ r.common_days }}</td>
-              <td>{{ '%.3f'|format(r.mae) if r.mae is not none else '—' }}</td>
-              <td>{{ '%.3f'|format(r.bias) if r.bias is not none else '—' }}</td>
-              <td>{{ '%.3f'|format(r.rmse) if r.rmse is not none else '—' }}</td>
-              <td>{{ '%.3f'|format(r.ets) if r.ets is not none else '—' }}</td>
-              <td>{{ '%.0f%%'|format(r.availability_rate * 100) if r.availability_rate is not none else '—' }}</td>
-              <td>{{ '%.3f'|format(r.delta_vs_incumbent) if r.delta_vs_incumbent is not none else '—' }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    </section>
-
-    {# --- Diagnostics --- #}
-    {% if day_context %}
-      <section class="card">
-        <h2>Diagnostics</h2>
-        <p>
-          {{ day_context.snapshot_days }} snapshot days
-          &middot; {{ day_context.days_with_exclusions }} with knowability exclusions
-          &middot; {{ day_context.null_availability_samples }} null-availability samples
-        </p>
-      </section>
     {% endif %}
 
-    {# --- Methodology / provenance --- #}
-    <section class="card">
-      <h2>Methodology</h2>
-      <p class="muted">
-        Methodology v{{ run.methodology_version }}
-        &middot; app {{ run.app_version }}
-        &middot; seed {{ run.bootstrap_seed }}
-        &middot; {{ run.bootstrap_resamples }} resamples
-        &middot; fingerprint {{ run.input_fingerprint[:12] }}&hellip;
+    {% if warnings.stale_inputs %}
+      <p class="notice" data-v16="16.1.warn_stale">Inputs have changed since this run was published — results reflect the pinned snapshot, not current data.</p>
+    {% endif %}
+    {% if warnings.failed_newer_attempt %}
+      <p class="notice" data-v16="16.1.warn_failed_newer">A newer verification attempt failed; the results below are from the last successful run.</p>
+    {% endif %}
+  </section>
+
+  {# ------------------------------------------------------------------ #}
+  {# §16.2 Per-variable verdict cards                                    #}
+  {# ------------------------------------------------------------------ #}
+  <section class="panel wide" id="verification-verdicts">
+    <h2>Verdicts</h2>
+    <p class="panel-hint">One outcome per variable, under the run&rsquo;s declared configuration.</p>
+    {% for v in verdicts %}
+      <div class="subsection verdict verdict-{{ v.outcome }}" data-v16="16.2.card" data-variable="{{ v.variable }}" data-outcome="{{ v.outcome }}">
+        <h3>{{ v.variable }}</h3>
+        <p class="verdict-head" data-v16="16.2.outcome">
+          <strong>{{ v.label }}</strong>
+          {% if v.is_placeholder %}<span class="badge warn" data-v16="16.2.placeholder">placeholder verdict — not evidence</span>{% endif %}
+        </p>
+        {% if v.caveat %}<p class="verdict-caveat" data-v16="16.2.caveat">{{ v.caveat }}</p>{% endif %}
+        <dl class="facts">
+          <div data-v16="16.2.incumbent_depth"><dt>Incumbent depth (pinned by run #{{ run.id }})</dt><dd>{{ v.incumbent_depth }}</dd></div>
+          <div data-v16="16.2.recommended_depth"><dt>Recommended depth</dt><dd>{{ v.recommended_depth if v.recommended_depth is not none else '—' }}</dd></div>
+          <div data-v16="16.2.primary_effect"><dt>Primary effect</dt><dd>{% if v.primary and v.primary.endpoints %}{{ num(v.primary.endpoints[0].point) }} ({{ v.primary.endpoints[0].label }}){% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.primary_ci"><dt>Confidence interval</dt><dd>{% if v.primary and v.primary.endpoints %}{{ ci(v.primary.endpoints[0].ci) }}{% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.adequate_leads"><dt>Adequate leads</dt><dd>{% if v.primary and v.primary.endpoints %}{{ v.primary.endpoints[0].adequate_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.common_day_range"><dt>Common-day range</dt><dd>{% set span = common_days.get(v.variable) %}{% if span %}{{ span.min }}&ndash;{{ span.max }} days{% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.practical_significance"><dt>Practical significance</dt><dd>
+            {%- if v.primary -%}
+              {%- set practical = v.primary.gates | selectattr('key', 'in', ['practical_floor', 'total_material', 'occurrence_material']) | list -%}
+              {%- if practical %}{% for g in practical %}{{ g.label }}: {{ g.state }}{{ '' if loop.last else ' · ' }}{% endfor %}{% else %}—{% endif -%}
+            {%- else -%}—{%- endif -%}
+          </dd></div>
+        </dl>
+        <p class="muted" data-v16="16.2.baseline_gates">Baseline gates:
+          {% if v.primary and v.primary.baselines %}
+            {% for b in v.primary.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }}{{ '' if loop.last else ' · ' }}{% endfor %}
+          {% else %}—{% endif %}
+        </p>
+        <p class="muted" data-v16="16.2.completeness_guards">Completeness guards: {{ gates(v.primary.gates if v.primary else []) }}</p>
+        {% if v.unresolved %}
+          <p class="muted" data-v16="16.2.unresolved">Statistically unresolved against the chosen depth: {{ v.unresolved | join(', ') }}</p>
+        {% endif %}
+        {% if v.skip_reason %}
+          <p class="muted" data-v16="16.2.skip_reason">Reason: {{ v.skip_reason }}</p>
+        {% endif %}
+      </div>
+    {% else %}
+      <p class="empty">No verdicts on this run.</p>
+    {% endfor %}
+
+    {% if depths %}
+      <p class="muted depth-line" data-v16="16.2.live_depth">
+        Live effective blend depth <em>now</em> (current settings — not the depths this run was scored under):
+        {% for variable, d in depths.items() %}
+          {{ variable }} {{ d.depth }} ({{ d.source }}){{ '' if loop.last else ' · ' }}
+        {% endfor %}
       </p>
-      <p class="muted">
-        Candidate CI {{ '%.4f'|format(methodology.candidate_ci_level) }}
-        &middot; precip-improvement CI {{ '%.4f'|format(methodology.precip_improvement_ci_level) }}
-        &middot; baseline-gate CI {{ '%.2f'|format(methodology.baseline_gate_ci_level) }}
-        &middot; non-inferiority margins {{ methodology.non_inferiority_mae_margin }} / {{ methodology.non_inferiority_ets_margin }}
-      </p>
+      {% if depth_mismatch %}
+        <p class="notice" data-v16="16.2.depth_mismatch">The live effective depth differs from the incumbent depth this run was scored under; the verdicts above still describe the pinned configuration.</p>
+      {% endif %}
+    {% endif %}
+  </section>
+
+  {# ------------------------------------------------------------------ #}
+  {# §16.3 Headline evidence table                                       #}
+  {# ------------------------------------------------------------------ #}
+  <section class="panel wide" id="verification-headline">
+    <h2>Headline results</h2>
+    <p class="panel-hint">Decision leads D1&ndash;D7, by variable &times; lead &times; quantity &times; candidate depth, on the strict common core. D0 is diagnostic only and appears below.</p>
+    {% if headline %}
+      <div class="table-wrap">
+        <table class="cardify" data-v16="16.3.table">
+          <thead>
+            <tr>
+              <th>Variable</th><th>Lead</th><th>Quantity</th><th>Candidate depth</th>
+              <th>Primary metric</th><th>&Delta; vs incumbent</th><th>CI</th>
+              <th>Common days</th><th>Observed events</th><th>Realized contributors</th>
+              <th>Availability</th><th>Baselines</th><th>Gates</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in headline %}
+              <tr data-v16="16.3.row" data-variable="{{ r.variable }}" data-lead="{{ r.lead }}" data-quantity="{{ r.quantity }}" data-depth="{{ r.depth }}">
+                <td data-label="Variable">{{ r.variable }}</td>
+                <td data-label="Lead">D{{ r.lead }}</td>
+                <td data-label="Quantity">{{ r.quantity }}</td>
+                <td data-label="Candidate depth" data-v16="16.3.candidate_depth">{{ r.depth }}{% if r.is_incumbent %} <span class="badge muted">incumbent</span>{% endif %}</td>
+                <td data-label="Primary metric" data-v16="16.3.primary_metric">{{ r.metric_label }} {{ num(r.metric_value) }}</td>
+                <td data-label="Delta vs incumbent" data-v16="16.3.incumbent_delta">{% if r.is_incumbent %}n/a{% else %}{{ num(r.delta_vs_incumbent) }}{% endif %}</td>
+                <td data-label="CI" data-v16="16.3.ci">{{ ci(r.ci) }}</td>
+                <td data-label="Common days" data-v16="16.3.common_days">{{ r.common_days }}</td>
+                <td data-label="Observed events" data-v16="16.3.observed_events">{% if r.events %}{{ r.events.hits }}/{{ r.events.misses }}/{{ r.events.false_alarms }}/{{ r.events.correct_negatives }}{% else %}n/a{% endif %}</td>
+                <td data-label="Realized contributors" data-v16="16.3.realized_contributors">{% if r.contributors %}{{ r.contributors[0] }}&ndash;{{ r.contributors[1] }}{% else %}—{% endif %}</td>
+                <td data-label="Availability">{{ '%.0f%%'|format(r.availability_rate * 100) if r.availability_rate is not none else '—' }}</td>
+                <td data-label="Baselines" data-v16="16.3.baseline_comparisons">
+                  {% for b in r.baselines %}{{ b.name }} {{ num(b.value) }}{{ '' if loop.last else ' · ' }}{% else %}—{% endfor %}
+                </td>
+                <td data-label="Gates" data-v16="16.3.gate_states">
+                  <span class="badge {{ 'ok' if r.lead_state == 'adequate' else 'muted' }}" data-gate="lead_adequacy" data-gate-state="{{ r.lead_state }}">lead: {{ r.lead_state }}</span>
+                  {{ gates(r.gates) }}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No headline evidence rows on this run.</p>
+    {% endif %}
+  </section>
+
+  {# ------------------------------------------------------------------ #}
+  {# §16.4 Diagnostics — non-enactable                                   #}
+  {# ------------------------------------------------------------------ #}
+  {% if diagnostics %}
+    <section class="panel wide" id="verification-diagnostics">
+      <h2>Diagnostics</h2>
+      <p class="panel-hint" data-v16="16.4.non_enactable"><strong>Non-enactable:</strong> nothing in this section feeds a verdict. It is reported for interpretation only.</p>
+
+      <div class="subsection" data-v16="16.4.day_context">
+        <h3>Run day context</h3>
+        <p>
+          {{ diagnostics.day_context.snapshot_days }} snapshot days
+          &middot; {{ diagnostics.day_context.days_with_exclusions }} with knowability exclusions
+          &middot; {{ diagnostics.day_context.null_availability_samples }} null-availability samples
+        </p>
+      </div>
+
+      <div class="subsection" data-v16="16.4.d0">
+        <h3>D0 (partly elapsed target day — never pooled with D1&ndash;D7)</h3>
+        {% if diagnostics.d0 %}
+          <div class="table-wrap">
+            <table class="cardify">
+              <thead><tr><th>Variable</th><th>Quantity</th><th>Depth</th><th>Common days</th><th>MAE</th><th>Bias</th><th>RMSE</th><th>ETS</th></tr></thead>
+              <tbody>
+                {% for r in diagnostics.d0 %}
+                  <tr>
+                    <td data-label="Variable">{{ r.variable }}</td>
+                    <td data-label="Quantity">{{ r.quantity }}</td>
+                    <td data-label="Depth">{{ r.entity_key }}</td>
+                    <td data-label="Common days">{{ r.common_days }}</td>
+                    <td data-label="MAE">{{ num(r.mae) }}</td>
+                    <td data-label="Bias">{{ num(r.bias) }}</td>
+                    <td data-label="RMSE">{{ num(r.rmse) }}</td>
+                    <td data-label="ETS">{{ num(r.ets) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No D0 rows on this run.</p>
+        {% endif %}
+      </div>
+
+      <div class="subsection" data-v16="16.4.daily_rank">
+        <h3>Daily-quantity-ranking policies</h3>
+        <p class="panel-hint">As-of daily rank order per quantity; requires &ge; {{ methodology.daily_rank_min_history_days }} knowable scorable days per feed. Diagnostic, never a decision input.</p>
+        {% if diagnostics.daily_rank %}
+          <div class="table-wrap">
+            <table class="cardify">
+              <thead><tr><th>Variable</th><th>Lead</th><th>Quantity</th><th>Policy</th><th>Common days</th><th>MAE</th><th>ETS</th><th>&Delta; vs incumbent</th></tr></thead>
+              <tbody>
+                {% for r in diagnostics.daily_rank %}
+                  <tr>
+                    <td data-label="Variable">{{ r.variable }}</td>
+                    <td data-label="Lead">D{{ r.lead }}</td>
+                    <td data-label="Quantity">{{ r.quantity }}</td>
+                    <td data-label="Policy">{{ r.entity_key }}</td>
+                    <td data-label="Common days">{{ r.common_days }}</td>
+                    <td data-label="MAE">{{ num(r.mae) }}</td>
+                    <td data-label="ETS">{{ num(r.ets) }}</td>
+                    <td data-label="Delta vs incumbent">{{ num(r.delta_vs_incumbent) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No daily-rank diagnostic rows on this run.</p>
+        {% endif %}
+      </div>
+
+      <div class="subsection" data-v16="16.4.feeds">
+        <h3>Pairwise-only and below-floor feeds</h3>
+        <p class="panel-hint">Feeds scored pairwise against the incumbent, and feeds under the {{ '%.0f%%'|format(methodology.roster_availability_floor * 100) }} availability floor. Visible, never decision inputs.</p>
+        {% if diagnostics.feeds %}
+          <div class="table-wrap">
+            <table class="cardify">
+              <thead><tr><th>Feed</th><th>Variable</th><th>Lead</th><th>Quantity</th><th>Availability</th><th>State</th><th>Common days</th><th>MAE</th><th>ETS</th></tr></thead>
+              <tbody>
+                {% for r in diagnostics.feeds %}
+                  <tr data-below-floor="{{ 'yes' if r.below_floor else 'no' }}" data-pairwise-only="{{ 'yes' if r.pairwise_only else 'no' }}">
+                    <td data-label="Feed">#{{ r.entity_key }}</td>
+                    <td data-label="Variable">{{ r.variable }}</td>
+                    <td data-label="Lead">D{{ r.lead }}</td>
+                    <td data-label="Quantity">{{ r.quantity }}</td>
+                    <td data-label="Availability">{{ '%.0f%%'|format(r.availability_rate * 100) if r.availability_rate is not none else '—' }}</td>
+                    <td data-label="State">
+                      {% if r.below_floor %}<span class="badge warn">below floor</span>{% endif %}
+                      {% if r.pairwise_only %}<span class="badge muted">pairwise-only</span>{% endif %}
+                      {% if not r.below_floor and not r.pairwise_only %}<span class="badge ok">roster member</span>{% endif %}
+                    </td>
+                    <td data-label="Common days">{{ r.common_days }}</td>
+                    <td data-label="MAE">{{ num(r.mae) }}</td>
+                    <td data-label="ETS">{{ num(r.ets) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No feed-level diagnostic rows on this run.</p>
+        {% endif %}
+      </div>
+
+      <div class="subsection" data-v16="16.4.bias_rmse">
+        <h3>Bias and RMSE (D1&ndash;D7)</h3>
+        <p class="panel-hint">Reported for interpretation; neither quantity gates a verdict.</p>
+        {% if diagnostics.bias_rmse %}
+          <div class="table-wrap">
+            <table class="cardify">
+              <thead><tr><th>Variable</th><th>Lead</th><th>Quantity</th><th>Depth</th><th>Bias</th><th>RMSE</th></tr></thead>
+              <tbody>
+                {% for r in diagnostics.bias_rmse %}
+                  <tr>
+                    <td data-label="Variable">{{ r.variable }}</td>
+                    <td data-label="Lead">D{{ r.lead }}</td>
+                    <td data-label="Quantity">{{ r.quantity }}</td>
+                    <td data-label="Depth">{{ r.entity_key }}</td>
+                    <td data-label="Bias">{{ num(r.bias) }}</td>
+                    <td data-label="RMSE">{{ num(r.rmse) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No bias/RMSE rows on this run.</p>
+        {% endif %}
+      </div>
+
+      <div class="subsection" data-v16="16.4.contingency">
+        <h3>Contingency counts (precip occurrence)</h3>
+        {% if diagnostics.contingency %}
+          <div class="table-wrap">
+            <table class="cardify">
+              <thead><tr><th>Entity</th><th>Lead</th><th>Hits</th><th>Misses</th><th>False alarms</th><th>Correct negatives</th><th>ETS</th></tr></thead>
+              <tbody>
+                {% for r in diagnostics.contingency %}
+                  <tr>
+                    <td data-label="Entity">{{ r.entity_type }}:{{ r.entity_key }}</td>
+                    <td data-label="Lead">D{{ r.lead }}</td>
+                    <td data-label="Hits">{{ r.hits }}</td>
+                    <td data-label="Misses">{{ r.misses }}</td>
+                    <td data-label="False alarms">{{ r.false_alarms }}</td>
+                    <td data-label="Correct negatives">{{ r.correct_negatives }}</td>
+                    <td data-label="ETS">{{ num(r.ets) }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty">No contingency rows on this run.</p>
+        {% endif %}
+      </div>
+
+      {% for item in diagnostics.unavailable %}
+        <div class="subsection" data-v16="16.4.{{ item.key }}">
+          <h3>{{ item.label }}</h3>
+          <p class="empty">Not available — {{ item.reason }}</p>
+        </div>
+      {% endfor %}
     </section>
   {% endif %}
+
+  {# ------------------------------------------------------------------ #}
+  {# §16.5 Methodology and provenance                                    #}
+  {# ------------------------------------------------------------------ #}
+  <section class="panel wide" id="verification-methodology">
+    <h2>Methodology &amp; provenance</h2>
+    <p class="panel-hint">
+      Methodology v{{ run.methodology_version }} &middot; app {{ run.app_version }} &middot;
+      every result on this page belongs to
+      <a href="{{ url('/api/verification/runs/' ~ run.id) }}" data-v16="16.5.run_link">immutable run #{{ run.id }}</a>.
+    </p>
+    <dl class="facts">
+      <div data-v16="16.5.snapshot_time"><dt>Canonical snapshot time</dt><dd>{{ snapshot.wall_clock if snapshot and snapshot.wall_clock else methodology.snapshot_local_time_default }} site-local (default {{ methodology.snapshot_local_time_default }})</dd></div>
+      <div data-v16="16.5.timezone"><dt>Timezone</dt><dd>{{ snapshot.timezone if snapshot else '—' }} (generation #{{ run.tz_generation_id }})</dd></div>
+      <div data-v16="16.5.truth_rules"><dt>Truth rules</dt><dd>temp: &ge; {{ methodology.temp_truth_min_hours }} covered hours plus the {{ methodology.temp_peak_window_high[0] }}&ndash;{{ methodology.temp_peak_window_high[1] }} / {{ methodology.temp_peak_window_low[0] }}&ndash;{{ methodology.temp_peak_window_low[1] }} local peak windows; wind/precip: &ge; expected slots &minus; {{ methodology.near_complete_slot_allowance }}</dd></div>
+      <div data-v16="16.5.eligibility_rules"><dt>Eligibility rules</dt><dd>forecast and truth both eligible on the day; knowability lag {{ methodology.consensus_lag_hours }} h after valid_at; late writes accepted up to {{ methodology.late_write_window_hours }} h after T</dd></div>
+      <div data-v16="16.5.roster_floor"><dt>Roster availability floor</dt><dd>{{ '%.0f%%'|format(methodology.roster_availability_floor * 100) }} of truth-eligible days</dd></div>
+      <div data-v16="16.5.candidates"><dt>Candidate depths</dt><dd>{{ methodology.simulated_depths | join(', ') }}</dd></div>
+      <div data-v16="16.5.baselines"><dt>Baselines</dt><dd>persistence, all-feed mean, always-dry (occurrence)</dd></div>
+      <div data-v16="16.5.metrics"><dt>Metrics</dt><dd>{% for name, direction in contract.metric_direction.items() %}{{ name }} ({{ direction }}){{ '' if loop.last else ' · ' }}{% endfor %}</dd></div>
+      <div data-v16="16.5.units"><dt>Units</dt><dd>{% for quantity, unit in contract.units.items() %}{{ quantity }} {{ unit }}{{ '' if loop.last else ' · ' }}{% endfor %}</dd></div>
+      <div data-v16="16.5.bootstrap"><dt>Bootstrap</dt><dd>{{ methodology.bootstrap_method }} over target dates, block length {{ methodology.bootstrap_block_length_days }} days, {{ run.bootstrap_resamples }} resamples, seed {{ run.bootstrap_seed }}</dd></div>
+      <div data-v16="16.5.thresholds"><dt>Thresholds</dt><dd>
+        candidate CI {{ '%.4f'|format(methodology.candidate_ci_level) }} &middot;
+        precip-improvement CI {{ '%.4f'|format(methodology.precip_improvement_ci_level) }} &middot;
+        baseline-gate CI {{ '%.2f'|format(methodology.baseline_gate_ci_level) }} &middot;
+        practical floor {{ methodology.practical_floor_relative_mae }} relative MAE / {{ methodology.practical_floor_ets }} ETS &middot;
+        non-inferiority {{ methodology.non_inferiority_mae_margin }} MAE / {{ methodology.non_inferiority_ets_margin }} ETS &middot;
+        adequate lead &ge; {{ methodology.adequate_lead_min_days }} common days, &ge; {{ methodology.min_adequate_leads_per_variable }} adequate leads &middot;
+        occurrence minimum {{ methodology.occurrence_min_wet_days }} wet / {{ methodology.occurrence_min_dry_days }} dry days
+      </dd></div>
+      <div data-v16="16.5.ranking_basis"><dt>Ranking basis</dt><dd>pooled effect over the adequate leads, ties broken toward the depth nearest the incumbent when CIs overlap; lead stability {{ methodology.lead_stability_numerator }}/{{ methodology.lead_stability_denominator }} of adequate leads</dd></div>
+      <div data-v16="16.5.code_version"><dt>Code version</dt><dd>{{ run.app_version }}</dd></div>
+      <div data-v16="16.5.input_fingerprint"><dt>Input fingerprint</dt><dd><code>{{ run.input_fingerprint }}</code></dd></div>
+      <div data-v16="16.5.exclusion_counts"><dt>Exclusion counts</dt><dd>{{ day_context.days_with_exclusions }} days with knowability exclusions of {{ day_context.snapshot_days }} snapshot days &middot; {{ day_context.null_availability_samples }} null-availability samples</dd></div>
+      <div data-v16="16.5.schema"><dt>Contract version</dt><dd>verification_schema {{ verification_schema }} &middot; {{ contract.null_semantics }}</dd></div>
+    </dl>
+
+    {% if snapshot %}
+      <div class="subsection" data-v16="16.5.config_snapshot">
+        <h3>Pinned configuration snapshot</h3>
+        <p class="muted">
+          Timezone {{ snapshot.timezone }} &middot; wall clock {{ snapshot.wall_clock }} &middot;
+          rain threshold {{ num(snapshot.rain_threshold_mm, '%.1f') }} mm &middot;
+          global depth {{ snapshot.blend_depth }} &middot; min pairs {{ snapshot.min_n }} &middot;
+          window {{ snapshot.window_days }} days &middot; roster {{ snapshot.roster_size }} feeds
+        </p>
+      </div>
+    {% endif %}
+
+    <div class="subsection" data-v16="16.5.tested_family">
+      <h3>Tested family</h3>
+      <p class="panel-hint">Every endpoint, comparison, and gate outcome behind each verdict (§12, §14.3).</p>
+      {% for v in verdicts %}
+        <div data-v16="16.5.tested_family_variable" data-variable="{{ v.variable }}">
+          <h4>{{ v.variable }} — tested depths: {{ v.tested_keys | join(', ') if v.tested_keys else '—' }}</h4>
+          {% if v.candidates %}
+            <div class="table-wrap">
+              <table class="cardify">
+                <thead><tr><th>Candidate depth</th><th>Endpoint</th><th>Adjusted confidence level</th><th>Pooled effect</th><th>CI</th><th>Adequate leads</th><th>Gates</th><th>Baseline comparisons</th></tr></thead>
+                <tbody>
+                  {% for c in v.candidates %}
+                    {% for e in c.endpoints %}
+                      <tr data-candidate="{{ c.key }}" data-endpoint="{{ e.name }}">
+                        <td data-label="Candidate depth">{{ c.key }}</td>
+                        <td data-label="Endpoint">{{ e.label }}</td>
+                        <td data-label="Adjusted confidence level" data-v16="16.5.adjusted_confidence">{{ '%.4f'|format(methodology.precip_improvement_ci_level if v.variable == 'precip' else methodology.candidate_ci_level) }}</td>
+                        <td data-label="Pooled effect">{{ num(e.point) }}</td>
+                        <td data-label="CI">{{ ci(e.ci) }}</td>
+                        <td data-label="Adequate leads">{{ e.adequate_leads | join(', ') if e.adequate_leads else '—' }}</td>
+                        <td data-label="Gates" data-v16="16.5.gate_outcomes">{{ gates(c.gates) }}</td>
+                        <td data-label="Baseline comparisons" data-v16="16.5.baseline_comparisons">
+                          {% for b in c.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }} at {{ '%.2f'|format(methodology.baseline_gate_ci_level) }}{{ '' if loop.last else ' · ' }}{% else %}—{% endfor %}
+                        </td>
+                      </tr>
+                    {% else %}
+                      <tr data-candidate="{{ c.key }}">
+                        <td data-label="Candidate depth">{{ c.key }}</td>
+                        <td data-label="Endpoint" colspan="7">No endpoint evaluated — insufficient evidence.</td>
+                      </tr>
+                    {% endfor %}
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          {% else %}
+            <p class="empty">No tested candidates recorded for this variable.</p>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </section>
 {% endif %}
 {% endblock %}

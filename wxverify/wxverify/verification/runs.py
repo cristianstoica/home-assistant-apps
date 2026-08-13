@@ -22,7 +22,10 @@ from typing import cast
 from wxverify import __version__
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_id,
+)
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting
@@ -119,7 +122,25 @@ def roster_feeds(conn: sqlite3.Connection, site_id: int) -> tuple[RosterFeed, ..
 def capture_config_snapshot(
     conn: sqlite3.Connection, site_id: int
 ) -> dict[str, object]:
-    """The run's pinned configuration + roster, as one canonical JSON-able dict."""
+    """The run's pinned configuration + roster, as one canonical JSON-able dict.
+
+    WRITE PATH ONLY: seeds the site's initial timezone generation when the
+    published pointer is absent, so it needs a write connection. The
+    read-only staleness check uses :func:`current_input_fingerprint`.
+    """
+    return _config_snapshot(
+        conn, site_id, tz_generation_id=ensure_published_generation(conn, site_id)
+    )
+
+
+def _config_snapshot(
+    conn: sqlite3.Connection, site_id: int, *, tz_generation_id: int
+) -> dict[str, object]:
+    """Snapshot body against an already-resolved timezone generation.
+
+    Every statement here reads; the caller supplies the generation id, which
+    is the only part of the snapshot that can require a write.
+    """
     site = conn.execute(
         "SELECT timezone, rain_threshold_mm FROM sites WHERE id = ?",
         (site_id,),
@@ -138,7 +159,7 @@ def capture_config_snapshot(
         "blend_depth_sources": {v: d.source for v, d in depths.items()},
         "min_n": get_number_setting(conn, "min_n", 30, minimum=0),
         "window_days": get_number_setting(conn, "rolling_window_days", 30, minimum=1),
-        "tz_generation_id": ensure_published_generation(conn, site_id),
+        "tz_generation_id": tz_generation_id,
         "roster": [
             {"feed_id": f.feed_id, "source": f.source, "model": f.model}
             for f in roster_feeds(conn, site_id)
@@ -199,6 +220,22 @@ def input_fingerprint(
             ).encode()
         )
     return digest.hexdigest()
+
+
+def current_input_fingerprint(conn: sqlite3.Connection, site_id: int) -> str | None:
+    """Today's input fingerprint for a staleness check — READ PATH, never writes.
+
+    Resolves the timezone generation with the non-seeding
+    :func:`published_generation_id`, so the request path cannot INSERT on a
+    read-pool connection no matter what the pointer state is. Returns None
+    when the site has no published generation yet: the comparison is then
+    unknown rather than stale, and the caller says so instead of guessing.
+    """
+    generation_id = published_generation_id(conn, site_id)
+    if generation_id is None:
+        return None
+    snapshot = _config_snapshot(conn, site_id, tz_generation_id=generation_id)
+    return input_fingerprint(conn, site_id, snapshot)
 
 
 def seed_from_fingerprint(fingerprint: str) -> int:

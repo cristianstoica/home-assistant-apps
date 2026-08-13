@@ -397,11 +397,16 @@ def test_page_api_and_rows_agree_on_verdicts_counts_and_nulls(
     assert api_verdicts == db_verdicts
     assert "<h3>temperature</h3>" in page
     assert "Recommend depth change" in page
-    assert "Incumbent depth 2 &middot; recommended depth 3" in page
+    assert f"<dt>Incumbent depth (pinned by run #{run_id})</dt><dd>2</dd>" in page
+    assert "<dt>Recommended depth</dt><dd>3</dd>" in page
     assert "<h3>precip</h3>" in page
-    assert "Incumbent depth 5" in page  # the skipped precip card
-    # A skipped/retained variable has NO recommended depth anywhere.
-    assert page.count("recommended depth") == 1
+    assert f"<dt>Incumbent depth (pinned by run #{run_id})</dt><dd>5</dd>" in page
+    # A skipped/retained variable has NO recommended depth: exactly one card
+    # carries a numeric recommendation, the other two an em dash.
+    assert page.count("<dt>Recommended depth</dt><dd>—</dd>") == 2
+    # The placeholder ('skipped') verdict is never shown as successful
+    # evidence (§16.1).
+    assert 'data-v16="16.2.placeholder"' in page
 
     # 2. Run identity is the same integer in all three places.
     assert f"Run #{run_id}" in page
@@ -419,18 +424,28 @@ def test_page_api_and_rows_agree_on_verdicts_counts_and_nulls(
         assert cell["common_days"] == int(row["common_days"])
         assert cell["mae"] == row["mae"]
         assert cell["availability_rate"] == row["availability_rate"]
-        assert f"<td>{int(row['common_days'])}</td>" in page
+        assert (
+            f'<td data-label="Common days" data-v16="16.3.common_days">'
+            f"{int(row['common_days'])}</td>" in page
+        )
+        metric = "MAE" if str(row["quantity"]) != "precip_occurrence" else "ETS"
         if row["mae"] is None:
             # 4. Insufficient is an em dash on the page and null on the
             #    wire — NEVER a numeric zero on either.
             assert cell["mae"] is None
-            assert "<td>0.000</td>" not in page
-            assert "<td>—</td>" in page
+            assert "0.000" not in page
+            assert (
+                '<td data-label="Primary metric" data-v16="16.3.primary_metric">'
+                f"{metric} —</td>" in page
+            )
         else:
-            assert f"<td>{float(row['mae']):.3f}</td>" in page
+            assert (
+                '<td data-label="Primary metric" data-v16="16.3.primary_metric">'
+                f"{metric} {float(row['mae']):.3f}</td>" in page
+            )
         if row["availability_rate"] is not None:
             pct = f"{float(row['availability_rate']) * 100:.0f}%"
-            assert f"<td>{pct}</td>" in page
+            assert f'<td data-label="Availability">{pct}</td>' in page
 
     # 5. Exclusions/diagnostic counts agree between page and API.
     assert "1 snapshot days" in page
@@ -439,6 +454,6 @@ def test_page_api_and_rows_agree_on_verdicts_counts_and_nulls(
 
     # 6. Units and confidence levels are machine-readable on the wire and
     #    rendered with the template's precision on the page.
-    assert "Candidate CI 0.9833" in page
+    assert "candidate CI 0.9833" in page
     assert "precip-improvement CI 0.9917" in page
     assert "baseline-gate CI 0.95" in page

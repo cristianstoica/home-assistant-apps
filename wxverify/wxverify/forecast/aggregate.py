@@ -142,16 +142,18 @@ def displayed_daily(
         ]
         return {
             "total_mm": blend_mean([sum(v) for v in per_feed_values if v]),
-            "chance": chance_of_rain(shares),
+            "chance": predicted_wet_hour_share(shares),
         }
     raise ValueError(f"unknown variable {variable!r}")
 
 
-def chance_of_rain(per_feed_shares: Sequence[float]) -> float | None:
-    """Blend per-feed wet shares (equal weights) into the displayed chance.
+def predicted_wet_hour_share(per_feed_shares: Sequence[float]) -> float | None:
+    """Blend per-feed wet shares (equal weights) into the displayed value.
 
-    This is a coverage-of-the-day estimate, not a calibrated
-    probability of precipitation: each feed contributes ITS share of wet
-    slots, and the shares are averaged across feeds.
+    §16's shipped vocabulary: this is the PREDICTED WET-HOUR SHARE — a
+    coverage-of-the-day estimate, not a calibrated probability of
+    precipitation. Each feed contributes ITS share of wet slots, and the
+    shares are averaged across feeds. (The payload key stays ``chance``:
+    it is a wire and template contract, not internal vocabulary.)
     """
     return blend_mean(per_feed_shares)

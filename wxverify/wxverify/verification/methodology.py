@@ -1,10 +1,10 @@
 """Methodology constants for the forecast-product backtest (plan §17).
 
 Every constant is pre-declared and versioned here — one module, one
-``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. Nothing
-here is wired into behavior yet; later phases (record snapshots, backtest
-engine, verdicts) import from this module so the whole methodology is
-auditable in one place.
+``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. Every
+constant here is wired into behavior; the record snapshots, backtest
+engine, verdicts, and the published contract import from this module so
+the whole methodology is auditable in one place.
 
 Naming follows the §17 table row-for-row; values are the table's, verbatim.
 """

@@ -11,7 +11,7 @@ data layer, and the "partial" badge is assembled in the service layer from
 This file owns everything pure: `ms_to_kmh`, `display_day_index` (the display
 half of the day-boundary gate), `covered_hours`, `clears_coverage` (pinned
 against `MIN_COVERAGE_HOURS`, not a hardcoded 18), `blend_mean`, `wet_share`
-(the rain-threshold inclusive boundary), and `chance_of_rain` (per-feed
+(the rain-threshold inclusive boundary), and `predicted_wet_hour_share` (per-feed
 average, proven distinct from a naive pooled share).
 
 No SQLite anywhere in this module — nothing to isolate.
@@ -26,10 +26,10 @@ from wxverify.core.units import kmh_to_ms, ms_to_kmh
 from wxverify.forecast.aggregate import (
     MIN_COVERAGE_HOURS,
     blend_mean,
-    chance_of_rain,
     clears_coverage,
     covered_hours,
     display_day_index,
+    predicted_wet_hour_share,
     wet_share,
 )
 
@@ -201,13 +201,13 @@ def test_wet_share_empty_is_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# chance_of_rain — equal-weight average of PER-FEED shares, proven distinct
+# predicted_wet_hour_share — equal-weight average of PER-FEED shares, proven distinct
 # from a naive pooled share (this keeps one feed's longer horizon from
 # out-voting a shorter one).
 # ---------------------------------------------------------------------------
 
 
-def test_chance_of_rain_is_per_feed_averaged_not_pooled() -> None:
+def test_predicted_wet_hour_share_is_per_feed_averaged_not_pooled() -> None:
     # Feed A: 2 of 2 covered hours wet -> share 1.0.
     # Feed B: 1 of 4 covered hours wet -> share 0.25.
     feed_a = [0.5, 0.5]
@@ -219,7 +219,7 @@ def test_chance_of_rain_is_per_feed_averaged_not_pooled() -> None:
     assert share_a is not None
     assert share_b is not None
 
-    per_feed_averaged = chance_of_rain([share_a, share_b])
+    per_feed_averaged = predicted_wet_hour_share([share_a, share_b])
     # Naive pooled share across all 6 raw hourly slots (3 wet of 6): what a
     # POOLED implementation would (wrongly) produce.
     pooled = 3 / 6
@@ -227,5 +227,5 @@ def test_chance_of_rain_is_per_feed_averaged_not_pooled() -> None:
     assert per_feed_averaged != pooled
 
 
-def test_chance_of_rain_empty_is_none() -> None:
-    assert chance_of_rain([]) is None
+def test_predicted_wet_hour_share_empty_is_none() -> None:
+    assert predicted_wet_hour_share([]) is None

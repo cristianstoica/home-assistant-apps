@@ -46,6 +46,7 @@ from wxverify.forecast.selection import (
     select_cell_feeds,
 )
 from wxverify.scoring.leaderboard import LeaderboardRow
+from wxverify.settings.depth import DEPTH_VARIABLES
 from wxverify.verification.asof import pair_knowability_exclusions
 from wxverify.verification.coverage import (
     QUANTITY_PRECIP_OCCURRENCE,
@@ -63,7 +64,7 @@ from wxverify.verification.runs import RunConfig
 
 #: The simulated horizon matches the record horizon: target day 0..7.
 SIM_DAY_COUNT = 8
-SIM_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
+SIM_VARIABLES: tuple[str, ...] = DEPTH_VARIABLES
 #: Headline §10 blend depths.
 SIM_DEPTHS: tuple[int, ...] = (1, 2, 3, 4)
 

@@ -141,15 +141,17 @@ def _continuous_metrics(
     return mae(errors), bias(errors), rmse(errors)
 
 
-def _contingency(rows: dict[str, sqlite3.Row], dates: list[str]) -> Contingency:
+def _contingency(rows: dict[str, sqlite3.Row], dates: list[str]) -> Contingency | None:
+    # NB-1: the SAME fail-closed guard as _continuous_metrics, not a quiet
+    # skip. A partially covered core would otherwise be counted over fewer
+    # days than the `common_days` written beside it, so the counts would
+    # describe a different sample than the column claims — and an empty core
+    # would publish 0/0/0/0 where §16 requires null.
+    if not dates or any(d not in rows for d in dates):
+        return None
     table = Contingency()
     for d in dates:
-        row = rows.get(d)
-        if row is None:
-            # Same F-3 guard as _continuous_metrics: absent incumbent rows
-            # contribute nothing rather than crashing.
-            continue
-        outcome = row["occurrence_outcome"]
+        outcome = rows[d]["occurrence_outcome"]
         if outcome is not None:
             table = table.add(str(outcome))
     return table
@@ -219,14 +221,16 @@ def _write_result(
     delta: float | None = None
     if quantity == QUANTITY_PRECIP_OCCURRENCE:
         table = _contingency(rows, dates)
-        hits, misses, fas, cns = (
-            table.hits,
-            table.misses,
-            table.false_alarms,
-            table.correct_negatives,
-        )
-        ets_v = ets(table)
-        inc_ets = ets(_contingency(incumbent_rows, dates))
+        if table is not None:
+            hits, misses, fas, cns = (
+                table.hits,
+                table.misses,
+                table.false_alarms,
+                table.correct_negatives,
+            )
+            ets_v = ets(table)
+        inc_table = _contingency(incumbent_rows, dates)
+        inc_ets = None if inc_table is None else ets(inc_table)
         if ets_v is not None and inc_ets is not None:
             delta = ets_v - inc_ets
     else:

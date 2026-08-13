@@ -752,9 +752,12 @@ def test_verification_page_published_run(
         assert "Skipped (incumbent outside simulated range)" in page.text
         assert "Headline results" in page.text
         assert "Methodology v1" in page.text
-        # Effective-depth provenance line.
-        assert "Effective blend depth" in page.text
+        # Live effective depth is labelled as LIVE, distinctly from the
+        # run's pinned incumbent depth (§16.1/§16.2).
+        assert "Live effective blend depth" in page.text
         assert "(global)" in page.text
+        assert 'data-v16="16.2.live_depth"' in page.text
+        assert 'data-v16="16.1.config_snapshot"' in page.text
 
 
 def test_forecast_page_ride_alongs(

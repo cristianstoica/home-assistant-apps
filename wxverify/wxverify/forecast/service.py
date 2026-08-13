@@ -46,11 +46,12 @@ from wxverify.forecast.selection import (
     select_cell_feeds,
 )
 from wxverify.scoring.leaderboard import LeaderboardRow
-from wxverify.settings.depth import effective_blend_depths
+from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.web.context import feed_label
 
 DAY_COUNT = 8
-VARIABLES = ("temperature", "wind", "precip")
+#: Page column order = the canonical roster (NB-4).
+VARIABLES = DEPTH_VARIABLES
 # Rain glyph appears when the blended chance is meaningful, i.e. a nontrivial
 # share of the day is expected wet — not on every 3% drizzle share.
 RAIN_GLYPH_MIN_CHANCE_PCT = 25

@@ -45,7 +45,7 @@ from wxverify.forecast.selection import (
     select_cell_feeds,
 )
 from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard_with_status
-from wxverify.settings.depth import effective_blend_depths
+from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.verification.coverage import evaluate_variable, local_day_bounds
 from wxverify.verification.methodology import (
@@ -57,7 +57,7 @@ from wxverify.worker.control import JobCancelled, JobDeferred
 
 #: Record identity spans the production display horizon: day 0..7.
 RECORD_DAY_COUNT = 8
-RECORD_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
+RECORD_VARIABLES: tuple[str, ...] = DEPTH_VARIABLES
 
 #: Global settings key for the snapshot wall-clock time; a per-site override
 #: lives at ``record_snapshot_local_time:<site_id>`` (§15).

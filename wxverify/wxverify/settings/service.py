@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import sqlite3
 
-from wxverify.core.options import RuntimeOptions
+from wxverify.core.options import RuntimeOptions, depth_option_values
 from wxverify.db.connection import get_db
-from wxverify.settings.depth import DEPTH_VARIABLES, depth_override_key
+from wxverify.settings.depth import depth_override_key
 from wxverify.settings.keys import set_setting
 
 
@@ -43,8 +43,7 @@ async def apply_plain_settings(options: RuntimeOptions) -> None:
         # only: a key absent from this apply DELETES its settings row, so
         # the global fallback takes effect and provenance reads "global".
         # The plain keys above keep their apply-when-present semantics.
-        for variable in DEPTH_VARIABLES:
-            value = getattr(options, f"forecast_blend_depth_{variable}")
+        for variable, value in depth_option_values(options).items():
             key = depth_override_key(variable)
             if value is not None:
                 set_setting(conn, key, str(int(value)))

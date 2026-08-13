@@ -102,6 +102,65 @@ def published_generation_clause(alias: str) -> str:
     )
 
 
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(str(value))
+
+
+def _optional_str(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def generation_status(
+    conn: sqlite3.Connection, site_id: int | None = None
+) -> list[dict[str, object]]:
+    """Every timezone generation, oldest first, with the published pointer
+    resolved and the reconciliation tally a correction chain records.
+
+    Read-only: the operator surface for §20's "verify the counts" step. The
+    counts are NULL until the correction chain starts filling them, and a
+    finished correction satisfies ``examined == changed + unchanged +
+    excluded``. Raises ValueError for an unknown ``site_id``.
+    """
+    if site_id is not None:
+        site = conn.execute("SELECT id FROM sites WHERE id=?", (site_id,)).fetchone()
+        if site is None:
+            raise ValueError(f"site {site_id} does not exist")
+    rows = conn.execute(
+        f"""
+        SELECT g.site_id, g.id, g.timezone, g.mode, g.state,
+               g.effective_from, g.effective_to, g.published_at,
+               g.examined_count, g.changed_count,
+               g.unchanged_count, g.excluded_count,
+               CAST(rs.value AS INTEGER) AS pointer
+        FROM timezone_generations g
+        LEFT JOIN runtime_state rs
+          ON rs.key = '{_POINTER_KEY_PREFIX}' || g.site_id
+        WHERE (? IS NULL OR g.site_id = ?)
+        ORDER BY g.site_id, g.id
+        """,
+        (site_id, site_id),
+    ).fetchall()
+    return [
+        {
+            "site_id": int(row["site_id"]),
+            "generation_id": int(row["id"]),
+            "timezone": str(row["timezone"]),
+            "mode": str(row["mode"]),
+            "state": str(row["state"]),
+            "published_pointer": row["pointer"] is not None
+            and int(row["pointer"]) == int(row["id"]),
+            "effective_from": _optional_str(row["effective_from"]),
+            "effective_to": _optional_str(row["effective_to"]),
+            "published_at": _optional_str(row["published_at"]),
+            "examined": _optional_int(row["examined_count"]),
+            "changed": _optional_int(row["changed_count"]),
+            "unchanged": _optional_int(row["unchanged_count"]),
+            "excluded": _optional_int(row["excluded_count"]),
+        }
+        for row in rows
+    ]
+
+
 def resolve_generation_for_instant(
     conn: sqlite3.Connection, site_id: int, instant_utc: str
 ) -> int | None:

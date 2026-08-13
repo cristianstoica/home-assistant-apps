@@ -16,7 +16,10 @@ from typing import Literal
 
 from wxverify.settings.keys import get_number_setting, get_setting
 
-#: The variables that accept a per-variable depth override (§15).
+#: The variables that accept a per-variable depth override (§15), and the
+#: CANONICAL forecast-variable roster: the forecast page, sample validation,
+#: the record builder and the verification simulator all derive their own
+#: tuples from this one (NB-4) so the set can never drift between them.
 DEPTH_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
 
 DEPTH_MIN = 1

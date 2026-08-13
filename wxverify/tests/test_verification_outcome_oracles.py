@@ -331,7 +331,12 @@ def test_temperature_component_non_inferiority_margin(
         high[d] = (0.5 * oh, oh)
         low[d] = (low_ratio * ol, ol)
         joint[d] = (high[d], low[d])
-    base = _strong_baseline(high)
+    # Condition 4 is evaluated on the COMPOSITE (mean of high and low MAE)
+    # over the high∩low intersection, so BOTH components must be supplied:
+    # (c, 2c) on each side makes the composite improvement exactly 0.5 under
+    # any resample weights, leaving condition 5 as the sole discriminator.
+    base_high = _strong_baseline(high)
+    base_low = _strong_baseline(low)
     candidate = CandidateSeries(
         key="3",
         continuous={
@@ -341,10 +346,12 @@ def test_temperature_component_non_inferiority_margin(
         temp={ld: dict(joint) for ld in range(1, 8)},
         baseline_continuous={
             "baseline_persistence": {
-                "temperature_high": {ld: dict(base) for ld in range(1, 8)}
+                "temperature_high": {ld: dict(base_high) for ld in range(1, 8)},
+                "temperature_low": {ld: dict(base_low) for ld in range(1, 8)},
             },
             "baseline_all_feed_mean": {
-                "temperature_high": {ld: dict(base) for ld in range(1, 8)}
+                "temperature_high": {ld: dict(base_high) for ld in range(1, 8)},
+                "temperature_low": {ld: dict(base_low) for ld in range(1, 8)},
             },
         },
     )
@@ -358,6 +365,184 @@ def test_temperature_component_non_inferiority_margin(
     assert low_comp["degraded"] is degraded
     assert low_comp["pooled_point"] == pytest.approx(1.0 - low_ratio)
     assert _conditions(verdict, "3")["components_non_inferior"] is (not degraded)
+    # Condition 5 must be the ONLY discriminator between the two rows: if the
+    # composite baseline gate ever fails here, the retain_incumbent row would
+    # pass for the wrong reason and stop testing the margin at all.
+    assert _conditions(verdict, "3")["beats_baselines"] is True
+
+
+# ---------------------------------------------------------------------------
+# O8b/O8c/O8d — temperature condition 4 is the COMPOSITE gate (§11/§12.5):
+# each baseline is compared on mean(high MAE, low MAE) over the high∩low
+# intersection, never on temperature_high alone. O8b is the negative (a
+# baseline that loses on highs but WINS on lows must not be beaten), O8c its
+# paired positive, O8d the §16.5 shape pin on the published family.
+# ---------------------------------------------------------------------------
+
+
+def _flat_lead(cand: float, opp: float, dates: list[str]) -> ContinuousLead:
+    """A constant paired series: weighted MAEs are invariant under any
+    resample weighting, so every effect below is an exact hand-computed
+    point and each CI degenerates to that point."""
+    return {d: (cand, opp) for d in dates}
+
+
+def _temp_joint(high: ContinuousLead, low: ContinuousLead) -> TempLead:
+    """The high∩low joint series the composite endpoint is built from."""
+    return {d: (high[d], low[d]) for d in high.keys() & low.keys()}
+
+
+def _temp_candidate(
+    high: ContinuousLead,
+    low: ContinuousLead,
+    baselines: dict[str, dict[str, dict[int, ContinuousLead]]],
+) -> CandidateSeries:
+    return CandidateSeries(
+        key="3",
+        continuous={
+            "temperature_high": {ld: dict(high) for ld in range(1, 8)},
+            "temperature_low": {ld: dict(low) for ld in range(1, 8)},
+        },
+        temp={ld: _temp_joint(high, low) for ld in range(1, 8)},
+        baseline_continuous=baselines,
+    )
+
+
+def _temp_verdict(candidate: CandidateSeries, *, seed: int) -> Verdict:
+    inputs = VariableInputs(
+        variable="temperature", incumbent_key="2", candidates=(candidate,)
+    )
+    return decide_variable(inputs, seed=seed, resamples=60)
+
+
+# Candidate vs incumbent, shared by O8b/O8c: high and low MAE 2.0 against an
+# incumbent at 4.0 -> composite improvement exactly 0.5 on every lead, so
+# conditions 1, 2, 3 and 5 all pass and condition 4 is the sole variable.
+_CAND_HIGH = _flat_lead(2.0, 4.0, _DATES)
+_CAND_LOW = _flat_lead(2.0, 4.0, _DATES)
+# A baseline the candidate crushes on both components (composite 1 - 2/8).
+_WEAK_BASELINE = {
+    "temperature_high": {ld: _flat_lead(2.0, 8.0, _DATES) for ld in range(1, 8)},
+    "temperature_low": {ld: _flat_lead(2.0, 8.0, _DATES) for ld in range(1, 8)},
+}
+
+
+def test_temperature_baseline_gate_rejects_baseline_that_wins_on_lows() -> None:
+    # Persistence loses on highs (2.0 vs 3.0) but WINS on lows (2.0 vs 1.0).
+    # Composite means are 2.0 on both sides -> effect exactly 0.0 on every
+    # resample, a degenerate [0, 0] CI that does not exclude zero. A
+    # high-only gate would instead see 1 - 2/3 = 1/3 and wave it through.
+    candidate = _temp_candidate(
+        _CAND_HIGH,
+        _CAND_LOW,
+        {
+            "baseline_persistence": {
+                "temperature_high": {
+                    ld: _flat_lead(2.0, 3.0, _DATES) for ld in range(1, 8)
+                },
+                "temperature_low": {
+                    ld: _flat_lead(2.0, 1.0, _DATES) for ld in range(1, 8)
+                },
+            },
+            "baseline_all_feed_mean": _WEAK_BASELINE,
+        },
+    )
+    verdict = _temp_verdict(candidate, seed=20260713)
+    assert verdict.outcome != "recommend"
+    conditions = _conditions(verdict, "3")
+    assert conditions["beats_baselines"] is False
+    # Isolate the gate: nothing else about this candidate fails.
+    assert conditions["ci_excludes_zero"] is True
+    assert conditions["lead_stability"] is True
+    assert conditions["practical_floor"] is True
+    assert conditions["components_non_inferior"] is True
+    baselines = cast(dict[str, object], _record(verdict, "3")["baselines"])
+    persistence = cast(dict[str, object], baselines["baseline_persistence"])
+    assert persistence["passed"] is False
+    assert persistence["pooled_point"] == pytest.approx(0.0)
+    all_feed_mean = cast(dict[str, object], baselines["baseline_all_feed_mean"])
+    assert all_feed_mean["passed"] is True
+
+
+def test_temperature_baseline_gate_passes_when_baseline_weak_on_both() -> None:
+    # Same fixture shape as the negative, with persistence made weak on the
+    # LOW component too (2.0 vs 3.0): composite opponent mean 3.0 against a
+    # candidate mean of 2.0 -> effect exactly 1/3, the gate passes, and the
+    # candidate reaches 'recommend'. Without this pair the negative above
+    # could be green for any unrelated reason.
+    candidate = _temp_candidate(
+        _CAND_HIGH,
+        _CAND_LOW,
+        {
+            "baseline_persistence": {
+                "temperature_high": {
+                    ld: _flat_lead(2.0, 3.0, _DATES) for ld in range(1, 8)
+                },
+                "temperature_low": {
+                    ld: _flat_lead(2.0, 3.0, _DATES) for ld in range(1, 8)
+                },
+            },
+            "baseline_all_feed_mean": _WEAK_BASELINE,
+        },
+    )
+    verdict = _temp_verdict(candidate, seed=20260714)
+    assert verdict.outcome == "recommend"
+    assert verdict.recommended_key == "3"
+    assert _conditions(verdict, "3")["beats_baselines"] is True
+    baselines = cast(dict[str, object], _record(verdict, "3")["baselines"])
+    persistence = cast(dict[str, object], baselines["baseline_persistence"])
+    assert persistence["passed"] is True
+    assert persistence["pooled_point"] == pytest.approx(1 / 3)
+
+
+def test_temperature_baseline_family_describes_the_composite_sample() -> None:
+    # §16.5: `baselines` is published as the verdict's COMPLETE tested
+    # family, so every entry must describe the composite (high∩low) sample
+    # the headline was decided on — not the wider high-only sample.
+    #
+    # Each baseline's HIGH series covers all 24 dates on all 7 leads; its LOW
+    # series covers 20 dates on leads 1-5 and only 19 on leads 6-7. The
+    # intersection is therefore 20 days on leads 1-5 (adequate: the §12 floor
+    # is inclusive) and 19 on leads 6-7 (below the floor). A high-only family
+    # would report 24 days on all 7 leads and adequate_leads [1..7]; the
+    # composite family must report [1, 2, 3, 4, 5].
+    low_dates = {ld: _DATES[:20] if ld <= 5 else _DATES[:19] for ld in range(1, 8)}
+    baseline = {
+        "temperature_high": {ld: _flat_lead(2.0, 4.0, _DATES) for ld in range(1, 8)},
+        "temperature_low": {
+            ld: _flat_lead(2.0, 4.0, low_dates[ld]) for ld in range(1, 8)
+        },
+    }
+    candidate = _temp_candidate(
+        _CAND_HIGH,
+        _CAND_LOW,
+        {
+            "baseline_persistence": baseline,
+            "baseline_all_feed_mean": {
+                quantity: {ld: dict(series) for ld, series in by_lead.items()}
+                for quantity, by_lead in baseline.items()
+            },
+        },
+    )
+    verdict = _temp_verdict(candidate, seed=20260715)
+    record = _record(verdict, "3")
+    baselines = cast(dict[str, object], record["baselines"])
+    assert set(baselines) == {"baseline_persistence", "baseline_all_feed_mean"}
+    for name in ("baseline_persistence", "baseline_all_feed_mean"):
+        entry = cast(dict[str, object], baselines[name])
+        assert entry["adequate_leads"] == [1, 2, 3, 4, 5], name
+        assert set(cast(dict[str, object], entry["per_lead"])) == {
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+        }, name
+        assert entry["pooled_point"] == pytest.approx(0.5), name
+    # Paired positive: the shortfall is the injected low-series geometry, not
+    # an ambient adequacy failure — the candidate's own composite, whose high
+    # and low series both span all 24 dates, keeps all seven leads.
+    assert _headline(verdict, "3")["adequate_leads"] == list(range(1, 8))
 
 
 # ---------------------------------------------------------------------------
