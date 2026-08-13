@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
@@ -35,6 +36,148 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
     _enqueue_due_current_obs(conn)
+    _enqueue_due_forecast_records(conn)
+    _enqueue_due_verification_runs(conn)
+
+
+# Site-local wall-clock time at/after which the nightly verification trigger
+# fires (§14). A scheduling default, not §17 methodology — it cannot change
+# any score. Late (02:00) so the day's record and truth writes land first.
+VERIFICATION_TRIGGER_LOCAL_TIME = "02:00"
+
+
+def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
+    """Enqueue the nightly verification chain per site (§14).
+
+    Due when the site's local time has passed the trigger time and no
+    trigger decision exists yet for (site, local today). An active chain
+    suppresses the trigger with a DURABLE ``suppressed_because_active``
+    decision row — that row also gates re-enqueue for the rest of the day.
+    Bad tz config fails closed per site, like the record trigger above.
+    """
+    from wxverify.verification.record import resolve_snapshot_utc
+    from wxverify.verification.runs import (
+        record_trigger_decision,
+        trigger_decision_exists,
+    )
+    from wxverify.worker.verification_run import verification_job_key
+
+    now = utc_now()
+    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
+    for row in rows:
+        site_id = int(row["id"])
+        timezone = str(row["timezone"])
+        try:
+            tz = ZoneInfo(timezone)
+            local_today = now.astimezone(tz).date()
+            trigger_utc = resolve_snapshot_utc(
+                timezone, local_today, VERIFICATION_TRIGGER_LOCAL_TIME
+            )
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "scheduler: unusable verification trigger config site=%s; skipping",
+                site_id,
+            )
+            continue
+        if now < trigger_utc:
+            continue
+        day_iso = local_today.isoformat()
+        if trigger_decision_exists(conn, site_id, day_iso):
+            continue
+        active = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE type = 'verification_run' AND site_id = ? AND job_key = ?
+              AND status IN ('pending', 'running')
+            LIMIT 1
+            """,
+            (site_id, verification_job_key(site_id)),
+        ).fetchone()
+        if active is not None:
+            record_trigger_decision(
+                conn,
+                site_id,
+                trigger_date=day_iso,
+                decision="suppressed_because_active",
+                reason="verification chain already active",
+            )
+            continue
+        enqueue_if_absent_with_cooldown(
+            conn,
+            "verification_run",
+            site_id,
+            verification_job_key(site_id),
+            {"trigger_date": day_iso},
+            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+        )
+
+
+def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
+    """Enqueue the daily forecast_record job (and gap scan) per site (§14).
+
+    Due when the site's local time has reached today's snapshot time T and
+    no record/missed row exists yet for (site, current generation, today).
+    The date-scoped ``job_key`` plus ``idx_jobs_active_dedupe`` guarantees
+    one active job per day even across the doubled autumn hour. The gap
+    scan is enqueued once per local day after T; a completed jobs row for
+    the day's key gates re-enqueue.
+    """
+    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.verification.record import (
+        record_rows_exist,
+        resolve_snapshot_utc,
+        snapshot_wall_clock,
+    )
+
+    now = utc_now()
+    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
+    for row in rows:
+        site_id = int(row["id"])
+        timezone = str(row["timezone"])
+        try:
+            tz = ZoneInfo(timezone)
+            local_today = now.astimezone(tz).date()
+            wall_clock = snapshot_wall_clock(conn, site_id)
+            snapshot_utc = resolve_snapshot_utc(timezone, local_today, wall_clock)
+        except (ZoneInfoNotFoundError, ValueError):
+            # Foreign/corrupt timezone or wall clock: fail closed (skip this
+            # site for this tick) -- inventing a snapshot instant would stamp
+            # records on an invented schedule. Every other site still runs.
+            logger.warning(
+                "scheduler: unusable snapshot config site=%s; skipping", site_id
+            )
+            continue
+        if now < snapshot_utc:
+            continue
+        day_iso = local_today.isoformat()
+        generation_id = ensure_published_generation(conn, site_id)
+        if not record_rows_exist(conn, site_id, generation_id, day_iso):
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "forecast_record",
+                site_id,
+                f"record:{day_iso}",
+                {"snapshot_local_date": day_iso},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
+        gap_key = f"gapscan:{day_iso}"
+        done = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE type = 'record_gap_scan' AND site_id = ? AND job_key = ?
+            LIMIT 1
+            """,
+            (site_id, gap_key),
+        ).fetchone()
+        if done is None:
+            enqueue_if_absent_with_cooldown(
+                conn,
+                "record_gap_scan",
+                site_id,
+                gap_key,
+                {},
+                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            )
 
 
 def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:

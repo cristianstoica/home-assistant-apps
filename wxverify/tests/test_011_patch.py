@@ -25,6 +25,7 @@ from wxverify.db.connection import (
     get_db,
     init_db,
 )
+from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import (
     FailDisposition,
     Job,
@@ -1503,7 +1504,7 @@ def test_worker_url_secrets_redacted_in_logs(
 def test_idx_pairs_cell_created_on_fresh_db(tmp_path: Path) -> None:
     conn = _init_tmp_db(tmp_path)
     assert _index_exists(conn, "idx_pairs_cell")
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
 
 
 def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
@@ -1521,7 +1522,9 @@ def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
 
     assert _index_exists(conn2, "idx_pairs_cell"), "idx_pairs_cell must be re-created"
     version = conn2.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 3, "user_version must reach 3 after the migration"
+    assert version == TARGET_USER_VERSION, (
+        "user_version must reach TARGET_USER_VERSION after the migration"
+    )
 
 
 def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(

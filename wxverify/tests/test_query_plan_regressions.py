@@ -11,11 +11,16 @@ it.
 from __future__ import annotations
 
 import datetime
+import inspect
 import os
 import sqlite3
 
 import pytest
 
+import wxverify.api.routes.verification
+import wxverify.db.runtime_state
+import wxverify.verification.runs
+import wxverify.web.verification
 from wxverify.api.routes.health import (
     FORECAST_PAIRS_COUNT_SQL,
     FORECAST_SAMPLES_COUNT_SQL,
@@ -256,7 +261,35 @@ def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
         ("valid_at", 0),
         ("issued_at", 1),
         ("abs_error", 0),
+        ("tz_generation_id", 0),
     ]
+
+
+def test_winrate_published_pointer_resolves_as_a_runtime_state_key_probe() -> None:
+    # The published-generation binding embeds a correlated scalar subquery on
+    # runtime_state ('tz_generation_published:' || fp.site_id). It runs once
+    # per candidate pairs row, so it must stay a key probe of runtime_state's
+    # primary key -- a per-row SCAN of runtime_state would make every
+    # pairs-reading statement O(pairs x runtime_state). Asserted as a
+    # structural relationship (probe present, scan absent), not exact EQP
+    # phrasing, which is build-specific.
+    conn = _fresh_conn()
+    sql = winrate_sql("")
+    params = (1, 1, 1, "temperature", 1)
+    plan = _plan(conn, sql, params)
+    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
+    assert not any("SCAN rs" in line for line in plan), plan
+
+    # Negative control: defeat the key probe (CAST strips the equality from
+    # the primary key) and the very same statement degrades to SCAN rs --
+    # proving the healthy assertion above is discriminating, not vacuous.
+    degraded_sql = sql.replace(
+        "rs.key = 'tz_generation_published:' || fp.site_id",
+        "CAST(rs.key AS TEXT) = 'tz_generation_published:' || fp.site_id",
+    )
+    assert degraded_sql != sql, "clause text drifted; update this control"
+    degraded_plan = _plan(conn, degraded_sql, params)
+    assert any("SCAN rs" in line for line in degraded_plan), degraded_plan
 
 
 def test_worker_status_count_statements_stay_index_only_scans() -> None:
@@ -531,4 +564,384 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
         ("valid_at", 0),
         ("variable", 0),
         ("model_run_id", 0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# §18.12 — query-plan expectations for the 0.11.0 verification indexes.
+#
+# Every /api/verification/* collection read must SEEK into an index on its
+# scoping key (run_id or site_id); a plan that SCANs one of these tables is
+# unbounded across runs/sites and is exactly the regression this family
+# exists to fail on. Each positive is paired with an empirically degrading
+# negative control: dropping the index, or dropping the scoping conjunct.
+#
+# The statements are retyped here because the route builds them as f-strings
+# around an optional filter clause rather than exporting a constant; a
+# source-text tripwire below fails if the production text drifts away from
+# what is pinned.
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_PAGE_SQL = """
+            SELECT * FROM verification_evidence
+            WHERE run_id = ?
+            ORDER BY id LIMIT ? OFFSET ?
+            """
+
+_RUNS_PAGE_SQL = """
+            SELECT * FROM verification_runs
+            ORDER BY id DESC LIMIT ? OFFSET ?
+            """
+
+_FAILED_NEWER_SQL = """
+        SELECT 1 FROM verification_runs
+        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1
+        """
+
+
+def test_verification_route_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire: the route composes its statements inline, so the
+    pinned copies above are only trustworthy while the production text
+    still contains them."""
+    source = inspect.getsource(wxverify.api.routes.verification)
+    assert "SELECT * FROM verification_evidence\n            WHERE run_id = ?" in source
+    assert "ORDER BY id LIMIT ? OFFSET ?" in source
+    assert "SELECT * FROM verification_runs {where}\n            ORDER BY id DESC" in (
+        source
+    )
+    assert (
+        "SELECT 1 FROM verification_runs\n"
+        "        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1" in source
+    )
+
+
+def test_evidence_page_seeks_by_run_id_never_scans() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
+    assert any("SEARCH verification_evidence" in line for line in plan), plan
+    assert any("(run_id=?)" in line for line in plan), plan
+    assert not any(line.startswith("SCAN verification_evidence") for line in plan), plan
+    # The run-scoping survives even without the secondary cell index: the
+    # UNIQUE(run_id, ...) autoindex leads on run_id too. Pinning both
+    # configurations records WHY the page can never scan all runs.
+    conn.execute("DROP INDEX idx_verification_evidence_cell")
+    fallback = _plan(conn, _EVIDENCE_PAGE_SQL, (1, 10, 0))
+    assert any(
+        "SEARCH verification_evidence USING INDEX"
+        " sqlite_autoindex_verification_evidence_1 (run_id=?)" in line
+        for line in fallback
+    ), fallback
+
+
+def test_evidence_page_without_run_scoping_degrades_to_a_scan() -> None:
+    """Negative control: the exact regression §18.12 names — a detailed
+    evidence read that loses its run_id binding — plans as a full scan, so
+    the positive above is not vacuously true on this schema."""
+    conn = _fresh_conn()
+    degraded = _EVIDENCE_PAGE_SQL.replace("WHERE run_id = ?", "WHERE variable = ?")
+    assert degraded != _EVIDENCE_PAGE_SQL
+    plan = _plan(conn, degraded, ("wind", 10, 0))
+    assert plan == ["SCAN verification_evidence"], plan
+
+
+def test_runs_page_and_failed_newer_probe_use_idx_verification_runs_site() -> None:
+    conn = _fresh_conn()
+    site_sql = _RUNS_PAGE_SQL.replace(
+        "FROM verification_runs", "FROM verification_runs WHERE site_id = ?"
+    )
+    plan = _plan(conn, site_sql, (1, 10, 0))
+    assert any(
+        "SEARCH verification_runs USING INDEX idx_verification_runs_site (site_id=?)"
+        in line
+        for line in plan
+    ), plan
+    # The status banner's "a newer attempt failed" probe binds all three
+    # index columns and never touches the table.
+    probe = _plan(conn, _FAILED_NEWER_SQL, (1, 0))
+    assert probe == [
+        "SEARCH verification_runs USING COVERING INDEX"
+        " idx_verification_runs_site (site_id=? AND state=? AND id>?)"
+    ], probe
+
+    # Negative control: without the index the site page scans every run and
+    # the status probe falls back to a rowid range over all sites.
+    conn.execute("DROP INDEX idx_verification_runs_site")
+    assert _plan(conn, site_sql, (1, 10, 0)) == ["SCAN verification_runs"]
+    assert _plan(conn, _FAILED_NEWER_SQL, (1, 0)) == [
+        "SEARCH verification_runs USING INTEGER PRIMARY KEY (rowid>?)"
+    ]
+
+
+def test_trigger_decision_lookup_uses_its_site_date_index() -> None:
+    conn = _fresh_conn()
+    sql = """
+        SELECT * FROM verification_trigger_decisions
+        WHERE site_id = ? AND trigger_date = ? ORDER BY id DESC LIMIT 1
+        """
+    plan = _plan(conn, sql, (1, "2026-05-01"))
+    assert plan == [
+        "SEARCH verification_trigger_decisions USING INDEX"
+        " idx_verification_trigger_site_date (site_id=? AND trigger_date=?)"
+    ], plan
+    conn.execute("DROP INDEX idx_verification_trigger_site_date")
+    assert _plan(conn, sql, (1, "2026-05-01")) == [
+        "SCAN verification_trigger_decisions"
+    ]
+
+
+def test_new_verification_index_column_order_matches_the_query_shapes() -> None:
+    """Structure asserted via PRAGMA index_xinfo, never a DDL string copy."""
+    conn = _fresh_conn()
+
+    def keyed(index: str) -> list[tuple[str, int]]:
+        return [
+            (str(row["name"]), int(row["desc"]))
+            for row in conn.execute(f"PRAGMA index_xinfo({index})")  # noqa: S608
+            if row["key"]
+        ]
+
+    assert keyed("idx_verification_runs_site") == [
+        ("site_id", 0),
+        ("state", 0),
+        ("id", 0),
+    ]
+    assert keyed("idx_verification_evidence_cell") == [
+        ("run_id", 0),
+        ("entity_type", 0),
+        ("quantity", 0),
+        ("lead", 0),
+        ("target_local_date", 0),
+    ]
+    assert keyed("idx_verification_trigger_site_date") == [
+        ("site_id", 0),
+        ("trigger_date", 0),
+        ("id", 0),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# §18.12 — the /status input-fingerprint statements (NB-2).
+#
+# `GET /api/verification/status` and the /verification page recompute the
+# live input fingerprint per site ON THE REQUEST PATH
+# (`current_input_fingerprint`): a runtime_state pointer probe plus three
+# growth-proportional reads over `observations`, `forecast_samples` and
+# `daily_truth`. Measured at ~29 ms/site at three years of data, ~21.7 ms of
+# it the observations COUNT(*). That cost is tolerable only while every one
+# of those reads stays SITE-SCOPED through an index -- a plan that scans any
+# of these tables grows with the whole install instead of with the site, and
+# turns a status page into an unbounded read.
+#
+# Relationships are pinned (site binding present, table never scanned), not
+# planner phrasing. These are the post-NB-9 statements: the read path now
+# resolves the generation with the non-seeding pointer read, so the pointer
+# probe below is part of the request path too.
+#
+# Retyped + tripwired like the route statements above: `runs.py` composes
+# these inline rather than exporting constants.
+# ---------------------------------------------------------------------------
+
+_FINGERPRINT_OBS_SQL = """
+        SELECT COUNT(*) AS n, MAX(computed_at) AS latest
+        FROM observations WHERE site_id = ?
+        """
+
+_FINGERPRINT_SAMPLES_SQL = (
+    "SELECT COALESCE(MAX(id), 0) AS hi FROM forecast_samples WHERE site_id = ?"
+)
+
+_FINGERPRINT_TRUTH_SQL = """
+        SELECT local_date, quantity, value, eligible, covered_hours, stale
+        FROM daily_truth
+        WHERE site_id = ? AND tz_generation_id = ?
+        ORDER BY local_date, quantity
+        """
+
+_TZ_POINTER_SQL = "SELECT value FROM runtime_state WHERE key = ?"
+
+
+def test_fingerprint_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire for the four statements pinned below."""
+    source = inspect.getsource(wxverify.verification.runs)
+    assert (
+        "SELECT COUNT(*) AS n, MAX(computed_at) AS latest\n"
+        "        FROM observations WHERE site_id = ?" in source
+    )
+    assert _FINGERPRINT_SAMPLES_SQL in source
+    assert (
+        "SELECT local_date, quantity, value, eligible, covered_hours, stale\n"
+        "        FROM daily_truth\n"
+        "        WHERE site_id = ? AND tz_generation_id = ?\n"
+        "        ORDER BY local_date, quantity" in source
+    )
+    # The pointer probe reaches the request path through
+    # published_generation_id -> get_runtime_state.
+    assert _TZ_POINTER_SQL in inspect.getsource(wxverify.db.runtime_state)
+    assert "published_generation_id(conn, site_id)" in source
+
+
+def test_fingerprint_observation_count_seeks_by_site_never_scans() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _FINGERPRINT_OBS_SQL, (1,))
+    assert any(
+        "SEARCH observations" in line and "(site_id=?)" in line for line in plan
+    ), plan
+    assert not any(line.startswith("SCAN observations") for line in plan), plan
+    # Negative control: the same aggregate without its site scoping is the
+    # whole-install scan this pin exists to keep off the request path.
+    unscoped = _FINGERPRINT_OBS_SQL.replace(" WHERE site_id = ?", "")
+    assert unscoped != _FINGERPRINT_OBS_SQL
+    assert _plan(conn, unscoped, ()) == ["SCAN observations"], unscoped
+
+
+def test_fingerprint_sample_high_water_stays_site_scoped() -> None:
+    conn = _fresh_conn()
+    # The site binding comes from the UNIQUE key, not from any one secondary
+    # index, so it survives losing them one at a time. Pinning the whole
+    # fallback ladder records WHY this read can never degrade to a scan.
+    for dropped in (None, "idx_samples_runs", "idx_samples_site_var_valid"):
+        if dropped is not None:
+            conn.execute(f"DROP INDEX {dropped}")  # noqa: S608
+        plan = _plan(conn, _FINGERPRINT_SAMPLES_SQL, (1,))
+        assert any(
+            "SEARCH forecast_samples USING COVERING INDEX" in line
+            and "(site_id=?)" in line
+            for line in plan
+        ), (dropped, plan)
+
+
+def test_fingerprint_truth_rows_seek_by_site_and_sort_in_a_temp_btree() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _FINGERPRINT_TRUTH_SQL, (1, 1))
+    assert any(
+        "SEARCH daily_truth" in line and "(site_id=?)" in line for line in plan
+    ), plan
+    assert not any(line.startswith("SCAN daily_truth") for line in plan), plan
+    # The UNIQUE key is (site_id, quantity, local_date, tz_generation_id), so
+    # ORDER BY (local_date, quantity) cannot be served from it: the sort is a
+    # temp b-tree over the site's truth rows. Pinned as the KNOWN cost of
+    # this read -- if an index ever makes the ordering index-served, this is
+    # the line that records the improvement.
+    assert any("USE TEMP B-TREE FOR ORDER BY" in line for line in plan), plan
+    # Negative control: lose the site conjunct and the read scans every
+    # site's whole truth history.
+    degraded = _FINGERPRINT_TRUTH_SQL.replace("site_id = ?", "timezone = ?")
+    assert degraded != _FINGERPRINT_TRUTH_SQL
+    assert _plan(conn, degraded, ("UTC", 1))[0] == "SCAN daily_truth", degraded
+
+
+def test_tz_generation_pointer_probe_is_a_key_lookup() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _TZ_POINTER_SQL, ("tz_generation_published:1",))
+    assert any("SEARCH runtime_state" in line and "(key=?)" in line for line in plan), (
+        plan
+    )
+    # Negative control: probing by value instead of by key scans the table.
+    degraded = _TZ_POINTER_SQL.replace("WHERE key = ?", "WHERE value = ?")
+    assert _plan(conn, degraded, ("1",)) == ["SCAN runtime_state"], degraded
+
+
+# ---------------------------------------------------------------------------
+# §18.12 — the /verification PAGE's two run-scoped reads (Round B).
+#
+# Rendering one run loads every persisted result row (`_load_results`) and
+# aggregates the run's evidence into realized contributor depths
+# (`_load_contributor_depths`). Both tables accumulate one set of rows per
+# run FOREVER, so these are the two reads that grow with the install's whole
+# verification history rather than with the run being shown: only a run_id
+# seek keeps the page's cost proportional to one run.
+#
+# Both statements are composed inline in `wxverify/web/verification.py`, so
+# they are retyped here and guarded by a source tripwire below.
+#
+# Relationships are pinned -- the named index is used and the table is never
+# scanned -- never the planner's exact phrasing, which differs between the
+# `sqlite3` CLI, the interpreter this suite runs under, and CI.
+# ---------------------------------------------------------------------------
+
+_PAGE_RESULTS_SQL = """
+        SELECT variable, lead, quantity, entity_type, entity_key, headline,
+               common_days, mae, bias, rmse, hits, misses, false_alarms,
+               correct_negatives, ets, availability_rate, delta_vs_incumbent
+        FROM verification_results
+        WHERE run_id = ?
+        ORDER BY variable, quantity, lead, entity_type, entity_key
+        """
+
+_PAGE_CONTRIBUTORS_SQL = """
+        SELECT variable, lead, quantity, entity_key,
+               MIN(realized_contributors) AS lo,
+               MAX(realized_contributors) AS hi
+        FROM verification_evidence
+        WHERE run_id = ? AND entity_type = 'depth'
+          AND forecast_eligible = 1 AND realized_contributors IS NOT NULL
+        GROUP BY variable, lead, quantity, entity_key
+        """
+
+
+def test_verification_page_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire for the two page reads pinned below."""
+    source = inspect.getsource(wxverify.web.verification)
+    assert _PAGE_RESULTS_SQL in source
+    assert _PAGE_CONTRIBUTORS_SQL in source
+
+
+def test_page_result_load_seeks_by_run_never_scans_the_results_table() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _PAGE_RESULTS_SQL, (1,))
+    assert any(
+        "SEARCH verification_results" in line and "(run_id=?)" in line for line in plan
+    ), plan
+    assert not any(line.startswith("SCAN verification_results") for line in plan), plan
+    # Negative control: the UNIQUE key leads on run_id, so DROPping a
+    # secondary index proves nothing -- removing the run scoping is what
+    # empirically degrades this read to a whole-history scan.
+    unscoped = _PAGE_RESULTS_SQL.replace("WHERE run_id = ?\n", "")
+    assert unscoped != _PAGE_RESULTS_SQL
+    assert _plan(conn, unscoped, ())[0] == "SCAN verification_results", unscoped
+
+
+def test_page_contributor_rollup_uses_the_evidence_cell_index() -> None:
+    conn = _fresh_conn()
+    plan = _plan(conn, _PAGE_CONTRIBUTORS_SQL, (1,))
+    assert any(
+        "SEARCH verification_evidence USING INDEX idx_verification_evidence_cell"
+        in line
+        and "(run_id=? AND entity_type=?)" in line
+        for line in plan
+    ), plan
+    assert not any(line.startswith("SCAN verification_evidence") for line in plan), plan
+    # The GROUP BY is not index-served (the cell index orders by quantity,
+    # lead, target_local_date), so the rollup sorts in a temp b-tree over ONE
+    # run's evidence. Pinned as this read's known, run-bounded cost.
+    assert any("USE TEMP B-TREE FOR GROUP BY" in line for line in plan), plan
+    # Negative control: drop the run scoping (not the index -- the UNIQUE
+    # autoindex also leads on run_id, so an index drop is not a real
+    # degradation) and the rollup walks every run's evidence ever recorded.
+    unscoped = _PAGE_CONTRIBUTORS_SQL.replace("run_id = ? AND ", "")
+    assert unscoped != _PAGE_CONTRIBUTORS_SQL
+    degraded_plan = _plan(conn, unscoped, ())
+    assert any(
+        line.startswith("SCAN verification_evidence") for line in degraded_plan
+    ), degraded_plan
+
+
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pin: planner phrasing is build-specific (WXV_EQP_SHIPPING=1)",
+)
+def test_verification_page_reads_have_the_expected_shipping_plans() -> None:
+    conn = _fresh_conn()
+    assert _plan(conn, _PAGE_RESULTS_SQL, (1,)) == [
+        "SEARCH verification_results USING INDEX"
+        " sqlite_autoindex_verification_results_1 (run_id=?)",
+        # The UNIQUE key is (run_id, variable, lead, quantity, entity_type,
+        # entity_key), so the seek delivers rows already ordered by the
+        # ORDER BY's FIRST term; only the remaining four are sorted.
+        "USE TEMP B-TREE FOR LAST 4 TERMS OF ORDER BY",
+    ]
+    assert _plan(conn, _PAGE_CONTRIBUTORS_SQL, (1,)) == [
+        "SEARCH verification_evidence USING INDEX"
+        " idx_verification_evidence_cell (run_id=? AND entity_type=?)",
+        "USE TEMP B-TREE FOR GROUP BY",
     ]

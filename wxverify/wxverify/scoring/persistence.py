@@ -25,6 +25,10 @@ from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_clause,
+)
 from wxverify.scoring.pair_flags import precip_flags
 
 _MAX_DAY_AHEAD = 7
@@ -38,8 +42,8 @@ class _Group:
     rain_threshold_mm: float
     # (epoch_seconds, stored valid_at string, value, is_canonical)
     targets: list[tuple[int, str, float, bool]]
-    # canonical hour sources only: epoch_seconds -> value
-    sources: dict[int, float]
+    # canonical hour sources only: epoch_seconds -> (value, computed_at)
+    sources: dict[int, tuple[float, str | None]]
 
 
 def materialize_persistence(
@@ -60,8 +64,8 @@ def materialize_persistence(
     params: tuple[object, ...] = () if site_id is None else (site_id,)
     observations = conn.execute(
         f"""
-        SELECT o.site_id, o.variable, o.valid_at, o.value, s.timezone,
-               s.rain_threshold_mm
+        SELECT o.site_id, o.variable, o.valid_at, o.value, o.computed_at,
+               s.timezone, s.rain_threshold_mm
         FROM observations o
         JOIN sites s ON s.id = o.site_id
         {where}
@@ -73,8 +77,13 @@ def materialize_persistence(
     existing_counts = _existing_pair_counts(conn, feed_id, site_id)
     groups = _group_observations(observations)
     written = 0
+    generation_ids: dict[int, int] = {}
     for (obs_site_id, variable), group in groups.items():
         rain_threshold = group.rain_threshold_mm if variable == "precip" else None
+        generation_id = generation_ids.get(obs_site_id)
+        if generation_id is None:
+            generation_id = ensure_published_generation(conn, obs_site_id)
+            generation_ids[obs_site_id] = generation_id
         written += _materialize_group(
             conn,
             feed_id=feed_id,
@@ -84,6 +93,7 @@ def materialize_persistence(
             group=group,
             rain_threshold=rain_threshold,
             existing_counts=existing_counts,
+            generation_id=generation_id,
         )
     return written
 
@@ -101,6 +111,7 @@ def _existing_pair_counts(
         SELECT site_id, variable, valid_at, COUNT(*) AS n
         FROM forecast_pairs
         WHERE feed_id = ? {count_where}
+          AND {published_generation_clause("forecast_pairs")}
         GROUP BY site_id, variable, valid_at
         """,
         count_params,
@@ -134,7 +145,10 @@ def _group_observations(
         epoch = int(dt.timestamp())
         group.targets.append((epoch, valid_at, float(obs["value"]), canonical))
         if canonical:
-            group.sources[epoch] = float(obs["value"])
+            computed_at = (
+                None if obs["computed_at"] is None else str(obs["computed_at"])
+            )
+            group.sources[epoch] = (float(obs["value"]), computed_at)
     return groups
 
 
@@ -148,6 +162,7 @@ def _materialize_group(
     group: _Group,
     rain_threshold: float | None,
     existing_counts: dict[tuple[int, str, str], int],
+    generation_id: int,
 ) -> int:
     tz = ZoneInfo(group.timezone)
     # Sources bucketed by their sub-hour remainder: a target only ever lags
@@ -170,6 +185,7 @@ def _materialize_group(
                 observed=observed,
                 timezone=group.timezone,
                 rain_threshold=rain_threshold,
+                generation_id=generation_id,
             )
             continue
         arrays = by_remainder.get(epoch % 3600)
@@ -197,7 +213,8 @@ def _materialize_group(
             source_epoch = epochs[index]
             lead = (epoch - source_epoch) // 3600
             issued_at = isoformat_utc(valid_dt - timedelta(hours=lead))
-            written += _insert_persistence_pair(
+            source_value, source_computed_at = group.sources[source_epoch]
+            written += insert_persistence_pair(
                 conn,
                 site_id=site_id,
                 feed_id=feed_id,
@@ -206,9 +223,11 @@ def _materialize_group(
                 valid_at=valid_at,
                 lead=lead,
                 bucket=target_ordinal - date_ordinals[index],
-                forecast=group.sources[source_epoch],
+                forecast=source_value,
                 observed=observed,
                 rain_threshold=rain_threshold,
+                first_known_at=source_computed_at,
+                generation_id=generation_id,
             )
     return written
 
@@ -224,6 +243,7 @@ def _materialize_target_fallback(
     observed: float,
     timezone: str,
     rain_threshold: float | None,
+    generation_id: int,
 ) -> int:
     """0.1.0 per-lead point lookups for non-canonical target timestamps."""
     valid = parse_utc(valid_at)
@@ -232,7 +252,7 @@ def _materialize_target_fallback(
         issued_at = isoformat_utc(valid - timedelta(hours=lead))
         lagged = conn.execute(
             """
-            SELECT value FROM observations
+            SELECT value, computed_at FROM observations
             WHERE site_id=? AND variable=? AND valid_at=?
             """,
             (site_id, variable, issued_at),
@@ -242,7 +262,7 @@ def _materialize_target_fallback(
         bucket = day_ahead(issued_at, valid_at, timezone)
         if bucket < 0 or bucket > _MAX_DAY_AHEAD:
             continue
-        written += _insert_persistence_pair(
+        written += insert_persistence_pair(
             conn,
             site_id=site_id,
             feed_id=feed_id,
@@ -254,11 +274,15 @@ def _materialize_target_fallback(
             forecast=float(lagged["value"]),
             observed=observed,
             rain_threshold=rain_threshold,
+            first_known_at=(
+                None if lagged["computed_at"] is None else str(lagged["computed_at"])
+            ),
+            generation_id=generation_id,
         )
     return written
 
 
-def _insert_persistence_pair(
+def insert_persistence_pair(
     conn: sqlite3.Connection,
     *,
     site_id: int,
@@ -271,7 +295,20 @@ def _insert_persistence_pair(
     forecast: float,
     observed: float,
     rain_threshold: float | None,
+    first_known_at: str | None,
+    generation_id: int,
 ) -> int:
+    """Insert one persistence pair.
+
+    Public: also the insert primitive for the timezone-correction rebuild
+    (``scoring.tz_rebuild``), which re-derives persistence pairs under a
+    building generation.
+
+    ``first_known_at`` is the SOURCE observation's ``computed_at`` — the
+    lagged observation serving as the persistence forecast defines when this
+    pair became knowable. A source without ``computed_at`` stays NULL (never
+    invented); downstream as-of reads exclude it with a recorded reason.
+    """
     hit, false, miss, correct_neg = precip_flags(
         variable, forecast, observed, rain_threshold
     )
@@ -281,8 +318,8 @@ def _insert_persistence_pair(
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
              day_ahead, forecast, observed, error, abs_error, sq_error,
              cat_hit, cat_false, cat_miss, cat_correct_neg,
-             rain_threshold_mm)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             rain_threshold_mm, first_known_at, tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -302,6 +339,8 @@ def _insert_persistence_pair(
             miss,
             correct_neg,
             rain_threshold,
+            first_known_at,
+            generation_id,
         ),
     )
     return cur.rowcount

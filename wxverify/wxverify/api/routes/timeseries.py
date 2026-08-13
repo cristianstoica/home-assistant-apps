@@ -7,6 +7,7 @@ import sqlite3
 from fastapi import APIRouter, Query
 
 from wxverify.db.connection import get_db
+from wxverify.db.tz_generations import published_generation_clause
 
 router = APIRouter(prefix="/api", tags=["timeseries"])
 
@@ -21,7 +22,12 @@ async def timeseries(
     to: str | None = None,
 ) -> dict[str, object]:
     def _read(conn: sqlite3.Connection) -> dict[str, object]:
-        clauses = ["site_id=?", "variable=?", "feed_id=?"]
+        clauses = [
+            "site_id=?",
+            "variable=?",
+            "feed_id=?",
+            published_generation_clause("forecast_pairs"),
+        ]
         params: list[object] = [site, variable, feed_id]
         if issued_at is not None:
             clauses.append("issued_at=?")

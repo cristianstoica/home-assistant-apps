@@ -29,6 +29,7 @@ from datetime import UTC, datetime, timedelta
 
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.data import (
     forecast_ranking,
     load_feed_freshness,
@@ -110,8 +111,9 @@ def _insert_pair(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -126,6 +128,7 @@ def _insert_pair(
             error,
             abs(error),
             error * error,
+            ensure_published_generation(conn, site_id),
         ),
     )
 

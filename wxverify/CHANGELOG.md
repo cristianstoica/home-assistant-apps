@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.11.0
+
+### Added
+
+- A **Verification** page, with matching read-only `/api/verification/*`
+  endpoints, that backtests the add-on's own forecast product. For each past
+  day it reconstructs the forecast the add-on would actually have published,
+  using only what was known at that morning's decision time, then scores it
+  against every individual feed, against a day-before persistence baseline,
+  and against the equal-weight average of all feeds — all on the identical set
+  of days, so no comparison is won on an easier sample. Daily high and daily
+  low are scored separately, as are daily maximum wind, whether precipitation
+  occurred, and how much fell. Where a feed or a lead has too little history
+  to support a conclusion, the page says so rather than publishing a number.
+  Recommendations are advisory: nothing on this page changes the add-on's
+  forecast selection on its own.
+- Forecast blend depth can now be set per variable, through three new
+  options — `forecast_blend_depth_temperature`, `forecast_blend_depth_wind`
+  and `forecast_blend_depth_precip`. Each is optional and falls back to the
+  global `forecast_blend_depth` when left unset. The Forecast page shows the
+  depth in effect for each variable and whether it came from the per-variable
+  setting or the global one. Clearing one of these options removes the
+  override and restores the global value.
+- Three site-timezone commands — `wxverify timezone status`,
+  `wxverify timezone correct` and `wxverify timezone change`. Correcting a
+  timezone that was recorded wrongly rebuilds history under the corrected
+  zone; changing a timezone because a site genuinely moved preserves the
+  earlier history and applies the new zone only from an effective date
+  forward. Neither happens as a side effect of an ordinary edit, so a routine
+  change can no longer silently rewrite history.
+- Verification runs and their results are carried through database export and
+  restore.
+
+### Changed
+
+- **Correcting a site's timezone shifts historical leaderboard values.** This
+  is expected: local days and forecast leads that had been bucketed under the
+  wrong timezone are being reclassified, so the scores and rankings derived
+  from them change. The corrected history is built alongside the live data and
+  only replaces it once its row counts reconcile; while it runs, the site
+  reports as recalculating and forecast selection keeps using the previous
+  results.
+- The Forecast page's precipitation percentage is now labelled **predicted
+  wet-hour share** instead of chance of rain. The number never was a
+  probability — it is the share of the day's forecast hours that are wet — and
+  the new label says what it actually measures.
+- The first start after upgrading rebuilds two database tables, including the
+  forecast-pair table, and recreates their indexes. This happens once and is
+  slower than a normal start, more noticeably on SD or eMMC card storage.
+
+### Notes
+
+- The Verification page names the diagnostics it does not produce rather than
+  omitting them silently. **Wet-hour-share verification is deferred to
+  methodology version 2** — version 1 declares neither the bin edges nor the
+  rule reconciling the predicted share against the observed one, so no such
+  evidence is published. **Split-half results have been withdrawn** from the
+  page altogether: at the history depth available they could not have carried
+  information.
+
 ## 0.10.1
 
 ### Fixed

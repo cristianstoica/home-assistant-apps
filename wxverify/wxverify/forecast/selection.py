@@ -39,7 +39,7 @@ _MAE_NONE_LAST = float("inf")
 class CellCandidate:
     """A feed eligible for one cell: skill info (if any) + sample presence.
 
-    ``covered_hours`` is the count of distinct local hours the feed supplies
+    ``covered_hours`` is the count of distinct UTC hour instants the feed supplies
     for this tile day — the selection-side coverage signal used to build the
     pre-ladder coverage pool.
     """

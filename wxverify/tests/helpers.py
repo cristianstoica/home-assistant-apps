@@ -6,9 +6,12 @@ modules belong here. Anything used by a single file stays local to it.
 
 from __future__ import annotations
 
+import sqlite3
 from html.parser import HTMLParser
 
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
+from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 
 
 def assert_read_pool_at_rest(db: Database) -> None:
@@ -163,4 +166,142 @@ def assert_summary_mount_not_nested_in_chart(html: str, *, summary_id: str) -> N
     assert not parser.is_descendant, (
         f'<div id="{summary_id}"> is nested inside a [data-chart] container -- '
         "it must be a sibling"
+    )
+
+
+# ---------------------------------------------------------------------------
+# As-of / outcome-knowability fixture builders (plan §6, §18.1, §18.6).
+# Shared by test_asof_leakage.py and test_asof_live_equivalence.py.
+# All values are synthetic (fake site names, fake source/model ids).
+# ---------------------------------------------------------------------------
+
+
+def asof_conn() -> sqlite3.Connection:
+    """Fresh fully-migrated in-memory database (real datastore, no mocks)."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    return conn
+
+
+def asof_make_site(conn: sqlite3.Connection, name: str) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
+        VALUES (?, 47.0, 25.0, 900.0, 'UTC')
+        """,
+        (name,),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def asof_make_real_feed(conn: sqlite3.Connection, model: str) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO feeds (source, model, default_subscribed,
+                           fetch_interval_minutes, max_lead_hours)
+        VALUES ('example-src', ?, 1, 360, 48)
+        """,
+        (model,),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def asof_persistence_feed_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
+    ).fetchone()
+    assert row is not None
+    return int(row["id"])
+
+
+def asof_insert_sample(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    issued_at: str,
+    valid_at: str,
+    lead_hours: int,
+    value: float,
+    fetched_at: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO forecast_samples
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             value, source_raw, model_run_id, fetched_at)
+        VALUES (?, ?, 'temperature', ?, ?, ?, ?, '{}', 'run-x', ?)
+        """,
+        (site_id, feed_id, issued_at, valid_at, lead_hours, value, fetched_at),
+    )
+
+
+def asof_insert_pair(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    valid_at: str,
+    issued_at: str,
+    forecast: float,
+    observed: float,
+    first_known_at: str | None,
+    day_ahead: int = 1,
+    lead_hours: int = 6,
+    generation_id: int | None = None,
+) -> None:
+    """Generation-bound pair insert for crafting knowability scenarios.
+
+    ``generation_id=None`` binds the row to the site's PUBLISHED generation
+    (seeding it on first use); pass an explicit id to plant decoys under a
+    non-published generation.
+    """
+    if generation_id is None:
+        generation_id = ensure_published_generation(conn, site_id)
+    error = forecast - observed
+    conn.execute(
+        """
+        INSERT INTO forecast_pairs
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             first_known_at, tz_generation_id)
+        VALUES (?, ?, 'temperature', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            site_id,
+            feed_id,
+            issued_at,
+            valid_at,
+            lead_hours,
+            day_ahead,
+            forecast,
+            observed,
+            error,
+            abs(error),
+            error**2,
+            first_known_at,
+            generation_id,
+        ),
+    )
+
+
+def asof_insert_observation(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    valid_at: str,
+    value: float,
+    computed_at: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO observations
+            (site_id, variable, valid_at, value, n_stations, computed_at)
+        VALUES (?, 'temperature', ?, ?, 3, ?)
+        """,
+        (site_id, valid_at, value, computed_at),
     )

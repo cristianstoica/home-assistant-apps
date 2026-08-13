@@ -43,6 +43,7 @@ from wxverify import config
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import fetch_feed_once
@@ -108,8 +109,8 @@ def _seed_forecast_pair(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,
-             forecast, observed, error, abs_error, sq_error)
-        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?)
+             forecast, observed, error, abs_error, sq_error, tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -123,6 +124,7 @@ def _seed_forecast_pair(
             error,
             abs(error),
             error * error,
+            ensure_published_generation(conn, site_id),
         ),
     )
 

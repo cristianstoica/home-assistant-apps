@@ -27,6 +27,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import cutoff_for_window
 from wxverify.scoring.winrate import winrate
@@ -204,8 +205,9 @@ def _add_pair(
         """
         INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error)
-        VALUES (?, ?, ?, ?, ?, 24, ?, ?, 0.0, ?, ?, ?)
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, 24, ?, ?, 0.0, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -218,6 +220,7 @@ def _add_pair(
             abs_error,
             abs_error,
             abs_error**2,
+            ensure_published_generation(conn, site_id),
         ),
     )
 

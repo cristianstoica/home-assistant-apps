@@ -9,6 +9,7 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
@@ -735,6 +736,7 @@ def _scoring_feeds(
         WHERE EXISTS (
             SELECT 1 FROM forecast_pairs fp
             WHERE fp.site_id = ? AND fp.feed_id = a.feed_id AND fp.variable = ?
+              AND {published_generation_clause("fp")}
         )
         ORDER BY f.source, f.model
         """,

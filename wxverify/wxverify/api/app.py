@@ -29,9 +29,11 @@ from wxverify.api.routes import (
     feeds,
     forecast,
     health,
+    settings,
     sites,
     stations,
     timeseries,
+    verification,
 )
 from wxverify.collection.budget import set_source_cap
 from wxverify.core.options import load_runtime_options
@@ -88,6 +90,8 @@ def create_app(
     app.include_router(health.router)
     app.include_router(backfill.router)
     app.include_router(db_transfer.router)
+    app.include_router(verification.router)
+    app.include_router(settings.router)
     app.include_router(web_router)
 
     @app.middleware("http")

@@ -31,6 +31,7 @@ from wxverify.core.timeutil import (
     window_cutoff,
 )
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
@@ -92,8 +93,8 @@ def _ref_pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) 
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
                  cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 rain_threshold_mm)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 rain_threshold_mm, tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(row["site_id"]),
@@ -113,6 +114,7 @@ def _ref_pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) 
                 miss,
                 correct_neg,
                 rain_threshold,
+                ensure_published_generation(conn, int(row["site_id"])),
             ),
         )
         written += cur.rowcount
@@ -184,8 +186,8 @@ def _ref_materialize_persistence(
                     (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                      day_ahead, forecast, observed, error, abs_error, sq_error,
                      cat_hit, cat_false, cat_miss, cat_correct_neg,
-                     rain_threshold_mm)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     rain_threshold_mm, tz_generation_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(obs["site_id"]),
@@ -205,6 +207,7 @@ def _ref_materialize_persistence(
                     miss,
                     correct_neg,
                     rain_threshold,
+                    ensure_published_generation(conn, int(obs["site_id"])),
                 ),
             )
             written += cur.rowcount

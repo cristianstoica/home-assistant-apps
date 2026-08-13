@@ -39,6 +39,7 @@ from pydantic import ValidationError
 from wxverify.core.options import RuntimeOptions, _from_env
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.service import build_forecast
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
@@ -204,10 +205,11 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
                 """
                 INSERT INTO forecast_pairs
                     (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                     day_ahead, forecast, observed, error, abs_error, sq_error)
+                     day_ahead, forecast, observed, error, abs_error, sq_error,
+                     tz_generation_id)
                 VALUES
                     (1, ?, 'temperature', '2035-06-30T00:00:00Z', ?, ?, 1, ?,
-                     10.0, ?, ?, ?)
+                     10.0, ?, ?, ?, ?)
                 """,
                 (
                     target_feed,
@@ -217,6 +219,7 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
                     error,
                     abs(error),
                     error * error,
+                    ensure_published_generation(conn, 1),
                 ),
             )
 

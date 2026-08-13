@@ -43,6 +43,7 @@ from wxverify.api.routes import db_transfer
 from wxverify.db import connection as db_connection
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.migrations import TARGET_USER_VERSION
+from wxverify.db.tz_generations import ensure_published_generation
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1320,11 +1321,11 @@ def test_import_round_trip_rebuilds_derived_tables(
             INSERT INTO forecast_pairs
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg)
+                 cat_hit, cat_false, cat_miss, cat_correct_neg, tz_generation_id)
             VALUES (?, ?, 'wind', '2035-06-02T00:00:00Z', '2035-06-02T00:00:00Z',
-                    24, 1, 5.0, 4.0, 1.0, 1.0, 1.0, 1, 0, 0, 0)
+                    24, 1, 5.0, 4.0, 1.0, 1.0, 1.0, 1, 0, 0, 0, ?)
             """,
-            (site_b, feed_id),
+            (site_b, feed_id, ensure_published_generation(conn_b, site_b)),
         )
         conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn_b.commit()

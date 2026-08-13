@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal
 
-from wxverify.core.timeutil import window_cutoff
+from wxverify.core.timeutil import parse_utc, window_cutoff
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import active_competitor_clause, active_feed_cte
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting
+from wxverify.verification.asof import knowable_pair_predicate
 
 LeaderboardStatus = Literal["hit", "stale", "rebuilding", "empty", "live"]
 
@@ -160,8 +163,29 @@ def _live_leaderboard(
     variable: str,
     day_ahead: int,
     resolved: WindowResolution,
+    as_of: str | None = None,
+    min_n_override: int | None = None,
 ) -> list[LeaderboardRow]:
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    """Compute the leaderboard live from pairs (no ``score_cache`` read).
+
+    With ``as_of`` set this is the §6 as-of parameterization of the SAME
+    query shapes: feed discovery and metric aggregation see only pairs
+    knowable at T, and ``min_n_override`` MUST carry the run's declared
+    value — the as-of path never reads live mutable settings.
+    """
+    if as_of is not None and min_n_override is None:
+        raise ValueError("as-of leaderboard requires a declared min_n")
+    min_n = (
+        min_n_override
+        if min_n_override is not None
+        else get_number_setting(conn, "min_n", 30, minimum=0)
+    )
+    asof_clause = ""
+    asof_params: tuple[object, ...] = ()
+    if as_of is not None:
+        predicate, params = knowable_pair_predicate("fp", as_of=as_of)
+        asof_clause = f"AND {predicate}"
+        asof_params = params
     feeds = conn.execute(
         f"""
         SELECT DISTINCT fp.feed_id, f.source, f.model
@@ -173,9 +197,11 @@ def _live_leaderboard(
           AND fp.variable = ?
           AND fp.day_ahead = ?
           AND {active_competitor_clause(site_expr="fp.site_id")}
+          AND {published_generation_clause("fp")}
+          {asof_clause}
         ORDER BY f.source, f.model
         """,
-        (site_id, variable, day_ahead),
+        (site_id, variable, day_ahead, *asof_params),
     ).fetchall()
     rows: list[LeaderboardRow] = []
     for feed in feeds:
@@ -187,6 +213,7 @@ def _live_leaderboard(
             day_ahead=day_ahead,
             window_cutoff=resolved.cutoff,
             min_n=min_n,
+            as_of=as_of,
         )
         rows.append(
             LeaderboardRow(
@@ -311,6 +338,7 @@ def _expected_active_feed_ids(
               AND fp.feed_id = a.feed_id
               AND fp.variable = ?
               AND fp.day_ahead = ?
+              AND {published_generation_clause("fp")}
               {window_clause}
         )
         """,
@@ -329,11 +357,58 @@ def below_baseline(raw: float | None) -> bool:
     return raw is not None and raw < 0
 
 
+def asof_leaderboard(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    as_of: str,
+    min_n: int,
+    window_days: int | None,
+) -> list[LeaderboardRow]:
+    """Incumbent-ranking reconstruction as of T (plan §6).
+
+    A declared-configuration counterfactual: ``min_n`` and ``window_days``
+    are the run's pinned configuration snapshot, passed in explicitly — this
+    path never reads live mutable settings and never touches the mutable
+    ``score_cache``. The rolling cutoff is anchored at T (``window_cutoff``
+    with ``now=T``), and only pairs knowable at T participate; today's
+    leaderboard or the rebuilt all-history cache is never applied
+    retrospectively. ``window_days=None`` means all history up to T.
+    """
+    cutoff = (
+        None if window_days is None else window_cutoff(window_days, parse_utc(as_of))
+    )
+    resolved = WindowResolution(
+        window_key=("asof:all" if window_days is None else f"asof:{window_days}d"),
+        window_days=window_days,
+        cutoff=cutoff,
+        cache_backed=False,
+    )
+    return _live_leaderboard(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        resolved=resolved,
+        as_of=as_of,
+        min_n_override=min_n,
+    )
+
+
 def cutoff_for_window(conn: sqlite3.Connection, window: str) -> str | None:
     return resolve_window(conn, window).cutoff
 
 
-def resolve_window(conn: sqlite3.Connection, window: str) -> WindowResolution:
+def resolve_window(
+    conn: sqlite3.Connection, window: str, *, now: datetime | None = None
+) -> WindowResolution:
+    """Resolve a window token; ``now`` anchors relative cutoffs (default: now).
+
+    The backtest threads ``now=T`` so every relative window is computed
+    against the canonical decision time, never wall-clock time (plan §6).
+    """
     if window == "all":
         return WindowResolution(
             window_key="w:all", window_days=None, cutoff=None, cache_backed=True
@@ -343,7 +418,7 @@ def resolve_window(conn: sqlite3.Connection, window: str) -> WindowResolution:
         return WindowResolution(
             window_key=f"w:{days}",
             window_days=days,
-            cutoff=window_cutoff(days),
+            cutoff=window_cutoff(days, now),
             cache_backed=True,
         )
     if window.endswith("d") and window[:-1].isdigit():
@@ -351,14 +426,14 @@ def resolve_window(conn: sqlite3.Connection, window: str) -> WindowResolution:
         return WindowResolution(
             window_key=f"live:{days}d",
             window_days=days,
-            cutoff=window_cutoff(days),
+            cutoff=window_cutoff(days, now),
             cache_backed=False,
         )
     days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     return WindowResolution(
         window_key=f"w:{days}",
         window_days=days,
-        cutoff=window_cutoff(days),
+        cutoff=window_cutoff(days, now),
         cache_backed=True,
     )
 

@@ -10,6 +10,10 @@ from fastapi.responses import HTMLResponse
 from wxverify.api.errors import ApiError
 from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
 from wxverify.db.connection import get_db
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_clause,
+)
 from wxverify.scoring.engine import pair_and_score
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
@@ -64,6 +68,10 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         ).fetchone()
         if row is None:
             raise RuntimeError("site insert failed")
+        # New sites get their initial published timezone generation and
+        # published-pointer row immediately — the same seed migrate_v4
+        # applies to pre-existing sites.
+        ensure_published_generation(conn, int(row["id"]))
         return _site_out(row)
 
     site = await get_db().write(_write)
@@ -105,8 +113,24 @@ async def update_site(
                 "UPDATE sites SET rain_threshold_mm=? WHERE id=?",
                 (body.rain_threshold_mm, site_id),
             )
+            # Published generation only (§13): a building correction
+            # generation's precip pairs belong to the correction chain;
+            # deleting them here mid-chain would corrupt the rebuild.
+            # Known limitation: a threshold change landing DURING a
+            # correction build leaves already-rebuilt building days on the
+            # old threshold. The post-flip rescore does NOT heal them:
+            # pair_and_score's real-pair lane is INSERT OR IGNORE, so
+            # existing generation-tagged pairs keep their stale cat_*
+            # flags into the published generation (only the
+            # multimodel-mean lane recomputes). They stay stale until the
+            # next threshold edit's published-scoped delete-and-recreate
+            # here, or a consensus mutation of those specific hours.
             conn.execute(
-                "DELETE FROM forecast_pairs WHERE site_id=? AND variable='precip'",
+                f"""
+                DELETE FROM forecast_pairs
+                WHERE site_id=? AND variable='precip'
+                  AND {published_generation_clause("forecast_pairs")}
+                """,
                 (site_id,),
             )
             conn.execute(

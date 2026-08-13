@@ -24,12 +24,16 @@ from wxverify.collection.forecast_validation import (
     invalid_forecast_sample_sql,
 )
 from wxverify.core.timeutil import parse_utc
-from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard
+from wxverify.scoring.leaderboard import LeaderboardRow, asof_leaderboard, leaderboard
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 _EXCLUDED_FEEDS_SQL = (
     "f.is_virtual = 0 AND NOT (f.source = 'meteoblue' AND f.model = 'multimodel')"
 )
+
+# Recorded exclusion reason (plan §6): a forecast run whose availability
+# timestamp is NULL cannot be placed on the as-of timeline.
+SAMPLE_EXCLUDE_NULL_FETCHED_AT = "null_fetched_at"
 
 
 @dataclass(frozen=True)
@@ -56,7 +60,11 @@ class FeedFreshness:
 
 
 def load_future_samples(
-    conn: sqlite3.Connection, *, site_id: int, since_valid_at: str
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    since_valid_at: str,
+    as_of: str | None = None,
 ) -> list[FutureSampleRow]:
     """Load the latest-run future samples for a site.
 
@@ -69,9 +77,25 @@ def load_future_samples(
     window function, so an invalid sample from a newer run still cannot shadow a
     valid older one. ``variable IN (...)`` is implied by ``NOT invalid`` and is
     stated only to make idx_samples_site_var_valid's valid_at range reachable.
+
+    ``as_of`` (plan §6): restrict to runs available at T — ``issued_at <= T``
+    AND ``fetched_at <= T`` — applied BEFORE the latest-run pick, so the
+    newest run *at T* wins, not today's newest. Rows with NULL ``fetched_at``
+    are excluded (count them via :func:`count_null_availability_samples` and
+    record :data:`SAMPLE_EXCLUDE_NULL_FETCHED_AT`). With ``as_of=None`` the
+    statement is byte-identical to the production one.
     """
     invalid = invalid_forecast_sample_sql("fs")
     variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
+    asof_clause = ""
+    asof_params: tuple[object, ...] = ()
+    if as_of is not None:
+        asof_clause = (
+            "AND fs.fetched_at IS NOT NULL "
+            "AND julianday(fs.fetched_at) <= julianday(?) "
+            "AND julianday(fs.issued_at) <= julianday(?)"
+        )
+        asof_params = (as_of, as_of)
     rows = conn.execute(
         f"""
         SELECT feed_id, source, model, variable, issued_at, valid_at, value
@@ -89,11 +113,12 @@ def load_future_samples(
               AND fs.valid_at >= ?
               AND {_EXCLUDED_FEEDS_SQL}
               AND NOT {invalid}
+              {asof_clause}
         )
         WHERE rn = 1
         ORDER BY valid_at, feed_id
         """,
-        (site_id, since_valid_at),
+        (site_id, since_valid_at, *asof_params),
     ).fetchall()
     return [
         FutureSampleRow(
@@ -107,6 +132,36 @@ def load_future_samples(
         )
         for row in rows
     ]
+
+
+def count_null_availability_samples(
+    conn: sqlite3.Connection, *, site_id: int, since_valid_at: str
+) -> int:
+    """Count otherwise-eligible samples excluded for NULL ``fetched_at``.
+
+    The as-of path (:func:`load_future_samples` with ``as_of``) cannot place
+    a NULL-availability run on the timeline; plan §6 requires the exclusion
+    to be recorded, not silent. Same eligibility predicates as the loader
+    (variables, valid_at floor, feed exclusions, validity) so the count is
+    exactly the rows the as-of restriction dropped for this reason.
+    """
+    invalid = invalid_forecast_sample_sql("fs")
+    variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM forecast_samples fs
+        JOIN feeds f ON f.id = fs.feed_id
+        WHERE fs.site_id = ?
+          AND fs.variable IN ({variables})
+          AND fs.valid_at >= ?
+          AND {_EXCLUDED_FEEDS_SQL}
+          AND NOT {invalid}
+          AND fs.fetched_at IS NULL
+        """,
+        (site_id, since_valid_at),
+    ).fetchone()
+    return int(row["n"])
 
 
 def load_feed_freshness(
@@ -195,6 +250,9 @@ def forecast_ranking(
     variable: str,
     day_ahead: int,
     window: str = "rolling",
+    as_of: str | None = None,
+    declared_min_n: int | None = None,
+    declared_window_days: int | None = None,
 ) -> dict[int, LeaderboardRow]:
     """Skill ranking for one (variable, day_ahead) cell, keyed by feed id.
 
@@ -202,6 +260,12 @@ def forecast_ranking(
     exclusions AT the ranking step by design: virtual feeds and the meteoblue
     package feed are removed here explicitly, not left to the intersection
     with fresh samples. Keep the filter here even if it looks redundant.
+
+    ``as_of`` (plan §6): the ranking is recomputed live from pairs knowable
+    at T under the run's declared configuration (``declared_min_n``,
+    ``declared_window_days`` — never live settings, never ``score_cache``;
+    ``window`` is ignored on this path). The eligibility exclusions below
+    apply IDENTICALLY on both paths — one filter, two row sources.
     """
     excluded = {
         int(row["id"])
@@ -213,11 +277,24 @@ def forecast_ranking(
             """
         ).fetchall()
     }
-    rows = leaderboard(
-        conn,
-        site_id=site_id,
-        variable=variable,
-        day_ahead=day_ahead,
-        window=window,
-    )
+    if as_of is not None:
+        if declared_min_n is None:
+            raise ValueError("as-of forecast_ranking requires declared_min_n")
+        rows = asof_leaderboard(
+            conn,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            as_of=as_of,
+            min_n=declared_min_n,
+            window_days=declared_window_days,
+        )
+    else:
+        rows = leaderboard(
+            conn,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
     return {row.feed_id: row for row in rows if row.feed_id not in excluded}

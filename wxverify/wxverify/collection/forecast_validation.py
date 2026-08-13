@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import Final
 
-FORECAST_VARIABLES: Final[tuple[str, ...]] = ("temperature", "wind", "precip")
+from wxverify.settings.depth import DEPTH_VARIABLES
+
+#: The canonical roster (NB-4) — sample validation accepts exactly the
+#: variables the rest of the pipeline scores.
+FORECAST_VARIABLES: Final[tuple[str, ...]] = DEPTH_VARIABLES
 FORECAST_VALUE_RANGES: Final[dict[str, tuple[float, float]]] = {
     "temperature": (-90.0, 70.0),
     "wind": (0.0, 150.0),

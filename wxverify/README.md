@@ -105,6 +105,38 @@ The add-on config exposes these options:
 The add-on serves through Home Assistant Ingress. Do not pass an extra root path
 to uvicorn; the app owns `root_path` internally.
 
+### Forecast blend depth is owned by the options, not the database
+
+Blend depth — how many forecast days the blend averages over — has one global
+value plus an optional override per variable:
+
+| Key                                 | Range | Effect                                     |
+| ----------------------------------- | ----- | ------------------------------------------ |
+| `forecast_blend_depth`              | 1–6   | Global depth, used wherever no override set |
+| `forecast_blend_depth_temperature`  | 1–6   | Overrides the global depth for temperature |
+| `forecast_blend_depth_wind`         | 1–6   | Overrides the global depth for wind        |
+| `forecast_blend_depth_precip`       | 1–6   | Overrides the global depth for precip      |
+
+**The three per-variable overrides belong to the add-on options, not to the
+database.** Every startup re-applies the options over the stored settings: an
+override present in the options is written into the `settings` table, and an
+override **absent from the options is deleted from it**, dropping that variable
+back to the global depth. So a per-variable depth set straight into the
+database — with `settings set`, with a script, or by restoring someone else's
+database — lasts only until the next restart, then silently disappears. The
+options are the only place a per-variable depth survives.
+
+That has one consequence worth spelling out, because it is easy to hit and
+leaves no error behind:
+
+> **Set the options BEFORE importing a database, not after.** Importing a
+> database that carries per-variable depth overrides does not carry the options
+> with it. If the destination's options do not already list those overrides, the
+> next startup clears them and every variable quietly reverts to the global
+> depth — scores then continue to be computed at a depth nobody chose. Put the
+> overrides in the add-on configuration (or the matching `WXV_FORECAST_BLEND_DEPTH_*`
+> environment variables for a standalone run) and only then run the import.
+
 ## First-run Workflow
 
 1. Start the app.
@@ -229,6 +261,7 @@ Main pages:
 /sites
 /ops
 /overlay
+/verification
 ```
 
 The UI uses CSRF-protected HTMX JSON actions. Mutating actions are not plain HTML
@@ -317,6 +350,9 @@ python -m wxverify --db /path/to/wxverify.db providers reconcile
 python -m wxverify --db /path/to/wxverify.db providers enable --site-id <site_id> --all-new
 python -m wxverify --db /path/to/wxverify.db providers fetch --site-id <site_id> --source visualcrossing
 python -m wxverify --db /path/to/wxverify.db providers smoke --site-id <site_id> --all-new
+python -m wxverify --db /path/to/wxverify.db timezone status [--site-id <site_id>] [--json]
+python -m wxverify --db /path/to/wxverify.db timezone correct --site-id <site_id> --timezone <IANA> [--json]
+python -m wxverify --db /path/to/wxverify.db timezone change --site-id <site_id> --timezone <IANA> --effective-from <ISO-8601 UTC> [--json]
 ```
 
 Changing `rolling_window_days` through the settings path invalidates old cached
@@ -333,6 +369,90 @@ overwriting edited caps or feed settings. New or changed Python adapter code
 still requires restarting the app process so the running interpreter loads that
 code.
 
+## Timezone corrections
+
+A site's timezone is **not** an ordinary editable field. `PUT /api/sites/{id}`
+has no timezone attribute and the Sites page cannot change one, on purpose: the
+timezone decides which observations fall on which local day, so changing it
+changes every daily truth row, every daily verification result, and every
+leaderboard value derived from them. A normal edit must never silently rewrite
+history, so the two ways to change a timezone are separate, deliberately
+obvious commands.
+
+Every change produces a numbered **generation**. Exactly one generation per
+site is *published* at a time, and readers keep serving the published one until
+a new generation is complete.
+
+```sh
+# Read-only: every generation for every site (or one site), with its
+# reconciliation counts.
+python -m wxverify --db /data/wxverify.db timezone status --site-id 7
+```
+
+```text
+site=7 generation=1 published=yes timezone=UTC mode=initial state=published
+  effective_from=- effective_to=- published_at=2026-08-01T09:12:04Z
+  examined=- changed=- unchanged=- excluded=-
+site=7 generation=2 published=no timezone=America/Denver mode=retrospective_correction state=building
+  effective_from=- effective_to=- published_at=-
+  examined=612 changed=118 unchanged=494 excluded=0
+```
+
+`--json` prints the same rows as a JSON document for scripting. A correction is
+reconciled when `examined == changed + unchanged + excluded`.
+
+### Which command
+
+**`timezone correct` — the stored timezone was always wrong.**
+
+```sh
+python -m wxverify --db /data/wxverify.db timezone correct \
+  --site-id 7 --timezone America/Denver
+```
+
+This starts a **retrospective correction**: a new generation is built
+*alongside* the live one, re-bucketing and rescoring the entire timezone-derived
+history, and only flips to published when the rebuild finishes. Until then
+readers keep serving the previous generation, so nothing goes blank mid-rebuild.
+
+> **A retrospective correction rewrites history.** Published leaderboard and
+> verification values for past days will change once the rebuilt generation is
+> published — a day that scored one way under the old zone can score
+> differently under the new one. That is the intended effect of fixing a wrong
+> timezone; it is not a display glitch, and it is not reversible except by
+> running another correction back.
+
+**`timezone change` — the site genuinely moved to a different zone on a date.**
+
+```sh
+python -m wxverify --db /data/wxverify.db timezone change \
+  --site-id 7 --timezone America/Denver --effective-from 2026-09-01T00:00:00Z
+```
+
+This applies a **prospective change**: the previous generation is closed at that
+instant and the new one takes over from it. History before the instant keeps its
+own generation and is not rebuilt.
+
+Both commands exit non-zero with a one-line `error …` message (no traceback) if
+the site is unknown, the timezone is not a valid IANA name, the instant does not
+parse, or a correction is already building for that site.
+
+### Correction runbook
+
+Order matters. Run these steps in sequence:
+
+1. **Ship** the release that contains the timezone-aware code and migration,
+   and let the add-on start normally.
+2. **Correct** the site: `timezone correct --site-id 7 --timezone America/Denver`.
+3. **Verify the counts** with `timezone status --site-id 7`, repeating until the
+   building generation reports `examined == changed + unchanged + excluded`.
+   Do not move on while the numbers are still climbing.
+4. **The generation activates** on its own: when the rebuild is reconciled the
+   published pointer flips to it, and `status` then shows `published=yes`
+   against the new generation. This is the moment historical values change.
+5. **The forecast-of-record log begins** after the flip, so every appended entry
+   is stamped against the corrected generation from its first row.
+
 ## Operational Notes
 
 - SQLite runs in WAL mode.
@@ -343,6 +463,10 @@ code.
   `last_obs_at`.
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
+- Audit queries against `verification_trigger_decisions` must select
+  `MAX(id)` per `(site_id, trigger_date)`: a retried trigger appends a new
+  decision row for the same site and day rather than updating the old one,
+  so the highest `id` is the decision that actually stood.
 
 ## Database Export and Import
 
@@ -359,6 +483,11 @@ required tables), and the current database is automatically backed up to
 on every add-on startup, so the operator never needs to remove them by hand.
 After a successful import the add-on rebuilds consensus observations,
 forecast pairs, and cached scores in the background — no restart is needed.
+
+**Before importing, set the per-variable forecast blend depths in the
+destination's options** — an imported database's overrides are cleared at the
+next startup if the destination's options do not list them. See
+[Forecast blend depth is owned by the options, not the database](#forecast-blend-depth-is-owned-by-the-options-not-the-database).
 
 To restore a backup manually: stop the add-on, copy the chosen `.bak` file
 over `/data/wxverify.db`, delete any `wxverify.db-wal` or `wxverify.db-shm`

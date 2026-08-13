@@ -14,15 +14,15 @@ Methodology (aggregate per feed, then blend):
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import parse_utc
 
-# A feed's day counts as fully covered at >= 18 of 24 local hours. DST days
-# have 23 or 25 local hours; the threshold stays a fixed 18 distinct covered
-# hours rather than a fraction.
+# A feed's day counts as fully covered at >= 18 of 24 covered hours (distinct
+# UTC hour instants). DST days have 23 or 25 local hours; the threshold stays
+# a fixed 18 distinct covered hours rather than a fraction.
 MIN_COVERAGE_HOURS = 18
 
 # A feed needs enough distinct local hours for its daily high/low to be
@@ -53,11 +53,17 @@ def display_day_index(valid_at: str, *, timezone: str, now: datetime) -> int:
     return (valid_day - today).days
 
 
-def covered_hours(valid_ats: Iterable[str], *, timezone: str) -> int:
-    """Distinct local wall-clock hours covered by a feed's samples in a day."""
-    tz = ZoneInfo(timezone)
+def covered_hours(valid_ats: Iterable[str]) -> int:
+    """Distinct UTC hour instants covered by a feed's samples in a day.
+
+    Counted in UTC deliberately: local wall-clock hours collapse the autumn
+    DST fold (aware datetimes differing only in ``fold`` compare and hash
+    equal), undercounting the fall-back day by one real hour. Truncating the
+    UTC instant to the hour BEFORE any local conversion counts every real
+    hour exactly once on 23-, 24- and 25-local-hour days alike.
+    """
     hours = {
-        parse_utc(valid_at).astimezone(tz).replace(minute=0, second=0, microsecond=0)
+        parse_utc(valid_at).replace(minute=0, second=0, microsecond=0)
         for valid_at in valid_ats
     }
     return len(hours)
@@ -88,11 +94,66 @@ def wet_share(values: Sequence[float], *, threshold_mm: float) -> float | None:
     return wet / len(values)
 
 
-def chance_of_rain(per_feed_shares: Sequence[float]) -> float | None:
-    """Blend per-feed wet shares (equal weights) into the displayed chance.
+def clearing_subset(
+    selected_ids: Sequence[int], covered_by_feed: Mapping[int, int]
+) -> tuple[list[int], bool]:
+    """The feed subset whose values aggregate for display, plus ``partial``.
 
-    This is a coverage-of-the-day estimate, not a calibrated
-    probability of precipitation: each feed contributes ITS share of wet
-    slots, and the shares are averaged across feeds.
+    Feeds clearing the >= 18-hour coverage guard aggregate alone; when NO
+    selected feed clears it, ALL selected feeds still aggregate (the tile
+    stays populated) and the cell carries the orthogonal ``partial`` badge.
+    Shared by the Forecast page and the forecast-of-record builder so the
+    two cannot drift.
+    """
+    clearing = [fid for fid in selected_ids if clears_coverage(covered_by_feed[fid])]
+    if clearing:
+        return clearing, False
+    return list(selected_ids), True
+
+
+def displayed_daily(
+    variable: str,
+    per_feed_values: Sequence[Sequence[float]],
+    *,
+    rain_threshold_mm: float,
+) -> dict[str, float | None]:
+    """The DISPLAYED daily quantities for one cell, aggregate-per-feed-then-blend.
+
+    Each inner sequence is one feed's hourly values for the day (already
+    restricted to the :func:`clearing_subset`). Native units throughout
+    (wind in m/s; chance as a 0..1 fraction) — unit conversion and percent
+    rounding are presentational. Shared by the Forecast page and the
+    forecast-of-record builder so the two cannot drift.
+    """
+    if variable == "temperature":
+        return {
+            "high_c": blend_mean([max(v) for v in per_feed_values if v]),
+            "low_c": blend_mean([min(v) for v in per_feed_values if v]),
+        }
+    if variable == "wind":
+        return {"max_ms": blend_mean([max(v) for v in per_feed_values if v])}
+    if variable == "precip":
+        shares = [
+            share
+            for share in (
+                wet_share(v, threshold_mm=rain_threshold_mm) for v in per_feed_values
+            )
+            if share is not None
+        ]
+        return {
+            "total_mm": blend_mean([sum(v) for v in per_feed_values if v]),
+            "chance": predicted_wet_hour_share(shares),
+        }
+    raise ValueError(f"unknown variable {variable!r}")
+
+
+def predicted_wet_hour_share(per_feed_shares: Sequence[float]) -> float | None:
+    """Blend per-feed wet shares (equal weights) into the displayed value.
+
+    §16's shipped vocabulary: this is the PREDICTED WET-HOUR SHARE — a
+    coverage-of-the-day estimate, not a calibrated probability of
+    precipitation. Each feed contributes ITS share of wet slots, and the
+    shares are averaged across feeds. (The payload key stays ``chance``:
+    it is a wire and template contract, not internal vocabulary.)
     """
     return blend_mean(per_feed_shares)

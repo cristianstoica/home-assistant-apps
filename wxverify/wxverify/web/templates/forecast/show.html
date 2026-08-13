@@ -18,6 +18,14 @@
 </section>
 
 {% if site and view %}
+  {% if depths %}
+    <p class="muted depth-line">
+      Blend depth:
+      {% for variable, d in depths.items() %}
+        {{ variable }} {{ d.depth }} ({{ d.source }}){{ '' if loop.last else ' · ' }}
+      {% endfor %}
+    </p>
+  {% endif %}
   {% include "forecast/_tiles.html" %}
   <div id="forecast-day-detail" class="day-detail"></div>
 {% else %}
