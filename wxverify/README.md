@@ -502,18 +502,25 @@ subsequent 0.11.3 restarts.
 
 For when the Ops control itself is unreachable — a broken toggle, a template or
 route regression, or a downgrade to a version that honours the hold but has no
-control for it. It writes the same `settings` row the Ops control writes, so the
-scheduler picks it up on its next tick with no restart, but it bypasses the
-last-transition record, which will keep describing the older transition.
+control for it. Releasing is the direction this fallback exists for: a
+downgraded 0.11.2 honours an armed hold and has no control to clear it. The
+command writes the same `settings` row the Ops control writes, but it bypasses
+the last-transition record, which will keep describing the older transition.
+
+On 0.11.3 the scheduler picks the change up on its next tick, with no restart.
+**On 0.11.2 it does not:** the skip decision already recorded for that day stops
+the scheduler before it re-reads the key, so a release there only takes effect
+at the next nightly trigger (02:00 local time) — up to about a day later. Plan
+the window accordingly if you are releasing on a downgraded instance.
 
 The command runs **inside the add-on's own container**, against that container's
 own `/data/wxverify.db`:
 
 ```sh
-python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 1
+python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 0
 ```
 
-`1` arms the hold, `0` releases it. There is no `wxverify` executable in the
+`0` releases the hold, `1` arms it. There is no `wxverify` executable in the
 image — `python3 -m wxverify` is the invocation the service itself uses — and
 `--db` is a global option that must come before the `settings` subcommand.
 
@@ -525,7 +532,7 @@ wxverify container first, then run the command inside it:
 ```sh
 docker ps --filter name=wxverify --format '{{.Names}}'
 docker exec <name-from-the-line-above> \
-    python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 1
+    python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 0
 ```
 
 Two links in that chain cannot be answered from this repository. Confirm both
