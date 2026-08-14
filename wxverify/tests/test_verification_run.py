@@ -1178,7 +1178,7 @@ def test_redecide_is_bounded_and_still_starts_exactly_one_run(
         (site_id,),
     ).fetchall()
     assert len(runs) == 1
-    assert max_attempts <= 2
+    assert max_attempts == 1
     assert _decision_shape(conn, site_id) == [
         ("run_started", True, True),
         ("skipped", False, True),
@@ -1189,6 +1189,142 @@ def test_redecide_is_bounded_and_still_starts_exactly_one_run(
     assert str(rows[2]["reason"]) == "started after 2 fingerprint re-derivations"
     assert int(rows[2]["run_id"]) == int(runs[0]["id"])
     assert str(rows[2]["input_fingerprint"]) == str(runs[0]["input_fingerprint"])
+
+
+def _scripted_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, script: list[str]
+) -> list[str]:
+    """Replace `input_fingerprint` with a deterministic scripted sequence.
+
+    The deterministic form of the `advancing` monkeypatch above. The script
+    ``["fp-a", "fp-b", "fp-b", "fp-c"]`` walks the chain to the forced-start
+    branch exactly: decide #1 records `fp-a`; start #1 derives `fp-b` and
+    supersedes, `redecide_attempts` -> 1; decide #2 records `fp-b` and its
+    own gates pass against `fp-b`; start #2 derives `fp-c` with
+    `attempts == MAX_REDECIDE_ATTEMPTS`, which is the forced start. Arming a
+    gate against `fp-c` alone therefore proves the decide-phase gates are
+    not the thing being exercised. Returns the list of issued values so the
+    call count is assertable.
+    """
+    issued: list[str] = []
+
+    def scripted(
+        _conn: sqlite3.Connection, _site_id: int, _snapshot: dict[str, object]
+    ) -> str:
+        value = script[min(len(issued), len(script) - 1)]
+        issued.append(value)
+        return value
+
+    monkeypatch.setattr("wxverify.worker.verification_run.input_fingerprint", scripted)
+    return issued
+
+
+def test_forced_start_re_evaluates_the_published_fingerprint_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kills the shipped forced-start branch, which calls `start_run`
+    unconditionally: a second run row appears and the last decision row is
+    `run_started` with the forced-start reason, so both the run-count and
+    the decision-shape assertions go red."""
+    conn = asof_conn()
+    site_id, _feeds = _make_verification_site(conn)
+    _drive_chain(conn, site_id, dict(_W8_PAYLOAD))
+    first_run = published_run_id(conn, site_id)
+    assert first_run is not None
+    conn.execute(
+        "UPDATE verification_runs SET input_fingerprint = 'fp-c' WHERE id = ?",
+        (first_run,),
+    )
+    before = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_runs WHERE site_id = ?",
+            (site_id,),
+        ).fetchone()["n"]
+    )
+    decisions_before = len(_decisions(conn, site_id))
+
+    issued = _scripted_fingerprint(monkeypatch, ["fp-a", "fp-b", "fp-b", "fp-c"])
+    payload = dict(_W8_PAYLOAD)
+    payload["trigger_date"] = "2026-06-07"
+    calls: list[dict[str, object]] = []
+    _drive_fixed(conn, site_id, payload, calls, 40)
+
+    after = int(
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_runs WHERE site_id = ?",
+            (site_id,),
+        ).fetchone()["n"]
+    )
+    assert after == before
+    # Premise: the chain really did reach the forced start — four
+    # derivations, and the round-2 `run_started` row sits before the bail.
+    assert issued == ["fp-a", "fp-b", "fp-b", "fp-c"]
+    assert _decision_shape(conn, site_id)[decisions_before:] == [
+        ("run_started", True, True),
+        ("skipped", False, True),
+        ("run_started", True, True),
+        ("no_change_skip", False, True),
+    ]
+    last = _decisions(conn, site_id)[-1]
+    assert str(last["decision"]) == "no_change_skip"
+    assert str(last["reason"]) == "input fingerprint matches the published run"
+    assert str(last["input_fingerprint"]) == "fp-c"
+    # The bail is terminal and writes NO state dict (§3.2).
+    assert _load_state(conn, site_id) is None
+
+
+def test_forced_start_re_evaluates_the_attempt_cap_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same kill as its sibling: the shipped branch starts a run instead of
+    bailing, so `state != 'failed'` count goes from 0 to 1 and the last
+    decision row is `run_started`."""
+    conn = asof_conn()
+    site_id, _feeds = _make_verification_site(conn)
+    gen_row = conn.execute(
+        "SELECT id FROM timezone_generations WHERE site_id = ? ORDER BY id DESC",
+        (site_id,),
+    ).fetchone()
+    for _ in range(2):
+        conn.execute(
+            """
+            INSERT INTO verification_runs
+                (site_id, tz_generation_id, methodology_version, app_version,
+                 state, attempt, config_snapshot, bootstrap_seed,
+                 bootstrap_resamples, input_fingerprint)
+            VALUES (?, ?, 1, '0.0.0-test', 'failed', 1, '{}', 1, 10, 'fp-c')
+            """,
+            (site_id, int(gen_row["id"])),
+        )
+
+    issued = _scripted_fingerprint(monkeypatch, ["fp-a", "fp-b", "fp-b", "fp-c"])
+    payload = dict(_W8_PAYLOAD)
+    calls: list[dict[str, object]] = []
+    _drive_fixed(conn, site_id, payload, calls, 40)
+
+    running = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM verification_runs
+        WHERE site_id = ? AND state != 'failed'
+        """,
+        (site_id,),
+    ).fetchone()
+    assert int(running["n"]) == 0
+    assert issued == ["fp-a", "fp-b", "fp-b", "fp-c"]
+    assert _decision_shape(conn, site_id) == [
+        ("run_started", True, True),
+        ("skipped", False, True),
+        ("run_started", True, True),
+        ("skipped", False, True),
+    ]
+    last = _decisions(conn, site_id)[-1]
+    assert str(last["reason"]) == "attempt cap reached for this fingerprint"
+    assert str(last["input_fingerprint"]) == "fp-c"
+    # Paired negative on the reason: the bail is NOT the superseding row the
+    # divergence branch writes, so a mutant that reaches this point through
+    # the re-decide branch instead is visible here.
+    assert not str(last["reason"]).startswith("superseded: ")
+    assert _load_state(conn, site_id) is None
 
 
 def test_redecide_honours_the_published_fingerprint_gate() -> None:

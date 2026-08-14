@@ -32,9 +32,12 @@ from wxverify.verification.decision import (
     TempLead,
     VariableInputs,
     Verdict,
+    _baseline_endpoint,  # noqa: SLF001
+    _evaluate_endpoint,  # noqa: SLF001
     decide_variable,
 )
 from wxverify.verification.engine import aggregate_run
+from wxverify.verification.methodology import BASELINE_GATE_CI_LEVEL
 from wxverify.verification.runs import RosterFeed, RunConfig
 
 # 24 target dates — enough for the 20-day adequacy floor with margin.
@@ -565,6 +568,217 @@ def test_temperature_baseline_family_describes_the_composite_sample() -> None:
             "baseline_all_feed_mean",
             "baseline_persistence",
         ]
+
+
+# ---------------------------------------------------------------------------
+# O8e/O8f — §12 condition 4 is evaluated on the HEADLINE CORE, and each
+# endpoint's gate gets its OWN core. Both fixtures make the core differ from
+# the baseline's own adequate set; without that difference the restriction is
+# a no-op and every assertion below is vacuous.
+# ---------------------------------------------------------------------------
+
+
+def test_the_baseline_gate_is_evaluated_on_the_headline_core() -> None:
+    """A candidate that wins only on a lead its own headline dropped.
+
+    Persistence loses to the candidate by 0.125 on leads 1-4 and wins big on
+    lead 5; all_feed_mean has no lead-5 series at all, so §8 drops lead 5
+    from the headline core with reason ``baseline_absent``. Evaluated on
+    that core the persistence gate must FAIL (pooled -0.125); evaluated on
+    persistence's own wider set it passes (pooled +0.05), which is what the
+    unrestricted gate shipped in 0.11.1 does.
+
+    Kills:
+    - M1, the shipped gate that passes no core: assertions 1, 3, 4 and 5 go
+      red against it (`recommend`, `beats_baselines: True`,
+      `adequate_leads == [1,2,3,4,5]`, `pooled_point == +0.05`).
+    - M2, `core: tuple[int, ...] | None = None` meaning "unrestricted":
+      behaviourally identical to M1, killed identically.
+    - M3, restricting by REBUILDING the endpoint from the core leads instead
+      of restricting the adequate set. Every value assertion here is green
+      under M3 — the fixture's per-lead ratio is constant, so the effect is
+      weight-invariant and shrinking the bootstrap universe moves no number.
+      Assertion 6 is the sole discriminator: a rebuilt endpoint holds no
+      lead-5 pairs, so `_adequate_leads`' `if pairs:` guard suppresses every
+      record for it and no ``outside_core`` entry can exist.
+    """
+    headline = {ld: _ratio_series(_DATES, 0.5) for ld in range(1, 6)}
+    persistence = {ld: _ratio_series(_DATES, 1.125) for ld in range(1, 5)}
+    persistence[5] = _ratio_series(_DATES, 0.25)
+    all_feed_mean = {ld: _ratio_series(_DATES, 0.5) for ld in range(1, 5)}
+    candidate = CandidateSeries(
+        key="3",
+        continuous={"wind_max": headline},
+        baseline_continuous={
+            "baseline_persistence": {"wind_max": persistence},
+            "baseline_all_feed_mean": {"wind_max": all_feed_mean},
+        },
+    )
+    inputs = VariableInputs(variable="wind", incumbent_key="2", candidates=(candidate,))
+    verdict = decide_variable(inputs, seed=20260815, resamples=60)
+
+    # 1 — the flip itself.
+    assert verdict.outcome == "retain_incumbent"
+    assert verdict.recommended_key is None
+    # 2 — the premise: the headline core excludes lead 5.
+    head = _headline(verdict, "3")
+    assert head["adequate_leads"] == [1, 2, 3, 4]
+    assert head["pooled_point"] == pytest.approx(0.5)
+    dropped = cast(list[dict[str, object]], head["dropped_leads"])
+    assert dropped == [
+        {
+            "lead": 5,
+            "reason": "baseline_absent",
+            "missing_baselines": ["baseline_all_feed_mean"],
+        }
+    ]
+    # 3 — the gate is isolated as the sole failing condition.
+    conditions = _conditions(verdict, "3")
+    assert conditions["beats_baselines"] is False
+    assert conditions["ci_excludes_zero"] is True
+    assert conditions["lead_stability"] is True
+    assert conditions["practical_floor"] is True
+
+    baselines = cast(dict[str, object], _record(verdict, "3")["baselines"])
+    persistence_detail = cast(dict[str, object], baselines["baseline_persistence"])
+    # 4 — the direct same-core pin.
+    assert persistence_detail["adequate_leads"] == [1, 2, 3, 4]
+    assert persistence_detail["passed"] is False
+    assert persistence_detail["insufficient"] is False
+    # 5 — the pooled effect on the core, and its sign.
+    assert persistence_detail["pooled_point"] == pytest.approx(-0.125)
+    persistence_ci = cast(list[float], persistence_detail["ci"])
+    assert persistence_ci[0] < 0.0
+    # 6 — MANDATORY: the drop record M3 structurally cannot emit.
+    assert {"lead": 5, "reason": "outside_core"} in cast(
+        list[dict[str, object]], persistence_detail["dropped_leads"]
+    )
+    # 7 — the other required baseline is beaten, so the conjunction fails on
+    # persistence alone.
+    all_feed_detail = cast(dict[str, object], baselines["baseline_all_feed_mean"])
+    assert all_feed_detail["passed"] is True
+    assert all_feed_detail["adequate_leads"] == [1, 2, 3, 4]
+
+    # 8 — discriminating control. The SAME persistence endpoint, evaluated
+    # with NO restriction at the gate's own level and seed (decide_variable
+    # derives seed + 1000 * (offset + 1) per candidate, the wind gate then
+    # adds 1), passes: adequate [1..5], pooled +0.05, CI above zero. Without
+    # this the test would be green for any candidate that simply loses
+    # everywhere; with it, the flip is proven to be caused by the
+    # restriction alone.
+    endpoint = _baseline_endpoint(
+        candidate,
+        "baseline_persistence",
+        quantity="wind_max",
+        occurrence=False,
+        temp=False,
+    )
+    unrestricted = _evaluate_endpoint(
+        endpoint,
+        occurrence=False,
+        level=BASELINE_GATE_CI_LEVEL,
+        seed=20260815 + 1000 + 1,
+        resamples=60,
+    )
+    assert unrestricted.adequate == (1, 2, 3, 4, 5)
+    assert unrestricted.point == pytest.approx(0.05)
+    assert unrestricted.ci is not None
+    assert unrestricted.ci[0] > 0.0
+
+
+def test_each_precip_gate_uses_its_own_endpoint_core() -> None:
+    """The precip path has two gates and two DIFFERENT cores.
+
+    ``baseline_all_feed_mean`` has no precip-total series at lead 5, so §8
+    drops lead 5 from the total core; ``baseline_persistence`` DOES carry
+    lead 5 there, and every occurrence baseline covers leads 1-5, so the
+    occurrence core keeps it. Assertions 1 and 2 are the premise — they
+    establish that the two cores genuinely differ, without which 3 and 4 are
+    vacuous.
+
+    The asymmetry between the two total baselines is deliberate: it is what
+    makes the total gate's own restriction observable. With both total
+    baselines stopping at lead 4 their unrestricted sets already equal the
+    core and M1 is an equivalent mutant on this fixture.
+
+    Kills:
+    - passing `total.adequate` to the occurrence gate: the occurrence
+      baselines' adequate sets collapse to [1, 2, 3, 4] (assertion 4);
+    - passing `occ.adequate` to the total gate: persistence then reports
+      [1, 2, 3, 4, 5] and all_feed_mean, which holds no lead-5 total series,
+      fires `missing_leads == [5]` and turns `insufficient: True` (both
+      halves of assertion 3);
+    - M1/M2 on the total gate: unrestricted, persistence reports
+      [1, 2, 3, 4, 5] and carries no ``outside_core`` record (assertion 3).
+    """
+    total_series = {ld: _ratio_series(_DATES, 0.5, base=1.0) for ld in range(1, 6)}
+    total_persistence = {
+        ld: _strong_baseline(_ratio_series(_DATES, 0.5, base=1.0)) for ld in range(1, 6)
+    }
+    total_all_feed_mean = {
+        ld: _strong_baseline(_ratio_series(_DATES, 0.5, base=1.0)) for ld in range(1, 5)
+    }
+    # 12 candidate-wet and 12 candidate-dry days per lead, both clear of the
+    # OCCURRENCE_MIN_WET_DAYS / OCCURRENCE_MIN_DRY_DAYS floor of 8.
+    occ: OccurrenceLead = {}
+    for i, day in enumerate(_DATES):
+        occ[day] = ("hit", "miss") if i < 12 else ("correct_negative", "false_alarm")
+    candidate = CandidateSeries(
+        key="3",
+        continuous={"precip_total": total_series},
+        occurrence={ld: dict(occ) for ld in range(1, 6)},
+        baseline_continuous={
+            "baseline_persistence": {"precip_total": total_persistence},
+            "baseline_all_feed_mean": {"precip_total": total_all_feed_mean},
+        },
+        baseline_occurrence=occurrence_baseline_set(
+            {ld: dict(occ) for ld in range(1, 6)}
+        ),
+    )
+    inputs = VariableInputs(
+        variable="precip", incumbent_key="2", candidates=(candidate,)
+    )
+    verdict = decide_variable(inputs, seed=20260816, resamples=60)
+    record = _record(verdict, "3")
+
+    # 1 and 2 — the premise: the two cores differ.
+    total_core = cast(dict[str, object], record["total"])["adequate_leads"]
+    occ_core = cast(dict[str, object], record["occurrence"])["adequate_leads"]
+    assert total_core == [1, 2, 3, 4]
+    assert occ_core == [1, 2, 3, 4, 5]
+
+    baselines = cast(dict[str, object], record["baselines"])
+    total_detail = cast(dict[str, object], baselines["total"])
+    occ_detail = cast(dict[str, object], baselines["occurrence"])
+    # 3 — the total gate got the TOTAL core, and cleared it.
+    assert set(total_detail) == {"baseline_persistence", "baseline_all_feed_mean"}
+    for name in total_detail:
+        entry = cast(dict[str, object], total_detail[name])
+        assert entry["adequate_leads"] == [1, 2, 3, 4], name
+        assert entry["insufficient"] is False, name
+        assert entry["passed"] is True, name
+        assert "missing_leads" not in entry, name
+    # ... and persistence, which DOES hold a lead-5 total series, names the
+    # lead the restriction removed. The `if pairs:` guard means only a
+    # genuinely supported lead can produce this record.
+    assert cast(dict[str, object], total_detail["baseline_persistence"])[
+        "dropped_leads"
+    ] == [{"lead": 5, "reason": "outside_core"}]
+    assert (
+        cast(dict[str, object], total_detail["baseline_all_feed_mean"])["dropped_leads"]
+        == []
+    )
+    # 4 — the occurrence gate got the OCCURRENCE core, all five leads.
+    assert set(occ_detail) == {
+        "baseline_persistence",
+        "baseline_all_feed_mean",
+        "baseline_always_dry",
+    }
+    for name in occ_detail:
+        entry = cast(dict[str, object], occ_detail[name])
+        assert entry["adequate_leads"] == [1, 2, 3, 4, 5], name
+        assert entry["insufficient"] is False, name
+        assert entry["dropped_leads"] == [], name
 
 
 # ---------------------------------------------------------------------------

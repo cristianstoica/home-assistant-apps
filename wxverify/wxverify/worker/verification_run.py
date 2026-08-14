@@ -89,7 +89,10 @@ MAX_FAILED_ATTEMPTS = 2
 # so an unbounded loop would live-lock the chain and never start a run. On
 # the round-2 divergence the run starts against its OWN freshly derived
 # fingerprint and snapshot — a self-consistent pair, which is the property
-# this item exists to guarantee — with the gates re-evaluated first.
+# this item exists to guarantee. The published-fingerprint and attempt-cap
+# gates are re-evaluated against the freshly derived fingerprint on both the
+# re-decide branch and the forced-start branch; the settled-truth gate is
+# enforced by `start_run` (runs.py).
 MAX_REDECIDE_ATTEMPTS = 1
 SUPERSEDED_REASON = "superseded: input fingerprint changed between decide and start"
 FORCED_START_REASON = "started after 2 fingerprint re-derivations"
@@ -241,6 +244,20 @@ def advance_verification(
     )
 
 
+def _blocking_gate(
+    conn: sqlite3.Connection, site_id: int, fingerprint: str
+) -> tuple[str, str] | None:
+    """The (decision, reason) of the first blocking pre-start gate, or None."""
+    if published_fingerprint(conn, site_id) == fingerprint:
+        return ("no_change_skip", "input fingerprint matches the published run")
+    if (
+        failed_attempts_for_fingerprint(conn, site_id, fingerprint)
+        >= MAX_FAILED_ATTEMPTS
+    ):
+        return ("skipped", "attempt cap reached for this fingerprint")
+    return None
+
+
 def _decide_phase(
     conn: sqlite3.Connection,
     site_id: int,
@@ -256,27 +273,15 @@ def _decide_phase(
         raise JobCancelled() from exc
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     generation_id = int(str(snapshot["tz_generation_id"]))
-    if published_fingerprint(conn, site_id) == fingerprint:
+    blocked = _blocking_gate(conn, site_id, fingerprint)
+    if blocked is not None:
+        decision, reason = blocked
         record_trigger_decision(
             conn,
             site_id,
             trigger_date=trigger_date,
-            decision="no_change_skip",
-            reason="input fingerprint matches the published run",
-            fingerprint=fingerprint,
-        )
-        _clear_state(conn, site_id)
-        return False
-    if (
-        failed_attempts_for_fingerprint(conn, site_id, fingerprint)
-        >= MAX_FAILED_ATTEMPTS
-    ):
-        record_trigger_decision(
-            conn,
-            site_id,
-            trigger_date=trigger_date,
-            decision="skipped",
-            reason="attempt cap reached for this fingerprint",
+            decision=decision,
+            reason=reason,
             fingerprint=fingerprint,
         )
         _clear_state(conn, site_id)
@@ -371,6 +376,23 @@ def _start_phase(
         )
         _heartbeat(conn, site_id)
         return True
+    # §11/W8: the forced start reaches `start_run` without ever re-entering
+    # `decide`, so the two gates `decide` owns are re-evaluated here against
+    # the freshly derived fingerprint. The bail writes NO state dict (§3.2):
+    # `_clear_state` is the same terminal action every `decide` gate takes.
+    blocked = _blocking_gate(conn, site_id, fingerprint)
+    if blocked is not None:
+        decision, reason = blocked
+        record_trigger_decision(
+            conn,
+            site_id,
+            trigger_date=trigger_date,
+            decision=decision,
+            reason=reason,
+            fingerprint=fingerprint,
+        )
+        _clear_state(conn, site_id)
+        return False
     cfg = start_run(
         conn, site_id, snapshot=snapshot, fingerprint=fingerprint, now=utc_now()
     )

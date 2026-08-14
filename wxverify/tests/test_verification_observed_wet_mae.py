@@ -440,7 +440,12 @@ async def _idle_worker(_db: object) -> None:  # pragma: no cover - never awaited
 
 
 def _published_app_run(
-    tmp_path: Path, days: list[_Day], *, precip_depth: int = _DEPTH
+    tmp_path: Path,
+    days: list[_Day],
+    *,
+    precip_depth: int = _DEPTH,
+    leads: tuple[int, ...] = (_LEAD,),
+    offsets: dict[int, float] | None = None,
 ) -> int:
     from wxverify import config
     from wxverify.db.connection import close_db, init_db
@@ -452,7 +457,9 @@ def _published_app_run(
     config.options_path = str(options_path)
     db = init_db(config.db_path)
     conn = db._conn  # noqa: SLF001
-    site_id, run_id, _cfg = _make_run(conn, days, precip_depth=precip_depth)
+    site_id, run_id, _cfg = _make_run(
+        conn, days, precip_depth=precip_depth, leads=leads, offsets=offsets
+    )
     publish_run(conn, site_id, run_id)
     conn.commit()
     return site_id
@@ -561,3 +568,122 @@ def test_the_page_names_the_subject_even_when_the_value_is_absent(
     # ... with the explanation that belongs to THIS state, and no other.
     assert expected_sentence in rendered
     assert forbidden_sentence not in rendered
+
+
+# ---------------------------------------------------------------------------
+# The `leads` disclosure grid is RENDERED (0.11.2 item 4)
+# ---------------------------------------------------------------------------
+
+
+def _wetmae_slice(text: str) -> str:
+    """The subsection slice every render assertion below reads.
+
+    Bounded at the end of the enclosing diagnostics ``<section>`` so the
+    absence assertions cannot be satisfied by a slice that merely stops
+    short of the markup they are looking for.
+    """
+    tail = text.split('data-v16="16.4.observed_wet_precip_mae"', 1)[1]
+    slice_ = tail.split("</section>", 1)[0]
+    assert len(slice_) < len(tail)
+    return slice_
+
+
+def _render(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **kwargs: Any) -> str:
+    from wxverify.api.app import create_app
+
+    site_id = _published_app_run(tmp_path, **kwargs)
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app: Any = create_app(root_path="")
+    with TestClient(app) as client:
+        page = client.get(f"/verification?site={site_id}")
+    assert page.status_code == 200
+    return _wetmae_slice(page.text)
+
+
+def test_the_leads_grid_renders_only_the_leads_the_run_scored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sparsity and per-entity values, hand-computed from the fixture rows.
+
+    ``_MIXED`` on leads 0 and 3 only, with depth 4 offset by +2.0.
+    ``diagnostics.py`` loops ``range(SIM_DAY_COUNT)`` and skips a lead with
+    no observed-wet common date, so leads 1, 2 and 4-7 must not appear.
+    Nine observed-wet days x four ``SIM_DEPTHS`` members x two leads = eight
+    rendered rows: depths 1, 2 and 3 at (1+2+3)*3 / 9 = 2.00, depth 4 at
+    (3+4+5)*3 / 9 = 4.00.
+
+    Kills:
+    - a fixed D0-D7 table, which emits eight phantom lead rows and blows
+      both the absence assertions and the row count;
+    - a template that repeats the headline value in every row: the headline
+      is 2.00 and the depth-4 rows must read 4.00;
+    - a template that renders ``entry.sample_days`` (9) where ``e.value``
+      belongs: neither 2.00 nor 4.00 would appear in the MAE cell.
+    """
+    rendered = _render(
+        tmp_path, monkeypatch, days=_MIXED, leads=(0, 3), offsets={4: 2.0}
+    )
+    assert 'data-field="observed_wet_leads"' in rendered
+    assert 'data-field="observed_wet_leads_empty"' not in rendered
+    # Sparsity: only the two scored leads, and nothing else in D0..D7.
+    assert 'data-lead="0"' in rendered
+    assert 'data-lead="3"' in rendered
+    for absent in (1, 2, 4, 5, 6, 7):
+        assert f'data-lead="{absent}"' not in rendered
+    assert rendered.count("<tr data-lead=") == 8
+
+    # Per-entity values, asserted as an unordered set: member order comes
+    # from the persisted cell resolution and is not a contract.
+    rows = {
+        (lead, depth): f'<tr data-lead="{lead}" data-entity="depth:{depth}">'
+        for lead in (0, 3)
+        for depth in SIM_DEPTHS
+    }
+    assert set(rows) == {(lead, depth) for lead in (0, 3) for depth in SIM_DEPTHS}
+    for (lead, depth), marker in rows.items():
+        assert marker in rendered, (lead, depth)
+        cells = rendered.split(marker, 1)[1].split("</tr>", 1)[0]
+        expected = "4.00" if depth == 4 else "2.00"
+        assert f'<td data-label="MAE (mm)">{expected}</td>' in cells, (lead, depth)
+        assert '<td data-label="Days">9</td>' in cells, (lead, depth)
+        assert f'<td data-label="Lead">D{lead}</td>' in cells, (lead, depth)
+
+
+def test_the_leads_grid_renders_when_the_headline_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Placement pin: the grid sits OUTSIDE the `wetmae.value is none` pair.
+
+    The ``incumbent_not_simulated`` state (``_MIXED`` with a precip depth
+    outside ``SIM_DEPTHS``) has a null headline and a fully populated grid —
+    ``diagnostics.py`` builds the grid from the cell's resolved members and
+    never consults the incumbent depth. Hiding the disclosure exactly when
+    the headline cannot be read inverts its purpose.
+
+    Kills: nesting the grid inside the `{% else %}` value branch, and
+    nesting it inside the `{% if %}` reason branch (the paired positive in
+    the sibling test above covers the value state, so a grid that renders in
+    only one of the two states fails one of the pair).
+    """
+    rendered = _render(tmp_path, monkeypatch, days=_MIXED, precip_depth=5, leads=(0, 3))
+    assert 'data-field="observed_wet_precip_mae_reason"' in rendered
+    assert 'data-field="observed_wet_precip_mae">' not in rendered
+    assert 'data-field="observed_wet_leads"' in rendered
+    assert 'data-lead="0"' in rendered
+    assert 'data-lead="3"' in rendered
+
+
+def test_the_leads_grid_shows_its_empty_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No lead cell has an observed-wet common day -> the named empty state.
+
+    Kills an unconditional `<table>` that renders a header row over nothing:
+    the table marker must be absent, not merely empty.
+    """
+    rendered = _render(tmp_path, monkeypatch, days=_DRY_ONLY)
+    # Non-vacuity: the subsection really is on screen in this slice.
+    assert 'data-field="observed_wet_precip_mae_reason"' in rendered
+    assert 'data-field="observed_wet_leads_empty"' in rendered
+    assert 'data-field="observed_wet_leads"' not in rendered
+    assert "data-lead=" not in rendered

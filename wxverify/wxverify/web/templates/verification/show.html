@@ -437,6 +437,34 @@
             {% endif %}
           </p>
         {% endif %}
+        <p class="muted">
+          Per-lead disclosure beside the headline &mdash; not what the headline is derived
+          from. Do not aggregate these rows to reproduce the value above.
+        </p>
+        {% if wetmae.leads %}
+          <div class="table-wrap">
+            <table class="cardify" data-field="observed_wet_leads">
+              <thead><tr><th>Lead</th><th>Observed-wet days</th><th>Entity</th><th>MAE (mm)</th><th>Days</th></tr></thead>
+              <tbody>
+                {% for entry in wetmae.leads %}
+                  {% for e in entry.entities %}
+                    <tr data-lead="{{ entry.lead }}" data-entity="{{ e.entity_type }}:{{ e.entity_key }}">
+                      <td data-label="Lead">D{{ entry.lead }}</td>
+                      <td data-label="Observed-wet days">{{ entry.sample_days }}</td>
+                      <td data-label="Entity">{{ e.entity_type }}:{{ e.entity_key }}</td>
+                      <td data-label="MAE (mm)">{{ num(e.value, '%.2f') }}</td>
+                      <td data-label="Days">{{ e.sample_days }}</td>
+                    </tr>
+                  {% endfor %}
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% else %}
+          <p class="empty" data-field="observed_wet_leads_empty">
+            No lead cell on this run has an observed-wet common day.
+          </p>
+        {% endif %}
       </div>
 
       {% for item in diagnostics.unavailable %}

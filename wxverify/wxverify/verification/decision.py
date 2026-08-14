@@ -241,6 +241,7 @@ def _adequate_leads(
     *,
     occurrence: bool,
     baseline_support: Mapping[str, frozenset[int]] | None = None,
+    restrict_to: tuple[int, ...] | None = None,
 ) -> tuple[tuple[int, ...], list[dict[str, object]]]:
     """§12 adequacy: >= 20 strict-common days; occurrence also needs the
     minimum wet/dry event counts on the OBSERVED side of the common core.
@@ -252,6 +253,11 @@ def _adequate_leads(
     records keep the two causes distinguishable — a thin lead and a
     baseline-less lead are different claims and must not collapse into one
     report.
+
+    ``restrict_to`` is the headline core the caller pools over; it is the
+    LAST condition applied, so ``outside_core`` names only leads this
+    endpoint genuinely supported. ``None`` means no restriction — never an
+    empty core.
     """
     out: list[int] = []
     dropped: list[dict[str, object]] = []
@@ -284,6 +290,9 @@ def _adequate_leads(
                     "missing_baselines": missing,
                 }
             )
+            continue
+        if restrict_to is not None and lead not in restrict_to:
+            dropped.append({"lead": lead, "reason": "outside_core"})
             continue
         out.append(lead)
     return tuple(out), dropped
@@ -345,9 +354,13 @@ def _evaluate_endpoint(
     seed: int,
     resamples: int,
     baseline_support: Mapping[str, frozenset[int]] | None = None,
+    restrict_to: tuple[int, ...] | None = None,
 ) -> _EndpointEvaluation:
     adequate, dropped = _adequate_leads(
-        endpoint, occurrence=occurrence, baseline_support=baseline_support
+        endpoint,
+        occurrence=occurrence,
+        baseline_support=baseline_support,
+        restrict_to=restrict_to,
     )
     point = endpoint.pooled_effect(adequate, None) if adequate else None
     ci = _bootstrap_ci(endpoint, adequate, level=level, seed=seed, resamples=resamples)
@@ -460,13 +473,22 @@ def _baseline_gate(
     temp: bool = False,
     seed: int,
     resamples: int,
+    core: tuple[int, ...],
 ) -> tuple[bool, dict[str, object]]:
-    """Condition 4: beat EVERY REQUIRED baseline at 95% on the same core.
+    """Condition 4: beat EVERY REQUIRED baseline at 95% on ``core``.
+
+    ``core`` is the headline evaluation's adequate-lead set, passed as a
+    REQUIRED keyword so no call site can fall back to a per-baseline set
+    of its own — the omission this signature exists to make impossible.
 
     Allowlist, not presence test: the gate iterates the required set, so a
     missing or unsupported baseline fails it and writes a named
-    ``insufficient`` entry. An absent detail block reads as "passed" on the
-    surface, so no branch may omit one.
+    ``insufficient`` entry. A baseline that cannot support every lead of
+    ``core`` fails the same way and names the leads: §8 already removed
+    such leads from ``core``, so a shortfall here is a broken contract and
+    is reported as NOT SHOWN — never as a silent pass, never as a verdict
+    of worse. An absent detail block reads as "passed" on the surface, so
+    no branch may omit one.
     """
     detail: dict[str, object] = {}
     passed = True
@@ -480,6 +502,7 @@ def _baseline_gate(
             level=BASELINE_GATE_CI_LEVEL,
             seed=seed,
             resamples=resamples,
+            restrict_to=core,
         )
         if not evaluation.adequate:
             passed = False
@@ -487,6 +510,17 @@ def _baseline_gate(
                 "passed": False,
                 "insufficient": True,
                 "reason": "required baseline missing or under-supported",
+                **evaluation.as_json(),
+            }
+            continue
+        missing_leads = [lead for lead in core if lead not in evaluation.adequate]
+        if missing_leads:
+            passed = False
+            detail[baseline] = {
+                "passed": False,
+                "insufficient": True,
+                "reason": "required baseline not supported on every core lead",
+                "missing_leads": missing_leads,
                 **evaluation.as_json(),
             }
             continue
@@ -570,6 +604,7 @@ def _decide_wind_or_temp(
             temp=True,
             seed=seed + 1,
             resamples=resamples,
+            core=evaluation.adequate,
         )
     else:
         c4, baseline_detail = _baseline_gate(
@@ -578,6 +613,7 @@ def _decide_wind_or_temp(
             occurrence=False,
             seed=seed + 1,
             resamples=resamples,
+            core=evaluation.adequate,
         )
     c5 = True
     if inputs.variable == "temperature":
@@ -716,6 +752,7 @@ def _decide_precip(
         occurrence=False,
         seed=seed + 1,
         resamples=resamples,
+        core=total.adequate,
     )
     occ_ok, occ_detail = _baseline_gate(
         candidate,
@@ -723,6 +760,7 @@ def _decide_precip(
         occurrence=True,
         seed=seed + 2,
         resamples=resamples,
+        core=occ.adequate,
     )
     c4 = total_ok and occ_ok
     baseline_detail: dict[str, object] = {
