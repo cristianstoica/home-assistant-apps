@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.11.2
+
+A fix release remediating an external implementation audit of 0.11.1. No
+schema change, no migration, and no wire-contract change; the methodology
+version is unchanged because the fix makes the code conform to the
+methodology it already declared, rather than changing it.
+
+### Fixed
+
+- The condition-4 baseline gate compared each required baseline against its
+  own independently derived set of adequate-lead days instead of against
+  the candidate's own headline days, contradicting the methodology the code
+  documented. This could recommend a blend-depth change for a candidate
+  that, restricted to its own headline leads, actually loses to plain
+  persistence. The candidate's headline core is now threaded through and
+  used for every baseline comparison in the gate.
+- The published-fingerprint and attempt-cap checks are now re-evaluated
+  immediately before a run starts, not only earlier in the decide phase, so
+  a state change between decide and start can no longer slip past them.
+- The per-lead observed-wet MAE disclosure grid was computed but never
+  rendered on the Verification page; it now displays.
+
 ## 0.11.1
 
 A remediation release for the Verification page introduced in 0.11.0. It
