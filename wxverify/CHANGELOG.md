@@ -1,5 +1,138 @@
 # Changelog
 
+## 0.11.1
+
+A remediation release for the Verification page introduced in 0.11.0. It
+corrects how the backtest scores the add-on's own forecast, closes gaps in
+the daily forecast-of-record log, and publishes evidence 0.11.0 described
+but never produced. Nothing about how the add-on selects or displays a
+forecast changes.
+
+### Added
+
+- A `verification_publish_hold` setting that stops the nightly
+  verification chain from starting new runs. Set it with
+  `wxverify settings set verification_publish_hold 1`; the hold is in
+  effect only for the exact value `1`, so an absent or any other value
+  leaves the chain running and a fresh install is never silently
+  non-verifying. A run already under way is left to finish. Clear the hold
+  by setting the same key to `0`.
+- The Verification page and `GET /api/verification/status` now report what
+  the nightly trigger actually did for the current cycle — started a run,
+  skipped it and why, or recorded no decision at all — along with any
+  starts that were superseded that night and whether the publish hold is
+  on. Until now, "no published verification run for this site yet" was the
+  only signal an operator got, whatever the cause.
+- The per-feed diagnostics table gains a **Vs recommended** column. A feed
+  below the availability floor is now compared against the blend the run
+  recommends, over the days the two share, instead of being listed with no
+  comparison at all; where no comparison is possible, the table gives the
+  reason.
+- The system health monitor gains a `record_gap_scan_degraded` condition,
+  counting sites whose daily record gap scan could not assess one or more
+  dates.
+
+### Fixed
+
+- Under Home Assistant ingress, `GET /api/verification/latest` redirected
+  to a path outside the add-on's own mount, so the redirect failed. It is
+  now built through the ingress prefix like every other absolute URL in
+  the app. Standalone installs were unaffected.
+- The all-feed average the backtest compares against was built from every
+  feed on the site's pinned roster, including feeds that supplied nothing
+  for the day and variable being scored. It is now built from the feeds
+  actually resolved for that comparison, in a second pass after the roster
+  is settled, so it is a real average of the available feeds rather than a
+  diluted one.
+- The backtest scored a blend of every feed that had samples, while the
+  Forecast page displays a blend of only the feeds that clear its
+  selection. Both now use the same set, so the score describes the
+  forecast the add-on actually publishes, and the covered hours and
+  contributor count reported beside each score describe that same set. The
+  daily quantities kept in the forecast-of-record carried the same
+  mismatch and are corrected the same way.
+- A blend depth could be recommended without having been checked against
+  every comparison baseline it is required to beat. The check now works
+  from a fixed required list: a baseline that is absent, or that has too
+  little history at a given forecast lead, fails the check and is named as
+  insufficient rather than quietly skipped. For precipitation, the
+  amount check and the did-it-rain check now both always run, instead of
+  only whichever one happened to show an improvement.
+- A forecast lead could count toward the "enough leads agree" requirement
+  at leads where a required baseline had no usable history. Those leads
+  are now dropped before the count, and each dropped lead records which of
+  three reasons applied — too few days, too few wet or dry days, or a
+  missing baseline — so a thin lead and a baseline-less lead are no longer
+  reported as the same thing.
+- A day's forecast-of-record counted as finished as soon as a single row
+  existed for it, so a day interrupted part-way through was sealed
+  incomplete and never revisited. A day is now finished only when every
+  variable and every lead is present, and an incomplete day is retried
+  about once an hour while its late-write window is open. A cell for which
+  nothing was knowable at recording time now writes no row at all, instead
+  of an empty one that would seal the day.
+- The gap scan that closes missing record days only looked forward from
+  the newest day already recorded, so a hole left earlier in the log was
+  never revisited. It now walks the log itself, back as far as 30 days,
+  and visits every day that is not provably complete.
+- When the gap scan closes a day whose late-write window has passed, each
+  missing entry now records why it is missing: the write was lost, or
+  there was nothing to record in the first place. Every entry previously
+  got the same reason, which asserted a lost write even where no forecast
+  had ever been available.
+- A date the gap scan could not assess used to abandon the rest of the
+  scan with no trace — the job still reported success and nothing anywhere
+  said a date had been skipped. Such a date is now rolled back on its own,
+  the rest of the scan still commits, and the failure is recorded durably
+  and counted by the system health monitor.
+- A verification run could be pinned to inputs that had already moved on,
+  because its fingerprint was taken when the nightly trigger decided to
+  run rather than when the run started against a snapshot. The run now
+  derives its fingerprint from the snapshot it stores. Where the two
+  differ, the night's decision is taken again once — re-running every gate
+  — and the superseded attempt is recorded, so the trail shows what
+  happened.
+- Two steps of the verification chain rebuilt their progress record from
+  scratch instead of updating it, losing the run they belonged to. A run
+  reaching either step would have cancelled itself silently, and gone on
+  doing so every night after.
+- 0.11.0 described a precipitation-amount error measured only on days it
+  actually rained, and always displayed, but nothing computed it. The
+  Verification page and the run diagnostics endpoint now show it, for the
+  precipitation blend depth the run was scored under, with the number of
+  days behind it and a caution when that sample is thin.
+- 0.11.0 obliged the release to say so when ranking feeds day by day beats
+  every blend depth in use. Nothing made that comparison. Each variable
+  now carries that conclusion on the Verification page and in the verdicts
+  endpoint. It is diagnostic only — a ranking basis is not something the
+  add-on can act on, so the recommendation is unchanged by it.
+- An empty diagnostics section on the Verification page now says why it is
+  empty and which condition this run failed to meet, instead of leaving an
+  operator to guess whether the section was empty or simply not built yet.
+- The provenance kept with each recorded forecast cell listed only the
+  feeds that supplied samples. It now lists every feed that could have
+  taken part — including those configured but silent, and those that can
+  never be loaded — and how each one participated, so a feed that
+  contributed nothing is distinguishable from one that was never
+  considered.
+- Two methodology constants were published for the audit trail but wired
+  to nothing. They have been removed, and every remaining published
+  constant must now be either used or explicitly declared as unused.
+
+### Notes
+
+- **Before deploying this version**, hold the nightly verification chain:
+  set `verification_publish_hold` to exactly `1`, and confirm no
+  verification run is in progress. Release the hold only after you have
+  confirmed the upgrade is healthy.
+- Verification results from this version are not comparable with those
+  from 0.11.0. The scored blend and the all-feed average have both
+  changed, so scores, baselines and recommendations will move even where
+  nothing about the forecasts themselves did. Runs published by 0.11.0 are
+  left in place; read them as a separate series.
+- A verification run now has three more phases and does more work per
+  night, so nightly runs take longer than they did in 0.11.0.
+
 ## 0.11.0
 
 ### Added
