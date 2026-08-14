@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import NamedTuple
 
 RUNTIME_STATE_KEYS = (
     "worker_started_at",
@@ -62,6 +63,24 @@ def get_runtime_state(conn: sqlite3.Connection, key: str) -> str | None:
         "SELECT value FROM runtime_state WHERE key = ?", (key,)
     ).fetchone()
     return None if row is None else str(row["value"])
+
+
+class RuntimeStateEntry(NamedTuple):
+    """A runtime_state row's value alongside its own last-write timestamp."""
+
+    value: str
+    updated_at: str
+
+
+def get_runtime_state_entry(
+    conn: sqlite3.Connection, key: str
+) -> RuntimeStateEntry | None:
+    row = conn.execute(
+        "SELECT value, updated_at FROM runtime_state WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    return RuntimeStateEntry(value=str(row["value"]), updated_at=str(row["updated_at"]))
 
 
 def delete_runtime_state(conn: sqlite3.Connection, *keys: str) -> None:

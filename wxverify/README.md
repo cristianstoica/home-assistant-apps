@@ -468,6 +468,82 @@ Order matters. Run these steps in sequence:
   decision row for the same site and day rather than updating the old one,
   so the highest `id` is the decision that actually stood.
 
+## Verification Publish Hold
+
+The publish hold is the kill switch for the nightly verification chain. While it
+is held, no **new** verification run is started. It does not stop a run that is
+already queued or under way — that chain continues and may publish — so read the
+active-chain badge before you rely on the hold.
+
+Ops → Nightly Verification Publishing is the control. It shows whether the hold
+is held or released, whether a chain is currently active, and when the state last
+changed and from where (Ops or Bootstrap). The button arms or releases the hold:
+it asks for confirmation in the browser, then sends
+`PUT /api/verification/publish-hold` and rewrites the badges, the button, and the
+last-changed line from what that call returns — no manual reload. Arming reloads
+the page once, so the banner is written by the server rather than restated in the
+browser. While the hold is on, `/ops` and `/verification` also carry a banner
+saying so.
+
+- **Arming is never refused.** You can hold publishing at any time, including
+  while a chain is running.
+- **Releasing is refused with `409` while any site has a queued or running
+  verification chain**, and the state is left unchanged. Wait for the chain to
+  finish, then click again.
+
+Upgrading an existing pre-0.11.3 installation arms the hold once during startup.
+This blocks newly scheduled verification runs until you review and release it.
+A run already queued or under way may still publish, which is why deployment
+requires confirming that no job is pending or running first. A fresh install is
+not held. Once released, this 0.11.3 bootstrap decision is preserved across
+subsequent 0.11.3 restarts.
+
+### Emergency fallback: the CLI
+
+For when the Ops control itself is unreachable — a broken toggle, a template or
+route regression, or a downgrade to a version that honours the hold but has no
+control for it. It writes the same `settings` row the Ops control writes, so the
+scheduler picks it up on its next tick with no restart, but it bypasses the
+last-transition record, which will keep describing the older transition.
+
+The command runs **inside the add-on's own container**, against that container's
+own `/data/wxverify.db`:
+
+```sh
+python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 1
+```
+
+`1` arms the hold, `0` releases it. There is no `wxverify` executable in the
+image — `python3 -m wxverify` is the invocation the service itself uses — and
+`--db` is a global option that must come before the `settings` subcommand.
+
+Getting a shell there is the part to plan in advance. The *Advanced SSH & Web
+Terminal* add-on is a **different** container: the wxverify package is not
+importable in it and its `/data` is a different volume. From there, find the
+wxverify container first, then run the command inside it:
+
+```sh
+docker ps --filter name=wxverify --format '{{.Names}}'
+docker exec <name-from-the-line-above> \
+    python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 1
+```
+
+Two links in that chain cannot be answered from this repository. Confirm both
+once, in advance, rather than during an incident:
+
+- **The container name.** The Supervisor composes it from the repository the
+  add-on was installed from plus the slug — `addon_local_wxverify` for a local
+  install, `addon_<repository-id>_wxverify` for one added by URL. Only the slug,
+  `wxverify`, is fixed here, which is why the `docker ps` line is a required
+  discovery step and not decoration.
+- **Whether the SSH add-on can reach Docker at all.** That generally requires its
+  *Protection mode* to be off. Check that `docker ps` returns output before you
+  need this procedure.
+
+If the wxverify container is restart-looping, `docker exec` may not land at all.
+The fallback then is the add-on *Restore from backup* path, or reinstalling a
+known-good version.
+
 ## Database Export and Import
 
 Ops → Database Export downloads a consistent snapshot of the add-on database
@@ -483,6 +559,12 @@ required tables), and the current database is automatically backed up to
 on every add-on startup, so the operator never needs to remove them by hand.
 After a successful import the add-on rebuilds consensus observations,
 forecast pairs, and cached scores in the background — no restart is needed.
+
+**An import discards any verification run that was in progress in the donor.**
+Its `verification_run` job is failed with `suppressed: imported active
+verification chain`, any run still marked running is failed with the same
+reason, and the partial evidence of every unpublished run is deleted. Published
+runs, and every other job type, are untouched.
 
 **Before importing, set the per-variable forecast blend depths in the
 destination's options** — an imported database's overrides are cleared at the

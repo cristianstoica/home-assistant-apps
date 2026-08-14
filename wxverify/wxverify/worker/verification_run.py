@@ -38,7 +38,7 @@ from typing import cast
 
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.queue import Job
+from wxverify.db.queue import ACTIVE_JOB_SQL, Job
 from wxverify.db.runtime_state import (
     delete_runtime_state,
     get_runtime_state,
@@ -114,6 +114,22 @@ def verification_heartbeat_key(site_id: int) -> str:
 def verification_job_key(site_id: int) -> str:
     """Queue dedupe key of the site's verification chain."""
     return f"verify:{site_id}"
+
+
+def verification_chain_active(conn: sqlite3.Connection, site_id: int) -> bool:
+    """Whether a verification chain is queued or running for this site."""
+    row = conn.execute(
+        ACTIVE_JOB_SQL, ("verification_run", verification_job_key(site_id), site_id)
+    ).fetchone()
+    return row is not None
+
+
+def any_verification_chain_active(conn: sqlite3.Connection) -> bool:
+    """Whether any site has a queued or running verification chain."""
+    return any(
+        verification_chain_active(conn, int(row["id"]))
+        for row in conn.execute("SELECT id FROM sites").fetchall()
+    )
 
 
 def mark_verification_failed(conn: sqlite3.Connection, job: Job) -> None:

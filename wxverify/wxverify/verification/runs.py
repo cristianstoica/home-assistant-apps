@@ -304,6 +304,48 @@ def failed_attempts_for_fingerprint(
     )
 
 
+def fail_incomplete_attempts(
+    conn: sqlite3.Connection, site_id: int, *, error: str
+) -> None:
+    """Fail the site's non-published attempts and drop their partial evidence.
+
+    Extracted from `start_run`'s inline cleanup (§7.9) so the import
+    neutralizer (D13) can reuse this domain's own semantics instead of a
+    second hand-written cleanup. Reproduces the original block exactly:
+    every non-published run's evidence is deleted regardless of state, but
+    only `running` runs are marked `failed` — a run already `failed` keeps
+    its own error via `COALESCE`, never this one.
+    """
+    stale = [
+        int(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id FROM verification_runs
+            WHERE site_id = ? AND state != 'published'
+            """,
+            (site_id,),
+        ).fetchall()
+    ]
+    if not stale:
+        return
+    marks = ",".join("?" for _ in stale)
+    for table in (
+        "verification_evidence",
+        "verification_day_context",
+        "verification_results",
+        "verification_verdicts",
+    ):
+        conn.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", tuple(stale))
+    conn.execute(
+        f"""
+        UPDATE verification_runs SET state = 'failed',
+            error = COALESCE(error, ?)
+        WHERE id IN ({marks}) AND state = 'running'
+        """,
+        (error, *stale),
+    )
+
+
 def start_run(
     conn: sqlite3.Connection,
     site_id: int,
@@ -327,33 +369,7 @@ def start_run(
     start = truth_period_start(conn, site_id=site_id, tz_generation_id=generation_id)
     if end is None or start is None or start > end:
         return None
-    stale = [
-        int(row["id"])
-        for row in conn.execute(
-            """
-            SELECT id FROM verification_runs
-            WHERE site_id = ? AND state != 'published'
-            """,
-            (site_id,),
-        ).fetchall()
-    ]
-    if stale:
-        marks = ",".join("?" for _ in stale)
-        for table in (
-            "verification_evidence",
-            "verification_day_context",
-            "verification_results",
-            "verification_verdicts",
-        ):
-            conn.execute(f"DELETE FROM {table} WHERE run_id IN ({marks})", tuple(stale))
-        conn.execute(
-            f"""
-            UPDATE verification_runs SET state = 'failed',
-                error = COALESCE(error, 'superseded by a newer attempt')
-            WHERE id IN ({marks}) AND state = 'running'
-            """,
-            tuple(stale),
-        )
+    fail_incomplete_attempts(conn, site_id, error="superseded by a newer attempt")
     attempt = failed_attempts_for_fingerprint(conn, site_id, fingerprint) + 1
     seed = seed_from_fingerprint(fingerprint)
     cur = conn.execute(
@@ -560,6 +576,11 @@ SUPERSEDED_REASON_PREFIX = "superseded:"
 #: reader surfaces. The scheduler owns the write; this is the read-side name.
 PUBLISH_HOLD_REASON = "publish_hold"
 
+#: §D13 reason recorded on a `verification_run` job/run neutralized because it
+#: arrived via import while still active in the donor. One definition, used by
+#: `db_transfer.py` and by the tests — no caller may spell the string literally.
+IMPORT_SUPPRESSED_REASON = "suppressed: imported active verification chain"
+
 #: §12 trigger-status values carried on both the API status payload and the
 #: /verification page context.
 TRIGGER_STATUS_TRIGGERED = "triggered"
@@ -708,18 +729,31 @@ def trigger_status(
     return out
 
 
-def trigger_decision_exists(
-    conn: sqlite3.Connection, site_id: int, trigger_date: str
+def trigger_decision_blocks(
+    conn: sqlite3.Connection, site_id: int, trigger_date: str, *, held: bool
 ) -> bool:
-    """Whether the nightly trigger already decided for this local date."""
+    """Whether an existing decision for this local date must stop a new enqueue.
+
+    A publish-hold skip is the ONE decision that stops blocking once the hold
+    is released; every other decision — including a skip with any other reason
+    — stays terminal for the date.
+    """
+    # `reason IS ?` not `=` is deliberate: NULL-safe, though equivalent here.
     row = conn.execute(
         """
-        SELECT 1 FROM verification_trigger_decisions
-        WHERE site_id = ? AND trigger_date = ? LIMIT 1
+        SELECT
+            COALESCE(MAX(CASE WHEN decision = 'skipped' AND reason IS ?
+                              THEN 1 ELSE 0 END), 0) AS hold_rows,
+            COALESCE(MAX(CASE WHEN decision = 'skipped' AND reason IS ?
+                              THEN 0 ELSE 1 END), 0) AS other_rows
+        FROM verification_trigger_decisions
+        WHERE site_id = ? AND trigger_date = ?
         """,
-        (site_id, trigger_date),
+        (PUBLISH_HOLD_REASON, PUBLISH_HOLD_REASON, site_id, trigger_date),
     ).fetchone()
-    return row is not None
+    if int(row["other_rows"]) == 1:
+        return True
+    return held and int(row["hold_rows"]) == 1
 
 
 def published_fingerprint(conn: sqlite3.Connection, site_id: int) -> str | None:

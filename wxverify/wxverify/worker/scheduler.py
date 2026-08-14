@@ -70,8 +70,10 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
 # any score. Late (02:00) so the day's record and truth writes land first.
 VERIFICATION_TRIGGER_LOCAL_TIME = "02:00"
 
-# Operator kill-switch for the nightly verification chain (0.11.1 §3.1),
-# set through the existing `wxverify settings set` CLI. Truthy is exactly
+# Operator kill-switch for the nightly verification chain (0.11.1 §3.1), set
+# through the Ops publish-hold control (`PUT /api/verification/publish-hold`),
+# or `python3 -m wxverify --db /data/wxverify.db settings set
+# verification_publish_hold 1` as an emergency fallback. Truthy is exactly
 # "1"; ABSENT OR ANY OTHER VALUE MEANS NOT HELD, so a fresh install is never
 # silently non-verifying. The gate is scheduler-side rather than
 # publish-side deliberately: suppressing the enqueue leaves no partial run
@@ -98,11 +100,15 @@ def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
     from wxverify.verification.runs import (
         PUBLISH_HOLD_REASON,
         record_trigger_decision,
-        trigger_decision_exists,
+        trigger_decision_blocks,
     )
-    from wxverify.worker.verification_run import verification_job_key
+    from wxverify.worker.verification_run import (
+        verification_chain_active,
+        verification_job_key,
+    )
 
     now = utc_now()
+    held = verification_publish_held(conn)
     rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
     for row in rows:
         site_id = int(row["id"])
@@ -122,18 +128,10 @@ def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
         if now < trigger_utc:
             continue
         day_iso = local_today.isoformat()
-        if trigger_decision_exists(conn, site_id, day_iso):
+        if trigger_decision_blocks(conn, site_id, day_iso, held=held):
             continue
-        active = conn.execute(
-            """
-            SELECT 1 FROM jobs
-            WHERE type = 'verification_run' AND site_id = ? AND job_key = ?
-              AND status IN ('pending', 'running')
-            LIMIT 1
-            """,
-            (site_id, verification_job_key(site_id)),
-        ).fetchone()
-        if active is not None:
+        active = verification_chain_active(conn, site_id)
+        if active:
             record_trigger_decision(
                 conn,
                 site_id,
@@ -142,7 +140,7 @@ def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
                 reason="verification chain already active",
             )
             continue
-        if verification_publish_held(conn):
+        if held:
             # §3.1: the hold is a real control. The durable row uses the
             # existing 'skipped' enum value -- `decision` is CHECK-constrained
             # to four values and widening it means rebuilding the table -- and

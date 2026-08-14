@@ -1,0 +1,16 @@
+{# D14: two truthful variants. Neither claims that nothing publishes while
+   held -- the hold blocks NEW runs only; a chain already active continues
+   and may publish. #}
+{% if publish_hold.held %}
+  <p class="notice" id="publish-hold-banner">
+    {% if publish_hold.chain_active %}
+      <strong>Verification publishing is held &mdash; but a verification run is already in progress.</strong>
+      The hold blocks <em>new</em> runs only; the run already under way will continue and may publish.
+      Release it from Ops when you have validated this release.
+    {% else %}
+      <strong>Verification publishing is held.</strong>
+      New verification runs are not being started.
+      Release it from Ops when you have validated this release.
+    {% endif %}
+  </p>
+{% endif %}

@@ -11,11 +11,14 @@ zero.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from dataclasses import asdict
 from typing import cast
 
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 
 from wxverify.api.errors import ApiError
 from wxverify.core.timeutil import utc_now
@@ -26,6 +29,7 @@ from wxverify.verification.contract import (
     methodology_constants,
 )
 from wxverify.verification.diagnostics import observed_wet_precip_mae
+from wxverify.verification.publish_hold import read_publish_hold, set_publish_hold
 from wxverify.verification.ranking import daily_rank_conclusions
 from wxverify.verification.runs import (
     current_input_fingerprint,
@@ -33,6 +37,8 @@ from wxverify.verification.runs import (
     trigger_status,
 )
 from wxverify.web.render import ingress_url
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/verification", tags=["verification"])
 
@@ -147,6 +153,47 @@ async def verification_status(site: int | None = None) -> dict[str, object]:
         }
 
     return await get_db().read(_read)
+
+
+class PublishHoldIn(BaseModel):
+    """Payload for the Ops publish-hold toggle (D6). Both fields required."""
+
+    held: bool
+    confirm: bool
+
+
+@router.put("/publish-hold")
+async def set_publish_hold_route(body: PublishHoldIn) -> dict[str, object]:
+    """Arm or release the nightly-verification kill switch (D5, D6).
+
+    Behind the existing ``MutationGuard`` (same-origin, JSON content type,
+    CSRF double-submit) by construction -- this route adds no exemption.
+    Release is refused with 409 while any site has a queued or running
+    verification chain; arming is never refused (D5).
+    """
+    if body.confirm is not True:
+        raise ApiError(400, "confirmation required")
+
+    def _write(conn: sqlite3.Connection) -> dict[str, object]:
+        from wxverify.worker.scheduler import verification_publish_held
+        from wxverify.worker.verification_run import any_verification_chain_active
+
+        was_held = verification_publish_held(conn)
+        chain_active = any_verification_chain_active(conn)
+        if not body.held and chain_active:
+            raise ApiError(409, "a verification run is active; release refused")
+        set_publish_hold(conn, held=body.held, source="ops")
+        logger.info(
+            "publish-hold transition old_held=%s new_held=%s source=ops "
+            "chain_active=%s",
+            was_held,
+            body.held,
+            chain_active,
+        )
+        state = read_publish_hold(conn)
+        return cast("dict[str, object]", asdict(state))
+
+    return await get_db().write(_write)
 
 
 @router.get("/runs")

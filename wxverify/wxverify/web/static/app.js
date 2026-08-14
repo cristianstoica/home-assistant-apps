@@ -829,6 +829,113 @@
       });
   });
 
+  // Renders the PUT read-back into the live publish-hold control, so a
+  // successful toggle never leaves the operator acting on page-load values --
+  // data-held above all, since it computes the NEXT click's direction.
+  //
+  // This only ever rewrites elements the server already rendered; it never
+  // authors the hold banner. Those two variants are operator-facing safety
+  // copy and live in templates/_publish_hold_banner.html alone: a second
+  // wording here could drift out of step with the one the pages serve. So
+  // releasing removes the banner, and when arming needs one back the render
+  // is handed to the server -- this returns true and the caller reloads. The
+  // last-transition hint is the same case: the server omits it entirely until
+  // a transition exists. Banner presence and data-held are rendered from the
+  // same `held`, so "the response says held and no banner is present" is
+  // exactly the arm transition.
+  function renderPublishHold(payload) {
+    // An unrecognized payload shape is not rendered as a guess: showing
+    // "Released" or "No active chain" when neither holds is the dangerous
+    // direction for a kill switch, so defer to the server instead.
+    if (
+      !payload ||
+      typeof payload.held !== "boolean" ||
+      typeof payload.chain_active !== "boolean"
+    ) {
+      return true;
+    }
+    var state = document.getElementById("publish-hold-state");
+    var chain = document.getElementById("publish-hold-chain-active");
+    var transition = document.getElementById("publish-hold-last-transition");
+    var toggle = document.getElementById("publish-hold-toggle");
+    var banner = document.getElementById("publish-hold-banner");
+    if (state) {
+      state.className = "badge " + (payload.held ? "warn" : "ok");
+      state.textContent = payload.held ? "Held" : "Released";
+    }
+    if (chain) {
+      chain.className = "badge " + (payload.chain_active ? "warn" : "muted");
+      chain.textContent = payload.chain_active
+        ? "Chain active"
+        : "No active chain";
+    }
+    if (toggle) {
+      toggle.dataset.held = payload.held ? "1" : "0";
+      toggle.textContent = payload.held ? "Release hold" : "Arm hold";
+    }
+    if (transition && payload.last_state) {
+      transition.textContent =
+        "Last changed to " +
+        payload.last_state +
+        " via " +
+        (payload.last_source === "ops" ? "Ops" : "Bootstrap") +
+        " at " +
+        payload.last_changed_at +
+        ".";
+    }
+    if (!payload.held && banner) {
+      banner.parentNode.removeChild(banner);
+    }
+    return (payload.held && !banner) || (!transition && !!payload.last_state);
+  }
+
+  // Publish-hold toggle: arm/release the nightly verification kill switch.
+  document.body.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.matches("#publish-hold-toggle")) {
+      return;
+    }
+    var result = document.getElementById("publish-hold-result");
+    function show(text) {
+      result.hidden = false;
+      result.textContent = text;
+    }
+    var nextHeld = target.dataset.held !== "1";
+    var confirmed = window.confirm(
+      nextHeld
+        ? "Hold nightly verification publishing? New runs will not start until released."
+        : "Release the nightly verification publishing hold?"
+    );
+    if (!confirmed) {
+      return;
+    }
+    var token = document.querySelector('meta[name="csrf-token"]').content;
+    fetch(target.dataset.publishHoldUrl, {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: {
+        "X-CSRF-Token": token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ held: nextHeld, confirm: true })
+    })
+      .then(function (response) {
+        return response.json().then(function (payload) {
+          if (response.ok) {
+            show("Updated.");
+            if (renderPublishHold(payload)) {
+              window.location.reload();
+            }
+          } else {
+            show(payload.error || "Update failed.");
+          }
+        });
+      })
+      .catch(function () {
+        show("Update failed.");
+      });
+  });
+
   // Database export: prepare-then-chunked-download. A plain GET download would
   // hold the request open (no headers) through VACUUM INTO and trip HA
   // ingress's response-start timeout, so this POSTs /begin (with CSRF), polls

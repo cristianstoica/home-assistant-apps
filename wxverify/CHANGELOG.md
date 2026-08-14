@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.11.3
+
+Adds an operator-facing kill switch for the nightly verification chain and
+closes a gap where an imported database could carry an active verification
+run past the hold.
+
+### Added
+
+- Ops → Nightly Verification Publishing: a control that arms or releases the
+  verification publish hold. Arming is never refused, including while a
+  chain is running. Releasing is refused with `409` while any site has a
+  queued or running verification chain, and the state is left unchanged.
+  Upgrading an existing pre-0.11.3 installation arms the hold once during
+  startup, so newly scheduled verification runs are blocked until you
+  review and release it; a fresh install is not held.
+
+### Changed
+
+- Importing a database now discards the donor's in-flight verification run
+  instead of carrying it across the import. Any `verification_run` job
+  still `pending` or `running` is failed with
+  `suppressed: imported active verification chain`, any run left in a
+  non-`published` state is failed with the same reason, and the partial
+  evidence of every unpublished run is deleted. Published runs and every
+  other job type are untouched.
+
 ## 0.11.2
 
 A fix release remediating an external implementation audit of 0.11.1. No

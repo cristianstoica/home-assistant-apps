@@ -1,0 +1,35 @@
+<section class="panel" id="publish-hold-panel">
+  <h2>Nightly Verification Publishing</h2>
+  <p class="panel-hint">
+    Kill switch for the nightly verification chain. Held blocks NEW runs
+    only &mdash; a chain already active will continue and may publish.
+  </p>
+  <div class="status-stack">
+    <span class="badge {{ 'warn' if publish_hold.held else 'ok' }}" id="publish-hold-state">
+      {{ 'Held' if publish_hold.held else 'Released' }}
+    </span>
+    <span class="badge {{ 'warn' if publish_hold.chain_active else 'muted' }}" id="publish-hold-chain-active">
+      {{ 'Chain active' if publish_hold.chain_active else 'No active chain' }}
+    </span>
+  </div>
+  {% if publish_hold.last_state %}
+    <p class="panel-hint" id="publish-hold-last-transition">
+      Last changed to {{ publish_hold.last_state }} via
+      {{ 'Ops' if publish_hold.last_source == 'ops' else 'Bootstrap' }} at
+      {{ publish_hold.last_changed_at }}.
+    </p>
+  {% endif %}
+  {% if publish_hold.bootstrap %}
+    <p class="panel-hint" id="publish-hold-bootstrap-marker">
+      Bootstrap marker: {{ publish_hold.bootstrap }}
+    </p>
+  {% endif %}
+  <div class="button-row">
+    <button type="button" id="publish-hold-toggle"
+            data-publish-hold-url="{{ url('/api/verification/publish-hold') }}"
+            data-held="{{ '1' if publish_hold.held else '0' }}">
+      {{ 'Release hold' if publish_hold.held else 'Arm hold' }}
+    </button>
+  </div>
+  <p class="empty" id="publish-hold-result" hidden></p>
+</section>

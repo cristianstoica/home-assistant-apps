@@ -693,12 +693,15 @@ def load_verification(
     conn: sqlite3.Connection, site_id: int | None
 ) -> dict[str, object]:
     """Everything the /verification page renders, in one read closure."""
+    from wxverify.verification.publish_hold import read_publish_hold
+
     sites = load_sites(conn, include_disabled=False)
     site = _resolve_site(conn, site_id, sites)
     live_depths = effective_blend_depths(conn)
     context: dict[str, object] = {
         "sites": sites,
         "site": site,
+        "publish_hold": read_publish_hold(conn),
         "run": None,
         "snapshot": None,
         "verdicts": [],

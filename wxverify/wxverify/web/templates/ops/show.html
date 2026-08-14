@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Ops - {{ app_title }}{% endblock %}
 {% block content %}
+{% include "_publish_hold_banner.html" %}
 <section class="page-heading">
   <div>
     <h1>Ops</h1>
@@ -9,6 +10,7 @@
 </section>
 
 <section class="ops-grid">
+  {% include "ops/_publish_hold.html" %}
   {% include "ops/_feed_status.html" %}
   {% include "ops/_budget_gauges.html" %}
   {% include "ops/_backfill.html" %}

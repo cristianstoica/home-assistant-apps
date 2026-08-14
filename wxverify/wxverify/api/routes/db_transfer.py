@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from wxverify import config
 from wxverify.api.errors import ApiError
 from wxverify.core.error_sanitize import sanitized_exception
-from wxverify.core.timeutil import utc_now
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import reclaim_all_stale
@@ -491,6 +491,7 @@ async def import_db(request: Request) -> JSONResponse:
                 raise ApiError(422, "empty upload")
             _validate_upload(tmp)
             _stage_pending_rebuild_state(tmp)
+            _neutralize_imported_verification_chains(tmp)
             backup = _new_backup_path(db_dir)
             # COMMIT POINT: past a successful replace_from the live DB has
             # been overwritten, so the success response must go out
@@ -689,6 +690,84 @@ def _stage_pending_rebuild_state(tmp: Path) -> None:
             set_runtime_state(conn, "import_rebuild_state", "pending")
             delete_runtime_state(conn, "import_rebuild_done_at", "import_rebuild_error")
             sanitize_wedge_prone_timestamps(conn)
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+_VERIFICATION_RUN_TABLES = (
+    "verification_runs",
+    "verification_evidence",
+    "verification_day_context",
+    "verification_results",
+    "verification_verdicts",
+)
+
+
+def _neutralize_imported_verification_chains(tmp: Path) -> None:
+    """Neutralize an imported active verification chain before promotion (D13).
+
+    An import does not enqueue, so the hold (which gates the enqueue) never
+    sees a chain that arrives already ``pending``/``running`` inside the
+    imported ``jobs`` table. Run on the staged file, before promotion, so
+    the promoted database carries the neutralized state by construction --
+    ``replace_from``'s rename is atomic, exactly the precedent
+    ``_stage_pending_rebuild_state`` above already establishes.
+
+    The ``verification_*`` cleanups are conditional on their tables being
+    present in the staged file; ``runtime_state`` is ensured-then-written,
+    so a legacy (pre-verification) upload carrying none of the
+    ``verification_*`` tables still imports successfully rather than 500ing.
+    ``_validate_upload`` requires only ``sites``, ``stations`` and
+    ``station_observations``, so such an upload is legitimate.
+    """
+    from wxverify.verification.runs import (
+        IMPORT_SUPPRESSED_REASON,
+        fail_incomplete_attempts,
+    )
+    from wxverify.worker.verification_run import (
+        verification_heartbeat_key,
+        verification_state_key,
+    )
+
+    conn = sqlite3.connect(str(tmp))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            names = {
+                str(name_row[0])
+                for name_row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "jobs" in names:
+                conn.execute(
+                    """
+                    UPDATE jobs SET status = 'failed', last_error = ?,
+                        updated_at = ?
+                    WHERE type = 'verification_run'
+                      AND status IN ('pending', 'running')
+                    """,
+                    (IMPORT_SUPPRESSED_REASON, isoformat_utc()),
+                )
+            if all(table in names for table in _VERIFICATION_RUN_TABLES):
+                for site_row in conn.execute("SELECT id FROM sites").fetchall():
+                    fail_incomplete_attempts(
+                        conn, int(site_row["id"]), error=IMPORT_SUPPRESSED_REASON
+                    )
+            ensure_runtime_state_table(conn)
+            for site_row in conn.execute("SELECT id FROM sites").fetchall():
+                site_id = int(site_row["id"])
+                delete_runtime_state(
+                    conn,
+                    verification_state_key(site_id),
+                    verification_heartbeat_key(site_id),
+                )
         except BaseException:
             conn.rollback()
             raise

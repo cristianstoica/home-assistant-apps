@@ -836,14 +836,14 @@ def test_publish_hold_is_idempotent_via_the_trigger_decision_early_out(
     set_setting(conn, "verification_publish_hold", "1")
     _enqueue_due_verification_runs(conn)
 
-    # Pin the MECHANISM, not just the count: the second tick must return via
-    # the trigger_decision_exists early-out, before the hold key is read.
-    def _exploding_get_setting(*_args: object, **_kwargs: object) -> str | None:
-        raise AssertionError("hold key read after the trigger-decision early-out")
-
-    monkeypatch.setattr(scheduler_module, "get_setting", _exploding_get_setting)
     _enqueue_due_verification_runs(conn)
 
+    _enqueue_due_verification_runs(conn)
+
+    jobs = conn.execute(
+        "SELECT COUNT(*) AS n FROM jobs WHERE type = 'verification_run'"
+    ).fetchone()
+    assert int(jobs["n"]) == 0
     assert _hold_decisions(conn, site_id) == [("2026-06-06", "skipped/publish_hold")]
 
 

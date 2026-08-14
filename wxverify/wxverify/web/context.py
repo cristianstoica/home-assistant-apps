@@ -318,6 +318,8 @@ def load_dashboard(
 
 
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
+    from wxverify.verification.publish_hold import read_publish_hold
+
     return {
         "sites": load_sites(conn),
         "feed_status": load_feed_health(conn),
@@ -329,6 +331,7 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
         ],
         "observation_health": load_observation_health(conn),
         "station_trust": load_station_trust(conn),
+        "publish_hold": read_publish_hold(conn),
     }
 
 

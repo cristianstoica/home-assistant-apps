@@ -10,6 +10,7 @@ from datetime import timedelta
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
 logger = logging.getLogger(__name__)
 
@@ -643,6 +644,70 @@ def seed_default_feeds(conn: sqlite3.Connection) -> None:
     )
 
 
+#: One-time bootstrap decision marker (D2). Written exactly once per
+#: database, in either branch, on the first boot that reaches
+#: `run_migrations`. Its presence -- not its value -- is the gate: once
+#: written it is never rewritten or deleted by this release.
+PUBLISH_HOLD_BOOTSTRAP_KEY = "verification_publish_hold_bootstrap"
+
+
+def bootstrap_publish_hold(
+    conn: sqlite3.Connection, *, pre_migration_user_version: int
+) -> None:
+    """Arm the operator kill switch on upgrade; never on a fresh install (D1-D3).
+
+    ``pre_migration_user_version`` is required and keyword-only so a future
+    caller cannot silently pass the post-migration value and turn every
+    boot into "fresh". Runs as the last step of `run_migrations`, before the
+    `PRAGMA user_version` write, so a failure here aborts the migration
+    without bumping user_version and the next boot retries the decision.
+
+    The SAVEPOINT buys bootstrap-write atomicity -- the hold setting row,
+    its two last-transition metadata rows and the one-time marker land
+    together or not at all -- NOT atomicity of the whole migration:
+    `create_schema` has already COMMITTED by the time we get here, because
+    executescript implicitly commits the pending transaction before running
+    its script, so the outer BEGIN IMMEDIATE from Database._run_immediate is
+    long gone and each statement below would otherwise land individually.
+    That commit boundary is pre-existing -- these bootstrap writes expose
+    it, they do not introduce it. Unprotected, a failure after the hold
+    write but before the marker write would leave the database HELD with no
+    marker, and since marker PRESENCE (not value) is the anti-rearm gate, a
+    later operator release would then be silently re-armed on the next boot
+    -- the exact hazard this bootstrap exists to prevent. The savepoint
+    opens before the marker read so the already-bootstrapped path closes it
+    too, and execute() (unlike executescript) never forces an implicit
+    commit.
+    """
+    from wxverify.verification.publish_hold import set_publish_hold
+
+    conn.execute("SAVEPOINT bootstrap_publish_hold")
+    try:
+        # Phrased as "not yet bootstrapped" rather than an early return so
+        # there is exactly one exit and one RELEASE: an early return inside
+        # the savepoint would have to release on its own path too.
+        if get_runtime_state(conn, PUBLISH_HOLD_BOOTSTRAP_KEY) is None:
+            site_count_row = conn.execute(
+                "SELECT COUNT(*) AS n FROM sites WHERE enabled = 1"
+            ).fetchone()
+            enabled_site_count = int(site_count_row["n"])
+            existing_installation = (
+                pre_migration_user_version > 0 or enabled_site_count > 0
+            )
+            if existing_installation:
+                set_publish_hold(conn, held=True, source="bootstrap")
+                set_runtime_state(conn, PUBLISH_HOLD_BOOTSTRAP_KEY, "armed")
+            else:
+                set_runtime_state(
+                    conn, PUBLISH_HOLD_BOOTSTRAP_KEY, "skipped_fresh_install"
+                )
+    except BaseException:
+        conn.execute("ROLLBACK TO bootstrap_publish_hold")
+        conn.execute("RELEASE bootstrap_publish_hold")
+        raise
+    conn.execute("RELEASE bootstrap_publish_hold")
+
+
 def seed_default_settings(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -678,6 +743,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_feeds(conn)
     seed_default_settings(conn)
     logger.debug("migrations seeded sources+feeds+settings")
+    bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
     logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)
 
