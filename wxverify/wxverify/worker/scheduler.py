@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.queue import enqueue_if_absent_with_cooldown
-from wxverify.settings.keys import get_number_setting
+from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,31 @@ logger = logging.getLogger(__name__)
 # feed cannot retry faster than it would ever have been polled.
 _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 
+# How often an INCOMPLETE record day may be re-attempted while its
+# late-write window is open. A success-retry cadence, deliberately distinct
+# from _DUE_JOB_FAILURE_COOLDOWN above (same value today, different
+# decision, and they will drift apart): one hour is strictly finer than the
+# fastest cadence of the thing being waited on -- the seeded feeds carry
+# fetch_interval_minutes = 360 and the obs poll defaults to 180 -- so an
+# hourly retry never delays an arriving sample, while capping the day's
+# re-runs at 24 instead of one per worker-loop iteration.
+RECORD_RETRY_INTERVAL = timedelta(hours=1)
+
+
+def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
+    """Whether ``now`` is still inside the day's late-write window.
+
+    A fail-closed guard on the record re-enqueue, not an active filter: the
+    scheduler re-derives both instants from the same local day, so the two
+    normally lie less than 24 h apart. Its only reachable trigger is a site
+    whose snapshot wall clock is before 01:00 on a DST fall-back day. Past
+    window close the builder refuses outright and the gap scan owns the
+    day, so enqueuing there is pure churn.
+    """
+    from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
+
+    return now <= snapshot_utc + timedelta(hours=LATE_WRITE_WINDOW_HOURS)
+
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
@@ -45,6 +70,20 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
 # any score. Late (02:00) so the day's record and truth writes land first.
 VERIFICATION_TRIGGER_LOCAL_TIME = "02:00"
 
+# Operator kill-switch for the nightly verification chain (0.11.1 §3.1),
+# set through the existing `wxverify settings set` CLI. Truthy is exactly
+# "1"; ABSENT OR ANY OTHER VALUE MEANS NOT HELD, so a fresh install is never
+# silently non-verifying. The gate is scheduler-side rather than
+# publish-side deliberately: suppressing the enqueue leaves no partial run
+# whose evidence the non-published purge is entitled to delete, and no phase
+# the chain re-enters nightly with no clearing path.
+VERIFICATION_PUBLISH_HOLD_KEY = "verification_publish_hold"
+
+
+def verification_publish_held(conn: sqlite3.Connection) -> bool:
+    """Whether the operator has held the nightly verification trigger."""
+    return get_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY) == "1"
+
 
 def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
     """Enqueue the nightly verification chain per site (§14).
@@ -57,6 +96,7 @@ def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
     """
     from wxverify.verification.record import resolve_snapshot_utc
     from wxverify.verification.runs import (
+        PUBLISH_HOLD_REASON,
         record_trigger_decision,
         trigger_decision_exists,
     )
@@ -102,6 +142,20 @@ def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
                 reason="verification chain already active",
             )
             continue
+        if verification_publish_held(conn):
+            # §3.1: the hold is a real control. The durable row uses the
+            # existing 'skipped' enum value -- `decision` is CHECK-constrained
+            # to four values and widening it means rebuilding the table -- and
+            # carries its meaning in `reason`, which has exactly one
+            # definition, shared with the reader surfaces.
+            record_trigger_decision(
+                conn,
+                site_id,
+                trigger_date=day_iso,
+                decision="skipped",
+                reason=PUBLISH_HOLD_REASON,
+            )
+            continue
         enqueue_if_absent_with_cooldown(
             conn,
             "verification_run",
@@ -124,7 +178,7 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
     """
     from wxverify.db.tz_generations import ensure_published_generation
     from wxverify.verification.record import (
-        record_rows_exist,
+        record_day_complete,
         resolve_snapshot_utc,
         snapshot_wall_clock,
     )
@@ -151,7 +205,13 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
             continue
         day_iso = local_today.isoformat()
         generation_id = ensure_published_generation(conn, site_id)
-        if not record_rows_exist(conn, site_id, generation_id, day_iso):
+        # Three conditions, not one: a completeness predicate stays false
+        # all day on an ordinary partial day, and scheduler_tick runs once
+        # per worker-loop iteration -- so the window guard and the
+        # success cooldown are what keep this from becoming a hot loop.
+        if not record_day_complete(
+            conn, site_id, generation_id, day_iso
+        ) and record_window_open(now, snapshot_utc):
             enqueue_if_absent_with_cooldown(
                 conn,
                 "forecast_record",
@@ -159,6 +219,7 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
                 f"record:{day_iso}",
                 {"snapshot_local_date": day_iso},
                 cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+                success_cooldown=RECORD_RETRY_INTERVAL,
             )
         gap_key = f"gapscan:{day_iso}"
         done = conn.execute(

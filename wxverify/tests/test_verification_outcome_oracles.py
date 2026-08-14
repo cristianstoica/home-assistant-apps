@@ -23,7 +23,7 @@ from typing import cast
 
 import pytest
 
-from tests.helpers import asof_conn
+from tests.helpers import asof_conn, occurrence_baseline_set
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.verification.decision import (
     CandidateSeries,
@@ -539,10 +539,32 @@ def test_temperature_baseline_family_describes_the_composite_sample() -> None:
             "5",
         }, name
         assert entry["pooled_point"] == pytest.approx(0.5), name
+    # §8/W5 lockstep: the headline adequacy set follows the baseline
+    # shortfall, so leads 6-7 are dropped from the headline too — the
+    # candidate is never scored on a lead it was not baseline-checked at.
+    #
+    # Kills the 0.11.0 implementation, in which headline adequacy was
+    # computed from the candidate's own sample alone: leads 6 and 7 stayed
+    # in `adequate_leads` ([1..7]) and carried no `dropped_leads` entry, so
+    # the verdict pooled two leads that no baseline had ever been compared
+    # on. This assertion is what the earlier version of this test agreed
+    # with; `[1, 2, 3, 4, 5]` here is the whole behavioural change.
+    headline = _headline(verdict, "3")
+    assert headline["adequate_leads"] == [1, 2, 3, 4, 5]
     # Paired positive: the shortfall is the injected low-series geometry, not
-    # an ambient adequacy failure — the candidate's own composite, whose high
-    # and low series both span all 24 dates, keeps all seven leads.
-    assert _headline(verdict, "3")["adequate_leads"] == list(range(1, 8))
+    # an ambient adequacy failure — the candidate's own composite spans all
+    # 24 dates on every lead, so 6 and 7 are dropped for the baseline reason
+    # only, naming BOTH required baselines.
+    dropped = cast(list[dict[str, object]], headline["dropped_leads"])
+    assert [(d["lead"], d["reason"]) for d in dropped] == [
+        (6, "baseline_absent"),
+        (7, "baseline_absent"),
+    ]
+    for entry in dropped:
+        assert entry["missing_baselines"] == [
+            "baseline_all_feed_mean",
+            "baseline_persistence",
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +580,11 @@ def test_precip_mixed_by_quantity_when_occurrence_degrades() -> None:
     # (h=12, cn=16). cand ETS = (8 - 144/28)/(16 - 144/28) = (20/7)/(76/7)
     # = 5/19; opp ETS = 1.0 -> pooled diff = 5/19 - 1 = -14/19 << -0.02.
     occ: OccurrenceLead = {}
+    # §8: the occurrence gate is evaluated unconditionally, so the endpoint
+    # needs its required baselines. A baseline that misses every wet day AND
+    # false-alarms every dry day (ETS < 0) is beaten decisively, keeping the
+    # case about the incumbent comparison rather than the gate.
+    occ_baseline: OccurrenceLead = {}
     for i, d in enumerate(dates):
         if i < 8:
             occ[d] = ("hit", "hit")
@@ -567,6 +594,7 @@ def test_precip_mixed_by_quantity_when_occurrence_degrades() -> None:
             occ[d] = ("false_alarm", "correct_negative")
         else:
             occ[d] = ("correct_negative", "correct_negative")
+        occ_baseline[d] = (occ[d][0], "miss" if i < 12 else "false_alarm")
     strong = {ld: _strong_baseline(total[ld]) for ld in range(1, 8)}
     candidate = CandidateSeries(
         key="3",
@@ -576,6 +604,9 @@ def test_precip_mixed_by_quantity_when_occurrence_degrades() -> None:
             "baseline_persistence": {"precip_total": strong},
             "baseline_all_feed_mean": {"precip_total": strong},
         },
+        baseline_occurrence=occurrence_baseline_set(
+            {ld: occ_baseline for ld in range(1, 8)}
+        ),
     )
     inputs = VariableInputs(
         variable="precip", incumbent_key="2", candidates=(candidate,)

@@ -10,6 +10,31 @@
     {% for gate in items %}<span class="badge {{ 'ok' if gate.state == 'pass' else ('warn' if gate.state == 'fail' else 'muted') }}" data-gate="{{ gate.key }}" data-gate-state="{{ gate.state }}" title="{{ gate.label }}: {{ gate.state }}">{{ gate.label }}: {{ gate.state }}</span> {% endfor %}
   {% else %}—{% endif %}
 {% endmacro %}
+{# §16.1/§12: the nightly trigger's own decision, so "no published run" is
+   never the operator's only signal. The reason string is rendered, not the
+   decision enum — a gate skip and a superseded start share the enum. #}
+{% macro trigger_notice(trigger) %}
+  {% if trigger %}
+    <p class="notice" data-v16="16.1.trigger_status" data-trigger-status="{{ trigger.status }}">
+      {% if trigger.status == 'triggered' %}
+        Nightly trigger started a run for <span data-field="trigger_date">{{ trigger.trigger_date }}</span>.
+      {% elif trigger.status == 'skipped' %}
+        Nightly trigger skipped <span data-field="trigger_date">{{ trigger.trigger_date }}</span>{% if trigger.reason %} &mdash; <span data-field="trigger_reason">{{ trigger.reason }}</span>{% endif %}.
+      {% elif trigger.status == 'no_decision_recorded' %}
+        No nightly trigger decision recorded for <span data-field="trigger_date">{{ trigger.trigger_date }}</span>.
+      {% else %}
+        This site&rsquo;s nightly trigger date could not be derived &mdash; check its timezone.
+      {% endif %}
+      {% if trigger.superseded_count %}
+        <span data-field="trigger_superseded_count">{{ trigger.superseded_count }}</span> superseded start(s) on this date &mdash;
+        <span data-field="trigger_superseded_reason">{{ trigger.superseded_reason }}</span>.
+      {% endif %}
+      {% if trigger.publish_hold.held %}
+        Publishing is held by the operator (<span data-field="publish_hold_reason">{{ trigger.publish_hold.reason }}</span>).
+      {% endif %}
+    </p>
+  {% endif %}
+{% endmacro %}
 {% block content %}
 <section class="page-heading">
   <div>
@@ -31,6 +56,7 @@
   <p class="empty">No sites configured.</p>
 {% elif warnings.no_publishable_run %}
   <p class="notice" data-v16="16.1.no_publishable_run">No published verification run for this site yet.</p>
+  {{ trigger_notice(trigger) }}
 {% else %}
 
   {# ------------------------------------------------------------------ #}
@@ -89,6 +115,7 @@
       </div>
     {% endif %}
 
+    {{ trigger_notice(trigger) }}
     {% if warnings.stale_inputs %}
       <p class="notice" data-v16="16.1.warn_stale">Inputs have changed since this run was published — results reflect the pinned snapshot, not current data.</p>
     {% endif %}
@@ -111,6 +138,15 @@
           {% if v.is_placeholder %}<span class="badge warn" data-v16="16.2.placeholder">placeholder verdict — not evidence</span>{% endif %}
         </p>
         {% if v.caveat %}<p class="verdict-caveat" data-v16="16.2.caveat">{{ v.caveat }}</p>{% endif %}
+        {%- set ranking = v.ranking_redesign_indicated %}
+        {% if ranking %}
+        <p class="verdict-conclusion" data-v16="16.2.ranking_redesign" data-ranking="{{ ranking.value }}">
+          <strong>Daily-rank redesign:</strong>
+          <span data-field="ranking_value">{{ ranking.value }}</span>
+          &mdash; <span data-field="entities_examined">{{ ranking.entities_examined }}</span> daily-rank blends examined{% if ranking.selected_entity_key %}, carried by depth <span data-field="selected_entity_key">{{ ranking.selected_entity_key }}</span> (selected after the fact among those examined){% endif %}.
+          Diagnostic only: a ranking basis is not enactable, so the recommendation above is unchanged by this line.
+        </p>
+        {% endif %}
         <dl class="facts">
           <div data-v16="16.2.incumbent_depth"><dt>Incumbent depth (pinned by run #{{ run.id }})</dt><dd>{{ v.incumbent_depth }}</dd></div>
           <div data-v16="16.2.recommended_depth"><dt>Recommended depth</dt><dd>{{ v.recommended_depth if v.recommended_depth is not none else '—' }}</dd></div>
@@ -281,7 +317,7 @@
         {% if diagnostics.feeds %}
           <div class="table-wrap">
             <table class="cardify">
-              <thead><tr><th>Feed</th><th>Variable</th><th>Lead</th><th>Quantity</th><th>Availability</th><th>State</th><th>Common days</th><th>MAE</th><th>ETS</th></tr></thead>
+              <thead><tr><th>Feed</th><th>Variable</th><th>Lead</th><th>Quantity</th><th>Availability</th><th>State</th><th>Common days</th><th>MAE</th><th>ETS</th><th>Vs recommended</th></tr></thead>
               <tbody>
                 {% for r in diagnostics.feeds %}
                   <tr data-below-floor="{{ 'yes' if r.below_floor else 'no' }}" data-pairwise-only="{{ 'yes' if r.pairwise_only else 'no' }}">
@@ -298,6 +334,14 @@
                     <td data-label="Common days">{{ r.common_days }}</td>
                     <td data-label="MAE">{{ num(r.mae) }}</td>
                     <td data-label="ETS">{{ num(r.ets) }}</td>
+                    <td data-label="Vs recommended" data-vs-recommended="{{ 'yes' if r.vs_recommended and r.vs_recommended.available else 'no' }}">
+                      {% if r.vs_recommended and r.vs_recommended.available %}
+                        <span data-field="delta_vs_recommended">{{ num(r.vs_recommended.delta_vs_recommended) }}</span>
+                        <span class="muted">({{ r.vs_recommended.dates_n }} shared days)</span>
+                      {% else %}
+                        <span class="muted" data-field="reason">{{ r.vs_recommended.reason if r.vs_recommended else '—' }}</span>
+                      {% endif %}
+                    </td>
                   </tr>
                 {% endfor %}
               </tbody>
@@ -357,6 +401,41 @@
           </div>
         {% else %}
           <p class="empty">No contingency rows on this run.</p>
+        {% endif %}
+      </div>
+
+      {% set wetmae = diagnostics.observed_wet_precip_mae %}
+      <div class="subsection" data-v16="16.4.observed_wet_precip_mae">
+        <h3>Precip-total MAE on observed-wet common days</h3>
+        <p class="muted" data-field="observed_wet_entity" data-entity-type="{{ wetmae.entity_type }}">
+          Measured for blend depth
+          <span data-field="observed_wet_entity_key">{{ wetmae.entity_key }}</span>
+          &mdash; the precip depth this run was scored under.
+        </p>
+        {% if wetmae.value is none %}
+          <p class="empty" data-field="observed_wet_precip_mae_reason">
+            Not available &mdash;
+            {% if wetmae.reason == 'incumbent_not_simulated' %}
+              this run did not simulate the configured precip depth, so there was nothing to
+              measure (<span data-field="observed_wet_sample_days">{{ wetmae.sample_days }}</span>
+              days measured). Set the configured depth to one this run simulates.
+            {% elif wetmae.reason == 'no_observed_wet_days' %}
+              no observed-wet common days on this run
+              (<span data-field="observed_wet_sample_days">{{ wetmae.sample_days }}</span> observed-wet days).
+            {% else %}
+              no scored member on the observed-wet days
+              (<span data-field="observed_wet_sample_days">{{ wetmae.sample_days }}</span> observed-wet days).
+            {% endif %}
+          </p>
+        {% else %}
+          <p>
+            <span data-field="observed_wet_precip_mae">{{ num(wetmae.value, '%.2f') }}</span> mm
+            over <span data-field="observed_wet_sample_days">{{ wetmae.sample_days }}</span> observed-wet common days
+            &middot; <span data-field="observed_wet_observations">{{ wetmae.observations }}</span> scored member-days
+            {% if wetmae.low_sample %}
+              <strong data-field="observed_wet_low_sample">Thin sample &mdash; read with caution.</strong>
+            {% endif %}
+          </p>
         {% endif %}
       </div>
 

@@ -14,20 +14,25 @@ import json
 import sqlite3
 from typing import cast
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
 
 from wxverify.api.errors import ApiError
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.verification.contract import (
     CONTRACT,
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
+from wxverify.verification.diagnostics import observed_wet_precip_mae
+from wxverify.verification.ranking import daily_rank_conclusions
 from wxverify.verification.runs import (
     current_input_fingerprint,
     published_run_id,
+    trigger_status,
 )
+from wxverify.web.render import ingress_url
 
 router = APIRouter(prefix="/api/verification", tags=["verification"])
 
@@ -107,6 +112,11 @@ def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
     return {
         "site_id": site_id,
         "published_run": published,
+        # §12/§3.1: additive under §16.1 — the nightly trigger's own
+        # decision (and the publish hold), so `no_publishable_run` is no
+        # longer the operator's only signal. Same derivation the
+        # /verification page uses, so the two surfaces cannot disagree.
+        "trigger": trigger_status(conn, site_id, utc_now()),
         "warnings": {
             "no_publishable_run": run_id is None,
             "stale_inputs": stale,
@@ -169,7 +179,7 @@ async def list_runs(
 
 
 @router.get("/latest")
-async def latest_run(site: int) -> RedirectResponse:
+async def latest_run(request: Request, site: int) -> RedirectResponse:
     def _read(conn: sqlite3.Connection) -> int:
         run_id = published_run_id(conn, site)
         if run_id is None:
@@ -177,7 +187,14 @@ async def latest_run(site: int) -> RedirectResponse:
         return run_id
 
     run_id = await get_db().read(_read)
-    return RedirectResponse(url=f"/api/verification/runs/{run_id}", status_code=307)
+    # Built through the ingress prefix, exactly like every other absolute URL
+    # in the app: a hand-concatenated path sends an ingress client outside the
+    # mount and 404s. ``ingress_url`` returns the bare path when root_path is
+    # empty, so the standalone case is unchanged.
+    return RedirectResponse(
+        url=ingress_url(request, f"/api/verification/runs/{run_id}"),
+        status_code=307,
+    )
 
 
 @router.get("/runs/{run_id}")
@@ -203,6 +220,9 @@ async def run_verdicts(run_id: int) -> dict[str, object]:
             """,
             (run_id,),
         ).fetchall()
+        # §10: derived at read time by the SAME helper the page calls, so the
+        # two surfaces cannot state different conclusions.
+        conclusions = daily_rank_conclusions(conn, run_id)
         return {
             "verification_schema": VERIFICATION_SCHEMA,
             "run_id": run_id,
@@ -215,6 +235,7 @@ async def run_verdicts(run_id: int) -> dict[str, object]:
                     else int(row["recommended_depth"]),
                     "incumbent_depth": int(row["incumbent_depth"]),
                     "tested_family": _parse_json(row["tested_family"]),
+                    "ranking_redesign_indicated": conclusions.get(str(row["variable"])),
                 }
                 for row in rows
             ],
@@ -350,6 +371,9 @@ async def run_diagnostics(
                 }
                 for row in rows
             ],
+            # §14a: always-displayed secondary metric, from the same helper
+            # /verification renders, so the surfaces cannot drift.
+            "observed_wet_precip_mae": observed_wet_precip_mae(conn, run_id),
             "day_context": [
                 {
                     "snapshot_local_date": str(d["snapshot_local_date"]),

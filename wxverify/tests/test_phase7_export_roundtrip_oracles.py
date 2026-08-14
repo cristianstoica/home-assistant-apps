@@ -32,7 +32,7 @@ import gzip
 import json
 import sqlite3
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -61,6 +61,48 @@ _ENDPOINT_SUFFIXES = (
     "diagnostics",
     "methodology",
 )
+
+
+def _seed_record_grid(conn: sqlite3.Connection, site_id: int) -> None:
+    """Samples for every identity of the ``_RECORD_DAY`` grid.
+
+    The record now writes only identities that had samples at T, so the
+    24-row round-trip anchor below needs a fully seeded day.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO feeds (source, model, default_subscribed,
+                           fetch_interval_minutes, max_lead_hours)
+        VALUES ('example-src', 'grid-model', 1, 360, 192)
+        """
+    )
+    assert cur.lastrowid is not None
+    feed_id = int(cur.lastrowid)
+    start = datetime.fromisoformat(f"{_RECORD_DAY}T00:00:00+00:00")
+    issued = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fetched = (start + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for offset in range(8):
+        for variable, value in (("temperature", 10.0), ("wind", 5.0), ("precip", 0.0)):
+            for hour in range(24):
+                valid = start + timedelta(days=offset, hours=hour)
+                conn.execute(
+                    """
+                    INSERT INTO forecast_samples
+                        (site_id, feed_id, variable, issued_at, valid_at,
+                         lead_hours, value, source_raw, model_run_id, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-x', ?)
+                    """,
+                    (
+                        site_id,
+                        feed_id,
+                        variable,
+                        issued,
+                        valid.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        max(1, int((valid - start).total_seconds() // 3600)),
+                        value,
+                        fetched,
+                    ),
+                )
 
 
 def _capture(client: TestClient, site_id: int, run_id: int) -> dict[str, object]:
@@ -96,6 +138,7 @@ def test_round_trip_serves_identical_api_state(
         set_setting(conn_a, SNAPSHOT_TIME_KEY, "05:45")
         set_setting(conn_a, f"{SNAPSHOT_TIME_KEY}:{site_id}", "06:30")
         run_id = _seed_published_run(conn_a, site_id)
+        _seed_record_grid(conn_a, site_id)
         # One full record day: 8 target days x 3 variables = 24 rows,
         # written at T=06:30 local (the per-site override) + 30 minutes.
         build_forecast_record(

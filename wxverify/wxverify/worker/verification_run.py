@@ -14,11 +14,16 @@ durable trigger-decision row lands here, before any run row exists) →
 ``start`` (one transaction: prior incomplete attempts wiped, the new run
 row pins config + roster + generation + period + seed) → ``simulate``
 (chunked walk-forward evidence; each chunk first re-checks the pinned
-inputs against the live tables) → ``aggregate`` (cell resolution +
+inputs against the live tables) → ``resolve`` (§7 pass-1 availability-only
+resolution, one chunk) → ``baseline`` (§7 pass 2: the all-feed-mean
+baseline over the resolved headline roster, chunked like ``simulate``) →
+``aggregate`` (cell resolution +
 results, one transaction) → ``bootstrap`` (the ONLY async phase: series
 prepared on a read connection, the CPU-bound bootstrap runs in
 ``asyncio.to_thread`` — never inside ``db.write`` — then one write
-persists the verdicts) → ``publish`` (integrity check + atomic pointer
+persists the verdicts) → ``pairwise`` (§9: below-floor rows gain their
+comparison against the RECOMMENDED blend, one chunk, after the verdicts
+exist) → ``publish`` (integrity check + atomic pointer
 flip + blob cleanup).
 """
 
@@ -44,9 +49,12 @@ from wxverify.verification.decision import VariableInputs, Verdict, decide_varia
 from wxverify.verification.engine import (
     aggregate_run,
     finalize_verdicts,
+    pass1_baseline_feeds,
     prepare_bootstrap_inputs,
     preskipped_verdicts,
     publish_verified_run,
+    resolve_pass1_roster,
+    write_pairwise_comparisons,
 )
 from wxverify.verification.runs import (
     RunConfig,
@@ -61,7 +69,7 @@ from wxverify.verification.runs import (
     settled_through,
     start_run,
 )
-from wxverify.verification.simulate import simulate_snapshot_day
+from wxverify.verification.simulate import simulate_baseline_day, simulate_snapshot_day
 from wxverify.verification.truth import regenerate_marked_truth_chunk
 from wxverify.worker.control import JobCancelled, JobContinuation
 
@@ -75,6 +83,16 @@ SNAPSHOT_DAYS_PER_CHUNK = 7
 # Failed attempts on ONE fingerprint before the trigger stops retrying (§14:
 # a third start without completion marks the effort failed, not re-pended).
 MAX_FAILED_ATTEMPTS = 2
+# §11/W8: re-decide rounds allowed when the fingerprint derived in `start`
+# differs from the one the trigger decision was made against. The divergence
+# drivers (`sample_high_water`, the observation count) advance continuously,
+# so an unbounded loop would live-lock the chain and never start a run. On
+# the round-2 divergence the run starts against its OWN freshly derived
+# fingerprint and snapshot — a self-consistent pair, which is the property
+# this item exists to guarantee — with the gates re-evaluated first.
+MAX_REDECIDE_ATTEMPTS = 1
+SUPERSEDED_REASON = "superseded: input fingerprint changed between decide and start"
+FORCED_START_REASON = "started after 2 fingerprint re-derivations"
 
 _STATE_KEY_PREFIX = "verification_state:"
 _HEARTBEAT_KEY_PREFIX = "verification_heartbeat:"
@@ -161,7 +179,8 @@ def _persist_verdicts(
     if blob is None or str(blob.get("phase")) != "bootstrap":
         raise JobCancelled()
     finalize_verdicts(conn, cfg, verdicts)
-    blob["phase"] = "publish"
+    # §3.2 mutate-and-re-save: `run_id` must survive this write.
+    blob["phase"] = "pairwise"
     _save_state(conn, site_id, blob)
     _heartbeat(conn, site_id)
 
@@ -184,13 +203,26 @@ def advance_verification(
     if phase == "decide":
         return _decide_phase(conn, site_id, payload, blob)
     if phase == "start":
-        return _start_phase(conn, site_id, blob)
+        return _start_phase(conn, site_id, payload, blob)
     if phase == "simulate":
         return _simulate_chunk(conn, site_id, payload, blob)
+    if phase == "resolve":
+        return _resolve_phase(conn, site_id, blob)
+    if phase == "baseline":
+        return _baseline_chunk(conn, site_id, payload, blob)
     if phase == "aggregate":
         cfg = _blob_config(conn, blob)
         aggregate_run(conn, cfg)
         blob["phase"] = "bootstrap"
+        _save_state(conn, site_id, blob)
+        _heartbeat(conn, site_id)
+        return True
+    if phase == "pairwise":
+        cfg = _blob_config(conn, blob)
+        write_pairwise_comparisons(conn, cfg)
+        # §3.2 mutate-and-re-save, NOT a fresh dict: dropping `run_id` here
+        # would wedge the chain silently on every subsequent night.
+        blob["phase"] = "publish"
         _save_state(conn, site_id, blob)
         _heartbeat(conn, site_id)
         return True
@@ -276,6 +308,9 @@ def _decide_phase(
         fingerprint=fingerprint,
     )
     decision_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+    # `redecide_attempts` is the ONE key that crosses the start → decide
+    # boundary (§3.2), and this fresh dict would otherwise destroy it on the
+    # way back into `start`, unbounding the re-decide loop.
     _save_state(
         conn,
         site_id,
@@ -283,22 +318,59 @@ def _decide_phase(
             "phase": "start",
             "fingerprint": fingerprint,
             "decision_id": int(decision_id["id"]),
+            "redecide_attempts": _blob_int(blob, "redecide_attempts") or 0,
         },
     )
+    # Informational only (§11): what the trigger decision was made against.
+    # It is NEVER the comparand — `_continuation` enqueues after the state
+    # write commits, so a crash-resume replays the ORIGINAL scheduler
+    # payload and a payload-carried comparand would read as a divergence
+    # that never happened.
+    payload["decision_fingerprint"] = fingerprint
     _heartbeat(conn, site_id)
     return True
 
 
 def _start_phase(
-    conn: sqlite3.Connection, site_id: int, blob: dict[str, object]
+    conn: sqlite3.Connection,
+    site_id: int,
+    payload: dict[str, object],
+    blob: dict[str, object],
 ) -> bool:
-    fingerprint = str(blob.get("fingerprint", ""))
-    if not fingerprint:
+    decided = str(blob.get("fingerprint", ""))
+    if not decided:
+        raise JobCancelled()
+    trigger_date = payload.get("trigger_date")
+    if not isinstance(trigger_date, str):
         raise JobCancelled()
     try:
         snapshot = capture_config_snapshot(conn, site_id)
     except ValueError as exc:
         raise JobCancelled() from exc
+    # §11/W8: the run's fingerprint is derived from the snapshot the run
+    # actually stores, in this transaction — never the decide-phase value
+    # computed against a different sample high-water mark.
+    fingerprint = input_fingerprint(conn, site_id, snapshot)
+    attempts = _blob_int(blob, "redecide_attempts") or 0
+    diverged = fingerprint != decided
+    if diverged and attempts < MAX_REDECIDE_ATTEMPTS:
+        # No run starts on a divergent pass. Re-entering `decide` re-runs
+        # every gate (published-fingerprint, attempt cap, settled truth)
+        # against the new value; the superseding row keeps the audit trail
+        # honest, since the round-1 `run_started` row's run_id never lands.
+        record_trigger_decision(
+            conn,
+            site_id,
+            trigger_date=trigger_date,
+            decision="skipped",
+            reason=SUPERSEDED_REASON,
+            fingerprint=fingerprint,
+        )
+        _save_state(
+            conn, site_id, {"phase": "decide", "redecide_attempts": attempts + 1}
+        )
+        _heartbeat(conn, site_id)
+        return True
     cfg = start_run(
         conn, site_id, snapshot=snapshot, fingerprint=fingerprint, now=utc_now()
     )
@@ -307,7 +379,16 @@ def _start_phase(
         # race) — fail loudly rather than publish an empty run.
         raise RuntimeError(f"verification start for site={site_id}: no settled truth")
     decision_id = _blob_int(blob, "decision_id")
-    if decision_id is not None:
+    if decision_id is not None and diverged:
+        conn.execute(
+            """
+            UPDATE verification_trigger_decisions
+            SET run_id = ?, reason = ?, input_fingerprint = ?
+            WHERE id = ?
+            """,
+            (cfg.run_id, FORCED_START_REASON, fingerprint, decision_id),
+        )
+    elif decision_id is not None:
         conn.execute(
             "UPDATE verification_trigger_decisions SET run_id = ? WHERE id = ?",
             (cfg.run_id, decision_id),
@@ -338,6 +419,49 @@ def _simulate_chunk(
         if cursor > end:
             break
         simulate_snapshot_day(conn, cfg, cursor.isoformat())
+        cursor = cursor + timedelta(days=1)
+    if cursor > end:
+        blob["phase"] = "resolve"
+        blob.pop("cursor", None)
+    else:
+        blob["cursor"] = cursor.isoformat()
+    # MUTATE-AND-RE-SAVE (§3.2): a fresh dict here drops `run_id`, and the
+    # chain then cancels silently on every subsequent night with no run.
+    _save_state(conn, site_id, blob)
+    _heartbeat(conn, site_id)
+    return True
+
+
+def _resolve_phase(
+    conn: sqlite3.Connection, site_id: int, blob: dict[str, object]
+) -> bool:
+    """§7 steps 2-3: availability-only resolution, one bounded chunk."""
+    cfg = _blob_config(conn, blob)
+    resolve_pass1_roster(conn, cfg)
+    blob["phase"] = "baseline"
+    blob["cursor"] = cfg.period_start
+    _save_state(conn, site_id, blob)
+    _heartbeat(conn, site_id)
+    return True
+
+
+def _baseline_chunk(
+    conn: sqlite3.Connection,
+    site_id: int,
+    payload: dict[str, object],
+    blob: dict[str, object],
+) -> bool:
+    """§7 step 4: pass 2, chunked over snapshot days exactly as pass 1 is."""
+    cfg = _blob_config(conn, blob)
+    assert_inputs_unpinned_unchanged(conn, cfg)
+    rosters = pass1_baseline_feeds(conn, cfg.run_id)
+    days = _chunk_size(payload, "snapshot_days_per_chunk", SNAPSHOT_DAYS_PER_CHUNK)
+    cursor = date.fromisoformat(str(blob["cursor"]))
+    end = date.fromisoformat(cfg.period_end)
+    for _ in range(days):
+        if cursor > end:
+            break
+        simulate_baseline_day(conn, cfg, cursor.isoformat(), rosters)
         cursor = cursor + timedelta(days=1)
     if cursor > end:
         blob["phase"] = "aggregate"

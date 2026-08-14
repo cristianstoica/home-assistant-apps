@@ -19,6 +19,7 @@ Synthetic fixtures only: fake town names, UTC, invented feed ids.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections.abc import Iterator
@@ -35,6 +36,7 @@ from tests.test_phase7_surface import (
 )
 from wxverify.api.routes.verification import VERIFICATION_SCHEMA
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.verification.runs import capture_config_snapshot
 
 # ---------------------------------------------------------------------------
 # Fixture: two runs; run A carries six hand-placed evidence rows chosen so
@@ -46,6 +48,9 @@ _ROW_TUPLE = tuple[str, int, str, str, str]
 
 def _insert_run(conn: sqlite3.Connection, site_id: int) -> int:
     generation = ensure_published_generation(conn, site_id)
+    # A full pinned snapshot, as the production write path stores: readers
+    # rehydrate a RunConfig from this column, so '{}' is unproducible.
+    snapshot = json.dumps(capture_config_snapshot(conn, site_id), separators=(",", ":"))
     cur = conn.execute(
         """
         INSERT INTO verification_runs
@@ -53,10 +58,10 @@ def _insert_run(conn: sqlite3.Connection, site_id: int) -> int:
              state, attempt, config_snapshot, period_start, period_end,
              settled_through, bootstrap_seed, bootstrap_resamples,
              input_fingerprint)
-        VALUES (?, ?, 1, 'test', 'running', 1, '{}', '2026-05-01',
+        VALUES (?, ?, 1, 'test', 'running', 1, ?, '2026-05-01',
                 '2026-05-30', '2026-05-30', 1, 40, 'fp-contract')
         """,
-        (site_id, generation),
+        (site_id, generation, snapshot),
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)

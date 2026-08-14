@@ -19,8 +19,10 @@ from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.settings.keys import set_setting
 from wxverify.verification.record import (
     MISSED_WINDOW_CLOSED,
+    RECORD_DAY_COUNT,
     build_forecast_record,
-    record_rows_exist,
+    record_day_complete,
+    record_day_has_any_row,
     resolve_snapshot_utc,
     run_record_gap_scan,
     sites_with_record_gap,
@@ -74,6 +76,7 @@ def _insert_temp_day(
     issued_at: str,
     fetched_at: str | None,
     value: float,
+    variable: str = "temperature",
 ) -> None:
     issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
     for hour in range(24):
@@ -86,11 +89,12 @@ def _insert_temp_day(
             INSERT INTO forecast_samples
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  value, source_raw, model_run_id, fetched_at)
-            VALUES (?, ?, 'temperature', ?, ?, ?, ?, '{}', 'run-x', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-x', ?)
             """,
             (
                 site_id,
                 feed_id,
+                variable,
                 issued_at,
                 isoformat_utc(valid),
                 lead,
@@ -98,6 +102,54 @@ def _insert_temp_day(
                 fetched_at,
             ),
         )
+
+
+#: Sample value per variable for the full-grid fixture below.
+_GRID_VALUES = {"temperature": 10.0, "wind": 5.0, "precip": 0.0}
+
+
+def _insert_full_grid(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    start_date: date,
+    issued_at: str,
+    fetched_at: str | None,
+) -> None:
+    """Seed every (variable x display day) identity the record grid spans.
+
+    A record day is only written for identities that had samples at T, so a
+    fixture seeding one variable for one day produces one row, not a grid.
+    Anything asserting on the full 3 x 8 identity set needs the full grid.
+    """
+    for day in range(RECORD_DAY_COUNT):
+        for variable, value in _GRID_VALUES.items():
+            _insert_temp_day(
+                conn,
+                site_id=site_id,
+                feed_id=feed_id,
+                local_date=start_date + timedelta(days=day),
+                issued_at=issued_at,
+                fetched_at=fetched_at,
+                value=value,
+                variable=variable,
+            )
+
+
+def _seed_grid_for(
+    conn: sqlite3.Connection, *, site_id: int, feed_id: int, day: date
+) -> None:
+    """Full grid for snapshot ``day``, issued that morning (before its T)."""
+    issued = datetime.combine(day, datetime.min.time(), UTC) + timedelta(hours=6)
+    _insert_full_grid(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        start_date=day,
+        issued_at=isoformat_utc(issued),
+        fetched_at=isoformat_utc(issued + timedelta(minutes=5)),
+    )
 
 
 def _snapshot_t(local_date: date = _DAY) -> datetime:
@@ -154,14 +206,13 @@ def test_record_job_writes_full_grid() -> None:
     site_id = _make_site(conn, "site-a")
     ensure_published_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
-    _insert_temp_day(
+    _insert_full_grid(
         conn,
         site_id=site_id,
         feed_id=feed_id,
-        local_date=_DAY,
-        issued_at="2035-06-14T06:00:00Z",
-        fetched_at="2035-06-14T06:05:00Z",
-        value=10.0,
+        start_date=_DAY,
+        issued_at="2035-06-15T06:00:00Z",
+        fetched_at="2035-06-15T06:05:00Z",
     )
     t = _snapshot_t()
     build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(minutes=5))
@@ -205,11 +256,38 @@ def test_record_job_writes_full_grid() -> None:
     policy = json.loads(str(day0_temp["policy"]))
     assert set(policy) >= {"blend_depth", "min_n", "window_days", "rain_threshold_mm"}
 
-    # A cell with no samples is still a row -- honestly empty, never absent.
     day5_wind = next(
         r for r in rows if str(r["variable"]) == "wind" and int(r["display_lead"]) == 5
     )
-    assert json.loads(str(day5_wind["selected_feed_ids"])) == []
+    assert json.loads(str(day5_wind["selected_feed_ids"])) == [feed_id]
+
+
+def test_record_skips_cells_with_no_samples() -> None:
+    # Inverted from the pre-0.11.1 behaviour: a cell with nothing knowable at T
+    # used to be written as an empty ``recorded`` row, which is indistinguishable
+    # from a real all-feeds-agree-on-nothing day. Only sampled identities land.
+    conn = _conn()
+    site_id = _make_site(conn, "site-a")
+    ensure_published_generation(conn, site_id)
+    feed_id = _make_feed(conn, "model-a")
+    _insert_temp_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        local_date=_DAY,
+        issued_at="2035-06-15T06:00:00Z",
+        fetched_at="2035-06-15T06:05:00Z",
+        value=10.0,
+    )
+    t = _snapshot_t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(minutes=5))
+    rows = conn.execute(
+        "SELECT variable, display_lead FROM forecast_of_record WHERE site_id = ?",
+        (site_id,),
+    ).fetchall()
+    assert [(str(r["variable"]), int(r["display_lead"])) for r in rows] == [
+        ("temperature", 0)
+    ]
 
 
 def test_record_retry_is_idempotent() -> None:
@@ -332,25 +410,11 @@ def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
     site_id = _make_site(conn, "site-a")
     generation_id = ensure_published_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
-    for local_date in (_DAY, _DAY + timedelta(days=3)):
-        _insert_temp_day(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            local_date=local_date,
-            issued_at=isoformat_utc(
-                datetime.combine(
-                    local_date - timedelta(days=1), datetime.min.time(), UTC
-                )
-                + timedelta(hours=6)
-            ),
-            fetched_at=isoformat_utc(
-                datetime.combine(
-                    local_date - timedelta(days=1), datetime.min.time(), UTC
-                )
-                + timedelta(hours=6, minutes=5)
-            ),
-            value=10.0,
+    # One grid per snapshot day, issued that morning before T, so every day the
+    # scan visits has a full 3 x 8 identity set knowable as of its own T.
+    for offset in range(4):
+        _seed_grid_for(
+            conn, site_id=site_id, feed_id=feed_id, day=_DAY + timedelta(days=offset)
         )
     t0 = _snapshot_t(_DAY)
     build_forecast_record(
@@ -362,7 +426,7 @@ def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
 
     for offset, expected_status in ((1, "missed"), (2, "missed"), (3, "recorded")):
         day_iso = (_DAY + timedelta(days=offset)).isoformat()
-        assert record_rows_exist(conn, site_id, generation_id, day_iso)
+        assert record_day_has_any_row(conn, site_id, generation_id, day_iso)
         rows = conn.execute(
             """
             SELECT status, missed_reason, write_path FROM forecast_of_record
@@ -384,27 +448,30 @@ def test_gap_scan_chunks_with_continuation(monkeypatch: pytest.MonkeyPatch) -> N
     site_id = _make_site(conn, "site-a")
     ensure_published_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
-    _insert_temp_day(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        local_date=_DAY,
-        issued_at="2035-06-14T06:00:00Z",
-        fetched_at="2035-06-14T06:05:00Z",
-        value=10.0,
-    )
+    for offset in range(7):
+        _seed_grid_for(
+            conn, site_id=site_id, feed_id=feed_id, day=_DAY + timedelta(days=offset)
+        )
     t0 = _snapshot_t(_DAY)
     build_forecast_record(
         conn, site_id, _DAY.isoformat(), now=t0 + timedelta(minutes=5)
     )
     monkeypatch.setattr(record_mod, "GAP_SCAN_MAX_DATES", 2)
     now = _snapshot_t(_DAY + timedelta(days=5)) + timedelta(hours=26)
-    first = run_record_gap_scan(conn, site_id, {}, now=now)
-    assert first is not None and "after_date" in first
-    second = run_record_gap_scan(conn, site_id, first, now=now)
-    assert second is not None
-    third = run_record_gap_scan(conn, site_id, second, now=now)
-    assert third is None
+    # The traversal starts at the log's origin (D+0) rather than its tail, so
+    # the chunk budget is spent on D+0..D+6 -- the already-complete D+0 costs a
+    # slot and is simply cleared.
+    seen: list[str] = []
+    payload: dict[str, object] = {}
+    for _ in range(4):
+        nxt = run_record_gap_scan(conn, site_id, payload, now=now)
+        if nxt is None:
+            break
+        seen.append(str(nxt["after_date"]))
+        payload = nxt
+    else:  # pragma: no cover - guards an unterminated scan
+        raise AssertionError("gap scan did not terminate")
+    assert seen == [(_DAY + timedelta(days=off)).isoformat() for off in (1, 3, 5)]
     # now is T(D+5)+26h == D+6 09:00: D+1..D+5 are closed (missed) and D+6
     # (today, in-window) is late-reconstructed -- 7 days of 24 rows total.
     assert _row_count(conn, site_id) == 24 * 7
@@ -434,12 +501,25 @@ def test_scheduler_skips_record_when_rows_exist() -> None:
     site_id = _make_site(conn, "site-a")
     set_setting(conn, "record_snapshot_local_time", "00:00")
     generation_id = ensure_published_generation(conn, site_id)
+    feed_id = _make_feed(conn, "model-a")
     today = datetime.now(UTC).date()
+    # The scheduler now gates on COMPLETENESS, not on presence, so the day has
+    # to carry every identity before it counts as done.
+    issued = datetime.combine(today - timedelta(days=1), datetime.min.time(), UTC)
+    issued += timedelta(hours=23)
+    _insert_full_grid(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        start_date=today,
+        issued_at=isoformat_utc(issued),
+        fetched_at=isoformat_utc(issued + timedelta(minutes=5)),
+    )
     t = resolve_snapshot_utc("UTC", today, "00:00")
     build_forecast_record(
         conn, site_id, today.isoformat(), now=t + timedelta(minutes=1)
     )
-    assert record_rows_exist(conn, site_id, generation_id, today.isoformat())
+    assert record_day_complete(conn, site_id, generation_id, today.isoformat())
     _enqueue_due_forecast_records(conn)
     n = conn.execute(
         "SELECT COUNT(*) AS n FROM jobs WHERE site_id=? AND type='forecast_record'",

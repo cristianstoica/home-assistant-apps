@@ -862,7 +862,8 @@ def test_tz_generation_pointer_probe_is_a_key_lookup() -> None:
 _PAGE_RESULTS_SQL = """
         SELECT variable, lead, quantity, entity_type, entity_key, headline,
                common_days, mae, bias, rmse, hits, misses, false_alarms,
-               correct_negatives, ets, availability_rate, delta_vs_incumbent
+               correct_negatives, ets, availability_rate, delta_vs_incumbent,
+               detail
         FROM verification_results
         WHERE run_id = ?
         ORDER BY variable, quantity, lead, entity_type, entity_key

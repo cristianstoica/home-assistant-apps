@@ -19,6 +19,7 @@ from datetime import date, timedelta
 
 import pytest
 
+from tests.helpers import continuous_baseline_set, occurrence_baseline_set
 from wxverify.verification import methodology
 from wxverify.verification.decision import (
     CandidateSeries,
@@ -277,13 +278,25 @@ def test_occurrence_min_event_boundaries(
         if expected == "recommend"
         else {}
     )
+    # §8: the total gate is now evaluated unconditionally, so the measured
+    # total endpoint needs its required baselines too. A clearly-beaten
+    # baseline keeps the case about the wet/dry minimums.
+    beaten_total = {d: (2.0, 6.0) for d in _OCC_DATES}
+    baseline_continuous = (
+        continuous_baseline_set(
+            "precip_total", {lead: beaten_total for lead in range(1, 8)}
+        )
+        if expected == "recommend"
+        else {}
+    )
     candidate = CandidateSeries(
         key="3",
         continuous=continuous,
+        baseline_continuous=baseline_continuous,
         occurrence={lead: dict(vs_incumbent) for lead in range(1, 8)},
-        baseline_occurrence={
-            "baseline_always_dry": {lead: dict(vs_always_dry) for lead in range(1, 8)}
-        },
+        baseline_occurrence=occurrence_baseline_set(
+            {lead: vs_always_dry for lead in range(1, 8)}
+        ),
     )
     inputs = VariableInputs(
         variable="precip", incumbent_key="2", candidates=(candidate,)
@@ -325,9 +338,9 @@ def test_occurrence_recommend_case_ets_point_is_hand_derived() -> None:
     candidate = CandidateSeries(
         key="3",
         occurrence={lead: dict(vs_incumbent) for lead in range(1, 8)},
-        baseline_occurrence={
-            "baseline_always_dry": {lead: dict(vs_always_dry) for lead in range(1, 8)}
-        },
+        baseline_occurrence=occurrence_baseline_set(
+            {lead: vs_always_dry for lead in range(1, 8)}
+        ),
     )
     inputs = VariableInputs(
         variable="precip", incumbent_key="2", candidates=(candidate,)
@@ -386,9 +399,9 @@ def test_bonferroni_level_governs_occurrence_materiality() -> None:
     candidate = CandidateSeries(
         key="3",
         occurrence={lead: dict(vs_incumbent) for lead in leads},
-        baseline_occurrence={
-            "baseline_always_dry": {lead: dict(vs_always_dry) for lead in leads}
-        },
+        baseline_occurrence=occurrence_baseline_set(
+            {lead: vs_always_dry for lead in leads}
+        ),
     )
     inputs = VariableInputs(
         variable="precip", incumbent_key="2", candidates=(candidate,)
