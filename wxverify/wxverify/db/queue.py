@@ -154,6 +154,7 @@ def enqueue_if_absent_with_cooldown(
     payload: dict[str, object] | None,
     *,
     cooldown: timedelta,
+    success_cooldown: timedelta | None = None,
     max_retries: int | None = None,
 ) -> EnqueueResult | None:
     """Like ``enqueue_if_absent``, but suppressed while the latest job for
@@ -172,6 +173,18 @@ def enqueue_if_absent_with_cooldown(
     still cost two index seeks. ``jobs(type, job_key, site_id, id)`` keeps
     each of those seeks an index seek rather than a scan (``id`` is
     monotonic, so ``ORDER BY id DESC LIMIT 1`` needs no separate sort step).
+
+    ``success_cooldown``, when given, additionally suppresses while the
+    latest job is a *completed* row inside it — for a due-check whose
+    predicate legitimately stays true after a successful run (the record
+    due-check, whose completeness gate stays false all day on an ordinary
+    partial day). It fails CLOSED on an unreadable ``updated_at``, unlike
+    the failure cooldown beside it: the asymmetry is deliberate. Fail-open
+    on the failure cooldown costs one extra job; fail-open here costs an
+    unbounded tier-0 loop that re-runs the full record builder at worker
+    loop cadence and starves every other job type. The suppression is not
+    self-healing, and what bounds it is the date-scoped ``job_key`` — at
+    most one site-day, never a lane.
     """
     active = conn.execute(ACTIVE_JOB_SQL, (job_type, job_key, site_id)).fetchone()
     if active is None:
@@ -197,6 +210,31 @@ def enqueue_if_absent_with_cooldown(
                 logger.debug(
                     "enqueue suppressed type=%s site=%s key=%s"
                     " (terminal failure within cooldown)",
+                    job_type,
+                    site_id,
+                    job_key,
+                )
+                return None
+        if (
+            success_cooldown is not None
+            and latest is not None
+            and str(latest["status"]) == "completed"
+        ):
+            try:
+                completed_at = parse_utc(str(latest["updated_at"]))
+            except ValueError:
+                logger.warning(
+                    "success cooldown: unreadable updated_at on latest completed"
+                    " job type=%s site=%s key=%s; suppressing this tick",
+                    job_type,
+                    site_id,
+                    job_key,
+                )
+                return None
+            if utc_now() - completed_at < success_cooldown:
+                logger.debug(
+                    "enqueue suppressed type=%s site=%s key=%s"
+                    " (success within cooldown)",
                     job_type,
                     site_id,
                     job_key,

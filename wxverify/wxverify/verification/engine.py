@@ -33,7 +33,11 @@ from wxverify.verification.decision import (
     VariableInputs,
     Verdict,
 )
-from wxverify.verification.methodology import ROSTER_AVAILABILITY_FLOOR
+from wxverify.verification.methodology import (
+    CONTINUOUS_BASELINES,
+    OCCURRENCE_BASELINES,
+    ROSTER_AVAILABILITY_FLOOR,
+)
 from wxverify.verification.runs import RunConfig, publish_run
 from wxverify.verification.simulate import SIM_DAY_COUNT, SIM_DEPTHS, SIM_VARIABLES
 from wxverify.verification.stats import (
@@ -44,16 +48,16 @@ from wxverify.verification.stats import (
     rmse,
 )
 
-#: Baseline entity types per quantity kind.
-_CONTINUOUS_BASELINES = ("baseline_persistence", "baseline_all_feed_mean")
-_OCCURRENCE_BASELINES = (
-    "baseline_persistence",
-    "baseline_all_feed_mean",
-    "baseline_always_dry",
-)
-
 EntityId = tuple[str, str]
 _CellRows = dict[EntityId, dict[str, sqlite3.Row]]
+
+#: Top-level ``aggregate_state`` key holding the PASS-1 (availability-only)
+#: resolution (§7 step 3). It carries ``members`` and ``availability`` only —
+#: never ``common_dates`` — so the provisional core computed before the
+#: all-feed-mean baseline exists has no slot to occupy and cannot reach a
+#: ``verification_results`` row. ``_common_dates`` reads the PER-CELL keys,
+#: which this one sits beside and never collides with.
+PASS1_ROSTER_KEY = "pass1_roster"
 
 
 def _cell_key(variable: str, lead: int, quantity: str) -> str:
@@ -103,9 +107,9 @@ def _resolve_cell(
     """Headline roster, strict common core, and per-entity availability."""
     truth = _truth_dates(cell)
     baselines = (
-        _OCCURRENCE_BASELINES
+        OCCURRENCE_BASELINES
         if quantity == QUANTITY_PRECIP_OCCURRENCE
-        else _CONTINUOUS_BASELINES
+        else CONTINUOUS_BASELINES
     )
     members: list[EntityId] = [("depth", str(d)) for d in SIM_DEPTHS]
     for baseline in baselines:
@@ -163,9 +167,98 @@ def _pairwise_core(cell: _CellRows, entity: EntityId, incumbent: EntityId) -> li
     )
 
 
+def _cells(cfg: RunConfig) -> list[tuple[str, int, str]]:
+    return [
+        (variable, lead, quantity)
+        for variable in SIM_VARIABLES
+        for lead in range(SIM_DAY_COUNT)
+        for quantity in VARIABLE_QUANTITIES[variable]
+    ]
+
+
+def _stored_aggregate_state(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
+    """The run's ``aggregate_state``, or ``{}`` when NULL/absent/malformed."""
+    row = conn.execute(
+        "SELECT aggregate_state FROM verification_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None or row["aggregate_state"] is None:
+        return {}
+    try:
+        parsed: object = json.loads(str(row["aggregate_state"]))
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return cast(dict[str, object], parsed)
+
+
+def _write_aggregate_state(
+    conn: sqlite3.Connection, run_id: int, state: dict[str, object]
+) -> None:
+    conn.execute(
+        "UPDATE verification_runs SET aggregate_state = ? WHERE id = ?",
+        (json.dumps(state, separators=(",", ":"), sort_keys=True), run_id),
+    )
+
+
+def resolve_pass1_roster(conn: sqlite3.Connection, cfg: RunConfig) -> None:
+    """§7 steps 2-3: availability-only resolution, persisted for pass 2.
+
+    ``_resolve_cell``'s strict common core is DISCARDED here — at this point
+    the all-feed-mean baseline rows do not exist, so that core ignores the
+    baseline's coverage entirely and must never reach a result row.
+    """
+    state = _stored_aggregate_state(conn, cfg.run_id)
+    roster: dict[str, object] = {}
+    for variable, lead, quantity in _cells(cfg):
+        cell = _load_cell(conn, cfg.run_id, variable, lead, quantity)
+        members, _discarded_core, availability = _resolve_cell(cell, cfg, quantity)
+        roster[_cell_key(variable, lead, quantity)] = {
+            "members": [list(m) for m in members],
+            "availability": {f"{t}|{k}": v for (t, k), v in availability.items()},
+        }
+    state[PASS1_ROSTER_KEY] = roster
+    _write_aggregate_state(conn, cfg.run_id, state)
+
+
+def pass1_baseline_feeds(
+    conn: sqlite3.Connection, run_id: int
+) -> dict[tuple[str, int, str], list[int]]:
+    """Per-cell resolved feed roster the all-feed-mean baseline averages.
+
+    Keyed by ``(variable, lead, quantity)``; a cell whose resolved roster
+    holds no ``feed`` member is ABSENT from the mapping, so pass 2 writes no
+    baseline row for it rather than a ``no_samples`` row that would collapse
+    the strict common core.
+    """
+    roster = _stored_aggregate_state(conn, run_id).get(PASS1_ROSTER_KEY)
+    out: dict[tuple[str, int, str], list[int]] = {}
+    if not isinstance(roster, dict):
+        return out
+    for key, cell in cast(dict[str, object], roster).items():
+        if not isinstance(cell, dict):
+            continue
+        parts = key.split("|")
+        if len(parts) != 3 or not parts[1].isdecimal():
+            continue
+        members = cast(dict[str, object], cell).get("members")
+        if not isinstance(members, list):
+            continue
+        feeds: list[int] = []
+        for member in cast(list[object], members):
+            pair = cast(list[object], member) if isinstance(member, list) else []
+            if len(pair) == 2 and str(pair[0]) == "feed":
+                feeds.append(int(str(pair[1])))
+        if feeds:
+            out[(parts[0], int(parts[1]), parts[2])] = feeds
+    return out
+
+
 def aggregate_run(conn: sqlite3.Connection, cfg: RunConfig) -> None:
     """Resolve every cell, write ``verification_results`` + aggregate_state."""
-    state: dict[str, object] = {}
+    # MERGE, never replace: `pass1_roster` (§7 step 3) already lives in this
+    # column and a fresh dict would delete it on every run.
+    state: dict[str, object] = _stored_aggregate_state(conn, cfg.run_id)
     for variable in SIM_VARIABLES:
         # §15: the incumbent is the variable's pinned effective depth.
         incumbent: EntityId = ("depth", str(cfg.incumbent_depth(variable)))
@@ -196,10 +289,7 @@ def aggregate_run(conn: sqlite3.Connection, cfg: RunConfig) -> None:
                         headline=headline,
                         availability=availability.get(entity),
                     )
-    conn.execute(
-        "UPDATE verification_runs SET aggregate_state = ? WHERE id = ?",
-        (json.dumps(state, separators=(",", ":"), sort_keys=True), cfg.run_id),
-    )
+    _write_aggregate_state(conn, cfg.run_id, state)
 
 
 def _write_result(
@@ -275,6 +365,158 @@ def _write_result(
     )
 
 
+#: Closed set of reasons a below-floor row carries no recommended-blend
+#: comparison (§9). ``vs_recommended`` is ALWAYS an object, never JSON null —
+#: a bare null cannot carry which of these applied.
+PAIRWISE_UNAVAILABLE_REASONS = (
+    "no_recommendation",
+    "recommended_is_incumbent",
+    "insufficient_shared_days",
+)
+
+
+def _unavailable_vs_recommended(reason: str) -> dict[str, object]:
+    return {
+        "available": False,
+        "reason": reason,
+        "recommended_entity": None,
+        "dates_n": None,
+        "mae": None,
+        "ets": None,
+        "delta_vs_recommended": None,
+    }
+
+
+def _recommended_entities(
+    conn: sqlite3.Connection, run_id: int
+) -> dict[str, EntityId | str]:
+    """Per variable, the recommended entity — or the reason there is none.
+
+    A ``str`` value is one of ``PAIRWISE_UNAVAILABLE_REASONS``; an
+    :data:`EntityId` is the depth the run recommends.
+    """
+    out: dict[str, EntityId | str] = {}
+    for row in conn.execute(
+        """
+        SELECT variable, outcome, recommended_depth, incumbent_depth
+        FROM verification_verdicts WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchall():
+        variable = str(row["variable"])
+        recommended = row["recommended_depth"]
+        if str(row["outcome"]) != "recommend" or recommended is None:
+            out[variable] = "no_recommendation"
+        elif int(recommended) == int(row["incumbent_depth"]):
+            out[variable] = "recommended_is_incumbent"
+        else:
+            out[variable] = ("depth", str(int(recommended)))
+    return out
+
+
+def _vs_recommended(
+    cell: _CellRows,
+    entity: EntityId,
+    recommended: EntityId,
+    *,
+    quantity: str,
+) -> dict[str, object]:
+    """One below-floor entity's comparison against the recommended blend.
+
+    Sample is the PAIRWISE core of this pair, never the strict common core;
+    ``delta_vs_recommended`` uses the same sign convention
+    ``delta_vs_incumbent`` already uses — positive means the below-floor
+    entity is better.
+    """
+    dates = _pairwise_core(cell, entity, recommended)
+    if not dates:
+        return _unavailable_vs_recommended("insufficient_shared_days")
+    entity_ref = {"entity_type": recommended[0], "entity_key": recommended[1]}
+    mae_v: float | None = None
+    ets_v: float | None = None
+    delta: float | None = None
+    if quantity == QUANTITY_PRECIP_OCCURRENCE:
+        table = _contingency(cell.get(entity, {}), dates)
+        rec_table = _contingency(cell.get(recommended, {}), dates)
+        ets_v = None if table is None else ets(table)
+        rec_ets = None if rec_table is None else ets(rec_table)
+        if ets_v is not None and rec_ets is not None:
+            delta = ets_v - rec_ets
+    else:
+        metrics = _continuous_metrics(cell.get(entity, {}), dates)
+        rec_metrics = _continuous_metrics(cell.get(recommended, {}), dates)
+        if metrics is not None:
+            mae_v = metrics[0]
+        if metrics is not None and rec_metrics is not None and rec_metrics[0] != 0:
+            delta = (rec_metrics[0] - metrics[0]) / rec_metrics[0]
+    return {
+        "available": True,
+        "reason": None,
+        "recommended_entity": entity_ref,
+        "dates_n": len(dates),
+        "mae": mae_v,
+        "ets": ets_v,
+        "delta_vs_recommended": delta,
+    }
+
+
+def write_pairwise_comparisons(conn: sqlite3.Connection, cfg: RunConfig) -> None:
+    """§8.4/§9: below-floor rows gain a comparison vs the recommended blend.
+
+    Runs AFTER the verdicts exist (the ``pairwise`` phase, between
+    ``bootstrap`` and ``publish``) and writes with an UPDATE: ``_write_result``
+    carries ``ON CONFLICT … DO NOTHING``, so a re-INSERT would be a silent
+    no-op. Re-running over the same run produces byte-identical ``detail``.
+    """
+    recommended_by_variable = _recommended_entities(conn, cfg.run_id)
+    rows = conn.execute(
+        """
+        SELECT id, variable, lead, quantity, entity_type, entity_key, detail
+        FROM verification_results
+        WHERE run_id = ? AND headline = 0
+        ORDER BY id
+        """,
+        (cfg.run_id,),
+    ).fetchall()
+    cells: dict[tuple[str, int, str], _CellRows] = {}
+    for row in rows:
+        variable = str(row["variable"])
+        lead = int(row["lead"])
+        quantity = str(row["quantity"])
+        recommended = recommended_by_variable.get(variable, "no_recommendation")
+        if isinstance(recommended, str):
+            comparison = _unavailable_vs_recommended(recommended)
+        else:
+            key = (variable, lead, quantity)
+            if key not in cells:
+                cells[key] = _load_cell(conn, cfg.run_id, variable, lead, quantity)
+            comparison = _vs_recommended(
+                cells[key],
+                (str(row["entity_type"]), str(row["entity_key"])),
+                recommended,
+                quantity=quantity,
+            )
+        detail = _parse_detail(row["detail"])
+        detail["vs_recommended"] = comparison
+        conn.execute(
+            "UPDATE verification_results SET detail = ? WHERE id = ?",
+            (json.dumps(detail, separators=(",", ":")), int(row["id"])),
+        )
+
+
+def _parse_detail(raw: object) -> dict[str, object]:
+    """The row's existing ``detail`` object, or ``{}`` when absent/malformed."""
+    if raw is None:
+        return {}
+    try:
+        parsed: object = json.loads(str(raw))
+    except ValueError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return cast(dict[str, object], parsed)
+
+
 def _aggregate_state(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
     row = conn.execute(
         "SELECT aggregate_state FROM verification_runs WHERE id = ?", (run_id,)
@@ -295,6 +537,32 @@ def _common_dates(state: dict[str, object], key: str) -> list[str]:
     if not isinstance(dates, list):
         return []
     return [str(d) for d in cast(list[object], dates)]
+
+
+def stored_cell_resolution(
+    conn: sqlite3.Connection, run_id: int, variable: str, lead: int, quantity: str
+) -> tuple[list[EntityId], list[str]]:
+    """The cell's PERSISTED resolved members and strict common core (§7).
+
+    Read-time derivations (§10, §14a) must score the same resolution the
+    headline used, so they read it back from ``aggregate_state`` rather than
+    re-deriving it — a re-derivation would silently disagree whenever the
+    stored roster and the live config differ. Returns ``([], [])`` for a
+    cell the aggregate phase never wrote.
+    """
+    state = _stored_aggregate_state(conn, run_id)
+    key = _cell_key(variable, lead, quantity)
+    members: list[EntityId] = []
+    cell = state.get(key)
+    if isinstance(cell, dict):
+        raw = cast(dict[str, object], cell).get("members")
+        if isinstance(raw, list):
+            for member in cast(list[object], raw):
+                if isinstance(member, list):
+                    pair = cast(list[object], member)
+                    if len(pair) == 2:
+                        members.append((str(pair[0]), str(pair[1])))
+    return members, _common_dates(state, key)
 
 
 def _abs_series(
@@ -376,7 +644,7 @@ def prepare_bootstrap_inputs(
                         series = _class_series(cell, entity, incumbent, dates)
                         if series:
                             occurrence[lead] = series
-                        for baseline in _OCCURRENCE_BASELINES:
+                        for baseline in OCCURRENCE_BASELINES:
                             base: EntityId = (
                                 baseline,
                                 baseline.removeprefix("baseline_"),
@@ -390,7 +658,7 @@ def prepare_bootstrap_inputs(
                         series_c = _abs_series(cell, entity, incumbent, dates)
                         if series_c:
                             continuous.setdefault(quantity, {})[lead] = series_c
-                        for baseline in _CONTINUOUS_BASELINES:
+                        for baseline in CONTINUOUS_BASELINES:
                             base = (
                                 baseline,
                                 baseline.removeprefix("baseline_"),

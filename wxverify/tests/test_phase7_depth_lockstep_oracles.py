@@ -30,8 +30,14 @@ from typing import cast
 
 import pytest
 
-from tests.helpers import asof_conn, asof_make_site
+from tests.helpers import (
+    asof_conn,
+    asof_make_site,
+    continuous_baseline_set,
+    occurrence_baseline_set,
+)
 from wxverify.core.options import RuntimeOptions
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.settings.depth import (
@@ -268,6 +274,41 @@ _DAY1 = date(2035, 6, 15)
 _DAY2 = date(2035, 6, 16)
 
 
+def _seed_record_samples(conn: sqlite3.Connection, site_id: int, day: date) -> None:
+    """Knowable-at-T samples for snapshot ``day``.
+
+    A record day carries only the identities that had samples at T, so a
+    fixture with no samples produces no rows and no policy to read.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO feeds (source, model, default_subscribed,
+                           fetch_interval_minutes, max_lead_hours)
+        VALUES ('example-src', ?, 1, 360, 192)
+        """,
+        (f"grid-{day.isoformat()}",),
+    )
+    assert cur.lastrowid is not None
+    issued = datetime.combine(day, datetime.min.time(), UTC)
+    for hour in range(24):
+        conn.execute(
+            """
+            INSERT INTO forecast_samples
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 value, source_raw, model_run_id, fetched_at)
+            VALUES (?, ?, 'temperature', ?, ?, ?, 10.0, '{}', 'run-x', ?)
+            """,
+            (
+                site_id,
+                int(cur.lastrowid),
+                isoformat_utc(issued),
+                isoformat_utc(datetime(day.year, day.month, day.day, hour, tzinfo=UTC)),
+                max(1, hour),
+                isoformat_utc(issued.replace(minute=5)),
+            ),
+        )
+
+
 def _record_policy(
     conn: sqlite3.Connection, site_id: int, snapshot_local_date: str
 ) -> dict[str, object]:
@@ -288,6 +329,8 @@ def test_record_and_run_snapshot_pin_depths_flip_moves_only_post_flip() -> None:
     site_id = asof_make_site(conn, "Lockstep Town")
     generation = ensure_published_generation(conn, site_id)
     set_setting(conn, depth_override_key("precip"), "1")
+    _seed_record_samples(conn, site_id, _DAY1)
+    _seed_record_samples(conn, site_id, _DAY2)
 
     # Day-1 record at T+1h under the precip=1 override.
     t1 = datetime(2035, 6, 15, 8, 0, tzinfo=UTC)
@@ -477,13 +520,23 @@ def _f1_candidate(*, with_flat_total: bool) -> CandidateSeries:
         if with_flat_total
         else {}
     )
+    # §8: every required baseline must be present at each adequate lead.
+    # A clearly-beaten total baseline keeps these cases about F-1.
+    beaten_total: ContinuousLead = {d: (2.0, 6.0) for d in _F1_DATES}
     return CandidateSeries(
         key="3",
         continuous=continuous,
         occurrence={ld: dict(vs_incumbent) for ld in range(1, 8)},
-        baseline_occurrence={
-            "baseline_always_dry": {ld: dict(vs_always_dry) for ld in range(1, 8)}
-        },
+        baseline_continuous=(
+            continuous_baseline_set(
+                "precip_total", {ld: beaten_total for ld in range(1, 8)}
+            )
+            if with_flat_total
+            else {}
+        ),
+        baseline_occurrence=occurrence_baseline_set(
+            {ld: vs_always_dry for ld in range(1, 8)}
+        ),
     )
 
 
@@ -530,9 +583,13 @@ def test_f1_unmeasured_occurrence_blocks_total_recommendation() -> None:
     # exactly 0.5 on every resample) with NO occurrence series. The
     # unmeasurable occurrence endpoint must block the recommendation.
     material_total: ContinuousLead = {d: (1.0, 2.0) for d in _F1_DATES}
+    beaten_total: ContinuousLead = {d: (1.0, 6.0) for d in _F1_DATES}
     candidate = CandidateSeries(
         key="3",
         continuous={"precip_total": {ld: dict(material_total) for ld in range(1, 8)}},
+        baseline_continuous=continuous_baseline_set(
+            "precip_total", {ld: beaten_total for ld in range(1, 8)}
+        ),
         occurrence={},
     )
     inputs = VariableInputs(

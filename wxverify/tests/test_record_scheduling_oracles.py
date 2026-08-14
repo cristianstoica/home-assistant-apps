@@ -23,6 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 
 from tests.helpers import asof_conn, asof_make_site
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.monitor import build_verdict
 from wxverify.settings.keys import set_setting
@@ -48,6 +49,38 @@ def _freeze_scheduler_now(
     monkeypatch: pytest.MonkeyPatch, holder: dict[str, datetime]
 ) -> None:
     monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: holder["now"])
+
+
+def _seed_day_samples(conn: sqlite3.Connection, site_id: int, day: date) -> None:
+    """One variable's worth of knowable-at-T samples for snapshot ``day``."""
+    cur = conn.execute(
+        """
+        INSERT INTO feeds (source, model, default_subscribed,
+                           fetch_interval_minutes, max_lead_hours)
+        VALUES ('example-src', ?, 1, 360, 192)
+        """,
+        (f"grid-{day.isoformat()}",),
+    )
+    assert cur.lastrowid is not None
+    issued = datetime.combine(day, datetime.min.time(), UTC)
+    for hour in range(24):
+        valid = datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
+        conn.execute(
+            """
+            INSERT INTO forecast_samples
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 value, source_raw, model_run_id, fetched_at)
+            VALUES (?, ?, 'temperature', ?, ?, ?, 10.0, '{}', 'run-x', ?)
+            """,
+            (
+                site_id,
+                int(cur.lastrowid),
+                isoformat_utc(issued),
+                isoformat_utc(valid),
+                max(1, hour),
+                isoformat_utc(issued + timedelta(minutes=5)),
+            ),
+        )
 
 
 def _record_jobs(conn: sqlite3.Connection, site_id: int) -> list[sqlite3.Row]:
@@ -86,7 +119,7 @@ def test_due_check_single_snapshot_across_fall_back(
     doubled hour, before AND after the job completes.
 
     Kills, one at a time:
-    - dropping the ``record_rows_exist`` gate from
+    - dropping the ``record_day_has_any_row`` gate from
       ``_enqueue_due_forecast_records`` (the second occurrence re-enqueues a
       completed day);
     - widening that gate to any-rows-for-the-site (dropping the
@@ -255,6 +288,10 @@ def test_monitor_record_gap_pairs_and_slack_window() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "monitor-gap-site")
     ensure_published_generation(conn, site_id)
+    # The record day needs real samples: a day with nothing knowable at T now
+    # writes no rows at all, so without this the log never begins and the
+    # condition is vacuously ok in BOTH arms.
+    _seed_day_samples(conn, site_id, _DAY)
     t_day = resolve_snapshot_utc("UTC", _DAY, "07:00")
     build_forecast_record(
         conn, site_id, _DAY.isoformat(), now=t_day + timedelta(minutes=5)

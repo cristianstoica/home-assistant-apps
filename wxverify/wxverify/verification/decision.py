@@ -24,11 +24,13 @@ from wxverify.verification.methodology import (
     BASELINE_GATE_CI_LEVEL,
     BOOTSTRAP_BLOCK_LENGTH_DAYS,
     CANDIDATE_CI_LEVEL,
+    CONTINUOUS_BASELINES,
     LEAD_STABILITY_DENOMINATOR,
     LEAD_STABILITY_NUMERATOR,
     MIN_ADEQUATE_LEADS_PER_VARIABLE,
     NON_INFERIORITY_ETS_MARGIN,
     NON_INFERIORITY_MAE_MARGIN,
+    OCCURRENCE_BASELINES,
     OCCURRENCE_MIN_DRY_DAYS,
     OCCURRENCE_MIN_WET_DAYS,
     PRACTICAL_FLOOR_ETS,
@@ -99,7 +101,8 @@ class Verdict:
     detail: dict[str, object]
 
 
-def _required_lead_agreement(adequate: int) -> int:
+def required_lead_agreement(adequate: int) -> int:
+    """Leads that must agree for lead-stability, shared with §10 (W7)."""
     return math.ceil(adequate * LEAD_STABILITY_NUMERATOR / LEAD_STABILITY_DENOMINATOR)
 
 
@@ -233,21 +236,57 @@ def _index_endpoint(
     return _Endpoint(kind=kind, leads=leads, universe=universe)
 
 
-def _adequate_leads(endpoint: _Endpoint, *, occurrence: bool) -> tuple[int, ...]:
+def _adequate_leads(
+    endpoint: _Endpoint,
+    *,
+    occurrence: bool,
+    baseline_support: Mapping[str, frozenset[int]] | None = None,
+) -> tuple[tuple[int, ...], list[dict[str, object]]]:
     """§12 adequacy: >= 20 strict-common days; occurrence also needs the
-    minimum wet/dry event counts on the OBSERVED side of the common core."""
+    minimum wet/dry event counts on the OBSERVED side of the common core.
+
+    §8/W5 adds the required-baseline condition INSIDE this same loop rather
+    than as a filter over its output: a lead where a required baseline has
+    no adequately supported series is dropped, so the candidate is never
+    scored on a lead it was not baseline-checked at. The returned drop
+    records keep the two causes distinguishable — a thin lead and a
+    baseline-less lead are different claims and must not collapse into one
+    report.
+    """
     out: list[int] = []
+    dropped: list[dict[str, object]] = []
     for lead in DECISION_LEADS:
         pairs = endpoint.leads.get(lead, [])
         if len(pairs) < ADEQUATE_LEAD_MIN_DAYS:
+            if pairs:
+                dropped.append(
+                    {"lead": lead, "reason": "thin_data", "days": len(pairs)}
+                )
             continue
         if occurrence:
             wet = sum(1 for _, cand, _ in pairs if str(cand) in _WET_CLASSES)
             dry = len(pairs) - wet
             if wet < OCCURRENCE_MIN_WET_DAYS or dry < OCCURRENCE_MIN_DRY_DAYS:
+                dropped.append(
+                    {"lead": lead, "reason": "thin_events", "wet": wet, "dry": dry}
+                )
                 continue
+        missing = sorted(
+            baseline
+            for baseline, leads in (baseline_support or {}).items()
+            if lead not in leads
+        )
+        if missing:
+            dropped.append(
+                {
+                    "lead": lead,
+                    "reason": "baseline_absent",
+                    "missing_baselines": missing,
+                }
+            )
+            continue
         out.append(lead)
-    return tuple(out)
+    return tuple(out), dropped
 
 
 def _bootstrap_ci(
@@ -286,6 +325,7 @@ class _EndpointEvaluation:
     point: float | None
     ci: tuple[float, float] | None
     per_lead: dict[int, float | None]
+    dropped: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
 
     def as_json(self) -> dict[str, object]:
         return {
@@ -293,6 +333,7 @@ class _EndpointEvaluation:
             "pooled_point": self.point,
             "ci": None if self.ci is None else list(self.ci),
             "per_lead": {str(k): v for k, v in self.per_lead.items()},
+            "dropped_leads": self.dropped,
         }
 
 
@@ -303,21 +344,112 @@ def _evaluate_endpoint(
     level: float,
     seed: int,
     resamples: int,
+    baseline_support: Mapping[str, frozenset[int]] | None = None,
 ) -> _EndpointEvaluation:
-    adequate = _adequate_leads(endpoint, occurrence=occurrence)
+    adequate, dropped = _adequate_leads(
+        endpoint, occurrence=occurrence, baseline_support=baseline_support
+    )
     point = endpoint.pooled_effect(adequate, None) if adequate else None
     ci = _bootstrap_ci(endpoint, adequate, level=level, seed=seed, resamples=resamples)
     per_lead = {lead: endpoint.lead_effect(lead, None) for lead in adequate}
-    return _EndpointEvaluation(adequate=adequate, point=point, ci=ci, per_lead=per_lead)
+    return _EndpointEvaluation(
+        adequate=adequate, point=point, ci=ci, per_lead=per_lead, dropped=dropped
+    )
 
 
 def _lead_stability(evaluation: _EndpointEvaluation) -> bool:
     beneficial = sum(1 for e in evaluation.per_lead.values() if e is not None and e > 0)
-    return beneficial >= _required_lead_agreement(len(evaluation.adequate))
+    return beneficial >= required_lead_agreement(len(evaluation.adequate))
 
 
 def _beats(evaluation: _EndpointEvaluation) -> bool:
     return evaluation.ci is not None and evaluation.ci[0] > 0
+
+
+def _baseline_endpoint(
+    candidate: CandidateSeries,
+    baseline: str,
+    *,
+    quantity: str | None,
+    occurrence: bool,
+    temp: bool,
+) -> _Endpoint:
+    """The candidate-vs-one-baseline endpoint, built the SAME way everywhere.
+
+    One construction serves both the gate and the per-lead support map that
+    reduces the candidate's adequacy set, so the two can never disagree
+    about what a baseline supports at a lead.
+    """
+    if occurrence:
+        series = candidate.baseline_occurrence.get(baseline, {})
+        return _index_endpoint(
+            "occurrence",
+            {
+                ld: {d: (c, o) for d, (c, o) in days.items()}
+                for ld, days in series.items()
+            },
+        )
+    per_quantity = candidate.baseline_continuous.get(baseline, {})
+    if temp:
+        high_by_lead = per_quantity.get("temperature_high", {})
+        low_by_lead = per_quantity.get("temperature_low", {})
+        joint_by_lead: dict[int, TempLead] = {}
+        for lead in high_by_lead.keys() & low_by_lead.keys():
+            high = high_by_lead[lead]
+            low = low_by_lead[lead]
+            joint: TempLead = {d: (high[d], low[d]) for d in high.keys() & low.keys()}
+            if joint:
+                joint_by_lead[lead] = joint
+        return _index_endpoint(
+            "temp",
+            {
+                ld: {d: (h, low_pair) for d, (h, low_pair) in days.items()}
+                for ld, days in joint_by_lead.items()
+            },
+        )
+    assert quantity is not None
+    continuous = per_quantity.get(quantity, {})
+    return _index_endpoint(
+        "continuous",
+        {
+            ld: {d: (c, o) for d, (c, o) in days.items()}
+            for ld, days in continuous.items()
+        },
+    )
+
+
+def _required_baselines(*, occurrence: bool) -> tuple[str, ...]:
+    return OCCURRENCE_BASELINES if occurrence else CONTINUOUS_BASELINES
+
+
+def _baseline_support(
+    candidate: CandidateSeries,
+    *,
+    quantity: str | None,
+    occurrence: bool,
+    temp: bool = False,
+) -> dict[str, frozenset[int]]:
+    """Per required baseline, the leads where it has an adequate series.
+
+    §8/W5: membership is tested PER LEAD, never over the lead-aggregated
+    map — an aggregated test passes whenever any single lead supplied the
+    baseline, which is exactly the empty-roster case §7 produces.
+    """
+    return {
+        baseline: frozenset(
+            _adequate_leads(
+                _baseline_endpoint(
+                    candidate,
+                    baseline,
+                    quantity=quantity,
+                    occurrence=occurrence,
+                    temp=temp,
+                ),
+                occurrence=occurrence,
+            )[0]
+        )
+        for baseline in _required_baselines(occurrence=occurrence)
+    }
 
 
 def _baseline_gate(
@@ -329,83 +461,38 @@ def _baseline_gate(
     seed: int,
     resamples: int,
 ) -> tuple[bool, dict[str, object]]:
-    """Condition 4: beat every applicable baseline at 95% on the same core."""
+    """Condition 4: beat EVERY REQUIRED baseline at 95% on the same core.
+
+    Allowlist, not presence test: the gate iterates the required set, so a
+    missing or unsupported baseline fails it and writes a named
+    ``insufficient`` entry. An absent detail block reads as "passed" on the
+    surface, so no branch may omit one.
+    """
     detail: dict[str, object] = {}
     passed = True
-    if occurrence:
-        sources: dict[str, dict[int, OccurrenceLead]] = candidate.baseline_occurrence
-        for baseline, series in sorted(sources.items()):
-            endpoint = _index_endpoint(
-                "occurrence",
-                {
-                    ld: {d: (c, o) for d, (c, o) in days.items()}
-                    for ld, days in series.items()
-                },
-            )
-            evaluation = _evaluate_endpoint(
-                endpoint,
-                occurrence=True,
-                level=BASELINE_GATE_CI_LEVEL,
-                seed=seed,
-                resamples=resamples,
-            )
-            ok = _beats(evaluation)
-            passed = passed and ok
-            detail[baseline] = {"passed": ok, **evaluation.as_json()}
-    elif temp:
-        for baseline, per_quantity in sorted(candidate.baseline_continuous.items()):
-            high_by_lead = per_quantity.get("temperature_high", {})
-            low_by_lead = per_quantity.get("temperature_low", {})
-            joint_by_lead: dict[int, TempLead] = {}
-            for lead in high_by_lead.keys() & low_by_lead.keys():
-                high = high_by_lead[lead]
-                low = low_by_lead[lead]
-                joint: TempLead = {
-                    d: (high[d], low[d]) for d in high.keys() & low.keys()
-                }
-                if joint:
-                    joint_by_lead[lead] = joint
-            endpoint = _index_endpoint(
-                "temp",
-                {
-                    ld: {d: (h, low_pair) for d, (h, low_pair) in days.items()}
-                    for ld, days in joint_by_lead.items()
-                },
-            )
-            evaluation = _evaluate_endpoint(
-                endpoint,
-                occurrence=False,
-                level=BASELINE_GATE_CI_LEVEL,
-                seed=seed,
-                resamples=resamples,
-            )
-            ok = _beats(evaluation)
-            passed = passed and ok
-            detail[baseline] = {"passed": ok, **evaluation.as_json()}
-    else:
-        assert quantity is not None
-        for baseline, per_quantity in sorted(candidate.baseline_continuous.items()):
-            series = per_quantity.get(quantity, {})
-            endpoint = _index_endpoint(
-                "continuous",
-                {
-                    ld: {d: (c, o) for d, (c, o) in days.items()}
-                    for ld, days in series.items()
-                },
-            )
-            evaluation = _evaluate_endpoint(
-                endpoint,
-                occurrence=False,
-                level=BASELINE_GATE_CI_LEVEL,
-                seed=seed,
-                resamples=resamples,
-            )
-            ok = _beats(evaluation)
-            passed = passed and ok
-            detail[baseline] = {"passed": ok, **evaluation.as_json()}
-    if not detail:
-        # No baseline series at all means the gate cannot be demonstrated.
-        passed = False
+    for baseline in _required_baselines(occurrence=occurrence):
+        endpoint = _baseline_endpoint(
+            candidate, baseline, quantity=quantity, occurrence=occurrence, temp=temp
+        )
+        evaluation = _evaluate_endpoint(
+            endpoint,
+            occurrence=occurrence,
+            level=BASELINE_GATE_CI_LEVEL,
+            seed=seed,
+            resamples=resamples,
+        )
+        if not evaluation.adequate:
+            passed = False
+            detail[baseline] = {
+                "passed": False,
+                "insufficient": True,
+                "reason": "required baseline missing or under-supported",
+                **evaluation.as_json(),
+            }
+            continue
+        ok = _beats(evaluation)
+        passed = passed and ok
+        detail[baseline] = {"passed": ok, "insufficient": False, **evaluation.as_json()}
     return passed, detail
 
 
@@ -424,6 +511,14 @@ class _CandidateResult:
 def _decide_wind_or_temp(
     inputs: VariableInputs, candidate: CandidateSeries, *, seed: int, resamples: int
 ) -> _CandidateResult:
+    temp = inputs.variable == "temperature"
+    headline_quantity = None if temp else "wind_max"
+    # §8/W5: the adequacy set is reduced BEFORE the sufficiency test below,
+    # so a candidate can never clear the four-lead floor on leads it was
+    # never baseline-checked at.
+    support = _baseline_support(
+        candidate, quantity=headline_quantity, occurrence=False, temp=temp
+    )
     if inputs.variable == "temperature":
         endpoint = _index_endpoint(
             "temp",
@@ -447,6 +542,7 @@ def _decide_wind_or_temp(
         level=CANDIDATE_CI_LEVEL,
         seed=seed,
         resamples=resamples,
+        baseline_support=support,
     )
     record: dict[str, object] = {"headline": evaluation.as_json()}
     if len(evaluation.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE:
@@ -526,6 +622,10 @@ def _decide_wind_or_temp(
 def _decide_precip(
     candidate: CandidateSeries, *, seed: int, resamples: int
 ) -> _CandidateResult:
+    total_support = _baseline_support(
+        candidate, quantity="precip_total", occurrence=False
+    )
+    occ_support = _baseline_support(candidate, quantity=None, occurrence=True)
     total_series = candidate.continuous.get("precip_total", {})
     total = _evaluate_endpoint(
         _index_endpoint(
@@ -539,6 +639,7 @@ def _decide_precip(
         level=PRECIP_IMPROVEMENT_CI_LEVEL,
         seed=seed,
         resamples=resamples,
+        baseline_support=total_support,
     )
     occ = _evaluate_endpoint(
         _index_endpoint(
@@ -552,6 +653,7 @@ def _decide_precip(
         level=PRECIP_IMPROVEMENT_CI_LEVEL,
         seed=seed,
         resamples=resamples,
+        baseline_support=occ_support,
     )
     record: dict[str, object] = {
         "total": total.as_json(),
@@ -602,28 +704,31 @@ def _decide_precip(
         improved.append("total")
     if occ_material and total_non_inferior:
         improved.append("occurrence")
-    c4 = True
-    baseline_detail: dict[str, object] = {}
-    if "total" in improved:
-        ok, detail = _baseline_gate(
-            candidate,
-            quantity="precip_total",
-            occurrence=False,
-            seed=seed + 1,
-            resamples=resamples,
-        )
-        c4 = c4 and ok
-        baseline_detail["total"] = detail
-    if "occurrence" in improved:
-        ok, detail = _baseline_gate(
-            candidate,
-            quantity=None,
-            occurrence=True,
-            seed=seed + 2,
-            resamples=resamples,
-        )
-        c4 = c4 and ok
-        baseline_detail["occurrence"] = detail
+    # §8/W5: both gates run UNCONDITIONALLY and both details are always
+    # populated. `improved` reports which endpoint drove the outcome; it
+    # never decides whether the gate runs, because a conjunction evaluated
+    # over a subset of its own conditions is not the conjunction. The seed
+    # offsets are unchanged so the bootstrap stream matches runs where both
+    # gates already ran.
+    total_ok, total_detail = _baseline_gate(
+        candidate,
+        quantity="precip_total",
+        occurrence=False,
+        seed=seed + 1,
+        resamples=resamples,
+    )
+    occ_ok, occ_detail = _baseline_gate(
+        candidate,
+        quantity=None,
+        occurrence=True,
+        seed=seed + 2,
+        resamples=resamples,
+    )
+    c4 = total_ok and occ_ok
+    baseline_detail: dict[str, object] = {
+        "total": total_detail,
+        "occurrence": occ_detail,
+    }
     record["conditions"] = {
         "total_material": total_material,
         "occurrence_material": occ_material,

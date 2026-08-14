@@ -72,6 +72,7 @@ def _insert_day_samples(
     issued_at: str,
     fetched_at: str,
     value: float,
+    variable: str = "temperature",
 ) -> None:
     issued = datetime.fromisoformat(issued_at.replace("Z", "+00:00"))
     for hour in range(24):
@@ -84,11 +85,12 @@ def _insert_day_samples(
             INSERT INTO forecast_samples
                 (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
                  value, source_raw, model_run_id, fetched_at)
-            VALUES (?, ?, 'temperature', ?, ?, ?, ?, '{}', 'run-x', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-x', ?)
             """,
             (
                 site_id,
                 feed_id,
+                variable,
                 issued_at,
                 isoformat_utc(valid),
                 lead,
@@ -96,6 +98,57 @@ def _insert_day_samples(
                 fetched_at,
             ),
         )
+
+
+#: (variable, feed-A value, feed-B value) for the shared fixture. All three
+#: variables are seeded so the written grid covers every identity the fixture's
+#: 48 h lead cap can reach -- a one-variable fixture would make the row-count
+#: non-vacuity checks below trivially true.
+_FIXTURE_VARIABLES = (
+    ("temperature", 10.0, 12.0),
+    ("wind", 5.0, 6.0),
+    ("precip", 0.0, 1.0),
+)
+
+#: The identities `_seed_base_fixture` makes knowable at T: 3 variables x the
+#: 2 target days reachable within 48 h of lead.
+_FIXTURE_GRID_SIZE = len(_FIXTURE_VARIABLES) * 2
+
+
+def _seed_full_grid(
+    conn: sqlite3.Connection, site_id: int, day: date, *, tag: str = ""
+) -> int:
+    """Make every identity of snapshot ``day`` knowable at its T.
+
+    A record day now carries only the identities that had samples at T, so any
+    oracle asserting on the complete 3 x 8 grid has to seed one. The feed is
+    created here rather than through ``asof_make_real_feed`` because that
+    helper caps leads at 48 h, which cannot reach display day 7.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO feeds (source, model, default_subscribed,
+                           fetch_interval_minutes, max_lead_hours)
+        VALUES ('example-src', ?, 1, 360, 192)
+        """,
+        (f"grid-{day.isoformat()}{tag}",),
+    )
+    assert cur.lastrowid is not None
+    feed_id = int(cur.lastrowid)
+    issued = datetime.combine(day, datetime.min.time(), UTC)
+    for offset in range(8):
+        for variable, value, _ in _FIXTURE_VARIABLES:
+            _insert_day_samples(
+                conn,
+                site_id=site_id,
+                feed_id=feed_id,
+                local_date=day + timedelta(days=offset),
+                issued_at=isoformat_utc(issued),
+                fetched_at=isoformat_utc(issued + timedelta(minutes=5)),
+                value=value,
+                variable=variable,
+            )
+    return feed_id
 
 
 def _seed_base_fixture(conn: sqlite3.Connection) -> tuple[int, int, int]:
@@ -107,29 +160,38 @@ def _seed_base_fixture(conn: sqlite3.Connection) -> tuple[int, int, int]:
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
+    # Feed C exists on BOTH sides of every comparison and stays sample-less
+    # here; only the poisoned side gives it post-T samples. The candidate
+    # universe is write-time feed state (§13), so creating the row only on the
+    # poisoned side would differ the dumps for a fixture reason and mask the
+    # leak the oracle is actually hunting.
+    asof_make_real_feed(conn, "model-c")
     set_setting(conn, "forecast_blend_depth", "1")
     for local_date in (_DAY, _DAY + timedelta(days=1)):
         day_before = local_date - timedelta(days=1)
         issued = f"{day_before.isoformat()}T06:00:00Z"
         fetched = f"{day_before.isoformat()}T06:05:00Z"
-        _insert_day_samples(
-            conn,
-            site_id=site_id,
-            feed_id=feed_a,
-            local_date=local_date,
-            issued_at=issued,
-            fetched_at=fetched,
-            value=10.0,
-        )
-        _insert_day_samples(
-            conn,
-            site_id=site_id,
-            feed_id=feed_b,
-            local_date=local_date,
-            issued_at=issued,
-            fetched_at=fetched,
-            value=12.0,
-        )
+        for variable, value_a, value_b in _FIXTURE_VARIABLES:
+            _insert_day_samples(
+                conn,
+                site_id=site_id,
+                feed_id=feed_a,
+                local_date=local_date,
+                issued_at=issued,
+                fetched_at=fetched,
+                value=value_a,
+                variable=variable,
+            )
+            _insert_day_samples(
+                conn,
+                site_id=site_id,
+                feed_id=feed_b,
+                local_date=local_date,
+                issued_at=issued,
+                fetched_at=fetched,
+                value=value_b,
+                variable=variable,
+            )
     # Knowable-at-T pairs: A has 2, B has 1 -> scored rung ranks A first.
     for hour in (10, 11):
         asof_insert_pair(
@@ -164,7 +226,9 @@ def _poison_post_t(
     live-path winner. A leak through ANY of the three as-of seams changes
     the record's candidates, ranking, or selection.
     """
-    feed_c = asof_make_real_feed(conn, "model-c")
+    row = conn.execute("SELECT id FROM feeds WHERE model = 'model-c'").fetchone()
+    assert row is not None
+    feed_c = int(row["id"])
     post = isoformat_utc(snapshot_utc + timedelta(hours=1))
     for local_date in (_DAY, _DAY + timedelta(days=2)):
         _insert_day_samples(
@@ -266,7 +330,12 @@ def test_first_write_cutoff_late_build_bit_identical_to_at_t() -> None:
     conn_at_t = asof_conn()
     site_at_t, feed_a, _ = _seed_base_fixture(conn_at_t)
     build_forecast_record(conn_at_t, site_at_t, _DAY.isoformat(), now=t)
-    at_t_dump = _comparable_dump(conn_at_t, site_at_t, _DAY.isoformat())
+    # ``write_path`` records WHICH path wrote the row, not the product it
+    # wrote; it is derived from the build clock and so differs by construction
+    # between an at-T and an in-window late build.
+    at_t_dump = _comparable_dump(
+        conn_at_t, site_at_t, _DAY.isoformat(), also_exclude=("write_path",)
+    )
 
     conn_late = asof_conn()
     site_late, feed_a_late, feed_b_late = _seed_base_fixture(conn_late)
@@ -275,9 +344,12 @@ def test_first_write_cutoff_late_build_bit_identical_to_at_t() -> None:
     build_forecast_record(
         conn_late, site_late, _DAY.isoformat(), now=t + timedelta(hours=6)
     )
-    late_dump = _comparable_dump(conn_late, site_late, _DAY.isoformat())
+    late_dump = _comparable_dump(
+        conn_late, site_late, _DAY.isoformat(), also_exclude=("write_path",)
+    )
 
-    assert len(at_t_dump) == 24  # non-vacuity: full grid on both sides
+    # Non-vacuity: every identity the fixture makes knowable, on both sides.
+    assert len(at_t_dump) == _FIXTURE_GRID_SIZE
     assert late_dump == at_t_dump
 
     # Independent reconstruction from the fixture (not the code under test):
@@ -325,7 +397,7 @@ def test_retry_after_post_t_data_confirms_never_replaces() -> None:
             (site_id,),
         )
     ]
-    assert len(before) == 24
+    assert len(before) == _FIXTURE_GRID_SIZE
 
     _poison_post_t(conn, site_id=site_id, feed_b=feed_b, snapshot_utc=t)
     build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(hours=6))
@@ -369,6 +441,9 @@ def test_generation_binding_resolves_at_t_not_pointer() -> None:
         conn, site_id, "Etc/GMT-2", "2035-06-20T00:00:00Z"
     )
     assert published_generation_id(conn, site_id) == gen_new
+    # Only sampled identities are written now, so each probed day needs data.
+    _seed_full_grid(conn, site_id, date(2035, 6, 15))
+    _seed_full_grid(conn, site_id, date(2035, 6, 25))
 
     # Day before the boundary: T resolves inside gen_old's interval.
     build_forecast_record(
@@ -423,7 +498,11 @@ def test_daily_job_never_writes_missed_gap_scan_writes_full_grid_once() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-missed-site")
     ensure_published_generation(conn, site_id)
-    # Seed the log start: an (empty-grid) on-time record for _DAY.
+    # Seed the log start: a complete on-time record for _DAY, plus the data
+    # that makes every identity of the following day knowable at ITS T -- the
+    # missed grid's reasons come from that as-of-T assessment.
+    _seed_full_grid(conn, site_id, _DAY)
+    _seed_full_grid(conn, site_id, _DAY + timedelta(days=1))
     build_forecast_record(
         conn, site_id, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
     )
@@ -483,33 +562,45 @@ def test_daily_job_never_writes_missed_gap_scan_writes_full_grid_once() -> None:
 
 def test_late_write_window_boundary_is_inclusive_on_both_paths() -> None:
     """§7/§14: at exactly T + LATE_WRITE_WINDOW_HOURS a reconstruction is
-    still permitted -- the daily job writes (still ``on_time``: pins
-    implementation latitude, architect to ratify) and the gap scan
+    still permitted -- the daily job writes, and the gap scan
     late-reconstructs rather than writing ``missed``.
+
+    Both paths now stamp ``late_reconstruction``: ``write_path`` is derived
+    from how far past T the build ran (§4), not from which caller ran it, so
+    the boundary build is late whichever path reaches it. The old latitude pin
+    (daily job always ``on_time``) made the column describe the caller.
 
     Kills, one at a time:
     - in ``build_forecast_record``, ``at > snapshot_utc + window`` -> ``>=``
       (daily build at the exact boundary cancels);
     - in ``run_record_gap_scan``, ``at <= snapshot_utc + window`` -> ``<``
-      (the scan marks the exact-boundary day missed).
+      (the scan marks the exact-boundary day missed);
+    - the 0.11.0 implementation itself, ``write_path`` chosen by caller
+      identity (the daily job stamps ``on_time``, the gap scan
+      ``late_reconstruction``): a boundary build reached by the daily job
+      would report ``on_time`` here, hiding a 48-hour-late write behind the
+      column that is supposed to expose it.
     """
     boundary = timedelta(hours=LATE_WRITE_WINDOW_HOURS)
 
     conn_daily = asof_conn()
     site_daily = asof_make_site(conn_daily, "record-boundary-daily")
     ensure_published_generation(conn_daily, site_daily)
+    _seed_full_grid(conn_daily, site_daily, _DAY)
     build_forecast_record(conn_daily, site_daily, _DAY.isoformat(), now=_t() + boundary)
     rows = conn_daily.execute(
         "SELECT DISTINCT status, write_path FROM forecast_of_record WHERE site_id = ?",
         (site_daily,),
     ).fetchall()
     assert [(str(r["status"]), str(r["write_path"])) for r in rows] == [
-        ("recorded", "on_time")
+        ("recorded", "late_reconstruction")
     ]
 
     conn_scan = asof_conn()
     site_scan = asof_make_site(conn_scan, "record-boundary-scan")
     ensure_published_generation(conn_scan, site_scan)
+    _seed_full_grid(conn_scan, site_scan, _DAY)
+    _seed_full_grid(conn_scan, site_scan, _DAY + timedelta(days=1))
     build_forecast_record(
         conn_scan, site_scan, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
     )
@@ -570,7 +661,9 @@ def test_gap_scan_reconstruction_equals_at_t_build() -> None:
         conn_scan, site_scan, target.isoformat(), also_exclude=("write_path",)
     )
 
-    assert len(at_t_dump) == 24
+    # Snapshot day _DAY+1 is the fixture's last seeded target date, so only its
+    # display-lead-0 identities are knowable -- one per variable.
+    assert len(at_t_dump) == len(_FIXTURE_VARIABLES)
     assert scan_dump == at_t_dump
     day0 = _cell(conn_scan, site_scan, target.isoformat(), "temperature", 0)
     assert json.loads(str(day0["selected_feed_ids"])) == [feed_a]
@@ -578,20 +671,25 @@ def test_gap_scan_reconstruction_equals_at_t_build() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Oracle 7 — empty-grid latitude pin: no samples at T still yields a full
-# recorded grid (honestly empty, never absent).
+# Oracle 7 — a candidate-less cell is ABSENT, not an empty `recorded` row.
 # ---------------------------------------------------------------------------
 
 
-def test_zero_sample_day_writes_empty_recorded_grid() -> None:
-    """Pins implementation latitude (architect to ratify): with NO samples
-    knowable at T the builder writes the full 24-row ``recorded`` grid with
-    empty selections, rather than skipping or cancelling -- the spec (§7)
-    only mandates that missed rows come from the gap scan; empty-but-present
-    recorded rows are the implementer's chosen shape.
+def test_zero_sample_day_writes_no_rows() -> None:
+    """§4: an identity with nothing knowable at T gets no row at all.
 
-    Kills: an ``if not samples: raise JobCancelled()`` guard (or skipping
-    the INSERT for candidate-less cells) added to ``build_forecast_record``.
+    This inverts the pre-0.11.1 latitude pin, which asserted a full 24-row
+    grid of empty ``recorded`` rows for a day with no samples. That shape was
+    the defect: an empty ``recorded`` row asserts "this is what was forecast"
+    for a cell where nothing was, and it is indistinguishable from a genuine
+    all-feeds-silent product. Absence is now the honest encoding, and the gap
+    scan remains the single writer that turns a closed window into ``missed``.
+
+    Kills, one at a time:
+    - restoring the unconditional per-cell INSERT (candidate-less cells come
+      back as empty ``recorded`` rows);
+    - an ``if not samples: raise JobCancelled()`` guard (the daily job must
+      still complete cleanly on a partial day, writing what it knows).
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-empty-site")
@@ -599,26 +697,29 @@ def test_zero_sample_day_writes_empty_recorded_grid() -> None:
     build_forecast_record(
         conn, site_id, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
     )
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) AS n FROM forecast_of_record WHERE site_id = ?",
+            (site_id,),
+        ).fetchone()["n"]
+        == 0
+    )
+
+    # Paired positive, so the assertion above is not vacuously satisfied by a
+    # builder that writes nothing at all: the same day WITH samples is written.
+    other = asof_make_site(conn, "record-partial-site")
+    ensure_published_generation(conn, other)
+    _seed_full_grid(conn, other, _DAY, tag="-partial")
+    build_forecast_record(
+        conn, other, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
+    )
     rows = conn.execute(
-        "SELECT status, selected_feed_ids, hourly_values, daily_quantities"
-        " FROM forecast_of_record WHERE site_id = ?",
-        (site_id,),
+        "SELECT status, selected_feed_ids FROM forecast_of_record WHERE site_id = ?",
+        (other,),
     ).fetchall()
     assert len(rows) == 24
     assert all(str(r["status"]) == "recorded" for r in rows)
-    assert all(json.loads(str(r["selected_feed_ids"])) == [] for r in rows)
-    assert all(json.loads(str(r["hourly_values"])) == [] for r in rows)
-    # Empty cells store honestly-null displayed dailies (not_available on the
-    # page -> every displayed value is None, no badges).
-    for r in rows:
-        displayed = json.loads(str(r["daily_quantities"]))["displayed"]
-        assert displayed["partial"] is False
-        assert displayed["low_confidence"] is False
-        values = {
-            k: v for k, v in displayed.items() if k not in ("partial", "low_confidence")
-        }
-        assert values  # non-vacuity: the variable's value keys are present
-        assert all(v is None for v in values.values())
+    assert all(json.loads(str(r["selected_feed_ids"])) != [] for r in rows)
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +783,12 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
+    # Feed C exists on BOTH sides of every comparison and stays sample-less
+    # here; only the poisoned side gives it post-T samples. The candidate
+    # universe is write-time feed state (§13), so creating the row only on the
+    # poisoned side would differ the dumps for a fixture reason and mask the
+    # leak the oracle is actually hunting.
+    asof_make_real_feed(conn, "model-c")
     site = conn.execute(
         "SELECT timezone, rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
     ).fetchone()
@@ -763,3 +870,81 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     assert tile.precip.chance_pct == round(chance * 100)
     assert chance == 0.25  # 6 wet hours of A's 24; B's all-wet share excluded
     assert precip["total_mm"] == pytest.approx(6 * threshold)
+
+
+def test_record_outcomes_score_the_clearing_subset_and_keep_the_full_hourly() -> None:
+    """§17 family 4 (W3), record side: the stored OUTCOMES describe the
+    clearing subset — the same feed set the displayed value uses — while
+    ``hourly_values`` deliberately stays the FULL-selection blend that
+    reproduces the Forecast page's hourly drill-down.
+
+    Fixture: feed A covers all 24 hours dry (0.0 mm, clears coverage);
+    feed B covers hours 0-13 only (14 hours, selected but NOT clearing) at
+    ``threshold + 1.0`` mm. Hand-computed from the code path:
+
+    * outcomes blend = feed A alone -> 24 covered hours, zero wet slots,
+      near-complete -> ``precip_occurrence`` value 0.0 (DRY, eligible) and
+      ``precip_total`` 0.0;
+    * ``hourly_values`` = both feeds -> 24 entries, hours 0-13 at
+      ``(threshold + 1.0) / 2`` (wet) and hours 14-23 at 0.0.
+
+    Kills the 0.11.0 implementation, which evaluated the outcomes over the
+    full-selection blend and so reported ``precip_occurrence`` 1.0 (WET,
+    14 wet slots) beside a displayed total of 0.0. Kills the opposite
+    over-correction too — unifying ``hourly_values`` onto ``agg_ids``
+    drops every wet hour from the drill-down series.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "record-w3-site")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    feed_b = asof_make_real_feed(conn, "model-b")
+    site = conn.execute(
+        "SELECT rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
+    ).fetchone()
+    assert site is not None
+    threshold = float(site["rain_threshold_mm"])
+    wet_value = threshold + 1.0
+
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 0.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_b,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(14),
+        value_fn=lambda _h: wet_value,
+    )
+
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=_t())
+    row = _cell(conn, site_id, _DAY.isoformat(), "precip", 0)
+    # Fixture validity: both feeds are selected, only A clears coverage.
+    assert json.loads(str(row["selected_feed_ids"])) == [feed_a, feed_b]
+
+    quantities = json.loads(str(row["daily_quantities"]))
+    outcomes = {str(o["quantity"]): o for o in quantities["outcomes"]}
+    occurrence = outcomes["precip_occurrence"]
+    assert occurrence["value"] == 0.0
+    assert occurrence["eligible"] is True
+    assert occurrence["wet_hours"] == 0
+    assert occurrence["covered_hours"] == 24
+    total = outcomes["precip_total"]
+    assert total["value"] == pytest.approx(0.0)
+    assert total["eligible"] is True
+
+    hourly = [(str(at), float(v)) for at, v in json.loads(str(row["hourly_values"]))]
+    assert len(hourly) == 24
+    # The drill-down series keeps feed B: hours 0-13 blend to the mean of
+    # the two feeds, which is wet — exactly what the outcomes must ignore.
+    assert [v for _at, v in hourly[:14]] == [pytest.approx(wet_value / 2)] * 14
+    assert [v for _at, v in hourly[14:]] == [0.0] * 10
+    assert wet_value / 2 >= threshold

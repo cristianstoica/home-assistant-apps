@@ -20,6 +20,7 @@ import json
 import sqlite3
 from typing import cast
 
+from wxverify.core.timeutil import utc_now
 from wxverify.settings.depth import effective_blend_depths
 from wxverify.verification import methodology
 from wxverify.verification.contract import (
@@ -27,9 +28,12 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
+from wxverify.verification.diagnostics import observed_wet_precip_mae
+from wxverify.verification.ranking import daily_rank_conclusions
 from wxverify.verification.runs import (
     current_input_fingerprint,
     published_run_id,
+    trigger_status,
 )
 from wxverify.web.context import SiteView, load_site, load_sites
 
@@ -113,8 +117,14 @@ _QUANTITY_ENDPOINT: dict[str, str] = {
     "precip_occurrence": "occurrence",
 }
 
-#: §16.4 diagnostics that methodology v1 does not produce. Declared on the
-#: page rather than silently omitted, so the divergence stays visible.
+#: §16.4 diagnostics methodology v1 declines to define at all. Declared on
+#: the page rather than silently omitted, so the divergence stays visible.
+#: This list is for METHODOLOGY gaps only — a metric the specification calls
+#: always-displayed and the code merely does not implement is a gap to close,
+#: never an entry here (that is why the observed-wet precip-total MAE is
+#: absent from it: §14a implements the metric instead). Families that exist
+#: in methodology v1 but can come up empty for DATA reasons are declared per
+#: run from _DATA_UNAVAILABLE_DIAGNOSTICS below.
 UNAVAILABLE_DIAGNOSTICS: list[dict[str, str]] = [
     {
         "key": "wet_hour_share",
@@ -126,6 +136,47 @@ UNAVAILABLE_DIAGNOSTICS: list[dict[str, str]] = [
         ),
     },
 ]
+
+#: §16.4 diagnostic families methodology v1 DOES produce but which a given
+#: run can fail to populate for data reasons. Emitting the reason keeps an
+#: empty section from reading as an unimplemented one.
+_DATA_UNAVAILABLE_DIAGNOSTICS: dict[str, dict[str, str]] = {
+    "d0": {
+        "label": "Same-day (D0) skill",
+        "reason": (
+            "no same-day depth result was scored on this run - the run's "
+            "snapshot days carry no D0 pairs that passed the truth gates."
+        ),
+    },
+    "bias_rmse": {
+        "label": "Bias and RMSE by lead",
+        "reason": (
+            "no scored depth result at lead 1 or beyond carries a bias value "
+            "on this run, so no bias/RMSE row can be shown."
+        ),
+    },
+    "contingency": {
+        "label": "Precip-occurrence contingency tables",
+        "reason": (
+            "no precip-occurrence result on this run reached a contingency "
+            "table - the common days held too few wet or dry events."
+        ),
+    },
+    "daily_rank": {
+        "label": "Daily-rank diagnostic",
+        "reason": (
+            "no (feed, quantity) pair reached the minimum rank history this "
+            "run, so no daily-rank row was persisted."
+        ),
+    },
+    "feeds": {
+        "label": "Per-feed availability and pairwise comparison",
+        "reason": (
+            "this run persisted no per-feed result rows, so neither the "
+            "availability floor nor the pairwise comparison can be shown."
+        ),
+    },
+}
 
 _BASELINE_PREFIX = "baseline_"
 
@@ -381,14 +432,23 @@ def _load_results(conn: sqlite3.Connection, run_id: int) -> list[dict[str, objec
         """
         SELECT variable, lead, quantity, entity_type, entity_key, headline,
                common_days, mae, bias, rmse, hits, misses, false_alarms,
-               correct_negatives, ets, availability_rate, delta_vs_incumbent
+               correct_negatives, ets, availability_rate, delta_vs_incumbent,
+               detail
         FROM verification_results
         WHERE run_id = ?
         ORDER BY variable, quantity, lead, entity_type, entity_key
         """,
         (run_id,),
     ).fetchall()
-    return [dict(row) for row in rows]
+    # §9: `detail` carries `vs_recommended` on below-floor / pairwise-only
+    # rows. Parsed here rather than in the template — a raw JSON string in a
+    # view row is one `|tojson` away from being rendered as text.
+    out: list[dict[str, object]] = []
+    for row in rows:
+        view = dict(row)
+        view["detail"] = _as_dict(_parse_json(view["detail"]))
+        out.append(view)
+    return out
 
 
 def _load_contributor_depths(
@@ -571,16 +631,35 @@ def _diagnostics(
                     "below_floor": rate is not None
                     and rate < methodology.ROSTER_AVAILABILITY_FLOOR,
                     "pairwise_only": not int(str(result["headline"])),
+                    # §9: written by the `pairwise` phase; surfaced here so
+                    # the page and the API diagnostics payload agree.
+                    "vs_recommended": _as_dict(result.get("detail")).get(
+                        "vs_recommended"
+                    ),
                 }
             )
-    return {
+    families: dict[str, list[dict[str, object]]] = {
         "d0": d0,
         "bias_rmse": bias_rmse,
         "contingency": contingency,
         "daily_rank": daily_rank,
         "feeds": feeds,
+    }
+    # §14/W11: an empty family is declared with its DATA reason, so the page
+    # never leaves the operator to guess whether a section is empty because
+    # this run had nothing to put in it or because nothing computes it.
+    unavailable: list[dict[str, str]] = [
+        *UNAVAILABLE_DIAGNOSTICS,
+        *(
+            {"key": key, **_DATA_UNAVAILABLE_DIAGNOSTICS[key]}
+            for key, rows in families.items()
+            if not rows
+        ),
+    ]
+    return {
+        **families,
         "day_context": day_context,
-        "unavailable": UNAVAILABLE_DIAGNOSTICS,
+        "unavailable": unavailable,
     }
 
 
@@ -627,6 +706,7 @@ def load_verification(
         "common_days": {},
         "diagnostics": None,
         "day_context": None,
+        "trigger": None,
         "warnings": {},
         "depths": live_depths,
         "depth_mismatch": False,
@@ -645,6 +725,9 @@ def load_verification(
     }
     if site is None:
         return context
+    # §12/§3.1: same derivation the status API serves, so the page and the
+    # payload cannot report different trigger states for one site.
+    context["trigger"] = trigger_status(conn, site.id, utc_now())
     run_id = published_run_id(conn, site.id)
     failed_newer = conn.execute(
         """
@@ -657,6 +740,13 @@ def load_verification(
     if run_id is not None:
         run = _load_run(conn, run_id)
         verdicts = _load_verdicts(conn, run_id)
+        # §10: the daily-rank conclusion is a first-class conclusion line,
+        # derived by the same helper the verdicts API calls.
+        conclusions = daily_rank_conclusions(conn, run_id)
+        for verdict in verdicts:
+            verdict["ranking_redesign_indicated"] = conclusions.get(
+                str(verdict["variable"])
+            )
         results = _load_results(conn, run_id)
         day_context = _load_day_context(conn, run_id)
         context["run"] = run
@@ -666,7 +756,12 @@ def load_verification(
             results, verdicts, _load_contributor_depths(conn, run_id)
         )
         context["common_days"] = _common_day_ranges(results)
-        context["diagnostics"] = _diagnostics(results, day_context)
+        context["diagnostics"] = {
+            **_diagnostics(results, day_context),
+            # §14a: always-displayed secondary metric, derived by the same
+            # helper the API diagnostics payload calls.
+            "observed_wet_precip_mae": observed_wet_precip_mae(conn, run_id),
+        }
         context["day_context"] = day_context
         # §16.1/§16.2: the cards carry the run's PINNED incumbent depth; the
         # live effective depth is a different number whenever settings moved

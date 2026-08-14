@@ -1,15 +1,26 @@
 """Methodology constants for the forecast-product backtest (plan §17).
 
 Every constant is pre-declared and versioned here — one module, one
-``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. Every
-constant here is wired into behavior; the record snapshots, backtest
-engine, verdicts, and the published contract import from this module so
-the whole methodology is auditable in one place.
+``METHODOLOGY_VERSION`` — and is never tuned after viewing scores. The
+record snapshots, backtest engine, verdicts, and the published contract
+import from this module so the whole methodology is auditable in one place.
+
+Every public constant here is either consumed by a non-test module or
+named in ``DECLARATIVE_ONLY`` — published for the audit trail but wired to
+no behavior. A module-scan test pins that disjunction, so a constant can
+never again sit here unconsumed and undeclared.
 
 Naming follows the §17 table row-for-row; values are the table's, verbatim.
 """
 
 from __future__ import annotations
+
+#: Constants published here that are deliberately wired to NO behavior.
+#: Empty is the honest state and the desirable one: the sensitivity
+#: exhibits are deferred, so their alternate-value tuples were deleted
+#: rather than left declared-and-unwired. Anything added here must be
+#: justified in the comment beside its definition.
+DECLARATIVE_ONLY: frozenset[str] = frozenset()
 
 # Version of this constant set. Bump when ANY constant below changes; runs
 # persist the version they were scored under.
@@ -39,9 +50,19 @@ TEMP_PEAK_WINDOW_LOW = (3, 9)  # local hours, overnight minimum
 NEAR_COMPLETE_SLOT_ALLOWANCE = 1
 
 # Roster availability floor: share of truth-eligible days on which every
-# active real feed must be available. Sensitivity exhibits use the alternates.
+# active real feed must be available.
 ROSTER_AVAILABILITY_FLOOR = 0.70
-ROSTER_AVAILABILITY_FLOOR_SENSITIVITY = (0.60, 0.80)
+
+# Required baselines per quantity kind (§9/§12 condition 4). Declared here
+# rather than in engine.py because the §12 gate validates exactly this set
+# and a second copy of the membership would drift from the one the evidence
+# is built against.
+CONTINUOUS_BASELINES = ("baseline_persistence", "baseline_all_feed_mean")
+OCCURRENCE_BASELINES = (
+    "baseline_persistence",
+    "baseline_all_feed_mean",
+    "baseline_always_dry",
+)
 
 # Adequate lead: minimum strict-common days for a lead to count. Minimum
 # number of adequate leads (of D1-D7) per variable.
@@ -50,7 +71,6 @@ MIN_ADEQUATE_LEADS_PER_VARIABLE = 4
 
 # Bootstrap: moving-block over target dates, fixed seed per run.
 BOOTSTRAP_BLOCK_LENGTH_DAYS = 3
-BOOTSTRAP_BLOCK_LENGTH_SENSITIVITY = (2, 5)
 BOOTSTRAP_RESAMPLES = 10_000
 
 # Confidence-interval levels. Candidate CIs are simultaneous at

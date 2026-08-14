@@ -16,7 +16,10 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.verification.record import sites_with_record_gap
+from wxverify.verification.record import (
+    gap_scan_degraded_sites,
+    sites_with_record_gap,
+)
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -223,6 +226,14 @@ def _pipeline_conditions(
         conn, now, slack=timedelta(minutes=PENDING_OVERDUE_MINUTES)
     )
 
+    # record_gap_scan_degraded (§4 change 7): sites whose gap scan could not
+    # assess one or more dates. Trips on PRESENCE, with no freshness window
+    # -- the scan runs once per local day, so an `as_of` window would blank a
+    # standing failure for half of every day, and the key is deleted the
+    # moment its dates clear. It does not wait on FAILED_JOB_AGE_HOURS: the
+    # job completes, by design, so the failure is only visible here.
+    gap_scan_failed_n, gap_scan_newest = gap_scan_degraded_sites(conn)
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -285,6 +296,13 @@ def _pipeline_conditions(
             record_gap_n > 0,
             record_gap_n,
             f"{record_gap_n} sites missing the latest forecast record",
+        ),
+        _cond(
+            "record_gap_scan_degraded",
+            gap_scan_failed_n > 0,
+            gap_scan_failed_n,
+            f"{gap_scan_failed_n} sites with unassessed record gap-scan dates"
+            f" (newest failure {gap_scan_newest})",
         ),
     ]
 
@@ -509,6 +527,7 @@ def build_verdict(
                 "pair_score_live",
                 "problem_jobs",
                 "forecast_record_gap",
+                "record_gap_scan_degraded",
             )
         )
 

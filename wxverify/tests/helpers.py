@@ -7,11 +7,42 @@ modules belong here. Anything used by a single file stays local to it.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Mapping
 from html.parser import HTMLParser
 
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.verification.decision import ContinuousLead, OccurrenceLead
+from wxverify.verification.methodology import (
+    CONTINUOUS_BASELINES,
+    OCCURRENCE_BASELINES,
+)
+
+
+def occurrence_baseline_set(
+    per_lead: Mapping[int, OccurrenceLead],
+) -> dict[str, dict[int, OccurrenceLead]]:
+    """Fan one series out over every required occurrence baseline (§8).
+
+    The baseline gate validates a required SET, so a fixture that supplies
+    only one baseline no longer reaches a verdict. Fixtures whose subject
+    is not the gate use this to satisfy the set with a single series.
+    """
+    return {
+        name: {lead: dict(series) for lead, series in per_lead.items()}
+        for name in OCCURRENCE_BASELINES
+    }
+
+
+def continuous_baseline_set(
+    quantity: str, per_lead: Mapping[int, ContinuousLead]
+) -> dict[str, dict[str, dict[int, ContinuousLead]]]:
+    """Fan one series out over every required continuous baseline (§8)."""
+    return {
+        name: {quantity: {lead: dict(series) for lead, series in per_lead.items()}}
+        for name in CONTINUOUS_BASELINES
+    }
 
 
 def assert_read_pool_at_rest(db: Database) -> None:

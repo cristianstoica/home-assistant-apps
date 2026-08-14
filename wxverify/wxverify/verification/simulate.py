@@ -197,6 +197,10 @@ def _entities_for_selection(
     (clearing subset, aggregate per feed, then blend); eligibility and the
     occurrence value come from ``evaluate_variable`` over the blended
     hourly series (§5 forecast-side eligibility — record.py parity).
+
+    One feed set describes the scored entity end to end: the clearing
+    subset. Coverage, occurrence, eligibility and the contributor count all
+    describe the same feeds the displayed value was computed from.
     """
     present = [fid for fid in feed_ids if feeds_samples.get(fid)]
     out: dict[str, _Entity] = {}
@@ -221,7 +225,11 @@ def _entities_for_selection(
         [[s.value for s in feeds_samples[fid]] for fid in agg_ids],
         rain_threshold_mm=rain_threshold_mm,
     )
-    hourly = _blend_hourly(present, feeds_samples)
+    # The scored product IS the displayed product, so ``agg_ids`` -- the
+    # clearing subset ``displayed`` is computed over -- is the feed set of
+    # record for everything that qualifies it: the blended hourly series,
+    # the covered-hour count and the contributor count alike.
+    hourly = _blend_hourly(agg_ids, feeds_samples)
     hours = covered_hours(valid_at for valid_at, _ in hourly)
     outcomes = _quantity_outcomes(
         variable,
@@ -243,7 +251,7 @@ def _entities_for_selection(
             forecast_eligible=outcome.eligible,
             forecast_exclusion_reason=outcome.exclusion_reason,
             covered_hours=hours,
-            realized_contributors=len(present),
+            realized_contributors=len(agg_ids),
         )
     return out
 
@@ -429,6 +437,197 @@ def _insert_evidence(
     )
 
 
+def _snapshot_samples(
+    conn: sqlite3.Connection, cfg: RunConfig, local_date: date, as_of: str
+) -> list[FutureSampleRow]:
+    """The snapshot day's as-of sample set, restricted to the pinned roster."""
+    bounds = local_day_bounds(local_date, cfg.timezone)
+    roster_ids = {f.feed_id for f in cfg.roster}
+    return [
+        s
+        for s in load_future_samples(
+            conn,
+            site_id=cfg.site_id,
+            since_valid_at=isoformat_utc(bounds.start_utc),
+            as_of=as_of,
+        )
+        if s.feed_id in roster_ids
+    ]
+
+
+def _pass1_truth_source(
+    conn: sqlite3.Connection,
+    cfg: RunConfig,
+    *,
+    snapshot_local_date: str,
+    target_local_date: str,
+    lead: int,
+    variable: str,
+    quantity: str,
+) -> sqlite3.Row | None:
+    """The pass-1 row whose truth columns a pass-2 baseline row copies (§7.4a).
+
+    The canonical source is the shallowest simulated depth, which pass 1
+    writes for EVERY cell-date including the no-samples case. Returns None
+    when the source is absent: pass 2 then writes nothing rather than
+    re-reading ``daily_truth`` and inventing a second truth pairing.
+    """
+    return conn.execute(
+        """
+        SELECT * FROM verification_evidence
+        WHERE run_id = ? AND snapshot_local_date = ? AND target_local_date = ?
+          AND lead = ? AND variable = ? AND quantity = ?
+          AND entity_type = 'depth' AND entity_key = ?
+        """,
+        (
+            cfg.run_id,
+            snapshot_local_date,
+            target_local_date,
+            lead,
+            variable,
+            quantity,
+            str(SIM_DEPTHS[0]),
+        ),
+    ).fetchone()
+
+
+def _insert_baseline_evidence(
+    conn: sqlite3.Connection,
+    cfg: RunConfig,
+    *,
+    snapshot_local_date: str,
+    target_local_date: str,
+    lead: int,
+    variable: str,
+    quantity: str,
+    entity: _Entity,
+    source: sqlite3.Row,
+) -> None:
+    """Write one pass-2 baseline row, copying its truth from ``source``.
+
+    Six truth columns are copied verbatim; ``abs_error`` and
+    ``occurrence_outcome`` are entity-specific and re-derived from the
+    copied truth against THIS entity's ``predicted``.
+    """
+    truth_value = (
+        None if source["truth_value"] is None else float(source["truth_value"])
+    )
+    truth_eligible = bool(source["truth_eligible"])
+    abs_error: float | None = None
+    occurrence_outcome: str | None = None
+    if (
+        entity.forecast_eligible
+        and truth_eligible
+        and entity.predicted is not None
+        and truth_value is not None
+    ):
+        abs_error = abs(entity.predicted - truth_value)
+        if quantity == QUANTITY_PRECIP_OCCURRENCE:
+            occurrence_outcome = classify_occurrence_outcome(
+                entity.predicted, truth_value
+            )
+    conn.execute(
+        """
+        INSERT INTO verification_evidence
+            (run_id, snapshot_local_date, target_local_date, lead, variable,
+             quantity, entity_type, entity_key, predicted, forecast_eligible,
+             forecast_exclusion_reason, covered_hours, realized_contributors,
+             truth_value, truth_eligible, truth_exclusion_reason,
+             truth_covered_hours, truth_wet_hours, truth_dry_hours,
+             abs_error, occurrence_outcome)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(run_id, snapshot_local_date, lead, variable, quantity,
+                    entity_type, entity_key) DO NOTHING
+        """,
+        (
+            cfg.run_id,
+            snapshot_local_date,
+            target_local_date,
+            lead,
+            variable,
+            quantity,
+            entity.entity_type,
+            entity.entity_key,
+            entity.predicted,
+            1 if entity.forecast_eligible else 0,
+            entity.forecast_exclusion_reason,
+            entity.covered_hours,
+            entity.realized_contributors,
+            source["truth_value"],
+            source["truth_eligible"],
+            source["truth_exclusion_reason"],
+            source["truth_covered_hours"],
+            source["truth_wet_hours"],
+            source["truth_dry_hours"],
+            abs_error,
+            occurrence_outcome,
+        ),
+    )
+
+
+def simulate_baseline_day(
+    conn: sqlite3.Connection,
+    cfg: RunConfig,
+    snapshot_local_date: str,
+    rosters: dict[tuple[str, int, str], list[int]],
+) -> None:
+    """Pass 2 (§7 step 4): the all-feed-mean baseline for one snapshot day.
+
+    ``rosters`` is the resolved headline roster per ``(variable, lead,
+    quantity)`` cell; a cell absent from it resolved to no floor-clearing
+    feed and gets NO baseline row. The product path is re-run per cell (it
+    is not a post-hoc average of pass-1 per-feed rows) and only the row for
+    the cell's own quantity is persisted, because
+    ``_entities_for_selection`` emits every quantity of the variable from
+    one call and the insert discards duplicates rather than overwriting.
+    """
+    local_date = date.fromisoformat(snapshot_local_date)
+    snapshot_utc = resolve_snapshot_utc(cfg.timezone, local_date, cfg.wall_clock)
+    as_of = isoformat_utc(snapshot_utc)
+    samples = _snapshot_samples(conn, cfg, local_date, as_of)
+    grouped = _group_samples(samples, timezone=cfg.timezone, now=snapshot_utc)
+    for lead in range(SIM_DAY_COUNT):
+        target_iso = (local_date + timedelta(days=lead)).isoformat()
+        for variable in SIM_VARIABLES:
+            feeds_samples = grouped.get(variable, {}).get(lead, {})
+            for quantity in VARIABLE_QUANTITIES[variable]:
+                feed_ids = rosters.get((variable, lead, quantity))
+                if not feed_ids:
+                    continue
+                built = _entities_for_selection(
+                    entity_type="baseline_all_feed_mean",
+                    entity_key="all_feed_mean",
+                    variable=variable,
+                    feed_ids=feed_ids,
+                    feeds_samples=feeds_samples,
+                    timezone=cfg.timezone,
+                    target_date=local_date + timedelta(days=lead),
+                    rain_threshold_mm=cfg.rain_threshold_mm,
+                )
+                source = _pass1_truth_source(
+                    conn,
+                    cfg,
+                    snapshot_local_date=snapshot_local_date,
+                    target_local_date=target_iso,
+                    lead=lead,
+                    variable=variable,
+                    quantity=quantity,
+                )
+                if source is None:
+                    continue
+                _insert_baseline_evidence(
+                    conn,
+                    cfg,
+                    snapshot_local_date=snapshot_local_date,
+                    target_local_date=target_iso,
+                    lead=lead,
+                    variable=variable,
+                    quantity=quantity,
+                    entity=built[quantity],
+                    source=source,
+                )
+
+
 def simulate_snapshot_day(
     conn: sqlite3.Connection, cfg: RunConfig, snapshot_local_date: str
 ) -> None:
@@ -438,14 +637,7 @@ def simulate_snapshot_day(
     as_of = isoformat_utc(snapshot_utc)
     bounds = local_day_bounds(local_date, cfg.timezone)
     since_valid_at = isoformat_utc(bounds.start_utc)
-    roster_ids = {f.feed_id for f in cfg.roster}
-    samples = [
-        s
-        for s in load_future_samples(
-            conn, site_id=cfg.site_id, since_valid_at=since_valid_at, as_of=as_of
-        )
-        if s.feed_id in roster_ids
-    ]
+    samples = _snapshot_samples(conn, cfg, local_date, as_of)
     null_availability = count_null_availability_samples(
         conn, site_id=cfg.site_id, since_valid_at=since_valid_at
     )
@@ -544,18 +736,10 @@ def simulate_snapshot_day(
                         rain_threshold_mm=cfg.rain_threshold_mm,
                     )
                 )
-            entities.append(
-                _entities_for_selection(
-                    entity_type="baseline_all_feed_mean",
-                    entity_key="all_feed_mean",
-                    variable=variable,
-                    feed_ids=[f.feed_id for f in cfg.roster],
-                    feeds_samples=feeds_samples,
-                    timezone=cfg.timezone,
-                    target_date=target_date,
-                    rain_threshold_mm=cfg.rain_threshold_mm,
-                )
-            )
+            # The all-feed-mean baseline is NOT built here: §9.2 defines it
+            # over the frozen headline roster, which is a period-wide
+            # availability statistic and cannot be known inside pass 1. It is
+            # built by `simulate_baseline_day` in the `baseline` phase (§7).
             for quantity in VARIABLE_QUANTITIES[variable]:
                 value = persistence[quantity]
                 entities.append(
@@ -669,5 +853,6 @@ __all__ = [
     "SIM_VARIABLES",
     "classify_occurrence_outcome",
     "latest_knowable_target",
+    "simulate_baseline_day",
     "simulate_snapshot_day",
 ]

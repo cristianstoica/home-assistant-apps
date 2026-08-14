@@ -549,6 +549,165 @@ def record_trigger_decision(
     )
 
 
+#: Prefix every superseding trigger-decision reason carries (§12/W8). The
+#: `decision` column is CHECK-constrained to four values, so a superseded
+#: start reuses `skipped` and is told apart from a gate skip only by this
+#: prefix on `reason`.
+SUPERSEDED_REASON_PREFIX = "superseded:"
+
+#: Reason the scheduler records on the durable decision row when the §3.1
+#: publish hold suppressed the nightly enqueue, mirrored here for the two
+#: reader surfaces. The scheduler owns the write; this is the read-side name.
+PUBLISH_HOLD_REASON = "publish_hold"
+
+#: §12 trigger-status values carried on both the API status payload and the
+#: /verification page context.
+TRIGGER_STATUS_TRIGGERED = "triggered"
+TRIGGER_STATUS_SKIPPED = "skipped"
+TRIGGER_STATUS_NO_DECISION = "no_decision_recorded"
+TRIGGER_STATUS_DATE_UNKNOWN = "trigger_date_unknown"
+
+
+def expected_trigger_date(
+    conn: sqlite3.Connection, site_id: int, now: datetime
+) -> str | None:
+    """Local date of the trigger cycle a reader should be looking at (§12).
+
+    The site-local date once local time is at or past the nightly trigger
+    time, the previous local date before it. Returns ``None`` — never
+    raises — when the site's timezone or trigger wall clock is
+    unresolvable, matching how every other resolution of ``sites.timezone``
+    degrades per site.
+
+    This is a READER-side derivation ("which trigger cycle is current"),
+    deliberately distinct from the scheduler's fail-closed "may the trigger
+    fire now" guard, which keeps its own rule.
+    """
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    from wxverify.verification.record import resolve_snapshot_utc
+    from wxverify.worker.scheduler import VERIFICATION_TRIGGER_LOCAL_TIME
+
+    row = conn.execute("SELECT timezone FROM sites WHERE id = ?", (site_id,)).fetchone()
+    if row is None or row["timezone"] is None:
+        return None
+    timezone = str(row["timezone"])
+    try:
+        local_today = now.astimezone(ZoneInfo(timezone)).date()
+        trigger_utc = resolve_snapshot_utc(
+            timezone, local_today, VERIFICATION_TRIGGER_LOCAL_TIME
+        )
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    if now >= trigger_utc:
+        return local_today.isoformat()
+    return (local_today - timedelta(days=1)).isoformat()
+
+
+@dataclass(frozen=True)
+class TriggerDecisionRead:
+    """Latest decision for one exact trigger date, plus the supersede tally."""
+
+    decision: str
+    reason: str | None
+    superseded_count: int
+    superseded_reason: str | None
+
+
+def latest_trigger_decision(
+    conn: sqlite3.Connection, site_id: int, trigger_date: str
+) -> TriggerDecisionRead | None:
+    """Highest-``id`` decision for THAT exact date, plus its supersedes (§12).
+
+    Latest-``id`` alone would mask the W8 chain's supersede: that chain
+    emits a second ``run_started`` after the superseding ``skipped``, so the
+    newest row on a divergent night is byte-identical to a clean one. The
+    count and newest reason of the date's ``superseded:`` rows are therefore
+    returned alongside it.
+    """
+    row = conn.execute(
+        """
+        SELECT decision, reason FROM verification_trigger_decisions
+        WHERE site_id = ? AND trigger_date = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (site_id, trigger_date),
+    ).fetchone()
+    if row is None:
+        return None
+    superseded = conn.execute(
+        """
+        SELECT COUNT(*) AS n, MAX(id) AS newest
+        FROM verification_trigger_decisions
+        WHERE site_id = ? AND trigger_date = ? AND decision = 'skipped'
+          AND reason LIKE ? || '%'
+        """,
+        (site_id, trigger_date, SUPERSEDED_REASON_PREFIX),
+    ).fetchone()
+    count = int(superseded["n"])
+    newest_reason: str | None = None
+    if count:
+        newest = conn.execute(
+            "SELECT reason FROM verification_trigger_decisions WHERE id = ?",
+            (int(superseded["newest"]),),
+        ).fetchone()
+        newest_reason = None if newest is None else str(newest["reason"])
+    return TriggerDecisionRead(
+        decision=str(row["decision"]),
+        reason=None if row["reason"] is None else str(row["reason"]),
+        superseded_count=count,
+        superseded_reason=newest_reason,
+    )
+
+
+def trigger_status(
+    conn: sqlite3.Connection, site_id: int, now: datetime
+) -> dict[str, object]:
+    """The §12 trigger status for one site, plus the §3.1 publish-hold state.
+
+    ONE derivation feeding both surfaces — ``GET
+    /api/verification/status`` and the ``/verification`` page — so the two
+    can never disagree. Degrades per site (``trigger_date_unknown``); never
+    raises, because both callers build their payload over every enabled
+    site and one unusable timezone must not remove the operator's whole
+    diagnostic window.
+    """
+    from wxverify.worker.scheduler import verification_publish_held
+
+    held = verification_publish_held(conn)
+    out: dict[str, object] = {
+        "status": TRIGGER_STATUS_DATE_UNKNOWN,
+        "trigger_date": None,
+        "reason": None,
+        "superseded_count": 0,
+        "superseded_reason": None,
+        "publish_hold": {
+            "held": held,
+            "reason": PUBLISH_HOLD_REASON if held else None,
+        },
+    }
+    trigger_date = expected_trigger_date(conn, site_id, now)
+    if trigger_date is None:
+        return out
+    out["trigger_date"] = trigger_date
+    read = latest_trigger_decision(conn, site_id, trigger_date)
+    if read is None:
+        out["status"] = TRIGGER_STATUS_NO_DECISION
+        return out
+    out["status"] = (
+        TRIGGER_STATUS_TRIGGERED
+        if read.decision == "run_started"
+        else TRIGGER_STATUS_SKIPPED
+    )
+    # The `reason` string is the payload, not the `decision` enum: a gate
+    # skip and a superseded start share the enum and differ only here.
+    out["reason"] = read.reason
+    out["superseded_count"] = read.superseded_count
+    out["superseded_reason"] = read.superseded_reason
+    return out
+
+
 def trigger_decision_exists(
     conn: sqlite3.Connection, site_id: int, trigger_date: str
 ) -> bool:
