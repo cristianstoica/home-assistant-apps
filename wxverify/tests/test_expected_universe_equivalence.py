@@ -14,7 +14,7 @@ Isolation: every test opens its own fresh ``sqlite3.connect(":memory:")`` and
 runs ``run_migrations`` (mirrors ``tests/test_forecast_data.py``).
 
 Synthetic data only (public repo): fake site name, the repo's existing
-47/25 lat-lon convention, no real station/device identifiers.
+40/-105 lat-lon convention, no real station/device identifiers.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def _make_db() -> sqlite3.Connection:
     conn.execute(
         """
         INSERT INTO sites (id, name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES (1, 'Test Site', 47.0, 25.0, 900.0, 'UTC')
+        VALUES (1, 'Test Site', 40.0, -105.0, 900.0, 'UTC')
         """
     )
     return conn
@@ -226,13 +226,13 @@ def test_expected_cells_match_distinct_form_across_windows() -> None:
     site_a = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('Site A', 47.0, 25.0, 900.0, 'UTC')"
+            " timezone) VALUES ('Site A', 40.0, -105.0, 900.0, 'UTC')"
         ).lastrowid
     )
     site_b = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('Site B', 47.0, 25.0, 900.0, 'UTC')"
+            " timezone) VALUES ('Site B', 40.0, -105.0, 900.0, 'UTC')"
         ).lastrowid
     )
     persistence_id = _feed_id(conn, "virtual", "_persistence")

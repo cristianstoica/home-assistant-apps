@@ -145,7 +145,7 @@ leaves no error behind:
    - name
    - forecast latitude and longitude
    - reference elevation in meters
-   - IANA timezone, for example `Europe/Bucharest`
+   - IANA timezone, for example `America/Denver`
    - rain threshold in mm
 4. Add at least one Weather.com PWS station to the site.
 5. Confirm provider key status on the Ops page.

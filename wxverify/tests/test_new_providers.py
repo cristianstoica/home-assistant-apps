@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -78,9 +78,51 @@ EXPECTED_DOMAINS: dict[str, str] = {
     "google": "weather.googleapis.com",
 }
 
+_SYNTHETIC_VALID_DT = datetime(2026, 6, 1, 12, tzinfo=UTC)
+
 EXPECTED_SYNTHETIC_ISSUED_AT = "2026-06-01T00:00:00Z"
 EXPECTED_SYNTHETIC_VALID_AT = "2026-06-01T12:00:00Z"
-EXPECTED_SYNTHETIC_VALID_EPOCH = int(datetime(2026, 6, 1, 12, tzinfo=UTC).timestamp())
+EXPECTED_SYNTHETIC_VALID_EPOCH = int(_SYNTHETIC_VALID_DT.timestamp())
+
+SYNTHETIC_SITE_LAT = 40.0
+SYNTHETIC_SITE_LON = -105.0
+
+# Google now collects a paginated horizon derived from max_lead_hours, so its
+# case supplies a whole page (GOOGLE_PAGE_SIZE contiguous hourly records)
+# rather than one record: under the completeness check a single record against
+# a 24-hour request is a short sequence.
+GOOGLE_SNAP_RECORD_COUNT = 24
+
+
+def _synthetic_start_time(offset_hours: int) -> str:
+    """The synthetic valid stamp, ``offset_hours`` after the shared valid_at."""
+    moment = _SYNTHETIC_VALID_DT + timedelta(hours=offset_hours)
+    return moment.isoformat().replace("+00:00", "Z")
+
+
+def _google_forecast_hours(count: int) -> list[dict[str, object]]:
+    """``count`` contiguous hourly Google records from the shared valid stamp."""
+    return [
+        {
+            "interval": {"startTime": _synthetic_start_time(offset)},
+            "temperature": {"degrees": 20.0, "unit": "CELSIUS"},
+            "wind": {"speed": {"value": 36.0, "unit": "KILOMETERS_PER_HOUR"}},
+            "precipitation": {"qpf": {"quantity": 1.2, "unit": "MILLIMETERS"}},
+        }
+        for offset in range(count)
+    ]
+
+
+# EXPECTED_SYNTHETIC_VALID_AT is EXPECTED_SYNTHETIC_ISSUED_AT + 12 h, so 24
+# contiguous records span leads 12-35 and google.py's lead filter
+# (`lead < 1 or lead > req.max_lead_hours`) retains leads 12-24 at
+# max_lead_hours=24 -- thirteen of the twenty-four raw records. That gap is
+# the point of the case: a whole raw sequence, a strictly smaller sample set.
+GOOGLE_RETAINED_LEADS = set(range(12, 25))
+GOOGLE_RETAINED_VALID_ATS = {_synthetic_start_time(offset) for offset in range(13)}
+
+SINGLE_HOUR_VALID_ATS = {EXPECTED_SYNTHETIC_VALID_AT}
+SINGLE_HOUR_LEADS = {12}
 
 ADAPTER_SNAP_CASES = (
     (
@@ -101,6 +143,8 @@ ADAPTER_SNAP_CASES = (
                 }
             ]
         },
+        SINGLE_HOUR_VALID_ATS,
+        SINGLE_HOUR_LEADS,
     ),
     (
         "openweathermap",
@@ -116,6 +160,8 @@ ADAPTER_SNAP_CASES = (
                 }
             ]
         },
+        SINGLE_HOUR_VALID_ATS,
+        SINGLE_HOUR_LEADS,
     ),
     (
         "weatherapi",
@@ -137,6 +183,8 @@ ADAPTER_SNAP_CASES = (
                 ]
             }
         },
+        SINGLE_HOUR_VALID_ATS,
+        SINGLE_HOUR_LEADS,
     ),
     (
         "meteosource",
@@ -154,26 +202,16 @@ ADAPTER_SNAP_CASES = (
                 ]
             }
         },
+        SINGLE_HOUR_VALID_ATS,
+        SINGLE_HOUR_LEADS,
     ),
     (
         "google",
         GoogleAdapter,
         google_feed,
-        {
-            "forecastHours": [
-                {
-                    "interval": {"startTime": EXPECTED_SYNTHETIC_VALID_AT},
-                    "temperature": {"degrees": 20.0, "unit": "CELSIUS"},
-                    "wind": {
-                        "speed": {
-                            "value": 36.0,
-                            "unit": "KILOMETERS_PER_HOUR",
-                        }
-                    },
-                    "precipitation": {"qpf": {"quantity": 1.2, "unit": "MILLIMETERS"}},
-                }
-            ]
-        },
+        {"forecastHours": _google_forecast_hours(GOOGLE_SNAP_RECORD_COUNT)},
+        GOOGLE_RETAINED_VALID_ATS,
+        GOOGLE_RETAINED_LEADS,
     ),
 )
 
@@ -284,7 +322,7 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('MissingKey', 47, 25, 900, 'UTC')
+            VALUES ('MissingKey', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -381,7 +419,14 @@ def test_snap_run_fixed_time_matches_cadence_floor(provider: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("provider", "adapter_cls", "provider_module", "payload"),
+    (
+        "provider",
+        "adapter_cls",
+        "provider_module",
+        "payload",
+        "expected_valid_ats",
+        "expected_leads",
+    ),
     ADAPTER_SNAP_CASES,
 )
 def test_new_provider_adapters_emit_shared_synthetic_run(
@@ -390,8 +435,16 @@ def test_new_provider_adapters_emit_shared_synthetic_run(
     adapter_cls,
     provider_module,
     payload,
+    expected_valid_ats,
+    expected_leads,
 ) -> None:
-    """Each adapter must emit the shared snap in its real normalized samples."""
+    """Each adapter must emit the shared snap in its real normalized samples.
+
+    ``issued_at``/``model``/``model_run_id`` stay single-valued for every
+    provider -- that is the shared-snap contract this test exists for. Only
+    ``valid_at`` and ``lead_hours`` are per-case, because Google now collects a
+    horizon-derived page where the other four yield a single hour.
+    """
     monkeypatch.setattr(
         provider_module,
         "snap_run",
@@ -406,8 +459,8 @@ def test_new_provider_adapters_emit_shared_synthetic_run(
             adapter = adapter_cls("test-key", client)
             result = await adapter.fetch_forecast(
                 ForecastRequest(
-                    lat=47.0,
-                    lon=25.0,
+                    lat=SYNTHETIC_SITE_LAT,
+                    lon=SYNTHETIC_SITE_LON,
                     model="blend",
                     variables=("temperature", "wind", "precip"),
                     max_lead_hours=24,
@@ -420,8 +473,8 @@ def test_new_provider_adapters_emit_shared_synthetic_run(
     assert samples, provider
     assert {sample.model for sample in samples} == {"blend"}
     assert {sample.issued_at for sample in samples} == {EXPECTED_SYNTHETIC_ISSUED_AT}
-    assert {sample.valid_at for sample in samples} == {EXPECTED_SYNTHETIC_VALID_AT}
-    assert {sample.lead_hours for sample in samples} == {12}
+    assert {sample.valid_at for sample in samples} == expected_valid_ats
+    assert {sample.lead_hours for sample in samples} == expected_leads
     assert {sample.model_run_id for sample in samples} == {
         f"blend:{EXPECTED_SYNTHETIC_ISSUED_AT}"
     }
@@ -439,7 +492,7 @@ def test_no_op_zero_usable_samples_stamps_sentinel(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('NoOpZero', 47, 25, 900, 'UTC')
+            VALUES ('NoOpZero', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -508,7 +561,7 @@ def test_no_op_idempotent_refetch_not_flagged(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('NoOpIdempotent', 47, 25, 900, 'UTC')
+            VALUES ('NoOpIdempotent', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -602,7 +655,7 @@ def test_historical_path_clears_error_state_unconditionally(tmp_path: Path) -> N
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('HistoricalClear', 47, 25, 900, 'UTC')
+            VALUES ('HistoricalClear', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -675,7 +728,7 @@ def test_no_op_render_status_ladder_ordering(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('NoOpRender', 47, 25, 900, 'UTC')
+                    VALUES ('NoOpRender', 40, -105, 900, 'UTC')
                     """
                 ).lastrowid
             )

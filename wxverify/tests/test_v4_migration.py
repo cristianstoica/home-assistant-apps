@@ -246,12 +246,12 @@ def _build_v3_db(db_path: Path) -> tuple[dict[int, str], list[dict[str, object]]
 
     site_timezones: dict[int, str] = {}
     for name, timezone in (
-        ("SITE-ALPHA", "Europe/Bucharest"),
+        ("SITE-ALPHA", "Europe/Athens"),
         ("SITE-BETA", "UTC"),
     ):
         raw.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES (?, 47.0, 25.0, 900.0, ?)",
+            " timezone) VALUES (?, 40.0, -105.0, 900.0, ?)",
             (name, timezone),
         )
         site_id = int(raw.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -480,7 +480,7 @@ def test_v3_to_v4_unique_key_now_includes_generation(tmp_path: Path) -> None:
     cur = conn.execute(
         """
         INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'Europe/Bucharest', 'retrospective_correction', 'building')
+        VALUES (?, 'Europe/Athens', 'retrospective_correction', 'building')
         """,
         (site_id,),
     )

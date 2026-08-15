@@ -306,7 +306,7 @@ def _make_verification_site(conn: sqlite3.Connection) -> tuple[int, list[int]]:
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('verify-town', 47.0, 25.0, 900.0, 'UTC')
+        VALUES ('verify-town', 40.0, -105.0, 900.0, 'UTC')
         """
     )
     assert cur.lastrowid is not None

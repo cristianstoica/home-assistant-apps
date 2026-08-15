@@ -13,7 +13,7 @@ file-backed ``tmp_path`` database through the real app, mirroring the pattern
 in ``tests/test_m1_m5.py``.
 
 Synthetic data only (public repo): fake site names, the repo's existing
-47/25 lat-lon convention, no real station or device identifiers.
+40/-105 lat-lon convention, no real station or device identifiers.
 """
 
 from __future__ import annotations
@@ -123,7 +123,7 @@ def _seed_into(conn: sqlite3.Connection, *, package_present: bool) -> _FeedHealt
                 """
                 INSERT INTO sites
                     (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-                VALUES (?, 47.0, 25.0, 900.0, 'UTC', ?)
+                VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
                 """,
                 (name, enabled),
             ).lastrowid
@@ -276,7 +276,7 @@ def test_the_two_surfaces_order_sites_by_different_collations() -> None:
     for name in ("aardvark site", "Zulu site"):
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone, enabled) VALUES (?, 47.0, 25.0, 900.0, 'UTC', 1)",
+            " timezone, enabled) VALUES (?, 40.0, -105.0, 900.0, 'UTC', 1)",
             (name,),
         )
     ops_names = [r.site_name for r in load_feed_health(conn)]
@@ -400,8 +400,8 @@ def _mark_error(
     target = FeedFetchTarget(
         site_id=site_id,
         feed_id=feed_id,
-        lat=47.0,
-        lon=25.0,
+        lat=40.0,
+        lon=-105.0,
         source="provider-two",
         model="modelB",
         max_lead_hours=168,
@@ -637,7 +637,7 @@ def test_backfill_site_htmx_fragment_does_not_load_ops(
                         """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Backfill Target', 47.0, 25.0, 900.0, 'UTC')
+                    VALUES ('Backfill Target', 40.0, -105.0, 900.0, 'UTC')
                     """
                     ).lastrowid
                 )

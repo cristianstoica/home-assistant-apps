@@ -83,7 +83,7 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', ?)
+            VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
             """,
             (name, enabled),
         ).lastrowid
@@ -1271,7 +1271,7 @@ def test_import_round_trip_rebuilds_derived_tables(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'SYN-STATION-B1', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'SYN-STATION-B1', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_b,),
             ).lastrowid
@@ -1428,7 +1428,7 @@ def _sqlite_bytes_with_late_blob_variable(path: Path) -> bytes:
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, 'IBLOBSTATION1', 47.0, 25.0, 900.0)
+                VALUES (?, 'IBLOBSTATION1', 40.0, -105.0, 900.0)
                 """,
                 (site_id,),
             ).lastrowid
@@ -2111,7 +2111,7 @@ def test_boot_resumes_interrupted_import_rebuild(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'SYN-STATION-BOOT1', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'SYN-STATION-BOOT1', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_b,),
             ).lastrowid

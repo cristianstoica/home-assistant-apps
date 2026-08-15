@@ -69,7 +69,7 @@ NEW_PROVIDER_MAX_LEAD_HOURS: Final[tuple[tuple[str, int], ...]] = (
     ("openweathermap", 48),
     ("weatherapi", 72),
     ("meteosource", 24),
-    ("google", 24),
+    ("google", 168),
 )
 
 FEED_SEEDS: Final[tuple[FeedSeed, ...]] = (

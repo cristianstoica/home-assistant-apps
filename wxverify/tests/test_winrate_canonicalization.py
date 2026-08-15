@@ -18,7 +18,7 @@ unnoticed. The one accepted exception is that it imports
 sides together and is not caught by this file.
 
 Synthetic data only (public repo): fake site names, the repo's existing
-47/25 lat-lon convention, no real station or device identifiers.
+40/-105 lat-lon convention, no real station or device identifiers.
 """
 
 from __future__ import annotations
@@ -160,7 +160,7 @@ def _insert_site(conn: sqlite3.Connection, name: str) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES (?, 47, 25, 900, 'UTC')
+            VALUES (?, 40, -105, 900, 'UTC')
             """,
             (name,),
         ).lastrowid

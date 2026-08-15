@@ -33,7 +33,7 @@ sub-tests monkeypatch a not-yet-existing ``enqueue_score_rescore`` symbol
 on the missing attribute until it lands -- they are NOT part of the
 failing-test-first set.
 
-Synthetic fixtures only -- fake site names and the repo's existing 47/25
+Synthetic fixtures only -- fake site names and the repo's existing 40/-105
 lat-lon convention (already used throughout the sibling composite suite), no
 real keys or station IDs.
 """
@@ -111,7 +111,7 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', ?)
+            VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
             """,
             (name, enabled),
         ).lastrowid

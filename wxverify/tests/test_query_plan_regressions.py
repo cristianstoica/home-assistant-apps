@@ -112,7 +112,7 @@ def test_sample_rollup_sql_seeks_the_covering_unique_autoindex() -> None:
     site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanRollup', 47, 25, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanRollup', 40, -105, 900, 'UTC')"
         ).lastrowid
     )
     # 17-key meteoblue IN list, not a single-key feed — the real production
@@ -150,7 +150,7 @@ def test_model_run_count_sql_requires_idx_samples_runs() -> None:
     site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanRuns', 47, 25, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanRuns', 40, -105, 900, 'UTC')"
         ).lastrowid
     )
     feed_ids = _seed_meteoblue_package_with_16_members(
@@ -187,7 +187,7 @@ def test_bad_sample_count_sql_requires_idx_samples_invalid() -> None:
     site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanBad', 47, 25, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanBad', 40, -105, 900, 'UTC')"
         ).lastrowid
     )
     feed_ids = _seed_meteoblue_package_with_16_members(
@@ -348,13 +348,13 @@ def _seed_jobs_across_two_sites(conn: sqlite3.Connection, *, rows: int) -> int:
     site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanJobsA', 47, 25, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanJobsA', 40, -105, 900, 'UTC')"
         ).lastrowid
     )
     other_site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanJobsB', 48, 26, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanJobsB', 41, -104, 900, 'UTC')"
         ).lastrowid
     )
     base = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
@@ -418,7 +418,7 @@ def _seeded_recent_metrics_fixture() -> tuple[
     site_id = int(
         conn.execute(
             "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES ('QueryPlanRecent', 47, 25, 900, 'UTC')"
+            " timezone) VALUES ('QueryPlanRecent', 40, -105, 900, 'UTC')"
         ).lastrowid
     )
     feed_ids = _seed_meteoblue_package_with_16_members(

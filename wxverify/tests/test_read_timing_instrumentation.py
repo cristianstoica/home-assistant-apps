@@ -498,7 +498,7 @@ def _seed_one_sample_and_one_pair(conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('WorkerStatusCounts', 47, 25, 900, 'UTC')
+            VALUES ('WorkerStatusCounts', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )

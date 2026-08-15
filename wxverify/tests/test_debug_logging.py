@@ -69,7 +69,7 @@ def _insert_site(conn: sqlite3.Connection) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('LogTest', 47.0, 25.0, 900.0, 'UTC')
+            VALUES ('LogTest', 40.0, -105.0, 900.0, 'UTC')
             """
         ).lastrowid
     )
@@ -681,8 +681,8 @@ def test_open_meteo_debug_lines_present_at_debug(
 
     # Minimal valid open-meteo response shape
     fake_payload = {
-        "latitude": 47.0,
-        "longitude": 25.0,
+        "latitude": 40.0,
+        "longitude": -105.0,
         "elevation": 900.0,
         "hourly": {
             "time": [],
@@ -706,8 +706,8 @@ def test_open_meteo_debug_lines_present_at_debug(
     from wxverify.feeds.seam import ForecastRequest  # noqa: PLC0415
 
     req = ForecastRequest(
-        lat=47.0,
-        lon=25.0,
+        lat=40.0,
+        lon=-105.0,
         model="ecmwf_ifs",
         variables=("temperature", "wind", "precip"),
         max_lead_hours=168,

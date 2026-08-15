@@ -64,7 +64,7 @@ def _insert_site(conn: sqlite3.Connection) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('PatchTest', 47.0, 25.0, 900.0, 'UTC')
+            VALUES ('PatchTest', 40.0, -105.0, 900.0, 'UTC')
             """
         ).lastrowid
     )

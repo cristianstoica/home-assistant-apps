@@ -114,7 +114,7 @@ def _make_conn() -> sqlite3.Connection:
 def _seed_site(conn: sqlite3.Connection, *, name: str = "SITE-A") -> int:
     conn.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES (?, 47.0, 25.0, 900.0, 'UTC')",
+        " VALUES (?, 40.0, -105.0, 900.0, 'UTC')",
         (name,),
     )
     return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
@@ -134,7 +134,7 @@ def _seed_station(
         "INSERT INTO stations"
         " (site_id, pws_station_id, lat, lon, dem_elevation_m,"
         "  enabled, last_run_at, last_error, error_count)"
-        " VALUES (?, ?, 47.0, 25.0, 900.0, ?, ?, ?, ?)",
+        " VALUES (?, ?, 40.0, -105.0, 900.0, ?, ?, ?, ?)",
         (site_id, pws_id, enabled, last_run_at, last_error, error_count),
     )
     return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])

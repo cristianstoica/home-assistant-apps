@@ -301,7 +301,7 @@ def _seed_site(conn: sqlite3.Connection, *, enabled: int = 1) -> int:
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,
                                timezone, enabled)
-            VALUES ('S', 47.0, 25.0, 900.0, 'UTC', ?)
+            VALUES ('S', 40.0, -105.0, 900.0, 'UTC', ?)
             """,
             (enabled,),
         ).lastrowid
@@ -470,7 +470,7 @@ def test_liveness_disabled_site_and_unsubscribed_feed_do_not_trip(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE2', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'FAKE2', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             )
@@ -534,7 +534,7 @@ def test_obs_stale_uses_sites_last_obs_at(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE1', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'FAKE1', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             )
@@ -717,7 +717,7 @@ def test_liveness_recent_completed_job_does_not_trip(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'FAKE3', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'FAKE3', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             )
@@ -2062,7 +2062,7 @@ def test_key_missing_weathercom_arm_positive(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'WXCFAKE1', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'WXCFAKE1', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             )
@@ -2223,7 +2223,7 @@ def test_key_missing_weathercom_arm_key_present_negative(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'WXCFAKE2', 47.0, 25.0, 900.0, 1)
+                VALUES (?, 'WXCFAKE2', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             )

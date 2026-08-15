@@ -269,7 +269,7 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Test', 47.0, 25.0, 900.0, 'Europe/Bucharest')
+        VALUES ('Test', 40.0, -105.0, 900.0, 'Europe/Athens')
         """
     )
     site_id = int(cur.lastrowid)
@@ -341,7 +341,7 @@ def test_worker_status_exposes_runtime_and_completed_job_fields(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Runtime', 47, 25, 900, 'UTC')
+                    VALUES ('Runtime', 40, -105, 900, 'UTC')
                     """
                 ).lastrowid
             )
@@ -610,7 +610,7 @@ def test_v1_migration_adds_backfill_columns(tmp_path: Path) -> None:
     raw.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Old', 47, 25, 900, 'UTC')
+        VALUES ('Old', 40, -105, 900, 'UTC')
         """
     )
     raw.execute("PRAGMA user_version = 1")
@@ -644,7 +644,7 @@ def test_queue_dedupe_and_stale_reclaim(tmp_path: Path) -> None:
     site_id = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Q', 47, 25, 900, 'UTC')
+        VALUES ('Q', 40, -105, 900, 'UTC')
         """
     ).lastrowid
     first = enqueue_if_absent(conn, "fetch_feed", site_id, "fetch:1", {"feed_id": 1})
@@ -670,7 +670,7 @@ def test_claim_next_job_dispositions_unreadable_row_instead_of_returning_it(
     site_id = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Q', 47, 25, 900, 'UTC')
+        VALUES ('Q', 40, -105, 900, 'UTC')
         """
     ).lastrowid
     bad_id = int(
@@ -724,7 +724,7 @@ def test_claim_next_job_dispositions_blob_retry_count_instead_of_returning_it(
     site_id = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Q', 47, 25, 900, 'UTC')
+        VALUES ('Q', 40, -105, 900, 'UTC')
         """
     ).lastrowid
     bad_id = int(
@@ -849,7 +849,7 @@ def test_pws_parser_and_fetch_obs_refresh(
                 "secret-weather",
                 window_start="2026-06-22T00:00:00Z",
                 window_end="2026-06-24T00:00:00Z",
-                timezone="Europe/Bucharest",
+                timezone="Europe/Athens",
                 client=client,
             )
 
@@ -864,14 +864,14 @@ def test_pws_parser_and_fetch_obs_refresh(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Obs', 47, 25, 900, 'UTC')
+            VALUES ('Obs', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
     conn.execute(
         """
         INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-        VALUES (?, 'OBS1', 47, 25, 900)
+        VALUES (?, 'OBS1', 40, -105, 900)
         """,
         (site_id,),
     )
@@ -956,8 +956,8 @@ def test_pws_parser_and_fetch_obs_refresh(
 
         def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
             seen["request"] = req
-            assert req.lat == 47
-            assert req.lon == 25
+            assert req.lat == 40
+            assert req.lon == -105
             assert req.variables == ("temperature", "wind", "precip")
             return CostEstimate(calls=1)
 
@@ -976,8 +976,8 @@ def test_pws_parser_and_fetch_obs_refresh(
                     )
                 ],
                 grid=GridProvenance(
-                    grid_lat=47.01,
-                    grid_lon=25.02,
+                    grid_lat=40.01,
+                    grid_lon=-104.98,
                     grid_elevation_m=901.0,
                 ),
             )
@@ -1024,8 +1024,8 @@ def test_pws_parser_and_fetch_obs_refresh(
     assert state["last_run_at"] is not None
     assert state["last_error"] is None
     assert state["error_count"] == 0
-    assert state["grid_lat"] == pytest.approx(47.01)
-    assert state["grid_lon"] == pytest.approx(25.02)
+    assert state["grid_lat"] == pytest.approx(40.01)
+    assert state["grid_lon"] == pytest.approx(-104.98)
     assert state["grid_elevation_m"] == pytest.approx(901.0)
     assert seen["source"] == "open-meteo"
     assert (
@@ -1062,7 +1062,7 @@ def test_station_call_pacing_is_seeded_bounded_and_used_by_fetch_obs(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Cluster', 47, 25, 900, 'UTC')
+            VALUES ('Cluster', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -1073,7 +1073,7 @@ def test_station_call_pacing_is_seeded_bounded_and_used_by_fetch_obs(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, ?, 47, 25, 900)
+                VALUES (?, ?, 40, -105, 900)
                 """,
                 (site_id, pws_id),
             ).lastrowid
@@ -1143,7 +1143,7 @@ def test_backfill_and_catchup_write_domain_state(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Backfill', 47, 25, 900, 'UTC')
+            VALUES ('Backfill', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -1151,7 +1151,7 @@ def test_backfill_and_catchup_write_domain_state(
         conn.execute(
             """
             INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, 'BF1', 47, 25, 900)
+            VALUES (?, 'BF1', 40, -105, 900)
             """,
             (site_id,),
         ).lastrowid
@@ -1219,8 +1219,8 @@ def test_backfill_and_catchup_write_domain_state(
                     )
                 ],
                 grid=GridProvenance(
-                    grid_lat=47.1,
-                    grid_lon=25.1,
+                    grid_lat=40.1,
+                    grid_lon=-104.9,
                     grid_elevation_m=905.0,
                 ),
             )
@@ -1294,8 +1294,8 @@ def test_backfill_and_catchup_write_domain_state(
     ).fetchone()
     assert feed_state is not None
     assert feed_state["last_run_at"] is None
-    assert feed_state["grid_lat"] == pytest.approx(47.1)
-    assert feed_state["grid_lon"] == pytest.approx(25.1)
+    assert feed_state["grid_lat"] == pytest.approx(40.1)
+    assert feed_state["grid_lon"] == pytest.approx(-104.9)
     assert feed_state["grid_elevation_m"] == pytest.approx(905.0)
 
     conn.execute(
@@ -1371,14 +1371,14 @@ def test_backfill_fetches_pws_history_once_across_forecast_chunks(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Chunked', 47, 25, 900, 'UTC')
+            VALUES ('Chunked', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
     conn.execute(
         """
         INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-        VALUES (?, 'BF2', 47, 25, 900)
+        VALUES (?, 'BF2', 40, -105, 900)
         """,
         (site_id,),
     )
@@ -1504,9 +1504,9 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
                 """
                 INSERT INTO sites
                     (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                VALUES (?, ?, 25, 900, 'UTC')
+                VALUES (?, ?, -105, 900, 'UTC')
                 """,
-                (f"Catchup {index}", 47.0 + index),
+                (f"Catchup {index}", 40.0 + index),
             ).lastrowid
         )
         station_id = int(
@@ -1514,7 +1514,7 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, ?, 47, 25, 900)
+                VALUES (?, ?, 40, -105, 900)
                 """,
                 (site_id, f"CU{index}"),
             ).lastrowid
@@ -1646,9 +1646,9 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
     assert second is None
     assert pws_calls == []
     assert forecast_calls == [
-        (47.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
-        (48.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
-        (49.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
+        (40.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
+        (41.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
+        (42.0, "2026-06-23T00:00:00Z", "2026-06-23T01:00:00Z"),
     ]
     assert (
         conn.execute("SELECT COUNT(*) AS n FROM forecast_samples").fetchone()["n"] == 3
@@ -1671,7 +1671,7 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Score', 47, 25, 900, 'UTC')
+            VALUES ('Score', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -1679,7 +1679,7 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, 'S1', 47, 25, 900)
+            VALUES (?, 'S1', 40, -105, 900)
             """,
             (site_id,),
         ).lastrowid
@@ -1703,7 +1703,7 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, ?, 47, 25, 900)
+                VALUES (?, ?, 40, -105, 900)
                 """,
                 (site_id, name),
             ).lastrowid
@@ -1911,7 +1911,7 @@ def test_corrected_observation_rebuilds_future_persistence(tmp_path: Path) -> No
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Persistence', 47, 25, 900, 'UTC')
+            VALUES ('Persistence', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -1919,7 +1919,7 @@ def test_corrected_observation_rebuilds_future_persistence(tmp_path: Path) -> No
         conn.execute(
             """
             INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, 'P1', 47, 25, 900)
+            VALUES (?, 'P1', 40, -105, 900)
             """,
             (site_id,),
         ).lastrowid
@@ -2011,7 +2011,7 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone,
                  rain_threshold_mm)
-            VALUES ('Shared Skill', 47, 25, 900, 'UTC', 0.2)
+            VALUES ('Shared Skill', 40, -105, 900, 'UTC', 0.2)
             """
         ).lastrowid
     )
@@ -2229,7 +2229,7 @@ def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Winrate', 47, 25, 900, 'UTC')
+            VALUES ('Winrate', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2345,7 +2345,7 @@ def test_winrate_applies_window_to_canonical_cells(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Winrate Window', 47, 25, 900, 'UTC')
+            VALUES ('Winrate Window', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2445,7 +2445,7 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Composite', 47, 25, 900, 'UTC')
+            VALUES ('Composite', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2569,7 +2569,7 @@ def test_composite_custom_window_computes_live_without_cache(tmp_path: Path) -> 
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Composite Live', 47, 25, 900, 'UTC')
+            VALUES ('Composite Live', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2628,7 +2628,7 @@ def test_subscription_rebuilds_multimodel_mean(tmp_path: Path) -> None:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Mean Rebuild', 47, 25, 900, 'UTC')
+            VALUES ('Mean Rebuild', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2726,7 +2726,7 @@ def test_meteoblue_package_gates_members_for_leaderboard_and_mean(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Meteoblue Gate', 47, 25, 900, 'UTC')
+            VALUES ('Meteoblue Gate', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -2853,7 +2853,7 @@ def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Readthrough', 47, 25, 900, 'UTC')
+                    VALUES ('Readthrough', 40, -105, 900, 'UTC')
                     """
                 ).lastrowid
             )
@@ -2928,7 +2928,7 @@ def test_cached_leaderboard_misses_when_active_feed_cache_is_incomplete(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Partial Cache', 47, 25, 900, 'UTC')
+            VALUES ('Partial Cache', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -3001,7 +3001,7 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Recompute', 47, 25, 900, 'UTC')
+                    VALUES ('Recompute', 40, -105, 900, 'UTC')
                     """
                 ).lastrowid
             )
@@ -3010,7 +3010,7 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """
                     INSERT INTO stations
                         (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                    VALUES (?, 'A', 47, 25, 900)
+                    VALUES (?, 'A', 40, -105, 900)
                     """,
                     (site_id,),
                 ).lastrowid
@@ -3020,7 +3020,7 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """
                     INSERT INTO stations
                         (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                    VALUES (?, 'B', 47, 25, 900)
+                    VALUES (?, 'B', 40, -105, 900)
                     """,
                     (site_id,),
                 ).lastrowid
@@ -3121,7 +3121,7 @@ def test_provider_http_errors_are_redacted_before_persisting(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Redact', 47, 25, 900, 'UTC')
+            VALUES ('Redact', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -3198,10 +3198,10 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
 
     async def fake_validate_station(station_id: str, api_key: str) -> PwsStation:
         assert api_key == "secret-weather"
-        return PwsStation(station_id=station_id, lat=47.1, lon=25.1)
+        return PwsStation(station_id=station_id, lat=40.1, lon=-104.9)
 
     async def fake_lookup_elevation_m(lat: float, lon: float) -> float:
-        assert (lat, lon) == (47.1, 25.1)
+        assert (lat, lon) == (40.1, -104.9)
         return 910.0
 
     monkeypatch.setattr(
@@ -3218,8 +3218,8 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
             "/api/sites",
             json={
                 "name": "API",
-                "forecast_lat": 47.0,
-                "forecast_lon": 25.0,
+                "forecast_lat": 40.0,
+                "forecast_lon": -105.0,
                 "elevation_m": 900.0,
                 "timezone": "UTC",
             },
@@ -3232,8 +3232,8 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
             "/api/sites",
             json={
                 "name": "Bad TZ",
-                "forecast_lat": 47.0,
-                "forecast_lon": 25.0,
+                "forecast_lat": 40.0,
+                "forecast_lon": -105.0,
                 "elevation_m": 900.0,
                 "timezone": "Not/AZone",
             },
@@ -3243,7 +3243,7 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
 
         rejected_identity = client.put(
             f"/api/sites/{site_id}",
-            json={"forecast_lat": 48.0},
+            json={"forecast_lat": 41.0},
             headers=headers,
         )
         assert rejected_identity.status_code == 422
@@ -3257,7 +3257,7 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
         assert station.json()["dem_elevation_m"] == 910.0
         rejected_station_identity = client.post(
             f"/api/sites/{site_id}/stations",
-            json={"pws_station_id": "TEST2", "lat": 47.1},
+            json={"pws_station_id": "TEST2", "lat": 40.1},
             headers=headers,
         )
         assert rejected_station_identity.status_code == 422
@@ -3322,7 +3322,7 @@ def test_health_feeds_reports_disabled_site_no_data_and_errors(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Active Health', 47, 25, 900, 'UTC')
+                    VALUES ('Active Health', 40, -105, 900, 'UTC')
                     """
                 ).lastrowid
             )
@@ -3332,7 +3332,7 @@ def test_health_feeds_reports_disabled_site_no_data_and_errors(
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone,
                          enabled)
-                    VALUES ('Disabled Health', 47, 25, 900, 'UTC', 0)
+                    VALUES ('Disabled Health', 40, -105, 900, 'UTC', 0)
                     """
                 ).lastrowid
             )
@@ -3503,8 +3503,8 @@ def test_site_create_does_not_require_weather_key_but_station_does(
             "/api/sites",
             json={
                 "name": "No key",
-                "forecast_lat": 47.0,
-                "forecast_lon": 25.0,
+                "forecast_lat": 40.0,
+                "forecast_lon": -105.0,
                 "elevation_m": 900.0,
                 "timezone": "UTC",
             },
@@ -3565,10 +3565,10 @@ def test_ui_root_path_htmx_and_create_site_fragment(tmp_path: Path) -> None:
             "/api/sites",
             json={
                 "name": "Ingress Site",
-                "forecast_lat": 47.0,
-                "forecast_lon": 25.0,
+                "forecast_lat": 40.0,
+                "forecast_lon": -105.0,
                 "elevation_m": 900.0,
-                "timezone": "Europe/Bucharest",
+                "timezone": "Europe/Athens",
             },
             headers={
                 "Origin": "http://testserver",
@@ -3588,10 +3588,10 @@ def test_ui_root_path_htmx_and_create_site_fragment(tmp_path: Path) -> None:
             "/api/sites",
             json={
                 "name": "Second Ingress Site",
-                "forecast_lat": 47.2,
-                "forecast_lon": 25.2,
+                "forecast_lat": 40.2,
+                "forecast_lon": -104.8,
                 "elevation_m": 910.0,
-                "timezone": "Europe/Bucharest",
+                "timezone": "Europe/Athens",
             },
             headers={
                 "Origin": "http://testserver",
@@ -3614,7 +3614,7 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Smoke', 47, 25, 900, 'UTC')
+            VALUES ('Smoke', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -3623,7 +3623,7 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES ('Paused Smoke', 48, 26, 910, 'UTC', 0)
+            VALUES ('Paused Smoke', 41, -104, 910, 'UTC', 0)
             """
         ).lastrowid
     )
@@ -3703,8 +3703,8 @@ def test_open_meteo_historical_trace_negative_precip_clamp_preserves_raw() -> No
             return httpx.Response(
                 200,
                 json={
-                    "latitude": 47.1,
-                    "longitude": 25.1,
+                    "latitude": 40.1,
+                    "longitude": -104.9,
                     "elevation": 901.0,
                     "hourly": {
                         "time": ["2026-01-02T01:00", "2026-01-02T02:00"],
@@ -3716,8 +3716,8 @@ def test_open_meteo_historical_trace_negative_precip_clamp_preserves_raw() -> No
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             historical = await OpenMeteoAdapter(client).fetch_historical(
                 ForecastRequest(
-                    lat=47,
-                    lon=25,
+                    lat=40,
+                    lon=-105,
                     model="jma_gsm",
                     variables=("precip",),
                     max_lead_hours=24,
@@ -3768,8 +3768,8 @@ def test_meteoblue_parser_and_member_registration(
             return httpx.Response(
                 200,
                 json={
-                    "latitude": 47.1,
-                    "longitude": 25.1,
+                    "latitude": 40.1,
+                    "longitude": -104.9,
                     "elevation": 901.0,
                     "hourly": {
                         "time": ["2026-01-03T00:00"],
@@ -3785,8 +3785,8 @@ def test_meteoblue_parser_and_member_registration(
         ) as client:
             historical = await OpenMeteoAdapter(client).fetch_historical(
                 ForecastRequest(
-                    lat=47,
-                    lon=25,
+                    lat=40,
+                    lon=-105,
                     model="ecmwf_ifs",
                     variables=("temperature", "wind", "precip"),
                     max_lead_hours=48,
@@ -3808,8 +3808,8 @@ def test_meteoblue_parser_and_member_registration(
             "metadata": {
                 "models": ["gfs", "icon"],
                 "modelrun_utc": ["2026-01-01 00:00", "2026-01-01 00:00"],
-                "latitude": 47.05,
-                "longitude": 25.05,
+                "latitude": 40.05,
+                "longitude": -104.95,
                 "height": 910.0,
             },
             "multimodel": {
@@ -3832,8 +3832,8 @@ def test_meteoblue_parser_and_member_registration(
         ) as client:
             result = await MeteoblueAdapter("key", client).fetch_forecast(
                 ForecastRequest(
-                    lat=47,
-                    lon=25,
+                    lat=40,
+                    lon=-105,
                     model="multimodel",
                     variables=("temperature", "wind", "precip"),
                     max_lead_hours=168,
@@ -3861,7 +3861,7 @@ def test_meteoblue_parser_and_member_registration(
                 """
                 INSERT INTO sites
                     (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                VALUES ('M7', 47, 25, 900, 'UTC')
+                VALUES ('M7', 40, -105, 900, 'UTC')
                 """
             ).lastrowid
         )
@@ -3929,7 +3929,7 @@ def test_options_boot_apply_bad_options_and_packaging_files(tmp_path: Path) -> N
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Boot', 47, 25, 900, 'UTC')
+            VALUES ('Boot', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -4149,7 +4149,7 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Oracle', 47.0, 25.0, 900.0, 'UTC')
+                    VALUES ('Oracle', 40.0, -105.0, 900.0, 'UTC')
                     """
                 ).lastrowid
             )
@@ -4255,7 +4255,7 @@ def test_operator_backfill_retry_ignores_recent_terminal_failure_cooldown(
                     """
                     INSERT INTO sites
                         (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('OperatorRetry', 47.0, 25.0, 900.0, 'UTC')
+                    VALUES ('OperatorRetry', 40.0, -105.0, 900.0, 'UTC')
                     """
                 ).lastrowid
             )

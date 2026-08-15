@@ -65,7 +65,7 @@ def _make_run(conn: sqlite3.Connection) -> tuple[int, int, RunConfig]:
                 """
                 INSERT INTO sites
                     (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                VALUES ('site-alpha', 47.0, 25.0, 900.0, 'UTC')
+                VALUES ('site-alpha', 40.0, -105.0, 900.0, 'UTC')
                 """
             ).lastrowid,
         )
@@ -110,7 +110,14 @@ def _make_run(conn: sqlite3.Connection) -> tuple[int, int, RunConfig]:
         min_n=1,
         window_days=30,
         tz_generation_id=generation_id,
-        roster=(RosterFeed(feed_id=feed_id, source="alpha", model="model-alpha"),),
+        roster=(
+            RosterFeed(
+                feed_id=feed_id,
+                source="alpha",
+                model="model-alpha",
+                max_lead_hours=168,
+            ),
+        ),
         period_start=_DATES[0],
         period_end=_DATES[-1],
         bootstrap_seed=77,

@@ -1,16 +1,19 @@
 <section class="panel">
   <h2>Composite</h2>
-  <p class="panel-hint">An overall ranking that blends skill and win rate into one score.</p>
+  <p class="panel-hint">An overall ranking. Each feed's score is the average of its
+    per-variable skill, and each variable is averaged over the leads that feed has
+    data for — so feeds with different horizons are not averaged over the same leads.</p>
   {% if composite %}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Feed</th><th>Score</th><th>Rank</th></tr></thead>
+        <thead><tr><th>Feed</th><th>Score</th><th>Rank</th><th>Leads</th></tr></thead>
         <tbody>
           {% for row in composite %}
             <tr>
               <td>{{ feed_label(row.source, row.model) }}</td>
               <td>{{ "%.3f"|format(row.score) if row.score is not none else "n/a" }}</td>
               <td>{{ loop.index }}</td>
+              <td title="{% for variable, count in row.lead_counts.items() %}{{ variable }} {{ count }}{{ '' if loop.last else ', ' }}{% endfor %}">{{ row.lead_cells_max }} / {{ row.lead_cells_total }}</td>
             </tr>
           {% endfor %}
         </tbody>

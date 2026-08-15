@@ -46,7 +46,7 @@ def _run(conn: sqlite3.Connection) -> int:
         """
         INSERT INTO sites (id, name, forecast_lat, forecast_lon, elevation_m,
                            timezone)
-        VALUES (1, 'site-alpha', 47.0, 25.0, 900.0, 'Etc/GMT+7')
+        VALUES (1, 'site-alpha', 40.0, -105.0, 900.0, 'Etc/GMT+7')
         """
     )
     generation_id = ensure_published_generation(conn, 1)

@@ -6,7 +6,7 @@ contains a comma -- plus the meteoblue-member roll-up and the exact key set
 the route publishes per feed.
 
 Synthetic data only (public repo): fake site names, the repo's existing
-47/25 lat-lon convention, no real station or device identifiers.
+40/-105 lat-lon convention, no real station or device identifiers.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _insert_site(conn: sqlite3.Connection) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('ProviderHealth', 47, 25, 900, 'UTC')
+            VALUES ('ProviderHealth', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -447,7 +447,7 @@ def _seed_a_site(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('HealthProvidersRoute', 47, 25, 900, 'UTC')
+        VALUES ('HealthProvidersRoute', 40, -105, 900, 'UTC')
         """
     )
 

@@ -720,6 +720,45 @@ def seed_default_settings(conn: sqlite3.Connection) -> None:
     )
 
 
+#: One-shot marker for the 0.12.0 Google horizon correction. Presence --
+#: not value -- is the gate, matching PUBLISH_HOLD_BOOTSTRAP_KEY.
+GOOGLE_HORIZON_CORRECTION_KEY = "google_horizon_correction_applied"
+
+
+def correct_google_horizon(conn: sqlite3.Connection) -> None:
+    """Raise the Google blend feed to the product's 7-day horizon, once.
+
+    Not a `user_version` migration: no schema shape changes, and older
+    code reads the corrected row correctly, so bumping the version
+    would assert an incompatibility that does not exist.
+
+    Targeted, not a general seed reconciliation: `seed_default_feeds`
+    runs on every open, so an UPSERT-all pass would reset the three
+    operator-writable columns (`enabled`, `fetch_interval_minutes`,
+    `default_subscribed`) at every boot.
+
+    The `runtime_state` marker -- not the `WHERE` clause -- is what
+    makes this one-shot. The `max_lead_hours = 24` predicate is
+    self-idempotent only while `max_lead_hours` is not
+    operator-writable (`api/routes/feeds.py`), which is a fact about a
+    different module; the marker does not depend on it.
+
+    Statement order is the crash guard, so no SAVEPOINT is needed:
+    `UPDATE` first, marker second. A crash between them leaves the row
+    at 168 with no marker, and the next boot re-runs an `UPDATE` that
+    matches nothing and writes the marker.
+    """
+    if get_runtime_state(conn, GOOGLE_HORIZON_CORRECTION_KEY) is not None:
+        return
+    conn.execute(
+        """
+        UPDATE feeds SET max_lead_hours = 168
+        WHERE source = 'google' AND model = 'blend' AND max_lead_hours = 24
+        """
+    )
+    set_runtime_state(conn, GOOGLE_HORIZON_CORRECTION_KEY, "applied")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -739,6 +778,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 4:
         logger.debug("migrations applying v4 timezone generations")
         migrate_v4(conn)
+    correct_google_horizon(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)

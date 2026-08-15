@@ -115,7 +115,7 @@ def create_app(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
-    ZoneInfo("Europe/Bucharest")
+    ZoneInfo("America/Denver")
     db = init_db(config.db_path)
     options = load_runtime_options()
     await db.write(reclaim_all_stale)
