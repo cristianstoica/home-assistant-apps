@@ -57,7 +57,7 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES (?, 47.0, 25.0, 900.0, 'UTC')
+        VALUES (?, 40.0, -105.0, 900.0, 'UTC')
         """,
         (name,),
     )

@@ -37,7 +37,7 @@ def _insert_site(conn: sqlite3.Connection) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Q', 47, 25, 900, 'UTC')
+            VALUES ('Q', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )
@@ -91,7 +91,7 @@ def test_hostile_fetch_interval_minutes_skips_only_that_feed(
         (bad_feed_id,),
     )
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.cadence"):
         targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
@@ -130,7 +130,7 @@ def test_hostile_fetch_interval_minutes_with_null_last_run_at_skips_that_feed(
     )
     # No site_feed_state row for either feed -> both have NULL last_run_at.
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.cadence"):
         targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
@@ -165,7 +165,7 @@ def test_hostile_non_integral_fetch_interval_minutes_with_null_last_run_at_skips
     )
     # No site_feed_state row for either feed -> both have NULL last_run_at.
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.cadence"):
         targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
@@ -198,7 +198,7 @@ def test_exact_integral_real_fetch_interval_minutes_is_accepted(
         "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
     )
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
     assert feed_id in {t.feed_id for t in targets}
@@ -215,7 +215,7 @@ def test_unparseable_last_run_at_skips_only_that_feed(
     _subscribe(conn, site_id, control_feed_id, last_run_at=far_past)
     _subscribe(conn, site_id, bad_feed_id, last_run_at="not-a-timestamp")
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
         targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
@@ -247,7 +247,7 @@ def test_overflowing_last_run_at_skips_only_that_feed(
     _subscribe(conn, site_id, control_feed_id, last_run_at=far_past)
     _subscribe(conn, site_id, bad_feed_id, last_run_at="9999-12-31T23:59:59-14:00")
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
         targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
@@ -277,7 +277,7 @@ def test_valid_interval_and_null_last_run_at_are_due(tmp_path: Path) -> None:
     # via the LEFT JOIN, so it must be due regardless of elapsed time, given
     # a parseable cadence.
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     targets = _due_open_meteo_targets(conn, site=site, window_end=utc_now())
 
     target_feed_ids = {t.feed_id for t in targets}
@@ -297,7 +297,7 @@ def test_not_yet_elapsed_valid_interval_is_not_due(tmp_path: Path) -> None:
     recent = isoformat_utc(now - timedelta(minutes=1))
     _subscribe(conn, site_id, feed_id, last_run_at=recent)
 
-    site = CatchupSite(site_id=site_id, lat=47.0, lon=25.0, timezone="UTC")
+    site = CatchupSite(site_id=site_id, lat=40.0, lon=-105.0, timezone="UTC")
     targets = _due_open_meteo_targets(conn, site=site, window_end=now)
 
     assert feed_id not in {t.feed_id for t in targets}

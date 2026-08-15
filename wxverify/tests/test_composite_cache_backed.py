@@ -24,7 +24,7 @@ a fixed past date (``2020-01-01T00:00:00Z``) for ``stale`` rows -- never the
 ``w:all``/2035-style always-fresh convention, which would silently skip the
 staleness branch entirely for a rolling-window row.
 
-Synthetic fixtures only -- fake site names and the repo's existing 47/25
+Synthetic fixtures only -- fake site names and the repo's existing 40/-105
 lat-lon convention (already used throughout this suite), no real keys or
 station IDs.
 """
@@ -109,7 +109,7 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', ?)
+            VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
             """,
             (name, enabled),
         ).lastrowid

@@ -35,6 +35,10 @@ class CompositeParts:
     model: str
     raw_components: dict[str, float] = field(default_factory=lambda: {})
     components: dict[str, float] = field(default_factory=lambda: {})
+    #: Per-variable count of day_ahead cells that entered that variable's
+    #: mean. Disclosure only -- feeds with different horizons average over
+    #: different lead sets, and this is what makes that legible.
+    lead_counts: dict[str, int] = field(default_factory=lambda: {})
 
 
 @dataclass(frozen=True)
@@ -241,6 +245,7 @@ def _cached_composite(
             raw = sum(scores) / len(scores)
             parts.raw_components[variable] = raw
             parts.components[variable] = max(0.0, raw)
+            parts.lead_counts[variable] = len(scores)
     return _format_composite(grouped, resolved.window_key), fresh
 
 
@@ -303,6 +308,7 @@ def _live_composite(
             raw = sum(scores) / len(scores)
             parts.raw_components[variable] = raw
             parts.components[variable] = max(0.0, raw)
+            parts.lead_counts[variable] = len(scores)
 
     return _format_composite(grouped, window_key)
 
@@ -325,6 +331,9 @@ def _format_composite(
                 "component_count": len(parts.components),
                 "components": dict(sorted(parts.components.items())),
                 "raw_components": dict(sorted(parts.raw_components.items())),
+                "lead_counts": dict(sorted(parts.lead_counts.items())),
+                "lead_cells_max": max(parts.lead_counts.values()),
+                "lead_cells_total": MAX_DAY_AHEAD + 1,
                 "score": score,
                 "raw_score": raw_score,
                 "badge": score_badge(score),

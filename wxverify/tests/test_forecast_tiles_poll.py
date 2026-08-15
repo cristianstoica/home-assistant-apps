@@ -68,7 +68,7 @@ def _make_site(
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', ?)
+            VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
             """,
             (name, enabled),
         ).lastrowid

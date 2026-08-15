@@ -74,7 +74,7 @@ def _make_site(
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('site-alpha', 47.0, 25.0, 900.0, 'UTC')
+        VALUES ('site-alpha', 40.0, -105.0, 900.0, 'UTC')
         """
     )
     assert cur.lastrowid is not None

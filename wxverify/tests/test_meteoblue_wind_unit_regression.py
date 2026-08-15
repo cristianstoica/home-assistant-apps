@@ -35,8 +35,8 @@ from wxverify.feeds.seam import ForecastRequest
 # ---------------------------------------------------------------------------
 
 _API_KEY = "test-key-wxv-synthetic"
-_LAT = 47.0
-_LON = 25.0
+_LAT = 40.0
+_LON = -105.0
 
 # Minimal valid meteoblue-shaped payload: two models, one hour, wind-only
 # focus.  Shape matches MeteoblueResponse/MeteoblueMetadata/MeteoblueData1h
@@ -47,8 +47,8 @@ _PAYLOAD = {
     "metadata": {
         "models": ["gfs"],
         "modelrun_utc": ["2026-01-01 00:00"],
-        "latitude": 47.05,
-        "longitude": 25.05,
+        "latitude": 40.05,
+        "longitude": -104.95,
         "height": 910.0,
     },
     "multimodel": {

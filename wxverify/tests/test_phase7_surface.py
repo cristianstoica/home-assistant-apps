@@ -87,7 +87,7 @@ def _make_site(conn: sqlite3.Connection, name: str = "Verify Town") -> int:
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES (?, 47.0, 25.0, 900.0, 'UTC', 1)
+            VALUES (?, 40.0, -105.0, 900.0, 'UTC', 1)
             """,
             (name,),
         ).lastrowid
@@ -435,8 +435,12 @@ def test_daily_rank_order_excludes_post_asof_revised_truth() -> None:
         window_days=30,
         tz_generation_id=generation_id,
         roster=(
-            RosterFeed(feed_id=101, source="syn-src", model="model-a"),
-            RosterFeed(feed_id=102, source="syn-src", model="model-b"),
+            RosterFeed(
+                feed_id=101, source="syn-src", model="model-a", max_lead_hours=168
+            ),
+            RosterFeed(
+                feed_id=102, source="syn-src", model="model-b", max_lead_hours=168
+            ),
         ),
         period_start="2026-05-01",
         period_end="2026-05-30",

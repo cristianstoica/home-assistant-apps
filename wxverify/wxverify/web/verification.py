@@ -267,6 +267,7 @@ def _snapshot_view(raw: object) -> dict[str, object] | None:
                     "feed_id": feed.get("feed_id"),
                     "source": feed.get("source"),
                     "model": feed.get("model"),
+                    "max_lead_hours": feed.get("max_lead_hours"),
                 }
             )
     return {

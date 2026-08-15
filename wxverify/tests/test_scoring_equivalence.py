@@ -327,9 +327,9 @@ def _make_db() -> sqlite3.Connection:
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,
                                timezone, rain_threshold_mm)
-            VALUES (?, 47.0, 25.0, 900.0, ?, 0.2)
+            VALUES (?, 40.0, -105.0, 900.0, ?, 0.2)
             """,
-            (name, "Europe/Bucharest" if name == "Test Alpha" else "UTC"),
+            (name, "Europe/Athens" if name == "Test Alpha" else "UTC"),
         )
     station_ids: dict[int, list[int]] = {}
     for site_id in (1, 2):
@@ -339,7 +339,7 @@ def _make_db() -> sqlite3.Connection:
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, ?, 47.0, 25.0, ?, 1)
+                VALUES (?, ?, 40.0, -105.0, ?, 1)
                 """,
                 (site_id, f"TESTPWS{site_id}{n:03d}", 900.0 + 5.0 * n),
             )

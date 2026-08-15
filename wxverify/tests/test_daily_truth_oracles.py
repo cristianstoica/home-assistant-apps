@@ -36,7 +36,7 @@ from wxverify.verification.truth import (
     regenerate_marked_truth,
 )
 
-_TZ_BUCHAREST = "Europe/Bucharest"
+_TZ_ATHENS = "Europe/Athens"
 
 
 def _conn() -> sqlite3.Connection:
@@ -57,7 +57,7 @@ def _make_site(
         INSERT INTO sites
             (name, forecast_lat, forecast_lon, elevation_m, timezone,
              rain_threshold_mm)
-        VALUES ('Oracle Site', 47.0, 25.0, 900.0, ?, ?)
+        VALUES ('Oracle Site', 40.0, -105.0, 900.0, ?, ?)
         """,
         (timezone, rain_threshold_mm),
     )
@@ -83,7 +83,7 @@ def _seed_obs(
     )
 
 
-def _bucharest_june_local_hours(local_hours: list[int]) -> list[tuple[str, float]]:
+def _athens_june_local_hours(local_hours: list[int]) -> list[tuple[str, float]]:
     """UTC-stamped samples for the given LOCAL hours of 2026-06-10 (UTC+3)."""
     out: list[tuple[str, float]] = []
     for local_hour in local_hours:
@@ -108,7 +108,7 @@ def _truth_rows(
 # --------------------------------------------------------------- O1: 18h gate
 
 
-def test_temp_min_hours_gate_exact_boundary_bucharest() -> None:
+def test_temp_min_hours_gate_exact_boundary_athens() -> None:
     """18 covered hours eligible, 17 excluded — kills M1 (`<` -> `<=`).
 
     Non-UTC timezone so the covered-hour count cannot come from a UTC
@@ -116,13 +116,13 @@ def test_temp_min_hours_gate_exact_boundary_bucharest() -> None:
     the only discriminating gate is the hour count.
     """
     day = date(2026, 6, 10)
-    eighteen = _bucharest_june_local_hours(list(range(18)))  # local 00..17
-    high, low = evaluate_temperature(eighteen, timezone=_TZ_BUCHAREST, local_date=day)
+    eighteen = _athens_june_local_hours(list(range(18)))  # local 00..17
+    high, low = evaluate_temperature(eighteen, timezone=_TZ_ATHENS, local_date=day)
     assert high.eligible and low.eligible
     assert high.covered_hours == 18
 
-    seventeen = _bucharest_june_local_hours(list(range(17)))  # local 00..16
-    high, low = evaluate_temperature(seventeen, timezone=_TZ_BUCHAREST, local_date=day)
+    seventeen = _athens_june_local_hours(list(range(17)))  # local 00..16
+    high, low = evaluate_temperature(seventeen, timezone=_TZ_ATHENS, local_date=day)
     assert not high.eligible
     assert high.exclusion_reason == EXCLUDE_INSUFFICIENT_COVERAGE
     assert not low.eligible
@@ -142,7 +142,7 @@ def test_high_peak_window_start_boundary_single_slot() -> None:
     # local 00..11 and 19..23 (17 slots outside [12,18)) + exactly local 12.
     hours = list(range(12)) + list(range(19, 24)) + [12]
     high, low = evaluate_temperature(
-        _bucharest_june_local_hours(hours), timezone=_TZ_BUCHAREST, local_date=day
+        _athens_june_local_hours(hours), timezone=_TZ_ATHENS, local_date=day
     )
     assert high.covered_hours == 18
     assert high.eligible
@@ -160,7 +160,7 @@ def test_high_peak_window_end_exclusive_and_local_not_utc() -> None:
     day = date(2026, 6, 10)
     hours = list(range(12)) + list(range(18, 24))  # 18 slots, none in [12,18)
     high, low = evaluate_temperature(
-        _bucharest_june_local_hours(hours), timezone=_TZ_BUCHAREST, local_date=day
+        _athens_june_local_hours(hours), timezone=_TZ_ATHENS, local_date=day
     )
     assert high.covered_hours == 18
     assert not high.eligible
@@ -181,7 +181,7 @@ def test_low_peak_window_is_its_own_window() -> None:
     day = date(2026, 6, 10)
     hours = [0, 1, 2] + list(range(9, 24))  # 18 slots; [3,9) empty (9 excluded)
     high, low = evaluate_temperature(
-        _bucharest_june_local_hours(hours), timezone=_TZ_BUCHAREST, local_date=day
+        _athens_june_local_hours(hours), timezone=_TZ_ATHENS, local_date=day
     )
     assert high.eligible
     assert not low.eligible
@@ -189,8 +189,8 @@ def test_low_peak_window_is_its_own_window() -> None:
 
     with_three = [3] + [0, 1] + list(range(9, 24))  # 18 slots, exactly local 3
     high, low = evaluate_temperature(
-        _bucharest_june_local_hours(with_three),
-        timezone=_TZ_BUCHAREST,
+        _athens_june_local_hours(with_three),
+        timezone=_TZ_ATHENS,
         local_date=day,
     )
     assert low.eligible
@@ -225,7 +225,7 @@ def test_near_complete_gate_both_sides_of_boundary() -> None:
 
 
 def _fall_back_hours() -> list[str]:
-    """The 25 UTC hourly instants of Bucharest local day 2026-10-25."""
+    """The 25 UTC hourly instants of Athens local day 2026-10-25."""
     hours = [f"2026-10-24T{h:02d}:00:00Z" for h in range(21, 24)]
     hours += [f"2026-10-25T{h:02d}:00:00Z" for h in range(22)]
     assert len(hours) == 25
@@ -246,7 +246,7 @@ def test_fold_instants_contribute_independently() -> None:
     ]
     total, occurrence = evaluate_precip(
         samples,
-        timezone=_TZ_BUCHAREST,
+        timezone=_TZ_ATHENS,
         local_date=date(2026, 10, 25),
         rain_threshold_mm=0.2,
     )
@@ -262,7 +262,7 @@ def test_fold_instants_contribute_independently() -> None:
     spring = [(f"2026-03-28T{h:02d}:00:00Z", 4.0) for h in (22, 23)] + [
         (f"2026-03-29T{h:02d}:00:00Z", 4.0) for h in range(20)
     ]
-    wind = evaluate_wind(spring, timezone=_TZ_BUCHAREST, local_date=date(2026, 3, 29))
+    wind = evaluate_wind(spring, timezone=_TZ_ATHENS, local_date=date(2026, 3, 29))
     assert wind.expected_slots == 23
     assert wind.covered_hours == 22
     assert wind.eligible
@@ -273,12 +273,12 @@ def test_25_hour_day_near_complete_needs_24() -> None:
     hours = _fall_back_hours()
     day = date(2026, 10, 25)
     wind_24 = evaluate_wind(
-        [(h, 6.0) for h in hours[:24]], timezone=_TZ_BUCHAREST, local_date=day
+        [(h, 6.0) for h in hours[:24]], timezone=_TZ_ATHENS, local_date=day
     )
     assert wind_24.covered_hours == 24
     assert wind_24.eligible
     wind_23 = evaluate_wind(
-        [(h, 6.0) for h in hours[:23]], timezone=_TZ_BUCHAREST, local_date=day
+        [(h, 6.0) for h in hours[:23]], timezone=_TZ_ATHENS, local_date=day
     )
     assert not wind_23.eligible
     assert wind_23.exclusion_reason == EXCLUDE_BELOW_NEAR_COMPLETE
@@ -335,7 +335,7 @@ def test_occurrence_wet_threshold_inclusive_at_any_coverage() -> None:
 def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     """Half-open UTC window derived from the LOCAL day, with decoys outside.
 
-    Bucharest 2026-06-10 spans 2026-06-09T21:00Z .. 2026-06-10T21:00Z. A
+    Athens 2026-06-10 spans 2026-06-09T21:00Z .. 2026-06-10T21:00Z. A
     +99 decoy one hour before the start and a -99 decoy exactly AT the end
     must both stay out. Kills M14 (SQL start `>=` -> `>`: the exact-start
     slot drops, covered 23) and M15 (bounds computed in UTC instead of the
@@ -346,7 +346,7 @@ def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     is killed in test_hourly_slot_window_is_half_open_at_both_ends.
     """
     conn = _conn()
-    site_id = _make_site(conn, timezone=_TZ_BUCHAREST)
+    site_id = _make_site(conn, timezone=_TZ_ATHENS)
     day = "2026-06-10"
     in_window = [f"2026-06-09T{h:02d}:00:00Z" for h in (21, 22, 23)] + [
         f"2026-06-10T{h:02d}:00:00Z" for h in range(21)
@@ -370,7 +370,7 @@ def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     persisted = _truth_rows(conn, site_id, day)["temperature_high"]
     assert persisted["day_start_utc"] == "2026-06-09T21:00:00Z"
     assert persisted["day_end_utc"] == "2026-06-10T21:00:00Z"
-    assert persisted["timezone"] == _TZ_BUCHAREST
+    assert persisted["timezone"] == _TZ_ATHENS
 
 
 def test_hourly_slot_window_is_half_open_at_both_ends() -> None:
@@ -384,12 +384,12 @@ def test_hourly_slot_window_is_half_open_at_both_ends() -> None:
     (`bounds.start_utc <= instant` -> `<`: the exact-start slot drops,
     covered 22, below near-complete).
     """
-    day = date(2026, 6, 10)  # Bucharest: 2026-06-09T21:00Z .. 2026-06-10T21:00Z
+    day = date(2026, 6, 10)  # Athens: 2026-06-09T21:00Z .. 2026-06-10T21:00Z
     samples = [("2026-06-09T21:00:00Z", 30.0)]  # exactly at start
     samples += [(f"2026-06-09T{h:02d}:00:00Z", 5.0) for h in (22, 23)]
     samples += [(f"2026-06-10T{h:02d}:00:00Z", 5.0) for h in range(20)]
     samples += [("2026-06-10T21:00:00Z", 99.0)]  # exactly at end — excluded
-    outcome = evaluate_wind(samples, timezone=_TZ_BUCHAREST, local_date=day)
+    outcome = evaluate_wind(samples, timezone=_TZ_ATHENS, local_date=day)
     assert outcome.covered_hours == 23
     assert outcome.value == 30.0
     assert outcome.eligible
@@ -425,12 +425,12 @@ def test_stale_marking_boundary_adjacency_variable_and_site_scope() -> None:
     day_end_utc for a UTC site. Kills M18 (end-closed match: June 10 also
     marked), M19 (start-open match: June 11 not marked), M20 (variable
     scope dropped: June 11's wind/precip rows marked by a temperature
-    mutation) and M21 (site scope dropped: the Bucharest decoy site's
+    mutation) and M21 (site scope dropped: the Athens decoy site's
     overlapping day marked).
     """
     conn = _conn()
     site_a = _make_site(conn, timezone="UTC")
-    site_b = _make_site(conn, timezone=_TZ_BUCHAREST)
+    site_b = _make_site(conn, timezone=_TZ_ATHENS)
     _seed_obs(
         conn,
         site_a,
@@ -510,7 +510,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
             """
             INSERT INTO stations
                 (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, ?, 47.0, 25.0, 900.0)
+            VALUES (?, ?, 40.0, -105.0, 900.0)
             """,
             (site_id, f"SYNTH{i:03d}"),
         )

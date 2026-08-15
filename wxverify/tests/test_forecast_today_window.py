@@ -37,7 +37,7 @@ def _make_db() -> sqlite3.Connection:
     conn.execute(
         """
         INSERT INTO sites (id, name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES (1, 'Test Site', 47.0, 25.0, 900.0, 'UTC')
+        VALUES (1, 'Test Site', 40.0, -105.0, 900.0, 'UTC')
         """
     )
     return conn

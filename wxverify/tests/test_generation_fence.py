@@ -50,7 +50,7 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
     cur = conn.execute(
         "INSERT INTO sites "
         "(name, forecast_lat, forecast_lon, elevation_m, timezone, enabled) "
-        "VALUES (?, 47.0, 25.0, 900.0, 'UTC', 1)",
+        "VALUES (?, 40.0, -105.0, 900.0, 'UTC', 1)",
         (name,),
     )
     site_id = cur.lastrowid
@@ -72,7 +72,7 @@ def _make_station(conn: sqlite3.Connection, site_id: int, pws_station_id: str) -
     cur = conn.execute(
         """
         INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)
-        VALUES (?, ?, 47.0, 25.0, 900.0)
+        VALUES (?, ?, 40.0, -105.0, 900.0)
         """,
         (site_id, pws_station_id),
     )
@@ -252,7 +252,7 @@ def test_create_station_fence_rejects_a_write_after_a_replace(
         entered.set()
         while not release.is_set():
             await asyncio.sleep(0.01)
-        return PwsStation(station_id=station_id, lat=47.1, lon=25.1)
+        return PwsStation(station_id=station_id, lat=40.1, lon=-104.9)
 
     monkeypatch.setattr(
         "wxverify.api.routes.stations.validate_station", _blocked_validate_station
@@ -266,8 +266,8 @@ def test_create_station_fence_rejects_a_write_after_a_replace(
             "/api/sites",
             json={
                 "name": "Original Site",
-                "forecast_lat": 47.0,
-                "forecast_lon": 25.0,
+                "forecast_lat": 40.0,
+                "forecast_lon": -105.0,
                 "elevation_m": 900.0,
                 "timezone": "UTC",
             },
@@ -492,8 +492,8 @@ def test_backfill_historical_feed_fence_discards_a_write_after_a_replace(
             writer = FencedWriter(db, db.generation)
             target = SiteBackfillTarget(
                 site_id=site_id,
-                lat=47.0,
-                lon=25.0,
+                lat=40.0,
+                lon=-105.0,
                 timezone="UTC",
                 backfill_status="in_progress",
                 backfill_through=None,

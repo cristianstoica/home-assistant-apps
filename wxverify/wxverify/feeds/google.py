@@ -1,12 +1,26 @@
 """Google Weather API hourly-forecast adapter.
 
-Single page only: ``hours=24`` with ``pageSize`` left at its default 24, and
-``nextPageToken`` is never followed, so ``estimate_cost`` stays one call.
+Cost model: the request horizon is derived from ``req.max_lead_hours``,
+clamped at ``GOOGLE_MAX_HOURS``; ``pageSize`` is pinned to
+``GOOGLE_PAGE_SIZE`` records per page, so one fetch costs
+``ceil(hours / GOOGLE_PAGE_SIZE)`` provider calls. ``estimate_cost`` and the
+page loop both take that number from ``_expected_pages``, so the reservation
+and the spend cannot diverge, and the loop is bounded by the reservation
+rather than by the presence of a ``nextPageToken``.
+
+The accumulated page sequence is rejected with ``GooglePageSequenceError``
+unless it is provably whole -- every page non-empty, a token on every page
+before the last expected one, no echoed token, strictly hourly
+``startTime`` values, and exactly the requested record count. Nothing is
+persisted from a partial sequence: this module accumulates in memory and
+never touches the database.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from datetime import datetime, timedelta
 from typing import ClassVar, Final
 
 import httpx
@@ -29,7 +43,33 @@ _EXPECTED_TEMPERATURE_UNIT: Final = "CELSIUS"
 _EXPECTED_SPEED_UNIT: Final = "KILOMETERS_PER_HOUR"
 _EXPECTED_PRECIP_UNIT: Final = "MILLIMETERS"
 
+GOOGLE_MAX_HOURS: Final = 240  # provider cap on `hours`
+GOOGLE_PAGE_SIZE: Final = 24  # provider cap on `pageSize`
+
+_ONE_HOUR: Final = timedelta(hours=1)
+
+# Page >= 2 connect failures are re-raised as GooglePageSequenceError so the
+# reservation is NOT refunded: earlier pages genuinely reached the provider.
+_PAGE_CONNECT_ERRORS: Final = (httpx.ConnectError, httpx.ConnectTimeout)
+
 logger = logging.getLogger(__name__)
+
+
+class GooglePageSequenceError(RuntimeError):
+    """The page sequence is not provably whole, so nothing may be persisted."""
+
+
+def _requested_hours(req: ForecastRequest) -> int:
+    """The horizon to request, clamped at the provider's own ``hours`` cap."""
+    hours = min(req.max_lead_hours, GOOGLE_MAX_HOURS)
+    if hours < 1:
+        raise ValueError(f"google: unusable max_lead_hours {req.max_lead_hours!r}")
+    return hours
+
+
+def _expected_pages(req: ForecastRequest) -> int:
+    """Pages one fetch costs -- the reservation AND the loop bound."""
+    return math.ceil(_requested_hours(req) / GOOGLE_PAGE_SIZE)
 
 
 class GoogleInterval(BaseModel):
@@ -88,6 +128,7 @@ class GoogleResponse(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     forecastHours: list[GoogleForecastHour] = Field(default_factory=_no_hours)
+    nextPageToken: str | None = None
 
 
 class GoogleAdapter:
@@ -98,27 +139,59 @@ class GoogleAdapter:
         self._client = client
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
-        return CostEstimate(calls=1)
+        return CostEstimate(calls=_expected_pages(req))
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
-        logger.debug("google forecast request lat=%s lon=%s", req.lat, req.lon)
-        response = await self._client.get(
-            _ENDPOINT,
-            params={
+        hours = _requested_hours(req)
+        pages = _expected_pages(req)
+        logger.debug(
+            "google forecast request lat=%s lon=%s hours=%s pages=%s",
+            req.lat,
+            req.lon,
+            hours,
+            pages,
+        )
+        # Snapped once, before page 1: the whole sequence is attributed to
+        # the run current when collection began, never to whatever the clock
+        # reads after several sequential round-trips.
+        issued_at = snap_run()
+        token: str | None = None
+        collected: list[GoogleForecastHour] = []
+        for page_index in range(pages):
+            params: dict[str, str | int | float] = {
                 "key": self._api_key,
                 "location.latitude": req.lat,
                 "location.longitude": req.lon,
-                "hours": 24,
+                "hours": hours,
+                "pageSize": GOOGLE_PAGE_SIZE,
                 "unitsSystem": "METRIC",
-            },
-            timeout=httpx.Timeout(15.0, connect=5.0),
-        )
-        response.raise_for_status()
-        payload = GoogleResponse.model_validate(response.json())
-        result = _to_fetch_result(req, payload)
+            }
+            if token is not None:
+                params["pageToken"] = token
+            try:
+                response = await self._client.get(
+                    _ENDPOINT,
+                    params=params,
+                    timeout=httpx.Timeout(15.0, connect=5.0),
+                )
+            except _PAGE_CONNECT_ERRORS as exc:
+                if page_index == 0:
+                    raise
+                raise GooglePageSequenceError(
+                    f"google: page {page_index} failed to connect after "
+                    f"{page_index} page(s) reached the provider"
+                ) from exc
+            response.raise_for_status()
+            payload = GoogleResponse.model_validate(response.json())
+            _check_page(payload, page_index=page_index, pages=pages, sent_token=token)
+            collected.extend(payload.forecastHours)
+            token = payload.nextPageToken
+        _check_sequence(collected, requested_hours=hours)
+        result = _to_fetch_result(req, collected, issued_at)
         logger.debug(
-            "google forecast response status=%s samples=%s",
-            response.status_code,
+            "google forecast response pages=%s records=%s samples=%s",
+            pages,
+            len(collected),
             len(result.samples),
         )
         return result
@@ -129,10 +202,54 @@ class GoogleAdapter:
         return None
 
 
-def _to_fetch_result(req: ForecastRequest, payload: GoogleResponse) -> FetchResult:
-    issued_at = snap_run()
+def _check_page(
+    payload: GoogleResponse, *, page_index: int, pages: int, sent_token: str | None
+) -> None:
+    """Reject a page that cannot be part of a whole sequence."""
+    if not payload.forecastHours:
+        raise GooglePageSequenceError(
+            f"google: page {page_index} returned an empty forecastHours"
+        )
+    if page_index < pages - 1 and payload.nextPageToken is None:
+        raise GooglePageSequenceError(
+            f"google: page {page_index} returned no nextPageToken before the "
+            f"requested horizon ({pages} pages expected)"
+        )
+    if sent_token is not None and payload.nextPageToken == sent_token:
+        raise GooglePageSequenceError(
+            f"google: page {page_index} echoed the pageToken it was sent"
+        )
+
+
+def _check_sequence(hours: list[GoogleForecastHour], *, requested_hours: int) -> None:
+    """Reject an accumulated sequence that is not provably whole.
+
+    Asserted on the RAW records, never on the retained samples: ``hours``
+    counts forward from now while ``lead`` is measured from the snapped run,
+    so the tail of the requested window is legitimately dropped by the lead
+    filter and a retained-count check would fail every healthy fetch.
+    """
+    previous: datetime | None = None
+    for index, hour in enumerate(hours):
+        current = parse_utc(hour.interval.startTime)
+        if previous is not None and current - previous != _ONE_HOUR:
+            raise GooglePageSequenceError(
+                f"google: record {index} startTime {hour.interval.startTime!r} "
+                f"is not exactly one hour after its predecessor"
+            )
+        previous = current
+    if len(hours) != requested_hours:
+        raise GooglePageSequenceError(
+            f"google: accumulated {len(hours)} records for a "
+            f"{requested_hours}-hour request"
+        )
+
+
+def _to_fetch_result(
+    req: ForecastRequest, hours: list[GoogleForecastHour], issued_at: str
+) -> FetchResult:
     samples: list[NormalizedSample] = []
-    for hour in payload.forecastHours:
+    for hour in hours:
         valid_at = isoformat_utc(parse_utc(hour.interval.startTime))
         lead = lead_hours(issued_at, valid_at)
         if lead < 1 or lead > req.max_lead_hours:

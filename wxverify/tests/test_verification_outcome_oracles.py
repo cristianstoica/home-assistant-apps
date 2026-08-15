@@ -995,7 +995,7 @@ def test_aggregate_strict_common_core_and_availability_floor() -> None:
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,
                            timezone)
-        VALUES ('oracle-town', 47.0, 25.0, 900.0, 'UTC')
+        VALUES ('oracle-town', 40.0, -105.0, 900.0, 'UTC')
         """
     )
     assert cur.lastrowid is not None
@@ -1091,8 +1091,18 @@ def test_aggregate_strict_common_core_and_availability_floor() -> None:
         window_days=30,
         tz_generation_id=generation,
         roster=(
-            RosterFeed(feed_id=101, source="example-src", model="model-gamma"),
-            RosterFeed(feed_id=102, source="example-src", model="model-delta"),
+            RosterFeed(
+                feed_id=101,
+                source="example-src",
+                model="model-gamma",
+                max_lead_hours=168,
+            ),
+            RosterFeed(
+                feed_id=102,
+                source="example-src",
+                model="model-delta",
+                max_lead_hours=168,
+            ),
         ),
         period_start="2026-07-01",
         period_end="2026-07-04",

@@ -30,7 +30,7 @@ def _insert_site(conn: sqlite3.Connection) -> int:
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('IndexReconciliation', 47, 25, 900, 'UTC')
+            VALUES ('IndexReconciliation', 40, -105, 900, 'UTC')
             """
         ).lastrowid
     )

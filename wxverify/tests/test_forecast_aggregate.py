@@ -105,7 +105,7 @@ def test_covered_hours_empty_is_zero() -> None:
 
 
 def test_covered_hours_counts_both_instants_of_the_autumn_fold() -> None:
-    # Europe/Bucharest 2026 fall-back: 00:00Z and 01:00Z both map to local
+    # Europe/Athens 2026 fall-back: 00:00Z and 01:00Z both map to local
     # 03:xx on 2026-10-25. Counting local wall-clock hours collapses them
     # (aware datetimes differing only in `fold` compare equal); counting UTC
     # hour instants keeps both real hours.
@@ -129,21 +129,21 @@ def _local_day_hourly_utc_instants(day: datetime, tz: ZoneInfo) -> list[str]:
 
 
 def test_covered_hours_full_fall_back_local_day_is_25() -> None:
-    # Europe/Bucharest 2026-10-25 is 25 real hours long. A localize-then-
+    # Europe/Athens 2026-10-25 is 25 real hours long. A localize-then-
     # dedupe implementation collapses the repeated 03:xx wall-clock hour
     # and reports 24.
     instants = _local_day_hourly_utc_instants(
-        datetime(2026, 10, 25), ZoneInfo("Europe/Bucharest")
+        datetime(2026, 10, 25), ZoneInfo("Europe/Athens")
     )
     assert len(instants) == 25  # fixture guard: the local day really has 25
     assert covered_hours(instants) == 25
 
 
 def test_covered_hours_spring_forward_local_day_is_23() -> None:
-    # Europe/Bucharest 2026-03-29 is 23 real hours long (03:00 EET jumps to
+    # Europe/Athens 2026-03-29 is 23 real hours long (03:00 EET jumps to
     # 04:00 EEST). Anything assuming 24 hours per local day overcounts.
     instants = _local_day_hourly_utc_instants(
-        datetime(2026, 3, 29), ZoneInfo("Europe/Bucharest")
+        datetime(2026, 3, 29), ZoneInfo("Europe/Athens")
     )
     assert len(instants) == 23  # fixture guard: the skipped hour is absent
     assert covered_hours(instants) == 23

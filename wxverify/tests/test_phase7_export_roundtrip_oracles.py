@@ -344,7 +344,7 @@ def test_shipped_export_download_restores_full_0_11_0_state(
             """
             INSERT INTO stations (site_id, pws_station_id, lat, lon,
                                   dem_elevation_m, enabled)
-            VALUES (?, 'FAKESTATION1', 47.0, 25.0, 900.0, 1)
+            VALUES (?, 'FAKESTATION1', 40.0, -105.0, 900.0, 1)
             """,
             (site_id,),
         ).lastrowid

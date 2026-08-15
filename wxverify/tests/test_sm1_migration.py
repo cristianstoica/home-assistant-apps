@@ -148,12 +148,12 @@ def test_v2_to_v3_migration_happy_path(tmp_path: Path) -> None:
     # Seed one site and one station.
     raw.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES ('SITE-A', 47.0, 25.0, 900.0, 'UTC')"
+        " VALUES ('SITE-A', 40.0, -105.0, 900.0, 'UTC')"
     )
     site_id = int(raw.execute("SELECT last_insert_rowid()").fetchone()[0])
     raw.execute(
         "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)"
-        " VALUES (?, 'ISTATION01', 47.0, 25.0, 900.0)",
+        " VALUES (?, 'ISTATION01', 40.0, -105.0, 900.0)",
         (site_id,),
     )
     # Seed a pending job to survive the rebuild.
@@ -227,13 +227,13 @@ def test_v2_to_v3_stagger_is_monotonic_for_multiple_stations(tmp_path: Path) -> 
 
     raw.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES ('SITE-MULTI', 47.0, 25.0, 900.0, 'UTC')"
+        " VALUES ('SITE-MULTI', 40.0, -105.0, 900.0, 'UTC')"
     )
     site_id = int(raw.execute("SELECT last_insert_rowid()").fetchone()[0])
     for i in range(3):
         raw.execute(
             "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m)"
-            " VALUES (?, ?, 47.0, 25.0, 900.0)",
+            " VALUES (?, ?, 40.0, -105.0, 900.0)",
             (site_id, f"ISTATION0{i + 1}"),
         )
     raw.close()
@@ -296,7 +296,7 @@ def _build_v2_db_with_raw_conn(db_path: Path) -> None:
     raw = _build_v2_db(db_path)
     raw.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES ('CRASH-SITE', 47.0, 25.0, 900.0, 'UTC')"
+        " VALUES ('CRASH-SITE', 40.0, -105.0, 900.0, 'UTC')"
     )
     site_id = int(raw.execute("SELECT last_insert_rowid()").fetchone()[0])
     raw.execute(
@@ -448,7 +448,7 @@ def test_fetch_current_obs_enqueue_on_v3_db(tmp_path: Path) -> None:
     # Insert a site to satisfy FK constraints.
     conn.execute(
         "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES ('OBS-SITE', 47.0, 25.0, 900.0, 'UTC')"
+        " VALUES ('OBS-SITE', 40.0, -105.0, 900.0, 'UTC')"
     )
     site_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
 

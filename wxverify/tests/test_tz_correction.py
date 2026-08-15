@@ -64,7 +64,7 @@ def _seed_station_observation(
             """
             INSERT INTO stations
                 (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-            VALUES (?, 'ISYNTH0001', 47.0, 25.0, 900.0, 1)
+            VALUES (?, 'ISYNTH0001', 40.0, -105.0, 900.0, 1)
             """,
             (site_id,),
         )

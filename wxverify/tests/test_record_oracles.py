@@ -431,7 +431,7 @@ def test_generation_binding_resolves_at_t_not_pointer() -> None:
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('record-genbind-site', 47.0, 25.0, 900.0, 'Etc/GMT-3')
+        VALUES ('record-genbind-site', 40.0, -105.0, 900.0, 'Etc/GMT-3')
         """
     )
     assert cur.lastrowid is not None

@@ -51,7 +51,7 @@ def _insert_site(conn: sqlite3.Connection, *, enabled: bool = True) -> int:
             """
             INSERT INTO sites
                 (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-            VALUES ('ProviderOps', 47, 25, 900, 'UTC', ?)
+            VALUES ('ProviderOps', 40, -105, 900, 'UTC', ?)
             """,
             (1 if enabled else 0,),
         ).lastrowid
@@ -633,7 +633,7 @@ def test_smoke_requires_usable_samples_and_accepts_idempotent_success(
                         ("precip", 0.5),
                     )
                 ],
-                grid=GridProvenance(grid_lat=47.0, grid_lon=25.0),
+                grid=GridProvenance(grid_lat=40.0, grid_lon=-105.0),
             )
 
         async def fetch_historical(

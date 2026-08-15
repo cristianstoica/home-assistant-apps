@@ -320,7 +320,7 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
         conn.execute(
             """
             INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('Estimator Site', 47, 25, 500, 'UTC')
+            VALUES ('Estimator Site', 40, -105, 500, 'UTC')
             """
         ).lastrowid
     )
@@ -332,7 +332,7 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m)
-                VALUES (?, ?, 47, 25, 500)
+                VALUES (?, ?, 40, -105, 500)
                 """,
                 (site_id, f"STATION{index}"),
             ).lastrowid

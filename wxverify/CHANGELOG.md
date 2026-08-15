@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.12.0
+
+Raises the Google feed's forecast horizon from 24 hours to the add-on's
+full 7-day (168-hour) horizon. The 24-hour value was a local mis-seed, not
+a limit of the Google API.
+
+### Changed
+
+- The Google feed's configured maximum forecast lead is now 168 hours
+  (7 days), matching every other feed. Existing installations are
+  corrected automatically and idempotently on startup; no manual action is
+  needed. The database schema is unchanged.
+- The Google adapter now paginates to cover the full horizon instead of
+  fetching a single 24-hour window. **This raises the Google feed's
+  API cost from 1 call per fetch to 7.** If you run Google against a
+  metered key, account for the higher call volume before upgrading.
+- The roster and composite dashboards now disclose each feed's forecast
+  horizon alongside its lead counts, so a feed's coverage is visible
+  without cross-referencing configuration.
+
 ## 0.11.3
 
 Adds an operator-facing kill switch for the nightly verification chain and

@@ -52,11 +52,18 @@ def published_run_id(conn: sqlite3.Connection, site_id: int) -> int | None:
 
 @dataclass(frozen=True)
 class RosterFeed:
-    """One pinned real feed of the run's frozen roster."""
+    """One pinned real feed of the run's frozen roster.
+
+    ``max_lead_hours`` carries no default on purpose: every construction
+    site must declare the horizon it means, and ``None`` means "the
+    snapshot did not record it" (a pre-0.12.0 run), never a fabricated
+    value.
+    """
 
     feed_id: int
     source: str
     model: str
+    max_lead_hours: int | None
 
 
 @dataclass(frozen=True)
@@ -100,7 +107,7 @@ def roster_feeds(conn: sqlite3.Connection, site_id: int) -> tuple[RosterFeed, ..
     clause = active_competitor_clause(site_expr=str(int(site_id)))
     rows = conn.execute(
         f"""
-        SELECT f.id, f.source, f.model
+        SELECT f.id, f.source, f.model, f.max_lead_hours
         FROM feeds f
         LEFT JOIN site_feed_state sfs
           ON sfs.site_id = ? AND sfs.feed_id = f.id
@@ -113,7 +120,10 @@ def roster_feeds(conn: sqlite3.Connection, site_id: int) -> tuple[RosterFeed, ..
     ).fetchall()
     return tuple(
         RosterFeed(
-            feed_id=int(row["id"]), source=str(row["source"]), model=str(row["model"])
+            feed_id=int(row["id"]),
+            source=str(row["source"]),
+            model=str(row["model"]),
+            max_lead_hours=int(row["max_lead_hours"]),
         )
         for row in rows
     )
@@ -161,7 +171,12 @@ def _config_snapshot(
         "window_days": get_number_setting(conn, "rolling_window_days", 30, minimum=1),
         "tz_generation_id": tz_generation_id,
         "roster": [
-            {"feed_id": f.feed_id, "source": f.source, "model": f.model}
+            {
+                "feed_id": f.feed_id,
+                "source": f.source,
+                "model": f.model,
+                "max_lead_hours": f.max_lead_hours,
+            }
             for f in roster_feeds(conn, site_id)
         ],
     }
@@ -403,7 +418,13 @@ def start_run(
 
 
 def _parse_roster(raw: object) -> tuple[RosterFeed, ...]:
-    """Rehydrate a pinned roster list from JSON-shaped data; skips foreign items."""
+    """Rehydrate a pinned roster list from JSON-shaped data; skips foreign items.
+
+    ``max_lead_hours`` is parsed tolerantly: a snapshot written before
+    0.12.0 genuinely does not record the horizon, so it rehydrates as
+    ``None`` -- "not recorded" -- rather than a fabricated 168, and no
+    pre-0.12.0 run fails to load. Same reasoning as `_parse_blend_depths`.
+    """
     roster: list[RosterFeed] = []
     if isinstance(raw, list):
         for item in cast("list[object]", raw):
@@ -415,6 +436,11 @@ def _parse_roster(raw: object) -> tuple[RosterFeed, ...]:
                     feed_id=int(str(entry["feed_id"])),
                     source=str(entry["source"]),
                     model=str(entry["model"]),
+                    max_lead_hours=(
+                        None
+                        if (v := entry.get("max_lead_hours")) is None
+                        else int(str(v))
+                    ),
                 )
             )
     return tuple(roster)

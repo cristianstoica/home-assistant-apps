@@ -99,16 +99,17 @@
         <div class="table-wrap" data-v16="16.1.roster_snapshot">
           <table class="cardify">
             <caption class="muted">Pinned roster ({{ snapshot.roster_size }} feeds)</caption>
-            <thead><tr><th>Feed</th><th>Source</th><th>Model</th></tr></thead>
+            <thead><tr><th>Feed</th><th>Source</th><th>Model</th><th>Horizon</th></tr></thead>
             <tbody>
               {% for feed in snapshot.roster %}
                 <tr>
                   <td data-label="Feed">#{{ feed.feed_id }}</td>
                   <td data-label="Source">{{ feed.source }}</td>
                   <td data-label="Model">{{ feed.model }}</td>
+                  <td data-label="Horizon">{% if feed.max_lead_hours is not none %}{{ feed.max_lead_hours }} h{% else %}not recorded{% endif %}</td>
                 </tr>
               {% else %}
-                <tr><td data-label="Feed" colspan="3">No roster feeds pinned.</td></tr>
+                <tr><td data-label="Feed" colspan="4">No roster feeds pinned.</td></tr>
               {% endfor %}
             </tbody>
           </table>

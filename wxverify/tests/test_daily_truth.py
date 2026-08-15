@@ -44,7 +44,7 @@ def _make_site(conn: sqlite3.Connection, timezone: str = "UTC") -> int:
     cur = conn.execute(
         """
         INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('Truth Site', 47.0, 25.0, 900.0, ?)
+        VALUES ('Truth Site', 40.0, -105.0, 900.0, ?)
         """,
         (timezone,),
     )
@@ -95,7 +95,7 @@ def _truth_row(
 
 
 def test_expected_slots_ordinary_and_dst_days() -> None:
-    tz = "Europe/Bucharest"
+    tz = "Europe/Athens"
     assert local_day_bounds(date(2026, 6, 10), tz).expected_slots == 24
     assert local_day_bounds(date(2026, 3, 29), tz).expected_slots == 23
     assert local_day_bounds(date(2026, 10, 25), tz).expected_slots == 25
@@ -258,7 +258,7 @@ def test_occurrence_wet_at_any_coverage_dry_needs_near_complete() -> None:
 
 def test_fall_back_day_counts_both_fold_instants() -> None:
     conn = _conn()
-    site_id = _make_site(conn, timezone="Europe/Bucharest")
+    site_id = _make_site(conn, timezone="Europe/Athens")
     day = "2026-10-25"  # 25-hour local day: 2026-10-24T21:00Z .. 2026-10-25T22:00Z
     hours = [f"2026-10-24T{h:02d}:00:00Z" for h in range(21, 24)] + [
         f"2026-10-25T{h:02d}:00:00Z" for h in range(22)
@@ -292,7 +292,7 @@ def test_fall_back_day_counts_both_fold_instants() -> None:
 
 def test_spring_forward_day_has_23_expected_slots() -> None:
     conn = _conn()
-    site_id = _make_site(conn, timezone="Europe/Bucharest")
+    site_id = _make_site(conn, timezone="Europe/Athens")
     day = "2026-03-29"  # 23-hour local day: 2026-03-28T22:00Z .. 2026-03-29T21:00Z
     hours = [f"2026-03-28T{h:02d}:00:00Z" for h in (22, 23)] + [
         f"2026-03-29T{h:02d}:00:00Z" for h in range(21)
@@ -395,7 +395,7 @@ def test_load_daily_truth_is_published_generation_bound() -> None:
     cur = conn.execute(
         """
         INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'Europe/Bucharest', 'retrospective_correction', 'building')
+        VALUES (?, 'Europe/Athens', 'retrospective_correction', 'building')
         """,
         (site_id,),
     )
