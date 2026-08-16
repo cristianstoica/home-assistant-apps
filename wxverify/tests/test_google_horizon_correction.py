@@ -13,9 +13,9 @@ user_version`` (mirrors ``tests/test_publish_hold_bootstrap.py``'s
 ``_emulated_0_11_0_db``), never through ``init_db``/a real file, because
 these oracles only need a bare schema plus a handful of ``feeds`` rows.
 
-Synthetic data only: ``site-beta-src`` / ``site-gamma-src`` feed rows,
-obviously-fake lead-hour values (77, 99) standing in for "some other
-value the correction must not touch".
+Synthetic data only: a ``site-beta-src`` / ``model-x`` feed row and a
+``google`` / ``current`` one, at obviously-fake lead-hour values (99, 50)
+standing in for "some other value the correction must not touch".
 """
 
 from __future__ import annotations
@@ -187,8 +187,12 @@ def test_update_precedes_marker_so_a_marker_write_failure_leaves_the_row_correct
     monkeypatch.setattr(migrations, "set_runtime_state", _boom)
     with pytest.raises(RuntimeError, match="simulated crash"):
         correct_google_horizon(conn)
-    # UPDATE ran first: the row is already correct and the receipt is absent,
-    # so the next boot re-runs the correction rather than skipping it.
+    # Ordering oracle: only an UPDATE-first implementation leaves the row at
+    # 168 here -- marker-first would have raised before the UPDATE, leaving
+    # 24. The marker assertion is not a second oracle: the patched write
+    # raises under either order, so the receipt is absent either way. It
+    # records the consequence -- no receipt means the next boot re-runs the
+    # correction rather than skipping it.
     assert _lead(conn, source="google", model="blend") == 168
     assert get_runtime_state(conn, GOOGLE_HORIZON_CORRECTION_KEY) is None
 
