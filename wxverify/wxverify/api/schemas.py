@@ -37,6 +37,20 @@ class SiteUpdate(StrictModel):
     rain_threshold_mm: float | None = Field(default=None, ge=0)
 
 
+class TimezoneCorrectionIn(StrictModel):
+    """Payload for the Ops retrospective-timezone-correction control.
+
+    Deliberately carries NO ``field_validator`` for ``timezone``: validity is
+    decided by the domain function's own check, so a bad zone surfaces as the
+    domain's legible message rather than a pydantic detail array. ``confirm``
+    is required and undefaulted so its removal from the contract is a
+    detectable regression.
+    """
+
+    timezone: str = Field(min_length=1, max_length=64)
+    confirm: bool
+
+
 class StationCreate(StrictModel):
     pws_station_id: str
 

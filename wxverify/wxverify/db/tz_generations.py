@@ -35,6 +35,36 @@ _POINTER_KEY_PREFIX = "tz_generation_published:"
 CORRECTION_JOB_KEY_PREFIX = "tzcorr:"
 
 
+class TimezoneOperationRefused(ValueError):
+    """Base for refusals raised by the timezone operations.
+
+    Subclasses ``ValueError`` deliberately: the CLI (``__main__.py``) and the
+    existing tests catch ``ValueError`` and print the message, and they must
+    keep working unchanged. The subclasses exist so an HTTP caller can map a
+    refusal to a status by TYPE rather than by matching message text.
+    """
+
+
+class UnknownTimezone(TimezoneOperationRefused):
+    """The supplied string is not a resolvable IANA timezone key."""
+
+
+class TimezoneSiteNotFound(TimezoneOperationRefused):
+    """The site a timezone operation targets does not exist."""
+
+
+class CorrectionAlreadyBuilding(TimezoneOperationRefused):
+    """A retrospective correction is already building for the site.
+
+    Carries the existing generation's id so the refusal message can name a
+    handle the operator can look up rather than a dead end.
+    """
+
+    def __init__(self, message: str, generation_id: int) -> None:
+        super().__init__(message)
+        self.generation_id = generation_id
+
+
 def correction_job_key(generation_id: int) -> str:
     """``jobs.job_key`` for the correction chain building ``generation_id``."""
     return f"{CORRECTION_JOB_KEY_PREFIX}{generation_id}"
@@ -44,7 +74,7 @@ def _validate_timezone(timezone: str) -> None:
     try:
         ZoneInfo(timezone)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"unknown IANA timezone {timezone!r}") from exc
+        raise UnknownTimezone(f"unknown IANA timezone {timezone!r}") from exc
 
 
 def published_pointer_key(site_id: int) -> str:
@@ -210,7 +240,7 @@ def start_retrospective_correction(
     _validate_timezone(timezone)
     site = conn.execute("SELECT timezone FROM sites WHERE id=?", (site_id,)).fetchone()
     if site is None:
-        raise ValueError(f"site {site_id} does not exist")
+        raise TimezoneSiteNotFound(f"site {site_id} does not exist")
     building = conn.execute(
         """
         SELECT id FROM timezone_generations
@@ -220,9 +250,10 @@ def start_retrospective_correction(
         (site_id,),
     ).fetchone()
     if building is not None:
-        raise ValueError(
+        raise CorrectionAlreadyBuilding(
             f"site {site_id} already has a correction building "
-            f"(generation {int(building['id'])})"
+            f"(generation {int(building['id'])})",
+            generation_id=int(building["id"]),
         )
     ensure_published_generation(conn, site_id)
     provenance = json.dumps(

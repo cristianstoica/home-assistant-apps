@@ -2,19 +2,31 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from wxverify.api.errors import ApiError
-from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
+from wxverify.api.schemas import (
+    SiteCreate,
+    SiteOut,
+    SiteUpdate,
+    TimezoneCorrectionIn,
+)
 from wxverify.db.connection import get_db
 from wxverify.db.tz_generations import (
+    CorrectionAlreadyBuilding,
+    TimezoneSiteNotFound,
+    UnknownTimezone,
     ensure_published_generation,
     published_generation_clause,
+    start_retrospective_correction,
 )
 from wxverify.scoring.engine import pair_and_score
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
 
@@ -164,6 +176,60 @@ async def delete_site(request: Request, site_id: int) -> dict[str, bool] | HTMLR
 
         return await render_site_cards(request)
     return {"deleted": True}
+
+
+@router.post("/{site_id}/timezone-correction", response_model=None)
+async def start_timezone_correction(
+    site_id: int, body: TimezoneCorrectionIn
+) -> dict[str, object]:
+    """Start a retrospective timezone correction for one site.
+
+    Behind the app-level ``MutationGuard`` by construction; this route adds
+    no exemption. ``confirm`` mitigates accidental activation and is not
+    authorization -- see ADR-0003, which classifies this action tier (c),
+    HTTP-eligible.
+
+    Refusals are mapped by exception TYPE, never by message text, and there
+    is deliberately no ``except ValueError`` catch-all: a refusal this route
+    has not reasoned about surfaces as a 500 rather than being guessed at.
+    """
+    if body.confirm is not True:
+        raise ApiError(400, "confirmation required")
+
+    def _write(conn: sqlite3.Connection) -> dict[str, object]:
+        from wxverify.worker.verification_run import verification_chain_active
+
+        # Route-owned refusal (ADR-0003 clause 1(b)): a correction's flip
+        # invalidates a verification run pinned to the generation it started
+        # on, so refuse while one is queued or running for this site. Runs
+        # inside the same write transaction as the domain call, so it cannot
+        # go stale. The CLI path is deliberately NOT subject to it.
+        if verification_chain_active(conn, site_id):
+            raise ApiError(
+                409, "a verification run is active for this site; correction refused"
+            )
+        try:
+            generation_id = start_retrospective_correction(conn, site_id, body.timezone)
+        except UnknownTimezone as exc:
+            raise ApiError(400, str(exc)) from exc
+        except TimezoneSiteNotFound as exc:
+            raise ApiError(404, str(exc)) from exc
+        except CorrectionAlreadyBuilding as exc:
+            raise ApiError(409, str(exc)) from exc
+        logger.info(
+            "timezone correction started site=%s generation=%s timezone=%s source=ops",
+            site_id,
+            generation_id,
+            body.timezone,
+        )
+        return {
+            "site_id": site_id,
+            "generation_id": generation_id,
+            "timezone": body.timezone,
+            "state": "building",
+        }
+
+    return await get_db().write(_write)
 
 
 def _wants_html(request: Request) -> bool:

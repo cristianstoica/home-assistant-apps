@@ -1,0 +1,165 @@
+<section class="panel" id="timezone-correction-panel">
+  <h2>Timezone Correction</h2>
+  <p class="panel-hint">
+    <strong>Retrospective timezone correction</strong> rebuilds a site's entire
+    timezone-derived history under a different zone. It runs as a background job
+    in chunks and can take a long time. Nothing changes for readers while it
+    builds — the site keeps serving its current published history until the
+    rebuild finishes and flips.
+  </p>
+  <p class="panel-hint"><strong>What the flip changes, permanently:</strong></p>
+  <ul class="panel-hint">
+    <li>The site's timezone becomes the new zone.</li>
+    <li>
+      Every daily-truth day and every forecast/observation pair is re-derived on
+      the new local-day boundaries, so day-level scores change.
+    </li>
+    <li>
+      The previous generation is retired and its derived rows are deleted in the
+      background. That deletion is housekeeping — the site's history is
+      already correct without it. If it stops before finishing, the panel says
+      so.
+    </li>
+    <li>
+      Raw forecast samples and raw observations are <strong>not</strong> deleted,
+      so a correction made with the wrong zone can simply be corrected again.
+    </li>
+  </ul>
+  <p class="panel-hint"><strong>What happens to verification runs:</strong></p>
+  <ul class="panel-hint">
+    <li>
+      Runs that were already published keep rendering. A published run is a
+      self-contained snapshot and is unaffected on the Verification page.
+    </li>
+    <li>
+      They can no longer be re-derived. A published run's input fingerprint was
+      computed over the daily-truth rows of the generation it ran on; once those
+      rows are deleted, that fingerprint can never be recomputed and checked
+      against live data again.
+    </li>
+    <li>
+      <strong>Expect the site's published run to be flagged "stale inputs"
+      straight after the flip.</strong>
+      This is correct, not a fault: the run was computed on the previous
+      generation. The flag clears when the next nightly run publishes under the
+      new generation.
+    </li>
+    <li>
+      <strong>If a nightly verification run happens to be running when the
+      rebuild flips, that run will normally fail</strong>, and the Verification
+      page will say "A newer verification attempt failed; the results below are
+      from the last successful run." This is expected, not damage the correction
+      caused: the run was pinned to the generation it started on, and the flip
+      changed that pinning underneath it. The last successful run keeps showing,
+      and the next nightly run publishes normally under the new generation.
+    </li>
+  </ul>
+  <p class="panel-hint">
+    <strong>If it goes wrong:</strong> start another correction with the right
+    zone. The data it derives from was never deleted. There is no way to cancel a
+    correction once it has started. A correction can also fail before it
+    publishes — if it does, the panel says so and names the generation;
+    nothing was published, and you can start another one. Separately, a
+    correction that published successfully can have its background cleanup stop.
+    The panel says so too. That one is not a data problem — the site's
+    history is correct — it only means the previous generation's rows were
+    not reclaimed and the database is larger than it needs to be. Starting
+    another correction clears them.
+  </p>
+  {% if timezone_correction %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Site</th>
+          <th>Current zone</th>
+          <th>State</th>
+          <th>Correct to</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in timezone_correction %}
+        <tr>
+          <td>{{ row.site_name }}</td>
+          <td>{{ row.current_timezone }}</td>
+          <td>
+            {% if row.building_generation_id is not none %}
+            <p>
+              building (generation {{ row.building_generation_id }} →
+              {{ row.building_timezone }})
+            </p>
+            <p>
+              examined {{ row.examined if row.examined is not none else "n/a" }}
+              / changed {{ row.changed if row.changed is not none else "n/a" }}
+              / unchanged
+              {{ row.unchanged if row.unchanged is not none else "n/a" }}
+              / excluded
+              {{ row.excluded if row.excluded is not none else "n/a" }}
+            </p>
+            <p class="panel-hint">
+              Counts rise as days are rebuilt; they are a progress signal, not a
+              percentage.
+            </p>
+            {% elif row.published_generation_id is not none %}
+            <p>
+              published generation {{ row.published_generation_id }}
+              ({{ row.last_published_at if row.last_published_at else "n/a" }})
+            </p>
+            {% else %}
+            <p>no published generation yet</p>
+            {% endif %}
+            {# Independent of the state above, never an else of it: a retry
+               creates a new building generation while the failed one is still
+               the newest failure, and both lines must render together. #}
+            {% if row.failed_generation_id is not none %}
+            <p class="panel-hint">
+              The last correction (generation {{ row.failed_generation_id }},
+              target {{ row.failed_timezone }}) failed and was abandoned. The
+              site's published history was not changed. Start another correction
+              to retry.
+            </p>
+            {% endif %}
+            {# Never a branch of the failure line above: this correction
+               SUCCEEDED, only its background housekeeping stopped. #}
+            {% if row.cleanup_stalled_generation_id is not none %}
+            <p class="panel-hint">
+              Generation {{ row.cleanup_stalled_generation_id }} published
+              successfully, but its background cleanup stopped before finishing.
+              The site's history is correct and nothing needs re-running for
+              accuracy; the previous generation's rows have not been reclaimed.
+              Starting another correction clears them.
+            </p>
+            {% endif %}
+          </td>
+          <td>
+            {% if row.applicable %}
+            <input
+              type="text"
+              id="tz-correct-input-{{ row.site_id }}"
+              placeholder="Area/Location"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button
+              type="button"
+              data-tz-correct-url="{{ url('/api/sites/' ~ row.site_id ~ '/timezone-correction') }}"
+              data-site-id="{{ row.site_id }}"
+              data-site-name="{{ row.site_name }}"
+              data-current-timezone="{{ row.current_timezone }}"
+            >
+              Start correction
+            </button>
+            {% else %}
+            <p class="panel-hint">{{ row.blocked_reason }}</p>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="empty">No sites configured.</p>
+  {% endif %}
+  <p class="empty" id="tz-correct-result" hidden></p>
+</section>
