@@ -284,12 +284,18 @@ def _assert_zero_persisted(
     """``max_lead_hours`` re-points the DB-path feed row at the SAME horizon
     (and therefore the same expected page count) as its paired
     direct-adapter fixture -- ``_setup_google_site`` otherwise leaves the
-    feed at 168h / 7 pages, so a 48h/72h / 2-3-page fixture would run out of
-    pages before the scenario-specific check and raise the generic "no
-    nextPageToken before horizon" error instead. ``match`` then pins the
-    DB-path failure to the SAME failure mode as the direct-adapter
-    assertion above each call site, rather than accepting any
-    ``GooglePageSequenceError``.
+    feed at 168h / 7 pages. Measured, 4 of the 7 call sites below need
+    that: the ones whose scenario-specific failure is a sequence-level
+    check (hourly spacing, total record count), which runs only once the
+    page loop has completed. At 7 expected pages the per-page "token before
+    the horizon" check is still armed on the fixture's last page, which
+    carries no token, so it raises the generic "no nextPageToken before the
+    requested horizon" first and the sequence check is never reached -- the
+    loop stops on that guard rather than exhausting the fixture. The other
+    3 call sites fail inside a per-page check that fires on the same page
+    under either horizon. ``match`` then pins the DB-path failure to the
+    SAME failure mode as the direct-adapter assertion above each call site,
+    rather than accepting any ``GooglePageSequenceError``.
     """
     db, conn, site_id, feed_id = _setup_google_site(tmp_path)
     conn.execute(
@@ -486,7 +492,8 @@ def test_mid_sequence_failure_persists_zero_rows(tmp_path: Path) -> None:
     """
     start = datetime(2026, 6, 1, 0, 0, 0, tzinfo=UTC)
     chunks = _chunks(72, start)  # 3 pages
-    # Page 1 (the middle page, genuinely mid-sequence) omits its token.
+    # Page 1 omits its token -- the second of the seven pages the feed's
+    # 168h horizon expects, so genuinely mid-sequence.
     pages = [(chunks[0], "token-page-2"), (chunks[1], None), (chunks[2], None)]
     requests_log: list[dict[str, str]] = []
     handler = _make_handler(pages, requests_log=requests_log)
