@@ -16,6 +16,14 @@ site, closing the gap for operators who have no route to a container shell.
   when it does not apply, and a double-click cannot start two corrections
   for the same site.
 
+### Fixed
+
+- The Timezone Correction panel could report a finished cleanup as stalled:
+  the check read the cleanup's two internal records separately, so it could
+  catch one before the worker's last commit and the other after, and
+  mistake that gap for a stall. The check now reads both records together,
+  so it always sees a state the worker actually committed.
+
 ## 0.12.0
 
 Raises the Google feed's forecast horizon from 24 hours to the add-on's

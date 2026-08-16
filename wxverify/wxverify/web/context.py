@@ -10,7 +10,6 @@ from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
 from wxverify.db.queue import ACTIVE_JOB_SQL
-from wxverify.db.runtime_state import get_runtime_state
 from wxverify.db.tz_generations import (
     correction_job_key,
     generation_status,
@@ -657,6 +656,19 @@ def _newest_failed_generation(
     return failed[-1] if failed else None
 
 
+# Both halves of the stalled-cleanup predicate in ONE statement, so an
+# autocommit reader evaluates them against a single snapshot. The job half is
+# composed from ACTIVE_JOB_SQL rather than retyped: "active" must keep meaning
+# exactly what enqueue_if_absent's dedupe means, and a second copy would drift.
+# Params: (state key, job type, job key, site id).
+STALLED_CLEANUP_SQL = f"""
+    SELECT 1 FROM runtime_state
+    WHERE key = ?
+      AND NOT EXISTS ({ACTIVE_JOB_SQL})
+    LIMIT 1
+    """
+
+
 def load_timezone_correction(
     conn: sqlite3.Connection, sites: list[SiteView]
 ) -> list[TimezoneCorrectionRow]:
@@ -664,10 +676,11 @@ def load_timezone_correction(
 
     One ``generation_status`` SELECT covers every site; the per-site work is
     an indexed ``jobs`` point lookup for the verification-chain check, plus at
-    most one ``runtime_state`` and one ``jobs`` point lookup for the
-    stalled-cleanup check. ``applicable`` mirrors the route's refusals: a
-    BUILDING correction or an active verification chain blocks; a FAILED
-    generation does not, because the domain refuses only on a building row.
+    most one ``STALLED_CLEANUP_SQL`` statement (an indexed ``runtime_state``
+    seek and an indexed ``jobs`` seek) for the stalled-cleanup check.
+    ``applicable`` mirrors the route's refusals: a BUILDING correction or an
+    active verification chain blocks; a FAILED generation does not, because
+    the domain refuses only on a building row.
     """
     from wxverify.worker.tz_correction import correction_state_key
     from wxverify.worker.verification_run import verification_chain_active
@@ -704,21 +717,30 @@ def load_timezone_correction(
         # A stall is only alarming for the CURRENTLY PUBLISHED correction: a
         # retired generation's residual blob is a historical stall whose rows
         # a later correction's cleanup has already swept. The predicate is
-        # exact rather than a timing guess because the worker completes a
-        # chunk and enqueues its continuation in one transaction, so no commit
-        # boundary leaves the blob present, the chain healthy and no job
-        # pending.
+        # exact rather than a timing guess only when both halves observe ONE
+        # snapshot: no committed state has the blob present with no job
+        # pending -- a chunk completes and enqueues its continuation in one
+        # transaction, and the final cleanup drops the blob inside the txn of
+        # a job that is still running -- but that blob delete and the job's
+        # completion commit SEPARATELY, so two statements on an autocommit
+        # reader can straddle the gap, see the blob before the delete and the
+        # chain after the completion, and report a stall for a cleanup that
+        # finished. Hence one statement, one implicit transaction.
         cleanup_stalled_id: int | None = None
         if (
             published is not None
             and published_id is not None
             and str(published["mode"]) == "retrospective_correction"
-            and get_runtime_state(conn, correction_state_key(published_id)) is not None
             and conn.execute(
-                ACTIVE_JOB_SQL,
-                ("timezone_correction", correction_job_key(published_id), site.id),
+                STALLED_CLEANUP_SQL,
+                (
+                    correction_state_key(published_id),
+                    "timezone_correction",
+                    correction_job_key(published_id),
+                    site.id,
+                ),
             ).fetchone()
-            is None
+            is not None
         ):
             cleanup_stalled_id = published_id
         out.append(

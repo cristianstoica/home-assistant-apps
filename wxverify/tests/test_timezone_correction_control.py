@@ -6,7 +6,9 @@ mapping (§7's exhaustive by-exception-type table), its ``MutationGuard``
 exposure, the loader/route applicability agreement (D6/D8), the panel's
 per-site query shape (O9), successful start (O10), non-mutation of published
 history until the flip (O11), the finished/failed/cleanup-stalled surfaces
-(O12/O13/O14/O16), and the always-visible disclosure copy (O15).
+(O12/O13/O14/O16), the always-visible disclosure copy (O15), and the
+stalled-cleanup predicate's single-statement snapshot plus its full
+committed-state truth table (O17).
 
 Isolation: HTTP-route oracles drive a real app over ``TestClient`` against a
 file-backed ``tmp_path`` database with an idle worker stand-in, mirroring
@@ -48,12 +50,13 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.queue import claim_next_job
-from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.tz_generations import (
     correction_job_key,
     ensure_published_generation,
     published_generation_clause,
     published_generation_id,
+    published_pointer_key,
 )
 from wxverify.scoring.pairing import pair_real_models
 from wxverify.scoring.persistence import materialize_persistence
@@ -1123,3 +1126,127 @@ def test_o16_cleanup_stall_is_reported_distinctly_from_failure(
         assert "background cleanup stopped" in html
         assert "failed and was abandoned" not in html
     close_db()
+
+
+# ---------------------------------------------------------------------------
+# O17 - The stalled-cleanup predicate (STALLED_CLEANUP_SQL) is ONE statement
+# joining runtime_state and jobs, so an autocommit reader evaluates both
+# halves against a single snapshot -- never a runtime_state read followed by
+# a separate jobs read that could straddle the worker's two-commit cleanup
+# (blob delete, then job completion, in separate transactions; see
+# ``STALLED_CLEANUP_SQL``'s own docstring in ``web/context.py``). Plus the
+# predicate's full committed-state truth table, direct-seeded rather than
+# worker-driven (mirrors O8's direct-loader style): the two states O16
+# already exercises via a real chain (blob+no-job, blob+pending-job) are not
+# repeated here.
+# ---------------------------------------------------------------------------
+
+
+def _seed_published_correction(
+    conn: sqlite3.Connection, site_id: int, *, timezone: str = _NEW_TZ
+) -> int:
+    """A published retrospective-correction generation, wired via the
+    pointer -- the only mode/state ``load_timezone_correction`` ever runs
+    the stalled-cleanup check against.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO timezone_generations
+            (site_id, timezone, mode, state, published_at)
+        VALUES (?, ?, 'retrospective_correction', 'published', ?)
+        """,
+        (site_id, timezone, "2026-06-11T01:00:00Z"),
+    )
+    assert cur.lastrowid is not None
+    generation_id = int(cur.lastrowid)
+    set_runtime_state(conn, published_pointer_key(site_id), str(generation_id))
+    return generation_id
+
+
+def _set_correction_blob(conn: sqlite3.Connection, generation_id: int) -> None:
+    import json as _json
+
+    set_runtime_state(
+        conn, correction_state_key(generation_id), _json.dumps({"phase": "cleanup"})
+    )
+
+
+def _insert_correction_job(
+    conn: sqlite3.Connection, site_id: int, generation_id: int, status: str
+) -> None:
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
+        "('timezone_correction', ?, ?, ?)",
+        (site_id, correction_job_key(generation_id), status),
+    )
+
+
+def test_o17_stalled_cleanup_check_issues_a_single_statement() -> None:
+    conn = asof_conn()
+    site_id = _insert_site(conn)
+    generation_id = _seed_published_correction(conn, site_id)
+    _set_correction_blob(conn, generation_id)
+    conn.commit()
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        rows = load_timezone_correction(conn, load_sites(conn))
+    finally:
+        conn.set_trace_callback(None)
+
+    row = next(r for r in rows if r.site_id == site_id)
+    assert row.cleanup_stalled_generation_id == generation_id
+
+    # "runtime_state" + "FROM jobs" together, in the SAME statement, is
+    # unique to STALLED_CLEANUP_SQL among every query load_timezone_correction
+    # runs: generation_status's own runtime_state join never mentions "FROM
+    # jobs", and verification_chain_active's ACTIVE_JOB_SQL probe never
+    # mentions "runtime_state". A two-statement predicate (a bare
+    # get_runtime_state SELECT, then a separate ACTIVE_JOB_SQL execute) would
+    # match NEITHER half of this conjunction, so this assertion would read 0
+    # -- not 1 -- and fail.
+    stall_check_statements = [
+        stmt for stmt in statements if "runtime_state" in stmt and "FROM jobs" in stmt
+    ]
+    assert len(stall_check_statements) == 1, statements
+
+
+@pytest.mark.parametrize(
+    ("blob_present", "job_status", "job_site", "expect_stalled"),
+    [
+        pytest.param(False, None, "own", False, id="no_blob_no_job"),
+        pytest.param(True, "running", "own", False, id="blob_running_job"),
+        pytest.param(True, "completed", "own", True, id="blob_completed_job"),
+        pytest.param(False, "completed", "own", False, id="no_blob_completed_job"),
+        pytest.param(
+            True, "running", "other", True, id="blob_job_belongs_to_other_site"
+        ),
+    ],
+)
+def test_o17_stalled_cleanup_predicate_truth_table(
+    blob_present: bool,
+    job_status: str | None,
+    job_site: str,
+    expect_stalled: bool,
+) -> None:
+    conn = asof_conn()
+    site_id = _insert_site(conn)
+    other_site_id = _insert_site(conn, "site-beta")
+    generation_id = _seed_published_correction(conn, site_id)
+    if blob_present:
+        _set_correction_blob(conn, generation_id)
+    if job_status is not None:
+        owner_site_id = site_id if job_site == "own" else other_site_id
+        _insert_correction_job(conn, owner_site_id, generation_id, job_status)
+    conn.commit()
+
+    row = next(
+        r
+        for r in load_timezone_correction(conn, load_sites(conn))
+        if r.site_id == site_id
+    )
+    if expect_stalled:
+        assert row.cleanup_stalled_generation_id == generation_id
+    else:
+        assert row.cleanup_stalled_generation_id is None
