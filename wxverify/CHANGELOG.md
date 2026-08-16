@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.13.0
+
+Adds an Ops-panel control to start a retrospective timezone correction for a
+site, closing the gap for operators who have no route to a container shell.
+
+### Added
+
+- Ops → Timezone Correction: a panel that starts a retrospective timezone
+  correction for a site directly from the browser. The panel states, per
+  site, whether the action currently applies, when it does not and why,
+  whether the last correction failed before it published, and whether a
+  published correction's background cleanup stopped before finishing. The
+  action is refused (with the domain's own message, not a generic error)
+  when it does not apply, and a double-click cannot start two corrections
+  for the same site.
+
 ## 0.12.0
 
 Raises the Google feed's forecast horizon from 24 hours to the add-on's

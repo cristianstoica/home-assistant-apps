@@ -936,6 +936,93 @@
       });
   });
 
+  // Retrospective timezone correction: rebuild one site's whole
+  // timezone-derived history under a different zone. A same-zone request is
+  // disclosure, not refusal -- the dialog says what it means and the request
+  // still goes through, because re-deriving under the same zone is a
+  // legitimate repair.
+  document.body.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.matches("button[data-tz-correct-url]")) {
+      return;
+    }
+    var result = document.getElementById("tz-correct-result");
+    function show(text) {
+      result.hidden = false;
+      result.textContent = text;
+    }
+    var siteName = target.dataset.siteName;
+    var input = document.getElementById(
+      "tz-correct-input-" + target.dataset.siteId
+    );
+    var timezone = input ? input.value.trim() : "";
+    if (!timezone) {
+      show("Enter a timezone, e.g. America/Denver.");
+      return;
+    }
+    var sameZone =
+      timezone === target.dataset.currentTimezone
+        ? "This matches the site's current zone. The history will be " +
+          "re-derived without changing the zone.\n\n"
+        : "";
+    var confirmed = window.confirm(
+      'Rebuild the entire timezone-derived history for "' +
+        siteName +
+        '" under ' +
+        timezone +
+        "?\n\n" +
+        sameZone +
+        "This retires the site's current generation, changes local-day " +
+        "boundaries and every day-level score, and will flag the site's " +
+        "published verification run as having stale inputs until the next " +
+        "nightly run publishes.\n\n" +
+        "It runs in the background, takes a long time, and cannot be cancelled."
+    );
+    if (!confirmed) {
+      return;
+    }
+    var token = document.querySelector('meta[name="csrf-token"]').content;
+    fetch(target.dataset.tzCorrectUrl, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        "X-CSRF-Token": token,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ timezone: timezone, confirm: true })
+    })
+      .then(function (response) {
+        return response.json().then(function (payload) {
+          if (response.ok) {
+            show(
+              'Correction started for "' +
+                siteName +
+                '" — generation ' +
+                payload.generation_id +
+                ", target zone " +
+                payload.timezone +
+                ". It rebuilds in the background; reload this page to follow " +
+                "the counts."
+            );
+          } else {
+            // Never success-shaped, never silent: a refusal the server
+            // explained is shown verbatim, and one it did not still names
+            // the status so the operator knows it did not start.
+            show(
+              payload.error ||
+                "The correction was refused (HTTP " + response.status + ")."
+            );
+          }
+        });
+      })
+      .catch(function () {
+        show(
+          "Could not reach the server. Reload the page and check whether " +
+            "the correction started before retrying."
+        );
+      });
+  });
+
   // Database export: prepare-then-chunked-download. A plain GET download would
   // hold the request open (no headers) through VACUUM INTO and trip HA
   // ingress's response-start timeout, so this POSTs /begin (with CSRF), polls

@@ -9,7 +9,13 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
-from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.queue import ACTIVE_JOB_SQL
+from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.tz_generations import (
+    correction_job_key,
+    generation_status,
+    published_generation_clause,
+)
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
@@ -202,6 +208,36 @@ class StationTrustRow:
     mean_delta: float
 
 
+@dataclass(frozen=True)
+class TimezoneCorrectionRow:
+    """One site's row in the Ops retrospective-timezone-correction panel.
+
+    ``applicable`` and ``blocked_reason`` are resolved here rather than in the
+    template so they can be pinned against the route's own refusals. There is
+    deliberately no ``reconciled`` field: ``examined == changed + unchanged +
+    excluded`` holds in every state the runtime can produce (it is true at
+    0/0/0/0 and the flip refuses to publish without it), so a badge derived
+    from it could never discriminate. The counts are carried raw.
+    """
+
+    site_id: int
+    site_name: str
+    current_timezone: str
+    published_generation_id: int | None
+    building_generation_id: int | None
+    building_timezone: str | None
+    failed_generation_id: int | None
+    failed_timezone: str | None
+    cleanup_stalled_generation_id: int | None
+    examined: int | None
+    changed: int | None
+    unchanged: int | None
+    excluded: int | None
+    last_published_at: str | None
+    applicable: bool
+    blocked_reason: str | None
+
+
 def load_sites(
     conn: sqlite3.Connection, *, include_disabled: bool = True
 ) -> list[SiteView]:
@@ -320,8 +356,9 @@ def load_dashboard(
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
     from wxverify.verification.publish_hold import read_publish_hold
 
+    sites = load_sites(conn)
     return {
-        "sites": load_sites(conn),
+        "sites": sites,
         "feed_status": load_feed_health(conn),
         "budgets": load_budgets(conn),
         "backfill": load_backfill(conn),
@@ -332,6 +369,7 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
         "observation_health": load_observation_health(conn),
         "station_trust": load_station_trust(conn),
         "publish_hold": read_publish_hold(conn),
+        "timezone_correction": load_timezone_correction(conn, sites),
     }
 
 
@@ -584,6 +622,150 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
         )
         for row in rows
     ]
+
+
+def _generation_int(row: dict[str, object], key: str) -> int:
+    return int(str(row[key]))
+
+
+def _generation_optional_int(row: dict[str, object], key: str) -> int | None:
+    value = row[key]
+    return None if value is None else int(str(value))
+
+
+def _generation_optional_str(row: dict[str, object], key: str) -> str | None:
+    value = row[key]
+    return None if value is None else str(value)
+
+
+def _newest_failed_generation(
+    rows: list[dict[str, object]], published_generation_id: int | None
+) -> dict[str, object] | None:
+    """The site's newest failed generation that is newer than the published one.
+
+    The "newer than published" clause is what stops a long-dead failure from
+    haunting a site that has since been corrected successfully. Rows arrive
+    ordered by generation id, so the last match is the newest.
+    """
+    failed = [row for row in rows if str(row["state"]) == "failed"]
+    if published_generation_id is not None:
+        failed = [
+            row
+            for row in failed
+            if _generation_int(row, "generation_id") > published_generation_id
+        ]
+    return failed[-1] if failed else None
+
+
+def load_timezone_correction(
+    conn: sqlite3.Connection, sites: list[SiteView]
+) -> list[TimezoneCorrectionRow]:
+    """Per-site applicability and progress for the timezone-correction panel.
+
+    One ``generation_status`` SELECT covers every site; the per-site work is
+    an indexed ``jobs`` point lookup for the verification-chain check, plus at
+    most one ``runtime_state`` and one ``jobs`` point lookup for the
+    stalled-cleanup check. ``applicable`` mirrors the route's refusals: a
+    BUILDING correction or an active verification chain blocks; a FAILED
+    generation does not, because the domain refuses only on a building row.
+    """
+    from wxverify.worker.tz_correction import correction_state_key
+    from wxverify.worker.verification_run import verification_chain_active
+
+    by_site: dict[int, list[dict[str, object]]] = {}
+    for row in generation_status(conn):
+        by_site.setdefault(_generation_int(row, "site_id"), []).append(row)
+
+    out: list[TimezoneCorrectionRow] = []
+    for site in sites:
+        rows = by_site.get(site.id, [])
+        published = next((row for row in rows if bool(row["published_pointer"])), None)
+        building = next((row for row in rows if str(row["state"]) == "building"), None)
+        published_id = (
+            None if published is None else _generation_int(published, "generation_id")
+        )
+        failed = _newest_failed_generation(rows, published_id)
+        # Counts belong to the generation the row is about: the one being
+        # built while a correction runs, otherwise the published one (which
+        # after a completed correction carries that correction's tally).
+        counts = building if building is not None else published
+        chain_active = verification_chain_active(conn, site.id)
+        building_id = (
+            None if building is None else _generation_int(building, "generation_id")
+        )
+        if building_id is not None:
+            blocked_reason = (
+                f"a correction is already building (generation {building_id})"
+            )
+        elif chain_active:
+            blocked_reason = "a verification run is active for this site"
+        else:
+            blocked_reason = None
+        # A stall is only alarming for the CURRENTLY PUBLISHED correction: a
+        # retired generation's residual blob is a historical stall whose rows
+        # a later correction's cleanup has already swept. The predicate is
+        # exact rather than a timing guess because the worker completes a
+        # chunk and enqueues its continuation in one transaction, so no commit
+        # boundary leaves the blob present, the chain healthy and no job
+        # pending.
+        cleanup_stalled_id: int | None = None
+        if (
+            published is not None
+            and published_id is not None
+            and str(published["mode"]) == "retrospective_correction"
+            and get_runtime_state(conn, correction_state_key(published_id)) is not None
+            and conn.execute(
+                ACTIVE_JOB_SQL,
+                ("timezone_correction", correction_job_key(published_id), site.id),
+            ).fetchone()
+            is None
+        ):
+            cleanup_stalled_id = published_id
+        out.append(
+            TimezoneCorrectionRow(
+                site_id=site.id,
+                site_name=site.name,
+                current_timezone=site.timezone,
+                published_generation_id=published_id,
+                building_generation_id=building_id,
+                building_timezone=(
+                    None if building is None else str(building["timezone"])
+                ),
+                failed_generation_id=(
+                    None if failed is None else _generation_int(failed, "generation_id")
+                ),
+                failed_timezone=None if failed is None else str(failed["timezone"]),
+                cleanup_stalled_generation_id=cleanup_stalled_id,
+                examined=(
+                    None
+                    if counts is None
+                    else _generation_optional_int(counts, "examined")
+                ),
+                changed=(
+                    None
+                    if counts is None
+                    else _generation_optional_int(counts, "changed")
+                ),
+                unchanged=(
+                    None
+                    if counts is None
+                    else _generation_optional_int(counts, "unchanged")
+                ),
+                excluded=(
+                    None
+                    if counts is None
+                    else _generation_optional_int(counts, "excluded")
+                ),
+                last_published_at=(
+                    None
+                    if published is None
+                    else _generation_optional_str(published, "published_at")
+                ),
+                applicable=building_id is None and not chain_active,
+                blocked_reason=blocked_reason,
+            )
+        )
+    return out
 
 
 def feed_label(source: str, model: str) -> str:
