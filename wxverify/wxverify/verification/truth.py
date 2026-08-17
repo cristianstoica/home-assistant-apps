@@ -12,7 +12,11 @@ Consensus-mutation contract: every consensus mutation funnels through
 writer), which calls :func:`mark_daily_truth_stale` for the mutated hour —
 affected rows get ``stale = 1`` and the nightly trigger regenerates marked
 days (:func:`regenerate_marked_truth`) before computing its input
-fingerprint (§14).
+fingerprint (§14). Regeneration is strictly regenerative — it rewrites days
+that already have rows; the CREATIVE path is
+:func:`materialize_missing_truth_days`, driven by the nightly chain's
+``discover`` phase, which materializes settled local days ``daily_truth``
+has never held.
 
 Reads are generation-bound through the shared
 ``published_generation_clause`` accessor — a partially built correction
@@ -21,10 +25,14 @@ generation is never read.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
+from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.db.connection import StaleGenerationError
 from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_clause,
@@ -35,6 +43,10 @@ from wxverify.verification.coverage import (
     evaluate_variable,
     local_day_bounds,
 )
+from wxverify.verification.methodology import CONSENSUS_LAG_HOURS
+from wxverify.worker.control import JobCancelled, JobDeferred
+
+logger = logging.getLogger(__name__)
 
 _TRUTH_VARIABLES: tuple[str, ...] = ("temperature", "wind", "precip")
 
@@ -275,6 +287,224 @@ def regenerate_marked_truth_chunk(
             tz_generation_id=int(group["tz_generation_id"]),
         )
     return len(groups)
+
+
+def settled_ceiling_local_date(timezone: str, now: datetime) -> date:
+    """Newest local day that is SETTLED at ``now`` under ``timezone``.
+
+    The Python mirror of the SQL predicate in
+    ``verification.runs.settled_through`` — ``julianday(day_end_utc, '+lag
+    hours') <= julianday(now)`` with ``lag = CONSENSUS_LAG_HOURS``. If either
+    side changes, both change.
+
+    Derivation. Let ``C = local_date(now - lag)``. A day ``D`` is settled
+    exactly when ``end_utc(D) <= now - lag``, and ``end_utc(D) ==
+    start_utc(D + 1)`` exactly, for every zone and every day (both come from
+    local midnight in ``coverage.local_day_bounds``). By the definition of a
+    local date, ``start_utc(C) <= now - lag < start_utc(C + 1)`` — so
+    substituting ``D = C - 1`` shows ``C - 1`` is always settled, and
+    ``D = C`` shows ``C`` never is. The ceiling is therefore exactly
+    ``C - 1``, with no loop and no dependence on day length: the 23- and
+    25-hour DST days are absorbed because the proof uses only boundary
+    contiguity.
+
+    ``now`` is normalized to UTC BEFORE the lag is subtracted. ``timedelta``
+    arithmetic on an aware datetime is wall-clock arithmetic in that
+    datetime's own zone, so across an offset transition it would not be
+    three ABSOLUTE hours; the SQL side has no such ambiguity because
+    ``settled_through`` binds ``now`` through ``isoformat_utc``. A naive
+    ``now`` is read as UTC for the same reason — matching ``isoformat_utc``,
+    never system-local.
+    """
+    instant = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    lagged = instant - timedelta(hours=CONSENSUS_LAG_HOURS)
+    return lagged.astimezone(ZoneInfo(timezone)).date() - timedelta(days=1)
+
+
+def observation_day_extent(
+    conn: sqlite3.Connection, site_id: int, timezone: str
+) -> tuple[date, date] | None:
+    """Inclusive local-day range spanning the site's observations, or None.
+
+    Deliberately NOT ``scoring.tz_rebuild.generation_day_range``, which is
+    otherwise the same shape. That one also spans ``forecast_samples``, whose
+    ``valid_at`` reaches a forecast horizon into the FUTURE, and discovery
+    must be bounded by what has actually been observed. Importing it here
+    would also invert the ``scoring -> verification`` edge — ``tz_rebuild``
+    imports :func:`materialize_daily_truth`.
+    """
+    tz = ZoneInfo(timezone)
+    stamps: list[str] = []
+    for order in ("ASC", "DESC"):
+        row = conn.execute(
+            f"""
+            SELECT valid_at FROM observations
+            WHERE site_id = ?
+            ORDER BY julianday(valid_at) {order}
+            LIMIT 1
+            """,
+            (site_id,),
+        ).fetchone()
+        if row is not None:
+            stamps.append(str(row["valid_at"]))
+    if not stamps:
+        return None
+    instants = [parse_utc(stamp) for stamp in stamps]
+    return (
+        min(instants).astimezone(tz).date(),
+        max(instants).astimezone(tz).date(),
+    )
+
+
+def missing_truth_days(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    tz_generation_id: int,
+    timezone: str,
+    now: datetime,
+    limit: int,
+    after_local_date: date | None = None,
+) -> list[date]:
+    """Up to ``limit`` settled observed local days holding no truth row yet.
+
+    The window is ``[first observed day .. min(last observed day, settled
+    ceiling)]`` and the result is that window MINUS every day already holding
+    a row under ``tz_generation_id`` — a set difference, so a forward gap
+    past existing rows and an interior hole are the same operation.
+    ``after_local_date`` raises the lower bound to the day after it (the
+    caller's chunk cursor).
+
+    Clamping the upper bound by the last observed day matters during a fetch
+    outage: the ceiling keeps advancing while observations stop, and without
+    the clamp discovery would materialize an unbounded run of zero-coverage
+    days, advancing the settled frontier over days nothing ever measured.
+    The lower bound anchors on the DATA, not on ``MIN(daily_truth
+    .local_date)``, so a late import of older observations is discoverable.
+
+    Nothing filters on ``eligible`` or ``stale``: an ineligible day is a
+    legitimate answer that must not be rebuilt every night, and staleness
+    belongs to :func:`regenerate_marked_truth_chunk`. Read-only and
+    limit-bounded.
+    """
+    extent = observation_day_extent(conn, site_id, timezone)
+    if extent is None:
+        return []
+    first_observed, last_observed = extent
+    lower = first_observed
+    if after_local_date is not None:
+        lower = max(lower, after_local_date + timedelta(days=1))
+    upper = min(last_observed, settled_ceiling_local_date(timezone, now))
+    if lower > upper:
+        return []
+    # A STRING range is a date range here: `materialize_daily_truth` binds
+    # the canonical extended-format `local_date` before every write.
+    present = {
+        str(row["local_date"])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT local_date FROM daily_truth
+            WHERE site_id = ? AND tz_generation_id = ?
+              AND local_date >= ? AND local_date <= ?
+            """,
+            (site_id, tz_generation_id, lower.isoformat(), upper.isoformat()),
+        ).fetchall()
+    }
+    missing: list[date] = []
+    day = lower
+    while day <= upper and len(missing) < limit:
+        if day.isoformat() not in present:
+            missing.append(day)
+        day += timedelta(days=1)
+    return missing
+
+
+def materialize_missing_truth_days(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    now: datetime,
+    limit: int,
+    after_local_date: str | None = None,
+) -> list[str]:
+    """Materialize up to ``limit`` missing settled local days (one chunk).
+
+    The structural analogue of :func:`regenerate_marked_truth_chunk`: one
+    bounded batch per chain chunk. Must run on a WRITE connection inside the
+    caller's transaction — :func:`materialize_daily_truth`'s own contract.
+    The published generation is resolved (and seeded on first use) ONCE per
+    chunk and passed explicitly to every per-day call, and the timezone comes
+    from that generation, never from ``sites.timezone``: a ceiling computed
+    under a different zone would disagree with the rows it creates. The
+    window is recomputed every chunk, never frozen in chain state, so
+    observations arriving mid-chain and a ceiling that steps over a local
+    midnight are both picked up by the next chunk.
+
+    Returns one entry per day selected from the window, ascending, whether or
+    not it materialized. ``len(result) < limit`` therefore means the window
+    is exhausted, never that days failed.
+
+    Failure boundary. The preamble — generation, zone, observation extent,
+    ceiling, presence query — is site- or generation-wide: every day in the
+    window would fail identically, so nothing catches it and it propagates to
+    the retry ladder, which is loud, bounded and self-clearing. Inside one
+    day's work only ``ValueError`` is contained, on a per-day ``SAVEPOINT``:
+    that is the entire failure vocabulary a single day's ROWS can produce (a
+    non-numeric ``observations.value``, a malformed ``computed_at``). Such a
+    day is rolled back, logged at ERROR with the site id and local date, and
+    re-selected by the next night's set difference. Anything else — a
+    ``sqlite3.Error``, ``ZoneInfoNotFoundError``, ``TypeError`` or any
+    programming defect — is systemic, recurs identically for every day in the
+    window, and must reach the retry ladder instead of silently skipping the
+    whole window.
+    """
+    generation_id = ensure_published_generation(conn, site_id)
+    timezone = _generation_timezone(conn, generation_id)
+    days = missing_truth_days(
+        conn,
+        site_id=site_id,
+        tz_generation_id=generation_id,
+        timezone=timezone,
+        now=now,
+        limit=limit,
+        after_local_date=(
+            None if after_local_date is None else date.fromisoformat(after_local_date)
+        ),
+    )
+    attempted: list[str] = []
+    for day in days:
+        conn.execute("SAVEPOINT truth_discovery_day")
+        try:
+            materialize_daily_truth(
+                conn,
+                site_id=site_id,
+                local_date=day.isoformat(),
+                tz_generation_id=generation_id,
+            )
+        except (JobDeferred, JobCancelled, StaleGenerationError):
+            # Worker control signals and a database swap are not data faults.
+            # None of the three subclasses ValueError, so the catch below
+            # already lets them past; this clause states the boundary.
+            raise
+        except ValueError as exc:
+            # Day DATA only. Every carrier inside materialize_daily_truth
+            # that a single day's rows can produce is a ValueError; a
+            # sqlite3.Error, KeyError/ZoneInfoNotFoundError, TypeError or any
+            # programming defect is systemic and must reach the retry ladder.
+            # No `finally`: on the propagating path the savepoint is
+            # discarded with the whole transaction by `Database._run_immediate`.
+            conn.execute("ROLLBACK TO truth_discovery_day")
+            conn.execute("RELEASE truth_discovery_day")
+            logger.error(
+                "daily_truth discovery: day data failed site=%s local_date=%s: %s",
+                site_id,
+                day.isoformat(),
+                sanitized_exception(exc),
+            )
+        else:
+            conn.execute("RELEASE truth_discovery_day")
+        attempted.append(day.isoformat())
+    return attempted
 
 
 def load_daily_truth(

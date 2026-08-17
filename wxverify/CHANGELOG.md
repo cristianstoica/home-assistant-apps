@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.13.1
+
+Fixes a deadlock where verification could never start on a site that had
+no ground-truth days yet.
+
+### Fixed
+
+- A site with no `daily_truth` rows had no route to create the first one
+  outside the timezone-correction chain, so the settled-through point
+  stayed empty and every nightly run recorded "skipped" with "no settled
+  truth under the published generation" — permanently, with no way to
+  recover.
+- Verification now runs a `discover` phase, ordered ahead of `regen`,
+  which materializes missing truth days in chunks of 20, resuming across
+  chunks via a durable cursor. Discovery looks for gaps anywhere in the
+  observed range, not just ahead of existing rows, so observations
+  imported later for older dates also become verifiable.
+- A day whose truth cannot be built no longer blocks the rest of the run:
+  the failure is contained to that day, logged, and discovery continues.
+
 ## 0.13.0
 
 Adds an Ops-panel control to start a retrospective timezone correction for a
