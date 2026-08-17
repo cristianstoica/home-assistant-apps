@@ -8,9 +8,12 @@ Chain state lives in one ``runtime_state`` JSON blob
 as the chunk's work; a progress heartbeat
 (``verification_heartbeat:<site_id>``) is refreshed each chunk.
 
-Phases: ``regen`` (chunked stale-truth regeneration BEFORE the fingerprint,
-§14.2) → ``decide`` (input fingerprint vs the last published run; the
-durable trigger-decision row lands here, before any run row exists) →
+Phases: ``discover`` (chunked discovery and materialization of settled local
+days missing from ``daily_truth`` — the only path that CREATES a truth row
+outside a retrospective timezone correction, §4/D1) → ``regen`` (chunked
+stale-truth regeneration BEFORE the fingerprint, §14.2) → ``decide`` (input
+fingerprint vs the last published run; the durable trigger-decision row lands
+here, before any run row exists) →
 ``start`` (one transaction: prior incomplete attempts wiped, the new run
 row pins config + roster + generation + period + seed) → ``simulate``
 (chunked walk-forward evidence; each chunk first re-checks the pinned
@@ -70,11 +73,20 @@ from wxverify.verification.runs import (
     start_run,
 )
 from wxverify.verification.simulate import simulate_baseline_day, simulate_snapshot_day
-from wxverify.verification.truth import regenerate_marked_truth_chunk
+from wxverify.verification.truth import (
+    materialize_missing_truth_days,
+    regenerate_marked_truth_chunk,
+)
 from wxverify.worker.control import JobCancelled, JobContinuation
 
 logger = logging.getLogger(__name__)
 
+# Missing settled local days materialized per `discover` chunk
+# (payload-overridable). Matches REGEN_CHUNK_GROUPS because the per-unit work
+# is identical: one materialize_daily_truth call, dominated by a single scan
+# of the site's observations. tz_correction's DAYS_PER_CHUNK = 14 is not the
+# precedent — a correction day also rebuilds pairs, so it costs strictly more.
+TRUTH_DISCOVERY_DAYS_PER_CHUNK = 20
 # Stale (local day, generation) truth groups regenerated per chunk
 # (payload-overridable, like tz_correction's days_per_chunk).
 REGEN_CHUNK_GROUPS = 20
@@ -209,8 +221,41 @@ def advance_verification(
 ) -> bool:
     """Execute one SYNC chain chunk inside the caller's write transaction."""
     loaded = _load_state(conn, site_id)
-    blob: dict[str, object] = {"phase": "regen"} if loaded is None else loaded
+    blob: dict[str, object] = {"phase": "discover"} if loaded is None else loaded
     phase = str(blob.get("phase", ""))
+    if phase == "discover":
+        site = conn.execute(
+            "SELECT rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
+        ).fetchone()
+        if site is None:
+            # The ONE condition this phase cancels for (§14). Every other
+            # fault propagates: chain-level to the retry ladder, per-day
+            # contained inside materialize_missing_truth_days.
+            raise JobCancelled()
+        # Site-wide precondition, probed at chain level so a corrupt value is
+        # a LOUD terminal failure instead of one contained ERROR per day of
+        # the backlog. The value is NOT passed on: materialize_daily_truth
+        # reads and uses its own.
+        float(site["rain_threshold_mm"])
+        limit = _chunk_size(
+            payload, "truth_discovery_days", TRUTH_DISCOVERY_DAYS_PER_CHUNK
+        )
+        cursor = blob.get("truth_cursor")
+        attempted = materialize_missing_truth_days(
+            conn,
+            site_id=site_id,
+            now=utc_now(),
+            limit=limit,
+            after_local_date=cursor if isinstance(cursor, str) else None,
+        )
+        if len(attempted) < limit:
+            blob.pop("truth_cursor", None)
+            blob["phase"] = "regen"
+        else:
+            blob["truth_cursor"] = attempted[-1]
+        _save_state(conn, site_id, blob)
+        _heartbeat(conn, site_id)
+        return True
     if phase == "regen":
         limit = _chunk_size(payload, "regen_chunk_groups", REGEN_CHUNK_GROUPS)
         done = regenerate_marked_truth_chunk(conn, site_id=site_id, limit=limit)
