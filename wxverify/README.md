@@ -475,7 +475,7 @@ is held, no **new** verification run is started. It does not stop a run that is
 already queued or under way — that chain continues and may publish — so read the
 active-chain badge before you rely on the hold.
 
-Ops → Nightly Verification Publishing is the control. It shows whether the hold
+Ops → Nightly Verification Run Hold is the control. It shows whether the hold
 is held or released, whether a chain is currently active, and when the state last
 changed and from where (Ops or Bootstrap). The button arms or releases the hold:
 it asks for confirmation in the browser, then sends

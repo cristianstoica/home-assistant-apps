@@ -38,12 +38,12 @@ from wxverify.worker import scheduler as scheduler_module
 from wxverify.worker.scheduler import _enqueue_due_verification_runs  # noqa: SLF001
 from wxverify.worker.verification_run import SUPERSEDED_REASON
 
-# `America/Denver` is UTC-6 in June, so the 02:00 local trigger instant for
-# local day D is D 08:00Z.
+# `America/Denver` is UTC-6 in June, so the 05:00 local trigger instant for
+# local day D is D 11:00Z.
 _TZ = "America/Denver"
-#: 06:00 local on 2026-06-06 — past that day's 02:00 trigger.
+#: 06:00 local on 2026-06-06 — past that day's 05:00 trigger.
 _AFTER_TRIGGER = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
-#: 01:00 local on 2026-06-06 — before that day's 02:00 trigger, so the
+#: 01:00 local on 2026-06-06 — before that day's 05:00 trigger, so the
 #: reader's current cycle is still 2026-06-05's.
 _BEFORE_TRIGGER = datetime(2026, 6, 6, 7, 0, tzinfo=UTC)
 

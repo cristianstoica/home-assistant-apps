@@ -59,6 +59,7 @@ from wxverify.verification.engine import (
     resolve_pass1_roster,
     write_pairwise_comparisons,
 )
+from wxverify.verification.read_cache import warm_read_cache
 from wxverify.verification.runs import (
     RunConfig,
     assert_inputs_unpinned_unchanged,
@@ -187,7 +188,14 @@ async def run_verification_chunk(
         await writer.write(lambda conn: _persist_verdicts(conn, site_id, cfg, verdicts))
         return _continuation(site_id, payload)
     more = await writer.write(lambda conn: advance_verification(conn, site_id, payload))
-    return _continuation(site_id, payload) if more else None
+    if more:
+        return _continuation(site_id, payload)
+    # Terminal chunk: `publish` has just moved the published-run pointer, so
+    # the page would otherwise serve the new run with no cache entry. This is
+    # a read and runs AFTER the write returned, never inside the transaction;
+    # `warm_read_cache` never raises `Exception`, so it cannot fail the run.
+    await warm_read_cache(db)
+    return None
 
 
 def _compute_verdicts(

@@ -28,9 +28,11 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     run_methodology_view,
 )
-from wxverify.verification.diagnostics import observed_wet_precip_mae
 from wxverify.verification.publish_hold import read_publish_hold, set_publish_hold
-from wxverify.verification.ranking import daily_rank_conclusions
+from wxverify.verification.read_cache import (
+    cached_daily_rank_conclusions,
+    cached_observed_wet_precip_mae,
+)
 from wxverify.verification.runs import (
     current_input_fingerprint,
     published_run_id,
@@ -269,7 +271,7 @@ async def run_verdicts(run_id: int) -> dict[str, object]:
         ).fetchall()
         # §10: derived at read time by the SAME helper the page calls, so the
         # two surfaces cannot state different conclusions.
-        conclusions = daily_rank_conclusions(conn, run_id)
+        conclusions = cached_daily_rank_conclusions(conn, run_id)
         return {
             "verification_schema": VERIFICATION_SCHEMA,
             "run_id": run_id,
@@ -420,7 +422,7 @@ async def run_diagnostics(
             ],
             # §14a: always-displayed secondary metric, from the same helper
             # /verification renders, so the surfaces cannot drift.
-            "observed_wet_precip_mae": observed_wet_precip_mae(conn, run_id),
+            "observed_wet_precip_mae": cached_observed_wet_precip_mae(conn, run_id),
             "day_context": [
                 {
                     "snapshot_local_date": str(d["snapshot_local_date"]),

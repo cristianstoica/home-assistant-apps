@@ -67,8 +67,12 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
 
 # Site-local wall-clock time at/after which the nightly verification trigger
 # fires (§14). A scheduling default, not §17 methodology — it cannot change
-# any score. Late (02:00) so the day's record and truth writes land first.
-VERIFICATION_TRIGGER_LOCAL_TIME = "02:00"
+# any score. It has to fall after `day_end_utc + CONSENSUS_LAG_HOURS` for the
+# PREVIOUS local day, or that day is still unsettled when the run starts and
+# the newest scorable day stays D-2 instead of D-1. Worst case is the
+# spring-forward day: only 4 real hours elapse from local midnight, leaving a
+# margin of 1 hour.
+VERIFICATION_TRIGGER_LOCAL_TIME = "05:00"
 
 # Operator kill-switch for the nightly verification chain (0.11.1 §3.1), set
 # through the Ops publish-hold control (`PUT /api/verification/publish-hold`),

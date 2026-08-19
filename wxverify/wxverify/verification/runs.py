@@ -36,12 +36,12 @@ from wxverify.verification.methodology import (
 )
 from wxverify.verification.record import snapshot_wall_clock
 
-_PUBLISHED_RUN_KEY_PREFIX = "verification_published_run:"
+PUBLISHED_RUN_KEY_PREFIX = "verification_published_run:"
 
 
 def published_run_key(site_id: int) -> str:
     """``runtime_state`` key holding the site's published verification run."""
-    return f"{_PUBLISHED_RUN_KEY_PREFIX}{site_id}"
+    return f"{PUBLISHED_RUN_KEY_PREFIX}{site_id}"
 
 
 def published_run_id(conn: sqlite3.Connection, site_id: int) -> int | None:

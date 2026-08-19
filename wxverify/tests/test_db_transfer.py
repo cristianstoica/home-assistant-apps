@@ -1877,7 +1877,7 @@ def test_import_content_length_over_cap_rejected_no_temp_created(
 ) -> None:
     """I8a: Content-Length header over cap -> 413, no temp ever created."""
     _init_tmp_db(tmp_path)
-    monkeypatch.setattr("wxverify.api.routes.db_transfer._MAX_IMPORT_BYTES", 64)
+    monkeypatch.setattr("wxverify.api.routes.db_transfer.MAX_IMPORT_BYTES", 64)
     app = _make_app(monkeypatch)
     with TestClient(app, raise_server_exceptions=False) as client:
         headers = _csrf_headers(client)
@@ -1900,7 +1900,7 @@ def test_import_oversized_streamed_body_rejected_despite_no_declared_length(
     mid-stream -- this exercises "the header can lie; the counter cannot".
     """
     _init_tmp_db(tmp_path)
-    monkeypatch.setattr("wxverify.api.routes.db_transfer._MAX_IMPORT_BYTES", 64)
+    monkeypatch.setattr("wxverify.api.routes.db_transfer.MAX_IMPORT_BYTES", 64)
     app = _make_app(monkeypatch)
 
     def _oversized_body() -> Iterator[bytes]:
@@ -3180,7 +3180,7 @@ def test_gzip_zip_bomb_rejected_413_and_disk_bounded(
     and the on-disk tmp never exceeds the cap (the 413 fires before full
     expansion). Paired with a gzip UNDER the same cap that inflates fully."""
     cap = 4096
-    monkeypatch.setattr("wxverify.api.routes.db_transfer._MAX_IMPORT_BYTES", cap)
+    monkeypatch.setattr("wxverify.api.routes.db_transfer.MAX_IMPORT_BYTES", cap)
 
     # Paired positive: comfortably under the cap -> inflates fully.
     under = b"under the cap"

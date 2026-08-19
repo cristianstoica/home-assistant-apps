@@ -19,6 +19,7 @@ import random
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 from wxverify.verification.methodology import (
     ADEQUATE_LEAD_MIN_DAYS,
@@ -1080,8 +1081,10 @@ def decide_variable(inputs: VariableInputs, *, seed: int, resamples: int) -> Ver
                     str, tuple[float | None, tuple[float, float] | None]
                 ] = {}
                 for r in passers:
-                    assert r.ordering_endpoint is not None
-                    restricted = _restrict_endpoint(r.ordering_endpoint, keep)
+                    # Not None: _shared_basis:987-992 refused this already.
+                    restricted = _restrict_endpoint(
+                        cast(_Endpoint, r.ordering_endpoint), keep
+                    )
                     recomputed[r.key] = (
                         restricted.pooled_effect(leads, None),
                         _bootstrap_ci(

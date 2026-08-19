@@ -36,6 +36,7 @@ from wxverify.verification.runs import (
     input_fingerprint,
     publish_run,
 )
+from wxverify.web.verification import _decision_days  # noqa: SLF001
 
 # ---------------------------------------------------------------------------
 # Harness.
@@ -2394,3 +2395,322 @@ def test_o22d_a_script_tag_refusal_token_is_escaped_not_executed(
     card = _card(page, "wind")
     assert "&lt;script&gt;x&lt;/script&gt;" in card
     assert "<script>x</script>" not in card
+
+
+# ---------------------------------------------------------------------------
+# O29 (item 3, §1.2/D14) -- the tested-family Comparison-window cell, scoped
+# strictly to its own row via O20's slice-then-assert idiom. Asserting
+# against the whole page instead of the row fragment makes this oracle
+# vacuous (§4 ground truth 30), because the run-level 16.2.decision_window
+# cell renders an overlapping "N days" string on the same page.
+# ---------------------------------------------------------------------------
+
+_O29_FAMILY: dict[str, object] = {
+    "incumbent": "2",
+    "candidates": {
+        # A numeric top-level "days" is seeded on every endpoint here --
+        # without it `_as_window` returns None and every branch renders the
+        # degenerate dash, proving nothing about the other two branches.
+        "3": {
+            "headline": {
+                "adequate_leads": [1],
+                "pooled_point": 0.1,
+                "ci": [0.05, 0.15],
+                "per_lead": {"1": 0.1},
+                "dropped_leads": [],
+                "window": {
+                    "first": "2026-05-01",
+                    "last": "2026-05-10",
+                    "days": 10,
+                    "per_lead": {},
+                },
+            },
+            "conditions": {
+                "ci_excludes_zero": True,
+                "lead_stability": True,
+                "practical_floor": True,
+                "beats_baselines": True,
+            },
+            "baselines": {},
+            "components": {},
+        },
+        "4": {
+            "headline": {
+                "adequate_leads": [],
+                "pooled_point": None,
+                "ci": None,
+                "per_lead": {},
+                "dropped_leads": [],
+                # Numeric "days" with no "first"/"last": the "0 days" branch.
+                "window": {"days": 0, "per_lead": {}},
+            },
+            "conditions": {
+                "ci_excludes_zero": False,
+                "lead_stability": False,
+                "practical_floor": False,
+                "beats_baselines": False,
+            },
+            "baselines": {},
+            "components": {},
+        },
+        "5": {
+            "headline": {
+                "adequate_leads": [],
+                "pooled_point": None,
+                "ci": None,
+                "per_lead": {},
+                "dropped_leads": [],
+                # No "days" at all: `_as_window` degrades to None, the '—'
+                # branch (this candidate's own degenerate case, not the
+                # ambient default -- the other two candidates prove the
+                # positive and the "0 days" branch aren't dashes too).
+                "window": {},
+            },
+            "conditions": {
+                "ci_excludes_zero": False,
+                "lead_stability": False,
+                "practical_floor": False,
+                "beats_baselines": False,
+            },
+            "baselines": {},
+            "components": {},
+        },
+    },
+    "statistically_unresolved": [],
+}
+
+
+def _o29_row(page: str, candidate: str) -> str:
+    row = page[page.index(f'data-candidate="{candidate}" data-endpoint="headline"') :]
+    return row[: row.index("</tr>")]
+
+
+def test_o29_comparison_window_cell_renders_the_exact_dated_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mutant M21 -> at this row's Comparison-window cell: correct =
+    '2026-05-01&ndash;2026-05-10 (10 days)', mutant (the endpoint cell
+    sourced from the run-level baseline/decision window instead of its own
+    `e.window`) = a different date range or no dated string at all in this
+    row -- forced by the row fragment carrying ONLY candidate 3's own
+    endpoint window."""
+    page = _render(
+        tmp_path, monkeypatch, [("temperature", "recommend", 3, 2, _O29_FAMILY)]
+    )
+    row = _o29_row(page, "3")
+    # mutant M22 -> at this row's Comparison-window cell: correct = 'N
+    # days' as its own substring (independent of the date range), mutant (a
+    # day-count that is dropped or mis-derived, e.g. always 0 or the wrong
+    # number) = '10 days' absent even though the date range is present. This
+    # single assertion carries both M21's and M22's kill: it is the full
+    # dated string, so a day-count mismatch fails it exactly as a date-range
+    # mismatch does -- a separate `"10 days" in row` assertion is strictly
+    # subsumed by this one and can never fail while it passes.
+    assert "2026-05-01&ndash;2026-05-10 (10 days)" in row
+
+
+def test_o29_zero_day_window_renders_the_zero_days_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `0 days` branch: a numeric `days` with no `first`/`last`."""
+    page = _render(
+        tmp_path, monkeypatch, [("temperature", "recommend", 3, 2, _O29_FAMILY)]
+    )
+    row = _o29_row(page, "4")
+    assert "0 days" in row
+    assert "&ndash;" not in row
+
+
+def test_o29_missing_days_renders_the_degenerate_dash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The degenerate `—` branch: no `days` at all -> `_as_window` -> None."""
+    page = _render(
+        tmp_path, monkeypatch, [("temperature", "recommend", 3, 2, _O29_FAMILY)]
+    )
+    row = _o29_row(page, "5")
+    window_cell = row[row.index('data-v16="16.5.endpoint_window"') :]
+    window_cell = window_cell[: window_cell.index("</td>")]
+    assert "—" in window_cell
+    assert "days" not in window_cell
+
+
+# ---------------------------------------------------------------------------
+# O27 (item 1, §1.2/D12) -- `_decision_days` is total over its declared type.
+#
+# Called DIRECTLY, not through the page: `_endpoint_view`'s output always
+# carries a "window" key (§4 ground truth 25), so the page can never drive
+# an endpoint dict missing it -- driving the page would test `_endpoint_view`
+# instead and prove nothing about `_decision_days` itself.
+# ---------------------------------------------------------------------------
+
+
+def test_o27_decision_days_is_total_over_a_malformed_endpoint() -> None:
+    """mutant M19 -> at each `_decision_days(...)` call below: correct =
+    `None` (no exception), mutant (the bare `endpoint["window"]` subscript
+    restored) = a raised `KeyError` on the first case -- the malformed
+    inputs a page-driven call can never produce."""
+    no_window_key: dict[str, object] = {}
+    assert _decision_days(no_window_key, 1) is None
+
+    none_window: dict[str, object] = {"window": None}
+    assert _decision_days(none_window, 1) is None
+
+    non_dict_window: dict[str, object] = {"window": "not-a-window"}
+    assert _decision_days(non_dict_window, 1) is None
+
+    # Positive control: the function still works, not merely fails to raise.
+    well_formed: dict[str, object] = {
+        "window": {"per_lead": {"1": {"days": 7}}},
+    }
+    assert _decision_days(well_formed, 1) == 7
+
+
+# ---------------------------------------------------------------------------
+# O30 -- one apostrophe form in show.html, and its data-v16 markers intact.
+# ---------------------------------------------------------------------------
+
+_EXPECTED_V16_MARKERS = frozenset(
+    {
+        "16.1.app_version",
+        "16.1.config_snapshot",
+        "16.1.created_at",
+        "16.1.data_cutoff",
+        "16.1.declared_configuration",
+        "16.1.methodology_version",
+        "16.1.no_publishable_run",
+        "16.1.period",
+        "16.1.pinned_depths",
+        "16.1.published_at",
+        "16.1.roster_snapshot",
+        "16.1.run_id",
+        "16.1.run_link",
+        "16.1.trigger_status",
+        "16.1.tz_generation",
+        "16.1.warn_failed_newer",
+        "16.1.warn_stale",
+        "16.2.adequate_leads",
+        "16.2.baseline_gates",
+        "16.2.basis_inconsistent",
+        "16.2.card",
+        "16.2.caveat",
+        "16.2.common_day_range",
+        "16.2.completeness_guards",
+        "16.2.decision_statement",
+        "16.2.decision_window",
+        "16.2.depth_mismatch",
+        "16.2.evidence_scope",
+        "16.2.incumbent_depth",
+        "16.2.live_depth",
+        "16.2.ordering_endpoint_unresolved",
+        "16.2.ordering_refusal",
+        "16.2.outcome",
+        "16.2.placeholder",
+        "16.2.practical_significance",
+        "16.2.primary_ci",
+        "16.2.primary_effect",
+        "16.2.primary_missing",
+        "16.2.ranking_redesign",
+        "16.2.recommended_depth",
+        "16.2.skip_reason",
+        "16.2.unresolved",
+        "16.3.baseline_comparisons",
+        "16.3.candidate_depth",
+        "16.3.ci",
+        "16.3.common_days",
+        "16.3.core_unavailable",
+        "16.3.decision_days",
+        "16.3.gate_states",
+        "16.3.incumbent_delta",
+        "16.3.observed_events",
+        "16.3.one_sample",
+        "16.3.primary_metric",
+        "16.3.realized_contributors",
+        "16.3.row",
+        "16.3.table",
+        "16.3.two_samples",
+        "16.4.{{ item.key }}",
+        "16.4.bias_rmse",
+        "16.4.contingency",
+        "16.4.d0",
+        "16.4.daily_rank",
+        "16.4.day_context",
+        "16.4.feeds",
+        "16.4.non_enactable",
+        "16.4.observed_wet_precip_mae",
+        "16.5.adjusted_confidence",
+        "16.5.baseline_comparisons",
+        "16.5.baseline_window",
+        "16.5.baselines",
+        "16.5.bootstrap",
+        "16.5.candidates",
+        "16.5.code_version",
+        "16.5.config_snapshot",
+        "16.5.eligibility_rules",
+        "16.5.endpoint_window",
+        "16.5.exclusion_counts",
+        "16.5.gate_outcomes",
+        "16.5.input_fingerprint",
+        "16.5.metrics",
+        "16.5.ranking_basis",
+        "16.5.roster_floor",
+        "16.5.run_link",
+        "16.5.schema",
+        "16.5.snapshot_time",
+        "16.5.tested_family",
+        "16.5.tested_family_variable",
+        "16.5.thresholds",
+        "16.5.timezone",
+        "16.5.truth_rules",
+        "16.5.units",
+    }
+)
+
+
+def test_o30_no_html_entity_apostrophe_and_v16_markers_are_the_pinned_set() -> None:
+    """A reflow that drops or renames a data-v16 marker while normalising
+    an apostrophe form. The expected set is a literal written into this
+    test (not re-derived from the file, which would pass against any
+    mutation that touches the file consistently) -- captured from the
+    already-normalised source, so it doubles as a regression pin against a
+    marker being silently added, removed, or renamed on any future edit to
+    this template.
+
+    mutant M23 -> at `markers == _EXPECTED_V16_MARKERS` below: correct =
+    `True` (the 91-element pinned set matches exactly), mutant (one
+    `data-v16` value in show.html altered to e.g. "16.5.endpoint_windows"
+    while normalising a nearby apostrophe) = `False` -- the mutated set has
+    a different element and is neither a subset nor superset of the
+    literal above, so `==` diverges.
+    """
+    wxverify_root = Path(__file__).resolve().parent.parent / "wxverify"
+    show_html = wxverify_root / "web" / "templates" / "verification" / "show.html"
+    source = show_html.read_text(encoding="utf-8")
+
+    apostrophe = chr(0x2019)
+    assert apostrophe not in source
+    assert "&rsquo;" not in source
+
+    for path in wxverify_root.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        assert "&rsquo;" not in text, f"stray &rsquo; entity in {path}"
+        assert apostrophe not in text, f"stray U+2019 apostrophe in {path}"
+
+    markers: set[str] = set()
+    marker_prefix = 'data-v16="'
+    idx = 0
+    while True:
+        idx = source.find(marker_prefix, idx)
+        if idx == -1:
+            break
+        start = idx + len(marker_prefix)
+        end = source.index('"', start)
+        markers.add(source[start:end])
+        idx = end
+
+    assert markers == _EXPECTED_V16_MARKERS
