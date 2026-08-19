@@ -161,9 +161,9 @@ def _contingency(rows: dict[str, sqlite3.Row], dates: list[str]) -> Contingency 
     return table
 
 
-def _pairwise_core(cell: _CellRows, entity: EntityId, incumbent: EntityId) -> list[str]:
+def _pairwise_core(cell: _CellRows, entity: EntityId, other: EntityId) -> list[str]:
     return sorted(
-        _eligible_dates(cell.get(entity, {})) & _eligible_dates(cell.get(incumbent, {}))
+        _eligible_dates(cell.get(entity, {})) & _eligible_dates(cell.get(other, {}))
     )
 
 
@@ -517,18 +517,6 @@ def _parse_detail(raw: object) -> dict[str, object]:
     return cast(dict[str, object], parsed)
 
 
-def _aggregate_state(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
-    row = conn.execute(
-        "SELECT aggregate_state FROM verification_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    if row is None or row["aggregate_state"] is None:
-        raise RuntimeError(f"verification run {run_id} has no aggregate state")
-    parsed: object = json.loads(str(row["aggregate_state"]))
-    if not isinstance(parsed, dict):
-        raise RuntimeError(f"verification run {run_id} aggregate state malformed")
-    return cast(dict[str, object], parsed)
-
-
 def _common_dates(state: dict[str, object], key: str) -> list[str]:
     cell = state.get(key)
     if not isinstance(cell, dict):
@@ -604,9 +592,13 @@ def _class_series(
 def prepare_bootstrap_inputs(
     conn: sqlite3.Connection, cfg: RunConfig
 ) -> list[VariableInputs]:
-    """Rebuild the §12 paired series from evidence + the persisted cell
-    resolution — read-only; safe on a read connection."""
-    state = _aggregate_state(conn, cfg.run_id)
+    """Rebuild the §12 paired series from evidence — read-only; safe on a
+    read connection.
+
+    Decision comparisons are paired, so each series is built on the pairwise
+    core of the two entities compared (§12 D1). The cell's strict common core
+    belongs to the headline results table, not here.
+    """
     out: list[VariableInputs] = []
     for variable in SIM_VARIABLES:
         incumbent_depth = cfg.incumbent_depth(variable)
@@ -617,14 +609,10 @@ def prepare_bootstrap_inputs(
             continue
         incumbent: EntityId = ("depth", str(incumbent_depth))
         cells: dict[tuple[int, str], _CellRows] = {}
-        cores: dict[tuple[int, str], list[str]] = {}
         for lead in DECISION_LEADS:
             for quantity in VARIABLE_QUANTITIES[variable]:
                 cells[(lead, quantity)] = _load_cell(
                     conn, cfg.run_id, variable, lead, quantity
-                )
-                cores[(lead, quantity)] = _common_dates(
-                    state, _cell_key(variable, lead, quantity)
                 )
         candidates: list[CandidateSeries] = []
         for depth in SIM_DEPTHS:
@@ -639,9 +627,13 @@ def prepare_bootstrap_inputs(
             for lead in DECISION_LEADS:
                 for quantity in VARIABLE_QUANTITIES[variable]:
                     cell = cells[(lead, quantity)]
-                    dates = cores[(lead, quantity)]
                     if quantity == QUANTITY_PRECIP_OCCURRENCE:
-                        series = _class_series(cell, entity, incumbent, dates)
+                        series = _class_series(
+                            cell,
+                            entity,
+                            incumbent,
+                            _pairwise_core(cell, entity, incumbent),
+                        )
                         if series:
                             occurrence[lead] = series
                         for baseline in OCCURRENCE_BASELINES:
@@ -649,13 +641,20 @@ def prepare_bootstrap_inputs(
                                 baseline,
                                 baseline.removeprefix("baseline_"),
                             )
-                            b_series = _class_series(cell, entity, base, dates)
+                            b_series = _class_series(
+                                cell, entity, base, _pairwise_core(cell, entity, base)
+                            )
                             if b_series:
                                 baseline_occurrence.setdefault(baseline, {})[lead] = (
                                     b_series
                                 )
                     else:
-                        series_c = _abs_series(cell, entity, incumbent, dates)
+                        series_c = _abs_series(
+                            cell,
+                            entity,
+                            incumbent,
+                            _pairwise_core(cell, entity, incumbent),
+                        )
                         if series_c:
                             continuous.setdefault(quantity, {})[lead] = series_c
                         for baseline in CONTINUOUS_BASELINES:
@@ -663,7 +662,9 @@ def prepare_bootstrap_inputs(
                                 baseline,
                                 baseline.removeprefix("baseline_"),
                             )
-                            b_series_c = _abs_series(cell, entity, base, dates)
+                            b_series_c = _abs_series(
+                                cell, entity, base, _pairwise_core(cell, entity, base)
+                            )
                             if b_series_c:
                                 baseline_continuous.setdefault(baseline, {}).setdefault(
                                     quantity, {}

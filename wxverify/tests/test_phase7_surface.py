@@ -97,10 +97,20 @@ def _make_site(conn: sqlite3.Connection, name: str = "Verify Town") -> int:
 
 
 def _seed_published_run(
-    conn: sqlite3.Connection, site_id: int, *, fresh_fingerprint: bool = True
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    fresh_fingerprint: bool = True,
+    methodology_version: int = 1,
 ) -> int:
     """A published run with verdicts (incl. 'skipped'), headline results
-    (incl. NULL metrics), evidence, day context, and a trigger decision."""
+    (incl. NULL metrics), evidence, day context, and a trigger decision.
+
+    ``methodology_version`` defaults to 1 -- the version every existing
+    caller relies on unchanged -- so it mirrors the live published run
+    (still on the pre-pairwise methodology). Pass 2 for O-V3's matching-
+    version arm.
+    """
     generation_id = ensure_published_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = (
@@ -114,10 +124,16 @@ def _seed_published_run(
                  state, attempt, config_snapshot, period_start, period_end,
                  settled_through, bootstrap_seed, bootstrap_resamples,
                  input_fingerprint)
-            VALUES (?, ?, 1, '0.11.0-test', 'running', 1, ?, '2026-05-01',
+            VALUES (?, ?, ?, '0.11.0-test', 'running', 1, ?, '2026-05-01',
                     '2026-05-30', '2026-05-30', 12345, 100, ?)
             """,
-            (site_id, generation_id, json.dumps(snapshot), fingerprint),
+            (
+                site_id,
+                generation_id,
+                methodology_version,
+                json.dumps(snapshot),
+                fingerprint,
+            ),
         ).lastrowid
     )
     verdict_rows = [
@@ -519,7 +535,7 @@ def test_api_status_runs_and_run_detail(
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         status = client.get(f"/api/verification/status?site={site_id}").json()
-        assert status["verification_schema"] == 1
+        assert status["verification_schema"] == 2
         assert "units" in status["contract"]
         (entry,) = status["sites"]
         assert entry["published_run"]["run_id"] == run_id
@@ -534,7 +550,7 @@ def test_api_status_runs_and_run_detail(
         assert [r["run_id"] for r in runs["runs"]] == [run_id]
 
         detail = client.get(f"/api/verification/runs/{run_id}").json()
-        assert detail["verification_schema"] == 1
+        assert detail["verification_schema"] == 2
         snapshot = detail["run"]["config_snapshot"]
         assert snapshot["blend_depths"] == {
             "temperature": 2,
@@ -596,7 +612,7 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
         evidence = client.get(
             f"/api/verification/runs/{run_id}/evidence?variable=temperature&lead=1"
         ).json()
-        assert evidence["verification_schema"] == 1
+        assert evidence["verification_schema"] == 2
         assert len(evidence["evidence"]) == 1
         assert evidence["evidence"][0]["quantity"] == "temperature_high"
 
@@ -621,11 +637,19 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
         assert wind_row["ets"] is None
         assert diag["day_context"][0]["null_availability_samples"] == 0
 
+        # O-V3, v1 arm: this fixture's run was scored under methodology
+        # version 1 (the shape of the live published run today), which does
+        # not match this build's version 2 -- so the endpoint refuses to
+        # answer with the current constants/contract rather than describing
+        # a run under a version it does not carry. See
+        # test_api_methodology_matches_the_build_version_it_was_scored_under
+        # for the matching-version (v2) arm.
         meth = client.get(f"/api/verification/runs/{run_id}/methodology").json()
-        assert meth["constants"]["methodology_version"] == 1
-        assert meth["constants"]["bootstrap_resamples"] == 10_000
-        assert meth["constants"]["simulated_depths"] == [1, 2, 3, 4]
-        assert meth["contract"]["units"]["wind_max"] == "m/s"
+        assert meth["contract"] is None
+        assert meth["constants"] is None
+        assert meth["contract_unavailable_reason"] is not None
+        assert "methodology version 1" in meth["contract_unavailable_reason"]
+        assert "methodology version 2" in meth["contract_unavailable_reason"]
         assert meth["provenance"]["run_id"] == run_id
 
         latest = client.get(
@@ -642,6 +666,32 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
             ).status_code
             == 404
         )
+
+
+def test_api_methodology_matches_the_build_version_it_was_scored_under(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O-V3, v2 arm: a run scored under this build's own methodology
+    version gets the real contract/constants, paired with the v1 refusal
+    arm above (`_seed_published_run`'s default) so a mutant that always
+    refuses -- or always answers -- is caught by whichever arm it breaks.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    run_id = _seed_published_run(conn, site_id, methodology_version=2)
+    conn.commit()
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        meth = client.get(f"/api/verification/runs/{run_id}/methodology").json()
+        assert meth["contract_unavailable_reason"] is None
+        assert meth["contract"] is not None
+        assert meth["constants"] is not None
+        assert meth["constants"]["methodology_version"] == 2
+        assert meth["constants"]["bootstrap_resamples"] == 10_000
+        assert meth["constants"]["simulated_depths"] == [1, 2, 3, 4]
+        assert meth["contract"]["units"]["wind_max"] == "m/s"
+        assert meth["provenance"]["run_id"] == run_id
 
 
 # ---------------------------------------------------------------------------

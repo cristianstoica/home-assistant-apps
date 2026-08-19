@@ -1,9 +1,10 @@
 """Pure §12 gatekeeping: bootstrap CIs, gates, and the per-variable verdict.
 
-No SQLite, no clock — the engine hands this module already-joined
-common-core paired series (candidate vs incumbent and candidate vs each
-baseline, per lead and quantity) and gets back one verdict per variable
-plus a JSON-able evidence record for ``verification_verdicts.tested_family``.
+No SQLite, no clock — the engine hands this module already-joined paired
+series (candidate vs incumbent and candidate vs each baseline, per lead and
+quantity, each on the pairwise core of the two entities compared) and gets
+back one verdict per variable plus a JSON-able evidence record for
+``verification_verdicts.tested_family``.
 
 Clustering unit: the TARGET DATE. One moving-block bootstrap resample draws
 a date multiset from the comparison's date universe; every lead and
@@ -236,6 +237,30 @@ def _index_endpoint(
     return _Endpoint(kind=kind, leads=leads, universe=universe)
 
 
+def _restrict_endpoint(endpoint: _Endpoint, keep: Mapping[int, set[str]]) -> _Endpoint:
+    """``endpoint`` narrowed to ``keep``'s per-lead dates, re-indexed dense.
+
+    Every stored triple carries its date index, so ``endpoint.universe``
+    recovers the date with no extra plumbing. The result is re-indexed
+    through ``_index_endpoint`` because the moving-block bootstrap draws
+    indices over a DENSE universe; a sparse one would resample dates the
+    restriction removed.
+    """
+    series: dict[int, dict[str, tuple[object, object]]] = {}
+    for lead, pairs in endpoint.leads.items():
+        wanted = keep.get(lead)
+        if not wanted:
+            continue
+        days = {
+            endpoint.universe[i]: (a, b)
+            for i, a, b in pairs
+            if endpoint.universe[i] in wanted
+        }
+        if days:
+            series[lead] = days
+    return _index_endpoint(endpoint.kind, series)
+
+
 def _adequate_leads(
     endpoint: _Endpoint,
     *,
@@ -243,8 +268,8 @@ def _adequate_leads(
     baseline_support: Mapping[str, frozenset[int]] | None = None,
     restrict_to: tuple[int, ...] | None = None,
 ) -> tuple[tuple[int, ...], list[dict[str, object]]]:
-    """§12 adequacy: >= 20 strict-common days; occurrence also needs the
-    minimum wet/dry event counts on the OBSERVED side of the common core.
+    """§12 adequacy: >= 20 paired days; occurrence also needs the minimum
+    wet/dry event counts on the OBSERVED side of those days.
 
     §8/W5 adds the required-baseline condition INSIDE this same loop rather
     than as a filter over its output: a lead where a required baseline has
@@ -264,10 +289,10 @@ def _adequate_leads(
     for lead in DECISION_LEADS:
         pairs = endpoint.leads.get(lead, [])
         if len(pairs) < ADEQUATE_LEAD_MIN_DAYS:
-            if pairs:
-                dropped.append(
-                    {"lead": lead, "reason": "thin_data", "days": len(pairs)}
-                )
+            # Unconditional: a lead with NO shared day is the worst case and
+            # must not be the one case that reports nothing. `days: 0` is the
+            # whole distinction, so the drop vocabulary stays closed.
+            dropped.append({"lead": lead, "reason": "thin_data", "days": len(pairs)})
             continue
         if occurrence:
             wet = sum(1 for _, cand, _ in pairs if str(cand) in _WET_CLASSES)
@@ -328,12 +353,44 @@ def _bootstrap_ci(
     return percentile_ci(draws, level)
 
 
+def _endpoint_window(
+    endpoint: _Endpoint, adequate: tuple[int, ...]
+) -> dict[str, object]:
+    """The days actually pooled: the overall span and the per-lead spans.
+
+    ``days`` counts DISTINCT dates, so the overall figure is not the sum of
+    the per-lead ones. An endpoint with no adequate lead still returns the
+    block with ``first``/``last`` NULL and ``days`` 0 — an absent block would
+    read as "not disclosed", which is the thing this field exists to prevent.
+    """
+    per_lead: dict[str, object] = {}
+    universe: set[str] = set()
+    for lead in adequate:
+        dates = sorted(endpoint.universe[i] for i, _, _ in endpoint.leads.get(lead, []))
+        if not dates:
+            continue
+        universe.update(dates)
+        per_lead[str(lead)] = {
+            "first": dates[0],
+            "last": dates[-1],
+            "days": len(dates),
+        }
+    ordered = sorted(universe)
+    return {
+        "first": ordered[0] if ordered else None,
+        "last": ordered[-1] if ordered else None,
+        "days": len(ordered),
+        "per_lead": per_lead,
+    }
+
+
 @dataclass(frozen=True)
 class _EndpointEvaluation:
     adequate: tuple[int, ...]
     point: float | None
     ci: tuple[float, float] | None
     per_lead: dict[int, float | None]
+    window: dict[str, object]
     dropped: list[dict[str, object]] = field(default_factory=list[dict[str, object]])
 
     def as_json(self) -> dict[str, object]:
@@ -342,6 +399,7 @@ class _EndpointEvaluation:
             "pooled_point": self.point,
             "ci": None if self.ci is None else list(self.ci),
             "per_lead": {str(k): v for k, v in self.per_lead.items()},
+            "window": self.window,
             "dropped_leads": self.dropped,
         }
 
@@ -366,7 +424,12 @@ def _evaluate_endpoint(
     ci = _bootstrap_ci(endpoint, adequate, level=level, seed=seed, resamples=resamples)
     per_lead = {lead: endpoint.lead_effect(lead, None) for lead in adequate}
     return _EndpointEvaluation(
-        adequate=adequate, point=point, ci=ci, per_lead=per_lead, dropped=dropped
+        adequate=adequate,
+        point=point,
+        ci=ci,
+        per_lead=per_lead,
+        window=_endpoint_window(endpoint, adequate),
+        dropped=dropped,
     )
 
 
@@ -540,6 +603,18 @@ class _CandidateResult:
     pooled: float | None
     ci: tuple[float, float] | None
     record: dict[str, object]
+    #: The endpoint `decide_variable` orders passers on, its name in
+    #: ``record``, and the level/seed its own evaluation used — carried so the
+    #: shared-basis step can recompute point AND interval without re-deriving
+    #: anything. ``adequate_by_endpoint`` holds each endpoint's adequate set
+    #: AS THE GATE DECIDED IT: reconstructing it from pair counts would
+    #: re-admit every lead the §8/W5 baseline lockstep dropped, which is the
+    #: direction that overstates the evidence.
+    ordering_endpoint: _Endpoint | None
+    ordering_endpoint_name: str
+    ordering_level: float
+    ordering_seed: int
+    adequate_by_endpoint: dict[str, tuple[int, ...]]
 
 
 def _decide_wind_or_temp(
@@ -578,7 +653,12 @@ def _decide_wind_or_temp(
         resamples=resamples,
         baseline_support=support,
     )
-    record: dict[str, object] = {"headline": evaluation.as_json()}
+    record: dict[str, object] = {
+        "headline": evaluation.as_json(),
+        # D14: the render layer reads the decision's endpoint by name from
+        # here rather than re-implementing the selection rule.
+        "ordering_endpoint_name": "headline",
+    }
     if len(evaluation.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE:
         return _CandidateResult(
             key=candidate.key,
@@ -589,6 +669,11 @@ def _decide_wind_or_temp(
             pooled=evaluation.point,
             ci=evaluation.ci,
             record=record,
+            ordering_endpoint=endpoint,
+            ordering_endpoint_name="headline",
+            ordering_level=CANDIDATE_CI_LEVEL,
+            ordering_seed=seed,
+            adequate_by_endpoint={"headline": evaluation.adequate},
         )
     c1 = _beats(evaluation)
     c2 = _lead_stability(evaluation)
@@ -652,6 +737,11 @@ def _decide_wind_or_temp(
         pooled=evaluation.point,
         ci=evaluation.ci,
         record=record,
+        ordering_endpoint=endpoint,
+        ordering_endpoint_name="headline",
+        ordering_level=CANDIDATE_CI_LEVEL,
+        ordering_seed=seed,
+        adequate_by_endpoint={"headline": evaluation.adequate},
     )
 
 
@@ -663,34 +753,39 @@ def _decide_precip(
     )
     occ_support = _baseline_support(candidate, quantity=None, occurrence=True)
     total_series = candidate.continuous.get("precip_total", {})
+    total_endpoint = _index_endpoint(
+        "continuous",
+        {
+            ld: {d: (c, o) for d, (c, o) in days.items()}
+            for ld, days in total_series.items()
+        },
+    )
     total = _evaluate_endpoint(
-        _index_endpoint(
-            "continuous",
-            {
-                ld: {d: (c, o) for d, (c, o) in days.items()}
-                for ld, days in total_series.items()
-            },
-        ),
+        total_endpoint,
         occurrence=False,
         level=PRECIP_IMPROVEMENT_CI_LEVEL,
         seed=seed,
         resamples=resamples,
         baseline_support=total_support,
     )
+    occ_endpoint = _index_endpoint(
+        "occurrence",
+        {
+            ld: {d: (c, o) for d, (c, o) in days.items()}
+            for ld, days in candidate.occurrence.items()
+        },
+    )
     occ = _evaluate_endpoint(
-        _index_endpoint(
-            "occurrence",
-            {
-                ld: {d: (c, o) for d, (c, o) in days.items()}
-                for ld, days in candidate.occurrence.items()
-            },
-        ),
+        occ_endpoint,
         occurrence=True,
         level=PRECIP_IMPROVEMENT_CI_LEVEL,
         seed=seed,
         resamples=resamples,
         baseline_support=occ_support,
     )
+    # The two endpoints have INDEPENDENT adequate sets, so a single tuple
+    # could only ever be right for one of them (D5).
+    adequate_by_endpoint = {"total": total.adequate, "occurrence": occ.adequate}
     record: dict[str, object] = {
         "total": total.as_json(),
         "occurrence": occ.as_json(),
@@ -699,6 +794,8 @@ def _decide_precip(
         len(total.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE
         and len(occ.adequate) < MIN_ADEQUATE_LEADS_PER_VARIABLE
     ):
+        # Nothing improved, so F-4 selects the total endpoint (D5/D14).
+        record["ordering_endpoint_name"] = "total"
         return _CandidateResult(
             key=candidate.key,
             passed=False,
@@ -708,6 +805,11 @@ def _decide_precip(
             pooled=None,
             ci=None,
             record=record,
+            ordering_endpoint=total_endpoint,
+            ordering_endpoint_name="total",
+            ordering_level=PRECIP_IMPROVEMENT_CI_LEVEL,
+            ordering_seed=seed,
+            adequate_by_endpoint=adequate_by_endpoint,
         )
     total_material = (
         len(total.adequate) >= MIN_ADEQUATE_LEADS_PER_VARIABLE
@@ -787,21 +889,25 @@ def _decide_precip(
     )
     # F-4 (documented unit mix): total.point is a RELATIVE-MAE improvement
     # while occ.point is an ETS DIFFERENCE — different units, deliberately
-    # NOT normalized. `pooled` only orders passing candidates for the §12
-    # tie-break (and CI overlap then prefers the depth nearest the
-    # incumbent), so a cross-unit max is an ordering heuristic, not a
-    # reported effect size; the per-endpoint effects in `record` stay in
-    # their own units.
-    pooled_candidates = [
-        e
-        for e in (
-            total.point if "total" in improved or not improved else None,
-            occ.point if "occurrence" in improved else None,
-        )
-        if e is not None
-    ]
-    pooled = max(pooled_candidates) if pooled_candidates else total.point
-    ci = total.ci if "occurrence" not in improved else occ.ci
+    # NOT normalized. The selection is therefore made ONCE and atomically:
+    # the ordering point, the ordering interval, the ordering endpoint and
+    # the persisted name all come from that single endpoint, so no value
+    # recorded beside the point is measured on the other endpoint's scale.
+    # The CROSS-CANDIDATE unit mix is untouched by this and remains real —
+    # one passer ordered on a relative-MAE improvement against another
+    # ordered on an ETS difference — because no rule applied inside one
+    # candidate can make two candidates' endpoints commensurable;
+    # `_shared_basis` case 3 (mixed_endpoint_kind) is what refuses to order
+    # on it.
+    ordering_name = "occurrence" if "occurrence" in improved else "total"
+    selected, selected_endpoint = (
+        (occ, occ_endpoint)
+        if ordering_name == "occurrence"
+        else (total, total_endpoint)
+    )
+    pooled = selected.point
+    ci = selected.ci
+    record["ordering_endpoint_name"] = ordering_name
     return _CandidateResult(
         key=candidate.key,
         passed=bool(improved) and c4,
@@ -811,6 +917,11 @@ def _decide_precip(
         pooled=pooled,
         ci=ci,
         record=record,
+        ordering_endpoint=selected_endpoint,
+        ordering_endpoint_name=ordering_name,
+        ordering_level=PRECIP_IMPROVEMENT_CI_LEVEL,
+        ordering_seed=seed,
+        adequate_by_endpoint=adequate_by_endpoint,
     )
 
 
@@ -818,6 +929,102 @@ def _ci_overlaps(a: tuple[float, float] | None, b: tuple[float, float] | None) -
     if a is None or b is None:
         return False
     return a[0] <= b[1] and b[0] <= a[1]
+
+
+def _basis_record(
+    keep: Mapping[int, set[str]],
+    recomputed: Mapping[str, tuple[float | None, tuple[float, float] | None]],
+) -> dict[str, object]:
+    """The disclosed shared basis: the days ordered on, and what they gave.
+
+    ``cis`` is recorded beside ``points`` because the overlap step is what
+    decides whether the nearest-incumbent fallback fires. Without the
+    intervals, a step that recomputed the point but re-used each passer's
+    stored per-window interval would be indistinguishable from a full
+    recomputation.
+
+    ``days_total`` is the count of DISTINCT dates across all basis leads —
+    the union, never the sum of the per-lead ``days`` counts. The basis
+    leads share most of their dates, so the sum overstates the sample by
+    roughly the lead count. It is recorded rather than left to the reader
+    because the card renders the basis window and the render layer is
+    forbidden from re-deriving any part of the basis (D5/D9).
+    """
+    dates = sorted({d for days in keep.values() for d in days})
+    return {
+        "leads": sorted(keep),
+        "days": {str(lead): len(days) for lead, days in sorted(keep.items())},
+        "days_total": len(dates),
+        "first": dates[0] if dates else None,
+        "last": dates[-1] if dates else None,
+        "points": {key: point for key, (point, _) in recomputed.items()},
+        "cis": {
+            key: None if ci is None else list(ci) for key, (_, ci) in recomputed.items()
+        },
+    }
+
+
+def _shared_basis(
+    passers: list[_CandidateResult],
+) -> tuple[dict[int, set[str]] | None, str | None]:
+    """The days two or more passers can be ordered on, or a refusal token.
+
+    Leads are the intersection of the passers' CARRIED adequate sets — never
+    re-derived from pair counts, which would re-admit every lead the §8/W5
+    baseline lockstep dropped (a lead can hold a full complement of
+    candidate-vs-incumbent pairs and still have no baseline series). Dates
+    are the intersection of the per-lead date sets.
+
+    The surviving leads are then re-passed through ``_adequate_leads`` on the
+    RESTRICTED endpoint rather than re-checked by hand, so the shared basis
+    has to clear every floor the adequacy definition applies: the day floor
+    and, on an occurrence endpoint, the wet/dry event floors. A basis thick
+    in days and thin in wet days is the live shape this forecloses.
+    """
+    endpoints: list[_Endpoint] = []
+    lead_sets: list[set[int]] = []
+    for result in passers:
+        if result.ordering_endpoint is None:
+            # Unreachable: only a passer reaches here and every passer
+            # evaluated an endpoint. Fail closed rather than order on
+            # nothing.
+            return None, "thin_shared_basis"
+        endpoints.append(result.ordering_endpoint)
+        lead_sets.append(
+            set(result.adequate_by_endpoint.get(result.ordering_endpoint_name, ()))
+        )
+    if len({endpoint.kind for endpoint in endpoints}) > 1:
+        return None, "mixed_endpoint_kind"
+    occurrence = endpoints[0].kind == "occurrence"
+    leads = set(lead_sets[0])
+    for other in lead_sets[1:]:
+        leads &= other
+    keep: dict[int, set[str]] = {}
+    for lead in leads:
+        dates = {
+            endpoints[0].universe[i] for i, _, _ in endpoints[0].leads.get(lead, [])
+        }
+        for endpoint in endpoints[1:]:
+            dates &= {endpoint.universe[i] for i, _, _ in endpoint.leads.get(lead, [])}
+        if dates:
+            keep[lead] = dates
+    thick = [
+        lead for lead, dates in keep.items() if len(dates) >= ADEQUATE_LEAD_MIN_DAYS
+    ]
+    if len(thick) < MIN_ADEQUATE_LEADS_PER_VARIABLE:
+        return None, "thin_shared_basis"
+    in_basis: set[int] | None = None
+    for endpoint in endpoints:
+        adequate, _ = _adequate_leads(
+            _restrict_endpoint(endpoint, keep), occurrence=occurrence
+        )
+        in_basis = set(adequate) if in_basis is None else in_basis & set(adequate)
+    if in_basis is None or len(in_basis) < MIN_ADEQUATE_LEADS_PER_VARIABLE:
+        # The day floor already cleared above, so on an occurrence endpoint
+        # the only remaining cause is the event floors: "wait for more rain",
+        # not "wait for more days".
+        return None, "thin_shared_events" if occurrence else "thin_shared_basis"
+    return {lead: keep[lead] for lead in sorted(in_basis)}, None
 
 
 def decide_variable(inputs: VariableInputs, *, seed: int, resamples: int) -> Verdict:
@@ -846,32 +1053,90 @@ def decide_variable(inputs: VariableInputs, *, seed: int, resamples: int) -> Ver
     }
     passers = [r for r in results if r.passed and r.pooled is not None]
     if passers:
-        best = max(passers, key=lambda r: (r.pooled or 0.0, r.key))
-        overlapping = [
-            r for r in passers if r is not best and _ci_overlaps(best.ci, r.ci)
-        ]
-        chosen = best
-        if overlapping:
-            # Material CI overlap: prefer the depth closest to the incumbent;
-            # the others are reported statistically unresolved (§12).
-            def distance(r: _CandidateResult) -> tuple[float, str]:
-                try:
-                    return (
-                        abs(int(r.key) - int(inputs.incumbent_key)),
-                        r.key,
-                    )
-                except ValueError:
-                    return (math.inf, r.key)
 
-            pool = [best, *overlapping]
-            chosen = min(pool, key=distance)
-            detail["statistically_unresolved"] = [
-                r.key for r in pool if r is not chosen
+        def distance(r: _CandidateResult) -> tuple[float, str]:
+            try:
+                return (
+                    abs(int(r.key) - int(inputs.incumbent_key)),
+                    r.key,
+                )
+            except ValueError:
+                return (math.inf, r.key)
+
+        # D5: with more than one passer, BOTH cross-candidate comparisons —
+        # the pooled max and the CI overlap that decides whether the
+        # nearest-incumbent fallback fires — must run on the same days.
+        # Under pairwise cores each passer has its own window, so point and
+        # interval are recomputed on the shared basis before either step.
+        ordering: dict[str, tuple[float | None, tuple[float, float] | None]] = {
+            r.key: (r.pooled, r.ci) for r in passers
+        }
+        basis: dict[str, object] | None = None
+        if len(passers) > 1:
+            keep, refusal = _shared_basis(passers)
+            if keep is not None:
+                leads = tuple(sorted(keep))
+                recomputed: dict[
+                    str, tuple[float | None, tuple[float, float] | None]
+                ] = {}
+                for r in passers:
+                    assert r.ordering_endpoint is not None
+                    restricted = _restrict_endpoint(r.ordering_endpoint, keep)
+                    recomputed[r.key] = (
+                        restricted.pooled_effect(leads, None),
+                        _bootstrap_ci(
+                            restricted,
+                            leads,
+                            level=r.ordering_level,
+                            seed=r.ordering_seed + 3,
+                            resamples=resamples,
+                        ),
+                    )
+                if any(ci is None for _, ci in recomputed.values()):
+                    # A restricted universe makes degenerate resamples more
+                    # likely, so this is reachable rather than defensive.
+                    refusal = "undefined_restricted_ci"
+                else:
+                    ordering = recomputed
+                    basis = _basis_record(keep, recomputed)
+            if basis is None:
+                basis = {"reason": refusal}
+        refused = basis is not None and "reason" in basis
+        if refused:
+            # Nothing was compared, so no depth leads: fall back to the depth
+            # nearest the incumbent and report every other passer unresolved.
+            chosen = min(passers, key=distance)
+            best_key: str | None = None
+            if len(passers) > 1:
+                detail["statistically_unresolved"] = [
+                    r.key for r in passers if r is not chosen
+                ]
+        else:
+            best = max(passers, key=lambda r: (ordering[r.key][0] or 0.0, r.key))
+            overlapping = [
+                r
+                for r in passers
+                if r is not best
+                and _ci_overlaps(ordering[best.key][1], ordering[r.key][1])
             ]
-        detail["tie_break"] = {
-            "best_by_pooled": best.key,
+            chosen = best
+            best_key = best.key
+            if overlapping:
+                # Material CI overlap: prefer the depth closest to the
+                # incumbent; the others are reported statistically
+                # unresolved (§12).
+                pool = [best, *overlapping]
+                chosen = min(pool, key=distance)
+                detail["statistically_unresolved"] = [
+                    r.key for r in pool if r is not chosen
+                ]
+        tie_break: dict[str, object] = {
+            "best_by_pooled": best_key,
             "chosen": chosen.key,
         }
+        if basis is not None:
+            tie_break["basis"] = basis
+        detail["tie_break"] = tie_break
         return Verdict(
             variable=inputs.variable,
             outcome="recommend",

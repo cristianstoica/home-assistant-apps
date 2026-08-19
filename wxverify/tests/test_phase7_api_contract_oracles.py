@@ -134,11 +134,11 @@ def contract_client(
 # ---------------------------------------------------------------------------
 
 
-def test_schema_constant_is_one_and_stamped_on_every_endpoint(
+def test_schema_constant_is_stamped_on_every_endpoint(
     contract_client: tuple[TestClient, int, int, int],
 ) -> None:
     client, site_id, run_a, _ = contract_client
-    assert VERIFICATION_SCHEMA == 1  # the wire contract version itself
+    assert VERIFICATION_SCHEMA == 2  # the wire contract version itself
     endpoints = [
         f"/api/verification/status?site={site_id}",
         f"/api/verification/runs?site={site_id}",
@@ -150,7 +150,7 @@ def test_schema_constant_is_one_and_stamped_on_every_endpoint(
     ]
     for url in endpoints:
         payload = client.get(url).json()
-        assert payload["verification_schema"] == 1, url
+        assert payload["verification_schema"] == 2, url
 
 
 def test_contract_confidence_levels_hand_pinned(

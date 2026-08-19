@@ -104,7 +104,12 @@ def test_two_passers_non_overlapping_cis_pick_greatest_pooled() -> None:
     verdict = decide_variable(inputs, seed=20260701, resamples=60)
     assert verdict.outcome == "recommend"
     assert verdict.recommended_key == "4"
-    assert verdict.detail["tie_break"] == {"best_by_pooled": "4", "chosen": "4"}
+    tie_break = cast(dict[str, object], verdict.detail["tie_break"])
+    # Two passers, so D5's shared-basis step runs and records its basis; the
+    # key set stays exact so an unexpected key still fails.
+    assert set(tie_break) == {"best_by_pooled", "chosen", "basis"}
+    assert tie_break["best_by_pooled"] == "4"
+    assert tie_break["chosen"] == "4"
     assert "statistically_unresolved" not in verdict.detail
     # Constant ratios: pooled effects are exactly 1 - ratio (up to fp noise).
     assert _headline(verdict, "4")["pooled_point"] == pytest.approx(0.5)
@@ -599,8 +604,8 @@ def test_the_baseline_gate_is_evaluated_on_the_headline_core() -> None:
       under M3 — the fixture's per-lead ratio is constant, so the effect is
       weight-invariant and shrinking the bootstrap universe moves no number.
       Assertion 6 is the sole discriminator: a rebuilt endpoint holds no
-      lead-5 pairs, so `_adequate_leads`' `if pairs:` guard suppresses every
-      record for it and no ``outside_core`` entry can exist.
+      lead-5 pairs, so the only record `_adequate_leads` can emit for that
+      lead is ``thin_data days=0`` and no ``outside_core`` entry can exist.
     """
     headline = {ld: _ratio_series(_DATES, 0.5) for ld in range(1, 6)}
     persistence = {ld: _ratio_series(_DATES, 1.125) for ld in range(1, 5)}
@@ -630,7 +635,9 @@ def test_the_baseline_gate_is_evaluated_on_the_headline_core() -> None:
             "lead": 5,
             "reason": "baseline_absent",
             "missing_baselines": ["baseline_all_feed_mean"],
-        }
+        },
+        {"lead": 6, "reason": "thin_data", "days": 0},
+        {"lead": 7, "reason": "thin_data", "days": 0},
     ]
     # 3 — the gate is isolated as the sole failing condition.
     conditions = _conditions(verdict, "3")
@@ -759,15 +766,25 @@ def test_each_precip_gate_uses_its_own_endpoint_core() -> None:
         assert entry["passed"] is True, name
         assert "missing_leads" not in entry, name
     # ... and persistence, which DOES hold a lead-5 total series, names the
-    # lead the restriction removed. The `if pairs:` guard means only a
-    # genuinely supported lead can produce this record.
+    # lead the restriction removed. Branch order is what keeps ``outside_core``
+    # exclusive to a genuinely supported lead: the append at
+    # `decision.py:294-296` is reachable only once the
+    # `len(pairs) < ADEQUATE_LEAD_MIN_DAYS` test (`:266`) and the `missing`
+    # test (`:285`) have both passed.
     assert cast(dict[str, object], total_detail["baseline_persistence"])[
         "dropped_leads"
-    ] == [{"lead": 5, "reason": "outside_core"}]
-    assert (
-        cast(dict[str, object], total_detail["baseline_all_feed_mean"])["dropped_leads"]
-        == []
-    )
+    ] == [
+        {"lead": 5, "reason": "outside_core"},
+        {"lead": 6, "reason": "thin_data", "days": 0},
+        {"lead": 7, "reason": "thin_data", "days": 0},
+    ]
+    assert cast(dict[str, object], total_detail["baseline_all_feed_mean"])[
+        "dropped_leads"
+    ] == [
+        {"lead": 5, "reason": "thin_data", "days": 0},
+        {"lead": 6, "reason": "thin_data", "days": 0},
+        {"lead": 7, "reason": "thin_data", "days": 0},
+    ]
     # 4 — the occurrence gate got the OCCURRENCE core, all five leads.
     assert set(occ_detail) == {
         "baseline_persistence",
@@ -778,7 +795,10 @@ def test_each_precip_gate_uses_its_own_endpoint_core() -> None:
         entry = cast(dict[str, object], occ_detail[name])
         assert entry["adequate_leads"] == [1, 2, 3, 4, 5], name
         assert entry["insufficient"] is False, name
-        assert entry["dropped_leads"] == [], name
+        assert entry["dropped_leads"] == [
+            {"lead": 6, "reason": "thin_data", "days": 0},
+            {"lead": 7, "reason": "thin_data", "days": 0},
+        ], name
 
 
 # ---------------------------------------------------------------------------
@@ -862,7 +882,10 @@ def test_tie_break_overlap_prefers_depth_closest_to_incumbent() -> None:
     verdict = decide_variable(inputs, seed=20260710, resamples=400)
     assert verdict.outcome == "recommend"
     assert verdict.recommended_key == "3"  # |3-2| = 1 < |4-2| = 2
-    assert verdict.detail["tie_break"] == {"best_by_pooled": "4", "chosen": "3"}
+    tie_break = cast(dict[str, object], verdict.detail["tie_break"])
+    assert set(tie_break) == {"best_by_pooled", "chosen", "basis"}
+    assert tie_break["best_by_pooled"] == "4"
+    assert tie_break["chosen"] == "3"
     assert verdict.detail["statistically_unresolved"] == ["4"]
     # The overlap premise itself: candidate 4's CI must contain 0.5.
     ci4 = cast(list[float], _headline(verdict, "4")["ci"])

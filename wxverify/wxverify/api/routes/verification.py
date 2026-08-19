@@ -26,7 +26,7 @@ from wxverify.db.connection import get_db
 from wxverify.verification.contract import (
     CONTRACT,
     VERIFICATION_SCHEMA,
-    methodology_constants,
+    run_methodology_view,
 )
 from wxverify.verification.diagnostics import observed_wet_precip_mae
 from wxverify.verification.publish_hold import read_publish_hold, set_publish_hold
@@ -442,8 +442,7 @@ async def run_methodology(run_id: int) -> dict[str, object]:
         return {
             "verification_schema": VERIFICATION_SCHEMA,
             "run_id": run_id,
-            "contract": CONTRACT,
-            "constants": methodology_constants(),
+            **run_methodology_view(int(row["methodology_version"])),
             "provenance": _run_out(row, include_snapshot=True),
         }
 

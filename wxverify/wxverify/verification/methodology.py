@@ -22,9 +22,12 @@ from __future__ import annotations
 #: justified in the comment beside its definition.
 DECLARATIVE_ONLY: frozenset[str] = frozenset()
 
-# Version of this constant set. Bump when ANY constant below changes; runs
-# persist the version they were scored under.
-METHODOLOGY_VERSION = 1
+# Version of this constant set. Bump when ANY constant below changes, and
+# equally when what a scored quantity MEANS changes — the date set a
+# comparison is computed on, for instance — because a run scored under the
+# new rule is not comparable with one scored under the old, whatever the
+# constants say; runs persist the version they were scored under.
+METHODOLOGY_VERSION = 2
 
 # Canonical snapshot time (default): the daily decision instant T, expressed
 # as site-local wall-clock time.

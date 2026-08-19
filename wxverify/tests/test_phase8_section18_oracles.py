@@ -891,6 +891,11 @@ _V16_2: dict[str, str] = {
 #: candidate depth: primary metric, incumbent delta, CI, common-day count,
 #: observed-event counts where applicable, realized contributor depth,
 #: baseline comparisons, and every gate's pass/fail/insufficient state."
+#: The three era-note markers (`16.3.two_samples` / `16.3.one_sample` /
+#: `16.3.core_unavailable`, show.html:301-305) are deliberately NOT
+#: registered here: `decision_core_era` picks exactly one of the three
+#: arms per page, so this required-SUBSET presence check would fail on the
+#: other two if they were added. Do not add them.
 _V16_3: dict[str, str] = {
     "16.3.table": "headline evidence table",
     "16.3.row": "rows by variable x lead x quantity x candidate depth",
@@ -899,6 +904,7 @@ _V16_3: dict[str, str] = {
     "16.3.incumbent_delta": "incumbent delta",
     "16.3.ci": "CI",
     "16.3.common_days": "common-day count",
+    "16.3.decision_days": "pairwise decision sample the verdict used for that depth",
     "16.3.observed_events": "observed-event counts where applicable",
     "16.3.realized_contributors": "realized contributor depth",
     "16.3.baseline_comparisons": "baseline comparisons",
@@ -917,16 +923,19 @@ _V16_3: dict[str, str] = {
 #:   constant or table anywhere in the spec) and structurally vacuous at
 #:   this release's history depth. It is deliberately NOT pinned here, and
 #:   its absence is not a §16 conformance failure.
-#: * "wet-hour-share verification" stays enumerated but is deferred to
-#:   ``methodology_version`` 2. Only its PRESENCE and declared-unavailable
-#:   state are pinned; its reason wording is explicitly not asserted, since
-#:   that string is changing in the same amendment.
+#: * "wet-hour-share verification" stays enumerated but is unspecified in
+#:   the shipped methodology version. Only its PRESENCE and
+#:   declared-unavailable state are pinned here; the reason wording is owned
+#:   by ``UNAVAILABLE_DIAGNOSTICS`` and pinned once, at
+#:   test_phase8_verification_v16.py:619.
 _V16_4: dict[str, str] = {
     "16.4.non_enactable": "labeled non-enactable",
     "16.4.d0": "D0",
     "16.4.daily_rank": "daily-quantity-ranking policies",
     "16.4.feeds": "pairwise-only and below-floor feeds",
-    "16.4.wet_hour_share": "wet-hour-share verification (deferred to v2)",
+    "16.4.wet_hour_share": (
+        "wet-hour-share verification (not specified in the shipped methodology version)"
+    ),
     "16.4.bias_rmse": "bias/RMSE",
     "16.4.contingency": "contingency counts",
 }
@@ -966,6 +975,7 @@ _V16_5: dict[str, str] = {
     "16.5.tested_family": "each verdict's complete tested family",
     "16.5.tested_family_variable": "the tested family, per verdict",
     "16.5.adjusted_confidence": "per-comparison adjusted confidence levels",
+    "16.5.endpoint_window": "each endpoint's own comparison window",
     "16.5.gate_outcomes": "gate outcomes",
     "16.5.baseline_comparisons": "comparisons",
     "16.5.run_link": "every displayed result linked to its immutable run",

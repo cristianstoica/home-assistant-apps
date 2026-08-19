@@ -12,9 +12,9 @@ drive as the paired negative.
 
 Family 10 (wire-contract additivity): 0.11.1 adds three keys to the
 verification API (``trigger`` on a status site, ``ranking_redesign_indicated``
-on a verdict, ``observed_wet_precip_mae`` on diagnostics) and holds
-``verification_schema`` at 1. That is legitimate only if it is purely
-additive. The pinned key/type map below was hand-derived by reading the
+on a verdict, ``observed_wet_precip_mae`` on diagnostics) and holds the
+schema constant. That is legitimate only if it is purely additive. The
+pinned key/type map below was hand-derived by reading the
 0.11.0 route module, not by recording what the new code prints, so it is an
 independent statement of the old contract: any key the release quietly
 renames, drops, or retypes fails here, and any key it adds beyond the three
@@ -168,11 +168,15 @@ _WARNINGS_0_11_0: dict[str, tuple[type, ...]] = {
     "failed_newer_attempt": (bool,),
 }
 
-# The three keys 0.11.1 is allowed to add, and nothing else.
+# The keys later releases are allowed to add, and nothing else.
 _DECLARED_ADDITIONS = {
     "status_site": {"trigger"},
     "verdict": {"ranking_redesign_indicated"},
     "diagnostics": {"observed_wet_precip_mae"},
+    # 0.13.2 (Fix 2): the per-run methodology-version refusal reason,
+    # `str | None` -- `None` on the version-matching path, a `str` naming
+    # both the run's version and the build's on any other.
+    "methodology": {"contract_unavailable_reason"},
 }
 
 
@@ -197,10 +201,9 @@ def test_every_0_11_0_payload_key_survives_with_its_type(
 ) -> None:
     """The 0.11.1 API is a strict superset of the 0.11.0 one.
 
-    Kills: any rename of a 0.11.0 key (the additive claim that lets
-    ``verification_schema`` stay 1 is then false and every existing consumer
-    breaks silently), any drop, and any addition beyond the three W-items
-    declare.
+    Kills: any rename of a 0.11.0 key (the additive claim that lets the
+    schema constant stand is then false and every existing consumer breaks
+    silently), any drop, and any addition beyond the three W-items declare.
 
     The key/type map alone does NOT catch a null-to-zero retype: a nullable
     key is pinned ``(int, None)``, so ``0`` where the contract says ``null``
@@ -218,7 +221,7 @@ def test_every_0_11_0_payload_key_survives_with_its_type(
     with TestClient(app) as client:
         status = client.get(f"/api/verification/status?site={site_id}").json()
         assert set(status) == {"verification_schema", "contract", "sites"}
-        assert status["verification_schema"] == 1
+        assert status["verification_schema"] == 2
         site = status["sites"][0]
         _check(
             site,
@@ -299,13 +302,23 @@ def test_every_0_11_0_payload_key_survives_with_its_type(
             _check(day, _DAY_CONTEXT_0_11_0, added=set(), where="day_context[]")
 
         methodology = client.get(f"/api/verification/runs/{run_id}/methodology").json()
-        assert set(methodology) == {
-            "verification_schema",
-            "run_id",
-            "contract",
-            "constants",
-            "provenance",
-        }
+        assert (
+            set(methodology)
+            == {
+                "verification_schema",
+                "run_id",
+                "contract",
+                "constants",
+                "provenance",
+            }
+            | _DECLARED_ADDITIONS["methodology"]
+        )
+        # This fixture's run (methodology_version 1) does not match the
+        # build's own version, so the refusal fires: `contract_unavailable_
+        # reason` is a populated `str`, not the `None` it holds on the
+        # matching-version path (test_phase7_surface.py's O-V3 v2 arm pins
+        # that side).
+        assert isinstance(methodology["contract_unavailable_reason"], str)
         _check(
             methodology["provenance"],
             _RUN_OUT_WITH_SNAPSHOT_0_11_0,
@@ -321,7 +334,7 @@ def test_the_evidence_row_shape_is_the_unchanged_results_table(
     0.11.1 does not migrate, so their key sets are the table columns.
 
     Kills: a release that adds a verification column (or projects a derived
-    field into these rows) while leaving ``verification_schema`` at 1 — the
+    field into these rows) while leaving the schema constant unchanged — the
     same undeclared-widening failure the map above catches for hand-built
     payloads, on the two payloads that are schema-shaped.
     """
