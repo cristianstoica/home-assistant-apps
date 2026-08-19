@@ -23,7 +23,7 @@
       {% elif trigger.status == 'no_decision_recorded' %}
         No nightly trigger decision recorded for <span data-field="trigger_date">{{ trigger.trigger_date }}</span>.
       {% else %}
-        This site&rsquo;s nightly trigger date could not be derived &mdash; check its timezone.
+        This site's nightly trigger date could not be derived &mdash; check its timezone.
       {% endif %}
       {% if trigger.superseded_count %}
         <span data-field="trigger_superseded_count">{{ trigger.superseded_count }}</span> superseded start(s) on this date &mdash;
@@ -66,7 +66,7 @@
   <section class="panel wide" id="verification-run-banner" data-run-id="{{ run.id }}">
     <h2>Run #{{ run.id }}</h2>
     <p class="panel-hint" data-v16="16.1.declared_configuration">
-      All results below hold <strong>under the run&rsquo;s declared configuration</strong> —
+      All results below hold <strong>under the run's declared configuration</strong> —
       the pinned snapshot shown here, not current settings.
       <a href="{{ url('/api/verification/runs/' ~ run.id) }}" data-v16="16.1.run_link">Immutable run #{{ run.id }}</a>
     </p>
@@ -131,7 +131,7 @@
   {# ------------------------------------------------------------------ #}
   <section class="panel wide" id="verification-verdicts">
     <h2>Verdicts</h2>
-    <p class="panel-hint">One outcome per variable, under the run&rsquo;s declared configuration.</p>
+    <p class="panel-hint">One outcome per variable, under the run's declared configuration.</p>
     {% for v in verdicts %}
       <div class="subsection verdict verdict-{{ v.outcome }}" data-v16="16.2.card" data-variable="{{ v.variable }}" data-outcome="{{ v.outcome }}">
         <h3>{{ v.variable }}</h3>
@@ -184,7 +184,7 @@
           <div data-v16="16.2.primary_ci"><dt>Confidence interval</dt><dd>{% if v.basis_inconsistent %}{{ not_available }}{% elif v.primary and v.basis_summary and v.basis_summary.label %}{{ ci(v.basis_summary.ci) }}{% elif v.primary and v.primary.ordering_endpoint %}{{ ci(v.primary.endpoint_by_name[v.primary.ordering_endpoint].ci) }}{% elif v.primary_missing or v.primary %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</dd></div>
           <div data-v16="16.2.adequate_leads"><dt>Adequate leads</dt><dd>{% if v.primary and v.basis_summary %}{{ v.basis_summary.lead_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% elif v.primary and v.primary.ordering_endpoint %}{{ v.primary.endpoint_by_name[v.primary.ordering_endpoint].adequate_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% elif v.primary_missing or v.primary %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</dd></div>
           <div data-v16="16.2.common_day_range"><dt>Headline-table common days</dt><dd>{% set span = common_days.get(v.variable) %}{% if span %}{{ span.min }}&ndash;{{ span.max }} days{% else %}—{% endif %}</dd></div>
-          <div data-v16="16.2.decision_window"><dt>Decision window</dt><dd>{% if v.no_recommendation %}No single decision window applies: no depth was recommended. Each tested depth&rsquo;s own comparison window is listed in the tested-family table below.{% elif v.primary and (v.basis_summary or v.primary.ordering_endpoint) %}{% if v.decision_window and v.decision_window.first %}{{ v.decision_window.first }}&ndash;{{ v.decision_window.last }} ({{ v.decision_window.days }} days){% else %}—{% endif %}{% else %}{{ not_available }}{% endif %}</dd></div>
+          <div data-v16="16.2.decision_window"><dt>Decision window</dt><dd>{% if v.no_recommendation %}No single decision window applies: no depth was recommended. Each tested depth's own comparison window is listed in the tested-family table below.{% elif v.primary and (v.basis_summary or v.primary.ordering_endpoint) %}{% if v.decision_window and v.decision_window.first %}{{ v.decision_window.first }}&ndash;{{ v.decision_window.last }} ({{ v.decision_window.days }} days){% else %}—{% endif %}{% else %}{{ not_available }}{% endif %}</dd></div>
           <div data-v16="16.2.practical_significance"><dt>Practical significance</dt><dd>
             {%- if v.primary -%}
               {%- set practical = v.primary.gates | selectattr('key', 'in', ['practical_floor', 'total_material', 'occurrence_material']) | list -%}
@@ -212,13 +212,13 @@
           <p class="muted" data-v16="16.2.unresolved">{% if refusal %}Other tested depths, left uncompared against the chosen depth{% else %}Statistically unresolved against the chosen depth{% endif %}: {{ v.unresolved | join(', ') }}</p>
         {% endif %}
         {% if v.primary and v.primary.ordering_endpoint_unresolved %}
-          <p class="notice" data-v16="16.2.ordering_endpoint_unresolved">This verdict&rsquo;s stored record names a decision endpoint it does not contain ({{ v.primary.ordering_endpoint_unresolved }}). Every figure above that depends on that endpoint is therefore not shown. {% if v.primary.endpoints %}The per-candidate table below lists the endpoints the record does hold.{% else %}This record holds no endpoint at all, so the per-candidate table below has none to list for it.{% endif %}</p>
+          <p class="notice" data-v16="16.2.ordering_endpoint_unresolved">This verdict's stored record names a decision endpoint it does not contain ({{ v.primary.ordering_endpoint_unresolved }}). Every figure above that depends on that endpoint is therefore not shown. {% if v.primary.endpoints %}The per-candidate table below lists the endpoints the record does hold.{% else %}This record holds no endpoint at all, so the per-candidate table below has none to list for it.{% endif %}</p>
         {% endif %}
         {% if v.primary_missing %}
           <p class="notice" data-v16="16.2.primary_missing">This verdict recommends depth {{ v.recommended_depth }}, but its stored record holds no tested-depth entry for that depth, so the summary fields above cannot be filled. The per-candidate table below lists the depths the record does hold.</p>
         {% endif %}
         {% if v.basis_inconsistent %}
-          <p class="notice" data-v16="16.2.basis_inconsistent">This verdict&rsquo;s stored record ordered the tested depths on a shared basis, but that basis holds no entry for the recommended depth ({{ v.recommended_depth }}), so the effect and interval above cannot be filled. The lead count and decision window are read from the basis itself and are unaffected. The per-candidate table below lists each tested depth&rsquo;s own comparison.</p>
+          <p class="notice" data-v16="16.2.basis_inconsistent">This verdict's stored record ordered the tested depths on a shared basis, but that basis holds no entry for the recommended depth ({{ v.recommended_depth }}), so the effect and interval above cannot be filled. The lead count and decision window are read from the basis itself and are unaffected. The per-candidate table below lists each tested depth's own comparison.</p>
         {% endif %}
         {% if v.skip_reason %}
           <p class="muted" data-v16="16.2.skip_reason">Reason: {{ v.skip_reason }}</p>
@@ -580,7 +580,7 @@
       <div data-v16="16.5.code_version"><dt>Code version</dt><dd>{{ run.app_version }}</dd></div>
       <div data-v16="16.5.input_fingerprint"><dt>Input fingerprint</dt><dd><code>{{ run.input_fingerprint }}</code></dd></div>
       <div data-v16="16.5.exclusion_counts"><dt>Exclusion counts</dt><dd>{{ day_context.days_with_exclusions }} days with knowability exclusions of {{ day_context.snapshot_days }} snapshot days &middot; {{ day_context.null_availability_samples }} null-availability samples</dd></div>
-      <div data-v16="16.5.schema"><dt>API contract version</dt><dd>verification_schema {{ verification_schema }} <span class="muted">(this build&rsquo;s payload shape, not this run&rsquo;s methodology)</span> &middot; {{ contract.null_semantics }}</dd></div>
+      <div data-v16="16.5.schema"><dt>API contract version</dt><dd>verification_schema {{ verification_schema }} <span class="muted">(this build's payload shape, not this run's methodology)</span> &middot; {{ contract.null_semantics }}</dd></div>
     </dl>
 
     {% if snapshot %}

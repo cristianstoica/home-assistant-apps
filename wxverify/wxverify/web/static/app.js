@@ -903,8 +903,8 @@
     var nextHeld = target.dataset.held !== "1";
     var confirmed = window.confirm(
       nextHeld
-        ? "Hold nightly verification publishing? New runs will not start until released."
-        : "Release the nightly verification publishing hold?"
+        ? "Hold nightly verification runs? New runs will not start until released. A run already in progress continues and may publish."
+        : "Release the nightly verification run hold?"
     );
     if (!confirmed) {
       return;

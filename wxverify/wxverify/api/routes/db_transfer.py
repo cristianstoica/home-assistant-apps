@@ -54,9 +54,11 @@ _STALE_AFTER_S = 3600.0
 # cutoff + one tick, so 300 s bounds a downloaded export to <= ~65 min on disk
 # even if `/begin` is never called again.
 _SWEEP_INTERVAL_S = 300.0
-# 256 MiB: the live DB is single-digit MBs today, and /data must hold upload
-# temp + backup + live DB simultaneously, so the cap bounds worst-case disk.
-_MAX_IMPORT_BYTES = 256 * 1024 * 1024
+# 256 MiB, bounding worst-case /data use (upload temp + backup + live DB at
+# once). Governs four refusals: the declared-length check at :479, and the
+# written-bytes checks at :579, :593 and :607.
+MAX_IMPORT_BYTES = 256 * 1024 * 1024
+MAX_IMPORT_MIB = MAX_IMPORT_BYTES // (1024 * 1024)
 # 1 MiB copy/inflate chunk: bounds the per-call decompress output (zip-bomb
 # guard) and the compress copy buffer.
 _DECOMP_CHUNK = 1 * 1024 * 1024
@@ -82,7 +84,7 @@ _BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
 # sweepable across the upgrade.
 _BAK_RE = re.compile(r"^wxverify-(\d{8}-\d{6})(?:-[0-9a-f]{8})?Z\.db\.bak$")
 # The only await in import_db that can block on client behavior is the body
-# read. 900 s bounds a full 256 MiB upload (_MAX_IMPORT_BYTES) at a ~291 KiB/s
+# read. 900 s bounds a full 256 MiB upload (MAX_IMPORT_BYTES) at a ~291 KiB/s
 # floor -- far below any LAN or ingress path -- so this can only fire on a
 # genuinely stalled client, never on a slow-but-live one.
 _IMPORT_STREAM_TIMEOUT_S = 900.0
@@ -474,8 +476,12 @@ async def import_db(request: Request) -> JSONResponse:
     _acquire_import_guard()
     try:
         declared = int(request.headers.get("content-length", "0") or "0")
-        if declared > _MAX_IMPORT_BYTES:
-            raise ApiError(413, "file too large")
+        if declared > MAX_IMPORT_BYTES:
+            raise ApiError(
+                413,
+                "file too large: the upload exceeds the "
+                f"{MAX_IMPORT_MIB} MiB import limit",
+            )
         db_dir = Path(config.db_path).parent
         tmp = db_dir / f".wxverify-import-{uuid.uuid4().hex}.db.tmp"
         try:
@@ -570,8 +576,13 @@ async def _stream_to(request: Request, tmp: Path) -> int:
                         # fires the instant cumulative output would cross.
                         out = decomp.decompress(data, _DECOMP_CHUNK)
                         written += len(out)
-                        if written > _MAX_IMPORT_BYTES:
-                            raise ApiError(413, "file too large")
+                        if written > MAX_IMPORT_BYTES:
+                            raise ApiError(
+                                413,
+                                "file too large: the database exceeds the "
+                                f"{MAX_IMPORT_MIB} MiB import limit, measured "
+                                "after any decompression",
+                            )
                         if out:
                             await asyncio.to_thread(handle.write, out)
                         data = decomp.unconsumed_tail
@@ -579,8 +590,13 @@ async def _stream_to(request: Request, tmp: Path) -> int:
                     raise ApiError(422, "not a valid gzip") from exc
             else:
                 written += len(chunk)
-                if written > _MAX_IMPORT_BYTES:
-                    raise ApiError(413, "file too large")
+                if written > MAX_IMPORT_BYTES:
+                    raise ApiError(
+                        413,
+                        "file too large: the database exceeds the "
+                        f"{MAX_IMPORT_MIB} MiB import limit, measured "
+                        "after any decompression",
+                    )
                 await asyncio.to_thread(handle.write, chunk)
         if decomp is not None:
             try:
@@ -588,8 +604,13 @@ async def _stream_to(request: Request, tmp: Path) -> int:
             except zlib.error as exc:
                 raise ApiError(422, "not a valid gzip") from exc
             written += len(tail)
-            if written > _MAX_IMPORT_BYTES:
-                raise ApiError(413, "file too large")
+            if written > MAX_IMPORT_BYTES:
+                raise ApiError(
+                    413,
+                    "file too large: the database exceeds the "
+                    f"{MAX_IMPORT_MIB} MiB import limit, measured "
+                    "after any decompression",
+                )
             if tail:
                 await asyncio.to_thread(handle.write, tail)
             if not decomp.eof:

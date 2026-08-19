@@ -599,6 +599,19 @@ def get_db() -> Database:
     return _db_instance
 
 
+def current_db_generation() -> int:
+    """The process database's swap generation, or ``0`` when none exists.
+
+    Deliberately does **not** call ``get_db()``: that auto-initialises a
+    ``Database`` against ``config.db_path``, so the obvious simplification to
+    ``get_db().generation`` would materialise the process database inside any
+    caller that only holds a bare ``sqlite3.Connection`` -- unit tests
+    included. This accessor exists so a generation can be read as a plain
+    observation, with no side effect.
+    """
+    return 0 if _db_instance is None else _db_instance.generation
+
+
 def close_db() -> None:
     global _db_instance
     if _db_instance is not None:

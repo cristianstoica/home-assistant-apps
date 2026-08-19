@@ -6,8 +6,10 @@ mapping (§7's exhaustive by-exception-type table), its ``MutationGuard``
 exposure, the loader/route applicability agreement (D6/D8), the panel's
 per-site query shape (O9), successful start (O10), non-mutation of published
 history until the flip (O11), the finished/failed/cleanup-stalled surfaces
-(O12/O13/O14/O16), the always-visible disclosure copy (O15), and the
-stalled-cleanup predicate's single-statement snapshot plus its full
+(O12/O13/O14/O16), the correction's disclosures living at the confirmation
+dialog and the verification page rather than the Ops panel prose (O15,
+0.13.3 §6.14), and the stalled-cleanup predicate's single-statement snapshot
+plus its full
 committed-state truth table (O17).
 
 Isolation: HTTP-route oracles drive a real app over ``TestClient`` against a
@@ -68,6 +70,8 @@ from wxverify.worker.tz_correction import (
     correction_state_key,
 )
 from wxverify.worker.verification_run import verification_job_key
+
+ROOT = Path(__file__).resolve().parents[1]
 
 _SITE_NAME = "site-alpha"
 _SITE_TZ = "America/Denver"
@@ -1002,14 +1006,52 @@ def test_o14_building_correction_is_never_reported_as_finished(
 
 
 # ---------------------------------------------------------------------------
-# O15 - The always-visible disclosure copy is present verbatim (whitespace-
-# normalized: the panel's HTML source line-wraps it).
+# O15 - 0.13.3 §6.14(a) deletes the Ops panel's static prose
+# (``ops/_timezone_correction.html:3-68``). The disclosures it carried are
+# not gone, just relocated: the correction's confirmation dialog
+# (``web/static/app.js:977-979``) still states the stale-inputs consequence,
+# and the verification page itself (``web/templates/verification/show.html``
+# ``:122`` and ``:126``) surfaces the two live facts a stale/failed run
+# actually produces. This oracle is retargeted at those real carriers rather
+# than the deleted panel, and pins the deletion so the prose cannot silently
+# come back in either of the two places it used to live.
 # ---------------------------------------------------------------------------
 
 
-def test_o15_panel_discloses_stale_inputs_and_verification_fallout(
+def test_o15_correction_disclosures_live_at_the_dialog_and_the_verification_page(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    app_js = (ROOT / "wxverify" / "web" / "static" / "app.js").read_text(
+        encoding="utf-8"
+    )
+    show_html = (
+        ROOT / "wxverify" / "web" / "templates" / "verification" / "show.html"
+    ).read_text(encoding="utf-8")
+
+    # The confirmation dialog: the correction flags the published run as
+    # having stale inputs until the next nightly run publishes.
+    assert "stale inputs" in app_js
+
+    # The verification page itself: the two live consequences a stale
+    # correction/rebuild can leave behind on the site's own results.
+    assert (
+        "Inputs have changed since this run was published — results "
+        "reflect the pinned snapshot, not current data."
+    ) in show_html
+    assert (
+        "A newer verification attempt failed; the results below are "
+        "from the last successful run."
+    ) in show_html
+
+    # Pins the deletion: the panel's old standalone "what happens to
+    # verification runs" heading is gone from both relocated carriers, so a
+    # regression that pastes the panel prose back in either place is caught.
+    assert "What happens to verification runs" not in app_js
+    assert "What happens to verification runs" not in show_html
+
+    # Paired positive: the panel itself still renders (its live per-site
+    # table is unaffected by the prose deletion), so this oracle cannot be
+    # satisfied by an Ops page that fails to render at all.
     app = _boot(tmp_path, "o15.db", monkeypatch)
     with TestClient(app) as client:
         db = get_db()
@@ -1018,10 +1060,8 @@ def test_o15_panel_discloses_stale_inputs_and_verification_fallout(
         resp = client.get("/ops")
         assert resp.status_code == 200, resp.text
         html = _norm(resp.text)
-
-        assert "stale inputs" in html
-        assert "keep rendering" in html
-        assert "will normally fail" in html
+        assert "Timezone Correction" in html
+        assert "What happens to verification runs" not in html
     close_db()
 
 

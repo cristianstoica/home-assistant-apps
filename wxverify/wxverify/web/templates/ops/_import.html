@@ -1,6 +1,7 @@
 <section class="panel" id="import-panel">
   <h2>Database Import</h2>
   <p class="panel-hint">Replace the database with a previously exported file.</p>
+  <p class="panel-hint" id="import-limit-note">Maximum {{ max_import_mib }} MiB, measured on the database after decompression — a compressed file that uploads successfully can still be refused once expanded.</p>
   <div class="button-row">
     {# htmx deliberately NOT used: hx-post cannot send a raw file body, and
        multipart encoding would require a server-side parser dependency.

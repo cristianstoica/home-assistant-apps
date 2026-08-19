@@ -2134,10 +2134,19 @@ def test_missing_db_recreation_reports_ok_documented_limitation(
     config.db_path = str(db_file)
     config.options_path = str(tmp_path / "missing-options.json")
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+
+    async def _no_warm(db: object) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
     app = create_app(root_path="")
     with TestClient(app) as client:
         # close_db() BEFORE deleting so we exercise the init_db() recreation
-        # path, not a stale open connection.
+        # path, not a stale open connection. The boot-time read-cache warm is
+        # stubbed out above: it schedules its own background db.read against
+        # this same connection, and without the stub it can read through the
+        # connection this test closes below, crashing the process instead of
+        # failing the test.
         from wxverify.db.connection import close_db as _close
 
         _close()
@@ -2151,6 +2160,49 @@ def test_missing_db_recreation_reports_ok_documented_limitation(
         # limitation (identity-loss is out of db_readable scope).
         assert _cond(body, "db_readable")["ok"] is True
         assert body["overall"] == "ok"
+
+
+def test_normal_shutdown_cancels_and_awaits_the_boot_warm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The fix above stubs warm_read_cache to a no-op so this DB-close test
+    # doesn't race a real warm. This is the paired proof that the stub is
+    # masking a test-only hazard (a live warm reading through a connection
+    # this test closes), not a real lifecycle bug: on an ORDINARY shutdown --
+    # no connection closed underneath it -- the lifespan's `finally` actually
+    # cancels the warm task and awaits it, rather than leaking it as a
+    # detached background task.
+    #
+    # A blocking fake turns the race into a rendezvous: it signals "entered"
+    # then blocks forever on an Event only cancellation can break. If the
+    # lifespan's `finally` (api/app.py) ever stopped cancelling/awaiting
+    # `warm`, this fake would never observe cancellation and the assertion
+    # below would fail for the right reason.
+    close_db()
+    state = {"entered": False, "cancelled": False}
+
+    async def _blocking_warm(db: object) -> None:
+        state["entered"] = True
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    config.db_path = str(tmp_path / "db-shutdown.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _blocking_warm)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        client.get("/api/health/monitor")
+        # The warm task has had the entire test-client startup plus one
+        # request round-trip to reach its blocking await.
+        assert state["entered"] is True
+        assert state["cancelled"] is False
+    # TestClient.__exit__ runs the lifespan's `finally` synchronously before
+    # returning, so by here the cancel-and-await has already happened.
+    assert state["cancelled"] is True
 
 
 def test_db_readable_sqlite_error_composition_invariant(

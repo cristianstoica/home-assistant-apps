@@ -29,8 +29,10 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
-from wxverify.verification.diagnostics import observed_wet_precip_mae
-from wxverify.verification.ranking import daily_rank_conclusions
+from wxverify.verification.read_cache import (
+    cached_daily_rank_conclusions,
+    cached_observed_wet_precip_mae,
+)
 from wxverify.verification.runs import (
     current_input_fingerprint,
     published_run_id,
@@ -738,14 +740,17 @@ def _primary_metric(result: dict[str, object]) -> tuple[str, float | None]:
 def _decision_days(endpoint: dict[str, object] | None, lead: int) -> int | None:
     """The pairwise days this depth's decision used at one lead (D9).
 
-    ``None`` when the depth has no endpoint record, or when the record predates
-    the window disclosure — the row's strict-core count still renders beside it,
-    so the two samples stay separately labelled rather than one standing in for
-    the other.
+    ``None`` when the depth has no endpoint record, when the record carries no
+    ``"window"`` key, or when the stored block carried no numeric top-level
+    ``days`` and ``_as_window`` degraded it to ``None``. Today's sole caller
+    passes ``_endpoint_view`` output, which always carries the key, so the
+    degraded block is the path production actually takes — the row's
+    strict-core count still renders beside it, so the two samples stay
+    separately labelled rather than one standing in for the other.
     """
     if endpoint is None:
         return None
-    window = endpoint["window"]
+    window = endpoint.get("window")
     if not isinstance(window, dict):
         return None
     per_lead = _as_dict(cast("dict[str, object]", window).get("per_lead"))
@@ -1031,7 +1036,7 @@ def load_verification(
         verdicts = _load_verdicts(conn, run_id)
         # §10: the daily-rank conclusion is a first-class conclusion line,
         # derived by the same helper the verdicts API calls.
-        conclusions = daily_rank_conclusions(conn, run_id)
+        conclusions = cached_daily_rank_conclusions(conn, run_id)
         for verdict in verdicts:
             verdict["ranking_redesign_indicated"] = conclusions.get(
                 str(verdict["variable"])
@@ -1055,7 +1060,7 @@ def load_verification(
             **_diagnostics(results, day_context),
             # §14a: always-displayed secondary metric, derived by the same
             # helper the API diagnostics payload calls.
-            "observed_wet_precip_mae": observed_wet_precip_mae(conn, run_id),
+            "observed_wet_precip_mae": cached_observed_wet_precip_mae(conn, run_id),
         }
         context["day_context"] = day_context
         # §16.1/§16.2: the cards carry the run's PINNED incumbent depth; the

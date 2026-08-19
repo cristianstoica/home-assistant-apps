@@ -41,6 +41,7 @@ from wxverify.db.connection import init_db
 from wxverify.db.queue import reclaim_all_stale
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state_now
 from wxverify.settings.service import apply_plain_settings, set_rolling_window_days
+from wxverify.verification.read_cache import warm_read_cache
 from wxverify.web.render import static_dir
 from wxverify.web.routes import router as web_router
 from wxverify.worker.processor import run_worker
@@ -160,6 +161,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     # export TTL sweep must run on a timer (not only on `/begin`) to reap a
     # retained snapshot when no further export is ever started.
     export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
+    # A run published before this process started is never warmed by a publish
+    # event, so without this leg the first request after every restart pays the
+    # full cold derivation. It does not block startup: `db.read` dispatches the
+    # derivations to an executor thread.
+    warm = asyncio.create_task(warm_read_cache(db))
     await publish_discovery(app.state.bind_port)
     try:
         yield
@@ -167,10 +173,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         logger.info("worker stopping")
         export_sweeper.cancel()
         worker.cancel()
+        warm.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await export_sweeper
         with contextlib.suppress(asyncio.CancelledError):
             await worker
+        # Awaited LAST, and CAUGHT rather than suppressed. Unlike its
+        # neighbours -- which never complete -- the warm is a task that
+        # finishes, so a stored exception would re-raise out of this `finally`
+        # and skip every await ordered behind it; ordering it last means an
+        # escape cannot skip another task's cleanup. Catching instead of
+        # `suppress(asyncio.CancelledError, Exception)` keeps the only signal
+        # that the warm broke its never-raise contract.
+        try:
+            await warm
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("shutdown: read-cache warm failed")
 
 
 def _stop_on_worker_done(task: asyncio.Task[None], stop_process: StopProcess) -> None:

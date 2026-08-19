@@ -11,8 +11,11 @@ fixture data is synthetic (invented dates, RFC-5737-style ids, UTC).
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
+import subprocess
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 from typing import cast
@@ -1959,3 +1962,115 @@ def test_o15_tested_family_window_days_reaches_the_verdicts_endpoint(
     # `_parse_json(row["tested_family"])`, dropping "window") = a KeyError
     # or an absent "window" key -- either way the assertion below fails.
     assert window_out["days"] == 24
+
+
+# ---------------------------------------------------------------------------
+# O28 -- no `-O`-removable narrowing device on the shared-basis fold, and
+# `-O` mode changes nothing about the decision it produces.
+# ---------------------------------------------------------------------------
+
+
+def test_o28a_shared_basis_fold_carries_no_assert_node() -> None:
+    """(a) Shape pin, not behavior: `python -O` strips every top-level
+    `assert` statement, so a narrowing `assert` inside `decide_variable`'s
+    shared-basis fold would silently vanish under `-O` and the function
+    would keep running past a state the source *appears* to have foreclosed
+    -- an "-O changes what runs" defect no runtime assertion here can
+    observe, because the whole point is that the removed statement has zero
+    runtime effect either way; only reading the AST can see whether it is
+    there. Confined to `decide_variable`, the function that contains the
+    fold (`_shared_basis` itself is a separate function and is not the
+    target).
+
+    mutant M20 -> at `len(asserts)` below: correct = `0` (the narrowing
+    device stays a plain `# Not None: ...` comment plus an unconditional
+    `cast()`, as `decision.py`'s current source has it), mutant (a restored
+    `assert r.ordering_endpoint is not None` inserted into the fold) = `1`.
+    """
+    source = Path("wxverify/verification/decision.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    target = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "decide_variable"
+    )
+    asserts = [n for n in ast.walk(target) if isinstance(n, ast.Assert)]
+    assert len(asserts) == 0
+
+
+_O28B_SCRIPT = """
+import json
+import sys
+
+from wxverify.verification.decision import (
+    CandidateSeries,
+    VariableInputs,
+    decide_variable,
+)
+from wxverify.verification.methodology import CONTINUOUS_BASELINES
+
+dates = [f"2026-07-{d:02d}" for d in range(1, 25)]
+
+
+def ratio_series(ratio, base=2.0, step=0.1):
+    out = {}
+    for i, d in enumerate(dates):
+        opp = base + step * i
+        out[d] = (ratio * opp, opp)
+    return out
+
+
+def strong_baseline(series):
+    return {d: (c, 2.0 * c) for d, (c, _o) in series.items()}
+
+
+def wind_candidate(key, ratio):
+    leads = {ld: ratio_series(ratio) for ld in range(1, 8)}
+    base = {ld: strong_baseline(s) for ld, s in leads.items()}
+    baseline_continuous = {
+        name: {"wind_max": {ld: dict(s) for ld, s in base.items()}}
+        for name in CONTINUOUS_BASELINES
+    }
+    return CandidateSeries(
+        key=key,
+        continuous={"wind_max": leads},
+        baseline_continuous=baseline_continuous,
+    )
+
+
+cand3 = wind_candidate("3", 0.9)
+cand4 = wind_candidate("4", 0.5)
+verdict = decide_variable(
+    VariableInputs(variable="wind", incumbent_key="2", candidates=(cand3, cand4)),
+    seed=20260701,
+    resamples=40,
+)
+sys.stdout.write(json.dumps(verdict.detail, sort_keys=True))
+"""
+
+
+def test_o28b_minus_o_mode_produces_a_byte_identical_decision() -> None:
+    """(b) Behavior oracle: runs the real shared-basis fold twice, once
+    under plain `python` and once under `python -O`, over a fixture with
+    two passers (`len(passers) > 1`, so `_shared_basis` actually executes)
+    and asserts the two serialized decisions are byte-identical. A narrowing
+    `assert` whose removal under `-O` changed the decision would diverge
+    here; the current source does not carry one, so both runs take the
+    identical code path and this passes as a positive control for (a).
+    """
+    plain = subprocess.run(
+        [sys.executable, "-c", _O28B_SCRIPT],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    optimized = subprocess.run(
+        [sys.executable, "-O", "-c", _O28B_SCRIPT],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    assert plain.stdout, "the plain-mode subprocess produced no output"
+    assert plain.stdout == optimized.stdout

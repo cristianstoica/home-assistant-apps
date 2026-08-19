@@ -179,8 +179,13 @@ async def verification_page(request: Request, site: int | None = None) -> HTMLRe
 
 @router.get("/ops", response_class=HTMLResponse)
 async def ops_page(request: Request) -> HTMLResponse:
+    # Function-local so the attribute is re-read per request: a module-level
+    # import binds its own copy, and a test that lowers the cap would then
+    # leave the panel disclosing the real one.
+    from wxverify.api.routes.db_transfer import MAX_IMPORT_MIB
+
     context = await get_db().read(load_ops)
-    return render(request, "ops/show.html", **context)
+    return render(request, "ops/show.html", **context, max_import_mib=MAX_IMPORT_MIB)
 
 
 @router.get("/overlay", response_class=HTMLResponse)

@@ -1,9 +1,5 @@
 <section class="panel" id="publish-hold-panel">
-  <h2>Nightly Verification Publishing</h2>
-  <p class="panel-hint">
-    Kill switch for the nightly verification chain. Held blocks NEW runs
-    only &mdash; a chain already active will continue and may publish.
-  </p>
+  <h2>Nightly Verification Run Hold</h2>
   <div class="status-stack">
     <span class="badge {{ 'warn' if publish_hold.held else 'ok' }}" id="publish-hold-state">
       {{ 'Held' if publish_hold.held else 'Released' }}

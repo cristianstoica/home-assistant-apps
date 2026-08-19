@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.13.3
+
+Speeds up the verification page and API, moves the nightly run later so it
+scores complete days, and corrects the import size limit's stated units.
+
+### Changed
+
+- The verification page and the verdicts endpoint share two derivations
+  that were being recomputed on every request. They are now cached per
+  published run and warmed at startup, so a restart does not leave the
+  first visitor paying the full cost.
+- The nightly verification run moves from 02:00 to 05:00 local. Over 20
+  measured days, every day's observations were final before 05:00, but
+  only 11 of 20 were final before 02:00, so the earlier trigger was
+  scoring incomplete days.
+- The import size limit now states the real limit: the cap is measured
+  after decompression, and the panel and refusal messages now say so and
+  say what was actually measured. The cap itself is unchanged.
+- The nightly hold panel is renamed to say what it actually does — it
+  holds the run, not just publishing.
+
+### Fixed
+
+- A comparison-window cell now states its date range and day count.
+- A lookup that could raise on a malformed record now returns the
+  documented null instead.
+- A typographic apostrophe was normalised.
+
 ## 0.13.2
 
 Tightens the verification page's coverage disclosure and methodology
