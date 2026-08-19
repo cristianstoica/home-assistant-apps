@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.13.2
+
+Tightens the verification page's coverage disclosure and methodology
+labeling so what a run is described by always matches the rules it was
+actually scored under.
+
+### Changed
+
+- The conservative coverage sentence — the one that says part of a
+  variable was never measured — now always shows when that is true.
+  Previously two outcomes were exempted from it, so a page could omit
+  the disclosure even when coverage genuinely was incomplete.
+- Each run is now described using the methodology version it was scored
+  under, not the version the running build ships. A page showing an
+  older run no longer borrows the current build's rules to describe it.
+- The methodology API now refuses to answer for any version other than
+  its own: `contract` and `constants` come back null, with a reason that
+  names both the requested version and the build's own version. This is
+  the release's one non-additive response-shape change.
+- The headline evidence table gained a Decision sample column, showing
+  the pairwise count the verdict was based on. It only appears for a run
+  scored under a methodology version this build can interpret.
+- The provenance label "Contract version" is now "API contract version",
+  to make clear it describes the build's payload shape, not the run's
+  methodology.
+
+### Notes
+
+- The branch that handles a run scored under a methodology version
+  newer than the build ships is exercised only by tests today — no such
+  version exists yet, so it has no production exposure until the next
+  methodology bump.
+- `tie_break.best_by_pooled` can now be null when the ordering basis
+  itself was refused.
+- There is no rollback for a published run. Undo means reinstalling
+  0.13.1 and letting the next nightly run republish under the previous
+  rule; the import-based restore path does not work at the live
+  database size, and a database export is not a rollback artifact.
+
 ## 0.13.1
 
 Fixes a deadlock where verification could never start on a site that had

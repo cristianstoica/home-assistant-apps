@@ -437,7 +437,7 @@ def test_bonferroni_level_governs_occurrence_materiality() -> None:
 
 
 def test_methodology_constants_match_spec_table() -> None:
-    assert methodology.METHODOLOGY_VERSION == 1
+    assert methodology.METHODOLOGY_VERSION == 2
     assert methodology.ADEQUATE_LEAD_MIN_DAYS == 20
     assert methodology.MIN_ADEQUATE_LEADS_PER_VARIABLE == 4
     assert methodology.BOOTSTRAP_BLOCK_LENGTH_DAYS == 3

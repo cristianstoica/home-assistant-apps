@@ -139,7 +139,33 @@
           <strong>{{ v.label }}</strong>
           {% if v.is_placeholder %}<span class="badge warn" data-v16="16.2.placeholder">placeholder verdict — not evidence</span>{% endif %}
         </p>
+        {%- set decision_statements = {
+          'retain_incumbent': 'Incumbent depth ' ~ v.incumbent_depth ~ ' retained — no candidate depth was recommended.',
+          'insufficient_evidence': 'No candidate depth was recommended — the evidence bar was not met.',
+          'mixed_by_lead': 'No candidate depth was recommended — a depth cleared every other bar, but its benefit did not hold at enough of the lead times.',
+          'mixed_by_quantity': 'No candidate depth was recommended — a depth moved one part of the precipitation forecast enough to matter while the other part was worse than the tolerated margin, or could not be measured.'
+        } -%}
+        {% if v.no_recommendation and v.outcome != 'skipped' %}
+          <p class="verdict-conclusion" data-v16="16.2.decision_statement">{{ decision_statements.get(v.outcome, 'No candidate depth was recommended. (' ~ v.outcome ~ ')') }}</p>
+        {% endif %}
         {% if v.caveat %}<p class="verdict-caveat" data-v16="16.2.caveat">{{ v.caveat }}</p>{% endif %}
+        {% if v.unmeasured_endpoints %}
+          {# The closing clause is unconditional. No outcome token may
+             license the reassuring "rests only on the parts that were
+             measured": an outcome names where the decision landed, not
+             whether the missing evidence was ignored safely or determined
+             the result. retain_incumbent is the counterexample -- with one
+             quantity adequate but tied against the incumbent and the other
+             never scored, neither side is material, so mixed_by_quantity is
+             False (decision.py:881) and the ladder falls through to
+             retain_incumbent with no recommended key (decision.py:1155, :1159);
+             add a measurable second endpoint, the first held identical, and
+             it flips to recommend. Only an explicit persisted decision-layer
+             fact -- that the gap could not have changed the outcome -- could
+             establish the stronger wording, and no such fact is recorded
+             today (deferred). #}
+          <p class="notice" data-v16="16.2.evidence_scope">Part of this variable was never measured: {% for u in v.unmeasured_endpoints %}{{ u.label }} ({{ u.name }}) had no adequate lead on any tested depth{% if u.reason %}, most often recorded as {{ u.reason }}{% endif %}{{ '' if loop.last else ' · ' }}{% endfor %}. The outcome above is not a conclusion about the parts that were never measured.</p>
+        {% endif %}
         {%- set ranking = v.ranking_redesign_indicated %}
         {% if ranking %}
         <p class="verdict-conclusion" data-v16="16.2.ranking_redesign" data-ranking="{{ ranking.value }}">
@@ -149,28 +175,50 @@
           Diagnostic only: a ranking basis is not enactable, so the recommendation above is unchanged by this line.
         </p>
         {% endif %}
+        {%- set not_applicable = "Not applicable — no recommended depth; see the tested-family table below for each candidate's effect, interval, gates and baseline comparisons." | safe -%}
+        {%- set not_available = "Not available — this verdict's stored record is inconsistent; see the per-candidate table below." | safe -%}
         <dl class="facts">
           <div data-v16="16.2.incumbent_depth"><dt>Incumbent depth (pinned by run #{{ run.id }})</dt><dd>{{ v.incumbent_depth }}</dd></div>
           <div data-v16="16.2.recommended_depth"><dt>Recommended depth</dt><dd>{{ v.recommended_depth if v.recommended_depth is not none else '—' }}</dd></div>
-          <div data-v16="16.2.primary_effect"><dt>Primary effect</dt><dd>{% if v.primary and v.primary.endpoints %}{{ num(v.primary.endpoints[0].point) }} ({{ v.primary.endpoints[0].label }}){% else %}—{% endif %}</dd></div>
-          <div data-v16="16.2.primary_ci"><dt>Confidence interval</dt><dd>{% if v.primary and v.primary.endpoints %}{{ ci(v.primary.endpoints[0].ci) }}{% else %}—{% endif %}</dd></div>
-          <div data-v16="16.2.adequate_leads"><dt>Adequate leads</dt><dd>{% if v.primary and v.primary.endpoints %}{{ v.primary.endpoints[0].adequate_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% else %}—{% endif %}</dd></div>
-          <div data-v16="16.2.common_day_range"><dt>Common-day range</dt><dd>{% set span = common_days.get(v.variable) %}{% if span %}{{ span.min }}&ndash;{{ span.max }} days{% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.primary_effect"><dt>Primary effect</dt><dd>{% if v.basis_inconsistent %}{{ not_available }}{% elif v.primary and v.basis_summary and v.basis_summary.label %}{{ num(v.basis_summary.point) }} ({{ v.basis_summary.label }}){% elif v.primary and v.primary.ordering_endpoint %}{% set oe = v.primary.endpoint_by_name[v.primary.ordering_endpoint] %}{{ num(oe.point) }} ({{ oe.label }}){% elif v.primary_missing or v.primary %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</dd></div>
+          <div data-v16="16.2.primary_ci"><dt>Confidence interval</dt><dd>{% if v.basis_inconsistent %}{{ not_available }}{% elif v.primary and v.basis_summary and v.basis_summary.label %}{{ ci(v.basis_summary.ci) }}{% elif v.primary and v.primary.ordering_endpoint %}{{ ci(v.primary.endpoint_by_name[v.primary.ordering_endpoint].ci) }}{% elif v.primary_missing or v.primary %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</dd></div>
+          <div data-v16="16.2.adequate_leads"><dt>Adequate leads</dt><dd>{% if v.primary and v.basis_summary %}{{ v.basis_summary.lead_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% elif v.primary and v.primary.ordering_endpoint %}{{ v.primary.endpoint_by_name[v.primary.ordering_endpoint].adequate_count }} of {{ methodology.min_adequate_leads_per_variable }} required{% elif v.primary_missing or v.primary %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</dd></div>
+          <div data-v16="16.2.common_day_range"><dt>Headline-table common days</dt><dd>{% set span = common_days.get(v.variable) %}{% if span %}{{ span.min }}&ndash;{{ span.max }} days{% else %}—{% endif %}</dd></div>
+          <div data-v16="16.2.decision_window"><dt>Decision window</dt><dd>{% if v.no_recommendation %}No single decision window applies: no depth was recommended. Each tested depth&rsquo;s own comparison window is listed in the tested-family table below.{% elif v.primary and (v.basis_summary or v.primary.ordering_endpoint) %}{% if v.decision_window and v.decision_window.first %}{{ v.decision_window.first }}&ndash;{{ v.decision_window.last }} ({{ v.decision_window.days }} days){% else %}—{% endif %}{% else %}{{ not_available }}{% endif %}</dd></div>
           <div data-v16="16.2.practical_significance"><dt>Practical significance</dt><dd>
             {%- if v.primary -%}
               {%- set practical = v.primary.gates | selectattr('key', 'in', ['practical_floor', 'total_material', 'occurrence_material']) | list -%}
               {%- if practical %}{% for g in practical %}{{ g.label }}: {{ g.state }}{{ '' if loop.last else ' · ' }}{% endfor %}{% else %}—{% endif -%}
-            {%- else -%}—{%- endif -%}
+            {%- elif v.primary_missing -%}{{ not_available }}{%- else -%}{{ not_applicable }}{%- endif -%}
           </dd></div>
         </dl>
         <p class="muted" data-v16="16.2.baseline_gates">Baseline gates:
-          {% if v.primary and v.primary.baselines %}
-            {% for b in v.primary.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }}{{ '' if loop.last else ' · ' }}{% endfor %}
-          {% else %}—{% endif %}
+          {% if v.primary %}
+            {% if v.primary.baselines %}{% for b in v.primary.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }}{{ '' if loop.last else ' · ' }}{% endfor %}{% else %}—{% endif %}
+          {% elif v.primary_missing %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}
         </p>
-        <p class="muted" data-v16="16.2.completeness_guards">Completeness guards: {{ gates(v.primary.gates if v.primary else []) }}</p>
+        <p class="muted" data-v16="16.2.completeness_guards">Completeness guards: {% if v.primary %}{{ gates(v.primary.gates) }}{% elif v.primary_missing %}{{ not_available }}{% else %}{{ not_applicable }}{% endif %}</p>
+        {%- set refusal = v.tie_break.basis.reason if v.tie_break and v.tie_break.basis else none -%}
+        {%- set refusal_sentences = {
+          'thin_shared_basis': 'Depths could not be compared on the same days: fewer than ' ~ methodology.min_adequate_leads_per_variable ~ ' leads have enough days in common. The depth shown is the tested depth closest to the incumbent, not a winner.',
+          'thin_shared_events': 'Depths could not be compared on the same days: fewer than ' ~ methodology.min_adequate_leads_per_variable ~ ' leads have enough rain and no-rain days in common. The depth shown is the tested depth closest to the incumbent, not a winner.',
+          'mixed_endpoint_kind': 'The depths improved on different things — one on rainfall amount, another on whether rain was called correctly — which are not on the same scale. The depth shown is the one closest to the incumbent.',
+          'undefined_restricted_ci': 'The days the depths have in common were too sparse to put a confidence interval on at least one of them. The depth shown is the one closest to the incumbent.'
+        } -%}
+        {% if refusal %}
+          <p class="notice" data-v16="16.2.ordering_refusal">{{ refusal_sentences.get(refusal, 'Depths could not be compared; the depth shown is the one closest to the incumbent. (' ~ refusal ~ ')') }}</p>
+        {% endif %}
         {% if v.unresolved %}
-          <p class="muted" data-v16="16.2.unresolved">Statistically unresolved against the chosen depth: {{ v.unresolved | join(', ') }}</p>
+          <p class="muted" data-v16="16.2.unresolved">{% if refusal %}Other tested depths, left uncompared against the chosen depth{% else %}Statistically unresolved against the chosen depth{% endif %}: {{ v.unresolved | join(', ') }}</p>
+        {% endif %}
+        {% if v.primary and v.primary.ordering_endpoint_unresolved %}
+          <p class="notice" data-v16="16.2.ordering_endpoint_unresolved">This verdict&rsquo;s stored record names a decision endpoint it does not contain ({{ v.primary.ordering_endpoint_unresolved }}). Every figure above that depends on that endpoint is therefore not shown. {% if v.primary.endpoints %}The per-candidate table below lists the endpoints the record does hold.{% else %}This record holds no endpoint at all, so the per-candidate table below has none to list for it.{% endif %}</p>
+        {% endif %}
+        {% if v.primary_missing %}
+          <p class="notice" data-v16="16.2.primary_missing">This verdict recommends depth {{ v.recommended_depth }}, but its stored record holds no tested-depth entry for that depth, so the summary fields above cannot be filled. The per-candidate table below lists the depths the record does hold.</p>
+        {% endif %}
+        {% if v.basis_inconsistent %}
+          <p class="notice" data-v16="16.2.basis_inconsistent">This verdict&rsquo;s stored record ordered the tested depths on a shared basis, but that basis holds no entry for the recommended depth ({{ v.recommended_depth }}), so the effect and interval above cannot be filled. The lead count and decision window are read from the basis itself and are unaffected. The per-candidate table below lists each tested depth&rsquo;s own comparison.</p>
         {% endif %}
         {% if v.skip_reason %}
           <p class="muted" data-v16="16.2.skip_reason">Reason: {{ v.skip_reason }}</p>
@@ -198,7 +246,7 @@
   {# ------------------------------------------------------------------ #}
   <section class="panel wide" id="verification-headline">
     <h2>Headline results</h2>
-    <p class="panel-hint">Decision leads D1&ndash;D7, by variable &times; lead &times; quantity &times; candidate depth, on the strict common core. D0 is diagnostic only and appears below.</p>
+    <p class="panel-hint">Decision leads D1&ndash;D7, by variable &times; lead &times; quantity &times; candidate depth. The primary metric, &Delta; and CI columns are computed on the strict common core across every resolved member of the cell{% if decision_core_era == 'pairwise' %}; the Decision sample column is the pairwise count the verdict used for that depth{% elif decision_core_era == 'strict' %}; the Decision sample column is blank because this run was scored before pairwise decision samples were recorded{% elif decision_core_era == 'unknown' %}; this run was scored under a methodology version this build does not carry, so the Decision sample column is not described{% endif %}. D0 is diagnostic only and appears below.</p>
     {% if headline %}
       <div class="table-wrap">
         <table class="cardify" data-v16="16.3.table">
@@ -206,7 +254,7 @@
             <tr>
               <th>Variable</th><th>Lead</th><th>Quantity</th><th>Candidate depth</th>
               <th>Primary metric</th><th>&Delta; vs incumbent</th><th>CI</th>
-              <th>Common days</th><th>Observed events</th><th>Realized contributors</th>
+              <th>Common days</th><th>Decision sample</th><th>Observed events</th><th>Realized contributors</th>
               <th>Availability</th><th>Baselines</th><th>Gates</th>
             </tr>
           </thead>
@@ -221,6 +269,19 @@
                 <td data-label="Delta vs incumbent" data-v16="16.3.incumbent_delta">{% if r.is_incumbent %}n/a{% else %}{{ num(r.delta_vs_incumbent) }}{% endif %}</td>
                 <td data-label="CI" data-v16="16.3.ci">{{ ci(r.ci) }}</td>
                 <td data-label="Common days" data-v16="16.3.common_days">{{ r.common_days }}</td>
+                {#- Era gate, not a data gate. A Decision sample is rendered
+                    only when this build can interpret it (the pairwise era);
+                    on `strict` and `unknown` the cell is always the em-dash.
+                    A run written by a NEWER build does carry a window, and
+                    reading it back after a downgrade is exactly the `unknown`
+                    case, so a value this build cannot vouch for is withheld
+                    rather than shown under this build's semantics. The record
+                    still has to hold a window (a pairwise-era row may lack
+                    one), but that is the second check, never the gate. The
+                    cell itself renders unconditionally: the column count must
+                    not vary by version, because `cardify` pairs every cell
+                    with its own `data-label`. #}
+                <td data-label="Decision sample" data-v16="16.3.decision_days">{% if decision_core_era == 'pairwise' and r.decision_days is not none %}{{ r.decision_days }}{% else %}—{% endif %}</td>
                 <td data-label="Observed events" data-v16="16.3.observed_events">{% if r.events %}{{ r.events.hits }}/{{ r.events.misses }}/{{ r.events.false_alarms }}/{{ r.events.correct_negatives }}{% else %}n/a{% endif %}</td>
                 <td data-label="Realized contributors" data-v16="16.3.realized_contributors">{% if r.contributors %}{{ r.contributors[0] }}&ndash;{{ r.contributors[1] }}{% else %}—{% endif %}</td>
                 <td data-label="Availability">{{ '%.0f%%'|format(r.availability_rate * 100) if r.availability_rate is not none else '—' }}</td>
@@ -236,6 +297,13 @@
           </tbody>
         </table>
       </div>
+      {% if decision_core_era == 'pairwise' %}
+        <p class="muted" data-v16="16.3.two_samples">Two samples, deliberately: Common days is the strict common core shared by every resolved member of the cell, while Decision sample is the pairwise core of the two entities the verdict actually compared.</p>
+      {% elif decision_core_era == 'strict' %}
+        <p class="muted" data-v16="16.3.one_sample">One sample: this run was scored on the strict common core shared by every resolved member of the cell, with no separate pairwise decision sample, so the Decision sample column shows a dash on every row.</p>
+      {% elif decision_core_era == 'unknown' %}
+        <p class="muted" data-v16="16.3.core_unavailable">This build does not carry the methodology version this run was scored under, so its decision core is not described here, and the Decision sample column shows a dash on every row for this run.</p>
+      {% endif %}
     {% else %}
       <p class="empty">No headline evidence rows on this run.</p>
     {% endif %}
@@ -512,7 +580,7 @@
       <div data-v16="16.5.code_version"><dt>Code version</dt><dd>{{ run.app_version }}</dd></div>
       <div data-v16="16.5.input_fingerprint"><dt>Input fingerprint</dt><dd><code>{{ run.input_fingerprint }}</code></dd></div>
       <div data-v16="16.5.exclusion_counts"><dt>Exclusion counts</dt><dd>{{ day_context.days_with_exclusions }} days with knowability exclusions of {{ day_context.snapshot_days }} snapshot days &middot; {{ day_context.null_availability_samples }} null-availability samples</dd></div>
-      <div data-v16="16.5.schema"><dt>Contract version</dt><dd>verification_schema {{ verification_schema }} &middot; {{ contract.null_semantics }}</dd></div>
+      <div data-v16="16.5.schema"><dt>API contract version</dt><dd>verification_schema {{ verification_schema }} <span class="muted">(this build&rsquo;s payload shape, not this run&rsquo;s methodology)</span> &middot; {{ contract.null_semantics }}</dd></div>
     </dl>
 
     {% if snapshot %}
@@ -536,7 +604,7 @@
           {% if v.candidates %}
             <div class="table-wrap">
               <table class="cardify">
-                <thead><tr><th>Candidate depth</th><th>Endpoint</th><th>Adjusted confidence level</th><th>Pooled effect</th><th>CI</th><th>Adequate leads</th><th>Gates</th><th>Baseline comparisons</th></tr></thead>
+                <thead><tr><th>Candidate depth</th><th>Endpoint</th><th>Adjusted confidence level</th><th>Pooled effect</th><th>CI</th><th>Adequate leads</th><th>Comparison window</th><th>Gates</th><th>Baseline comparisons</th></tr></thead>
                 <tbody>
                   {% for c in v.candidates %}
                     {% for e in c.endpoints %}
@@ -547,15 +615,16 @@
                         <td data-label="Pooled effect">{{ num(e.point) }}</td>
                         <td data-label="CI">{{ ci(e.ci) }}</td>
                         <td data-label="Adequate leads">{{ e.adequate_leads | join(', ') if e.adequate_leads else '—' }}</td>
+                        <td data-label="Comparison window" data-v16="16.5.endpoint_window">{% if e.window and e.window.first %}{{ e.window.first }}&ndash;{{ e.window.last }} ({{ e.window.days }} days){% elif e.window %}0 days{% else %}—{% endif %}</td>
                         <td data-label="Gates" data-v16="16.5.gate_outcomes">{{ gates(c.gates) }}</td>
                         <td data-label="Baseline comparisons" data-v16="16.5.baseline_comparisons">
-                          {% for b in c.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }} at {{ '%.2f'|format(methodology.baseline_gate_ci_level) }}{{ '' if loop.last else ' · ' }}{% else %}—{% endfor %}
+                          {% for b in c.baselines %}{{ b.name }}{% if b.scope %} ({{ b.scope }}){% endif %}: {{ b.state }} at {{ '%.2f'|format(methodology.baseline_gate_ci_level) }} {{ ci(b.ci) }} <span data-v16="16.5.baseline_window">{% if b.window and b.window.first %}{{ b.window.first }}&ndash;{{ b.window.last }} ({{ b.window.days }} days){% elif b.window %}0 days{% else %}—{% endif %}</span>{{ '' if loop.last else ' · ' }}{% else %}—{% endfor %}
                         </td>
                       </tr>
                     {% else %}
                       <tr data-candidate="{{ c.key }}">
                         <td data-label="Candidate depth">{{ c.key }}</td>
-                        <td data-label="Endpoint" colspan="7">No endpoint evaluated — insufficient evidence.</td>
+                        <td data-label="Endpoint" colspan="8">No endpoint evaluated — insufficient evidence.</td>
                       </tr>
                     {% endfor %}
                   {% endfor %}

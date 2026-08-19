@@ -89,7 +89,9 @@ def test_lead_drop_boundary_four_surviving_leads_still_recommend() -> None:
             "lead": 5,
             "reason": "baseline_absent",
             "missing_baselines": ["baseline_all_feed_mean"],
-        }
+        },
+        {"lead": 6, "reason": "thin_data", "days": 0},
+        {"lead": 7, "reason": "thin_data", "days": 0},
     ]
 
 
@@ -99,7 +101,7 @@ def test_lead_drop_boundary_three_surviving_leads_are_insufficient() -> None:
     assert verdict.outcome == "insufficient_evidence"
     assert verdict.recommended_key is None
     assert _adequate(verdict, "3") == [1, 2, 3]
-    assert [d["lead"] for d in _dropped(verdict, "3")] == [4, 5]
+    assert [d["lead"] for d in _dropped(verdict, "3")] == [4, 5, 6, 7]
 
 
 def test_thin_data_and_absent_baseline_drops_are_distinguishable() -> None:
@@ -124,7 +126,12 @@ def test_thin_data_and_absent_baseline_drops_are_distinguishable() -> None:
     )
     dropped = _dropped(_wind_verdict(candidate), "3")
     reasons = {int(cast(int, d["lead"])): d["reason"] for d in dropped}
-    assert reasons == {4: "baseline_absent", 5: "thin_data"}
+    assert reasons == {
+        4: "baseline_absent",
+        5: "thin_data",
+        6: "thin_data",
+        7: "thin_data",
+    }
     by_lead = {int(cast(int, d["lead"])): d for d in dropped}
     assert by_lead[4]["missing_baselines"] == ["baseline_all_feed_mean"]
     assert by_lead[5]["days"] == 10

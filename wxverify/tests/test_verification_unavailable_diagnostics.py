@@ -3,7 +3,8 @@
 Two kinds of "not shown" are kept apart, because conflating them is the
 false declaration W11 exists to remove:
 
-* a family methodology v1 does not define at all (``wet_hour_share``), and
+* a family the shipped methodology version does not define at all
+  (``wet_hour_share``), and
 * a family it does define but which THIS run has no data for.
 
 A metric the specification calls always-displayed and the code merely does

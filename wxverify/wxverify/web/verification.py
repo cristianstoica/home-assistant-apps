@@ -25,6 +25,7 @@ from wxverify.settings.depth import effective_blend_depths
 from wxverify.verification import methodology
 from wxverify.verification.contract import (
     CONTRACT,
+    PAIRWISE_DECISION_CORE_SINCE,
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
@@ -117,29 +118,31 @@ _QUANTITY_ENDPOINT: dict[str, str] = {
     "precip_occurrence": "occurrence",
 }
 
-#: §16.4 diagnostics methodology v1 declines to define at all. Declared on
-#: the page rather than silently omitted, so the divergence stays visible.
-#: This list is for METHODOLOGY gaps only — a metric the specification calls
-#: always-displayed and the code merely does not implement is a gap to close,
-#: never an entry here (that is why the observed-wet precip-total MAE is
-#: absent from it: §14a implements the metric instead). Families that exist
-#: in methodology v1 but can come up empty for DATA reasons are declared per
-#: run from _DATA_UNAVAILABLE_DIAGNOSTICS below.
+#: §16.4 diagnostics the shipped methodology version declines to define at
+#: all. Declared on the page rather than silently omitted, so the divergence
+#: stays visible. This list is for METHODOLOGY gaps only — a metric the
+#: specification calls always-displayed and the code merely does not
+#: implement is a gap to close, never an entry here (that is why the
+#: observed-wet precip-total MAE is absent from it: §14a implements the
+#: metric instead). Families that exist in the shipped methodology version
+#: but can come up empty for DATA reasons are declared per run from
+#: _DATA_UNAVAILABLE_DIAGNOSTICS below.
 UNAVAILABLE_DIAGNOSTICS: list[dict[str, str]] = [
     {
         "key": "wet_hour_share",
         "label": "Wet-hour-share verification",
         "reason": (
-            "Deferred to methodology version 2: methodology v1 declares neither "
-            "the bin edges nor the predicted-vs-observed denominator rule this "
-            "diagnostic needs, so this run persists no wet-hour-share evidence."
+            "Not specified by the methodology version this run was scored "
+            "under: it declares neither the bin edges nor the "
+            "predicted-vs-observed denominator rule this diagnostic needs, "
+            "so this run persists no wet-hour-share evidence."
         ),
     },
 ]
 
-#: §16.4 diagnostic families methodology v1 DOES produce but which a given
-#: run can fail to populate for data reasons. Emitting the reason keeps an
-#: empty section from reading as an unimplemented one.
+#: §16.4 diagnostic families the shipped methodology version DOES produce
+#: but which a given run can fail to populate for data reasons. Emitting the
+#: reason keeps an empty section from reading as an unimplemented one.
 _DATA_UNAVAILABLE_DIAGNOSTICS: dict[str, dict[str, str]] = {
     "d0": {
         "label": "Same-day (D0) skill",
@@ -180,6 +183,20 @@ _DATA_UNAVAILABLE_DIAGNOSTICS: dict[str, dict[str, str]] = {
 
 _BASELINE_PREFIX = "baseline_"
 
+# The order a candidate record's endpoints are listed in, and the order the
+# absent-selector fallback picks from (D14).
+_ENDPOINT_ORDER = ("headline", "total", "occurrence")
+
+# The order `_adequate_leads` itself tests the drop reasons in, used to break a
+# count tie when naming an unmeasured endpoint's cause; the page can then never
+# name a weaker cause than the payload did.
+_DROP_REASON_PRECEDENCE = (
+    "thin_data",
+    "thin_events",
+    "baseline_absent",
+    "outside_core",
+)
+
 
 def _parse_json(raw: object) -> object:
     if raw is None:
@@ -210,6 +227,42 @@ def _as_ci(value: object) -> list[float] | None:
     if len(items) != 2 or items[0] is None or items[1] is None:
         return None
     return [items[0], items[1]]
+
+
+def _as_date(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _as_window(value: object) -> dict[str, object] | None:
+    """A comparison window, or ``None`` when the block is missing or malformed.
+
+    A run scored under methodology version 1 stores no ``window`` at all, so
+    the accessor degrades to ``None`` and the page prints a dash instead of
+    failing on a record it can still render everything else from.
+    """
+    body = _as_dict(value)
+    days = _as_number(body.get("days"))
+    if days is None:
+        return None
+    per_lead: dict[str, object] = {}
+    for lead, entry in _as_dict(body.get("per_lead")).items():
+        inner = _as_dict(entry)
+        inner_days = _as_number(inner.get("days"))
+        if inner_days is None:
+            continue
+        per_lead[str(lead)] = {
+            "first": _as_date(inner.get("first")),
+            "last": _as_date(inner.get("last")),
+            "days": int(inner_days),
+        }
+    return {
+        "first": _as_date(body.get("first")),
+        "last": _as_date(body.get("last")),
+        "days": int(days),
+        "per_lead": per_lead,
+    }
 
 
 def _gate_state(value: object) -> str:
@@ -304,6 +357,11 @@ def _endpoint_view(name: str, raw: object) -> dict[str, object]:
         str(lead): _as_number(effect)
         for lead, effect in _as_dict(body.get("per_lead")).items()
     }
+    drop_reasons: dict[str, int] = {}
+    for item in _as_list(body.get("dropped_leads")):
+        reason = _as_dict(item).get("reason")
+        if isinstance(reason, str):
+            drop_reasons[reason] = drop_reasons.get(reason, 0) + 1
     return {
         "name": name,
         "label": ENDPOINT_LABELS.get(name, name),
@@ -312,6 +370,8 @@ def _endpoint_view(name: str, raw: object) -> dict[str, object]:
         "adequate_leads": adequate,
         "adequate_count": len(adequate),
         "per_lead": per_lead,
+        "window": _as_window(body.get("window")),
+        "drop_reasons": drop_reasons,
     }
 
 
@@ -327,6 +387,7 @@ def _baseline_views(raw: object) -> list[dict[str, object]]:
                     "scope": None,
                     "state": _gate_state(body.get("passed")),
                     "ci": _as_ci(body.get("ci")),
+                    "window": _as_window(body.get("window")),
                 }
             )
             continue
@@ -339,17 +400,42 @@ def _baseline_views(raw: object) -> list[dict[str, object]]:
                     "scope": name,
                     "state": _gate_state(inner_body.get("passed")),
                     "ci": _as_ci(inner_body.get("ci")),
+                    "window": _as_window(inner_body.get("window")),
                 }
             )
     return out
 
 
+def _ordering_endpoint(
+    record: dict[str, object],
+    endpoint_by_name: dict[str, dict[str, object]],
+    endpoints: list[dict[str, object]],
+) -> tuple[str | None, str | None]:
+    """The endpoint the decision was ordered on, and an unusable selector (D14).
+
+    Three states, and they are not collapsible. A record naming an endpoint it
+    does not contain is a stored-verdict inconsistency: it yields no endpoint
+    at all and hands the raw name back so the card can say what happened,
+    because substituting another endpoint would print numbers the decision
+    never used. The selector is read before the endpoints are counted, so a
+    record that names one while holding none still discloses the name it
+    recorded rather than losing it to the emptiness guard. A record with no
+    recorded selector is a run-1 record and keeps the first-listed endpoint,
+    which is exactly today's rendering, and yields nothing when there is none
+    to keep — the guard stays for that branch alone.
+    """
+    recorded = record.get("ordering_endpoint_name")
+    if isinstance(recorded, str):
+        return (recorded, None) if recorded in endpoint_by_name else (None, recorded)
+    if not endpoints:
+        return None, None
+    return str(endpoints[0]["name"]), None
+
+
 def _candidate_view(key: str, raw: object, variable: str) -> dict[str, object]:
     record = _as_dict(raw)
     endpoints = [
-        _endpoint_view(name, record[name])
-        for name in ("headline", "total", "occurrence")
-        if name in record
+        _endpoint_view(name, record[name]) for name in _ENDPOINT_ORDER if name in record
     ]
     conditions = _as_dict(record.get("conditions"))
     # Every gate the variable's §12 path declares is listed, so a gate that
@@ -370,14 +456,139 @@ def _candidate_view(key: str, raw: object, variable: str) -> dict[str, object]:
         }
         for name, value in sorted(_as_dict(record.get("components")).items())
     ]
+    endpoint_by_name = {str(e["name"]): e for e in endpoints}
+    ordering, unresolved = _ordering_endpoint(record, endpoint_by_name, endpoints)
     return {
         "key": key,
         "endpoints": endpoints,
-        "endpoint_by_name": {str(e["name"]): e for e in endpoints},
+        "endpoint_by_name": endpoint_by_name,
+        "ordering_endpoint": ordering,
+        "ordering_endpoint_unresolved": unresolved,
         "gates": gates,
         "baselines": _baseline_views(record.get("baselines")),
         "components": components,
         "insufficient": not conditions,
+    }
+
+
+def _unmeasured_endpoints(
+    candidates: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Endpoints no tested candidate could measure, with the dominant cause (D8).
+
+    An endpoint is unmeasured only when every candidate that holds it has an
+    empty adequate set — a partial shortfall is a fact about those candidates
+    and is disclosed on their own rows, not as a claim about the verdict. The
+    reported cause is the reason holding the most drop records across those
+    candidates, ties broken by the order the adequacy gate tests them in.
+    """
+    out: list[dict[str, object]] = []
+    for name in _ENDPOINT_ORDER:
+        views = [
+            endpoint
+            for endpoint in (
+                cast("dict[str, dict[str, object]]", c["endpoint_by_name"]).get(name)
+                for c in candidates
+            )
+            if endpoint is not None
+        ]
+        if not views or any(view["adequate_leads"] for view in views):
+            continue
+        counts: dict[str, int] = {}
+        for view in views:
+            for reason, count in cast("dict[str, int]", view["drop_reasons"]).items():
+                counts[reason] = counts.get(reason, 0) + count
+        dominant: str | None = None
+        if counts:
+            dominant = min(counts, key=lambda r: (-counts[r], _reason_rank(r), r))
+        out.append(
+            {
+                "name": name,
+                "label": ENDPOINT_LABELS.get(name, name),
+                "reason": dominant,
+            }
+        )
+    return out
+
+
+def _reason_rank(reason: str) -> int:
+    if reason in _DROP_REASON_PRECEDENCE:
+        return _DROP_REASON_PRECEDENCE.index(reason)
+    return len(_DROP_REASON_PRECEDENCE)
+
+
+def _decision_window(primary: dict[str, object]) -> dict[str, object] | None:
+    """The ordering endpoint's own window, when no shared basis resolved (D9).
+
+    Selected by name, never by position: a precipitation verdict ordered on
+    the occurrence endpoint must not report the total endpoint's window under
+    a label asserting the decision was made on it (D14). When the verdict DID
+    resolve a shared basis, the decision window is the BASIS window instead —
+    the sample both the ordering step and the overlap step consumed — and the
+    caller makes that selection.
+    """
+    name = primary["ordering_endpoint"]
+    if not isinstance(name, str):
+        return None
+    endpoint = cast("dict[str, dict[str, object]]", primary["endpoint_by_name"]).get(
+        name
+    )
+    if endpoint is None:
+        return None
+    return cast("dict[str, object] | None", endpoint["window"])
+
+
+def _basis_summary(
+    tie_break: dict[str, object], primary: dict[str, object]
+) -> dict[str, object] | None:
+    """The chosen depth's shared-basis point, interval, leads and window (D9).
+
+    With two or more passers the decision was ordered on the shared basis, so
+    the four decision-summary fields report the basis values: the candidate's
+    own-window numbers are quantities no step of the decision consumed, and on
+    a reversing verdict they describe a different depth. ``None`` on a refused
+    ordering and on a single passer — nothing was recomputed on either, and
+    the card keeps the ordering endpoint's own row exactly as it stands.
+
+    The key is the one the card already resolved ``primary`` with. A resolved
+    basis that does not carry it is a stored-verdict inconsistency, disclosed
+    rather than guessed at: the point and interval are withheld and
+    ``basis_inconsistent`` names the defect, while the lead count and window —
+    read off the basis itself, and the same numbers whichever key was chosen —
+    still render.
+    """
+    basis = _as_dict(tie_break.get("basis"))
+    if not basis or "reason" in basis:
+        return None
+    key = str(primary["key"])
+    points = _as_dict(basis.get("points"))
+    cis = _as_dict(basis.get("cis"))
+    inconsistent = key not in points or key not in cis
+    name = primary["ordering_endpoint"]
+    endpoint = (
+        cast("dict[str, dict[str, object]]", primary["endpoint_by_name"]).get(name)
+        if isinstance(name, str)
+        else None
+    )
+    return {
+        "inconsistent": inconsistent,
+        "point": None if inconsistent else _as_number(points[key]),
+        "ci": None if inconsistent else _as_ci(cis[key]),
+        # The basis point is on the ordering endpoint's scale and its interval
+        # is bootstrapped at that endpoint's own level, so the card's label,
+        # units and confidence wording do not move — only the sample does.
+        "label": None if endpoint is None else endpoint["label"],
+        "lead_count": len(_as_list(basis.get("leads"))),
+        # Shaped through the accessor the endpoint window already uses, so the
+        # card consumes one window shape whichever sample it reports. The day
+        # count is the recorded date union, never re-derived here (D5).
+        "window": _as_window(
+            {
+                "first": basis.get("first"),
+                "last": basis.get("last"),
+                "days": basis.get("days_total"),
+            }
+        ),
     }
 
 
@@ -395,7 +606,11 @@ def _verdict_view(row: sqlite3.Row) -> dict[str, object]:
         wanted = str(int(recommended))
         primary = next((c for c in candidates if c["key"] == wanted), None)
     tie_break = _as_dict(family.get("tie_break"))
-    return {
+    if "basis" in tie_break:
+        # Normalised so the card can read `basis.reason` off a malformed
+        # record without the template deciding what a basis looks like.
+        tie_break["basis"] = _as_dict(tie_break["basis"])
+    view: dict[str, object] = {
         "variable": variable,
         "outcome": outcome,
         "label": OUTCOME_LABELS.get(outcome, outcome),
@@ -412,7 +627,37 @@ def _verdict_view(row: sqlite3.Row) -> dict[str, object]:
         "tie_break": tie_break or None,
         "skip_reason": family.get("reason"),
         "tested_keys": [str(c["key"]) for c in candidates],
+        "no_recommendation": recommended is None,
+        # NOT `primary is None`: that is true in two different states and
+        # only one of them is a decision the run made. A stored depth with
+        # no matching candidate record is a defect in the record, and the
+        # card must not describe it as an absence of recommendation while
+        # printing the recommended depth two rows above (D13, §7.13).
+        "primary_missing": recommended is not None and primary is None,
+        # In the base dict, not only on the branch that can set it true: the
+        # environment's default `Undefined` is silently falsy, so a missing or
+        # mistyped key would disable the disclosure with every test still
+        # green. The negative case is a decision, not an omission (D9).
+        "basis_inconsistent": False,
+        "unmeasured_endpoints": _unmeasured_endpoints(candidates),
     }
+    if primary is not None:
+        # Only a recommended depth has a decision window. A union across
+        # candidates, or one candidate's window borrowed to fill the slot,
+        # would both report a sample the verdict did not use. When a shared
+        # basis resolved, that sample is the basis rather than the ordering
+        # endpoint's own window (D9).
+        basis_summary = _basis_summary(tie_break, primary)
+        view["basis_summary"] = basis_summary
+        view["basis_inconsistent"] = basis_summary is not None and bool(
+            basis_summary["inconsistent"]
+        )
+        view["decision_window"] = (
+            basis_summary["window"]
+            if basis_summary is not None
+            else _decision_window(primary)
+        )
+    return view
 
 
 def _load_verdicts(conn: sqlite3.Connection, run_id: int) -> list[dict[str, object]]:
@@ -490,6 +735,24 @@ def _primary_metric(result: dict[str, object]) -> tuple[str, float | None]:
     return "MAE", _as_number(result["mae"])
 
 
+def _decision_days(endpoint: dict[str, object] | None, lead: int) -> int | None:
+    """The pairwise days this depth's decision used at one lead (D9).
+
+    ``None`` when the depth has no endpoint record, or when the record predates
+    the window disclosure — the row's strict-core count still renders beside it,
+    so the two samples stay separately labelled rather than one standing in for
+    the other.
+    """
+    if endpoint is None:
+        return None
+    window = endpoint["window"]
+    if not isinstance(window, dict):
+        return None
+    per_lead = _as_dict(cast("dict[str, object]", window).get("per_lead"))
+    days = _as_number(_as_dict(per_lead.get(str(lead))).get("days"))
+    return None if days is None else int(days)
+
+
 def _headline_rows(
     results: list[dict[str, object]],
     verdicts: list[dict[str, object]],
@@ -537,6 +800,7 @@ def _headline_rows(
                 "dict[str, dict[str, object]]", candidate["endpoint_by_name"]
             )
             endpoint = endpoints.get(_QUANTITY_ENDPOINT.get(quantity, "headline"))
+        decision_days = _decision_days(endpoint, lead)
         if is_incumbent:
             lead_state = "incumbent"
         elif endpoint is None:
@@ -569,6 +833,7 @@ def _headline_rows(
                     )
                 ),
                 "lead_state": lead_state,
+                "decision_days": decision_days,
                 "events": events,
                 "contributors": contributors.get((variable, lead, quantity, depth_key)),
                 "baselines": baselines_by_cell.get((variable, lead, quantity), []),
@@ -582,7 +847,11 @@ def _headline_rows(
 def _common_day_ranges(
     results: list[dict[str, object]],
 ) -> dict[str, dict[str, int]]:
-    """Per-variable strict-common-day range over the decision leads (§16.2)."""
+    """Per-variable headline-table common-day range over the decision leads.
+
+    The strict common core across all resolved members — the headline table's
+    sample, not the pairwise sample any single decision was made on (§16.2).
+    """
     spans: dict[str, list[int]] = {}
     for result in results:
         if (
@@ -690,6 +959,22 @@ def _load_day_context(conn: sqlite3.Connection, run_id: int) -> dict[str, object
     }
 
 
+def _decision_core_era(methodology_version: int) -> str:
+    """Which decision-core description is true of a run (§16.3, D1).
+
+    Three states, not two. A version at or above the pairwise threshold
+    but no higher than this build's is `pairwise`; anything below the
+    threshold is `strict`; anything ABOVE this build's version is
+    `unknown`, because a downgraded add-on can meet a run written by a
+    newer build and must not describe it as either.
+    """
+    if methodology_version > methodology.METHODOLOGY_VERSION:
+        return "unknown"
+    if methodology_version >= PAIRWISE_DECISION_CORE_SINCE:
+        return "pairwise"
+    return "strict"
+
+
 def load_verification(
     conn: sqlite3.Connection, site_id: int | None
 ) -> dict[str, object]:
@@ -754,6 +1039,12 @@ def load_verification(
         results = _load_results(conn, run_id)
         day_context = _load_day_context(conn, run_id)
         context["run"] = run
+        # `_load_run` already coerced this column with `int(...)`; the dict
+        # it returns is `dict[str, object]`, so the cast restates that, and
+        # `int(object)` would not type-check.
+        context["decision_core_era"] = _decision_core_era(
+            cast("int", run["methodology_version"])
+        )
         context["snapshot"] = _snapshot_view(run["config_snapshot"])
         context["verdicts"] = verdicts
         context["headline"] = _headline_rows(

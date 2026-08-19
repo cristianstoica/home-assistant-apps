@@ -12,7 +12,10 @@ from wxverify.verification import methodology
 from wxverify.verification.simulate import SIM_DEPTHS, SIM_VARIABLES
 
 #: Response-contract version for every /api/verification/* payload (§16).
-VERIFICATION_SCHEMA = 1
+VERIFICATION_SCHEMA = 2
+
+#: First methodology version whose decision core is pairwise (§16.3, D1).
+PAIRWISE_DECISION_CORE_SINCE = 2
 
 #: Machine-readable measurement contract (§16): units, metric direction,
 #: confidence levels, sample definition, and null semantics.
@@ -37,9 +40,16 @@ CONTRACT: dict[str, object] = {
         "baseline_gate_ci": methodology.BASELINE_GATE_CI_LEVEL,
     },
     "sample_definition": (
-        "one local target day on the cell's strict common core; pairwise "
-        "cores for non-headline entities"
+        "one local target day; decision comparisons (candidate vs incumbent, "
+        "candidate vs each required baseline) use the pairwise core of the "
+        "two entities compared; the headline results table uses the cell's "
+        "strict common core"
     ),
+    "comparison_core": {
+        "decision": "pairwise",
+        "headline_table": "strict_common",
+        "non_headline_rows": "pairwise",
+    },
     "null_semantics": (
         "insufficient, not-applicable and failed values are null, never 0"
     ),
@@ -85,4 +95,30 @@ def methodology_constants() -> dict[str, object]:
         "daily_rank_min_history_days": methodology.DAILY_RANK_MIN_HISTORY_DAYS,
         "simulated_depths": list(SIM_DEPTHS),
         "simulated_variables": list(SIM_VARIABLES),
+    }
+
+
+def run_methodology_view(methodology_version: int) -> dict[str, object]:
+    """Contract and constants for a run, or an explicit refusal.
+
+    A run is immutable and records the methodology version it was scored
+    under. This build can only speak for its own version, so any other
+    version -- older OR newer -- is reported as unavailable rather than
+    answered with the current values.
+    """
+    if methodology_version != methodology.METHODOLOGY_VERSION:
+        return {
+            "contract": None,
+            "constants": None,
+            "contract_unavailable_reason": (
+                "This run was scored under methodology version "
+                f"{methodology_version}; this build carries methodology "
+                f"version {methodology.METHODOLOGY_VERSION}, and states the "
+                "contract and constants of its own version only."
+            ),
+        }
+    return {
+        "contract": CONTRACT,
+        "constants": methodology_constants(),
+        "contract_unavailable_reason": None,
     }
