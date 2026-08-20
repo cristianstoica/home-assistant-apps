@@ -30,7 +30,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from wxverify import config
-from wxverify.api.app import create_app
+from wxverify.api.app import create_app, lifespan
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.queue import claim_next_job
 from wxverify.worker.processor import run_worker
@@ -473,3 +473,168 @@ def test_cancellation_inside_claim_transaction_reclaims_cleanly_without_a_boot_s
         assert _job_status(conn, job_id) == "pending"
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Lifespan task-ownership fix: every background task is registered the
+# moment it exists and reaped (cancelled AND awaited) unconditionally,
+# whether startup fails after creation or one sibling task itself fails.
+# ---------------------------------------------------------------------------
+
+
+def test_startup_failure_after_task_creation_still_reaps_every_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A startup failure AFTER all three tasks exist must still cancel and
+    await every one of them to completion.
+
+    Catches: the pre-fix shape where the three ``create_task`` calls sit
+    ABOVE the ``try:``. There, a raise from ``publish_discovery`` (which
+    runs after all three creations, before ``yield``) never enters the
+    ``try``, so the ``finally`` never runs and all three tasks leak --
+    cancelled never, awaited never.
+    """
+    _init_tmp_db(tmp_path)
+    reaped: list[str] = []
+
+    def _make_stub(name: str):
+        async def _stub(*_args: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # The extra turn is not padding: it is the whole mechanism
+                # under test. `cancel()` only REQUESTS cancellation; the
+                # marker below is unreachable unless the task was awaited
+                # PAST the delivery turn, which is exactly what discriminates
+                # "awaited to completion" from "cancellation merely
+                # requested".
+                await asyncio.sleep(0)
+                reaped.append(name)
+                raise
+
+        return _stub
+
+    monkeypatch.setattr("wxverify.api.app.run_worker", _make_stub("worker"))
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper",
+        _make_stub("export sweeper"),
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
+    )
+
+    async def _boom(_port: int) -> None:
+        # The leading `await asyncio.sleep(0)` is not padding: `create_task`
+        # only SCHEDULES a task via `call_soon`, it does not run it. Without
+        # an intervening scheduling turn here, a synchronous raise never
+        # yields control back to the loop, so the three just-created tasks
+        # never reach their first `await` before `.cancel()` lands on them
+        # in the `finally`. Cancelling a task that has never been stepped
+        # throws `CancelledError` in at the very top of its coroutine --
+        # before it ever enters its own `try` -- so the stub's marker would
+        # never fire even against CORRECT code, silently destroying this
+        # test's ability to discriminate (verified empirically: dropping
+        # this line collapses `reaped` to `[]` under the fix too, not only
+        # under the base). One scheduling turn is enough for all three
+        # tasks to reach their `asyncio.Event().wait()`.
+        await asyncio.sleep(0)
+        raise RuntimeError("discovery boom")
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _boom)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        with pytest.raises(RuntimeError, match="discovery boom"):
+            await cm.__aenter__()
+        # No await above this line since the raise: a cancel-without-await
+        # regression cannot have completed a handler that itself awaits, so
+        # asserting here (rather than after asyncio.run) is load-bearing --
+        # asyncio.run's own loop teardown would reap the leaked tasks too
+        # and make a post-run assertion pass vacuously.
+        assert sorted(reaped) == ["export sweeper", "read-cache warm", "worker"]
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_a_failing_task_does_not_prevent_sibling_reaping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A task completing with a non-CancelledError must be captured and
+    reported by name, and must not prevent its siblings from being
+    cancelled and awaited to completion.
+
+    Catches: the pre-fix sequential ``finally`` (``worker.cancel()`` /
+    ``await worker`` / ``export_sweeper.cancel()`` / ``await export_sweeper``
+    / ...), where a ``RuntimeError`` surfacing from the first await skips
+    every await behind it and escapes the lifespan. Also catches the
+    partial-fix mutant ``gather(*handles)`` without ``return_exceptions=True``,
+    which resolves on the first exception -- leaving siblings unawaited and
+    still raising out of shutdown.
+    """
+    _init_tmp_db(tmp_path)
+    reaped: list[str] = []
+    sweeper_reached_raise = asyncio.Event()
+
+    def _make_stub(name: str):
+        async def _stub(*_args: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                reaped.append(name)
+                raise
+
+        return _stub
+
+    async def _crashing_sweeper() -> None:
+        sweeper_reached_raise.set()
+        raise RuntimeError("sweeper boom")
+
+    monkeypatch.setattr("wxverify.api.app.run_worker", _make_stub("worker"))
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper", _crashing_sweeper
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
+    )
+
+    async def _noop_discovery(_port: int) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _noop_discovery)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        # Rendezvous, not a sleep: the sweeper task must already be DONE
+        # with a stored RuntimeError before shutdown starts, or
+        # `_cancel_and_reap`'s up-front `.cancel()` would land on a
+        # not-yet-started task and it would finish CANCELLED instead --
+        # silently destroying the construction this test relies on.
+        await sweeper_reached_raise.wait()
+        with caplog.at_level(logging.ERROR, logger="wxverify.api.app"):
+            await cm.__aexit__(None, None, None)
+        # No await since __aexit__ returned: the assertion must sit before
+        # asyncio.run's own teardown can reap anything on its own.
+        assert sorted(reaped) == ["read-cache warm", "worker"]
+
+    asyncio.run(_run())
+
+    recs = [
+        r
+        for r in caplog.records
+        if r.name == "wxverify.api.app"
+        and r.getMessage() == "shutdown: export sweeper failed"
+    ]
+    assert len(recs) == 1, [r.getMessage() for r in caplog.records]
+    exc = recs[0].exc_info
+    assert exc is not None and isinstance(exc[1], RuntimeError)
+    assert str(exc[1]) == "sweeper boom"
+    assert stopped == []

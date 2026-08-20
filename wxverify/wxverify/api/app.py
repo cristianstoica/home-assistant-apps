@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -152,45 +151,102 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     if rebuild_state == "pending":
         logger.info("startup: resuming interrupted import rebuild")
         await db_transfer.run_rebuild_all()
-    worker = asyncio.create_task(run_worker(db))
-    logger.info("worker started")
-    worker.add_done_callback(
-        lambda task: _stop_on_worker_done(task, app.state.stop_process)
-    )
-    # Retain-and-resume: downloaded exports are NOT deleted post-send, so the
-    # export TTL sweep must run on a timer (not only on `/begin`) to reap a
-    # retained snapshot when no further export is ever started.
-    export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
-    # A run published before this process started is never warmed by a publish
-    # event, so without this leg the first request after every restart pays the
-    # full cold derivation. It does not block startup: `db.read` dispatches the
-    # derivations to an executor thread.
-    warm = asyncio.create_task(warm_read_cache(db))
-    await publish_discovery(app.state.bind_port)
+    # Every task below is registered the moment it exists, and the `finally`
+    # cancels and AWAITS every registered task. The `try` opens BEFORE the
+    # first `create_task` so a failure anywhere between the creations cannot
+    # leave an already-created task unowned.
+    tasks: list[tuple[str, asyncio.Task[None]]] = []
     try:
+        worker = asyncio.create_task(run_worker(db))
+        tasks.append(("worker", worker))
+        logger.info("worker started")
+        worker.add_done_callback(
+            lambda task: _stop_on_worker_done(task, app.state.stop_process)
+        )
+        # Retain-and-resume: downloaded exports are NOT deleted post-send, so the
+        # export TTL sweep must run on a timer (not only on `/begin`) to reap a
+        # retained snapshot when no further export is ever started.
+        export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
+        tasks.append(("export sweeper", export_sweeper))
+        # A run published before this process started is never warmed by a publish
+        # event, so without this leg the first request after every restart pays the
+        # full cold derivation. It does not block startup: `db.read` dispatches the
+        # derivations to an executor thread.
+        warm = asyncio.create_task(warm_read_cache(db))
+        tasks.append(("read-cache warm", warm))
+        await publish_discovery(app.state.bind_port)
         yield
     finally:
         logger.info("worker stopping")
-        export_sweeper.cancel()
-        worker.cancel()
-        warm.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await export_sweeper
-        with contextlib.suppress(asyncio.CancelledError):
-            await worker
-        # Awaited LAST, and CAUGHT rather than suppressed. Unlike its
-        # neighbours -- which never complete -- the warm is a task that
-        # finishes, so a stored exception would re-raise out of this `finally`
-        # and skip every await ordered behind it; ordering it last means an
-        # escape cannot skip another task's cleanup. Catching instead of
-        # `suppress(asyncio.CancelledError, Exception)` keeps the only signal
-        # that the warm broke its never-raise contract.
-        try:
-            await warm
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("shutdown: read-cache warm failed")
+        await _cancel_and_reap(tasks)
+
+
+async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
+    """Cancel every registered task, then await each one to completion.
+
+    That distinction is the whole point: `Task.cancel()` only REQUESTS
+    cancellation. The `CancelledError` is delivered on the task's next
+    scheduling turn, and a handler that itself awaits -- `run_worker`'s is
+    the shutdown job reclaim, an `await db.write(...)` -- needs several more
+    turns to finish. Nothing keeps the loop running to grant them once the
+    lifespan has returned, so a cancelled-but-unawaited task can be torn
+    down with its reclaim half-done, leaving a claimed job stranded at
+    `running` until the next boot's own `reclaim_all_stale` sweep. Awaiting
+    every task makes the handler's COMPLETION, not merely its scheduling,
+    part of shutdown.
+
+    `asyncio.TaskGroup` is the structured-concurrency answer to task
+    ownership and is the wrong tool here. Its `__aexit__` waits for every
+    child to finish on its own, and two of these children are endless loops
+    that finish only when cancelled -- so the block could be left only by
+    cancelling them by hand first, which is exactly the work done below. It
+    would also cancel the surviving children and raise an `ExceptionGroup`
+    the moment one child fails, turning a broken read-cache warm into an
+    exception escaping shutdown instead of a logged report.
+
+    `gather` additionally keeps its guarantee under a SECOND cancellation.
+    Cancelling the future `gather` returns does not resolve that future: the
+    request is forwarded to the children and merely recorded on the outer
+    one, which completes only once every child has actually finished. So a
+    supervisor impatient enough to cancel shutdown while the reap is still
+    in flight gets every reclaim run to the end anyway. A hand-rolled
+    `for task in handles: await task` loop has no such property -- cancel it
+    and every task it has not reached yet is abandoned unawaited, which is
+    the failure this helper exists to prevent.
+
+    Each entry in `tasks` pairs a task handle with the name it is reported
+    under.
+
+    In normal operation only the read-cache warm reaches a non-cancelled
+    outcome: its two neighbours are endless loops that return only when
+    cancelled, and the warm's contract is to never raise, so an exception
+    from it means that contract broke. The other two are not impossible --
+    `run_worker` can crash (that is what `_stop_on_worker_done` reports) and
+    `run_export_sweeper` does work before its first `try` -- so every
+    non-cancelled outcome is reported by name rather than assumed away.
+
+    `exc_info=result` rather than `logger.exception` is required, not
+    stylistic. `gather` RETURNS the exception instead of raising it, so no
+    active exception here belongs to `result`; and because this helper runs
+    from a `finally` that may be unwinding a startup failure,
+    `sys.exc_info()` is not even empty -- `logger.exception` would silently
+    attach THAT traceback instead. `wxverify/core/aio.py:64` uses the same
+    idiom for the same reason.
+    """
+    names = [name for name, _ in tasks]
+    handles = [task for _, task in tasks]
+    for task in handles:
+        task.cancel()
+    # The annotation is a tripwire, not decoration: it pins `gather`'s return
+    # type so a drift to `list[Any]` cannot silently disarm the `strict=True`
+    # pairing below.
+    results: list[BaseException | None] = await asyncio.gather(
+        *handles, return_exceptions=True
+    )
+    for name, result in zip(names, results, strict=True):
+        if result is None or isinstance(result, asyncio.CancelledError):
+            continue
+        logger.error("shutdown: %s failed", name, exc_info=result)
 
 
 def _stop_on_worker_done(task: asyncio.Task[None], stop_process: StopProcess) -> None:

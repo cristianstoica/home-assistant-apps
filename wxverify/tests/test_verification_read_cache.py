@@ -1698,10 +1698,17 @@ def test_o20_a_failing_warm_does_not_break_shutdown_and_is_logged(
             resp = client.get("/api/health/monitor")
             assert resp.status_code == 200
         assert any("worker stopping" in r.getMessage() for r in caplog.records)
+        # `exc_info is not None` alone does not discriminate: a
+        # `logger.exception(...)` call with no active exception still stamps
+        # `(None, None, None)`, which is "not None". Require the record to
+        # carry the actual exception instance the warm raised.
         error_records = [
             r
             for r in caplog.records
-            if r.levelno == logging.ERROR and r.exc_info is not None
+            if r.levelno == logging.ERROR
+            and r.exc_info is not None
+            and isinstance(r.exc_info[1], RuntimeError)
+            and str(r.exc_info[1]) == "warm exploded"
         ]
         assert any("read-cache warm failed" in r.getMessage() for r in error_records)
     finally:
@@ -1709,32 +1716,33 @@ def test_o20_a_failing_warm_does_not_break_shutdown_and_is_logged(
 
 
 # ---------------------------------------------------------------------------
-# O20b - The warm is awaited last, ordering observable (kills M9)
+# O20b - Reaping is collective, not per-task: the "warm failed" outcome
+# cannot be logged while a sibling task is still mid-cancellation
 # ---------------------------------------------------------------------------
 
 
 def test_o20b_warm_is_awaited_after_worker_on_shutdown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Both `worker.cancel()` and `warm.cancel()` run unconditionally, up
-    # front, in the SAME two lines regardless of which `await` comes next --
-    # so which task's cancellation HANDLER runs first is governed by
-    # call_soon FIFO order on those two (unmutated) `.cancel()` calls, not by
-    # the awaits that follow. A completion-order assertion on cancellation
-    # handlers is therefore vacuous here (confirmed empirically: it stays
-    # green even with the two awaits transposed).
+    # `_cancel_and_reap` now cancels every registered task in one
+    # non-yielding pass, then does a SINGLE
+    # `await asyncio.gather(*handles, return_exceptions=True)` over all of
+    # them -- there is no longer a per-task `.cancel()` / `await` pair to
+    # transpose, so a completion-order mutant on individual cancel/await
+    # statements no longer applies. What this test still pins: `gather`
+    # cannot return until every child task is actually done, so the
+    # "warm failed" log (emitted only after `gather` returns) cannot appear
+    # while a sibling task is still blocked mid-cancellation.
     #
     # The genuinely order-sensitive construction: make `warm`'s task ALREADY
-    # DONE (holding a stored exception) before shutdown ever starts, so
-    # retrieving it via `await warm` is synchronous and instantaneous
-    # whenever that statement runs -- no scheduling ambiguity. Make
+    # DONE (holding a stored exception) before shutdown ever starts, so its
+    # result is available in `gather`'s return list immediately. Make
     # `worker`'s cancellation handling block on a gate only this test
-    # releases. Run shutdown in a background thread so the main thread can
-    # observe mid-shutdown state: under the real order (worker first), the
-    # "warm failed" log cannot appear before the gate is released, because
-    # the code is still parked at `await worker`. Under M9 (warm first), the
-    # already-completed `warm` is retrieved immediately, so the log appears
-    # before the gate is ever touched.
+    # releases, so `gather` cannot resolve yet. Run shutdown in a background
+    # thread so the main thread can observe mid-shutdown state: while the
+    # worker is still gated, the "warm failed" log must not have appeared
+    # yet, because `gather` -- and therefore the whole reap loop that logs
+    # it -- has not returned.
     from wxverify.db.connection import close_db
 
     async def _warm_stub(db: object) -> None:

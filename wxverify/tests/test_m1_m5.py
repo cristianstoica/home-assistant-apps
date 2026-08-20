@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import errno
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -534,7 +535,9 @@ def test_worker_done_callback_terminates_only_non_cancelled_tasks() -> None:
 
 
 def test_worker_done_callback_registered_fires_on_worker_crash(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Integration: crashing worker triggers stop_process via the real lifespan."""
     close_db()
@@ -547,15 +550,51 @@ def test_worker_done_callback_registered_fires_on_worker_crash(
 
     monkeypatch.setattr("wxverify.api.app.run_worker", _crashing_worker)
     app = create_app(root_path="", _stop_process=lambda: callback_fired.set())
-    # The worker crashes during the lifespan yield.  When the TestClient context
-    # exits, the lifespan finally-block awaits the already-failed task and
-    # re-raises its exception — wrap that expected shutdown error here so the
-    # real oracle (callback_fired) can be checked cleanly afterward.
-    with pytest.raises(RuntimeError, match="worker crash"), TestClient(app):
+    # The worker crashes during the lifespan yield. `_cancel_and_reap` now
+    # captures every non-cancelled task outcome and logs it by name instead
+    # of letting it re-raise out of the `finally` -- the architect ruled
+    # this capture-and-log behavior correct, and the old propagation this
+    # test used to assert is obsolete scaffolding. `TestClient(app)` is
+    # therefore entered BARE: a regression back to propagation makes this
+    # test error at `__exit__` on its own, so the bare `with` block is
+    # itself an oracle, not just a precondition for the callback check.
+    with (
+        caplog.at_level(logging.ERROR, logger="wxverify.api.app"),
+        TestClient(app),
+    ):
         callback_fired.wait(timeout=2.0)
     assert callback_fired.is_set(), (
         "add_done_callback registration is missing: stop_process was never called"
     )
+
+    # Positive companion to the bare `with` above: prove the crashed worker
+    # was actually reaped at shutdown, not merely that nothing escaped.
+    # Without this, deleting `tasks.append(("worker", worker))` in app.py
+    # would still leave `callback_fired` set (`add_done_callback` is wired
+    # independently of `tasks`) and this test would go green over a worker
+    # that is never cancelled or awaited at shutdown at all.
+    worker_records = [
+        r
+        for r in caplog.records
+        if r.name == "wxverify.api.app" and r.getMessage() == "shutdown: worker failed"
+    ]
+    assert len(worker_records) == 1, [r.getMessage() for r in caplog.records]
+    exc = worker_records[0].exc_info
+    assert exc is not None and isinstance(exc[1], RuntimeError)
+    assert str(exc[1]) == "worker crash"
+
+    # The siblings (export sweeper, read-cache warm) must be reaped cleanly
+    # alongside the crashed worker -- no other "shutdown: ... failed" record
+    # should appear. Confirmed empirically against a real run: the warm's
+    # own cancellation surfaces only as a WARNING from
+    # `wxverify.db.connection` ("db read failed or cancelled"), never as an
+    # app-logger shutdown record, so this list is exactly one entry long.
+    shutdown_messages = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "wxverify.api.app" and r.getMessage().startswith("shutdown: ")
+    ]
+    assert shutdown_messages == ["shutdown: worker failed"]
 
 
 def test_worker_done_callback_registered_fires_on_clean_return(
