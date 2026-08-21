@@ -369,7 +369,6 @@ def test_v3_to_v4_seeds_one_published_initial_generation_per_site(
     conn, site_timezones, _snapshot = _migrate(tmp_path)
 
     assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
-    assert TARGET_USER_VERSION == 4
 
     for site_id, timezone in site_timezones.items():
         rows = conn.execute(

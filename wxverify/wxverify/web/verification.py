@@ -34,8 +34,9 @@ from wxverify.verification.read_cache import (
     cached_observed_wet_precip_mae,
 )
 from wxverify.verification.runs import (
-    current_input_fingerprint,
+    RESULT_BASIS_NO_RUN,
     published_run_id,
+    result_basis_freshness,
     trigger_status,
 )
 from wxverify.web.context import SiteView, load_site, load_sites
@@ -300,6 +301,7 @@ def _load_run(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
         "bootstrap_seed": int(row["bootstrap_seed"]),
         "bootstrap_resamples": int(row["bootstrap_resamples"]),
         "input_fingerprint": str(row["input_fingerprint"]),
+        "result_basis_fingerprint": row["result_basis_fingerprint"],
         "created_at": str(row["created_at"]),
         "published_at": row["published_at"],
         "config_snapshot": _parse_json(row["config_snapshot"]),
@@ -1002,6 +1004,9 @@ def load_verification(
         "day_context": None,
         "trigger": None,
         "warnings": {},
+        # Set in the BASE context: an unset Jinja name is silently falsy, so
+        # the no-site and no-run paths must carry a real state too.
+        "result_basis": RESULT_BASIS_NO_RUN.as_payload(),
         "depths": live_depths,
         "depth_mismatch": False,
         "verification_schema": VERIFICATION_SCHEMA,
@@ -1071,10 +1076,22 @@ def load_verification(
             and live_depths[str(v["variable"])].depth != v["incumbent_depth"]
             for v in verdicts
         )
-        # Read-only by construction (NB-9) — None means the timezone
-        # pointer is absent, so staleness is unknown, not true.
-        current = current_input_fingerprint(conn, site.id)
-        stale = current is not None and current != run["input_fingerprint"]
+        # Freshness of the run's configuration/roster/truth basis only —
+        # the forecast side is outside the digest. Read-only by
+        # construction (NB-9) — an unrecorded, malformed,
+        # superseded-algorithm or pointer-less basis is `unknown`, which is
+        # reported rather than warned about. `_load_run` returns
+        # `dict[str, object]`, so the casts restate the column types its
+        # projection already carries.
+        freshness = result_basis_freshness(
+            conn,
+            site.id,
+            recorded=cast("str | None", run["result_basis_fingerprint"]),
+            period_start=cast("str | None", run["period_start"]),
+            period_end=cast("str | None", run["period_end"]),
+        )
+        context["result_basis"] = freshness.as_payload()
+        stale = freshness.state == "changed"
     context["warnings"] = {
         "no_publishable_run": run_id is None,
         "stale_inputs": stale,

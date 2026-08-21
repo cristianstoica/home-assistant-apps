@@ -48,6 +48,7 @@ from wxverify.verification.runs import (
     input_fingerprint,
     publish_run,
     published_run_id,
+    result_basis_fingerprint,
 )
 from wxverify.verification.simulate import _daily_rank_order  # noqa: SLF001
 
@@ -116,6 +117,20 @@ def _seed_published_run(
     fingerprint = (
         input_fingerprint(conn, site_id, snapshot) if fresh_fingerprint else "0" * 64
     )
+    # A bare "0"*64 basis would read as `algorithm_changed` (wrong prefix)
+    # rather than `changed` -- a non-matching "rb1:"-prefixed value is what
+    # actually exercises the equality-mismatch path.
+    basis = (
+        result_basis_fingerprint(
+            conn,
+            site_id,
+            snapshot,
+            period_start="2026-05-01",
+            period_end="2026-05-30",
+        )
+        if fresh_fingerprint
+        else "rb1:" + "0" * 64
+    )
     run_id = int(
         conn.execute(
             """
@@ -123,9 +138,9 @@ def _seed_published_run(
                 (site_id, tz_generation_id, methodology_version, app_version,
                  state, attempt, config_snapshot, period_start, period_end,
                  settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint)
+                 input_fingerprint, result_basis_fingerprint)
             VALUES (?, ?, ?, '0.11.0-test', 'running', 1, ?, '2026-05-01',
-                    '2026-05-30', '2026-05-30', 12345, 100, ?)
+                    '2026-05-30', '2026-05-30', 12345, 100, ?, ?)
             """,
             (
                 site_id,
@@ -133,6 +148,7 @@ def _seed_published_run(
                 methodology_version,
                 json.dumps(snapshot),
                 fingerprint,
+                basis,
             ),
         ).lastrowid
     )

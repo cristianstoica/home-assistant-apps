@@ -720,22 +720,23 @@ def test_new_verification_index_column_order_matches_the_query_shapes() -> None:
 
 
 # ---------------------------------------------------------------------------
-# §18.12 — the /status input-fingerprint statements (NB-2).
+# §18.12 — the input-fingerprint statements (NB-2).
 #
-# `GET /api/verification/status` and the /verification page recompute the
-# live input fingerprint per site ON THE REQUEST PATH
-# (`current_input_fingerprint`): a runtime_state pointer probe plus three
+# `input_fingerprint` runs in the WORKER only: the nightly no-change gate,
+# the decide-to-run divergence guard and the bootstrap seed. Its three
 # growth-proportional reads over `observations`, `forecast_samples` and
-# `daily_truth`. Measured at ~29 ms/site at three years of data, ~21.7 ms of
-# it the observations COUNT(*). That cost is tolerable only while every one
-# of those reads stays SITE-SCOPED through an index -- a plan that scans any
-# of these tables grows with the whole install instead of with the site, and
-# turns a status page into an unbounded read.
+# `daily_truth` LEFT the request path when the freshness warning moved to
+# `result_basis_fingerprint` (pinned in the sub-block below), taking the
+# ~29 ms/site measured at three years of data -- ~21.7 ms of it the
+# observations COUNT(*) -- off the /status and /verification page budget.
+# They stay pinned here because the worker runs them per site every night:
+# a plan that scans any of these tables grows with the whole install
+# instead of with the site.
 #
 # Relationships are pinned (site binding present, table never scanned), not
-# planner phrasing. These are the post-NB-9 statements: the read path now
-# resolves the generation with the non-seeding pointer read, so the pointer
-# probe below is part of the request path too.
+# planner phrasing. The `runtime_state` pointer probe is the one statement
+# below that IS still on the request path: `current_result_basis_fingerprint`
+# resolves the generation the same non-seeding way (NB-9).
 #
 # Retyped + tripwired like the route statements above: `runs.py` composes
 # these inline rather than exporting constants.
@@ -839,6 +840,74 @@ def test_tz_generation_pointer_probe_is_a_key_lookup() -> None:
     # Negative control: probing by value instead of by key scans the table.
     degraded = _TZ_POINTER_SQL.replace("WHERE key = ?", "WHERE value = ?")
     assert _plan(conn, degraded, ("1",)) == ["SCAN runtime_state"], degraded
+
+
+# ---------------------------------------------------------------------------
+# §18.12 — the result-basis statement, the fingerprint read that REPLACED
+# the three above on the request path.
+#
+# `GET /api/verification/status` and the /verification page recompute
+# `result_basis_fingerprint` per site on the REQUEST PATH: the pointer probe
+# pinned above plus this one horizon-scoped read over `daily_truth`. The
+# `BETWEEN` bounds buy stability, NOT a smaller read -- `period_start` is the
+# site's earliest truth day, so the scoped range is very nearly its whole
+# truth history and the row count is within a day or two of the unscoped
+# digest's. So the same rule applies: site-scoped through an index, never a
+# scan.
+#
+# Retyped + tripwired like the statements above.
+# ---------------------------------------------------------------------------
+
+_RESULT_BASIS_TRUTH_SQL = """
+        SELECT local_date, quantity, value, eligible, covered_hours
+        FROM daily_truth
+        WHERE site_id = ? AND tz_generation_id = ?
+          AND local_date BETWEEN ? AND ?
+        ORDER BY local_date, quantity
+        """
+
+
+def test_result_basis_truth_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire for the statement pinned below.
+
+    The `BETWEEN` clause is asserted TEXTUALLY because the plan pin cannot
+    see it: the `daily_truth` UNIQUE key is (site_id, quantity, local_date,
+    tz_generation_id), so with `quantity` unconstrained the planner cannot
+    use `local_date` as a range bound and the scoped and unscoped statements
+    produce the identical plan shape. Losing the filter is what would
+    reintroduce the permanently-true staleness warning -- newly settled days
+    landing above the run's horizon would move the digest every night -- so
+    this line, not the plan, is that clause's guard.
+    """
+    source = inspect.getsource(wxverify.verification.runs)
+    assert (
+        "SELECT local_date, quantity, value, eligible, covered_hours\n"
+        "        FROM daily_truth\n"
+        "        WHERE site_id = ? AND tz_generation_id = ?\n"
+        "          AND local_date BETWEEN ? AND ?\n"
+        "        ORDER BY local_date, quantity" in source
+    )
+
+
+def test_result_basis_truth_rows_seek_by_site_and_sort_in_a_temp_btree() -> None:
+    conn = _fresh_conn()
+    params = (1, 1, "2026-01-01", "2026-06-30")
+    plan = _plan(conn, _RESULT_BASIS_TRUTH_SQL, params)
+    assert any(
+        "SEARCH daily_truth" in line and "(site_id=?)" in line for line in plan
+    ), plan
+    assert not any(line.startswith("SCAN daily_truth") for line in plan), plan
+    # Same known cost as the unscoped digest: ORDER BY (local_date, quantity)
+    # cannot be served from the UNIQUE key, so the sort is a temp b-tree over
+    # the site's truth rows. The horizon filter does not change that.
+    assert any("USE TEMP B-TREE FOR ORDER BY" in line for line in plan), plan
+    # Negative control: lose the site conjunct and the read scans every
+    # site's whole truth history.
+    degraded = _RESULT_BASIS_TRUTH_SQL.replace("site_id = ?", "timezone = ?")
+    assert degraded != _RESULT_BASIS_TRUTH_SQL
+    assert _plan(conn, degraded, ("UTC", 1, "2026-01-01", "2026-06-30"))[0] == (
+        "SCAN daily_truth"
+    ), degraded
 
 
 # ---------------------------------------------------------------------------

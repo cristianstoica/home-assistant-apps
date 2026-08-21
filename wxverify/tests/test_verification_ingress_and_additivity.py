@@ -170,7 +170,11 @@ _WARNINGS_0_11_0: dict[str, tuple[type, ...]] = {
 
 # The keys later releases are allowed to add, and nothing else.
 _DECLARED_ADDITIONS = {
-    "status_site": {"trigger"},
+    # `result_basis`: the three-state freshness of the published run's
+    # scored basis (D9), a sibling of `warnings` -- not a member of it.
+    # `stale_inputs` stays `bool` and stays present (D7); only its value
+    # distribution changes, which is the bug fix, not a contract change.
+    "status_site": {"trigger", "result_basis"},
     "verdict": {"ranking_redesign_indicated"},
     "diagnostics": {"observed_wet_precip_mae"},
     # 0.13.2 (Fix 2): the per-run methodology-version refusal reason,

@@ -2577,6 +2577,7 @@ _EXPECTED_V16_MARKERS = frozenset(
         "16.1.created_at",
         "16.1.data_cutoff",
         "16.1.declared_configuration",
+        "16.1.freshness_unknown",
         "16.1.methodology_version",
         "16.1.no_publishable_run",
         "16.1.period",
@@ -2677,7 +2678,7 @@ def test_o30_no_html_entity_apostrophe_and_v16_markers_are_the_pinned_set() -> N
     this template.
 
     mutant M23 -> at `markers == _EXPECTED_V16_MARKERS` below: correct =
-    `True` (the 91-element pinned set matches exactly), mutant (one
+    `True` (the 92-element pinned set matches exactly), mutant (one
     `data-v16` value in show.html altered to e.g. "16.5.endpoint_windows"
     while normalising a nearby apostrophe) = `False` -- the mutated set has
     a different element and is neither a subset nor superset of the
@@ -2713,4 +2714,5 @@ def test_o30_no_html_entity_apostrophe_and_v16_markers_are_the_pinned_set() -> N
         markers.add(source[start:end])
         idx = end
 
+    assert len(_EXPECTED_V16_MARKERS) == 92
     assert markers == _EXPECTED_V16_MARKERS
