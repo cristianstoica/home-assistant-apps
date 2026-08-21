@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.13.4
+
+Makes container shutdown clean and complete every time, including the
+host's scheduled nightly backup, which stops and restarts this add-on.
+
+### Fixed
+
+- If a background task failed to start while others were still starting
+  up, the tasks that had already started could be left running instead
+  of being shut down with the rest. Shutdown now always accounts for
+  every background task it started, however far startup got.
+- Shutdown now cancels and waits for all background tasks together and
+  logs the outcome of each one by name, instead of stopping partway
+  through if an earlier task's cleanup ran into trouble.
+
 ## 0.13.3
 
 Speeds up the verification page and API, moves the nightly run later so it
