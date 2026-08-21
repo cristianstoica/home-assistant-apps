@@ -204,15 +204,33 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     the moment one child fails, turning a broken read-cache warm into an
     exception escaping shutdown instead of a logged report.
 
-    `gather` additionally keeps its guarantee under a SECOND cancellation.
-    Cancelling the future `gather` returns does not resolve that future: the
-    request is forwarded to the children and merely recorded on the outer
-    one, which completes only once every child has actually finished. So a
-    supervisor impatient enough to cancel shutdown while the reap is still
-    in flight gets every reclaim run to the end anyway. A hand-rolled
-    `for task in handles: await task` loop has no such property -- cancel it
-    and every task it has not reached yet is abandoned unawaited, which is
-    the failure this helper exists to prevent.
+    A SECOND cancellation of the lifespan must not reach the children, and
+    an unshielded `await` of the gathering future does not stop it.
+    `_GatheringFuture.cancel()` re-cancels every unfinished child, so the
+    request lands INSIDE a cancellation handler that is itself awaiting --
+    delivering a fresh `CancelledError` at `run_worker`'s reclaim write --
+    and it additionally makes `gather` raise instead of returning results,
+    discarding every outcome reported below. Awaiting under
+    `asyncio.shield` leaves the children untouched, and re-establishing the
+    shield after each delivered cancellation is what makes that hold for
+    the second, third and Nth cancel rather than only the first: N cancels
+    cost N iterations, never a dropped reap. The cancellation is deferred,
+    not swallowed -- it is re-raised once the reap is complete.
+    `core/aio.py` runs the same loop for the same reason one layer down,
+    around the executor thread.
+
+    A hand-rolled `for task in handles: await task` loop has neither
+    property -- cancel it and every task it has not reached yet is
+    abandoned unawaited, which is the failure this helper exists to
+    prevent.
+
+    Shielding gives up the escalation path: a child that SWALLOWED
+    cancellation would hang shutdown here with no second cancel able to
+    push it along. None of the three does. `run_worker` re-raises after a
+    reclaim whose SQLite wait is capped by `PRAGMA busy_timeout=30000`, and
+    neither `run_export_sweeper` nor `warm_read_cache` handles
+    `CancelledError` at all, so the wait is bounded. A fourth task added to
+    `tasks` owes that same check.
 
     Each entry in `tasks` pairs a task handle with the name it is reported
     under.
@@ -224,6 +242,32 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     `run_worker` can crash (that is what `_stop_on_worker_done` reports) and
     `run_export_sweeper` does work before its first `try` -- so every
     non-cancelled outcome is reported by name rather than assumed away.
+
+    A crashed worker is the one outcome this helper cannot actually
+    report in production. `_stop_on_worker_done` fires the moment the
+    worker task completes and its `stop_process` -- `os._exit(1)` by
+    default -- ends the process on the spot. A worker that crashes
+    during the yield therefore exits before this helper is ever
+    entered; one that crashes inside its own cancellation handler exits
+    mid-reap, and there the ordering settles it: `add_done_callback` is
+    registered on the worker before `gather` registers its own on the
+    same task and callbacks fire in registration order, so
+    `_stop_on_worker_done` runs first -- the sweeper and warm are never
+    awaited and no line below is ever emitted. Either way that
+    fail-fast is deliberate. The worker is the service; a nonzero exit
+    is the unambiguous signal the supervisor restarts on, and jobs left
+    `running` are recovered by the next boot's `reclaim_all_stale`. The
+    worker's entry below is therefore reached only when `stop_process`
+    is injected, as the tests do.
+
+    Failure policy: a non-cancelled outcome is REPORTED, never propagated.
+    Re-raising one task's exception is what the sequential shape did, and
+    it is what abandoned the tasks behind it -- the defect this helper
+    exists to remove. It would also replace, rather than add to, the report:
+    `return_exceptions=True` yields every outcome, and raising surfaces one.
+    And it buys nothing downstream: a lifespan SHUTDOWN failure changes no
+    exit code, so the service supervisor cannot see it either way. The
+    named ERROR line below is the whole operator-visible difference.
 
     `exc_info=result` rather than `logger.exception` is required, not
     stylistic. `gather` RETURNS the exception instead of raising it, so no
@@ -237,16 +281,27 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     handles = [task for _, task in tasks]
     for task in handles:
         task.cancel()
-    # The annotation is a tripwire, not decoration: it pins `gather`'s return
-    # type so a drift to `list[Any]` cannot silently disarm the `strict=True`
-    # pairing below.
-    results: list[BaseException | None] = await asyncio.gather(
-        *handles, return_exceptions=True
-    )
+    reap = asyncio.gather(*handles, return_exceptions=True)
+    cancelled: asyncio.CancelledError | None = None
+    while not reap.done():
+        try:
+            await asyncio.shield(reap)
+        except asyncio.CancelledError as exc:
+            if cancelled is None:
+                cancelled = exc  # remember the FIRST one, keep waiting
+    # The annotation is a tripwire, not decoration: it pins `gather`'s
+    # result type so a drift to `list[Any]` cannot silently disarm the
+    # `strict=True` pairing below.
+    results: list[BaseException | None] = reap.result()
     for name, result in zip(names, results, strict=True):
         if result is None or isinstance(result, asyncio.CancelledError):
             continue
         logger.error("shutdown: %s failed", name, exc_info=result)
+    if cancelled is not None:
+        # Re-raised AFTER the report, and never absorbed with
+        # `Task.uncancel()`: this helper did not issue that cancellation,
+        # so the request must stay visible to whoever did.
+        raise cancelled
 
 
 def _stop_on_worker_done(task: asyncio.Task[None], stop_process: StopProcess) -> None:

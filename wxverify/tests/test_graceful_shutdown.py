@@ -30,7 +30,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from wxverify import config
-from wxverify.api.app import create_app, lifespan
+from wxverify.api.app import _cancel_and_reap, create_app, lifespan
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.queue import claim_next_job
 from wxverify.worker.processor import run_worker
@@ -638,3 +638,327 @@ def test_a_failing_task_does_not_prevent_sibling_reaping(
     assert exc is not None and isinstance(exc[1], RuntimeError)
     assert str(exc[1]) == "sweeper boom"
     assert stopped == []
+
+
+# ---------------------------------------------------------------------------
+# `_cancel_and_reap` shielding fix: a SECOND cancellation of the lifespan
+# (e.g. a second SIGTERM, or the ASGI server cancelling shutdown on its own
+# timeout) must not reach the still-cleaning-up children, and the reap must
+# still finish and report before the deferred cancellation is re-raised.
+#
+# Every test below drives `lifespan()` by hand inside a single
+# `asyncio.run(_run())`, never `TestClient`: `TestClient`'s anyio portal
+# closes via `Runner.close()` -> `_cancel_all_tasks`, which itself cancels
+# AND awaits any leaked task, so an assertion made after the portal closes
+# would pass whether or not `_cancel_and_reap` shields anything. Every
+# assertion therefore sits directly inside `_run`, with no `await` between
+# the observed event and the assertion.
+#
+# The "second cancellation" is delivered by wrapping `cm.__aexit__(...)` in
+# its own task (`shutdown`) and cancelling THAT task, rather than wrapping
+# the whole `__aenter__`/`__aexit__` drive in one task. Both are faithful
+# analogues of a second real cancellation reaching `lifespan()`'s `finally`
+# while it awaits `_cancel_and_reap`; this one is chosen because it keeps
+# `__aenter__` (task creation) off the task being cancelled, so the
+# cancellation is guaranteed to land exactly at the `await
+# asyncio.shield(reap)` inside `_cancel_and_reap` and nowhere earlier.
+# ---------------------------------------------------------------------------
+
+
+def _make_gated_worker_stub(
+    order: list[str], entered: asyncio.Event, release: asyncio.Event
+):
+    """A worker stand-in whose cancellation handler parks mid-cleanup until
+    the test releases it -- the rendezvous that turns "cancel a second time
+    while children are still cleaning up" into a deterministic window
+    instead of a race."""
+
+    async def _stub(*_args: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            entered.set()
+            await release.wait()
+            order.append("worker-cleanup-done")
+            raise
+
+    return _stub
+
+
+def _make_immediate_stub(_name: str):
+    """A sibling stand-in (export sweeper / read-cache warm) that reacts to
+    cancellation immediately, with no gating -- only the worker stub above
+    needs to be held open for these tests' rendezvous."""
+
+    async def _stub(*_args: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise
+
+    return _stub
+
+
+def _wire_gated_lifespan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], asyncio.Event, asyncio.Event, list[None]]:
+    """Shared wiring for T3, T5 and T7: a gated worker plus two immediately
+    re-raising siblings, with a noop discovery publish and a captured
+    ``stop_process`` (the production default is ``os._exit(1)``, which would
+    kill the test process outright)."""
+    order: list[str] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    monkeypatch.setattr(
+        "wxverify.api.app.run_worker", _make_gated_worker_stub(order, entered, release)
+    )
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper",
+        _make_immediate_stub("export sweeper"),
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
+    )
+
+    # This coroutine has no `await` in its body, so awaiting it never
+    # yields control back to the loop -- `__aenter__` therefore runs
+    # straight through to `yield` without ever stepping the three
+    # `create_task`ed tasks. It is the test's later `await entered.wait()`
+    # / `await sweeper_reached_raise.wait()` that first suspends and lets
+    # the loop run them, which is what gets every stub past its own first
+    # `await` before any `.cancel()` lands.
+    async def _noop_discovery(_port: int) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _noop_discovery)
+    stopped: list[None] = []
+    return order, entered, release, stopped
+
+
+def test_second_cancellation_is_shielded_from_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second cancellation of shutdown must not reach the worker mid-reap,
+    and shutdown cannot finish before the worker's own cleanup does.
+
+    Catches: the shield-removal mutant, i.e. `_cancel_and_reap`'s body as it
+    was before this fix -- a bare `await asyncio.gather(*handles,
+    return_exceptions=True)` with no shield, no loop, and no re-raise. Under
+    that shape, cancelling the `shutdown` task cancels the `_GatheringFuture`
+    directly, which re-cancels every unfinished child -- the worker's
+    `await release.wait()` raises `CancelledError` there instead of
+    returning normally, so its handler aborts and `"worker-cleanup-done"` is
+    never appended.
+    """
+    _init_tmp_db(tmp_path)
+    order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await entered.wait()
+        shutdown.cancel()
+        await asyncio.sleep(0)
+        assert order == []
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        order.append("shutdown-returned")
+        assert order == ["worker-cleanup-done", "shutdown-returned"]
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_outcome_report_survives_second_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sibling failure discovered before shutdown even starts must still
+    be reported by name after a second cancellation lands mid-reap.
+
+    Catches: the same shield-removal mutant as
+    `test_second_cancellation_is_shielded_from_children`, through a
+    different mechanism -- under it, the second `.cancel()` makes the bare
+    `await gather(...)` raise instead of returning the results list, so the
+    reporting loop below it never runs and zero records are emitted. Also
+    catches a "return early once cancelled" mutant that skips the report on
+    any path where a cancellation was observed.
+    """
+    _init_tmp_db(tmp_path)
+    order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
+    sweeper_reached_raise = asyncio.Event()
+
+    async def _crashing_sweeper() -> None:
+        sweeper_reached_raise.set()
+        raise RuntimeError("sweeper boom")
+
+    # Reused from _wire_gated_lifespan except the sweeper, which must crash
+    # with a stored outcome BEFORE shutdown starts -- otherwise
+    # `_cancel_and_reap`'s up-front `.cancel()` would land on a not-yet-
+    # started task and it would finish CANCELLED instead of with a reportable
+    # RuntimeError, silently destroying this test's construction.
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper", _crashing_sweeper
+    )
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        await sweeper_reached_raise.wait()
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await entered.wait()
+        shutdown.cancel()
+        release.set()
+        with (
+            caplog.at_level(logging.ERROR, logger="wxverify.api.app"),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await shutdown
+        # Pinned by logger name, not just message: `read_cache.py:407` emits
+        # the colliding literal "read-cache warm failed" from inside the
+        # warm's own contract-violation path, under a different logger.
+        recs = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.api.app"
+            and r.getMessage() == "shutdown: export sweeper failed"
+        ]
+        assert len(recs) == 1, [r.getMessage() for r in caplog.records]
+        exc = recs[0].exc_info
+        assert exc is not None and isinstance(exc[1], RuntimeError)
+        assert str(exc[1]) == "sweeper boom"
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_second_cancellation_is_deferred_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cancellation IS re-raised once the reap finishes -- it is
+    deferred, never swallowed.
+
+    Only the `pytest.raises(asyncio.CancelledError)` line below is a
+    preservation invariant: it is already green against the code as it
+    was BEFORE this change, because a bare `await gather(...)` also
+    propagates a `CancelledError` delivered to the awaiting task. The
+    `order` assertion is NOT -- pre-fix, the second cancel reaches the
+    worker at `release.wait()`, its handler never appends, and this
+    test fails. So the test as a whole IS red against the pre-fix
+    helper, and `test_second_cancellation_is_shielded_from_children`
+    subsumes both of its assertions. What it adds over that test is the
+    interleaving: the cancel and the release land in the same
+    synchronous turn, before the shutdown task has resumed even once.
+
+    Catches: deleting `if cancelled is not None: raise cancelled` (the
+    `__aexit__` task then completes normally instead of cancelled --
+    `Task.cancelled()` is `False` because `_must_cancel` was consumed at
+    delivery -- so `pytest.raises` below fails). Also catches an
+    `uncancel()`-instead-of-re-raise mutant by the identical assertion.
+    """
+    _init_tmp_db(tmp_path)
+    order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await entered.wait()
+        shutdown.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        assert order == ["worker-cleanup-done"]
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+@pytest.mark.parametrize("cancel_count", [1, 2])
+def test_shielded_reap_survives_repeated_cancellation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel_count: int
+) -> None:
+    """The shield holds across N cancellations, not just the first.
+
+    Catches: the partial-fix mutant `try: await asyncio.shield(reap) except
+    asyncio.CancelledError: ...` WITHOUT the enclosing `while not
+    reap.done():`. Empirically (verified against a scratch mutant, not just
+    theorized) that mutant falls straight through to `reap.result()` the
+    moment ONE cancellation is caught, and this harness's worker stub is
+    still deliberately parked on `release.wait()` at that point -- so
+    `reap.result()` raises `InvalidStateError` on the very first cancel,
+    before a second is ever issued. Both parametrized cases (`cancel_count`
+    1 and 2) therefore kill this mutant at the same divergence point for the
+    same reason; they are not two different discriminators here.
+    `test_second_cancellation_is_shielded_from_children` kills that same
+    mutant at that same `reap.result()`, so this test is not its only
+    pin; and no construction can restore a 1-vs-2 split against it,
+    because the mutant reaches `reap.result()` in the same synchronous
+    step in which it catches the cancellation, while a `reap` that is
+    already done makes `asyncio.shield` return the inner future
+    outright, leaving no await at which a cancellation could be
+    delivered. The parametrize is kept because it is still the direct expression of the
+    property the `while` loop provides -- "retry across N cancels, not just
+    one" -- and this is no longer hypothetical: a single-retry mutant
+    (`try: await asyncio.shield(reap) except CancelledError: cancelled =
+    exc; await asyncio.shield(reap)`, i.e. one manual retry instead of the
+    `while` loop, so it DOES reach `reap.result()` only once `reap` is
+    actually done rather than mid-cancel) was built and measured, not
+    predicted. `cancel_count=1` is the matched control and PASSES against
+    it; `cancel_count=2` FAILS against it, with `order ==
+    ["shutdown-returned"]` instead of `["worker-cleanup-done",
+    "shutdown-returned"]` -- the second cancel outruns the retry's own
+    reap. `cancel_count=2` is therefore this test's discriminator for that
+    mutant, distinct from the shield-removal mutant both cases catch
+    identically above.
+    """
+    _init_tmp_db(tmp_path)
+    order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await entered.wait()
+        for _ in range(cancel_count):
+            shutdown.cancel()
+            await asyncio.sleep(0)
+        assert order == []
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        order.append("shutdown-returned")
+        assert order == ["worker-cleanup-done", "shutdown-returned"]
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_cancel_and_reap_with_no_tasks_is_a_noop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`_cancel_and_reap([])` completes, returns `None`, and emits no
+    `wxverify.api.app` records.
+
+    Shape guard, not a shielding discriminator: `gather()` with zero
+    arguments returns an already-resolved plain future rather than a
+    `_GatheringFuture`, so `reap.done()` is `True` immediately and the
+    shield loop's body never runs -- this test cannot tell a shielded reap
+    from an unshielded one. It exists only to catch a `zip(...,
+    strict=True)` mis-pairing regression and any rewrite that indexes
+    `handles[0]` or awaits unconditionally in a way that raises on an empty
+    task list.
+    """
+
+    async def _run() -> None:
+        result = await _cancel_and_reap([])
+        assert result is None
+
+    with caplog.at_level(logging.ERROR, logger="wxverify.api.app"):
+        asyncio.run(_run())
+    assert not any(r.name == "wxverify.api.app" for r in caplog.records)

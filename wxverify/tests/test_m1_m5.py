@@ -550,14 +550,15 @@ def test_worker_done_callback_registered_fires_on_worker_crash(
 
     monkeypatch.setattr("wxverify.api.app.run_worker", _crashing_worker)
     app = create_app(root_path="", _stop_process=lambda: callback_fired.set())
-    # The worker crashes during the lifespan yield. `_cancel_and_reap` now
-    # captures every non-cancelled task outcome and logs it by name instead
-    # of letting it re-raise out of the `finally` -- the architect ruled
-    # this capture-and-log behavior correct, and the old propagation this
-    # test used to assert is obsolete scaffolding. `TestClient(app)` is
-    # therefore entered BARE: a regression back to propagation makes this
-    # test error at `__exit__` on its own, so the bare `with` block is
-    # itself an oracle, not just a precondition for the callback check.
+    # The worker crashes during the lifespan yield. `_cancel_and_reap`
+    # captures every non-cancelled task outcome and logs it by name
+    # instead of letting it re-raise out of the `finally`; the reasoning
+    # is in that helper's docstring, under "Failure policy". The old
+    # propagation this test used to assert is obsolete scaffolding.
+    # `TestClient(app)` is therefore entered BARE: a regression back to
+    # propagation makes this test error at `__exit__` on its own, so the
+    # bare `with` block is itself an oracle, not just a precondition for
+    # the callback check.
     with (
         caplog.at_level(logging.ERROR, logger="wxverify.api.app"),
         TestClient(app),
