@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.13.5
+
+Fixes the verification page's freshness warning, which used to read
+"inputs changed" forever once a run had been published.
+
+### Fixed
+
+- The freshness warning now compares current configuration, feed roster
+  and daily-truth state against the basis pinned when the run was
+  created, instead of against values that advance continuously. It
+  recovers to normal once inputs match that basis again. Freshness
+  covers configuration, the feed roster and daily truth only, not
+  forecasts.
+- Runs published before this release have no recorded basis and report
+  freshness as unknown until a new run publishes.
+- A warning still showing "changed" only means inputs are known to have
+  moved since the run's basis; it does not certify inputs fresh.
+
+Includes a database schema update (adds a new column). Once a database
+has been opened by this version, it can no longer be opened by 0.13.4
+or earlier.
+
 ## 0.13.4
 
 Makes container shutdown clean and complete every time, including the
