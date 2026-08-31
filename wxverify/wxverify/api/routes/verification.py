@@ -34,8 +34,9 @@ from wxverify.verification.read_cache import (
     cached_observed_wet_precip_mae,
 )
 from wxverify.verification.runs import (
-    current_input_fingerprint,
+    RESULT_BASIS_NO_RUN,
     published_run_id,
+    result_basis_freshness,
     trigger_status,
 )
 from wxverify.web.render import ingress_url
@@ -100,16 +101,23 @@ def _run_row(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
 def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
     run_id = published_run_id(conn, site_id)
     published: dict[str, object] | None = None
-    stale = False
+    freshness = RESULT_BASIS_NO_RUN
     if run_id is not None:
         row = _run_row(conn, run_id)
         published = _run_out(row, include_snapshot=False)
-        # Cheap staleness check: recompute the input fingerprint against
-        # live tables and compare with the published run's pinned one.
-        # Read-only by construction (NB-9) — None means the timezone
-        # pointer is absent, so staleness is unknown, not true.
-        current = current_input_fingerprint(conn, site_id)
-        stale = current is not None and current != str(row["input_fingerprint"])
+        # Freshness of the run's configuration/roster/truth basis — not of
+        # the forecast side, which the digest does not cover: recompute the
+        # basis over the run's own horizon and compare with its pinned one.
+        # Read-only by construction (NB-9) — an unrecorded, malformed,
+        # superseded-algorithm or pointer-less basis is `unknown`, which is
+        # not a warning.
+        freshness = result_basis_freshness(
+            conn,
+            site_id,
+            recorded=row["result_basis_fingerprint"],
+            period_start=row["period_start"],
+            period_end=row["period_end"],
+        )
     failed_newer = conn.execute(
         """
         SELECT 1 FROM verification_runs
@@ -125,9 +133,15 @@ def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
         # longer the operator's only signal. Same derivation the
         # /verification page uses, so the two surfaces cannot disagree.
         "trigger": trigger_status(conn, site_id, utc_now()),
+        # §16.1: additive sibling of `warnings` — three-state freshness of
+        # the published run's configuration/roster/truth basis, from the
+        # same derivation the /verification page uses. `stale_inputs` stays
+        # a bool and is exactly the `changed` state; `unknown` is reported,
+        # never warned.
+        "result_basis": freshness.as_payload(),
         "warnings": {
             "no_publishable_run": run_id is None,
-            "stale_inputs": stale,
+            "stale_inputs": freshness.state == "changed",
             "failed_newer_attempt": failed_newer is not None,
         },
     }

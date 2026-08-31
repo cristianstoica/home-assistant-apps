@@ -3,10 +3,11 @@
 Covers ``wxverify.db.migrations.correct_google_horizon``: the one-shot,
 marker-gated data correction that raises the ``(source='google',
 model='blend')`` feed row from 24 to 168 on an existing database, and the
-fresh-install seed path that lands on 168 directly. Every oracle asserts
-``PRAGMA user_version`` still equals ``TARGET_USER_VERSION`` — the
-correction is a data fix, not a schema migration, and must never move the
-version (§4 "Why this does not bump TARGET_USER_VERSION").
+fresh-install seed path that lands on 168 directly. The ``run_migrations``
+oracles assert ``PRAGMA user_version`` ends at ``TARGET_USER_VERSION``; the
+direct-invocation oracle asserts ``correct_google_horizon`` leaves the
+version exactly where it found it — the correction is a data fix, not a
+schema migration (§4 "Why this does not bump TARGET_USER_VERSION").
 
 Every fixture is built with ``create_schema`` + a hand-set ``PRAGMA
 user_version`` (mirrors ``tests/test_publish_hold_bootstrap.py``'s
@@ -198,10 +199,28 @@ def test_update_precedes_marker_so_a_marker_write_failure_leaves_the_row_correct
 
 
 def test_no_version_movement_across_run_migrations() -> None:
-    """No version movement: TARGET_USER_VERSION == 4 (the literal the
-    rollback/export guarantees in §4 are pinned against), and a database
-    that starts at user_version = 4 still reads 4 after run_migrations."""
-    assert TARGET_USER_VERSION == 4
-    conn = _bare_db(user_version=4)
+    """Re-running the orchestrator from a database already at
+    TARGET_USER_VERSION still reads TARGET_USER_VERSION afterwards. It does
+    NOT pin that ``correct_google_horizon`` leaves the version alone:
+    ``run_migrations`` writes ``PRAGMA user_version`` unconditionally after
+    calling the correction, so any version write inside the correction is
+    overwritten before this assertion can read it. The oracle below is the
+    one that kills that mutant."""
+    conn = _bare_db(user_version=TARGET_USER_VERSION)
     run_migrations(conn)
-    assert _user_version(conn) == 4
+    assert _user_version(conn) == TARGET_USER_VERSION
+
+
+def test_correction_alone_never_moves_user_version() -> None:
+    """The correction is a data fix and must leave ``PRAGMA user_version``
+    exactly where it found it. Driven by a DIRECT call, because the
+    orchestrator's own unconditional final write would mask a version write
+    added inside the correction. The sentinel 99 is deliberately no real
+    schema version -- seeded at TARGET_USER_VERSION the most likely mutant
+    (a correction that bumps to the current target) would still pass -- and
+    the connection is deliberately not routed through ``run_migrations``,
+    which raises on a version newer than the app.
+    """
+    conn = _bare_db(user_version=99)
+    correct_google_horizon(conn)
+    assert _user_version(conn) == 99

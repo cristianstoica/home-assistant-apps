@@ -14,7 +14,7 @@ from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 4
+TARGET_USER_VERSION = 5
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -350,7 +350,8 @@ def create_schema(conn: sqlite3.Connection) -> None:
             error TEXT,
             created_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-            published_at TEXT
+            published_at TEXT,
+            result_basis_fingerprint TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_verification_runs_site
             ON verification_runs(site_id, state, id);
@@ -778,6 +779,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 4:
         logger.debug("migrations applying v4 timezone generations")
         migrate_v4(conn)
+    if current < 5:
+        logger.debug("migrations applying v5 result-basis fingerprint")
+        migrate_v5_result_basis_fingerprint(conn)
     correct_google_horizon(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
@@ -1137,6 +1141,28 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
         conn.execute("RELEASE migrate_v4")
         raise
     conn.execute("RELEASE migrate_v4")
+
+
+def migrate_v5_result_basis_fingerprint(conn: sqlite3.Connection) -> None:
+    """Add ``verification_runs.result_basis_fingerprint`` (nullable).
+
+    One additive ``ALTER TABLE``; nothing is backfilled. A run published
+    before this column existed reads NULL, which the freshness derivation
+    reports as *unknown* rather than fabricating a baseline.
+
+    Column-probed idempotence, following
+    :func:`migrate_v2_backfill_status`: ``run_migrations`` writes
+    ``PRAGMA user_version`` only after this returns, so a crash in between
+    leaves the column present at user_version 4 and the next boot re-enters
+    the ``current < 5`` gate. :func:`create_schema` already creates the
+    column on a fresh database, where this is likewise a no-op -- which is
+    why the DDL appends it after ``published_at``, so a fresh and a migrated
+    database agree on column order, not just membership.
+    """
+    if "result_basis_fingerprint" not in _table_columns(conn, "verification_runs"):
+        conn.execute(
+            "ALTER TABLE verification_runs ADD COLUMN result_basis_fingerprint TEXT"
+        )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

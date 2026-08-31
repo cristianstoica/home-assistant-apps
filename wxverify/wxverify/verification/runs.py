@@ -8,6 +8,47 @@ watermark, the bootstrap seed/count, and the input fingerprint the nightly
 trigger decided on. The published pointer is a ``runtime_state`` row per
 site (``verification_published_run:<site_id>``), flipped in the publish
 transaction only — until then the previous published run keeps serving.
+
+TWO fingerprints, each answering one question:
+
+``input_fingerprint`` — "would re-running produce anything new, including
+from data that has merely grown?" Consumers: the bootstrap seed, the
+``no_change_skip`` gate, the decide-to-run divergence guard and
+``failed_attempts_for_fingerprint``. Raw-data growth MUST stay in its
+scope: it is what defeats ``no_change_skip`` and makes a run happen at all.
+
+``result_basis_fingerprint`` — "have this run's configuration, roster and
+the truth rows over its horizon changed since the basis was pinned for
+it?" NOT a digest of everything the run scored: the forecast side is
+outside it, along with the rest of the exclusions
+:func:`result_basis_fingerprint` documents. Consumer: the operator-facing
+freshness warning, and nothing else. Horizon-scoped, so the nightly
+arrival of newly settled days leaves it alone.
+
+The basis is pinned once, at ``start_run``. Two NARROW stability claims
+hold across the run's life, and neither is absolute:
+
+* configuration and roster are guarded by
+  :func:`assert_inputs_unpinned_unchanged`, which fails the run on
+  divergence — but it compares RESOLVED depths only, so a
+  ``blend_depth_sources`` provenance flip (an override set equal to the
+  global value) passes that guard by design and still moves this digest,
+  which hashes the whole snapshot;
+* no remaining HASHED truth column is written between ``regen`` and
+  ``publish`` through the normal run and ingest paths. Ordinary
+  observation ingest DOES write ``daily_truth`` in that window —
+  ``mark_daily_truth_stale`` sets ``stale = 1`` — but ``stale`` is not
+  hashed here, so an intervening consensus change only marks rows stale
+  and leaves this digest alone. Administrative paths — database
+  import/replace, repair tooling, migrations — have not been traced
+  against an active run and are outside this claim.
+
+Pinning at ``start_run`` does not DEPEND on absolute immutability. What
+matters is that the recorded fingerprint accurately describes the basis
+the run actually used. If a genuinely hashed field does move mid-run,
+reporting ``changed`` is correct behavior, not a bug: the published
+results describe the pinned basis, and the operator should know that
+current data has moved away from it.
 """
 
 from __future__ import annotations
@@ -17,7 +58,7 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Final, Literal, cast
 
 from wxverify import __version__
 from wxverify.core.timeutil import isoformat_utc
@@ -136,7 +177,8 @@ def capture_config_snapshot(
 
     WRITE PATH ONLY: seeds the site's initial timezone generation when the
     published pointer is absent, so it needs a write connection. The
-    read-only staleness check uses :func:`current_input_fingerprint`.
+    read-only freshness check uses
+    :func:`current_result_basis_fingerprint`.
     """
     return _config_snapshot(
         conn, site_id, tz_generation_id=ensure_published_generation(conn, site_id)
@@ -237,20 +279,201 @@ def input_fingerprint(
     return digest.hexdigest()
 
 
-def current_input_fingerprint(conn: sqlite3.Connection, site_id: int) -> str | None:
-    """Today's input fingerprint for a staleness check — READ PATH, never writes.
+RESULT_BASIS_ALGORITHM: Final = "rb1"
+# The stored form is `"<algorithm>:<sha256 hex>"`, and BOTH halves are
+# validated on read: a right-prefix/wrong-body value is a corrupt record,
+# not a superseded algorithm, and the two are reported apart.
+_RESULT_BASIS_DIGEST_LEN: Final = 64
+_HEX_LOWER: Final = frozenset("0123456789abcdef")
+
+
+def result_basis_fingerprint(
+    conn: sqlite3.Connection,
+    site_id: int,
+    snapshot: dict[str, object],
+    *,
+    period_start: str,
+    period_end: str,
+) -> str:
+    """Digest of a run's configuration, roster and truth basis over its horizon.
+
+    The freshness warning's basis only — NOT a digest of everything the run
+    scored.
+
+    Covered: the run's configuration snapshot (which carries the frozen
+    roster and the timezone generation), the algorithm and methodology
+    versions, the period bounds, and row hashes over the ``daily_truth``
+    rows INSIDE ``[period_start, period_end]`` — FIVE columns,
+    ``local_date``, ``quantity``, ``value``, ``eligible`` and
+    ``covered_hours``, ``|``-separated with one newline per row.
+    :func:`input_fingerprint` hashes those five AND ``stale``. The
+    divergence is deliberate: a pending regeneration IS a reason to re-run,
+    which is that function's question and not this one's. The two were
+    never byte-comparable regardless — this digest carries an
+    algorithm/period preamble, and its SELECT adds ``AND local_date BETWEEN
+    ? AND ?``, which :func:`input_fingerprint`'s does not.
+
+    Excluded, and what each exclusion costs:
+
+    * the observation/sample counters — they grow on every ingest tick,
+      which is what makes them right for :func:`input_fingerprint` and
+      wrong here;
+    * truth rows above the run's horizon — a day settling tonight is not a
+      change to what this run covered;
+    * the ``stale`` column — a regeneration marker, never read by scoring
+      (``verification/simulate.py`` does not reference it). Hashing it
+      would let an ingest landing between the ``regen`` and ``start``
+      phases bake a ``1`` into the recorded basis, which the next night's
+      regeneration clears back to ``0``: the recorded value could then
+      never be reproduced, and the warning would read ``changed`` for the
+      rest of that run's published life over byte-identical truth;
+    * the FORECAST side — forecast rows inside the horizon can be rebuilt
+      or deleted without moving this digest, so a re-run could score
+      differently while the freshness check still reports ``fresh``.
+      Covering it would mean hashing the largest tables in the database on
+      a read path already over its render budget; the real coverage is a
+      later, separately-designed change.
+
+    The period bounds are hashed as well as filtered on, so a run whose
+    horizon differs cannot collide with one whose horizon matched. The
+    algorithm version travels IN the returned value (``"rb1:<digest>"``),
+    so a future redefinition compares unequal on the prefix and is reported
+    unknown rather than silently changed.
+    """
+    generation_id = int(str(snapshot["tz_generation_id"]))
+    digest = hashlib.sha256()
+    digest.update(_dumps(snapshot).encode())
+    digest.update(
+        _dumps(
+            {
+                "algorithm": RESULT_BASIS_ALGORITHM,
+                "methodology_version": METHODOLOGY_VERSION,
+                "period_start": period_start,
+                "period_end": period_end,
+            }
+        ).encode()
+    )
+    truth_rows = conn.execute(
+        """
+        SELECT local_date, quantity, value, eligible, covered_hours
+        FROM daily_truth
+        WHERE site_id = ? AND tz_generation_id = ?
+          AND local_date BETWEEN ? AND ?
+        ORDER BY local_date, quantity
+        """,
+        (site_id, generation_id, period_start, period_end),
+    ).fetchall()
+    for row in truth_rows:
+        digest.update(
+            (
+                f"{row['local_date']}|{row['quantity']}|{row['value']}|"
+                f"{row['eligible']}|{row['covered_hours']}\n"
+            ).encode()
+        )
+    return f"{RESULT_BASIS_ALGORITHM}:{digest.hexdigest()}"
+
+
+def current_result_basis_fingerprint(
+    conn: sqlite3.Connection, site_id: int, *, period_start: str, period_end: str
+) -> str | None:
+    """Today's result basis over a published run's horizon — READ PATH.
 
     Resolves the timezone generation with the non-seeding
     :func:`published_generation_id`, so the request path cannot INSERT on a
     read-pool connection no matter what the pointer state is. Returns None
     when the site has no published generation yet: the comparison is then
-    unknown rather than stale, and the caller says so instead of guessing.
+    unknown rather than changed, and the caller says so instead of guessing.
     """
     generation_id = published_generation_id(conn, site_id)
     if generation_id is None:
         return None
     snapshot = _config_snapshot(conn, site_id, tz_generation_id=generation_id)
-    return input_fingerprint(conn, site_id, snapshot)
+    return result_basis_fingerprint(
+        conn, site_id, snapshot, period_start=period_start, period_end=period_end
+    )
+
+
+@dataclass(frozen=True)
+class ResultBasisFreshness:
+    """Three-state freshness of a published run's configuration/truth basis.
+
+    That basis only: the forecast side is outside the digest (see
+    :func:`result_basis_fingerprint`), so ``fresh`` does not promise a
+    re-run would score identically.
+
+    ``unknown`` is NOT a warning: a run with no recorded basis, one whose
+    recorded basis is malformed, or one recorded under a superseded
+    algorithm, is reported as unknown rather than presented as stale on no
+    evidence. ``reason`` is None for ``fresh`` and ``changed``.
+    """
+
+    state: Literal["fresh", "changed", "unknown"]
+    reason: str | None
+
+    def as_payload(self) -> dict[str, str | None]:
+        """The surface payload — the ONE serializer both surfaces use."""
+        return {"state": self.state, "reason": self.reason}
+
+
+RESULT_BASIS_NO_RUN: Final = ResultBasisFreshness(
+    state="unknown", reason="no_published_run"
+)
+
+
+def result_basis_freshness(
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    recorded: str | None,
+    period_start: str | None,
+    period_end: str | None,
+) -> ResultBasisFreshness:
+    """Compare a published run's recorded basis against today's — READ PATH.
+
+    ONE derivation feeding both surfaces — ``GET
+    /api/verification/status`` and the ``/verification`` page — so both
+    apply the same rules and cannot drift apart as the rules change. It
+    does not make them simultaneous: pooled read connections run
+    ``isolation_level=None`` (``db/connection.py:131``), so two requests
+    observe two database states and may legitimately report different
+    verdicts across an intervening write. Takes primitives rather than a
+    row because the two
+    callers hold different row shapes (a ``sqlite3.Row`` from ``SELECT *``
+    and an explicit projection).
+
+    Every step is an allowlist on a known-good value, and the order is
+    deliberate. A missing value comes first: with nothing recorded there is
+    nothing to diagnose. The stored FORM — the algorithm prefix, then the
+    digest's own shape — is checked next, BEFORE the period bounds, because
+    a value written under a superseded algorithm or with a corrupt digest
+    is diagnosable without knowing the horizon and must not be masked as
+    ``period_unknown``. Both form tests run BEFORE the equality test for
+    the same reason: the other way round such a value would simply compare
+    unequal and be reported ``changed``, which is the silent misverdict the
+    versioned prefix exists to prevent. A corrupt digest is reported
+    ``malformed_record``, kept apart from ``algorithm_changed`` so a
+    damaged record and a superseded one stay diagnosable separately.
+    ``no_published_run`` is not produced here — the helper needs a run to
+    reason about; the call sites use :data:`RESULT_BASIS_NO_RUN`.
+    """
+    if recorded is None:
+        return ResultBasisFreshness(state="unknown", reason="not_recorded")
+    prefix = f"{RESULT_BASIS_ALGORITHM}:"
+    if not recorded.startswith(prefix):
+        return ResultBasisFreshness(state="unknown", reason="algorithm_changed")
+    digest = recorded.removeprefix(prefix)
+    if len(digest) != _RESULT_BASIS_DIGEST_LEN or not _HEX_LOWER.issuperset(digest):
+        return ResultBasisFreshness(state="unknown", reason="malformed_record")
+    if period_start is None or period_end is None:
+        return ResultBasisFreshness(state="unknown", reason="period_unknown")
+    current = current_result_basis_fingerprint(
+        conn, site_id, period_start=period_start, period_end=period_end
+    )
+    if current is None:
+        return ResultBasisFreshness(state="unknown", reason="no_published_generation")
+    return ResultBasisFreshness(
+        state="fresh" if current == recorded else "changed", reason=None
+    )
 
 
 def seed_from_fingerprint(fingerprint: str) -> int:
@@ -387,14 +610,19 @@ def start_run(
     fail_incomplete_attempts(conn, site_id, error="superseded by a newer attempt")
     attempt = failed_attempts_for_fingerprint(conn, site_id, fingerprint) + 1
     seed = seed_from_fingerprint(fingerprint)
+    # The freshness basis is pinned here, over the horizon this row records,
+    # from the same snapshot. The seed stays derived from `fingerprint`.
+    basis = result_basis_fingerprint(
+        conn, site_id, snapshot, period_start=start, period_end=end
+    )
     cur = conn.execute(
         """
         INSERT INTO verification_runs
             (site_id, tz_generation_id, methodology_version, app_version,
              state, attempt, config_snapshot, period_start, period_end,
              settled_through, bootstrap_seed, bootstrap_resamples,
-             input_fingerprint, created_at)
-        VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             input_fingerprint, result_basis_fingerprint, created_at)
+        VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             site_id,
@@ -409,6 +637,7 @@ def start_run(
             seed,
             BOOTSTRAP_RESAMPLES,
             fingerprint,
+            basis,
             isoformat_utc(now),
         ),
     )
@@ -714,8 +943,13 @@ def trigger_status(
     """The §12 trigger status for one site, plus the §3.1 publish-hold state.
 
     ONE derivation feeding both surfaces — ``GET
-    /api/verification/status`` and the ``/verification`` page — so the two
-    can never disagree. Degrades per site (``trigger_date_unknown``); never
+    /api/verification/status`` and the ``/verification`` page — so both
+    apply the same rules and cannot drift apart as the rules change. It
+    does not make them simultaneous: pooled read connections run
+    ``isolation_level=None`` (``db/connection.py:131``), so two requests
+    observe two database states and may legitimately report different
+    statuses across an intervening write. Degrades per site
+    (``trigger_date_unknown``); never
     raises, because both callers build their payload over every enabled
     site and one unusable timezone must not remove the operator's whole
     diagnostic window.

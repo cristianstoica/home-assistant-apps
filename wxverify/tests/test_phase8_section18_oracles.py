@@ -9,9 +9,9 @@ Five families live here, each pinned against the mutation it exists to kill
   one module without the others fails loudly.
 * **NB-1** — ``_contingency`` fails closed on an empty or partially covered
   strict common core, in lockstep with ``_continuous_metrics``.
-* **NB-9** — ``current_input_fingerprint`` is a pure read: proven against a
-  connection with SQLite's ``query_only`` pragma engaged, where any write
-  raises.
+* **NB-9** — ``current_result_basis_fingerprint`` is a pure read: proven
+  against a connection with SQLite's ``query_only`` pragma engaged, where
+  any write raises.
 * **NB-5** — the retrospective-correction pointer flip, page leg: the
   ``/verification`` surface never shows a half-flipped state, plus
   ``generation_status()``'s persisted reconciliation tally.
@@ -66,9 +66,10 @@ from wxverify.verification.engine import (  # noqa: PLC2701
 from wxverify.verification.record import RECORD_VARIABLES
 from wxverify.verification.runs import (
     capture_config_snapshot,
-    current_input_fingerprint,
+    current_result_basis_fingerprint,
     input_fingerprint,
     publish_run,
+    result_basis_fingerprint,
 )
 from wxverify.verification.simulate import SIM_VARIABLES
 from wxverify.verification.stats import Contingency
@@ -309,10 +310,11 @@ def _read_only(conn: sqlite3.Connection) -> None:
 
 
 class TestReadPathNeverWrites:
-    def test_current_input_fingerprint_is_pure_under_query_only(self) -> None:
+    def test_current_result_basis_fingerprint_is_pure_under_query_only(self) -> None:
         """Kills: reintroducing ``ensure_published_generation`` (or any other
-        write) into ``current_input_fingerprint`` — the seeding INSERT raises
-        'attempt to write a readonly database' against this connection.
+        write) into ``current_result_basis_fingerprint`` — the seeding INSERT
+        raises 'attempt to write a readonly database' against this
+        connection.
 
         Anchored, not merely non-crashing: the value must equal the write
         path's fingerprint over the same state, so a mutation that returns a
@@ -328,14 +330,21 @@ class TestReadPathNeverWrites:
             value=11.0,
             computed_at="2026-05-01T07:00:00Z",
         )
-        expected = input_fingerprint(
-            conn, site_id, capture_config_snapshot(conn, site_id)
+        snapshot = capture_config_snapshot(conn, site_id)
+        expected = result_basis_fingerprint(
+            conn,
+            site_id,
+            snapshot,
+            period_start="2026-05-01",
+            period_end="2026-05-01",
         )
         _read_only(conn)
 
-        actual = current_input_fingerprint(conn, site_id)
+        actual = current_result_basis_fingerprint(
+            conn, site_id, period_start="2026-05-01", period_end="2026-05-01"
+        )
         assert actual == expected
-        assert actual is not None and len(actual) == 64
+        assert actual is not None and actual.startswith("rb1:")
 
         conn.execute("PRAGMA query_only=OFF")
         assert published_generation_id(conn, site_id) == generation_id
@@ -362,7 +371,12 @@ class TestReadPathNeverWrites:
         )
         _read_only(conn)
 
-        assert current_input_fingerprint(conn, site_id) is None
+        assert (
+            current_result_basis_fingerprint(
+                conn, site_id, period_start="2026-05-01", period_end="2026-05-01"
+            )
+            is None
+        )
 
         conn.execute("PRAGMA query_only=OFF")
         after = int(
@@ -604,9 +618,18 @@ def _seed_correction_history(conn: sqlite3.Connection) -> int:
 
 
 def _publish_minimal_run(conn: sqlite3.Connection, site_id: int) -> int:
-    """A published run pinned to whatever generation is current right now."""
+    """A published run pinned to whatever generation is current right now.
+
+    The result basis is seeded to match the state at write time (not left
+    NULL), so a later mutation actually moves the recomputed basis away from
+    the recorded one -- a NULL/unrecorded basis would read as `unknown`
+    rather than `changed` and could never exercise the stale-inputs warning.
+    """
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
+    basis = result_basis_fingerprint(
+        conn, site_id, snapshot, period_start="2026-06-10", period_end="2026-06-11"
+    )
     run_id = int(
         conn.execute(
             """
@@ -614,15 +637,16 @@ def _publish_minimal_run(conn: sqlite3.Connection, site_id: int) -> int:
                 (site_id, tz_generation_id, methodology_version, app_version,
                  state, attempt, config_snapshot, period_start, period_end,
                  settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint)
+                 input_fingerprint, result_basis_fingerprint)
             VALUES (?, ?, 1, '0.11.0-test', 'running', 1, ?, '2026-06-10',
-                    '2026-06-11', '2026-06-11', 77, 10000, ?)
+                    '2026-06-11', '2026-06-11', 77, 10000, ?, ?)
             """,
             (
                 site_id,
                 int(str(snapshot["tz_generation_id"])),
                 json.dumps(snapshot),
                 fingerprint,
+                basis,
             ),
         ).lastrowid
     )
@@ -1132,6 +1156,12 @@ def _seed_v16_run(conn: sqlite3.Connection, site_id: int) -> int:
     generation_id = ensure_published_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
+    # Seeded to match at write time, so a genuine post-publish config change
+    # is what moves the recomputed basis -- a NULL basis would read as
+    # `unknown` and could never flip to `changed`.
+    basis = result_basis_fingerprint(
+        conn, site_id, snapshot, period_start="2026-04-02", period_end="2026-05-11"
+    )
     run_id = int(
         conn.execute(
             """
@@ -1139,11 +1169,11 @@ def _seed_v16_run(conn: sqlite3.Connection, site_id: int) -> int:
                 (site_id, tz_generation_id, methodology_version, app_version,
                  state, attempt, config_snapshot, period_start, period_end,
                  settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint)
+                 input_fingerprint, result_basis_fingerprint)
             VALUES (?, ?, 1, '0.11.0-oracle', 'running', 3, ?, '2026-04-02',
-                    '2026-05-11', '2026-05-11', 909, 10000, ?)
+                    '2026-05-11', '2026-05-11', 909, 10000, ?, ?)
             """,
-            (site_id, generation_id, json.dumps(snapshot), fingerprint),
+            (site_id, generation_id, json.dumps(snapshot), fingerprint, basis),
         ).lastrowid
     )
     conn.executemany(
@@ -1623,10 +1653,10 @@ class TestSection16ConditionalWarnings:
         """§16.1: 'explicit warnings for stale results'.
 
         Injected precondition: a settings change AFTER publication moves the
-        live input fingerprint away from the run's pinned one. Paired
-        positive: the same page before the change carries no warning.
+        live result basis away from the run's pinned one. Paired positive:
+        the same page before the change carries no warning.
 
-        Kills: dropping the ``current_input_fingerprint`` comparison, or
+        Kills: dropping the ``result_basis_freshness`` comparison, or
         comparing the run against itself (always fresh).
         """
         conn = _open_app_db(tmp_path, monkeypatch)

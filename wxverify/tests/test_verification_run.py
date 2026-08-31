@@ -711,6 +711,33 @@ def test_run_config_round_trips_the_pinned_roster() -> None:
     )
 
 
+def test_bootstrap_seed_is_derived_from_the_input_fingerprint_only() -> None:
+    """Seed provenance: the seed comes from ``input_fingerprint``, and
+    demonstrably NOT from the freshness basis ``start_run`` also pins. The
+    second assertion is the one that catches a mis-wire; the stored seed for
+    a given input state must not move now that a second hash exists.
+    """
+    conn = asof_conn()
+    site_id, _feeds = _make_verification_site(conn)
+    _drive_chain(conn, site_id, {"trigger_date": "2026-06-06"})
+    run_id = published_run_id(conn, site_id)
+    assert run_id is not None
+    row = conn.execute(
+        """
+        SELECT bootstrap_seed, input_fingerprint, result_basis_fingerprint
+        FROM verification_runs WHERE id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    basis = row["result_basis_fingerprint"]
+    # Without this the inequality below passes vacuously on a NULL column.
+    assert basis is not None
+    assert int(row["bootstrap_seed"]) == seed_from_fingerprint(
+        str(row["input_fingerprint"])
+    )
+    assert int(row["bootstrap_seed"]) != seed_from_fingerprint(str(basis))
+
+
 # ---------------------------------------------------------------------------
 # Scheduler trigger
 # ---------------------------------------------------------------------------
