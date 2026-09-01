@@ -2,9 +2,14 @@
 
 The aggregate phase resolves each cell's headline roster and strict common
 core ONCE, persists the resolution in the run row's ``aggregate_state``
-JSON, and writes ``verification_results``. The bootstrap-input builder then
-reads that SAME resolution back — the results table and the §12 decision
-can never disagree about which days were common.
+JSON, and scores the headline ``verification_results`` rows on it. Read-time
+derivations (§10, §14a) read that SAME resolution back through
+``stored_cell_resolution`` rather than re-deriving it. The §12 decision does
+NOT: ``prepare_bootstrap_inputs`` builds every paired series on the pairwise
+core of the two entities compared, which for two roster members CONTAINS the
+strict core — one member missing a day collapses the headline core and
+leaves the pair's intact. A verdict can therefore rest on more days than the
+headline row's ``common_days``; that is methodology v2, not drift.
 
 Cell = (variable, lead, quantity). Headline roster per §8: the four blend
 depths, the baselines, and every pinned roster feed at/above the

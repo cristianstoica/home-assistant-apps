@@ -454,8 +454,13 @@ def _baseline_endpoint(
     """The candidate-vs-one-baseline endpoint, built the SAME way everywhere.
 
     One construction serves both the gate and the per-lead support map that
-    reduces the candidate's adequacy set, so the two can never disagree
-    about what a baseline supports at a lead.
+    reduces the candidate's adequacy set, so both read the identical series
+    and agree lead-for-lead INSIDE the gate's ``core`` — ``restrict_to`` is
+    applied last, after every support test. The gate's adequate set is still
+    core-restricted, so it is not a support claim on its own: on an EMPTY
+    core (only ``_decide_precip`` can pass one, when its other endpoint
+    carried the variable) every lead drops ``outside_core`` and the gate
+    labels a fully supported baseline ``insufficient``.
     """
     if occurrence:
         series = candidate.baseline_occurrence.get(baseline, {})
