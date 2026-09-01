@@ -1,8 +1,12 @@
 """Per-variable blend-depth resolution with provenance (§15).
 
 The Forecast page, the forecast-of-record builder, and the verification
-run snapshot all resolve depth through this ONE helper, so the live page,
-the record, and the run incumbent can never disagree. An override key
+run snapshot all resolve depth through this ONE helper, so consumers
+reading the same settings state get the same depth under the same
+precedence rule. That is a rule guarantee, not a pinning one: a run and a
+record snapshot store the depths they resolved, so once settings move the
+live page and those pinned values legitimately differ — /verification
+detects exactly that and labels it. An override key
 (``forecast_blend_depth_<variable>``) wins when it parses to 1..6; anything
 else — absent, foreign, out of range — falls through to the existing
 global ``forecast_blend_depth`` setting.
