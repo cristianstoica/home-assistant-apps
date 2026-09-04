@@ -58,6 +58,25 @@ OccurrenceLead = dict[str, tuple[str, str]]
 
 _WET_CLASSES = frozenset({"hit", "miss"})
 
+#: Recorded by the condition-4 gate when it had no core to test on because
+#: the candidate endpoint that defines the core yielded no adequate lead,
+#: AND the baseline being evaluated was itself supported wherever it had
+#: data. Only `_decide_precip` can reach the gate with an empty core — it
+#: admits a variable when just ONE of its two endpoints is thin — and only
+#: it can tell candidate-side thinness from an absent required baseline,
+#: so that half of the answer is decided there and passed in. The other
+#: half is the gate entry's own drop records. The gate never infers the
+#: candidate's half, and the caller never infers any baseline's half.
+CANDIDATE_ENDPOINT_INSUFFICIENT_REASON = (
+    "required candidate endpoint missing or under-supported"
+)
+
+#: The drop reasons `_adequate_leads` records for a shortfall on the
+#: CANDIDATE side. An allowlist, not an exclusion list: a reason added to
+#: that vocabulary later is treated as NOT candidate-side, which keeps
+#: today's wording rather than inventing a claim about an unseen cause.
+_CANDIDATE_SIDE_DROP_REASONS = frozenset({"thin_data", "thin_events"})
+
 
 @dataclass(frozen=True)
 class CandidateSeries:
@@ -443,6 +462,28 @@ def _beats(evaluation: _EndpointEvaluation) -> bool:
     return evaluation.ci is not None and evaluation.ci[0] > 0
 
 
+def _candidate_side_empty_core_reason(evaluation: _EndpointEvaluation) -> str | None:
+    """Half the answer: did THIS candidate endpoint empty the core by itself?
+
+    ``None`` unless the endpoint has no adequate lead AND every lead it lost
+    was lost on the candidate side. An endpoint emptied by a missing required
+    baseline keeps the gate's own baseline reason: that reason is true there,
+    and relabelling it would trade one false attribution for another. A mixed
+    cause keeps it too — the per-lead split is already in ``dropped_leads``.
+
+    A non-``None`` return is NECESSARY but not SUFFICIENT for the gate to use
+    it: the baseline being evaluated may itself be thin, in which case the
+    baseline reason is earned and the gate keeps it (see ``_baseline_gate``).
+    """
+    if evaluation.adequate or not evaluation.dropped:
+        return None
+    candidate_side = all(
+        drop.get("reason") in _CANDIDATE_SIDE_DROP_REASONS
+        for drop in evaluation.dropped
+    )
+    return CANDIDATE_ENDPOINT_INSUFFICIENT_REASON if candidate_side else None
+
+
 def _baseline_endpoint(
     candidate: CandidateSeries,
     baseline: str,
@@ -543,12 +584,24 @@ def _baseline_gate(
     seed: int,
     resamples: int,
     core: tuple[int, ...],
+    empty_core_reason: str | None,
 ) -> tuple[bool, dict[str, object]]:
     """Condition 4: beat EVERY REQUIRED baseline at 95% on ``core``.
 
     ``core`` is the headline evaluation's adequate-lead set, passed as a
     REQUIRED keyword so no call site can fall back to a per-baseline set
     of its own — the omission this signature exists to make impossible.
+
+    ``empty_core_reason`` is the caller's account of WHY ``core`` is empty.
+    It replaces the baseline reason below only when ``core`` really is empty
+    AND this baseline dropped every lead ``outside_core``. Both halves are
+    needed: an empty core makes the baseline unmeasurable, but the baseline
+    may ALSO be thin, and then the baseline reason is earned. The second
+    half is sound because ``_adequate_leads`` applies its core restriction
+    LAST, so ``outside_core`` names only leads this baseline genuinely
+    supported. It is required for the same reason ``core`` is. The
+    single-endpoint callers pass ``None`` — they early-return below the
+    four-lead floor, so no empty core can reach them.
 
     Allowlist, not presence test: the gate iterates the required set, so a
     missing or unsupported baseline fails it and writes a named
@@ -561,6 +614,12 @@ def _baseline_gate(
     """
     detail: dict[str, object] = {}
     passed = True
+    # Call-wide half of the reason test. The other half is per baseline:
+    # with an empty core a baseline that had data drops `outside_core`,
+    # but one that was itself thin drops `thin_data` FIRST (the core
+    # restriction is `_adequate_leads`'s LAST condition), and then the
+    # baseline reason is earned. Two baselines in one call can differ.
+    empty_core = not core
     for baseline in _required_baselines(occurrence=occurrence):
         endpoint = _baseline_endpoint(
             candidate, baseline, quantity=quantity, occurrence=occurrence, temp=temp
@@ -575,10 +634,17 @@ def _baseline_gate(
         )
         if not evaluation.adequate:
             passed = False
+            reason = "required baseline missing or under-supported"
+            if empty_core_reason is not None and empty_core:
+                baseline_supported = all(
+                    drop.get("reason") == "outside_core" for drop in evaluation.dropped
+                )
+                if baseline_supported:
+                    reason = empty_core_reason
             detail[baseline] = {
                 "passed": False,
                 "insufficient": True,
-                "reason": "required baseline missing or under-supported",
+                "reason": reason,
                 **evaluation.as_json(),
             }
             continue
@@ -696,6 +762,11 @@ def _decide_wind_or_temp(
             seed=seed + 1,
             resamples=resamples,
             core=evaluation.adequate,
+            # Single endpoint: the sufficiency early-return above means `core`
+            # is never empty here, so `empty_core` is always False and this
+            # value is unobservable. Passed explicitly anyway — the keyword is
+            # required so a future caller that CAN empty the core must answer.
+            empty_core_reason=None,
         )
     else:
         c4, baseline_detail = _baseline_gate(
@@ -705,6 +776,7 @@ def _decide_wind_or_temp(
             seed=seed + 1,
             resamples=resamples,
             core=evaluation.adequate,
+            empty_core_reason=None,
         )
     c5 = True
     if inputs.variable == "temperature":
@@ -861,6 +933,7 @@ def _decide_precip(
         seed=seed + 1,
         resamples=resamples,
         core=total.adequate,
+        empty_core_reason=_candidate_side_empty_core_reason(total),
     )
     occ_ok, occ_detail = _baseline_gate(
         candidate,
@@ -869,6 +942,7 @@ def _decide_precip(
         seed=seed + 2,
         resamples=resamples,
         core=occ.adequate,
+        empty_core_reason=_candidate_side_empty_core_reason(occ),
     )
     c4 = total_ok and occ_ok
     baseline_detail: dict[str, object] = {
