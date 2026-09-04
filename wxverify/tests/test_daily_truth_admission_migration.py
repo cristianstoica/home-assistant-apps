@@ -38,6 +38,7 @@ from wxverify.db.migrations import (
 )
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.verification.completeness import ADMISSION_COMPLETE, ADMISSION_DEADLINE
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.runs import (
     capture_config_snapshot,
@@ -342,14 +343,18 @@ def test_o14c_check_constraint_rejects_invalid_and_accepts_valid(
         == 0
     )
 
-    for offset, value in enumerate((None, "complete", "deadline")):
+    for offset, value in enumerate((None, ADMISSION_COMPLETE, ADMISSION_DEADLINE)):
         _insert_daily_truth_row(
             conn, site_id, generation_id, f"2026-06-{2 + offset:02d}", value
         )
     rows = conn.execute(
         "SELECT admission_basis FROM daily_truth ORDER BY local_date"
     ).fetchall()
-    assert [r["admission_basis"] for r in rows] == [None, "complete", "deadline"]
+    assert [r["admission_basis"] for r in rows] == [
+        None,
+        ADMISSION_COMPLETE,
+        ADMISSION_DEADLINE,
+    ]
 
 
 # ---------------------------------------------------------------------------
