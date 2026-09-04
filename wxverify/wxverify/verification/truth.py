@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,7 @@ from wxverify.db.tz_generations import (
 )
 from wxverify.verification.coverage import (
     VARIABLE_QUANTITIES,
+    DayBounds,
     QuantityOutcome,
     evaluate_variable,
     local_day_bounds,
@@ -61,39 +63,61 @@ def _generation_timezone(conn: sqlite3.Connection, generation_id: int) -> str:
     return str(row["timezone"])
 
 
-def materialize_daily_truth(
+@dataclass(frozen=True)
+class _DayEvaluation:
+    """One (site, local day, generation)'s evaluated truth, before any write.
+
+    The seam between :func:`_evaluate_day`, which only reads, and
+    :func:`_write_day`, which only writes: everything the INSERT needs is
+    carried here as data, so a caller can evaluate a day WITHOUT
+    materializing it.
+
+    ``local_date`` is the CANONICAL extended-format spelling of the date the
+    caller passed, and ``max_computed_at`` is the newest
+    ``observations.computed_at`` behind the day as its stored timestamp
+    string — None when no observation in the day carries one.
+    """
+
+    generation_id: int
+    timezone: str
+    local_date: str
+    bounds: DayBounds
+    threshold: float
+    outcomes: dict[str, QuantityOutcome]
+    max_computed_at: str | None
+
+
+def _evaluate_day(
     conn: sqlite3.Connection,
     *,
     site_id: int,
     local_date: str,
-    tz_generation_id: int | None = None,
-) -> dict[str, QuantityOutcome]:
-    """Delete-and-recreate the five truth rows for one (site, local day).
+    tz_generation_id: int,
+) -> _DayEvaluation:
+    """Evaluate one (site, local day) against the CURRENT observations.
 
-    ``local_date`` is an ISO calendar date in the generation's timezone.
-    When ``tz_generation_id`` is None the site's PUBLISHED generation is
-    used (seeded on first use); regeneration passes the row's own tag so a
-    correction generation's rows stay in their generation. All five
-    quantity rows are always written — an excluded outcome stays visible
-    with its coverage count and exclusion reason (§4). Must run on a write
-    connection inside the caller's transaction.
+    READ-ONLY by construction, and that property is load-bearing: every
+    statement here is a SELECT, and the generation is an ARGUMENT rather
+    than something resolved in the body, so this function can never reach
+    ``ensure_published_generation`` — whose seeding branch writes a
+    generation row and the published pointer. A caller may therefore
+    evaluate a day without taking on a write.
+
+    Raises ``ValueError`` for a missing site, a missing timezone generation,
+    or a value in the day's rows that will not coerce — the whole failure
+    vocabulary one day's data can produce.
     """
     site = conn.execute(
         "SELECT rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
     ).fetchone()
     if site is None:
         raise ValueError(f"site {site_id} does not exist")
-    generation_id = (
-        ensure_published_generation(conn, site_id)
-        if tz_generation_id is None
-        else tz_generation_id
-    )
-    timezone = _generation_timezone(conn, generation_id)
+    timezone = _generation_timezone(conn, tz_generation_id)
     day = date.fromisoformat(local_date)
     # Bind the CANONICAL extended-format date, never the caller's raw
     # string: Python 3.11's date.fromisoformat accepts basic-format input
     # ("20260610"), which would defeat the UNIQUE(site, quantity,
-    # local_date, generation) dedup and the DELETE below.
+    # local_date, generation) dedup and `_write_day`'s DELETE.
     local_date = day.isoformat()
     bounds = local_day_bounds(day, timezone)
     start = isoformat_utc(bounds.start_utc)
@@ -134,14 +158,65 @@ def materialize_daily_truth(
             rain_threshold_mm=threshold,
         ):
             outcomes[outcome.quantity] = outcome
+    return _DayEvaluation(
+        generation_id=tz_generation_id,
+        timezone=timezone,
+        local_date=local_date,
+        bounds=bounds,
+        threshold=threshold,
+        outcomes=outcomes,
+        max_computed_at=max_computed_at,
+    )
+
+
+def _write_day(
+    conn: sqlite3.Connection,
+    ev: _DayEvaluation,
+    *,
+    site_id: int,
+    admission_basis: str | None,
+) -> None:
+    """Delete-and-recreate one (site, local day, generation)'s truth rows.
+
+    ``admission_basis`` resolves in exactly one order: a provided basis
+    wins; otherwise the basis already on disk for this day is PRESERVED;
+    otherwise NULL. The existing value is read BEFORE the DELETE, on the
+    same key the DELETE uses, so a rewrite that provides no basis — every
+    regeneration and every timezone rebuild — can never silently drop the
+    verdict the creating pass recorded.
+
+    ``stale`` is written as the literal 0 rather than bound: creating a
+    day's rows and regenerating them both produce rows that are, by
+    construction, current with the observations just read.
+
+    Must run on a write connection inside the caller's transaction.
+    """
+    existing = conn.execute(
+        """
+        SELECT admission_basis
+        FROM daily_truth
+        WHERE site_id = ? AND local_date = ? AND tz_generation_id = ?
+        LIMIT 1
+        """,
+        (site_id, ev.local_date, ev.generation_id),
+    ).fetchone()
+    basis = admission_basis
+    if basis is None and existing is not None:
+        # A day's rows are written together and therefore all carry one
+        # basis, so any single row answers "what did the creating pass
+        # record?" — the LIMIT 1 above is not an arbitrary pick.
+        recorded = existing["admission_basis"]
+        basis = None if recorded is None else str(recorded)
     conn.execute(
         """
         DELETE FROM daily_truth
         WHERE site_id = ? AND local_date = ? AND tz_generation_id = ?
         """,
-        (site_id, local_date, generation_id),
+        (site_id, ev.local_date, ev.generation_id),
     )
     generated_at = isoformat_utc()
+    start = isoformat_utc(ev.bounds.start_utc)
+    end = isoformat_utc(ev.bounds.end_utc)
     conn.executemany(
         """
         INSERT INTO daily_truth
@@ -149,13 +224,13 @@ def materialize_daily_truth(
              covered_hours, expected_slots, peak_window_ok, wet_hours,
              dry_hours, rain_threshold_mm, day_start_utc, day_end_utc,
              timezone, source_max_computed_at, stale, generated_at,
-             tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+             tz_generation_id, admission_basis)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
         """,
         [
             (
                 site_id,
-                local_date,
+                ev.local_date,
                 outcome.quantity,
                 outcome.value,
                 1 if outcome.eligible else 0,
@@ -167,18 +242,54 @@ def materialize_daily_truth(
                 else (1 if outcome.peak_window_ok else 0),
                 outcome.wet_hours,
                 outcome.dry_hours,
-                threshold if outcome.quantity.startswith("precip") else None,
+                ev.threshold if outcome.quantity.startswith("precip") else None,
                 start,
                 end,
-                timezone,
-                max_computed_at,
+                ev.timezone,
+                ev.max_computed_at,
                 generated_at,
-                generation_id,
+                ev.generation_id,
+                basis,
             )
-            for outcome in outcomes.values()
+            for outcome in ev.outcomes.values()
         ],
     )
-    return outcomes
+
+
+def materialize_daily_truth(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: str,
+    tz_generation_id: int | None = None,
+) -> dict[str, QuantityOutcome]:
+    """Delete-and-recreate the five truth rows for one (site, local day).
+
+    ``local_date`` is an ISO calendar date in the generation's timezone.
+    When ``tz_generation_id`` is None the site's PUBLISHED generation is
+    used (seeded on first use); regeneration passes the row's own tag so a
+    correction generation's rows stay in their generation. All five
+    quantity rows are always written — an excluded outcome stays visible
+    with its coverage count and exclusion reason (§4). Must run on a write
+    connection inside the caller's transaction.
+
+    Ungated by construction — it writes whatever :func:`_evaluate_day`
+    found. Passing no ``admission_basis`` makes every rewrite through this
+    entry point PRESERVE the basis already on the day's rows.
+    """
+    generation_id = (
+        ensure_published_generation(conn, site_id)
+        if tz_generation_id is None
+        else tz_generation_id
+    )
+    ev = _evaluate_day(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        tz_generation_id=generation_id,
+    )
+    _write_day(conn, ev, site_id=site_id, admission_basis=None)
+    return ev.outcomes
 
 
 def mark_daily_truth_stale(
