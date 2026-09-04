@@ -14,7 +14,7 @@ from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 5
+TARGET_USER_VERSION = 6
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -226,6 +226,9 @@ def create_schema(conn: sqlite3.Connection) -> None:
             generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             tz_generation_id INTEGER NOT NULL
                 REFERENCES timezone_generations(id),
+            admission_basis TEXT
+                CHECK(admission_basis IS NULL
+                      OR admission_basis IN ('complete','deadline')),
             UNIQUE(site_id, quantity, local_date, tz_generation_id)
         );
         CREATE INDEX IF NOT EXISTS idx_daily_truth_stale
@@ -782,6 +785,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 5:
         logger.debug("migrations applying v5 result-basis fingerprint")
         migrate_v5_result_basis_fingerprint(conn)
+    if current < 6:
+        logger.debug("migrations applying v6 daily-truth admission basis")
+        migrate_v6_daily_truth_admission_basis(conn)
     correct_google_horizon(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
@@ -1162,6 +1168,37 @@ def migrate_v5_result_basis_fingerprint(conn: sqlite3.Connection) -> None:
     if "result_basis_fingerprint" not in _table_columns(conn, "verification_runs"):
         conn.execute(
             "ALTER TABLE verification_runs ADD COLUMN result_basis_fingerprint TEXT"
+        )
+
+
+def migrate_v6_daily_truth_admission_basis(conn: sqlite3.Connection) -> None:
+    """Add ``daily_truth.admission_basis`` (nullable, CHECK-constrained).
+
+    One additive ``ALTER TABLE``; nothing is backfilled. A row created
+    before this column existed reads NULL, and NULL is the exact,
+    by-construction marker of a pre-gate row -- a row whose creation was
+    never subject to an admission decision. Backfilling any value would
+    fabricate a decision that was never made, so nothing is backfilled.
+
+    Column-probed idempotence, following
+    :func:`migrate_v5_result_basis_fingerprint`: ``run_migrations`` writes
+    ``PRAGMA user_version`` only after this returns, so a crash in between
+    leaves the column present at user_version 5 and the next boot re-enters
+    the ``current < 6`` gate. :func:`create_schema` already creates the
+    column on a fresh database, where this is likewise a no-op -- which is
+    why the DDL appends it after ``tz_generation_id``, so a fresh and a
+    migrated database agree on column order, not just membership.
+
+    The ``CHECK`` predicate is repeated here, matching the one in the
+    ``create_schema`` DDL: ``ALTER TABLE ... ADD COLUMN`` accepts a bare
+    ``TEXT`` happily, so dropping it would leave migrated installs
+    accepting values a fresh install rejects.
+    """
+    if "admission_basis" not in _table_columns(conn, "daily_truth"):
+        conn.execute(
+            "ALTER TABLE daily_truth ADD COLUMN admission_basis TEXT "
+            "CHECK(admission_basis IS NULL "
+            "OR admission_basis IN ('complete','deadline'))"
         )
 
 
