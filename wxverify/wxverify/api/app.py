@@ -168,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # retained snapshot when no further export is ever started.
         export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
         tasks.append(("export sweeper", export_sweeper))
+        export_sweeper.add_done_callback(db_transfer.on_export_sweeper_done)
         # A run published before this process started is never warmed by a publish
         # event, so without this leg the first request after every restart pays the
         # full cold derivation. It does not block startup: `db.read` dispatches the

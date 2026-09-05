@@ -23,7 +23,7 @@ from starlette.responses import JSONResponse
 
 from wxverify import config
 from wxverify.api.errors import ApiError
-from wxverify.core.error_sanitize import sanitized_exception
+from wxverify.core.error_sanitize import safe_detail, sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION
@@ -377,6 +377,80 @@ async def run_export_sweeper() -> None:
             _sweep_stale(db_dir)
         except Exception:
             logger.exception("export: periodic sweep failed")
+
+
+@dataclass(frozen=True)
+class SweeperDeath:
+    """The latched fact that ``run_export_sweeper`` stopped running.
+
+    ``detail`` is a rendered, redacted line for the ``crashed`` case and the
+    empty string for ``returned``; the caller composes the operator-facing
+    sentence from ``reason``, ``at`` and this field.
+    """
+
+    at: str
+    reason: Literal["crashed", "returned"]
+    detail: str
+
+
+# Lower case marks this as `global`-rebound module state, the idiom `_EXPORTS`
+# above is process-global for the same reason: the sweeper's death is a fact
+# about THIS process, and only a restart -- which is also the only thing that
+# fixes it -- clears it.
+_sweeper_death: SweeperDeath | None = None
+
+
+def on_export_sweeper_done(task: asyncio.Task[None]) -> None:
+    """Latch and report the sweeper's death; a shutdown cancellation is not one.
+
+    Registered at the creation site in the lifespan, mirroring the worker's
+    create -> append -> ``add_done_callback`` order, so task ownership stays
+    readable in the one place it is reasoned about.
+
+    The ``cancelled()`` check FIRST is the whole false-positive defence: every
+    clean shutdown cancels this task, so a callback without it would latch a
+    death and alert the operator on every restart. It is also what keeps the
+    callback total -- ``Task.exception()`` RAISES ``CancelledError`` on a
+    cancelled task, and a raise here reaches only the loop's exception handler.
+
+    Never raises: the only rendering it does is ``safe_detail``, which cannot.
+    Loud but not fatal -- the process keeps serving and the sweeper is never
+    restarted; see the plan's D3 for why a disk-hygiene timer does not earn
+    the worker's ``os._exit(1)``.
+    """
+    global _sweeper_death
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        logger.critical("export sweeper returned unexpectedly (no exception)")
+        _sweeper_death = SweeperDeath(
+            at=isoformat_utc(utc_now()), reason="returned", detail=""
+        )
+        return
+    logger.critical(
+        "export sweeper crashed",
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    _sweeper_death = SweeperDeath(
+        at=isoformat_utc(utc_now()), reason="crashed", detail=safe_detail(exc)
+    )
+
+
+def export_sweeper_death() -> SweeperDeath | None:
+    """The latched sweeper death, or ``None`` while it is still running."""
+    return _sweeper_death
+
+
+def reset_export_sweeper_death() -> None:
+    """Clear the latch. Test seam only -- production never un-latches.
+
+    Wired into an autouse fixture because two graceful-shutdown tests crash a
+    REAL lifespan's sweeper; without this the latch leaks into unrelated
+    modules as an unattributable ``overall == "critical"``.
+    """
+    global _sweeper_death
+    _sweeper_death = None
 
 
 @router.post("/export/begin")

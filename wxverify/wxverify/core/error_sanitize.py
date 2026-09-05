@@ -19,6 +19,24 @@ def sanitized_exception(exc: BaseException) -> str:
     return redact_urls(str(exc))
 
 
+def safe_detail(exc: BaseException) -> str:
+    """Render an exception for a surface that must not raise while rendering.
+
+    Three properties, each load-bearing. The TYPE NAME is included because
+    ``sanitized_exception`` is ``redact_urls(str(exc))`` and carries none, so a
+    zero-argument ``raise RuntimeError`` would otherwise ship an empty detail --
+    discarding the single most diagnostic token on a surface that leaves the
+    process. The REDACTION stays, because this string reaches Home Assistant.
+    And the render CANNOT RAISE: ``sanitized_exception`` calls ``exc.__str__``,
+    and a pathological one must degrade to the class name rather than propagate
+    into a done-callback or out of a never-raises coroutine.
+    """
+    try:
+        return f"{type(exc).__name__}: {sanitized_exception(exc)}"
+    except Exception:
+        return type(exc).__name__
+
+
 def redact_urls(message: str) -> str:
     return _URL_RE.sub(lambda match: _redact_url(match.group(0)), message)
 

@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
+from wxverify.api.routes.db_transfer import export_sweeper_death
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.options import load_runtime_options
@@ -16,6 +17,7 @@ from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
 from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
+from wxverify.verification.read_cache import warm_outcome
 
 router = APIRouter(prefix="/api", tags=["health"])
 
@@ -343,6 +345,20 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
     # above, must not run inside _read under the read lock.
     result["generation"] = db.generation
     result["last_import_swap_at"] = db.last_import_swap_at
+    # Process state too, and present-and-None before any warm has run rather
+    # than absent. One slot shared by the boot warm and every publish-time
+    # warm, so a `running` state is only diagnosable against its `at` stamp.
+    warm = warm_outcome()
+    result["read_cache_warm"] = (
+        None
+        if warm is None
+        else {
+            "state": warm.state,
+            "at": warm.at,
+            "detail": warm.detail,
+            "derivations_failed": warm.derivations_failed,
+        }
+    )
     return result
 
 
@@ -351,6 +367,19 @@ async def health_monitor() -> dict[str, object]:
     now = utc_now()
     try:
         opts = load_runtime_options()
+        # Process state, not DB state: read here on the event loop and NEVER
+        # inside `_read`, which runs under the read lock it would be reporting
+        # on -- the same rule the post-await block in `worker_status` follows.
+        # The rendered line is composed here because `monitor.py` takes a plain
+        # `str | None`: a pure domain module must not import an API-routes one.
+        death = export_sweeper_death()
+        export_sweeper_dead: str | None = None
+        if death is not None:
+            export_sweeper_dead = (
+                f"export sweeper crashed at {death.at}: {death.detail}"
+                if death.reason == "crashed"
+                else f"export sweeper returned unexpectedly at {death.at}"
+            )
 
         def _read(conn: sqlite3.Connection) -> dict[str, object]:
             return build_verdict(
@@ -359,6 +388,7 @@ async def health_monitor() -> dict[str, object]:
                 budget_enabled=opts.monitor_budget,
                 db_enabled=opts.monitor_db,
                 now=now,
+                export_sweeper_dead=export_sweeper_dead,
             )
 
         return await get_db().read(_read)
