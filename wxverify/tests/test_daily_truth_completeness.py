@@ -3,12 +3,10 @@
 DEF-11 (``docs/plans/2026-09-01-def11-daily-truth-completeness.md``).
 
 Thirteen oracles: the plan's eleven pure-function oracles -- O1a, O1b,
-O1c, O3, O3b, O5, O5b, O6, O7a, O7b, O8 -- plus O8b and O8c, both added
-after this file was drafted. O8b is not in the plan; it pins the
+O1c, O3, O3b, O5, O5b, O6, O7a, O7b, O8 -- plus O8b and O8c. O8b pins the
 ``bool(covered_hours) and`` fail-closed guard against Python's
 ``all([]) is True`` vacuity for the genuinely empty sequence, which O8's
-``[0, 0, 0, 0, 0]`` does not exercise. O8c is also not in the plan; added
-on architect direction during DEF-11 step 2 sign-off, it pins the
+``[0, 0, 0, 0, 0]`` does not exercise. O8c pins the
 ``max_computed_at is not None`` presence guard against a
 ``max_computed_at is None or (...)`` mutant, using the separating state
 O8's docstring already discloses its own fixture cannot reach: C1-true
@@ -389,8 +387,7 @@ def test_o8_zero_observations_defers_then_clears_on_the_deadline() -> None:
 
 
 def test_o8b_empty_covered_hours_fails_closed_not_vacuously_true() -> None:
-    """O8b -- added on operator direction after this file was drafted;
-    this id and test are NOT in the plan. Pins that C1 means at least one
+    """O8b pins that C1 means at least one
     evaluated quantity, AND every evaluated quantity complete -- plan §5
     D3's pseudocode states only the second half. Python's
     ``all([]) is True`` would otherwise let a caller that evaluated zero
@@ -418,8 +415,8 @@ def test_o8b_empty_covered_hours_fails_closed_not_vacuously_true() -> None:
 
 
 def test_o8c_complete_coverage_with_no_computed_at_still_awaits_quiescence() -> None:
-    """O8c -- added on architect direction during DEF-11 step 2 sign-off;
-    not in the plan. O8's docstring already discloses that its
+    """O8c -- added on architect direction during DEF-11 step 2 sign-off.
+    O8's docstring already discloses that its
     ``covered_hours = [0, 0, 0, 0, 0]`` fixture cannot separate pristine
     from a ``quiesced = max_computed_at is None or (...)`` mutant, because
     C1 already fails that fixture regardless of C2. This oracle supplies

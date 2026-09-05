@@ -636,7 +636,7 @@ def test_o10_outage_clamps_to_last_observed_day() -> None:
     zero-coverage days.
 
     Kills: clamping the window's upper bound by the ceiling alone (without
-    also clamping by the last observed day) -- ``materialize_daily_truth``
+    also clamping by the last observed day) -- ``materialize_admitted_day``
     happily materializes a day with zero observations (all quantities
     ineligible), so an unclamped implementation would create rows for every
     day between the outage and the ceiling instead of stopping.
@@ -1101,7 +1101,8 @@ def test_o17_site_wide_precondition_fault_is_a_preamble_fault(
     contained per-day faults.
 
     Kills: leaving the ``float()`` coercion only inside
-    ``materialize_daily_truth``'s per-day body (would commit every day in
+    ``_evaluate_day``'s per-day body (reached via
+    ``materialize_admitted_day``) -- would commit every day in
     the window with a per-day ERROR logged for each, materializing rows
     under a misclassification of a site-wide fault as N day faults).
     """
