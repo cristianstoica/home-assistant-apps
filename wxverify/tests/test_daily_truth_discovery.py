@@ -45,6 +45,7 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_pointer_key,
 )
+from wxverify.verification.completeness import AdmissionDecision
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.runs import settled_through
 from wxverify.verification.truth import (
@@ -736,9 +737,11 @@ def test_o9_structural_termination_independent_of_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``discover`` reaches ``regen`` in a bounded number of chunks even
-    when ``materialize_daily_truth`` never actually creates a row -- the
+    when ``materialize_admitted_day`` never actually creates a row -- the
     chunk cursor's forward progress terminates the phase, not the missing
-    set shrinking.
+    set shrinking. A day that defers is exactly that shape in production,
+    so the stub below returns a deferring decision rather than a fake
+    admission.
 
     Kills: a "materialized day leaves the missing set" termination
     formulation. If ``discover`` re-derived its next window purely from
@@ -758,11 +761,12 @@ def test_o9_structural_termination_independent_of_materialization(
         *,
         site_id: int,
         local_date: str,
-        tz_generation_id: int | None = None,
-    ) -> dict[str, object]:
-        return {}
+        tz_generation_id: int,
+        now: datetime,
+    ) -> AdmissionDecision:
+        return AdmissionDecision(admit=False, basis=None, reason="stub_never_admits")
 
-    monkeypatch.setattr(truth, "materialize_daily_truth", _noop_materialize)
+    monkeypatch.setattr(truth, "materialize_admitted_day", _noop_materialize)
 
     max_steps = -(-len(days) // 2) + 1  # ceil(5/2) + 1 = 4
     steps = 0
@@ -966,15 +970,23 @@ def test_o15_one_unbuildable_day_is_contained_chunk_commits(
         assert db.write_sync(_corrupt_d2) == "text"
 
         sentinel_key = "test:o15:sentinel"
-        real_materialize = truth.materialize_daily_truth
+        real_materialize = truth.materialize_admitted_day
+        # Plain in-process list, not written through conn: a savepoint
+        # rollback on the fault day cannot erase it, so it stays a live
+        # liveness probe even if the DB-side sentinel assertion below were
+        # ever satisfied vacuously (e.g. the seam moving and the wrapper
+        # never firing at all).
+        calls: list[str] = []
 
         def _wrapper(
             conn: sqlite3.Connection,
             *,
             site_id: int,
             local_date: str,
-            tz_generation_id: int | None = None,
-        ) -> dict[str, object]:
+            tz_generation_id: int,
+            now: datetime,
+        ) -> AdmissionDecision:
+            calls.append(local_date)
             if local_date == d2:
                 set_runtime_state(conn, sentinel_key, "1")
             return real_materialize(
@@ -982,12 +994,13 @@ def test_o15_one_unbuildable_day_is_contained_chunk_commits(
                 site_id=site_id,
                 local_date=local_date,
                 tz_generation_id=tz_generation_id,
+                now=now,
             )
 
         import pytest as _pytest  # local alias to keep monkeypatch scoped here
 
         mp = _pytest.MonkeyPatch()
-        mp.setattr(truth, "materialize_daily_truth", _wrapper)
+        mp.setattr(truth, "materialize_admitted_day", _wrapper)
         try:
             payload: dict[str, object] = {"truth_discovery_days": 2}
             caplog = _CapLogAdapter()
@@ -1015,6 +1028,13 @@ def test_o15_one_unbuildable_day_is_contained_chunk_commits(
             assert int(d2_rows["n"]) == 0
             sentinel = db.read_sync(lambda conn: get_runtime_state(conn, sentinel_key))
             assert sentinel is None
+
+            # Durable liveness check: proves the wrapper actually ran (and
+            # for which days) regardless of which per-day seam the discover
+            # phase calls -- if that seam moves again without repointing the
+            # patch above, this goes RED instead of the sentinel assertion
+            # silently passing on an unpatched real call.
+            assert calls == [d1, d2]
 
             error_records = [
                 r
@@ -1161,15 +1181,16 @@ def test_o18_infra_fault_inside_per_day_body_propagates_whole_chunk(
 
         site_id = db.write_sync(_seed)
         d1, d2 = "2026-06-01", "2026-06-02"
-        real_materialize = truth.materialize_daily_truth
+        real_materialize = truth.materialize_admitted_day
 
         def _fake(
             conn: sqlite3.Connection,
             *,
             site_id: int,
             local_date: str,
-            tz_generation_id: int | None = None,
-        ) -> dict[str, object]:
+            tz_generation_id: int,
+            now: datetime,
+        ) -> AdmissionDecision:
             if local_date == d2:
                 raise sqlite3.OperationalError("disk I/O error")
             return real_materialize(
@@ -1177,12 +1198,13 @@ def test_o18_infra_fault_inside_per_day_body_propagates_whole_chunk(
                 site_id=site_id,
                 local_date=local_date,
                 tz_generation_id=tz_generation_id,
+                now=now,
             )
 
         import pytest as _pytest
 
         mp = _pytest.MonkeyPatch()
-        mp.setattr(truth, "materialize_daily_truth", _fake)
+        mp.setattr(truth, "materialize_admitted_day", _fake)
         try:
             payload: dict[str, object] = {"truth_discovery_days": 5}
             caplog = _CapLogAdapter()

@@ -242,7 +242,7 @@ def advance_verification(
             raise JobCancelled()
         # Site-wide precondition, probed at chain level so a corrupt value is
         # a LOUD terminal failure instead of one contained ERROR per day of
-        # the backlog. The value is NOT passed on: materialize_daily_truth
+        # the backlog. The value is NOT passed on: materialize_admitted_day
         # reads and uses its own.
         float(site["rain_threshold_mm"])
         limit = _chunk_size(

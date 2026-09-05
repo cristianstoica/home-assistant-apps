@@ -38,6 +38,7 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_clause,
 )
+from wxverify.verification.completeness import AdmissionDecision, decide_admission
 from wxverify.verification.coverage import (
     VARIABLE_QUANTITIES,
     DayBounds,
@@ -530,6 +531,66 @@ def missing_truth_days(
     return missing
 
 
+def materialize_admitted_day(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: str,
+    tz_generation_id: int,
+    now: datetime,
+) -> AdmissionDecision:
+    """Materialize one (site, local day) ONLY if admission allows it (DEF-11).
+
+    The gated creation path, and the only one: evaluate the day, decide, and
+    write the five rows or write nothing at all. A deferred day leaves no
+    trace, so the next nightly set difference re-offers it unchanged — that
+    is the whole reason deferral needs no retry state. The recorded
+    ``admission_basis`` is the decision's own basis, so a row always says
+    which branch created it. Sole caller:
+    :func:`materialize_missing_truth_days`; regeneration and the timezone
+    rebuild keep using the ungated :func:`materialize_daily_truth`, because
+    gating a rewrite would strand a ``stale = 1`` row forever.
+
+    ``tz_generation_id`` is REQUIRED, matching :func:`_evaluate_day`: the
+    caller resolves the published generation once per chunk, so this
+    function never seeds one per day.
+
+    Converting ``max_computed_at`` from its stored string to a datetime
+    happens HERE, one step before the decision, and never inside
+    ``decide_admission`` — which takes ``datetime | None`` and stays pure.
+    A non-NULL stamp the database cannot interpret is an invariant
+    violation, so the ``ValueError`` from :func:`parse_utc` is deliberately
+    left to escape: it is NOT coerced to None (None is the distinct fact
+    "this day holds no observation timestamp at all", which C2 reads as
+    not-quiesced), it never reaches a decision on either branch, and it
+    escapes BEFORE any write, so the day stays absent rather than
+    half-written. This conversion is also the only guaranteed validation
+    point on the path: the running-max fold in :func:`_evaluate_day`
+    short-circuits on the FIRST non-NULL stamp, so a day whose only stamp is
+    malformed would otherwise pass through unvalidated while a day carrying
+    two would raise.
+
+    Must run on a write connection inside the caller's transaction.
+    """
+    ev = _evaluate_day(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        tz_generation_id=tz_generation_id,
+    )
+    stamp = None if ev.max_computed_at is None else parse_utc(ev.max_computed_at)
+    decision = decide_admission(
+        day_end_utc=ev.bounds.end_utc,
+        expected_slots=ev.bounds.expected_slots,
+        covered_hours=[outcome.covered_hours for outcome in ev.outcomes.values()],
+        max_computed_at=stamp,
+        now=now,
+    )
+    if decision.admit:
+        _write_day(conn, ev, site_id=site_id, admission_basis=decision.basis)
+    return decision
+
+
 def materialize_missing_truth_days(
     conn: sqlite3.Connection,
     *,
@@ -542,7 +603,7 @@ def materialize_missing_truth_days(
 
     The structural analogue of :func:`regenerate_marked_truth_chunk`: one
     bounded batch per chain chunk. Must run on a WRITE connection inside the
-    caller's transaction — :func:`materialize_daily_truth`'s own contract.
+    caller's transaction — :func:`materialize_admitted_day`'s own contract.
     The published generation is resolved (and seeded on first use) ONCE per
     chunk and passed explicitly to every per-day call, and the timezone comes
     from that generation, never from ``sites.timezone``: a ceiling computed
@@ -551,9 +612,15 @@ def materialize_missing_truth_days(
     observations arriving mid-chain and a ceiling that steps over a local
     midnight are both picked up by the next chunk.
 
+    Every day goes through :func:`materialize_admitted_day`, so a day whose
+    content is still arriving is DEFERRED — nothing written, one INFO record
+    naming the site, the local date and the failing condition, and the day
+    re-offered unchanged by the next night's set difference.
+
     Returns one entry per day selected from the window, ascending, whether or
-    not it materialized. ``len(result) < limit`` therefore means the window
-    is exhausted, never that days failed.
+    not it materialized — deferred and failed days included. ``len(result) <
+    limit`` therefore means the window is exhausted, never that days failed
+    or deferred.
 
     Failure boundary. The preamble — generation, zone, observation extent,
     ceiling, presence query — is site- or generation-wide: every day in the
@@ -586,11 +653,12 @@ def materialize_missing_truth_days(
     for day in days:
         conn.execute("SAVEPOINT truth_discovery_day")
         try:
-            materialize_daily_truth(
+            decision = materialize_admitted_day(
                 conn,
                 site_id=site_id,
                 local_date=day.isoformat(),
                 tz_generation_id=generation_id,
+                now=now,
             )
         except (JobDeferred, JobCancelled, StaleGenerationError):
             # Worker control signals and a database swap are not data faults.
@@ -598,10 +666,13 @@ def materialize_missing_truth_days(
             # already lets them past; this clause states the boundary.
             raise
         except ValueError as exc:
-            # Day DATA only. Every carrier inside materialize_daily_truth
-            # that a single day's rows can produce is a ValueError; a
-            # sqlite3.Error, KeyError/ZoneInfoNotFoundError, TypeError or any
-            # programming defect is systemic and must reach the retry ladder.
+            # Day DATA only. Every carrier inside materialize_admitted_day
+            # that a single day's rows can produce is a ValueError — a
+            # non-numeric observations.value, and a malformed non-NULL
+            # computed_at, which the admission conversion raises on before
+            # any decision and before any write. A sqlite3.Error,
+            # KeyError/ZoneInfoNotFoundError, TypeError or any programming
+            # defect is systemic and must reach the retry ladder.
             # No `finally`: on the propagating path the savepoint is
             # discarded with the whole transaction by `Database._run_immediate`.
             conn.execute("ROLLBACK TO truth_discovery_day")
@@ -614,6 +685,14 @@ def materialize_missing_truth_days(
             )
         else:
             conn.execute("RELEASE truth_discovery_day")
+            if not decision.admit:
+                logger.info(
+                    "daily_truth discovery: day deferred site=%s local_date=%s "
+                    "reason=%s",
+                    site_id,
+                    day.isoformat(),
+                    decision.reason,
+                )
         attempted.append(day.isoformat())
     return attempted
 
