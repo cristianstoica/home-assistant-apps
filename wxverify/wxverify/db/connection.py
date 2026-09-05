@@ -448,6 +448,59 @@ class Database:
             conn.close()
         self._conn.close()
 
+    def close_if_idle(self) -> bool:
+        """Close every connection, but only while none of them is in use.
+
+        Returns ``True`` when the connections were closed, ``False`` when a
+        write was in flight or a pooled reader was checked out.
+
+        Closing a connection another thread is mid-statement on is a
+        use-after-close at the C level, not a Python error: every connection
+        here is opened ``check_same_thread=False`` (:131, :144) and every
+        query runs in an executor thread, so a ``close()`` and a live query
+        can genuinely overlap. ``close()`` itself neither clears the gate nor
+        drains the pool -- unlike ``replace_from`` -- so the caller is what
+        has to establish that overlap is impossible.
+
+        Both checks run on the event-loop thread with no ``await`` between
+        them and the ``close()`` they guard, so what they report cannot go
+        stale before it is used: a writer holds ``_write_lock`` for the
+        whole of ``write``/``write_fenced``, and a reader holds its
+        connection OUT of ``_read_pool`` for the whole of ``read``.
+
+        State what that buys exactly, because it is narrower than
+        "nothing is going on": when both predicates read idle, no thread
+        is EXECUTING on any connection, so this close cannot land
+        mid-statement. It does NOT mean no one can acquire afterwards.
+        ``asyncio.Lock.locked()`` reports the HOLDER only and never
+        consults the wait queue, so a writer already queued on
+        ``_write_lock`` is invisible here and may take it the moment this
+        returns; that caller gets a ``ProgrammingError`` on a closed
+        connection -- the same clean failure as a late reader, not
+        corruption.
+
+        ``_read_sync_conn`` is covered by neither check and needs no cover:
+        ``read_sync``/``write_sync`` have no caller inside the server process
+        (only ``__main__``'s CLI subcommands and tests).
+
+        The read gate is deliberately NOT cleared. A reader arriving after
+        this returns must fail loudly with ``ProgrammingError`` rather than
+        park forever on an event nobody will set again.
+        """
+        if self._write_lock.locked():
+            logger.warning("close skipped: a write is in flight")
+            return False
+        idle = self._read_pool.qsize()
+        if idle != _READ_POOL_SIZE:
+            logger.warning(
+                "close skipped: %d of %d pooled readers checked out",
+                _READ_POOL_SIZE - idle,
+                _READ_POOL_SIZE,
+            )
+            return False
+        self.close()
+        return True
+
     async def replace_from(self, new_db: Path, backup: Path) -> None:
         """Replace the live DB file with ``new_db``, backing up the current DB.
 
