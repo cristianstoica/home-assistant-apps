@@ -39,9 +39,14 @@ hold across the run's life, and neither is absolute:
   observation ingest DOES write ``daily_truth`` in that window —
   ``mark_daily_truth_stale`` sets ``stale = 1`` — but ``stale`` is not
   hashed here, so an intervening consensus change only marks rows stale
-  and leaves this digest alone. Administrative paths — database
-  import/replace, repair tooling, migrations — have not been traced
-  against an active run and are outside this claim.
+  and leaves this digest alone. Excluding ``stale`` from the digest is a
+  hashing choice and not a claim that a marked day still re-derives to
+  what it stored, so ``divergent_truth_in_horizon`` supplies that
+  enforcement instead — re-deriving every marked day of the run's
+  generation inside the horizon before publish and failing the run when
+  one no longer matches. Administrative paths — database import/replace,
+  repair tooling, migrations — have not been traced against an active run
+  and are outside this claim.
 
 Pinning at ``start_run`` does not DEPEND on absolute immutability. What
 matters is that the recorded fingerprint accurately describes the basis

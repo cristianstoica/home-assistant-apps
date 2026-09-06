@@ -18,6 +18,18 @@ that already have rows; the CREATIVE path is
 ``discover`` phase, which materializes settled local days ``daily_truth``
 has never held.
 
+Creation is ADMITTED, never automatic (DEF-11): the discovery path reaches
+``daily_truth`` only through :func:`materialize_admitted_day`, which
+evaluates the day and lets ``completeness.decide_admission`` rule on it —
+exactly covered and quiesced, or past its deadline — then writes all five
+quantity rows under that basis, or writes nothing at all and leaves the day
+to the next night's set difference. Regeneration
+(:func:`regenerate_marked_truth`, :func:`regenerate_marked_truth_chunk`)
+and the retrospective timezone rebuild are deliberately UNGATED, still
+writing through :func:`materialize_daily_truth`: admission rules on whether
+a day's content has finished ARRIVING, and re-asking that of a rewrite
+would strand a ``stale = 1`` row that nothing would ever rebuild.
+
 Reads are generation-bound through the shared
 ``published_generation_clause`` accessor — a partially built correction
 generation is never read.
@@ -716,3 +728,104 @@ def load_daily_truth(
         """,
         (site_id, local_date),
     ).fetchall()
+
+
+def divergent_truth_in_horizon(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    tz_generation_id: int,
+    period_start: str,
+    period_end: str,
+) -> list[tuple[str, str]]:
+    """(local_date, quantity) pairs whose stored truth no longer re-derives.
+
+    The pre-publish gate (§14): a run pins its truth values at ``start_run``
+    and every later phase consumes them, so publishing after one of those
+    values changed would report scores computed against the superseded
+    value. This answers exactly one question — did any truth value this run
+    consumed change after the run pinned its inputs? — over the run's own
+    generation and horizon, and answers it without firing on the routine.
+
+    ``stale = 1`` is an INDEX here, never a verdict. The flag is a
+    regeneration marker ("look at this day again"), set as readily by an
+    idempotent refetch as by a correction, and ``period_start`` is
+    ``MIN(local_date)`` over the generation, so every historical day sits
+    inside every run's horizon and a flag test would fire on any mark
+    anywhere in the record. Marked days inside the horizon are only the
+    candidates; the verdict is a re-derivation compared on ``value``,
+    ``eligible`` and ``covered_hours`` — exactly the scored columns
+    ``result_basis_fingerprint`` hashes, so the gate fires precisely when
+    the run's own result basis would move. The comparison is bit-exact and
+    needs no tolerance: both sides come from the same ``evaluate_variable``
+    path over the same rows, :func:`_write_day` stores the value unrounded,
+    and a NULL value compares None to None.
+
+    Both scopes are load-bearing. The generation scope keeps a retired
+    generation's divergent row from wedging publication permanently —
+    :func:`regenerate_marked_truth_chunk` refuses retired generations, so
+    nothing would ever clear it. The horizon scope excludes today's
+    in-progress day, which ordinary ingest marks and which genuinely
+    diverges all day long.
+
+    Read-only by construction: :func:`_evaluate_day` only reads and takes
+    the generation as a REQUIRED argument, so this can never reach
+    ``ensure_published_generation`` and never writes. Zero cost on a clean
+    night — the candidate query is one lookup on the partial index
+    ``idx_daily_truth_stale`` and returns nothing.
+    """
+    candidates = conn.execute(
+        """
+        SELECT DISTINCT local_date FROM daily_truth
+        WHERE site_id = ? AND tz_generation_id = ? AND stale = 1
+          AND local_date BETWEEN ? AND ?
+        ORDER BY local_date
+        """,
+        (site_id, tz_generation_id, period_start, period_end),
+    ).fetchall()
+    divergent: list[tuple[str, str]] = []
+    for candidate in candidates:
+        local_date = str(candidate["local_date"])
+        ev = _evaluate_day(
+            conn,
+            site_id=site_id,
+            local_date=local_date,
+            tz_generation_id=tz_generation_id,
+        )
+        # The candidate query already fixed site, generation, horizon and
+        # stale-day membership; this fetch takes EVERY stored quantity of
+        # the candidate day, deliberately WITHOUT a `stale` predicate,
+        # because repair rewrites the whole day and
+        # `result_basis_fingerprint` covers all of its rows. The generation
+        # predicate is what keeps another generation's row from ever being
+        # compared against this re-derivation.
+        stored = conn.execute(
+            """
+            SELECT quantity, value, eligible, covered_hours
+            FROM daily_truth
+            WHERE site_id = ? AND tz_generation_id = ? AND local_date = ?
+            ORDER BY quantity
+            """,
+            (site_id, tz_generation_id, local_date),
+        ).fetchall()
+        for row in stored:
+            quantity = str(row["quantity"])
+            outcome = ev.outcomes.get(quantity)
+            if outcome is None:
+                # Defence in depth, not a live path: unreachable while
+                # `_TRUTH_VARIABLES` and daily_truth's `quantity` CHECK
+                # agree on the same five quantities (a day with no
+                # observation at all still re-derives to five outcomes).
+                # A quantity added to the schema before the evaluator
+                # learns it therefore fails closed rather than being
+                # vouched for.
+                divergent.append((local_date, quantity))
+                continue
+            value = None if row["value"] is None else float(row["value"])
+            if (
+                value != outcome.value
+                or (int(row["eligible"]) == 1) != outcome.eligible
+                or int(row["covered_hours"]) != outcome.covered_hours
+            ):
+                divergent.append((local_date, quantity))
+    return divergent
