@@ -456,11 +456,12 @@ class Database:
 
         Closing a connection another thread is mid-statement on is a
         use-after-close at the C level, not a Python error: every connection
-        here is opened ``check_same_thread=False`` (:131, :144) and every
-        query runs in an executor thread, so a ``close()`` and a live query
-        can genuinely overlap. ``close()`` itself neither clears the gate nor
-        drains the pool -- unlike ``replace_from`` -- so the caller is what
-        has to establish that overlap is impossible.
+        here is opened ``check_same_thread=False`` (``_connect_reader``,
+        ``_open``) and every query runs in an executor thread, so a
+        ``close()`` and a live query can genuinely overlap. ``close()``
+        itself neither clears the gate nor drains the pool -- unlike
+        ``replace_from`` -- so the caller is what has to establish that
+        overlap is impossible.
 
         Both checks run on the event-loop thread with no ``await`` between
         them and the ``close()`` they guard, so what they report cannot go
