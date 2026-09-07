@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.14.0
+
+Stops the nightly run from scoring a day whose measurements are still
+arriving, and corrects a misleading reason shown when a forecast
+comparison has no usable baseline.
+
+### Changed
+
+- The nightly run no longer scores a day as soon as it can. It now waits
+  until either every measurement it needs for that day has arrived and
+  nothing new has turned up for an hour, or until 24 hours after the day
+  ended — whichever comes first. A day that is not ready is skipped and
+  offered again on the next run, so a day is scored once, from settled
+  data, rather than from a partial picture.
+- Each scored day now records which of those two reasons admitted it.
+  Days scored before this release carry no such record, which is exactly
+  how a pre-gate day is identified; nothing is filled in retroactively.
+
+### Fixed
+
+- A run can no longer publish results computed from ground truth that
+  changed after the run started. Before publishing, every day the run
+  marked as changed is re-derived and compared against the values the run
+  recorded, and any mismatch stops publication.
+- When a forecast comparison had no usable leads in its core window, the
+  page blamed the reference forecast — "required baseline missing or
+  under-supported" — even when the reference was fine and the forecast
+  being checked was the one that dropped every lead. The reason shown now
+  names the actual cause.
+
+Includes a database schema update (adds a new column). Once a database
+has been opened by this version, it can no longer be opened by 0.13.5 or
+earlier.
+
 ## 0.13.5
 
 Fixes the verification page's freshness warning, which used to read
