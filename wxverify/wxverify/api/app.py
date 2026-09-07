@@ -274,8 +274,8 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     active exception here belongs to `result`; and because this helper runs
     from a `finally` that may be unwinding a startup failure,
     `sys.exc_info()` is not even empty -- `logger.exception` would silently
-    attach THAT traceback instead. `wxverify/core/aio.py:64` uses the same
-    idiom for the same reason.
+    attach THAT traceback instead. `core.aio.run_to_completion` uses the
+    same idiom for the same reason.
     """
     names = [name for name, _ in tasks]
     handles = [task for _, task in tasks]
