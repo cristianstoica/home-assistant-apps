@@ -804,11 +804,27 @@ history.
 
 ## Local Checks
 
-Run these before relying on a local build:
+These are the same gates CI runs. Run them from the `wxverify/` add-on
+directory, in this order:
 
 ```sh
-uv run pytest
-uv run pyright wxverify
-uv run ruff check wxverify tests
-uv run ruff format --check wxverify tests
+uv lock --check
+uv sync --locked
+uv run --locked ruff check
+uv run --locked ruff format --check
+uv run --locked pyright
+WXV_WEATHERCOM_KEY=ci-placeholder uv run --locked pytest
+uv run --locked python -m wxverify --help
 ```
+
+Run each gate unscoped, exactly as written: narrowing one to a path can make it
+pass without checking anything. pyright is configured with `exclude = ["tests"]`,
+so `uv run --locked pyright tests/test_daily_truth_oracles.py` prints
+`0 errors, 0 warnings, 0 informations` while analyzing zero files
+(`filesAnalyzed: 0` under `--outputjson`) — it type-checks nothing and reports
+success. `ruff format --check` covers 227 files from the add-on directory but
+only 225 when scoped to `wxverify tests`, which drops `scripts/`.
+
+CI additionally runs the query-plan tests inside the add-on's base image with
+`WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
+than the local one. A green local run does not cover them.
