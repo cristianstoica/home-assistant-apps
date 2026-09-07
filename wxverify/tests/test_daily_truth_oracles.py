@@ -735,3 +735,69 @@ def test_evaluate_variable_dispatches_to_the_matching_evaluator() -> None:
         )
         == ()
     )
+
+
+# ----------------------------------- O14: precip total sample-order invariance
+
+
+def test_precip_total_is_invariant_to_sample_list_order() -> None:
+    """The daily precip total must not depend on ``samples`` list order.
+
+    §14's publish gate re-derives each candidate (stale, in-horizon) day and
+    compares the stored total against the re-derived one by exact equality —
+    if the sum were order-dependent, an unrelated index change that reorders
+    the upstream SQL result could make the gate block publication on data
+    that never changed. The observation fetch in ``truth._evaluate_day``
+    carries no ``ORDER BY``, so SQL row order reaches ``_hourly_slots``
+    unaltered and becomes the addition order of ``sum(slots.values())``.
+
+    ONE day is built once and its ``(hour, value)`` pairs are re-ordered
+    three ways, so the hour-to-value mapping is identical across cases and
+    only insertion order differs — the production variable exactly. The
+    value vector (six each of 0.1 / 0.2 / 0.3 / 0.0 mm) is
+    naive-order-sensitive: a plain left-to-right ``reduce`` over it gives
+    3.5999999999999988 forward and 3.6000000000000014 reversed — two
+    different float bit patterns for the identical multiset. Kills M28
+    (``sum(slots.values())`` -> ``functools.reduce(lambda a, b: a + b,
+    slots.values(), 0.0)``), which flips the first equality with exactly
+    those two values.
+
+    NOTE: this pins CPython 3.12+'s compensated (Neumaier) float summation
+    in ``builtins.sum`` being order-independent for this vector. The two
+    failure modes are not interchangeable. If the cross-order equality
+    fails, the sum became order-dependent and PRODUCTION must change —
+    there is no expected value to update. If only the ``hex()`` pin fails,
+    the sum is still order-independent but lands on a different double, so
+    stored ``precip_total`` values no longer re-derive equal and the publish
+    gate would fire across the whole history: re-check persistence
+    compatibility against production data first, and do not update the
+    expected value mechanically.
+    """
+    day = date(2031, 4, 9)
+    hours = [f"2031-04-09T{h:02d}:00:00Z" for h in range(24)]
+    values = [0.1] * 6 + [0.2] * 6 + [0.3] * 6 + [0.0] * 6
+    day_samples = list(zip(hours, values, strict=True))
+    orders = [
+        list(range(24)),  # forward
+        list(reversed(range(24))),  # reverse
+        # the four six-hour blocks resequenced 0.3 / 0.1 / 0.0 / 0.2
+        [i for block in (2, 0, 3, 1) for i in range(block * 6, block * 6 + 6)],
+    ]
+
+    outcomes = []
+    for order in orders:
+        samples = [day_samples[i] for i in order]
+        total, _ = evaluate_precip(
+            samples, timezone="UTC", local_date=day, rain_threshold_mm=0.2
+        )
+        assert total.covered_hours == 24
+        assert total.eligible
+        assert total.value is not None
+        outcomes.append(total)
+
+    # Same day, three insertion orders: the WHOLE outcome must match, not
+    # only the total — wet/dry counts and coverage are order-invariant too.
+    assert outcomes[0] == outcomes[1] == outcomes[2]
+    total_value = outcomes[0].value
+    assert total_value is not None
+    assert total_value.hex() == "0x1.ccccccccccccdp+1"  # == 3.6 exactly
