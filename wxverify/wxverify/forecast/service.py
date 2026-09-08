@@ -33,8 +33,9 @@ from wxverify.forecast.aggregate import (
     displayed_daily,
 )
 from wxverify.forecast.data import (
+    ForecastRanking,
     FutureSampleRow,
-    forecast_ranking,
+    forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
     samples_fingerprint,
@@ -45,7 +46,6 @@ from wxverify.forecast.selection import (
     representative_day_ahead,
     select_cell_feeds,
 )
-from wxverify.scoring.leaderboard import LeaderboardRow
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.web.context import feed_label
 
@@ -67,7 +67,7 @@ class FeedRef:
 class CellMeta:
     """Shared per-variable cell state: availability, ladder use, badges."""
 
-    state: str  # "normal" | "low_confidence" | "not_available"
+    state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
     feeds: list[FeedRef]
     partial: bool
     stale: bool
@@ -110,7 +110,8 @@ class DayTile:
     temp: TempCell
     wind: WindCell
     precip: PrecipCell
-    state: str  # tile-level: "normal" | "low_confidence" | "not_available"
+    # tile-level: "normal" | "low_confidence" | "rebuilding" | "not_available"
+    state: str
     stale: bool
     partial: bool
 
@@ -126,7 +127,7 @@ class ForecastView:
 
 # variable -> display day -> feed_id -> samples
 _Grouped = dict[str, dict[int, dict[int, list[FutureSampleRow]]]]
-_RankCache = dict[tuple[str, int], dict[int, LeaderboardRow]]
+_RankCache = dict[tuple[str, int], ForecastRanking]
 
 
 def build_forecast(
@@ -174,7 +175,7 @@ def build_forecast(
         cells: dict[str, tuple[CellMeta, CellSelection, dict[int, list[float]]]] = {}
         for variable in VARIABLES:
             feeds_samples = grouped.get(variable, {}).get(day, {})
-            selection = _select(
+            selection, rebuilding_by_feed = _select(
                 conn,
                 site_id=site_id,
                 variable=variable,
@@ -187,6 +188,7 @@ def build_forecast(
                 selection,
                 feeds_samples=feeds_samples,
                 stale_ids=stale_ids,
+                rebuilding_by_feed=rebuilding_by_feed,
             )
             cells[variable] = (meta, selection, values)
         tiles.append(
@@ -239,9 +241,10 @@ def build_hourly(
     rank_cache: _RankCache = {}
 
     selections: dict[str, CellSelection] = {}
+    rebuilding: dict[str, dict[int, bool]] = {}
     for variable in VARIABLES:
         feeds_samples = grouped.get(variable, {}).get(day, {})
-        selections[variable] = _select(
+        selections[variable], rebuilding[variable] = _select(
             conn,
             site_id=site_id,
             variable=variable,
@@ -294,6 +297,15 @@ def build_hourly(
 
     tz = ZoneInfo(timezone)
     today = at.astimezone(tz).date()
+    states = {
+        variable: _state_of(
+            selections[variable],
+            ranking_rebuilding=_any_rebuilding(
+                selections[variable].feeds, rebuilding[variable]
+            ),
+        )
+        for variable in VARIABLES
+    }
     return {
         "site_id": site_id,
         "day": day,
@@ -314,14 +326,22 @@ def build_hourly(
             }
             for feed_id, label in feed_order
         ],
-        "states": {variable: _state_of(selections[variable]) for variable in VARIABLES},
+        "states": states,
     }
 
 
-def _state_of(selection: CellSelection) -> str:
+def _state_of(selection: CellSelection, *, ranking_rebuilding: bool) -> str:
     if not selection.available:
         return "not_available"
+    if selection.low_confidence and ranking_rebuilding:
+        return "rebuilding"
     return "low_confidence" if selection.low_confidence else "normal"
+
+
+def _any_rebuilding(
+    feeds: list[CellCandidate], rebuilding_by_feed: dict[int, bool]
+) -> bool:
+    return any(rebuilding_by_feed[c.feed_id] for c in feeds)
 
 
 def relative_ago(timestamp: str, *, now: datetime) -> str:
@@ -358,9 +378,10 @@ def _select(
     feeds_samples: dict[int, list[FutureSampleRow]],
     blend_depth: int,
     rank_cache: _RankCache,
-) -> CellSelection:
+) -> tuple[CellSelection, dict[int, bool]]:
     """Build candidates for one cell and run the fallback ladder."""
     candidates: list[CellCandidate] = []
+    rebuilding_by_feed: dict[int, bool] = {}
     for feed_id, feed_samples in feeds_samples.items():
         rep = representative_day_ahead(
             [
@@ -370,10 +391,11 @@ def _select(
         )
         key = (variable, rep)
         if key not in rank_cache:
-            rank_cache[key] = forecast_ranking(
+            rank_cache[key] = forecast_ranking_with_status(
                 conn, site_id=site_id, variable=variable, day_ahead=rep
             )
-        row = rank_cache[key].get(feed_id)
+        rebuilding_by_feed[feed_id] = rank_cache[key].status == "rebuilding"
+        row = rank_cache[key].rows.get(feed_id)
         candidates.append(
             CellCandidate(
                 feed_id=feed_id,
@@ -387,7 +409,8 @@ def _select(
                 covered_hours=covered_hours(s.valid_at for s in feed_samples),
             )
         )
-    return select_cell_feeds(candidates, blend_depth=blend_depth)
+    selection = select_cell_feeds(candidates, blend_depth=blend_depth)
+    return selection, rebuilding_by_feed
 
 
 def _cell_meta_and_values(
@@ -395,6 +418,7 @@ def _cell_meta_and_values(
     *,
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
+    rebuilding_by_feed: dict[int, bool],
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage guard; return cell meta + per-feed value lists.
 
@@ -422,7 +446,10 @@ def _cell_meta_and_values(
         for candidate in agg_feeds
     }
     meta = CellMeta(
-        state="low_confidence" if selection.low_confidence else "normal",
+        state=_state_of(
+            selection,
+            ranking_rebuilding=_any_rebuilding(agg_feeds, rebuilding_by_feed),
+        ),
         feeds=[
             FeedRef(
                 feed_id=candidate.feed_id,
@@ -482,6 +509,8 @@ def _build_tile(
         state = "not_available"
     elif any(meta.state == "low_confidence" for meta in populated):
         state = "low_confidence"
+    elif any(meta.state == "rebuilding" for meta in populated):
+        state = "rebuilding"
     else:
         state = "normal"
     return DayTile(
