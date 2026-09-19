@@ -13,31 +13,42 @@ _SECRET_QUERY_KEYS = frozenset(
 )
 
 
-def sanitized_exception(exc: BaseException) -> str:
+def _sanitized_parts(exc: BaseException) -> tuple[str, list[str]]:
+    """Redacted base message (may be empty) and redacted notes, unjoined."""
     if isinstance(exc, httpx.HTTPStatusError):
         text = _http_status_error(exc)
     else:
-        text = redact_urls(str(exc)).strip() or type(exc).__name__
+        text = redact_urls(str(exc)).strip()
     notes = exc.__notes__ if hasattr(exc, "__notes__") else []
-    return " ".join([text, *(redact_urls(note) for note in notes)])
+    return text, [redact_urls(note) for note in notes]
+
+
+def sanitized_exception(exc: BaseException) -> str:
+    text, notes = _sanitized_parts(exc)
+    return " ".join([text or type(exc).__name__, *notes])
 
 
 def safe_detail(exc: BaseException) -> str:
     """Render an exception for a surface that must not raise while rendering.
 
-    Three properties, each load-bearing. The TYPE NAME is included because
-    ``sanitized_exception`` is ``redact_urls(str(exc))`` and carries none, so a
-    zero-argument ``raise RuntimeError`` would otherwise ship an empty detail --
-    discarding the single most diagnostic token on a surface that leaves the
-    process. The REDACTION stays, because this string reaches Home Assistant.
-    And the render CANNOT RAISE: ``sanitized_exception`` calls ``exc.__str__``,
-    and a pathological one must degrade to the class name rather than propagate
-    into a done-callback or out of a never-raises coroutine.
+    The class name leads and appears exactly once: ``RuntimeError`` for a
+    zero-argument raise, ``RuntimeError: worker stopped`` when there is a
+    message. Whether the ``: message`` part is present is decided by the
+    sanitizer's own redacted base text being empty -- never by inspecting
+    what the rendered text starts with, so a message that happens to begin
+    with the class name is kept whole. Notes (PEP 678) follow in the
+    sanitizer's redacted form. The REDACTION stays, because this string
+    reaches Home Assistant. And the render CANNOT RAISE: sanitizing calls
+    ``exc.__str__``, and a pathological one must degrade to the class name
+    alone rather than propagate into a done-callback or out of a
+    never-raises coroutine.
     """
+    name = type(exc).__name__
     try:
-        return f"{type(exc).__name__}: {sanitized_exception(exc)}"
+        text, notes = _sanitized_parts(exc)
     except Exception:
-        return type(exc).__name__
+        return name
+    return " ".join([f"{name}: {text}" if text else name, *notes])
 
 
 def redact_urls(message: str) -> str:

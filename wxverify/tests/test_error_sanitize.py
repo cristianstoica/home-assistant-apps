@@ -1,4 +1,4 @@
-"""Tests for wxverify.core.error_sanitize.sanitized_exception.
+"""Tests for wxverify.core.error_sanitize: sanitized_exception and safe_detail.
 
 O14 — sanitized_exception never returns an empty string, even for an
 exception whose str() is empty (httpx maps a bare TimeoutError() this way
@@ -7,7 +7,10 @@ error_sanitize.py:16-19). O15 — exception notes (PEP 678, add_note) are
 appended and redacted the same way the base message is. O16 — a rendered
 UpstreamPayloadError line survives sanitization byte-for-byte. O22(b) pins
 the same empty-text guarantee at the real ``jobs.last_error`` column via
-``fail()``.
+``fail()``. ``TestSafeDetail`` pins the never-raising render both task-death
+surfaces use: the class name leads and appears once, the message and notes
+are the sanitizer's own redacted text, and a raising ``__str__`` degrades to
+the class name alone.
 
 Synthetic data only: ``SYNTHETIC-SECRET-KEY`` stands in for a real API key.
 """
@@ -19,9 +22,10 @@ import sqlite3
 from pathlib import Path
 
 import httpx
+import pytest
 
 from wxverify import config
-from wxverify.core.error_sanitize import sanitized_exception
+from wxverify.core.error_sanitize import safe_detail, sanitized_exception
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.queue import enqueue_if_absent, fail
 from wxverify.obs.pws_adapter import decode_observations_payload
@@ -145,3 +149,51 @@ def test_fail_persists_class_name_for_empty_text_exception(tmp_path: Path) -> No
         "SELECT last_error FROM jobs WHERE id=?", (enqueued.job_id,)
     ).fetchone()["last_error"]
     assert last_error == "ReadTimeout"
+
+
+# ---------------------------------------------------------------------------
+# safe_detail — class name once, the sanitizer's message and notes, no raise
+# ---------------------------------------------------------------------------
+
+
+class TestSafeDetail:
+    def test_zero_argument_exception_is_the_class_name_alone(self) -> None:
+        assert safe_detail(RuntimeError()) == "RuntimeError"
+
+    def test_message_is_prefixed_with_the_class_name(self) -> None:
+        assert (
+            safe_detail(RuntimeError("worker stopped"))
+            == "RuntimeError: worker stopped"
+        )
+
+    def test_zero_argument_with_notes_names_the_class_once(self) -> None:
+        exc = RuntimeError()
+        exc.add_note(f"see https://api.example.com/x?apiKey={_API_KEY}")
+        detail = safe_detail(exc)
+        assert detail == "RuntimeError see https://api.example.com/x?apiKey=%2A%2A%2A"
+        assert _API_KEY not in detail
+        assert detail == sanitized_exception(exc), (
+            "with no message there is nothing to prefix: safe_detail and "
+            "sanitized_exception must agree byte-for-byte"
+        )
+
+    def test_message_and_notes_keep_the_sanitizer_order(self) -> None:
+        exc = RuntimeError("boom")
+        exc.add_note("station=ISTATION01 progress=2/3")
+        assert safe_detail(exc) == "RuntimeError: boom station=ISTATION01 progress=2/3"
+
+    def test_message_beginning_with_the_class_name_is_kept_whole(self) -> None:
+        assert (
+            safe_detail(RuntimeError("RuntimeError happened"))
+            == "RuntimeError: RuntimeError happened"
+        )
+
+    def test_unrenderable_exception_degrades_to_the_class_name(self) -> None:
+        class BoomError(RuntimeError):
+            def __str__(self) -> str:
+                raise ValueError("str exploded")
+
+        exc = BoomError("unrendered")
+        with pytest.raises(ValueError):
+            sanitized_exception(exc)  # liveness: the fallback path is reached
+        assert safe_detail(exc) == "BoomError"

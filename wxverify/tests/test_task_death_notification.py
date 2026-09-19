@@ -22,7 +22,8 @@ Mutant table:
 | A   ``on_export_sweeper_done``'s ``cancelled()`` guard deleted            | O2 |
 | B   swallows ``CancelledError`` from ``task.exception()`` into ``None``   | O2 |
 | M1  ``detail=sanitized_exception(exc)`` unguarded (case 3 driver)          | O11 |
-| M2  same bare rendering (case 2 driver)                                   | O11 |
+| M2  same bare rendering (case 1 driver: the class-name prefix is lost)    | O11 |
+| M5  unconditional prefix ``f"{name}: {sanitized_exception(exc)}"`` (case 2) | O11 |
 | M3  the ``running`` write moved outside the ``try`` (source edit)         | O11 |
 | M4  the ``failed``-write guard deleted, ``safe_detail`` kept (source edit) | O11 |
 
@@ -119,11 +120,13 @@ def test_o1_crash_latches_with_redacted_diagnosable_detail(
 def test_o1_zero_argument_crash_detail_never_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The zero-argument case: the type-name prefix keeps the detail
-    non-empty and carries no URL to redact.
+    """The zero-argument case: the class name alone is the detail -- non-empty,
+    named exactly once, and with no URL to redact.
 
-    O1 -> at ``death.detail``: correct = ``"RuntimeError: "``, mutant
-    (``str(exc)`` rendered directly with no type prefix) = ``""``.
+    O1 -> at ``death.detail``: correct = ``"RuntimeError"``, mutant
+    (``str(exc)`` rendered directly with no type prefix) = ``""``; mutant M5
+    (the class name prefixed unconditionally over ``sanitized_exception``'s
+    own class-name fallback) = ``"RuntimeError: RuntimeError"``.
     """
     close_db()
     config.db_path = str(tmp_path / "o1-zeroarg.db")
@@ -153,7 +156,7 @@ def test_o1_zero_argument_crash_detail_never_empty(
 
     death = export_sweeper_death()
     assert death is not None
-    assert death.detail == "RuntimeError: "
+    assert death.detail == "RuntimeError"
 
 
 def test_o2_clean_shutdown_does_not_latch_and_callback_never_raises_into_loop(
@@ -605,12 +608,14 @@ def test_o11_case1_published_targets_crash_records_failed_with_redacted_detail(
 def test_o11_case2_zero_argument_exception_detail_never_empty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Case 2: a zero-argument exception still yields a non-empty,
-    type-name-prefixed detail.
+    """Case 2: a zero-argument exception yields the class name alone --
+    non-empty and named exactly once.
 
-    O11 -> at ``outcome.detail``: correct = ``"RuntimeError: "``, mutant M2
-    (``detail=sanitized_exception(exc)`` unguarded, i.e. no type-name
-    prefix) = ``""``.
+    O11 -> at ``outcome.detail``: correct = ``"RuntimeError"``, mutant M5
+    (``f"{name}: {sanitized_exception(exc)}"``, the prefix applied
+    unconditionally) = ``"RuntimeError: RuntimeError"``. Mutant M2 (bare
+    ``detail=sanitized_exception(exc)``) renders ``"RuntimeError"`` here
+    too and is separated by case 1's missing prefix, not by this case.
     """
     close_db()
     db = init_db(str(tmp_path / "o11-case2.db"))
@@ -623,7 +628,7 @@ def test_o11_case2_zero_argument_exception_detail_never_empty(
     outcome = rc.warm_outcome()
     assert outcome is not None
     assert outcome.state == "failed"
-    assert outcome.detail == "RuntimeError: "
+    assert outcome.detail == "RuntimeError"
 
 
 def test_o11_case3_pathological_str_never_escapes_and_never_raises(
