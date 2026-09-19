@@ -449,6 +449,15 @@ def create_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, variable)
         );
 
+        CREATE TABLE IF NOT EXISTS verification_run_inputs (
+            run_id INTEGER NOT NULL
+                REFERENCES verification_runs(id) ON DELETE CASCADE,
+            component TEXT NOT NULL,
+            value TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            PRIMARY KEY (run_id, component)
+        );
+
         CREATE TABLE IF NOT EXISTS verification_trigger_decisions (
             id INTEGER PRIMARY KEY,
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,

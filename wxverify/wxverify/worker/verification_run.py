@@ -59,6 +59,7 @@ from wxverify.verification.engine import (
     resolve_pass1_roster,
     write_pairwise_comparisons,
 )
+from wxverify.verification.manifest import write_run_manifest
 from wxverify.verification.read_cache import warm_read_cache
 from wxverify.verification.runs import (
     RunConfig,
@@ -469,6 +470,7 @@ def _start_phase(
         # Settled truth vanished between decide and start (regeneration
         # race) — fail loudly rather than publish an empty run.
         raise RuntimeError(f"verification start for site={site_id}: no settled truth")
+    write_run_manifest(conn, cfg)
     decision_id = _blob_int(blob, "decision_id")
     if decision_id is not None and diverged:
         conn.execute(

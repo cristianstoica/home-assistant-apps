@@ -119,7 +119,15 @@
 
     {{ trigger_notice(trigger) }}
     {% if warnings.stale_inputs %}
-      <p class="notice" data-v16="16.1.warn_stale">Current inputs no longer match the basis pinned for this run — results reflect that pinned basis, not current data.</p>
+      {%- set input_labels = {
+        'config_truth_basis': 'the settings and daily history behind it',
+        'forecast_arrivals': 'new forecast rows inside the scored dates'
+      } -%}
+      {%- set moved = result_basis.components
+            | selectattr('state', 'equalto', 'changed')
+            | map(attribute='component')
+            | select('in', input_labels) | list -%}
+      <p class="notice" data-v16="16.1.warn_stale">Current inputs no longer match the basis pinned for this run{% if moved %} ({% for c in moved %}{{ input_labels[c] }}{{ "; " if not loop.last }}{% endfor %}){% endif %} — results reflect that pinned basis, not current data.</p>
     {% endif %}
     {% if result_basis.state == 'unknown' %}
       {%- set freshness_reasons = {

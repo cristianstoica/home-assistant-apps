@@ -937,6 +937,7 @@ def _build_o17d_legacy_donor(
         "verification_day_context",
         "verification_results",
         "verification_verdicts",
+        "verification_run_inputs",
         "verification_trigger_decisions",
     ):
         conn.execute(f"DROP TABLE {table}")

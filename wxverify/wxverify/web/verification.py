@@ -29,16 +29,15 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
+from wxverify.verification.freshness import (
+    RUN_INPUTS_NO_RUN,
+    published_input_freshness,
+)
 from wxverify.verification.read_cache import (
     cached_daily_rank_conclusions,
     cached_observed_wet_precip_mae,
 )
-from wxverify.verification.runs import (
-    RESULT_BASIS_NO_RUN,
-    published_run_id,
-    result_basis_freshness,
-    trigger_status,
-)
+from wxverify.verification.runs import published_run_id, trigger_status
 from wxverify.web.context import SiteView, load_site, load_sites
 
 #: Operator-facing labels for the verdict outcomes (§16.2), including the
@@ -1006,7 +1005,7 @@ def load_verification(
         "warnings": {},
         # Set in the BASE context: an unset Jinja name is silently falsy, so
         # the no-site and no-run paths must carry a real state too.
-        "result_basis": RESULT_BASIS_NO_RUN.as_payload(),
+        "result_basis": RUN_INPUTS_NO_RUN.as_payload(),
         "depths": live_depths,
         "depth_mismatch": False,
         "verification_schema": VERIFICATION_SCHEMA,
@@ -1076,17 +1075,18 @@ def load_verification(
             and live_depths[str(v["variable"])].depth != v["incumbent_depth"]
             for v in verdicts
         )
-        # Freshness of the run's configuration/roster/truth basis only —
-        # the forecast side is outside the digest. Read-only by
-        # construction (NB-9) — an unrecorded, malformed,
-        # superseded-algorithm or pointer-less basis is `unknown`, which is
-        # reported rather than warned about. `_load_run` returns
-        # `dict[str, object]`, so the casts restate the column types its
-        # projection already carries.
-        freshness = result_basis_freshness(
+        # Freshness of every input the run pinned at start — its
+        # configuration/roster/truth basis AND the forecast rows inside its
+        # scored horizon. Read-only by construction (NB-9) — an unrecorded,
+        # malformed, superseded-algorithm or pointer-less input is
+        # `unknown`, which is reported rather than warned about.
+        # `_load_run` returns `dict[str, object]`, so the casts restate the
+        # column types its projection already carries.
+        freshness = published_input_freshness(
             conn,
             site.id,
-            recorded=cast("str | None", run["result_basis_fingerprint"]),
+            run_id=run_id,
+            recorded_basis=cast("str | None", run["result_basis_fingerprint"]),
             period_start=cast("str | None", run["period_start"]),
             period_end=cast("str | None", run["period_end"]),
         )

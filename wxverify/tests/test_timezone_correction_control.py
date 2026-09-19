@@ -1034,10 +1034,8 @@ def test_o15_correction_disclosures_live_at_the_dialog_and_the_verification_page
 
     # The verification page itself: the two live consequences a stale
     # correction/rebuild can leave behind on the site's own results.
-    assert (
-        "Current inputs no longer match the basis pinned for this run — "
-        "results reflect that pinned basis, not current data."
-    ) in show_html
+    assert "Current inputs no longer match the basis pinned for this run" in show_html
+    assert (" — results reflect that pinned basis, not current data.") in show_html
     assert (
         "A newer verification attempt failed; the results below are "
         "from the last successful run."
