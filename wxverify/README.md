@@ -838,3 +838,9 @@ only 225 when scoped to `wxverify tests`, which drops `scripts/`.
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
 than the local one. A green local run does not cover them.
+
+Cite code by its owning symbol, never by `file.py:<line>`: a line number
+drifts the moment the file changes. The pytest suite includes a guard
+(`tests/test_citation_anchor_guard.py`) that fails on any `file.py:<line>`
+citation in a production docstring, comment, or Jinja template comment, so
+write "see `_decide_precip` in `decision.py`" rather than a line reference.

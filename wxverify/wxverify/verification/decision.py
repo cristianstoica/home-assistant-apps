@@ -1160,7 +1160,9 @@ def decide_variable(inputs: VariableInputs, *, seed: int, resamples: int) -> Ver
                     str, tuple[float | None, tuple[float, float] | None]
                 ] = {}
                 for r in passers:
-                    # Not None: _shared_basis:987-992 refused this already.
+                    # Not None: _shared_basis answers thin_shared_basis for a
+                    # passer with no ordering endpoint, so keep is None and
+                    # this loop never runs for one.
                     restricted = _restrict_endpoint(
                         cast(_Endpoint, r.ordering_endpoint), keep
                     )

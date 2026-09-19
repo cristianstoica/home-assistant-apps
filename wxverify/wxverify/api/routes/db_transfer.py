@@ -55,8 +55,9 @@ _STALE_AFTER_S = 3600.0
 # even if `/begin` is never called again.
 _SWEEP_INTERVAL_S = 300.0
 # 256 MiB, bounding worst-case /data use (upload temp + backup + live DB at
-# once). Governs four refusals: the declared-length check at :479, and the
-# written-bytes checks at :579, :593 and :607.
+# once). Governs four refusals: the content-length check in import_db, and the
+# three written-bytes checks in _stream_to -- after each gzip inflate call, on
+# the raw passthrough branch, and after the final inflate flush.
 MAX_IMPORT_BYTES = 256 * 1024 * 1024
 MAX_IMPORT_MIB = MAX_IMPORT_BYTES // (1024 * 1024)
 # 1 MiB copy/inflate chunk: bounds the per-call decompress output (zip-bomb
