@@ -15,8 +15,11 @@ _SECRET_QUERY_KEYS = frozenset(
 
 def sanitized_exception(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return _http_status_error(exc)
-    return redact_urls(str(exc))
+        text = _http_status_error(exc)
+    else:
+        text = redact_urls(str(exc)).strip() or type(exc).__name__
+    notes = exc.__notes__ if hasattr(exc, "__notes__") else []
+    return " ".join([text, *(redact_urls(note) for note in notes)])
 
 
 def safe_detail(exc: BaseException) -> str:

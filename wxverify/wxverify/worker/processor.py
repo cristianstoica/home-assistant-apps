@@ -195,12 +195,12 @@ async def run_worker(db: Database) -> None:
                         outcome = "failed"
                         logger.error(
                             "job failed permanently id=%s type=%s site=%s "
-                            "attempts=%d/%d: %s",
+                            "attempt %d of %d (retries exhausted): %s",
                             job.id,
                             job.type,
                             job.site_id,
                             disposition.retry_count,
-                            disposition.max_retries,
+                            disposition.max_retries + 1,
                             message,
                         )
                     else:
@@ -514,6 +514,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     )
                     if next_attempt_at is not None:
                         raise JobDeferred(next_attempt_at) from exc
+                    exc.add_note(
+                        f"station={station.pws_station_id} "
+                        f"progress={index}/{len(stations)}"
+                    )
                     raise
                 except Exception as exc:
                     error = sanitized_exception(exc)
@@ -525,6 +529,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                             _mark_station_error_and_refund(conn, station_id, err, res)
                         ),
                         reservation,
+                    )
+                    exc.add_note(
+                        f"station={station.pws_station_id} "
+                        f"progress={index}/{len(stations)}"
                     )
                     raise
                 station_changed = await write_after_reservation(
