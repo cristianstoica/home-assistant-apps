@@ -655,7 +655,9 @@ def test_c1_legacy_run_reports_unknown_not_recorded(
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
-        assert entry["result_basis"] == {"state": "unknown", "reason": "not_recorded"}
+        assert set(entry["result_basis"]) == {"state", "reason", "components"}
+        assert entry["result_basis"]["state"] == "unknown"
+        assert entry["result_basis"]["reason"] == "not_recorded"
         assert entry["warnings"]["stale_inputs"] is False
 
     page = _fetch_page(monkeypatch, site_id)
@@ -759,10 +761,9 @@ def test_c5_no_published_run_reports_no_publishable_run(
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
-        assert entry["result_basis"] == {
-            "state": "unknown",
-            "reason": "no_published_run",
-        }
+        assert set(entry["result_basis"]) == {"state", "reason", "components"}
+        assert entry["result_basis"]["state"] == "unknown"
+        assert entry["result_basis"]["reason"] == "no_published_run"
         assert entry["warnings"]["no_publishable_run"] is True
 
     page = _fetch_page(monkeypatch, site_id)
@@ -1156,6 +1157,11 @@ def test_f1_forecast_rebuild_inside_horizon_leaves_freshness_fresh_by_design() -
     grew this coverage, the fixed ``recorded`` value asserted here would
     stop matching ``current`` and this test would go red for exactly the
     reason its docstring names.
+
+    Still true after the 2026-09-02 input-manifest change: the manifest
+    derives the surface verdict *above* this function, and ``pair_arrivals``
+    is observed-only, so ``forecast_pairs`` churn still moves neither this
+    digest nor the reported state.
     """
     from datetime import UTC, datetime
 
@@ -1314,11 +1320,21 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
     the whole point of this oracle is to catch exactly the kind of edit
     that updates ``runs.py`` and forgets ``show.html``, and a hand-copied
     list in the test itself is exposed to that same forgetting.
+
+    Since the input manifest, the notice's reason may also be one of the
+    per-component notes ``manifest.py`` emits. Those come from
+    ``MANIFEST_NOTE_TOKENS`` -- the frozenset the evaluators themselves
+    validate against, imported here rather than regexed out of the module
+    source, because the legacy branch passes its note as a variable and a
+    ``note="..."`` regex would go silently empty there. The vocabulary is
+    pinned to be a subset of ``runs.py``'s reasons (no new tokens), and the
+    template's keys must equal the union.
     """
     import re
     from pathlib import Path
 
     import wxverify.verification.runs as runs_module
+    from wxverify.verification.manifest import MANIFEST_NOTE_TOKENS
 
     source = Path(str(runs_module.__file__)).read_text(encoding="utf-8")
     reasons_from_source = set(re.findall(r'reason="([a-z_]+)"', source))
@@ -1330,6 +1346,17 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
         "period_unknown",
         "no_published_generation",
     }, "the regex scope drifted -- update it, don't hardcode the result set"
+    assert {
+        "not_recorded",
+        "algorithm_changed",
+        "malformed_record",
+        "period_unknown",
+        "no_published_generation",
+    } == MANIFEST_NOTE_TOKENS, (
+        "the manifest note vocabulary drifted -- update it, "
+        "don't hardcode the result set"
+    )
+    assert reasons_from_source >= MANIFEST_NOTE_TOKENS
 
     import wxverify.web as web_module
 
@@ -1347,6 +1374,7 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
     template_keys = set(re.findall(r"'([a-z_]+)':", block_match.group(1)))
 
     assert reasons_from_source == template_keys
+    assert reasons_from_source | MANIFEST_NOTE_TOKENS == template_keys
 
 
 def test_f5b_rendered_notice_never_leaks_the_raw_reason_code(

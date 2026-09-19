@@ -37,6 +37,7 @@ from tests.test_phase7_surface import (
 )
 from wxverify.api.app import create_app
 from wxverify.config import SUPERVISOR_INGRESS_CLIENT
+from wxverify.verification.manifest import MANIFEST_COMPONENT_ORDER
 
 _INGRESS_PREFIX = "/api/hassio_ingress/EXAMPLETOKEN"
 
@@ -329,6 +330,61 @@ def test_every_0_11_0_payload_key_survives_with_its_type(
             added=set(),
             where="methodology.provenance",
         )
+
+
+def test_the_result_basis_inner_shape_is_pinned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``result_basis`` widened in place (input manifest, 2026-09-02) and the
+    schema constant stayed at 2: that is legitimate only because the
+    ``status_site`` top-level key set is unchanged and the widening is
+    additive nesting inside an already declared key. ``_check`` compares
+    top-level keys only, so this is the one place the inner shape is pinned.
+
+    Kills: a component-record rename or retype (``note`` -> ``reason``, a
+    ``scope`` leaking onto the wire), a breakdown emitted out of the
+    documented order, and a top-level addition that should have gone
+    through ``_DECLARED_ADDITIONS``.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = _make_site(conn, "Additive Town")
+    run_id = _seed_published_run(conn, site_id)
+    basis = conn.execute(
+        "SELECT result_basis_fingerprint FROM verification_runs WHERE id = ?",
+        (run_id,),
+    ).fetchone()[0]
+    horizon = (
+        '{"horizon_start_utc": "2026-05-01T00:00:00Z", '
+        '"horizon_end_utc": "2026-05-31T00:00:00Z"}'
+    )
+    conn.executemany(
+        "INSERT INTO verification_run_inputs (run_id, component, value, scope) "
+        "VALUES (?, ?, ?, ?)",
+        [
+            (run_id, "config_truth_basis", basis, "{}"),
+            (run_id, "forecast_arrivals", "fs1:0", horizon),
+            (run_id, "pair_arrivals", "fp1:0", horizon),
+        ],
+    )
+    conn.commit()
+
+    with TestClient(_app(monkeypatch)) as client:
+        status = client.get(f"/api/verification/status?site={site_id}").json()
+    assert status["verification_schema"] == 2
+    site = status["sites"][0]
+    _check(
+        site,
+        _STATUS_SITE_0_11_0,
+        added=_DECLARED_ADDITIONS["status_site"],
+        where="status.sites[]",
+    )
+    basis_payload = site["result_basis"]
+    assert set(basis_payload) == {"state", "reason", "components"}
+    components = basis_payload["components"]
+    assert isinstance(components, list)
+    for component in components:
+        assert set(component) == {"component", "state", "note"}
+    assert [c["component"] for c in components] == list(MANIFEST_COMPONENT_ORDER)
 
 
 def test_the_evidence_row_shape_is_the_unchanged_results_table(
