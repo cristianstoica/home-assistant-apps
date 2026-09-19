@@ -32,6 +32,7 @@ from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.data import (
     forecast_ranking,
+    forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
     samples_fingerprint,
@@ -574,3 +575,23 @@ def test_forecast_ranking_is_keyed_per_day_ahead_cell() -> None:
     )
     assert ids["member"] not in ranking_day1
     assert ranking_day1 == {}
+
+
+def test_forecast_ranking_with_status_as_of_branch_reports_live() -> None:
+    """The as-of branch (plan §6) recomputes live from pairs and never reads
+    score_cache, so it always reports the ``live`` status --
+    ``leaderboard_with_status``'s status for a non-cache-backed window --
+    never the cache-backed branch's ``rebuilding``."""
+    conn = _make_db()
+    assert (
+        forecast_ranking_with_status(
+            conn,
+            site_id=1,
+            variable="temperature",
+            day_ahead=0,
+            as_of="2035-07-01T00:00:00Z",
+            declared_min_n=1,
+            declared_window_days=None,
+        ).status
+        == "live"
+    )

@@ -24,7 +24,12 @@ from wxverify.collection.forecast_validation import (
     invalid_forecast_sample_sql,
 )
 from wxverify.core.timeutil import parse_utc
-from wxverify.scoring.leaderboard import LeaderboardRow, asof_leaderboard, leaderboard
+from wxverify.scoring.leaderboard import (
+    LeaderboardRow,
+    LeaderboardStatus,
+    asof_leaderboard,
+    leaderboard_with_status,
+)
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
 _EXCLUDED_FEEDS_SQL = (
@@ -57,6 +62,14 @@ class FeedFreshness:
     latest_issued_at: str
     fetch_interval_minutes: int | None
     stale: bool
+
+
+@dataclass(frozen=True)
+class ForecastRanking:
+    """Ranking rows for one cell, with the leaderboard cache status."""
+
+    rows: dict[int, LeaderboardRow]
+    status: LeaderboardStatus
 
 
 def load_future_samples(
@@ -254,6 +267,29 @@ def forecast_ranking(
     declared_min_n: int | None = None,
     declared_window_days: int | None = None,
 ) -> dict[int, LeaderboardRow]:
+    return forecast_ranking_with_status(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        window=window,
+        as_of=as_of,
+        declared_min_n=declared_min_n,
+        declared_window_days=declared_window_days,
+    ).rows
+
+
+def forecast_ranking_with_status(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    window: str = "rolling",
+    as_of: str | None = None,
+    declared_min_n: int | None = None,
+    declared_window_days: int | None = None,
+) -> ForecastRanking:
     """Skill ranking for one (variable, day_ahead) cell, keyed by feed id.
 
     Reuses the leaderboard skill computation, then applies the Forecast-page
@@ -265,7 +301,10 @@ def forecast_ranking(
     at T under the run's declared configuration (``declared_min_n``,
     ``declared_window_days`` — never live settings, never ``score_cache``;
     ``window`` is ignored on this path). The eligibility exclusions below
-    apply IDENTICALLY on both paths — one filter, two row sources.
+    apply IDENTICALLY on both paths — one filter, two row sources. The
+    as-of branch reports ``live`` — it never reads ``score_cache``, and
+    that is the status ``leaderboard_with_status`` assigns to a
+    non-cache-backed window.
     """
     excluded = {
         int(row["id"])
@@ -277,6 +316,7 @@ def forecast_ranking(
             """
         ).fetchall()
     }
+    status: LeaderboardStatus
     if as_of is not None:
         if declared_min_n is None:
             raise ValueError("as-of forecast_ranking requires declared_min_n")
@@ -289,12 +329,18 @@ def forecast_ranking(
             min_n=declared_min_n,
             window_days=declared_window_days,
         )
+        status = "live"
     else:
-        rows = leaderboard(
+        result = leaderboard_with_status(
             conn,
             site_id=site_id,
             variable=variable,
             day_ahead=day_ahead,
             window=window,
         )
-    return {row.feed_id: row for row in rows if row.feed_id not in excluded}
+        rows = result.rows
+        status = result.status
+    return ForecastRanking(
+        rows={row.feed_id: row for row in rows if row.feed_id not in excluded},
+        status=status,
+    )

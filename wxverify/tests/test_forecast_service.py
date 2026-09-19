@@ -35,7 +35,7 @@ from wxverify.forecast.service import (
     relative_ago,
 )
 from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.leaderboard import resolve_window
+from wxverify.scoring.leaderboard import leaderboard_with_status, resolve_window
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import feed_label
@@ -526,6 +526,17 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
 
     # precip: no samples at all -> not_available.
 
+    # The wind cell's leaderboard read is "empty" (no forecast_pairs at all),
+    # not "rebuilding" (an absent/mismatched cache snapshot over a REAL
+    # expected feed universe) -- states why the cell stays low_confidence
+    # rather than becoming rebuilding.
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="wind", day_ahead=1, window="rolling"
+        ).status
+        == "empty"
+    )
+
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -544,6 +555,342 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
     far_day = view.tiles[7]
     assert far_day.state == "not_available"
     assert far_day.temp.meta.available is False
+
+
+# ---------------------------------------------------------------------------
+# Cache-status display: a per-feed "rebuilding" ranking status can suppress
+# the low_confidence label, but only over the feeds each surface actually
+# renders. See wxverify/docs/plans/2026-09-08-cache-status-display.md.
+# ---------------------------------------------------------------------------
+
+
+def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
+    """O4: tile rollup precedence over the new vocabulary member.
+
+    Day tile 0: temp is `low_confidence` from an EMPTY leaderboard read (no
+    forecast_pairs at all), wind is `rebuilding` -- the rollup must still
+    read `low_confidence`, because that caveat does not resolve on its own.
+    Day tile 1: temp is confident/`normal`, wind is `rebuilding` and nothing
+    else is degraded -- the rollup must read `rebuilding`.
+
+    Both feeds are single-candidate cells (agg_feeds == selection.feeds), so
+    this is purely about D4's precedence, not D2's per-surface width -- that
+    is O8's job.
+    """
+    conn = _make_db()
+    ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
+    icon_id = _feed_id(conn, "open-meteo", "icon_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+
+    # --- Day tile 0 ("2026-07-20"): representative day_ahead=1 for both
+    # cells (issued the previous evening, matching the B2 fixture shape).
+    day0_valid_ats = _hours("2026-07-20", 4, 20)
+    _seed_hourly(
+        conn,
+        feed_id=ecmwf_id,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=day0_valid_ats,
+    )
+    # No forecast_pairs anywhere at (temperature, 1) -> empty universe ->
+    # "empty" status -> low_confidence (D5), never rebuilding.
+    _seed_hourly(
+        conn,
+        feed_id=gfs_id,
+        variable="wind",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=day0_valid_ats,
+        value=5.0,
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=gfs_id, variable="wind", day_ahead=1, forecast=10.5
+    )
+    # No score_cache seeded at (wind, 1) -> a real expected universe with no
+    # snapshot -> "rebuilding".
+
+    # --- Day tile 1 ("2026-07-21"): representative day_ahead=2 (issued two
+    # days before), so these keys cannot collide with day tile 0's cache
+    # entries above.
+    day1_valid_ats = _hours("2026-07-21", 0, 20)
+    _seed_hourly(
+        conn,
+        feed_id=ecmwf_id,
+        variable="temperature",
+        issued_at="2026-07-19T00:00:00Z",
+        valid_ats=day1_valid_ats,
+    )
+    _make_confident(conn, feed_id=ecmwf_id, variable="temperature", day_ahead=2)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=2)
+    # A distinct feed (icon_id, not gfs_id) so its far-future scoring pairs
+    # -- fixed at a constant (issued_at, valid_at) shared with tile 0's gfs_id
+    # insert above -- cannot collide on the (site, feed, variable, issued_at,
+    # valid_at) UNIQUE constraint.
+    _seed_hourly(
+        conn,
+        feed_id=icon_id,
+        variable="wind",
+        issued_at="2026-07-19T00:00:00Z",
+        valid_ats=day1_valid_ats,
+        value=5.0,
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=icon_id, variable="wind", day_ahead=2, forecast=10.5
+    )
+    # No score_cache seeded at (wind, 2) either -> "rebuilding".
+
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+        ).status
+        == "empty"
+    )
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="wind", day_ahead=1, window="rolling"
+        ).status
+        == "rebuilding"
+    )
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="wind", day_ahead=2, window="rolling"
+        ).status
+        == "rebuilding"
+    )
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+
+    today = view.tiles[0]
+    assert today.temp.meta.state == "low_confidence"
+    assert today.wind.meta.state == "rebuilding"
+    assert today.precip.meta.state == "not_available"
+    # low_confidence (a caveat that does not resolve on its own) outranks
+    # rebuilding (a caveat that resolves itself) -- D4.
+    assert today.state == "low_confidence"
+
+    tomorrow = view.tiles[1]
+    assert tomorrow.temp.meta.state == "normal"
+    assert tomorrow.wind.meta.state == "rebuilding"
+    assert tomorrow.precip.meta.state == "not_available"
+    # No cell is low_confidence; the only degraded populated cell is
+    # rebuilding, so the rollup reads rebuilding, not normal.
+    assert tomorrow.state == "rebuilding"
+
+
+def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
+    """O3: a rebuilding key on a feed the ladder never selects must not
+    relabel a cell whose selected feed has a settled, confident ranking.
+
+    Feed A (rep day_ahead=1) is confident with a complete score_cache
+    snapshot; feed B (rep day_ahead=0) has forecast_pairs but no snapshot
+    there, so its key is genuinely "rebuilding" -- not "empty". Rung 1
+    selects the confident feed A alone, so B (the rebuilding-keyed feed)
+    never enters either surface's rendered set.
+
+    ``uv run pytest tests/test_forecast_service.py -k mixed_lead``
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    valid_ats = _hours("2026-07-20", 4, 20)
+
+    # Feed A: issued the previous evening -> representative day_ahead=1.
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=valid_ats,
+    )
+    _make_confident(conn, feed_id=feed_a, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
+
+    # Feed B: issued the same morning -> representative day_ahead=0. Pairs
+    # exist (not an empty universe) but no snapshot -> rebuilding.
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-20T00:00:00Z",
+        valid_ats=valid_ats,
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
+    )
+
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+        ).status
+        == "hit"
+    )
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
+        ).status
+        == "rebuilding"
+    )
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    assert view.tiles[0].temp.meta.state == "normal"
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert hourly["states"]["temperature"] == "normal"
+
+
+def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> None:
+    """O7: sibling of the test above with feed A scored but NOT confident
+    (n > 0, below the raised min_n floor) rather than absent entirely. Rung
+    1 finds no confident candidate and skips; rung 2 selects the scored
+    feed A alone (feed B still reads pair_n=0 under its rebuilding key), so
+    the cell must stay low_confidence, not become rebuilding, on both
+    surfaces.
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    valid_ats = _hours("2026-07-20", 4, 20)
+
+    # Raise min_n above the 3 pairs _seed_scoring_pairs seeds, so feed A's
+    # cached row is scored (n=3 > 0) but not confident (n < min_n).
+    set_setting(conn, "min_n", "4")
+
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=valid_ats,
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=feed_a, variable="temperature", day_ahead=1, forecast=10.5
+    )
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
+
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-20T00:00:00Z",
+        valid_ats=valid_ats,
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
+    )
+
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+        ).status
+        == "hit"
+    )
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
+        ).status
+        == "rebuilding"
+    )
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    assert view.tiles[0].temp.meta.state == "low_confidence"
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert hourly["states"]["temperature"] == "low_confidence"
+
+
+def test_coverage_guard_splits_tile_and_drill_down_rebuilding_state() -> None:
+    """O8: the ONLY oracle in this suite where the tile and its own
+    drill-down are REQUIRED to disagree, and both are correct (D2). The
+    drill-down can read a more alarmed state than the tile, never the
+    reverse.
+
+    Feed A (rep day_ahead=1) covers >=18 hours -- clears the coverage guard
+    -- but has NO forecast_pairs at that cell, so its key is "empty" and it
+    reads pair_n=0. Feed B (rep day_ahead=0) covers 12-17 hours -- below the
+    guard but above the selection pool floor -- and has forecast_pairs with
+    no snapshot, so its key is genuinely "rebuilding". Neither is scored, so
+    rung 3 selects both feeds at the default blend depth of 2, ranked by
+    future-sample count (A's 20 samples outrank B's 14).
+
+    ``clearing_subset`` then keeps A alone for the tile: the tile's own
+    rendered feed set never saw a rebuilding-keyed ranking, so it reads
+    low_confidence. ``build_hourly`` blends and plots the full selection,
+    A AND B, so it reads rebuilding -- true of what it actually draws.
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+
+    # Feed A: representative day_ahead=1, 20 covered hours (clears the
+    # 18-hour coverage guard), no forecast_pairs at all -> "empty".
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 20),
+    )
+
+    # Feed B: representative day_ahead=0, 14 covered hours (clears the
+    # 12-hour selection floor but not the 18-hour coverage guard);
+    # forecast_pairs exist with no snapshot -> "rebuilding".
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-20T00:00:00Z",
+        valid_ats=_hours("2026-07-20", 4, 14),
+    )
+    _seed_scoring_pairs(
+        conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
+    )
+
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
+        ).status
+        == "empty"
+    )
+    # Assertion 5: without this, a fixture that quietly produced "empty" for
+    # B (instead of the intended "rebuilding") would pass vacuously.
+    assert (
+        leaderboard_with_status(
+            conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
+        ).status
+        == "rebuilding"
+    )
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    today = view.tiles[0]
+    # Assertion 1: the tile's own rendered set (A alone) never saw a
+    # rebuilding-keyed ranking.
+    assert today.temp.meta.state == "low_confidence"
+    # Assertion 2: the tile's width, made visible -- A is rendered, B is not.
+    feed_ids = {ref.feed_id for ref in today.temp.meta.feeds}
+    assert feed_a in feed_ids
+    assert feed_b not in feed_ids
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    # Assertion 3: the ONLY kill in this plan for M9 (collapsing the
+    # drill-down onto the tile's width). This is by design: the drill-down
+    # can be more alarmed than the tile, never less (D2).
+    assert hourly["states"]["temperature"] == "rebuilding"
+    # Assertion 4: anchors that wider status to a chart that demonstrably
+    # contains B, not an assumption about what build_hourly selected.
+    hourly_feed_ids = {feed["feed_id"] for feed in hourly["feeds"]}
+    assert feed_a in hourly_feed_ids
+    assert feed_b in hourly_feed_ids
 
 
 # ---------------------------------------------------------------------------
