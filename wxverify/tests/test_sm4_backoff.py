@@ -17,7 +17,6 @@ pass when the other side is exercised.
 from __future__ import annotations
 
 import asyncio
-import json
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -34,6 +33,7 @@ from wxverify.db.migrations import (
     seed_default_settings,
     seed_default_sources,
 )
+from wxverify.obs.pws_adapter import UpstreamPayloadError
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.current_obs import MIN_INTERVAL_SECONDS
 from wxverify.worker.processor import _fetch_current_obs  # noqa: PLC2701
@@ -531,7 +531,7 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
             # response.json() raises JSONDecodeError; the except block still
             # re-raises the original exception, but only after routing it
             # through the same TRANSIENT-persist path a transport error takes.
-            with pytest.raises(json.JSONDecodeError):
+            with pytest.raises(UpstreamPayloadError):
                 asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
         mock_fetch.assert_called_once()

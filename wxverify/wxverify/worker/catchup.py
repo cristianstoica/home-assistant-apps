@@ -110,7 +110,13 @@ async def run_catchup(
             continue
         except StaleGenerationError:
             raise
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "catchup site aborted for this tick site=%s: %s; "
+                "remaining sites continue",
+                site.site_id,
+                sanitized_exception(exc),
+            )
             continue
         logger.debug("catchup site result site=%s changed=%s", site.site_id, changed)
         if changed:

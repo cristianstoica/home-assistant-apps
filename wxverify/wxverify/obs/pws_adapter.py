@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -66,6 +67,166 @@ class CurrentObservation:
     neighborhood: str | None
 
 
+PayloadErrorKind = Literal[
+    "no_content", "json_decode", "invalid_structure", "provider_error"
+]
+BodyKind = Literal["empty", "whitespace", "content"]
+REQUEST_ID_HEADERS: tuple[str, ...] = ("x-request-id",)
+PROVIDER_ERROR_KEYS = frozenset({"errors", "error"})
+_CONTENT_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+_CONTENT_TYPE_MAX_LEN = 64
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
+
+
+@dataclass(frozen=True)
+class PayloadDiagnostics:
+    """Bounded facts about a 2xx response that did not yield ``observations``.
+
+    Every field is an enum, an int, the request path, or an allowlisted token:
+    no byte of the body, no query string and no unlisted header is captured,
+    so ``render()`` is safe to persist and to log as-is. ``reason``/``pos`` are
+    populated only for ``json_decode``.
+    """
+
+    kind: PayloadErrorKind
+    station_id: str | None
+    endpoint: str
+    status: int
+    content_type: str
+    body: BodyKind
+    body_bytes: int
+    elapsed_ms: int | None
+    request_id: str | None
+    reason: str | None
+    pos: int | None
+
+    def render(self) -> str:
+        """One line of fixed-order ``key=value`` pairs; ``-`` marks an absent value."""
+        station = "-" if self.station_id is None else self.station_id
+        elapsed = "-" if self.elapsed_ms is None else str(self.elapsed_ms)
+        request_id = "-" if self.request_id is None else self.request_id
+        line = (
+            f"upstream payload error kind={self.kind} station={station} "
+            f"endpoint={self.endpoint} status={self.status} "
+            f"content_type={self.content_type} body={self.body} "
+            f"body_bytes={self.body_bytes} elapsed_ms={elapsed} "
+            f"request_id={request_id}"
+        )
+        if self.reason is not None:
+            line = f'{line} reason="{self.reason}"'
+        if self.pos is not None:
+            line = f"{line} pos={self.pos}"
+        return line
+
+
+class UpstreamPayloadError(Exception):
+    """A 2xx PWS response whose body is not ``{"observations": [...]}``.
+
+    ``str(exc)`` is ``diagnostics.render()``. Deliberately not a ``ValueError``
+    subclass, so no ``except ValueError`` around a parse can swallow it.
+    """
+
+    def __init__(self, diagnostics: PayloadDiagnostics) -> None:
+        super().__init__(diagnostics.render())
+        self.diagnostics = diagnostics
+
+
+def decode_observations_payload(
+    response: httpx.Response, *, station_id: str | None
+) -> dict[str, object]:
+    """Decode a 2xx PWS response to its top-level object or raise a typed error.
+
+    The success shape is an allowlist: a JSON object whose ``observations``
+    value is a list (possibly empty). A 204 (``no_content``), a body that does
+    not decode (``json_decode``), any other document shape
+    (``invalid_structure``) or an error envelope without ``observations``
+    (``provider_error``) raises ``UpstreamPayloadError``. The diagnostics are
+    built only on the raising path; the success path touches nothing but
+    ``status_code`` and ``json()``.
+    """
+    if response.status_code == 204:
+        raise UpstreamPayloadError(_diagnose(response, "no_content", station_id))
+    try:
+        data: object = response.json()
+    except ValueError as exc:
+        raise UpstreamPayloadError(
+            _diagnose(response, "json_decode", station_id, cause=exc)
+        ) from exc
+    if not isinstance(data, dict):
+        raise UpstreamPayloadError(_diagnose(response, "invalid_structure", station_id))
+    payload = cast(dict[str, object], data)
+    if "observations" not in payload:
+        kind: PayloadErrorKind = (
+            "provider_error"
+            if PROVIDER_ERROR_KEYS & payload.keys()
+            else "invalid_structure"
+        )
+        raise UpstreamPayloadError(_diagnose(response, kind, station_id))
+    if not isinstance(payload["observations"], list):
+        raise UpstreamPayloadError(_diagnose(response, "invalid_structure", station_id))
+    return payload
+
+
+def _diagnose(
+    response: httpx.Response,
+    kind: PayloadErrorKind,
+    station_id: str | None,
+    *,
+    cause: ValueError | None = None,
+) -> PayloadDiagnostics:
+    content = response.content
+    if not content:
+        body: BodyKind = "empty"
+    elif content.isspace():
+        body = "whitespace"
+    else:
+        body = "content"
+    try:
+        elapsed_ms: int | None = int(response.elapsed.total_seconds() * 1000)
+    except RuntimeError:
+        elapsed_ms = None
+    reason: str | None = None
+    pos: int | None = None
+    if isinstance(cause, json.JSONDecodeError):
+        reason = cause.msg
+        pos = cause.pos
+    elif cause is not None:
+        reason = type(cause).__name__
+    raw_content_type: str | None = response.headers.get("content-type")
+    return PayloadDiagnostics(
+        kind=kind,
+        station_id=station_id,
+        endpoint=response.request.url.path,
+        status=response.status_code,
+        content_type=_content_type(raw_content_type),
+        body=body,
+        body_bytes=len(content),
+        elapsed_ms=elapsed_ms,
+        request_id=_request_id(response.headers),
+        reason=reason,
+        pos=pos,
+    )
+
+
+def _content_type(raw: str | None) -> str:
+    if raw is None:
+        return "absent"
+    media_type = raw.split(";", 1)[0].strip().lower()
+    if len(media_type) <= _CONTENT_TYPE_MAX_LEN and _CONTENT_TYPE_RE.fullmatch(
+        media_type
+    ):
+        return media_type
+    return "unrecognized"
+
+
+def _request_id(headers: httpx.Headers) -> str | None:
+    for name in REQUEST_ID_HEADERS:
+        value: str | None = headers.get(name)
+        if value is not None and _REQUEST_ID_RE.fullmatch(value):
+            return value
+    return None
+
+
 async def validate_station(
     station_id: str, api_key: str, *, lat: float | None = None, lon: float | None = None
 ) -> PwsStation:
@@ -86,7 +247,7 @@ async def validate_station(
             timeout=httpx.Timeout(10.0, connect=5.0),
         )
         response.raise_for_status()
-        data = cast(dict[str, Any], response.json())
+        data = decode_observations_payload(response, station_id=station_id)
     observations_obj = data.get("observations")
     if not isinstance(observations_obj, list) or not observations_obj:
         raise RuntimeError("station returned no current observation")
@@ -138,7 +299,10 @@ async def fetch_hourly_history(
     cutoff = utc_now() - timedelta(hours=hours)
     observations = [
         observation
-        for observation in observations_from_payload(response.json(), timezone=timezone)
+        for observation in observations_from_payload(
+            decode_observations_payload(response, station_id=station_id),
+            timezone=timezone,
+        )
         if parse_utc(observation.valid_at) >= cutoff
     ]
     logger.debug(
@@ -193,7 +357,10 @@ async def fetch_hourly_history_range(
         timeout=httpx.Timeout(20.0, connect=5.0),
     )
     response.raise_for_status()
-    observations = observations_from_payload(response.json(), timezone=timezone)
+    observations = observations_from_payload(
+        decode_observations_payload(response, station_id=station_id),
+        timezone=timezone,
+    )
     filtered = [
         observation
         for observation in observations

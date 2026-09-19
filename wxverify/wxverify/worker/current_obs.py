@@ -30,7 +30,11 @@ import httpx
 
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.obs import cadence
-from wxverify.obs.pws_adapter import CurrentObservation, current_obs_from_payload
+from wxverify.obs.pws_adapter import (
+    CurrentObservation,
+    current_obs_from_payload,
+    decode_observations_payload,
+)
 from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
@@ -83,7 +87,9 @@ def classify_current_obs(response: httpx.Response) -> PollOutcome:
     2. Other non-429 4xx (401/403/404/...) → TERMINAL.
     3. >=500 → TRANSIENT.
     4. 2xx that is 204 / empty body / empty ``observations`` → OFFLINE (checked
-       BEFORE ``response.json()`` so a 204's empty body never raises here).
+       BEFORE ``response.json()`` so a 204's empty body never raises here); a
+       decoded 2xx that is not ``{"observations": [...]}`` raises
+       ``UpstreamPayloadError`` (caller persists TRANSIENT).
     5. 2xx non-empty payload whose obsTime fails to parse → TRANSIENT (retry at
        floor), NOT the OFFLINE freeze.
     6. otherwise → ONLINE with the parsed snapshot and full-precision instant.
@@ -104,7 +110,9 @@ def classify_current_obs(response: httpx.Response) -> PollOutcome:
     # would wrongly re-poll a dead station as a transient error.
     if status == 204 or not response.content:
         return PollOutcome(Health.OFFLINE, error="empty body")
-    obs = current_obs_from_payload(response.json())
+    obs = current_obs_from_payload(
+        decode_observations_payload(response, station_id=None)
+    )
     if obs is None:
         # 2xx with a body but no first observation row ⇒ station is present but
         # reporting nothing ⇒ OFFLINE (freeze), not a transient retry.
