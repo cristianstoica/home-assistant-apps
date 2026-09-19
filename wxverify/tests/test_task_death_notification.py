@@ -835,8 +835,9 @@ def test_o13_superseded_is_neither_failed_nor_ok(tmp_path: Path) -> None:
     pinned tier.
 
     Single-site construction, named explicitly per the plan: warm A blocks
-    inside ``_fill`` (via a blocking ``daily_rank_conclusions``), warm B
-    bumps the epoch and runs to completion, then A is released.
+    inside ``_fill`` (via a blocking ``_is_published``, so A holds no stripe
+    while parked), warm B bumps the epoch and runs to completion, then A is
+    released.
 
     O13 -> at ``outcome.state``: correct = ``"superseded"``, mutant (an
     unconditional ``_note_warm("ok")`` after ``_reconcile_pins``, the naive
@@ -856,36 +857,56 @@ def test_o13_superseded_is_neither_failed_nor_ok(tmp_path: Path) -> None:
 
     entered_a = threading.Event()
     gate_a = threading.Event()
-    real_w7 = rc.daily_rank_conclusions
+    real_is_published = rc._is_published  # noqa: SLF001
+    gate_a_result: bool | None = None
 
-    def _blocking_w7(
-        conn: sqlite3.Connection,
-        run_id: int,
-        *,
-        leads: tuple[int, ...] | None = None,
-    ) -> dict[str, dict[str, object]]:
-        if run_id == run_a:
+    def _blocking_is_published(conn: sqlite3.Connection, run_id: int) -> bool:
+        nonlocal gate_a_result
+        # Park A at the published gate: the one `_cached` step BEFORE the
+        # stripe lock (`read_cache.py` "Step 1: the published gate, ahead of
+        # the key AND the lookup"). Parked inside `daily_rank_conclusions`
+        # instead, A would hold `_STRIPES[hash(key) % 8]` for the whole
+        # wait, and warm B's W13 key shares that stripe under roughly 9% of
+        # per-process hash seeds -- B would then wait on A's stripe, A on
+        # this gate, and the gate is only set after B returns: a
+        # seed-dependent deadlock-timeout flake. Parked here, A holds no
+        # stripe while parked, so B's `_fill` never contends with it.
+        if run_id == run_a and not entered_a.is_set():
             entered_a.set()
-            assert gate_a.wait(timeout=5.0)
-        return real_w7(conn, run_id, leads=leads)
+            gate_a_result = gate_a.wait(timeout=5.0)
+        return real_is_published(conn, run_id)
 
-    rc.daily_rank_conclusions = _blocking_w7  # type: ignore[assignment]
+    rc._is_published = _blocking_is_published  # type: ignore[assignment]
     try:
 
         async def _scenario() -> None:
             task_a = asyncio.create_task(rc.warm_read_cache(db))
-            await asyncio.wait_for(asyncio.to_thread(entered_a.wait, 5.0), timeout=5.0)
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(entered_a.wait, 5.0), timeout=5.0
+                )
 
-            _full_run(conn, site_id, state="published")
-            conn.commit()
-            await rc.warm_read_cache(db)  # warm B, real, runs to completion
-
-            gate_a.set()
-            await asyncio.wait_for(task_a, timeout=5.0)
+                _full_run(conn, site_id, state="published")
+                conn.commit()
+                await rc.warm_read_cache(db)  # warm B, real, runs to completion
+            finally:
+                # Gate release and task cleanup happen even if the body
+                # above raised, so warm A's task never dangles past the
+                # test.
+                gate_a.set()
+                await asyncio.wait_for(task_a, timeout=5.0)
 
         asyncio.run(_scenario())
     finally:
-        rc.daily_rank_conclusions = real_w7  # type: ignore[assignment]
+        rc._is_published = real_is_published  # type: ignore[assignment]
+
+    # Asserted first, before any outcome/state assertion: a starved gate
+    # wait must surface as a named gate timeout, never as a misleading
+    # `outcome.state` mismatch downstream of it.
+    assert gate_a_result is True, (
+        "gate_a.wait(timeout=5.0) returned False: warm A never observed "
+        "the gate release"
+    )
 
     outcome = rc.warm_outcome()
     assert outcome is not None
