@@ -30,10 +30,16 @@ from wxverify.verification.decision import (
     OccurrenceLead,
     VariableInputs,
     Verdict,
+    _baseline_endpoint,  # noqa: SLF001
+    _baseline_gate,  # noqa: SLF001
+    _evaluate_endpoint,  # noqa: SLF001
     decide_variable,
 )
 from wxverify.verification.engine import finalize_verdicts
-from wxverify.verification.methodology import METHODOLOGY_VERSION
+from wxverify.verification.methodology import (
+    BASELINE_GATE_CI_LEVEL,
+    METHODOLOGY_VERSION,
+)
 from wxverify.verification.runs import (
     capture_config_snapshot,
     input_fingerprint,
@@ -429,7 +435,16 @@ def test_o6_case_g_mixed_cause_keeps_the_baseline_reason() -> None:
 # and `passed`/`insufficient` match §4.6.
 # ---------------------------------------------------------------------------
 
-_GATE_ENTRY_KEYS = {
+#: Gate-entry key set for the two shapes that omit `missing_leads` --
+#: `_baseline_gate` writes `missing_leads` only for a baseline whose
+#: `reason` is the literal "required baseline not supported on every core
+#: lead" (its own reason string for that shape); the other two shapes
+#: (fully passing, or `insufficient` for a different reason) never write
+#: it. It is NOT the key set of every gate entry: the third shape (a
+#: baseline adequate on SOME but not all core leads) adds `missing_leads`
+#: and is pinned separately by
+#: `test_baseline_gate_missing_leads_is_a_fail_closed_guard` below.
+_GATE_ENTRY_KEYS_SUPPORTED_ON_EVERY_CORE_LEAD = {
     "passed",
     "insufficient",
     "reason",
@@ -535,9 +550,104 @@ def test_o7_regression_measured_invariants(
             entry = cast(dict[str, object], raw_entry)
             assert entry["insufficient"] is expect_insufficient
             assert entry["passed"] is (not expect_insufficient)
-            assert set(entry.keys()) - {"reason"} == _GATE_ENTRY_KEYS - {"reason"}
+            assert set(entry.keys()) - {
+                "reason"
+            } == _GATE_ENTRY_KEYS_SUPPORTED_ON_EVERY_CORE_LEAD - {"reason"}
             if not expect_insufficient:
                 assert "reason" not in entry
+
+
+# ---------------------------------------------------------------------------
+# O11 — the `missing_leads` guard: a defensive fail-closed branch for an
+# invariant `_baseline_gate` does not itself establish
+# ---------------------------------------------------------------------------
+
+
+def test_baseline_gate_missing_leads_is_a_fail_closed_guard() -> None:
+    """Synthetic invariant violation -- not a state any application fixture
+    can reach.
+
+    `core` reaching `_baseline_gate` is always a subset of every required
+    baseline's adequate-lead set: that invariant is established one layer
+    up, by `_baseline_support`/§8's core reduction, never by
+    `_baseline_gate` itself. `_baseline_gate`'s own docstring names the
+    branch this proves as the fail-closed answer if the invariant is ever
+    broken: "a shortfall here is a broken contract and is reported as NOT
+    SHOWN -- never as a silent pass, never as a verdict of worse." Nothing
+    in `_baseline_gate`'s signature enforces the subset relationship --
+    `core` is a plain required `tuple[int, ...]` -- so this test calls
+    `_baseline_gate` DIRECTLY with a `core` that violates it on purpose,
+    pinning the guard as a property separate from (and not a substitute
+    for) the invariant proof one layer up.
+
+    `core=(5, 3, 1)`; `baseline_persistence` has adequate data only at
+    lead 1. `missing_leads` is therefore expected as `[5, 3]` -- `core`'s
+    OWN order, not ascending -- which pins that the guard reports
+    `core`'s order rather than re-sorting it.
+    """
+    core = (5, 3, 1)
+    candidate = CandidateSeries(
+        key="synthetic-guard-candidate",
+        baseline_continuous={
+            "baseline_persistence": {"wind_max": {1: _flat(1.0, 5.0)}},
+            "baseline_all_feed_mean": {
+                "wind_max": {1: _flat(1.0, 5.0), 3: _flat(1.0, 5.0), 5: _flat(1.0, 5.0)}
+            },
+        },
+    )
+
+    passed, detail = _baseline_gate(
+        candidate,
+        quantity="wind_max",
+        occurrence=False,
+        seed=1,
+        resamples=20,
+        core=core,
+        empty_core_reason=None,
+    )
+    assert passed is False
+
+    entry = cast(dict[str, object], detail["baseline_persistence"])
+    assert entry["passed"] is False
+    assert entry["insufficient"] is True
+    assert entry["reason"] == "required baseline not supported on every core lead"
+    assert entry["missing_leads"] == [5, 3]
+    assert set(entry.keys()) == _GATE_ENTRY_KEYS_SUPPORTED_ON_EVERY_CORE_LEAD | {
+        "missing_leads"
+    }
+
+    # Independently re-derive the evaluation half of the entry through the
+    # SAME construction `_baseline_gate` uses internally, so this doesn't
+    # hand-compute bootstrap arithmetic that is already pinned elsewhere
+    # (test_verification_outcome_oracles.py).
+    endpoint = _baseline_endpoint(
+        candidate,
+        "baseline_persistence",
+        quantity="wind_max",
+        occurrence=False,
+        temp=False,
+    )
+    expected_evaluation = _evaluate_endpoint(
+        endpoint,
+        occurrence=False,
+        level=BASELINE_GATE_CI_LEVEL,
+        seed=1,
+        resamples=20,
+        restrict_to=core,
+    )
+    assert entry == {
+        "passed": False,
+        "insufficient": True,
+        "reason": "required baseline not supported on every core lead",
+        "missing_leads": [5, 3],
+        **expected_evaluation.as_json(),
+    }
+
+    # `baseline_all_feed_mean` is supported on every core lead, so it takes
+    # neither the third shape nor `missing_leads` -- the contrast the
+    # renamed constant above exists to make visible.
+    other = cast(dict[str, object], detail["baseline_all_feed_mean"])
+    assert "missing_leads" not in other
 
 
 # ---------------------------------------------------------------------------
