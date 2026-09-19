@@ -548,6 +548,7 @@ def test_worker_status_default_response_gains_read_timing_unconditionally(
         "read_timing_since",
         "generation",
         "last_import_swap_at",
+        "read_cache_warm",
     }
     assert isinstance(body["read_timing"], dict)
     assert isinstance(body["read_timing_since"], str)
@@ -619,6 +620,7 @@ def test_worker_status_counts_exact_adds_the_two_row_counts(
             "read_timing_since",
             "generation",
             "last_import_swap_at",
+            "read_cache_warm",
             "forecast_samples_rows",
             "forecast_pairs_rows",
         }

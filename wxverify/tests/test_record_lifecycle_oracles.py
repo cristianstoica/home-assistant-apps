@@ -642,6 +642,7 @@ def _degraded_condition(conn: sqlite3.Connection, now: datetime) -> dict[str, ob
         budget_enabled=False,
         db_enabled=False,
         now=now,
+        export_sweeper_dead=None,
     )
     conditions = verdict["conditions"]
     assert isinstance(conditions, list)

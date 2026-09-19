@@ -1,9 +1,13 @@
 """HA-native monitor: on-request threshold verdict over the add-on's SQLite DB.
 
-Pure module — no process, task, or loop. Each group's checks are read-only
-COUNT/EXISTS queries; ``build_verdict`` assembles the verdict envelope, honours
-the per-group toggles, applies the 10-min post-start grace to group 1, and maps
-a genuine ``sqlite3.Error`` on read to ``db_readable:false`` / ``overall:critical``.
+Pure module — it owns no process state and starts nothing. The one process
+fact it reports, ``export_sweeper_dead``, is a caller-supplied INPUT, exactly
+as ``now`` is. The DB groups' checks are read-only COUNT/EXISTS queries; the
+always-on ``process`` group runs none. ``build_verdict`` assembles the verdict
+envelope, honours the per-group toggles (which cover the DB groups only —
+``process`` has no query cost for a toggle to remove), applies the 10-min
+post-start grace to group 1, and maps a genuine ``sqlite3.Error`` on read to
+``db_readable:false`` / ``overall:critical``.
 """
 
 from __future__ import annotations
@@ -503,7 +507,15 @@ def build_verdict(
     budget_enabled: bool,
     db_enabled: bool,
     now: datetime,
+    export_sweeper_dead: str | None,
 ) -> dict[str, object]:
+    """Assemble the verdict envelope.
+
+    ``export_sweeper_dead`` is the rendered death line for the export sweeper,
+    or ``None`` while it is alive. It carries NO default on purpose: a caller
+    that forgot it would silently report the sweeper as alive, which is the
+    exact class of silence this condition exists to remove.
+    """
     conditions: list[Condition] = []
     grace_active = False
     db_read_failed = False
@@ -571,6 +583,21 @@ def build_verdict(
                 detail="database read raised sqlite3.Error",
             )
         )
+
+    # Evaluated OUTSIDE every `try` and every toggle: it touches no `conn`, so
+    # it must survive a `sqlite3.Error` short-circuit, and it runs no query for
+    # a toggle to remove. Appended before the fold so a latched death reaches
+    # `overall`.
+    conditions.append(
+        Condition(
+            id="export_sweeper_dead",
+            group="process",
+            ok=export_sweeper_dead is None,
+            skipped=False,
+            severity="critical",
+            detail=export_sweeper_dead,
+        )
+    )
 
     overall = "ok"
     for cond in conditions:
