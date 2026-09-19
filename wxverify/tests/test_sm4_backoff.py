@@ -492,13 +492,13 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
     untouched, and the job-level retry ladder (which never touches
     station_poll_state) took over instead of the transient-floor path. The
     fix moves the classify_current_obs call inside the try, so the
-    JSONDecodeError still propagates to the caller (same as before), but only
-    after the same TRANSIENT-persist write a transport error takes. This is
-    the same TRANSIENT + floor destination as a transport error, so it is the
-    paired sibling of TestTransportFailNoBackoff's connect-error case --
-    except the HTTP call itself succeeded, so the budget reservation must NOT
-    be refunded (is_refundable_transport_error only covers ConnectError /
-    ConnectTimeout; a JSONDecodeError never qualifies).
+    UpstreamPayloadError (kind=json_decode) still propagates to the caller,
+    but only after the same TRANSIENT-persist write a transport error takes.
+    This is the same TRANSIENT + floor destination as a transport error, so
+    it is the paired sibling of TestTransportFailNoBackoff's connect-error
+    case -- except the HTTP call itself succeeded, so the budget reservation
+    must NOT be refunded (is_refundable_transport_error only covers
+    ConnectError / ConnectTimeout; an UpstreamPayloadError never qualifies).
     """
 
     def test_malformed_json_persists_transient_at_floor_without_refund(self) -> None:
@@ -528,9 +528,11 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
         ):
             db = _RealDb(conn)
             writer = FencedWriter(db, db.generation)  # type: ignore[arg-type]
-            # response.json() raises JSONDecodeError; the except block still
-            # re-raises the original exception, but only after routing it
-            # through the same TRANSIENT-persist path a transport error takes.
+            # response.json() raises a decode error that decode_observations_
+            # payload wraps as UpstreamPayloadError (kind=json_decode); the
+            # except block re-raises that wrapped exception, but only after
+            # routing it through the same TRANSIENT-persist path a transport
+            # error takes.
             with pytest.raises(UpstreamPayloadError):
                 asyncio.run(_fetch_current_obs(db, writer, site_id, station_id))  # type: ignore[arg-type]
 
@@ -561,3 +563,10 @@ class TestMalformedJsonBodyEscapesToTransientFloor:
             "the HTTP call succeeded and reached the provider, so a"
             " JSON-parse failure must NOT refund the reserved call"
         )
+
+        # O18: the persisted last_error carries the rendered diagnostic line
+        # and never the request's secret query string.
+        assert ps["last_error"] is not None
+        assert ps["last_error"].startswith("upstream payload error kind=json_decode")
+        assert "SYNTHETIC" not in ps["last_error"]
+        assert "?" not in ps["last_error"]

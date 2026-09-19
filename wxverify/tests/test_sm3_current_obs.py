@@ -344,6 +344,40 @@ class TestClassifyCurrentObs:
             classify_current_obs(resp)
         assert info.value.diagnostics.kind == "invalid_structure"
 
+    def test_whitespace_body_raises_json_decode(self) -> None:
+        """200 + whitespace-only body → UpstreamPayloadError kind=json_decode.
+
+        The pre-parse OFFLINE branch only short-circuits on an EMPTY body
+        (``not response.content``); a body that is present but pure
+        whitespace reaches the decoder and fails there instead.
+        """
+        resp = _fake_response(200, content=b"   ")
+        with pytest.raises(UpstreamPayloadError) as info:
+            classify_current_obs(resp)
+        diagnostics = info.value.diagnostics
+        assert diagnostics.kind == "json_decode"
+        assert diagnostics.body == "whitespace"
+        assert diagnostics.endpoint == "/v2/pws/observations/current"
+
+    def test_non_json_body_raises_json_decode(self) -> None:
+        """200 + non-JSON body → UpstreamPayloadError kind=json_decode."""
+        resp = _fake_response(200, content=b"not json")
+        with pytest.raises(UpstreamPayloadError) as info:
+            classify_current_obs(resp)
+        assert info.value.diagnostics.kind == "json_decode"
+
+    def test_non_dict_payload_raises_invalid_structure(self) -> None:
+        """200 + a JSON array (not an object) → UpstreamPayloadError.
+
+        ``current_obs_from_payload`` tolerates a non-dict by returning
+        ``None`` (unchanged, out of scope); the decoder in front of it now
+        rejects the shape before that tolerant function is ever reached.
+        """
+        resp = _fake_response(200, json_data=[])
+        with pytest.raises(UpstreamPayloadError) as info:
+            classify_current_obs(resp)
+        assert info.value.diagnostics.kind == "invalid_structure"
+
     # -- TRANSIENT (unparseable obstime) — marquee negative --------------------
 
     def test_transient_unparseable_obstime_not_offline(self) -> None:

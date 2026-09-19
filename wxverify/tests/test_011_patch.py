@@ -34,6 +34,7 @@ from wxverify.db.queue import (
     fail,
 )
 from wxverify.feeds.seam import CostEstimate, FetchResult
+from wxverify.obs.pws_adapter import decode_observations_payload
 from wxverify.provider_ops import enqueue_fetch_for_feed
 from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
@@ -1494,6 +1495,130 @@ def test_worker_url_secrets_redacted_in_logs(
     assert "SYNTHETIC-SECRET" not in caplog.text, (
         "sanitized_exception must redact key= and appid= query params"
     )
+
+
+def _make_upstream_payload_error() -> Exception:
+    """Build a real UpstreamPayloadError the way _fetch_obs would encounter
+    one: a malformed 200 response decoded via decode_observations_payload,
+    then annotated with the station/progress note _fetch_obs attaches
+    before re-raising."""
+    request = httpx.Request(
+        "GET",
+        "https://api.weather.com/v2/pws/observations/hourly/7day"
+        "?stationId=ISTATION01&apiKey=SYNTHETIC-SECRET",
+    )
+    response = httpx.Response(
+        200,
+        content=b"not json",
+        headers={"content-type": "application/json"},
+        request=request,
+    )
+    exc: Exception | None = None
+    try:
+        decode_observations_payload(response, station_id="ISTATION01")
+    except Exception as raised:  # noqa: BLE001 - captured to add a note, like _fetch_obs
+        exc = raised
+    assert exc is not None
+    exc.add_note("station=ISTATION01 progress=0/1")
+    return exc
+
+
+def test_worker_terminal_upstream_payload_error_logs_full_diagnostics(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """O21: terminal UpstreamPayloadError failure -- ERROR record carries the
+    attempt count, 'retries exhausted', the payload-error kind, the station
+    id, and the progress note, with no secret leaking into the log or the
+    persisted jobs.last_error text."""
+    job = _make_job(job_type="fetch_obs", site_id=42, retry_count=5, max_retries=5)
+
+    async def _raise_payload_error(db: Any, writer: Any, j: Job) -> None:
+        raise _make_upstream_payload_error()
+
+    recorded_errors: list[str] = []
+
+    def _terminal_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
+        recorded_errors.append(error)
+        return FailDisposition(
+            terminal=True, retry_count=6, max_retries=5, next_attempt_at=None
+        )
+
+    _patch_worker_infra(monkeypatch)
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_payload_error)
+    monkeypatch.setattr("wxverify.worker.processor.fail", _terminal_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
+
+    with (
+        caplog.at_level(logging.ERROR, logger="wxverify.worker.processor"),
+        pytest.raises(_StopLoop),
+    ):
+        asyncio.run(run_worker(_FakeDb()))  # type: ignore[arg-type]
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    msg = errors[0].getMessage()
+    assert "attempt 6 of 6" in msg
+    assert "retries exhausted" in msg
+    assert "kind=json_decode" in msg
+    assert "station=ISTATION01" in msg
+    assert "progress=0/1" in msg
+    assert "SYNTHETIC-SECRET" not in caplog.text
+    assert "apiKey" not in caplog.text
+
+    assert len(recorded_errors) == 1
+    assert recorded_errors[0] != ""
+    assert "SYNTHETIC-SECRET" not in recorded_errors[0]
+    assert "apiKey" not in recorded_errors[0]
+
+
+def test_worker_retry_read_timeout_logs_class_name_only(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """O22(a): a non-terminal failure whose exception has empty str() (httpx
+    0.28.1's bare ReadTimeout("")) logs a WARNING that ends with the class
+    name, and the same class name is what gets persisted as the error."""
+    job = _make_job(job_type="fetch_obs", site_id=42)
+
+    async def _raise_read_timeout(db: Any, writer: Any, j: Job) -> None:
+        raise httpx.ReadTimeout("")
+
+    recorded_errors: list[str] = []
+
+    def _retry_disposition(
+        conn: Any, job_id: int, error: str, *, min_delay_seconds: int | None = None
+    ) -> FailDisposition:
+        recorded_errors.append(error)
+        return FailDisposition(
+            terminal=False,
+            retry_count=1,
+            max_retries=5,
+            next_attempt_at="2099-01-01T00:00:00.000Z",
+        )
+
+    _patch_worker_infra(monkeypatch)
+    monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _raise_read_timeout)
+    monkeypatch.setattr("wxverify.worker.processor.fail", _retry_disposition)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_feed_retry_floor_seconds", lambda c, j: None
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"),
+        pytest.raises(_StopLoop),
+    ):
+        asyncio.run(run_worker(_FakeDb()))  # type: ignore[arg-type]
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage().endswith(": ReadTimeout")
+
+    assert recorded_errors == ["ReadTimeout"]
 
 
 # ---------------------------------------------------------------------------
