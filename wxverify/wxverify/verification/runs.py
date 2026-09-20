@@ -439,10 +439,10 @@ def result_basis_freshness(
     /api/verification/status`` and the ``/verification`` page — so both
     apply the same rules and cannot drift apart as the rules change. It
     does not make them simultaneous: pooled read connections run
-    ``isolation_level=None`` (``db/connection.py:131``), so two requests
-    observe two database states and may legitimately report different
-    verdicts across an intervening write. Takes primitives rather than a
-    row because the two
+    ``isolation_level=None`` (``db.connection.Database._connect_reader``),
+    so two requests observe two database states and may legitimately
+    report different verdicts across an intervening write. Takes
+    primitives rather than a row because the two
     callers hold different row shapes (a ``sqlite3.Row`` from ``SELECT *``
     and an explicit projection).
 
@@ -951,10 +951,10 @@ def trigger_status(
     /api/verification/status`` and the ``/verification`` page — so both
     apply the same rules and cannot drift apart as the rules change. It
     does not make them simultaneous: pooled read connections run
-    ``isolation_level=None`` (``db/connection.py:131``), so two requests
-    observe two database states and may legitimately report different
-    statuses across an intervening write. Degrades per site
-    (``trigger_date_unknown``); never
+    ``isolation_level=None`` (``db.connection.Database._connect_reader``),
+    so two requests observe two database states and may legitimately
+    report different statuses across an intervening write. Degrades per
+    site (``trigger_date_unknown``); never
     raises, because both callers build their payload over every enabled
     site and one unusable timezone must not remove the operator's whole
     diagnostic window.

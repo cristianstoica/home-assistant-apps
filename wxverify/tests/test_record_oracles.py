@@ -830,6 +830,7 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
         )
 
     build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
     view = build_forecast(
         conn,
         site_id=site_id,

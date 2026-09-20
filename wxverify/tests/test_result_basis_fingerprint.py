@@ -655,7 +655,9 @@ def test_c1_legacy_run_reports_unknown_not_recorded(
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
-        assert entry["result_basis"] == {"state": "unknown", "reason": "not_recorded"}
+        assert set(entry["result_basis"]) == {"state", "reason", "components"}
+        assert entry["result_basis"]["state"] == "unknown"
+        assert entry["result_basis"]["reason"] == "not_recorded"
         assert entry["warnings"]["stale_inputs"] is False
 
     page = _fetch_page(monkeypatch, site_id)
@@ -759,10 +761,9 @@ def test_c5_no_published_run_reports_no_publishable_run(
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
-        assert entry["result_basis"] == {
-            "state": "unknown",
-            "reason": "no_published_run",
-        }
+        assert set(entry["result_basis"]) == {"state", "reason", "components"}
+        assert entry["result_basis"]["state"] == "unknown"
+        assert entry["result_basis"]["reason"] == "no_published_run"
         assert entry["warnings"]["no_publishable_run"] is True
 
     page = _fetch_page(monkeypatch, site_id)
@@ -775,26 +776,67 @@ def test_c5_no_published_run_reports_no_publishable_run(
 def test_c6_api_and_page_agree_on_state_and_reason(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """c6 -> at the page/API state+reason pair: correct = both surfaces
+    """c6/O9 -> at the page/API state+reason pair: correct = both surfaces
     report the exact same (state, reason) for the same DB state, mutant =
     a divergence if either surface stops using the shared
-    ``result_basis_freshness`` derivation. Verified by comparing the API's
+    ``published_basis_report`` derivation. Verified by comparing the API's
     JSON payload directly to the marker the page actually rendered, rather
-    than assuming they must agree."""
+    than assuming they must agree.
+
+    O9 extends c6 rather than duplicating it: (a) a recorder around each
+    surface's own from-imported ``published_basis_report`` name proves
+    each surface invokes the ONE derivation exactly once per site, and (b)
+    a static import check proves neither surface binds
+    ``result_basis_freshness``, ``run_input_freshness`` or
+    ``published_input_freshness`` from anywhere -- only the facade."""
+    import wxverify.api.routes.verification as api_verification
+    import wxverify.web.verification as web_verification
+    from tests.test_run_input_manifest import _imports_of
+
     conn = _open_app_db(tmp_path, monkeypatch)
     site_id = _make_site(conn, "c6-site")
     _seed_published_run(conn, site_id, fresh_fingerprint=False)
     app = _make_app(monkeypatch)
+
+    api_calls: list[int] = []
+    web_calls: list[int] = []
+    real_api = api_verification.published_basis_report
+    real_web = web_verification.published_basis_report
+
+    def _recording_api(conn: sqlite3.Connection, site_id: int) -> Any:
+        api_calls.append(site_id)
+        return real_api(conn, site_id)
+
+    def _recording_web(conn: sqlite3.Connection, site_id: int) -> Any:
+        web_calls.append(site_id)
+        return real_web(conn, site_id)
+
+    monkeypatch.setattr(api_verification, "published_basis_report", _recording_api)
+    monkeypatch.setattr(web_verification, "published_basis_report", _recording_web)
+
     from fastapi.testclient import TestClient
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
     assert entry["result_basis"]["state"] == "changed"
+    assert api_calls == [site_id]
 
     page = _fetch_page(monkeypatch, site_id)
     markers = _v16_markers(page)
     assert "16.1.warn_stale" in markers
     assert "16.1.freshness_unknown" not in markers
+    assert web_calls == [site_id]
+
+    for surface in ("wxverify.api.routes.verification", "wxverify.web.verification"):
+        _modules, bound = _imports_of(surface)
+        assert {name for _, name in bound}.isdisjoint(
+            {
+                "result_basis_freshness",
+                "run_input_freshness",
+                "published_input_freshness",
+            }
+        )
+        assert ("wxverify.verification.freshness", "published_basis_report") in bound
 
 
 def test_c7_round_trip_through_start_run_reads_fresh() -> None:
@@ -1156,6 +1198,11 @@ def test_f1_forecast_rebuild_inside_horizon_leaves_freshness_fresh_by_design() -
     grew this coverage, the fixed ``recorded`` value asserted here would
     stop matching ``current`` and this test would go red for exactly the
     reason its docstring names.
+
+    Still true after the 2026-09-02 input-manifest change: the manifest
+    derives the surface verdict *above* this function, and ``pair_arrivals``
+    is observed-only, so ``forecast_pairs`` churn still moves neither this
+    digest nor the reported state.
     """
     from datetime import UTC, datetime
 
@@ -1314,11 +1361,21 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
     the whole point of this oracle is to catch exactly the kind of edit
     that updates ``runs.py`` and forgets ``show.html``, and a hand-copied
     list in the test itself is exposed to that same forgetting.
+
+    Since the input manifest, the notice's reason may also be one of the
+    per-component notes ``manifest.py`` emits. Those come from
+    ``MANIFEST_NOTE_TOKENS`` -- the frozenset the evaluators themselves
+    validate against, imported here rather than regexed out of the module
+    source, because the legacy branch passes its note as a variable and a
+    ``note="..."`` regex would go silently empty there. The vocabulary is
+    pinned to be a subset of ``runs.py``'s reasons (no new tokens), and the
+    template's keys must equal the union.
     """
     import re
     from pathlib import Path
 
     import wxverify.verification.runs as runs_module
+    from wxverify.verification.manifest import MANIFEST_NOTE_TOKENS
 
     source = Path(str(runs_module.__file__)).read_text(encoding="utf-8")
     reasons_from_source = set(re.findall(r'reason="([a-z_]+)"', source))
@@ -1330,6 +1387,17 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
         "period_unknown",
         "no_published_generation",
     }, "the regex scope drifted -- update it, don't hardcode the result set"
+    assert {
+        "not_recorded",
+        "algorithm_changed",
+        "malformed_record",
+        "period_unknown",
+        "no_published_generation",
+    } == MANIFEST_NOTE_TOKENS, (
+        "the manifest note vocabulary drifted -- update it, "
+        "don't hardcode the result set"
+    )
+    assert reasons_from_source >= MANIFEST_NOTE_TOKENS
 
     import wxverify.web as web_module
 
@@ -1347,6 +1415,7 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
     template_keys = set(re.findall(r"'([a-z_]+)':", block_match.group(1)))
 
     assert reasons_from_source == template_keys
+    assert reasons_from_source | MANIFEST_NOTE_TOKENS == template_keys
 
 
 def test_f5b_rendered_notice_never_leaks_the_raw_reason_code(

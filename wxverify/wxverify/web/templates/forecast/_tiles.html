@@ -47,9 +47,10 @@
                 {% endif %}
               </div>
             </div>
-            {% if tile.state == 'low_confidence' or tile.stale or tile.partial %}
+            {% if tile.state == 'low_confidence' or tile.state == 'rebuilding' or tile.stale or tile.partial %}
               <div class="tile-badges">
                 {% if tile.state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
+                {% if tile.state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
                 {% if tile.stale %}<span class="badge warn">stale</span>{% endif %}
                 {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
               </div>

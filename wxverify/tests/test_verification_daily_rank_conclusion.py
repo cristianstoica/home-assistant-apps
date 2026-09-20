@@ -715,6 +715,7 @@ def test_the_conclusion_is_rendered_and_served_identically() -> None:
     )
     conn.execute("UPDATE verification_runs SET published_at = '2026-05-29T07:00:00Z'")
     set_runtime_state(conn, published_run_key(1), str(run_id))
+    conn.commit()
     context = load_verification(conn, 1)
     verdicts = cast("list[dict[str, object]]", context["verdicts"])
     page_value = cast("dict[str, object]", verdicts[0]["ranking_redesign_indicated"])

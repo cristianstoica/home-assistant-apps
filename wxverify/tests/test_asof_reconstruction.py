@@ -630,6 +630,7 @@ def test_forecast_ranking_applies_same_exclusions_on_both_paths() -> None:
     )
     assert persistence_id not in ranking_asof
     assert feed_known in ranking_asof
+    conn.commit()
     ranking_live = forecast_ranking(
         conn,
         site_id=site_id,
@@ -674,6 +675,7 @@ def test_asof_at_now_matches_live_leaderboard_for_fully_knowable_data() -> None:
         observed=4.0,
         first_known_at=known_at,
     )
+    conn.commit()
     live = forecast_ranking(
         conn, site_id=site_id, variable="temperature", day_ahead=1, window="30d"
     )

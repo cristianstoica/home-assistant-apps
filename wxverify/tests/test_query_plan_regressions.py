@@ -10,15 +10,18 @@ it.
 
 from __future__ import annotations
 
+import ast
 import datetime
 import inspect
 import os
 import sqlite3
+import textwrap
 
 import pytest
 
 import wxverify.api.routes.verification
 import wxverify.db.runtime_state
+import wxverify.verification.manifest
 import wxverify.verification.runs
 import wxverify.web.verification
 from wxverify.api.routes.health import (
@@ -27,6 +30,7 @@ from wxverify.api.routes.health import (
 )
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import ACTIVE_JOB_SQL, LATEST_JOB_SQL
+from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
     model_run_count_sql,
@@ -609,9 +613,17 @@ def test_verification_route_sql_still_matches_the_pinned_text() -> None:
     assert "SELECT * FROM verification_runs {where}\n            ORDER BY id DESC" in (
         source
     )
+
+
+def test_published_basis_report_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire: the newer-failed-attempt check moved into the read
+    snapshot bracket inside ``published_basis_report``, so the pinned copy
+    above is only trustworthy while that module's text still contains it."""
+    source = inspect.getsource(wxverify.verification.freshness)
     assert (
         "SELECT 1 FROM verification_runs\n"
-        "        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1" in source
+        "                WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1"
+        in source
     )
 
 
@@ -768,7 +780,11 @@ def test_fingerprint_sql_still_matches_the_pinned_text() -> None:
         "SELECT COUNT(*) AS n, MAX(computed_at) AS latest\n"
         "        FROM observations WHERE site_id = ?" in source
     )
-    assert _FINGERPRINT_SAMPLES_SQL in source
+    # Exactly once: the manifest writer runs an identical MAX(id) statement
+    # from its own module. A consolidation that moved it here would satisfy
+    # a bare substring check with the copy and stop guarding
+    # `input_fingerprint`'s own statement.
+    assert source.count(_FINGERPRINT_SAMPLES_SQL) == 1
     assert (
         "SELECT local_date, quantity, value, eligible, covered_hours, stale\n"
         "        FROM daily_truth\n"
@@ -1015,3 +1031,144 @@ def test_verification_page_reads_have_the_expected_shipping_plans() -> None:
         " idx_verification_evidence_cell (run_id=? AND entity_type=?)",
         "USE TEMP B-TREE FOR GROUP BY",
     ]
+
+
+# ---------------------------------------------------------------------------
+# §18.13 — the input-manifest arrivals probes (2026-09-02 input manifest, D7).
+#
+# `run_input_freshness` runs one of these per arrivals component on the
+# REQUEST PATH (`GET /api/verification/status` and the /verification page):
+# "did a row land inside the run's scored horizon after the watermark it
+# pinned at start". `NOT INDEXED` is the whole cost decision. Without it the
+# planner takes the site-scoped covering index -- a walk over the site's
+# entire history, 25.6 ms measured at three years of data -- where the
+# rowid range seek it forbids everything BUT reads only the rows added since
+# the pin: 0.13 ms, and constant. No functional test can see the difference,
+# so the directive is pinned here at three levels: the text (a), the
+# build-independent plan relationship (b), and the shipping build's exact
+# phrasing (c).
+#
+# The `valid_at` bounds are asserted TEXTUALLY for the same reason
+# `_RESULT_BASIS_TRUTH_SQL`'s BETWEEN is: the rowid seek is the only
+# predicate the plan reflects, so a dropped bound leaves the plan identical.
+# O4/O5 in tests/test_run_input_manifest.py catch that behaviourally.
+#
+# Retyped + tripwired like the statements above; the plan pins run the
+# statement LIFTED from the module, so a source edit that drops the
+# directive fails (b), not only the text tripwire.
+# ---------------------------------------------------------------------------
+
+_MANIFEST_SAMPLES_PROBE_SQL = """
+        SELECT EXISTS(
+            SELECT 1 FROM forecast_samples NOT INDEXED
+            WHERE site_id = ? AND id > ?
+              AND valid_at >= ? AND valid_at < ?
+        ) AS moved
+        """
+
+_MANIFEST_PAIRS_PROBE_SQL = """
+        SELECT EXISTS(
+            SELECT 1 FROM forecast_pairs NOT INDEXED
+            WHERE site_id = ? AND id > ?
+              AND valid_at >= ? AND valid_at < ?
+        ) AS moved
+        """
+
+_MANIFEST_PROBE_PARAMS = (1, 0, "2026-06-01T00:00:00Z", "2026-06-06T00:00:00Z")
+
+
+def _lifted_statement(fn: object) -> str:
+    """The one SELECT literal inside ``fn``'s body, as the module runs it."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+    literals = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "SELECT" in node.value
+    ]
+    assert len(literals) == 1, literals
+    return literals[0]
+
+
+def test_manifest_probe_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire for the two statements pinned below (O16 (a))."""
+    source = inspect.getsource(wxverify.verification.manifest)
+    for pinned, fn in (
+        (_MANIFEST_SAMPLES_PROBE_SQL, wxverify.verification.manifest._samples_arrived),
+        (_MANIFEST_PAIRS_PROBE_SQL, wxverify.verification.manifest._pairs_arrived),
+    ):
+        assert pinned in source
+        assert _lifted_statement(fn) == pinned
+        assert "NOT INDEXED" in pinned
+        assert "AND valid_at >= ?" in pinned
+        assert "AND valid_at < ?" in pinned
+
+
+@pytest.mark.parametrize(
+    ("table", "fn"),
+    [
+        ("forecast_samples", wxverify.verification.manifest._samples_arrived),
+        ("forecast_pairs", wxverify.verification.manifest._pairs_arrived),
+    ],
+)
+def test_manifest_probes_seek_the_rowid_never_an_index(table: str, fn: object) -> None:
+    """O16 (b): build-independent -- no plan line names an index."""
+    conn = _fresh_conn()
+    statement = _lifted_statement(fn)
+    plan = _plan(conn, statement, _MANIFEST_PROBE_PARAMS)
+    assert any(f"SEARCH {table}" in line for line in plan), plan
+    assert all("INDEX" not in line for line in plan), plan
+    # Negative control: drop the directive and the planner takes the
+    # site-scoped covering index -- the whole-history walk this pin forbids.
+    control = statement.replace(" NOT INDEXED", "")
+    assert control != statement
+    control_plan = _plan(conn, control, _MANIFEST_PROBE_PARAMS)
+    assert any("INDEX" in line for line in control_plan), control_plan
+
+
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pin: planner phrasing is build-specific (WXV_EQP_SHIPPING=1)",
+)
+def test_manifest_probes_have_the_expected_shipping_plans() -> None:
+    """O16 (c): the rowid range seek, in the shipping build's own words."""
+    conn = _fresh_conn()
+    samples = _lifted_statement(wxverify.verification.manifest._samples_arrived)
+    assert "SEARCH forecast_samples USING INTEGER PRIMARY KEY (rowid>?)" in _plan(
+        conn, samples, _MANIFEST_PROBE_PARAMS
+    )
+    pairs = _lifted_statement(wxverify.verification.manifest._pairs_arrived)
+    assert "SEARCH forecast_pairs USING INTEGER PRIMARY KEY (rowid>?)" in _plan(
+        conn, pairs, _MANIFEST_PROBE_PARAMS
+    )
+
+
+def test_failed_scopes_lookup_is_indexed_on_the_whole_scope() -> None:
+    """O11 -- the scope lookup is indexed on the whole scope."""
+    conn = _fresh_conn()
+    plan = _plan(conn, FAILED_SCOPES_SQL, ("2026-07-07T12:00:00Z",))
+    assert any(
+        "SEARCH k" in line and "idx_jobs_type_key_site" in line and "site_id=?" in line
+        for line in plan
+    ), plan
+
+    # Negative control (a): rewriting the job_key comparison so it is no
+    # longer a bare column reference ends the usable index prefix at type,
+    # so no line can carry the index together with site_id=? any more.
+    degraded = FAILED_SCOPES_SQL.replace(
+        "k.job_key IS j.job_key", "COALESCE(k.job_key, '') = COALESCE(j.job_key, '')"
+    )
+    assert degraded != FAILED_SCOPES_SQL
+    degraded_plan = _plan(conn, degraded, ("2026-07-07T12:00:00Z",))
+    assert not any(
+        "SEARCH k" in line and "idx_jobs_type_key_site" in line and "site_id=?" in line
+        for line in degraded_plan
+    ), degraded_plan
+
+    # Negative control (b): with the index gone, no line can name it at all.
+    conn.execute("DROP INDEX idx_jobs_type_key_site")
+    no_index_plan = _plan(conn, FAILED_SCOPES_SQL, ("2026-07-07T12:00:00Z",))
+    assert not any("idx_jobs_type_key_site" in line for line in no_index_plan), (
+        no_index_plan
+    )

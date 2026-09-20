@@ -35,9 +35,10 @@ def _resolve_site(
     """Site resolution shared by the page and poll paths.
 
     Contract preserved verbatim from _load_forecast_context: an EXPLICIT
-    site_id resolves through load_site, which does not filter on `enabled`
-    (web/context.py:219) -- a disabled site resolves normally on both the page
-    and the poll, and the enabled-site list is never loaded for this branch.
+    site_id resolves through `load_site`, which selects by id without applying
+    the enabled-site filter that `load_sites` uses -- a disabled site resolves
+    normally on both the page and the poll, and the enabled-site list is never
+    loaded for this branch.
     Only the implicit (site_id is None) branch is restricted to enabled
     sites, via load_sites(include_disabled=False) -- reusing the caller's
     already-loaded list when one is supplied via `enabled_sites`, otherwise

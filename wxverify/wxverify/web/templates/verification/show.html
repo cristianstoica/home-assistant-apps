@@ -119,7 +119,15 @@
 
     {{ trigger_notice(trigger) }}
     {% if warnings.stale_inputs %}
-      <p class="notice" data-v16="16.1.warn_stale">Current inputs no longer match the basis pinned for this run — results reflect that pinned basis, not current data.</p>
+      {%- set input_labels = {
+        'config_truth_basis': 'the settings and daily history behind it',
+        'forecast_arrivals': 'new forecast rows inside the scored dates'
+      } -%}
+      {%- set moved = result_basis.components
+            | selectattr('state', 'equalto', 'changed')
+            | map(attribute='component')
+            | select('in', input_labels) | list -%}
+      <p class="notice" data-v16="16.1.warn_stale">Current inputs no longer match the basis pinned for this run{% if moved %} ({% for c in moved %}{{ input_labels[c] }}{{ "; " if not loop.last }}{% endfor %}){% endif %} — results reflect that pinned basis, not current data.</p>
     {% endif %}
     {% if result_basis.state == 'unknown' %}
       {%- set freshness_reasons = {
@@ -167,14 +175,20 @@
              whether the missing evidence was ignored safely or determined
              the result. retain_incumbent is the counterexample -- with one
              quantity adequate but tied against the incumbent and the other
-             never scored, neither side is material, so mixed_by_quantity is
-             False (decision.py:881) and the ladder falls through to
-             retain_incumbent with no recommended key (decision.py:1155, :1159);
-             add a measurable second endpoint, the first held identical, and
-             it flips to recommend. Only an explicit persisted decision-layer
-             fact -- that the gap could not have changed the outcome -- could
-             establish the stronger wording, and no such fact is recorded
-             today (deferred). #}
+             never scored, neither side is material: in _decide_precip the
+             total_material and occ_material conjunctions both include
+             _beats (a CI lower bound above zero, which a tie does not give)
+             and the adequate-lead floor (which a never-scored endpoint does
+             not clear), and the insufficient early return needs both
+             endpoints below the floor, so it is not taken. mixed_by_quantity
+             is therefore False, no candidate passes, and decide_variable's
+             outcome ladder falls through to its final branch --
+             retain_incumbent with no recommended key. Add a measurable
+             second endpoint, the first held identical, and it flips to
+             recommend (the baseline gates permitting). Only an explicit
+             persisted decision-layer fact -- that the gap could not have
+             changed the outcome -- could establish the stronger wording,
+             and no such fact is recorded today (deferred). #}
           <p class="notice" data-v16="16.2.evidence_scope">Part of this variable was never measured: {% for u in v.unmeasured_endpoints %}{{ u.label }} ({{ u.name }}) had no adequate lead on any tested depth{% if u.reason %}, most often recorded as {{ u.reason }}{% endif %}{{ '' if loop.last else ' · ' }}{% endfor %}. The outcome above is not a conclusion about the parts that were never measured.</p>
         {% endif %}
         {%- set ranking = v.ranking_redesign_indicated %}

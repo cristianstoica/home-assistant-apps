@@ -513,6 +513,10 @@ details.help p {
   border-left: 4px solid var(--warn);
 }
 
+.tile.state-rebuilding {
+  border-left: 4px solid var(--accent);
+}
+
 .tile.state-not_available {
   border-style: dashed;
   box-shadow: none;

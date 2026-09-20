@@ -32,8 +32,11 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Callable
-from typing import cast
+from dataclasses import dataclass
+from typing import Literal, cast
 
+from wxverify.core.error_sanitize import safe_detail
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import Database, current_db_generation
 from wxverify.verification.diagnostics import observed_wet_precip_mae
 from wxverify.verification.ranking import daily_rank_conclusions
@@ -311,6 +314,62 @@ def cached_observed_wet_precip_mae(
     return _cached(conn, run_id, _W13_NAME, observed_wet_precip_mae)
 
 
+@dataclass(frozen=True)
+class WarmOutcome:
+    """What the last warm did, as the warm itself reports it.
+
+    ``running`` means one of three things: a ``BaseException`` left the frame
+    (cancellation is the ordinary one), the warm is still in it, or the outcome
+    writer failed on EVERY attempt -- and only that third case also logs
+    ``"read-cache warm: recording the outcome failed"``.
+
+    ``derivations_failed`` counts ``(site, derivation)`` pairs that raised and
+    were swallowed by ``_fill``'s inner catch, so an ``ok`` warm that warmed
+    nothing is visible rather than indistinguishable from a clean one. A
+    ``superseded`` outcome reports a PARTIAL count by construction: ``_fill``
+    returns early the moment it loses the ticket.
+    """
+
+    state: Literal["running", "superseded", "ok", "failed"]
+    at: str
+    detail: str
+    derivations_failed: int
+
+
+# One slot, shared by BOTH warm call sites (the lifespan boot warm and the
+# publish-time warm). Deliberate: a per-call-site map is over-engineering for a
+# diagnostic, and the cost is that a later warm overwrites a dead warm's
+# `running` with its own. `running` is therefore diagnosable only against `at`,
+# never alone. Lower case marks it as `global`-rebound module state, the idiom
+# `_warm_epoch` and `_reset_token` above already follow.
+_last_warm: WarmOutcome | None = None
+
+
+def warm_outcome() -> WarmOutcome | None:
+    """The last warm's self-reported outcome, or ``None`` if none has run."""
+    return _last_warm
+
+
+def _note_warm(
+    state: Literal["running", "superseded", "ok", "failed"],
+    failures: list[str],
+    *,
+    detail: str = "",
+) -> None:
+    """Record the warm's outcome.
+
+    Takes no lock: this is a single rebind of a frozen object, so a reader sees
+    either the old outcome or the new one and never a torn intermediate.
+    """
+    global _last_warm
+    _last_warm = WarmOutcome(
+        state=state,
+        at=isoformat_utc(utc_now()),
+        detail=detail,
+        derivations_failed=len(failures),
+    )
+
+
 def reset_read_cache() -> None:
     """Empty both tiers AND invalidate every computation already in flight.
 
@@ -326,13 +385,18 @@ def reset_read_cache() -> None:
     Neither counter is ever ZEROED: zeroing is the one thing that would make
     a stale ticket current again. ``_STRIPES`` is not rebuilt either -- a
     replaced stripe tuple would discard a lock another thread is holding.
+
+    The last warm outcome is cleared here too: it is process-global state about
+    a warm against the previous database, and a test that starts from a fresh
+    one must not read it.
     """
-    global _warm_epoch, _reset_token
+    global _warm_epoch, _reset_token, _last_warm
     with _LOCK:
         _ENTRIES.clear()
         _PINNED.clear()
         _warm_epoch += 1
         _reset_token += 1
+        _last_warm = None
 
 
 async def warm_read_cache(db: Database) -> None:
@@ -351,8 +415,27 @@ async def warm_read_cache(db: Database) -> None:
     ``db.read``, the pointer snapshot, the epoch ticket and the pin
     reconciliation -- which is exactly the shape that escapes an inner-only
     catch and would reach the lifespan.
+
+    Self-reports its own outcome at every exit (see ``WarmOutcome``), because
+    the swallowing above makes a broken warm and a successful one identical
+    from the task's outcome alone. Both call sites get that for free.
     """
+    # Only the sentinel sits above the total catch, and only because the handler
+    # below reads it: `None` is a singleton, so binding it looks nothing up,
+    # calls nothing, and allocates nothing, which makes it the one statement in
+    # this function that genuinely cannot raise. The list is allocated INSIDE
+    # the `try`, because allocating one CAN raise `MemoryError` -- which is an
+    # `Exception`, and out here would escape the contract above.
+    failures: list[str] | None = None
     try:
+        failures = []
+        # The outcome write, by contrast, is INSIDE the `try`, never above it.
+        # The two placements are semantically identical, but a `_note_warm`
+        # above the `try` would be the one statement in this function the total
+        # catch does not cover -- the single path on which this coroutine can
+        # raise `Exception`, which the docstring contract above and
+        # `verification_run.py`'s "cannot fail the run" comment both forbid.
+        _note_warm("running", failures)
 
         def _snapshot(
             conn: sqlite3.Connection,
@@ -375,6 +458,7 @@ async def warm_read_cache(db: Database) -> None:
         staged: dict[_Key, object] = {}
         for site_id, run_id in targets:
             if not _epoch_is_current(epoch):
+                _note_warm("superseded", failures)
                 return
 
             # One `db.read` per site rather than one spanning the whole warm:
@@ -394,6 +478,9 @@ async def warm_read_cache(db: Database) -> None:
                     try:
                         _cached(conn, run_id, name, compute, staged=staged)
                     except Exception:
+                        # Appended from the executor thread through the
+                        # closure, exactly as `staged` above already is.
+                        failures.append(f"{name}:{site_id}:{run_id}")
                         logger.exception(
                             "read-cache warm: %s failed for site=%s run=%s",
                             name,
@@ -403,5 +490,25 @@ async def warm_read_cache(db: Database) -> None:
 
             await db.read(_fill)
         _reconcile_pins(staged, epoch)
-    except Exception:
+        # Derived from the TICKET, not from control flow. A warm that loses the
+        # race inside `_fill` -- the realistic shape, since `_fill` is where the
+        # seconds go -- returns normally with `_reconcile_pins` a no-op on its
+        # stale ticket, and calling that `ok` would mean `ok` no longer implies
+        # the warm pinned anything.
+        _note_warm("ok" if _epoch_is_current(epoch) else "superseded", failures)
+    except Exception as exc:
         logger.exception("read-cache warm failed")
+        # The one `_note_warm` the outer catch does not cover: this handler has
+        # nothing above it, so a raise from here leaves the coroutine. The
+        # failure is logged FIRST, so it is on the record even when recording
+        # it fails. `safe_detail` cannot raise, so this guard covers
+        # `_note_warm` itself and the fallback list an exception raised before
+        # the real one existed still needs -- both are therefore inside it.
+        try:
+            _note_warm(
+                "failed",
+                failures if failures is not None else [],
+                detail=safe_detail(exc),
+            )
+        except Exception:
+            logger.exception("read-cache warm: recording the outcome failed")

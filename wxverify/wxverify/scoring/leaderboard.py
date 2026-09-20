@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Literal
 
 from wxverify.core.timeutil import parse_utc, window_cutoff
+from wxverify.db.snapshot import read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import active_competitor_clause, active_feed_cte
@@ -90,6 +91,42 @@ def leaderboard_with_status(
     ``live:{N}d`` cache keys, so they must not look like cache misses.
     Callers enqueue a rescore (after the read closes) only for ``stale`` and
     ``rebuilding``.
+
+    Every read the verdict depends on — the window setting, the site row, the
+    expected active feed set and the ``score_cache`` rows — runs inside one WAL
+    read snapshot (``read_snapshot``), so ``rebuilding`` is only ever reported
+    for a mismatch that existed in one state of the database, never for two
+    reads that straddled a rescore commit. The block is read-only. A caller
+    that already holds a transaction on ``conn`` — the forecast-record builder,
+    inside the writer's ``BEGIN IMMEDIATE`` — must call
+    ``leaderboard_with_status_in_transaction`` instead; the snapshot refuses to
+    nest.
+    """
+    with read_snapshot(conn, label="leaderboard"):
+        return leaderboard_with_status_in_transaction(
+            conn,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
+
+
+def leaderboard_with_status_in_transaction(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    window: str,
+) -> LeaderboardResult:
+    """``leaderboard_with_status`` for a caller that already holds the snapshot.
+
+    Identical verdict logic; issues no transaction of its own and requires
+    none. The one production caller is the forecast-record builder, which runs
+    inside the writer's ``BEGIN IMMEDIATE`` — already a single snapshot — where
+    the facade's ``read_snapshot`` would refuse to nest. Read paths call the
+    facade.
     """
     resolved = resolve_window(conn, window)
     if not resolved.cache_backed:

@@ -588,6 +588,7 @@ def test_stray_variable_cell_does_not_wedge_the_composite_window() -> None:
     )
     window_key, computed_at, min_n = _seed_fresh_complete_snapshot(conn, site_id=1)
 
+    conn.commit()
     baseline = composite_with_status(conn, site_id=1, window="rolling")
     assert baseline.status == "hit"
     baseline_counts = {row["feed_id"]: row["component_count"] for row in baseline.rows}
@@ -627,6 +628,7 @@ def test_stray_variable_cell_does_not_wedge_the_composite_window() -> None:
         computed_at=computed_at,
     )
 
+    conn.commit()
     result = composite_with_status(conn, site_id=1, window="rolling")
     assert result.status == "hit"
     for row in result.rows:
@@ -636,6 +638,7 @@ def test_stray_variable_cell_does_not_wedge_the_composite_window() -> None:
     # row -- the allowlist must not turn every partial snapshot into a
     # false hit; a genuinely incomplete one still reports `rebuilding`.
     conn.execute("DELETE FROM score_cache WHERE site_id=1 AND variable != 'humidity'")
+    conn.commit()
     negative = composite_with_status(conn, site_id=1, window="rolling")
     assert negative.status == "rebuilding"
 
@@ -651,6 +654,7 @@ def test_out_of_range_lead_cache_cell_does_not_wedge_the_composite_window() -> N
     )
     window_key, computed_at, min_n = _seed_fresh_complete_snapshot(conn, site_id=1)
 
+    conn.commit()
     baseline = composite_with_status(conn, site_id=1, window="rolling")
     assert baseline.status == "hit"
     baseline_counts = {row["feed_id"]: row["component_count"] for row in baseline.rows}
@@ -679,6 +683,7 @@ def test_out_of_range_lead_cache_cell_does_not_wedge_the_composite_window() -> N
         computed_at=computed_at,
     )
 
+    conn.commit()
     result = composite_with_status(conn, site_id=1, window="rolling")
     assert result.status == "hit"
     for row in result.rows:
@@ -689,5 +694,6 @@ def test_out_of_range_lead_cache_cell_does_not_wedge_the_composite_window() -> N
     conn.execute(
         f"DELETE FROM score_cache WHERE site_id=1 AND day_ahead != {MAX_DAY_AHEAD + 1}"
     )
+    conn.commit()
     negative = composite_with_status(conn, site_id=1, window="rolling")
     assert negative.status == "rebuilding"

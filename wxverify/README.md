@@ -659,14 +659,18 @@ is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
 only — it disables all Supervisor restarts, including crash recovery.
 
 **Proactive alerting** is HA-native. The add-on exposes a read-only verdict
-endpoint, `GET /api/health/monitor`, which runs pipeline (group 1), budget
-(group 2), and DB-integrity (group 4) threshold checks against its own database
-and returns a structured verdict (`overall` = `ok` / `warning` / `critical`,
-plus per-condition detail). It always responds `200` with a verdict body — even
-on a database read error, which surfaces as `db_readable:false` /
-`overall:critical` rather than an HTTP failure. Each group can be turned off via
-the `monitor_pipeline`, `monitor_budget`, and `monitor_db` options; a disabled
-group runs no queries and its conditions report `skipped`.
+endpoint, `GET /api/health/monitor`. It runs pipeline (group 1), budget
+(group 2), and DB-integrity (group 4) threshold checks against its own database,
+and one always-on `process` group that queries nothing at all — it reports facts
+about the running add-on itself, currently just whether the background export
+cleanup has stopped. It returns a structured verdict (`overall` = `ok` /
+`warning` / `critical`, plus per-condition detail), and always responds `200`
+with a verdict body — even on a database read error, which surfaces as
+`db_readable:false` / `overall:critical` rather than an HTTP failure. Each of the
+three database groups can be turned off via the `monitor_pipeline`,
+`monitor_budget`, and `monitor_db` options; a disabled group runs no queries and
+its conditions report `skipped`. The `process` group has no toggle — it runs no
+queries, so switching it off could only hide a fault, never save any work.
 
 Home Assistant owns the poll loop and delivery: a **REST sensor** polls
 `/api/health/monitor` on the internal add-on network, and two **automations**
@@ -680,7 +684,13 @@ that clears on its own is consistent with a Watchdog-triggered restart —
 confirm in the Supervisor log, which shows
 a `Watchdog found app Weather Verify ...` line.
 The runtime health routes `/api/health/*` and
-`/api/worker/status` remain available for ad-hoc inspection.
+`/api/worker/status` remain available for ad-hoc inspection. `/api/worker/status`
+also carries `read_cache_warm` — the read cache's own report of its most recent
+warm (`state`, `at`, `detail`, `derivations_failed`), or `null` before any warm
+has run. Read `state` together with `at`, never on its own: one slot is shared by
+the warm at startup and the warm after every publish, so a `running` whose `at`
+predates the last publish is a warm that never finished, while a recent
+`running` is simply one still in progress.
 
 ### Home Assistant package (REST sensor + automations)
 
@@ -828,3 +838,9 @@ only 225 when scoped to `wxverify tests`, which drops `scripts/`.
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
 than the local one. A green local run does not cover them.
+
+Cite code by its owning symbol, never by `file.py:<line>`: a line number
+drifts the moment the file changes. The pytest suite includes a guard
+(`tests/test_citation_anchor_guard.py`) that fails on any `file.py:<line>`
+citation in a production docstring, comment, or Jinja template comment, so
+write "see `_decide_precip` in `decision.py`" rather than a line reference.

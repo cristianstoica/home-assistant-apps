@@ -309,12 +309,86 @@ class Database:
                 # task is still running a query against it.
                 started, finished, result = await run_to_completion(_timed, conn)
             finally:
-                self._read_pool.put_nowait(conn)
+                self._read_pool.put_nowait(self._settle_reader(conn))
             return result
         finally:
             # This runs on the event-loop thread, which is single-threaded,
             # so `_read_stats` needs no lock of its own.
             self._record_read(label, requested, gated, acquired, started, finished)
+
+    def _settle_reader(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        """The connection this read is returning, guaranteed snapshot-free.
+
+        NEVER raises and always returns exactly one connection, so the pool
+        holds exactly ``_READ_POOL_SIZE`` at rest on every path. Fewer would
+        make ``close_if_idle`` read "a reader is checked out" for the rest of
+        the process lifetime and skip the graceful close forever; a
+        duplicate would hand one handle to two readers.
+
+        Runs on the event-loop thread, after ``run_to_completion`` (see
+        ``wxverify.core.aio``) has confirmed the executor thread stopped, so
+        no thread can be mid-statement on this connection -- and nothing
+        else that walks ``_read_conns`` can interleave with the swap below:
+        ``close``/``close_if_idle`` run on this same thread and the latter
+        refuses while this reader is out; ``replace_from`` drains the pool
+        first and cannot finish that drain until this method has returned
+        its connection.
+
+        Failure policy, in order. A connection that will not roll back is
+        closed, replaced by a fresh reader from ``_connect_reader`` at the
+        same ``_read_conns`` index, and the fresh one is returned -- the
+        queue and ``_read_conns`` keep naming the same objects. If the
+        reconnect itself fails, the CLOSED handle goes back: every later
+        read that draws it raises ``ProgrammingError`` -- loud, roughly one
+        draw in ``_READ_POOL_SIZE`` under sequential load, until the add-on
+        is restarted -- and never a stale snapshot. A ``close()`` that fails
+        is logged at ERROR and the reconnect proceeds anyway; a real reader
+        cannot reach that arm (``check_same_thread=False``, autocommit).
+        """
+        try:
+            if not conn.in_transaction:
+                return conn
+        except sqlite3.ProgrammingError:
+            # Closed: by the reconnect-failure arm below on an earlier
+            # return (the reachable case), or underneath us (no server path
+            # does that). The read that drew it has already failed loudly.
+            # It goes back so the pool keeps its size, and the reconnect is
+            # NOT retried here -- the ERROR line that arm logged says restart.
+            return conn
+        logger.warning("reader returned mid-transaction; rolling back")
+        try:
+            conn.rollback()
+        except Exception:
+            logger.exception("reader rollback failed")
+        else:
+            return conn
+        # Closing is the only remaining way to drop the read mark. A
+        # connection that cannot roll back would otherwise serve its stale
+        # snapshot to every later reader, silently -- the worst outcome on
+        # this path. Close, then replace: the pool must not shrink (see the
+        # docstring) and must not keep handing out a dead handle.
+        try:
+            conn.close()
+        except Exception:
+            logger.exception("reader close failed after a failed rollback")
+        else:
+            logger.error("reader closed after a failed rollback")
+        try:
+            fresh = self._connect_reader()
+        except Exception:
+            # The closed handle stays in the pool AND in _read_conns, so the
+            # pool keeps its size and close() still walks a real object.
+            logger.exception(
+                "reader reconnect failed; the unusable handle stays pooled "
+                "and every read that draws it fails until restart"
+            )
+            return conn
+        for i, pooled in enumerate(self._read_conns):
+            if pooled is conn:
+                self._read_conns[i] = fresh
+                break
+        logger.error("reader replaced after a failed rollback")
+        return fresh
 
     def _record_read(
         self,
@@ -447,6 +521,60 @@ class Database:
         for conn in self._read_conns:
             conn.close()
         self._conn.close()
+
+    def close_if_idle(self) -> bool:
+        """Close every connection, but only while none of them is in use.
+
+        Returns ``True`` when the connections were closed, ``False`` when a
+        write was in flight or a pooled reader was checked out.
+
+        Closing a connection another thread is mid-statement on is a
+        use-after-close at the C level, not a Python error: every connection
+        here is opened ``check_same_thread=False`` (``_connect_reader``,
+        ``_open``) and every query runs in an executor thread, so a
+        ``close()`` and a live query can genuinely overlap. ``close()``
+        itself neither clears the gate nor drains the pool -- unlike
+        ``replace_from`` -- so the caller is what has to establish that
+        overlap is impossible.
+
+        Both checks run on the event-loop thread with no ``await`` between
+        them and the ``close()`` they guard, so what they report cannot go
+        stale before it is used: a writer holds ``_write_lock`` for the
+        whole of ``write``/``write_fenced``, and a reader holds its
+        connection OUT of ``_read_pool`` for the whole of ``read``.
+
+        State what that buys exactly, because it is narrower than
+        "nothing is going on": when both predicates read idle, no thread
+        is EXECUTING on any connection, so this close cannot land
+        mid-statement. It does NOT mean no one can acquire afterwards.
+        ``asyncio.Lock.locked()`` reports the HOLDER only and never
+        consults the wait queue, so a writer already queued on
+        ``_write_lock`` is invisible here and may take it the moment this
+        returns; that caller gets a ``ProgrammingError`` on a closed
+        connection -- the same clean failure as a late reader, not
+        corruption.
+
+        ``_read_sync_conn`` is covered by neither check and needs no cover:
+        ``read_sync``/``write_sync`` have no caller inside the server process
+        (only ``__main__``'s CLI subcommands and tests).
+
+        The read gate is deliberately NOT cleared. A reader arriving after
+        this returns must fail loudly with ``ProgrammingError`` rather than
+        park forever on an event nobody will set again.
+        """
+        if self._write_lock.locked():
+            logger.warning("close skipped: a write is in flight")
+            return False
+        idle = self._read_pool.qsize()
+        if idle != _READ_POOL_SIZE:
+            logger.warning(
+                "close skipped: %d of %d pooled readers checked out",
+                _READ_POOL_SIZE - idle,
+                _READ_POOL_SIZE,
+            )
+            return False
+        self.close()
+        return True
 
     async def replace_from(self, new_db: Path, backup: Path) -> None:
         """Replace the live DB file with ``new_db``, backing up the current DB.

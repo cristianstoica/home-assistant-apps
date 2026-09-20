@@ -273,6 +273,7 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
     conn_default = _make_db()
     _seed_two_confident_feeds(conn_default)
     _seed_score_cache_for_fixture(conn_default)
+    conn_default.commit()
     view_default = build_forecast(
         conn_default, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -283,6 +284,7 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
     _seed_two_confident_feeds(conn_narrow)
     _seed_score_cache_for_fixture(conn_narrow)
     set_setting(conn_narrow, "forecast_blend_depth", "1")
+    conn_narrow.commit()
     view_narrow = build_forecast(
         conn_narrow, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )

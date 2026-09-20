@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.15.0
+
+Makes the results and health pages report the state they actually read
+from, and lets a database written by a version before 0.9.0 open again.
+
+### Added
+
+- Each verification run now records a manifest of the inputs it was
+  scored against. The "inputs changed" notice on the verification page
+  is derived from that manifest and names which input moved. Runs
+  recorded before this release have no manifest and keep the previous
+  fingerprint comparison.
+- The worker status now reports whether the export sweeper and the
+  read-cache warmer have died unexpectedly. Either one could previously
+  stop without a trace while the health page stayed green; the health
+  verdict now always includes a "process" group that turns red when
+  that happens.
+
+### Changed
+
+- The "problem jobs" health condition counts failed work by scope
+  rather than by row. For the single-step job types, a failure is
+  cleared once a later run of the same job completes successfully; a
+  cancelled or unavailable run does not count as recovery. Multi-step
+  jobs are still counted by age alone. The detail now names both
+  counts ("<n> unresolved failed scopes, <m> stuck/overdue jobs").
+  Completions recorded before this release carry no success marker, so
+  a failure from before the upgrade clears on the next successful run
+  rather than immediately.
+- Forecast tiles now show "rebuilding" while the leaderboard cache is
+  being rebuilt, instead of a generic low-confidence badge.
+- The database connections are closed cleanly when the add-on stops.
+
+### Fixed
+
+- A database last written by a version before 0.9.0 could not be
+  opened by 0.11.0 or later ("no such column: tz_generation_id").
+  Tables are now created before the migrations run and indexes after
+  them, so those older databases upgrade again.
+- The leaderboard and composite score, and the published-run freshness
+  report shared by the API and the verification page, each read their
+  inputs inside one consistent database snapshot. Before, a write
+  landing between two of those reads could produce a verdict about a
+  state that never existed.
+- A pooled database connection handed back mid-transaction is rolled
+  back before reuse, with a warning logged, instead of carrying the
+  open transaction into the next reader.
+- A job that fails for good is never recorded with an empty error any
+  more. A weather.com response that is not valid JSON is classified as
+  an upstream payload failure with a safe diagnostic, and a site whose
+  catch-up pass is aborted is logged as a warning while the other sites
+  continue.
+- Error details no longer repeat the exception class
+  ("RuntimeError: RuntimeError").
+
+The database schema version is unchanged (6). The one addition is a new
+table that older versions leave alone, so a database opened by this
+version can still be opened by 0.14.0.
+
 ## 0.14.0
 
 Stops the nightly run from scoring a day whose measurements are still

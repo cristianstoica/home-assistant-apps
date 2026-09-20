@@ -368,6 +368,7 @@ class TestMidBuildDeleteScoping:
         set_setting(conn, "min_n", "1")
 
         def _read() -> list[LeaderboardRow]:
+            conn.commit()
             return leaderboard(
                 conn,
                 site_id=site_id,

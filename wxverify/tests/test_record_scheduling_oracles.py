@@ -305,6 +305,7 @@ def test_monitor_record_gap_pairs_and_slack_window() -> None:
             budget_enabled=False,
             db_enabled=False,
             now=now,
+            export_sweeper_dead=None,
         )
         conditions = verdict["conditions"]
         assert isinstance(conditions, list)

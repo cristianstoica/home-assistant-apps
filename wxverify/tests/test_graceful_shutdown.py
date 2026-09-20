@@ -962,3 +962,511 @@ def test_cancel_and_reap_with_no_tasks_is_a_noop(
     with caplog.at_level(logging.ERROR, logger="wxverify.api.app"):
         asyncio.run(_run())
     assert not any(r.name == "wxverify.api.app" for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# DB pool close-on-shutdown: `Database.close_if_idle()` and
+# `_shutdown_database`. The nested `finally` at `lifespan`'s shutdown --
+# `try: await _cancel_and_reap(tasks) / finally: _shutdown_database(db)` --
+# closes the six connections only after the reap's own DB write has
+# committed, and only while `close_if_idle`'s two predicates both read idle.
+# ---------------------------------------------------------------------------
+
+
+def test_close_runs_only_after_the_reaps_write_commits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The pool closes only after the reap's own write has committed --
+    direct sequence proof.
+
+    A worker stub's ``except asyncio.CancelledError`` handler performs a
+    REAL ``db.write`` before re-raising, and ``Database.close_if_idle`` is
+    wrapped with a recorder, so one ``order`` list observes both events in
+    the sequence they actually happen in, not merely that both happened.
+
+    Catches: M1 (the close hoisted above the reap). Under that ordering the
+    handler's own write lands against an already-closed database and
+    raises ``sqlite3.ProgrammingError`` from inside its own
+    ``except asyncio.CancelledError`` handler, so ``order`` never gains
+    ``"reap-write-committed"`` at all -- and `_cancel_and_reap` separately
+    reports the worker as failed, a second independent signal not asserted
+    here but visible in the mutant's own terminal output.
+    """
+    conn = _init_tmp_db(tmp_path)
+    job_id = _insert_job(conn)
+
+    order: list[str] = []
+
+    async def _worker_stub(*_args: object) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await get_db().write(
+                lambda c: c.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE id = ?", (job_id,)
+                )
+            )
+            order.append("reap-write-committed")
+            raise
+
+    monkeypatch.setattr("wxverify.api.app.run_worker", _worker_stub)
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper",
+        _make_immediate_stub("export sweeper"),
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
+    )
+
+    async def _noop_discovery(_port: int) -> None:
+        # The leading `await asyncio.sleep(0)` is not padding: `create_task`
+        # only SCHEDULES a task via `call_soon`, it does not run it. Without
+        # an intervening scheduling turn here, the worker stub's cancel
+        # lands before its coroutine has ever been stepped, and Python
+        # delivers `CancelledError` at the very top of the coroutine --
+        # before it ever enters its own `try` -- so `_worker_stub`'s
+        # `except` branch would never run, silently destroying this test's
+        # ability to observe the write at all (verified empirically:
+        # dropping this line collapses `order` to `["db-closed"]`, matching
+        # `test_startup_failure_after_task_creation_still_reaps_every_task`'s
+        # identical finding for the same reason).
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _noop_discovery)
+
+    real_close_if_idle = Database.close_if_idle
+
+    def _recording_close_if_idle(self: Database) -> bool:
+        result = real_close_if_idle(self)
+        order.append("db-closed" if result else "db-close-skipped")
+        return result
+
+    monkeypatch.setattr(Database, "close_if_idle", _recording_close_if_idle)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        db = get_db()
+        with caplog.at_level(logging.INFO, logger="wxverify.api.app"):
+            await cm.__aexit__(None, None, None)
+        # (a) Ordering, asserted with no await since __aexit__ returned.
+        assert order == ["reap-write-committed", "db-closed"]
+        # (b) The pool is genuinely gone: a post-shutdown read fails loudly.
+        with pytest.raises(sqlite3.ProgrammingError):
+            await db.read(lambda c: c.execute("SELECT 1").fetchone())
+        # (d)/(e): D5's logging contract -- NOT M1 discriminators. Both hold
+        # under the pre-fix ordering too (the close still runs, merely too
+        # early), so they pin the log shape, not the sequence.
+        info_records = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.api.app" and r.levelno == logging.INFO
+        ]
+        closed_records = [
+            r for r in info_records if r.getMessage() == "database closed"
+        ]
+        assert len(closed_records) == 1, [r.getMessage() for r in caplog.records]
+        skip_records = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.api.app"
+            and r.getMessage().startswith("close skipped: ")
+        ]
+        assert skip_records == []
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+    # (c) After asyncio.run returns, a FRESH side connection shows the
+    # handler's row change on disk.
+    side = sqlite3.connect(config.db_path)
+    try:
+        row = side.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row is not None and row[0] == "completed"
+    finally:
+        side.close()
+
+
+def test_lifespan_shutdown_closes_the_pool_after_reclaim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same ordering as the previous oracle, through the real production
+    path: real ``run_worker``, a real claimed job, a real ``TestClient``
+    lifespan drive.
+
+    Never issues a page or dashboard request inside the ``TestClient``
+    block: those routes arm the fire-and-forget rescore task
+    (``schedule_score_rescore``) whenever the composite reads ``stale`` or
+    ``rebuilding`` -- an unowned writer racing shutdown, and exactly the
+    flake this oracle must not carry.
+
+    Catches: M1, by consequence rather than instrumentation. With the close
+    hoisted above the reap, ``run_worker``'s cancellation handler writes
+    against an already-closed database, so the reclaim never lands: the job
+    row stays ``running`` and the reap additionally logs
+    ``"shutdown reclaim failed"``. Closing the side connection BEFORE
+    checking for the WAL/SHM sidecars does not discriminate M1 -- that
+    mutant's close still runs, merely too early, so it removes the
+    sidecars all the same; what it catches is a close that is called but
+    ineffective (refused, or one connection missed).
+    """
+    _init_tmp_db(tmp_path)
+
+    block = asyncio.Event()
+
+    async def _blocked_dispatch(_db: Any, _writer: Any, _job: Any) -> None:
+        await block.wait()
+
+    monkeypatch.setattr("wxverify.worker.processor.dispatch", _blocked_dispatch)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+    side = sqlite3.connect(config.db_path, timeout=5.0)
+    side.row_factory = sqlite3.Row
+    try:
+        with (
+            caplog.at_level(logging.WARNING, logger="wxverify.worker.processor"),
+            TestClient(app) as client,
+        ):
+            job_id = _insert_job(side)
+            deadline = time.monotonic() + 2.0
+            while _job_status(side, job_id) != "running":
+                if time.monotonic() > deadline:
+                    raise TimeoutError("job never reached status=running")
+                time.sleep(0.02)
+            del client  # unused past this point; the `with` drives shutdown
+        row = side.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        assert row is not None
+        assert row["status"] == "pending"
+        reclaim_failed = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.worker.processor"
+            and "shutdown reclaim failed" in r.getMessage()
+        ]
+        assert reclaim_failed == [], [r.getMessage() for r in caplog.records]
+        assert stopped == [], "the default hard-kill stop_process must never fire"
+    finally:
+        # Closing the side connection FIRST is this assertion's own
+        # precondition, not incidental: SQLite only checkpoints and removes
+        # the WAL/SHM sidecars on the LAST connection close, so a still-open
+        # side connection would keep them alive regardless of what the
+        # process database did.
+        side.close()
+    wal_path = Path(f"{config.db_path}-wal")
+    shm_path = Path(f"{config.db_path}-shm")
+    assert not wal_path.exists()
+    assert not shm_path.exists()
+
+
+def test_close_if_idle_refuses_while_a_reader_is_checked_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The guard refuses while a pooled reader is checked out.
+
+    Parks a real ``db.read`` on a callback that blocks on a
+    ``threading.Event`` INSIDE the executor thread, before it issues any
+    SQL, so an unconditional-close mutant here closes an IDLE connection,
+    never one mid-statement.
+
+    Catches: M3 (``close_if_idle`` replaced by ``close()`` + ``return
+    True``). The kill is the ``assert db.close_if_idle() is False`` line
+    itself raising ``AssertionError`` while the read is still parked --
+    never a crash: a SIGSEGV under this construction would mean the
+    construction itself is wrong (SQL issued before the signal, or the
+    block released early), not that the mutant was killed.
+    """
+    _init_tmp_db(tmp_path)
+    db = get_db()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocking_read(conn: sqlite3.Connection) -> int:
+        entered.set()
+        release.wait()
+        row = conn.execute("SELECT 1").fetchone()
+        return int(row[0])
+
+    async def _run() -> None:
+        task = asyncio.create_task(db.read(_blocking_read))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        result: int | None = None
+        try:
+            with caplog.at_level(logging.WARNING, logger="wxverify.db.connection"):
+                assert db.close_if_idle() is False
+            # Match on the "close skipped: " prefix, never on "one WARNING
+            # from this logger": a parked read easily exceeds
+            # SLOW_READ_MS, so a "slow db read" WARNING from the same
+            # logger is expected alongside it once the read completes.
+            skip_records = [
+                r
+                for r in caplog.records
+                if r.name == "wxverify.db.connection"
+                and r.getMessage().startswith("close skipped: ")
+            ]
+            assert len(skip_records) == 1, [r.getMessage() for r in caplog.records]
+            assert (
+                skip_records[0].getMessage()
+                == "close skipped: 1 of 4 pooled readers checked out"
+            )
+        finally:
+            # Reap the parked task in the SAME try/finally: without this,
+            # run_to_completion keeps the executor thread alive underneath
+            # asyncio.run's own teardown, and a failing assertion above
+            # would hang the run instead of reporting the failure.
+            release.set()
+            with contextlib.suppress(Exception):
+                result = await task
+        assert result == 1, "the read must return its real value unharmed"
+        assert db.close_if_idle() is True
+
+    asyncio.run(_run())
+
+
+def test_close_if_idle_refuses_while_a_write_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The guard refuses while a write is in flight -- the paired predicate
+    to the previous oracle's pool check. The two paired message tails
+    (``"1 of 4 pooled readers checked out"`` here vs. ``"a write is in
+    flight"``) together prove WHICH predicate refused, not merely that one
+    did.
+
+    Catches: M4 (the pool-only guard, dropping the ``_write_lock.locked()``
+    check). Same shape as the read oracle: the kill is
+    ``assert db.close_if_idle() is False`` raising ``AssertionError`` while
+    the write is still parked, never a crash. This predicate is also
+    ``replace_from``'s backstop, since an import swap holds ``_write_lock``
+    across its whole body -- but in production a close during a swap is
+    unreachable for an independent reason (uvicorn drains the ``POST
+    /import`` request before lifespan shutdown starts), so this oracle
+    proves the backstop, not the unreachability.
+    """
+    _init_tmp_db(tmp_path)
+    db = get_db()
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _blocking_write(conn: sqlite3.Connection) -> int:
+        entered.set()
+        release.wait()
+        row = conn.execute("SELECT 1").fetchone()
+        return int(row[0])
+
+    async def _run() -> None:
+        task = asyncio.create_task(db.write(_blocking_write))
+        while not entered.is_set():
+            await asyncio.sleep(0.01)
+        result: int | None = None
+        try:
+            with caplog.at_level(logging.WARNING, logger="wxverify.db.connection"):
+                assert db.close_if_idle() is False
+            skip_records = [
+                r
+                for r in caplog.records
+                if r.name == "wxverify.db.connection"
+                and r.getMessage().startswith("close skipped: ")
+            ]
+            assert len(skip_records) == 1, [r.getMessage() for r in caplog.records]
+            assert skip_records[0].getMessage() == "close skipped: a write is in flight"
+        finally:
+            release.set()
+            with contextlib.suppress(Exception):
+                result = await task
+        assert result == 1, "the write must return its real value unharmed"
+        assert db.close_if_idle() is True
+
+    asyncio.run(_run())
+
+
+def test_close_if_idle_and_close_db_are_idempotent(tmp_path: Path) -> None:
+    """Double close is a no-op -- the invariant ~70 existing tests already
+    depend on via their trailing ``close_db()`` after a ``TestClient``
+    block.
+
+    Catches: a ``_closed``-flag implementation that raises or returns
+    ``False`` on a second call, which would make every one of those
+    trailing calls newly meaningful (and newly failing).
+    """
+    _init_tmp_db(tmp_path)
+    db = get_db()
+    assert db.close_if_idle() is True
+    assert db.close_if_idle() is True
+    db.close()
+    close_db()
+
+
+def test_close_survives_the_reaps_deferred_re_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The close survives the reap's deferred re-raise: the nested
+    ``finally`` runs even though ``_cancel_and_reap`` re-raises the
+    ``CancelledError`` it deferred.
+
+    Catches: M2 (close written as a plain statement AFTER
+    ``await _cancel_and_reap(tasks)`` instead of in a nested ``finally``).
+    That mutant passes the two ordering oracles above -- the reap always
+    finishes and always returns normally there -- and fails only here,
+    where the reap's own re-raise skips a bare follow-on statement
+    entirely.
+    """
+    _init_tmp_db(tmp_path)
+    order, entered, release, stopped = _wire_gated_lifespan(monkeypatch)
+
+    real_close_if_idle = Database.close_if_idle
+
+    def _recording_close_if_idle(self: Database) -> bool:
+        result = real_close_if_idle(self)
+        order.append("db-closed" if result else "db-close-skipped")
+        return result
+
+    monkeypatch.setattr(Database, "close_if_idle", _recording_close_if_idle)
+
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        db = get_db()
+        shutdown = asyncio.create_task(cm.__aexit__(None, None, None))
+        await entered.wait()
+        shutdown.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await shutdown
+        assert order == ["worker-cleanup-done", "db-closed"]
+        with pytest.raises(sqlite3.ProgrammingError):
+            await db.read(lambda c: c.execute("SELECT 1").fetchone())
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_close_failure_reported_not_propagated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A close failure is reported, never propagated, and is not named
+    like a task failure.
+
+    Catches: M5 (dropping ``_shutdown_database``'s ``try/except``), and any
+    rename of the ERROR record into the ``"shutdown: "`` family, which
+    would silently redefine ``tests/test_m1_m5.py``'s complete-set
+    assertion on that prefix.
+    """
+    _init_tmp_db(tmp_path)
+
+    monkeypatch.setattr("wxverify.api.app.run_worker", _make_immediate_stub("worker"))
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper",
+        _make_immediate_stub("export sweeper"),
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_immediate_stub("read-cache warm")
+    )
+
+    async def _noop_discovery(_port: int) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _noop_discovery)
+
+    def _raising_close_if_idle(self: Database) -> bool:
+        raise sqlite3.OperationalError("boom")
+
+    monkeypatch.setattr(Database, "close_if_idle", _raising_close_if_idle)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        await cm.__aenter__()
+        with caplog.at_level(logging.ERROR, logger="wxverify.api.app"):
+            await cm.__aexit__(None, None, None)
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.api.app" and r.levelno == logging.ERROR
+        ]
+        close_failed = [
+            r
+            for r in error_records
+            if r.getMessage() == "database close failed at shutdown"
+        ]
+        assert len(close_failed) == 1, [r.getMessage() for r in error_records]
+        exc_info = close_failed[0].exc_info
+        assert exc_info is not None
+        assert isinstance(exc_info[1], sqlite3.OperationalError)
+        assert not any(r.getMessage().startswith("shutdown: ") for r in error_records)
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+def test_startup_failure_after_task_creation_still_closes_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A startup failure AFTER all three tasks exist must still close the
+    database, not merely reap the tasks -- and pins F6's boundary: this is
+    the failure case that IS covered, since it fires after the
+    task-creation ``try`` opens.
+
+    Catches: a close reachable only on the clean-shutdown path -- e.g. one
+    hung off the ``yield``'s own return instead of the outer ``finally``.
+    """
+    _init_tmp_db(tmp_path)
+    reaped: list[str] = []
+    order: list[str] = []
+
+    def _make_stub(name: str):
+        async def _stub(*_args: object) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                reaped.append(name)
+                raise
+
+        return _stub
+
+    monkeypatch.setattr("wxverify.api.app.run_worker", _make_stub("worker"))
+    monkeypatch.setattr(
+        "wxverify.api.routes.db_transfer.run_export_sweeper",
+        _make_stub("export sweeper"),
+    )
+    monkeypatch.setattr(
+        "wxverify.api.app.warm_read_cache", _make_stub("read-cache warm")
+    )
+
+    real_close_if_idle = Database.close_if_idle
+
+    def _recording_close_if_idle(self: Database) -> bool:
+        result = real_close_if_idle(self)
+        order.append("db-closed" if result else "db-close-skipped")
+        return result
+
+    monkeypatch.setattr(Database, "close_if_idle", _recording_close_if_idle)
+
+    async def _boom(_port: int) -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("discovery boom")
+
+    monkeypatch.setattr("wxverify.api.app.publish_discovery", _boom)
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+
+    async def _run() -> None:
+        cm = lifespan(app)
+        with pytest.raises(RuntimeError, match="discovery boom"):
+            await cm.__aenter__()
+        assert sorted(reaped) == ["export sweeper", "read-cache warm", "worker"]
+        assert order == ["db-closed"]
+
+    asyncio.run(_run())
+    assert stopped == [], "the default hard-kill stop_process must never fire"

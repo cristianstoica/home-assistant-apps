@@ -36,7 +36,7 @@ from wxverify.api.routes import (
 )
 from wxverify.collection.budget import set_source_cap
 from wxverify.core.options import load_runtime_options
-from wxverify.db.connection import init_db
+from wxverify.db.connection import Database, init_db
 from wxverify.db.queue import reclaim_all_stale
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state_now
 from wxverify.settings.service import apply_plain_settings, set_rolling_window_days
@@ -168,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         # retained snapshot when no further export is ever started.
         export_sweeper = asyncio.create_task(db_transfer.run_export_sweeper())
         tasks.append(("export sweeper", export_sweeper))
+        export_sweeper.add_done_callback(db_transfer.on_export_sweeper_done)
         # A run published before this process started is never warmed by a publish
         # event, so without this leg the first request after every restart pays the
         # full cold derivation. It does not block startup: `db.read` dispatches the
@@ -178,7 +179,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
         yield
     finally:
         logger.info("worker stopping")
-        await _cancel_and_reap(tasks)
+        try:
+            await _cancel_and_reap(tasks)
+        finally:
+            _shutdown_database(db)
 
 
 async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
@@ -274,8 +278,8 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     active exception here belongs to `result`; and because this helper runs
     from a `finally` that may be unwinding a startup failure,
     `sys.exc_info()` is not even empty -- `logger.exception` would silently
-    attach THAT traceback instead. `wxverify/core/aio.py:64` uses the same
-    idiom for the same reason.
+    attach THAT traceback instead. `core.aio.run_to_completion` uses the
+    same idiom for the same reason.
     """
     names = [name for name, _ in tasks]
     handles = [task for _, task in tasks]
@@ -302,6 +306,25 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
         # `Task.uncancel()`: this helper did not issue that cancellation,
         # so the request must stay visible to whoever did.
         raise cancelled
+
+
+def _shutdown_database(db: Database) -> None:
+    """Close the process database now that the reap has released it.
+
+    Synchronous on purpose: no ``await`` between ``close_if_idle``'s
+    quiescence check and the close it guards, and no cancellation point on
+    a path that may already be unwinding one.
+
+    Never raises. A shutdown failure changes no exit code (see
+    ``_cancel_and_reap``'s "Failure policy"), and propagating here would
+    REPLACE the exception this ``finally`` may be unwinding -- including
+    the deferred ``CancelledError`` the reap deliberately kept visible.
+    """
+    try:
+        if db.close_if_idle():
+            logger.info("database closed")
+    except Exception:
+        logger.exception("database close failed at shutdown")
 
 
 def _stop_on_worker_done(task: asyncio.Task[None], stop_process: StopProcess) -> None:

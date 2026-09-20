@@ -13,6 +13,7 @@ from wxverify import config
 from wxverify.__main__ import main
 from wxverify.api.app import create_app
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
+from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import (
     claim_next_job,
     complete,
@@ -132,6 +133,58 @@ def test_reconcile_inserts_missing_catalog_rows_without_overwriting(
             """
         ).fetchone()["fetch_interval_minutes"]
         == 999
+    )
+
+
+def test_operator_feed_toggle_survives_a_second_run_migrations(
+    tmp_path: Path,
+) -> None:
+    """`run_migrations` -- not `reconcile_catalog` -- is the path a real
+    restart takes: `correct_google_horizon`, `seed_default_sources`,
+    `seed_default_feeds` and `seed_default_settings` all run UNCONDITIONALLY
+    inside `run_migrations` -- outside every `if current < N:` version
+    guard -- and only their `INSERT OR IGNORE` shape keeps a second boot
+    from clobbering an operator's edit.
+    `test_reconcile_inserts_missing_catalog_rows_...`
+    above proves preservation through `reconcile_catalog` directly;
+    `test_e2_run_migrations_is_idempotent` in
+    `test_result_basis_fingerprint.py` proves `run_migrations` itself is
+    idempotent on `user_version` -- neither calls `run_migrations` twice
+    and checks an operator-writable feed column."""
+    conn = _init_tmp_db(tmp_path)
+
+    feed_id = _feed_id(conn, source="meteoblue", model="multimodel")
+    conn.execute(
+        "UPDATE feeds SET enabled=0, disabled_reason=? WHERE id=?",
+        ("synthetic operator maintenance hold", feed_id),
+    )
+    conn.execute("UPDATE sources SET daily_call_limit=42 WHERE source='meteoblue'")
+
+    before_feeds = int(conn.execute("SELECT COUNT(*) AS n FROM feeds").fetchone()["n"])
+    before_sources = int(
+        conn.execute("SELECT COUNT(*) AS n FROM sources").fetchone()["n"]
+    )
+
+    run_migrations(conn)
+
+    row = conn.execute(
+        "SELECT enabled, disabled_reason FROM feeds WHERE id=?", (feed_id,)
+    ).fetchone()
+    assert row["enabled"] == 0
+    assert row["disabled_reason"] == "synthetic operator maintenance hold"
+    assert (
+        conn.execute(
+            "SELECT daily_call_limit FROM sources WHERE source='meteoblue'"
+        ).fetchone()["daily_call_limit"]
+        == 42
+    )
+    assert (
+        int(conn.execute("SELECT COUNT(*) AS n FROM feeds").fetchone()["n"])
+        == before_feeds
+    )
+    assert (
+        int(conn.execute("SELECT COUNT(*) AS n FROM sources").fetchone()["n"])
+        == before_sources
     )
 
 

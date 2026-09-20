@@ -174,6 +174,8 @@ async def run_worker(db: Database) -> None:
                     )
                 except JobCancelled:
                     outcome = "cancelled"
+                    # No success marker: a cancelled job resolved nothing
+                    # (the marker is written only by _complete_and_continue).
                     await writer.write(lambda conn, jid=job_id: complete(conn, jid))
                 except StaleGenerationError:
                     raise
@@ -195,12 +197,12 @@ async def run_worker(db: Database) -> None:
                         outcome = "failed"
                         logger.error(
                             "job failed permanently id=%s type=%s site=%s "
-                            "attempts=%d/%d: %s",
+                            "attempt %d of %d (retries exhausted): %s",
                             job.id,
                             job.type,
                             job.site_id,
                             disposition.retry_count,
-                            disposition.max_retries,
+                            disposition.max_retries + 1,
                             message,
                         )
                     else:
@@ -257,8 +259,15 @@ def _complete_and_continue(
     ``complete`` runs first so the finished row is no longer 'running' when
     ``enqueue_if_absent`` dedupes -- a chain's continuation must never be
     swallowed by its own just-finished chunk.
+
+    ``result='ok'`` is the success marker. This is the ONLY path that writes
+    it, and it means "dispatch returned normally" -- for a chain type that
+    is one chunk, not the chain. The JobCancelled branch of run_worker
+    completes WITHOUT it, so a cancelled or unavailable job leaves result
+    NULL, and FAILED_SCOPES_SQL (wxverify.monitor) treats only a marked row
+    as resolving an earlier failure of its scope.
     """
-    complete(conn, job_id)
+    complete(conn, job_id, result="ok")
     if continuation is not None:
         enqueue_if_absent(
             conn,
@@ -514,6 +523,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     )
                     if next_attempt_at is not None:
                         raise JobDeferred(next_attempt_at) from exc
+                    exc.add_note(
+                        f"station={station.pws_station_id} "
+                        f"progress={index}/{len(stations)}"
+                    )
                     raise
                 except Exception as exc:
                     error = sanitized_exception(exc)
@@ -525,6 +538,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                             _mark_station_error_and_refund(conn, station_id, err, res)
                         ),
                         reservation,
+                    )
+                    exc.add_note(
+                        f"station={station.pws_station_id} "
+                        f"progress={index}/{len(stations)}"
                     )
                     raise
                 station_changed = await write_after_reservation(
@@ -725,7 +742,10 @@ async def _fetch_feed(
                 conn, result.target, result.error
             )
         )
-        return
+        # Complete through the cancelled branch, without the success marker:
+        # the adapter could not be built, so no fetch ran and nothing about
+        # an earlier failure of this scope has been resolved.
+        raise JobCancelled()
 
 
 def _enabled_stations(
