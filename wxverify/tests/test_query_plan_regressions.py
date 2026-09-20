@@ -613,9 +613,17 @@ def test_verification_route_sql_still_matches_the_pinned_text() -> None:
     assert "SELECT * FROM verification_runs {where}\n            ORDER BY id DESC" in (
         source
     )
+
+
+def test_published_basis_report_sql_still_matches_the_pinned_text() -> None:
+    """Drift tripwire: the newer-failed-attempt check moved into the read
+    snapshot bracket inside ``published_basis_report``, so the pinned copy
+    above is only trustworthy while that module's text still contains it."""
+    source = inspect.getsource(wxverify.verification.freshness)
     assert (
         "SELECT 1 FROM verification_runs\n"
-        "        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1" in source
+        "                WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1"
+        in source
     )
 
 

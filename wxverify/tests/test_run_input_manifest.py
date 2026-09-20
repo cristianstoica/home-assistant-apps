@@ -1281,13 +1281,13 @@ def test_o25_runs_never_imports_the_manifest_or_the_facade() -> None:
 def test_o25_each_surface_binds_the_facade_and_never_the_derivation(
     surface: str,
 ) -> None:
-    """O25 (b) -> at the surface importing ``published_input_freshness``
+    """O25 (b) -> at the surface importing ``published_basis_report``
     from the facade and never ``wxverify.verification.manifest``: mutant
     M22 (calling ``run_input_freshness`` directly) is a second derivation
     outside the bracket the read-snapshot rebase will put in the facade."""
     modules, bound = _imports_of(surface)
     assert "wxverify.verification.manifest" not in modules
-    assert ("wxverify.verification.freshness", "published_input_freshness") in bound
+    assert ("wxverify.verification.freshness", "published_basis_report") in bound
 
 
 def test_o25_the_derivation_never_imports_the_facade() -> None:

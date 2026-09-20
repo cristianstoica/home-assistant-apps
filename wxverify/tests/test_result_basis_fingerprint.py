@@ -776,26 +776,67 @@ def test_c5_no_published_run_reports_no_publishable_run(
 def test_c6_api_and_page_agree_on_state_and_reason(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """c6 -> at the page/API state+reason pair: correct = both surfaces
+    """c6/O9 -> at the page/API state+reason pair: correct = both surfaces
     report the exact same (state, reason) for the same DB state, mutant =
     a divergence if either surface stops using the shared
-    ``result_basis_freshness`` derivation. Verified by comparing the API's
+    ``published_basis_report`` derivation. Verified by comparing the API's
     JSON payload directly to the marker the page actually rendered, rather
-    than assuming they must agree."""
+    than assuming they must agree.
+
+    O9 extends c6 rather than duplicating it: (a) a recorder around each
+    surface's own from-imported ``published_basis_report`` name proves
+    each surface invokes the ONE derivation exactly once per site, and (b)
+    a static import check proves neither surface binds
+    ``result_basis_freshness``, ``run_input_freshness`` or
+    ``published_input_freshness`` from anywhere -- only the facade."""
+    import wxverify.api.routes.verification as api_verification
+    import wxverify.web.verification as web_verification
+    from tests.test_run_input_manifest import _imports_of
+
     conn = _open_app_db(tmp_path, monkeypatch)
     site_id = _make_site(conn, "c6-site")
     _seed_published_run(conn, site_id, fresh_fingerprint=False)
     app = _make_app(monkeypatch)
+
+    api_calls: list[int] = []
+    web_calls: list[int] = []
+    real_api = api_verification.published_basis_report
+    real_web = web_verification.published_basis_report
+
+    def _recording_api(conn: sqlite3.Connection, site_id: int) -> Any:
+        api_calls.append(site_id)
+        return real_api(conn, site_id)
+
+    def _recording_web(conn: sqlite3.Connection, site_id: int) -> Any:
+        web_calls.append(site_id)
+        return real_web(conn, site_id)
+
+    monkeypatch.setattr(api_verification, "published_basis_report", _recording_api)
+    monkeypatch.setattr(web_verification, "published_basis_report", _recording_web)
+
     from fastapi.testclient import TestClient
 
     with TestClient(app) as client:
         entry = _status(client, site_id)
     assert entry["result_basis"]["state"] == "changed"
+    assert api_calls == [site_id]
 
     page = _fetch_page(monkeypatch, site_id)
     markers = _v16_markers(page)
     assert "16.1.warn_stale" in markers
     assert "16.1.freshness_unknown" not in markers
+    assert web_calls == [site_id]
+
+    for surface in ("wxverify.api.routes.verification", "wxverify.web.verification"):
+        _modules, bound = _imports_of(surface)
+        assert {name for _, name in bound}.isdisjoint(
+            {
+                "result_basis_freshness",
+                "run_input_freshness",
+                "published_input_freshness",
+            }
+        )
+        assert ("wxverify.verification.freshness", "published_basis_report") in bound
 
 
 def test_c7_round_trip_through_start_run_reads_fresh() -> None:

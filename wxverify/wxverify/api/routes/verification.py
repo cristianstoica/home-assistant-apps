@@ -28,10 +28,7 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     run_methodology_view,
 )
-from wxverify.verification.freshness import (
-    RUN_INPUTS_NO_RUN,
-    published_input_freshness,
-)
+from wxverify.verification.freshness import published_basis_report
 from wxverify.verification.publish_hold import read_publish_hold, set_publish_hold
 from wxverify.verification.read_cache import (
     cached_daily_rank_conclusions,
@@ -98,33 +95,21 @@ def _run_row(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
 
 
 def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
-    run_id = published_run_id(conn, site_id)
+    # The published-run pointer, its row, the freshness of every input the
+    # run pinned at start — its configuration/roster/truth basis AND the
+    # forecast rows inside its scored horizon, each compared with the
+    # current state over the run's own horizon — and the newer-failed
+    # probe, all from ONE read snapshot (`published_basis_report`), so this
+    # card's identity and the verdict about it describe one instant.
+    # Read-only by construction (NB-9) — an unrecorded, malformed,
+    # superseded-algorithm or pointer-less input is `unknown`, which is not
+    # a warning.
+    report = published_basis_report(conn, site_id)
     published: dict[str, object] | None = None
-    freshness = RUN_INPUTS_NO_RUN
-    if run_id is not None:
-        row = _run_row(conn, run_id)
-        published = _run_out(row, include_snapshot=False)
-        # Freshness of every input the run pinned at start — its
-        # configuration/roster/truth basis AND the forecast rows inside its
-        # scored horizon — each compared with the current state over the
-        # run's own horizon. Read-only by construction (NB-9) — an
-        # unrecorded, malformed, superseded-algorithm or pointer-less input
-        # is `unknown`, which is not a warning.
-        freshness = published_input_freshness(
-            conn,
-            site_id,
-            run_id=run_id,
-            recorded_basis=row["result_basis_fingerprint"],
-            period_start=row["period_start"],
-            period_end=row["period_end"],
-        )
-    failed_newer = conn.execute(
-        """
-        SELECT 1 FROM verification_runs
-        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1
-        """,
-        (site_id, run_id if run_id is not None else 0),
-    ).fetchone()
+    if report.run_id is not None:
+        if report.run_row is None:
+            raise ApiError(404, "verification run not found")
+        published = _run_out(report.run_row, include_snapshot=False)
     return {
         "site_id": site_id,
         "published_run": published,
@@ -134,18 +119,19 @@ def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
         # /verification page uses, so the two surfaces cannot disagree.
         "trigger": trigger_status(conn, site_id, utc_now()),
         # §16.1: additive sibling of `warnings` — three-state freshness of
-        # the published run's pinned inputs, from the same derivation the
-        # /verification page uses. The key keeps its name; since the input
-        # manifest it covers the forecast rows inside the horizon as well as
-        # the configuration/roster/truth basis, and carries a per-component
+        # the published run's pinned inputs, from `published_basis_report`,
+        # the same snapshot-aware derivation the /verification page uses.
+        # The key keeps its name; since the input manifest it covers the
+        # forecast rows inside the horizon as well as the
+        # configuration/roster/truth basis, and carries a per-component
         # `components` breakdown (observed-only components are reported
         # there but never move `state`). `stale_inputs` stays a bool and is
         # exactly the `changed` state; `unknown` is reported, never warned.
-        "result_basis": freshness.as_payload(),
+        "result_basis": report.freshness.as_payload(),
         "warnings": {
-            "no_publishable_run": run_id is None,
-            "stale_inputs": freshness.state == "changed",
-            "failed_newer_attempt": failed_newer is not None,
+            "no_publishable_run": report.run_id is None,
+            "stale_inputs": report.freshness.state == "changed",
+            "failed_newer_attempt": report.failed_newer_attempt,
         },
     }
 

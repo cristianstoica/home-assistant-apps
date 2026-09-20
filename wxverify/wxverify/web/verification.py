@@ -29,15 +29,12 @@ from wxverify.verification.contract import (
     VERIFICATION_SCHEMA,
     methodology_constants,
 )
-from wxverify.verification.freshness import (
-    RUN_INPUTS_NO_RUN,
-    published_input_freshness,
-)
+from wxverify.verification.freshness import RUN_INPUTS_NO_RUN, published_basis_report
 from wxverify.verification.read_cache import (
     cached_daily_rank_conclusions,
     cached_observed_wet_precip_mae,
 )
-from wxverify.verification.runs import published_run_id, trigger_status
+from wxverify.verification.runs import trigger_status
 from wxverify.web.context import SiteView, load_site, load_sites
 
 #: Operator-facing labels for the verdict outcomes (§16.2), including the
@@ -281,12 +278,7 @@ def _resolve_site(
     return sites[0] if sites else None
 
 
-def _load_run(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
-    row = conn.execute(
-        "SELECT * FROM verification_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"published run {run_id} missing")
+def _run_view(row: sqlite3.Row) -> dict[str, object]:
     return {
         "id": int(row["id"]),
         "state": str(row["state"]),
@@ -1026,17 +1018,23 @@ def load_verification(
     # §12/§3.1: same derivation the status API serves, so the page and the
     # payload cannot report different trigger states for one site.
     context["trigger"] = trigger_status(conn, site.id, utc_now())
-    run_id = published_run_id(conn, site.id)
-    failed_newer = conn.execute(
-        """
-        SELECT 1 FROM verification_runs
-        WHERE site_id = ? AND state = 'failed' AND id > ? LIMIT 1
-        """,
-        (site.id, run_id if run_id is not None else 0),
-    ).fetchone()
+    # The published-run pointer, its row, the freshness of every input the
+    # run pinned at start, the newer-failed probe AND the live effective
+    # depths, all from ONE read snapshot (`published_basis_report`): the
+    # freshness statement this page renders — `result_basis`, `warnings`
+    # and the depth-mismatch flag beside them — describes one instant.
+    # The loads below it stay outside the snapshot on purpose: they are
+    # keyed on the run id it pinned, and the read cache can block on
+    # another thread's compute, which must not hold a snapshot open.
+    report = published_basis_report(conn, site.id)
+    run_id = report.run_id
+    live_depths = report.blend_depths
+    context["depths"] = live_depths
     stale = False
     if run_id is not None:
-        run = _load_run(conn, run_id)
+        if report.run_row is None:
+            raise ValueError(f"published run {run_id} missing")
+        run = _run_view(report.run_row)
         verdicts = _load_verdicts(conn, run_id)
         # §10: the daily-rank conclusion is a first-class conclusion line,
         # derived by the same helper the verdicts API calls.
@@ -1048,7 +1046,7 @@ def load_verification(
         results = _load_results(conn, run_id)
         day_context = _load_day_context(conn, run_id)
         context["run"] = run
-        # `_load_run` already coerced this column with `int(...)`; the dict
+        # `_run_view` already coerced this column with `int(...)`; the dict
         # it returns is `dict[str, object]`, so the cast restates that, and
         # `int(object)` would not type-check.
         context["decision_core_era"] = _decision_core_era(
@@ -1075,26 +1073,14 @@ def load_verification(
             and live_depths[str(v["variable"])].depth != v["incumbent_depth"]
             for v in verdicts
         )
-        # Freshness of every input the run pinned at start — its
-        # configuration/roster/truth basis AND the forecast rows inside its
-        # scored horizon. Read-only by construction (NB-9) — an unrecorded,
-        # malformed, superseded-algorithm or pointer-less input is
-        # `unknown`, which is reported rather than warned about.
-        # `_load_run` returns `dict[str, object]`, so the casts restate the
-        # column types its projection already carries.
-        freshness = published_input_freshness(
-            conn,
-            site.id,
-            run_id=run_id,
-            recorded_basis=cast("str | None", run["result_basis_fingerprint"]),
-            period_start=cast("str | None", run["period_start"]),
-            period_end=cast("str | None", run["period_end"]),
-        )
-        context["result_basis"] = freshness.as_payload()
-        stale = freshness.state == "changed"
+        # Read-only by construction (NB-9) — an unrecorded, malformed,
+        # superseded-algorithm or pointer-less input is `unknown`, which is
+        # reported rather than warned about.
+        context["result_basis"] = report.freshness.as_payload()
+        stale = report.freshness.state == "changed"
     context["warnings"] = {
         "no_publishable_run": run_id is None,
         "stale_inputs": stale,
-        "failed_newer_attempt": failed_newer is not None,
+        "failed_newer_attempt": report.failed_newer_attempt,
     }
     return context
