@@ -30,6 +30,7 @@ from wxverify.api.routes.health import (
 )
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import ACTIVE_JOB_SQL, LATEST_JOB_SQL
+from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
     model_run_count_sql,
@@ -1132,4 +1133,34 @@ def test_manifest_probes_have_the_expected_shipping_plans() -> None:
     pairs = _lifted_statement(wxverify.verification.manifest._pairs_arrived)
     assert "SEARCH forecast_pairs USING INTEGER PRIMARY KEY (rowid>?)" in _plan(
         conn, pairs, _MANIFEST_PROBE_PARAMS
+    )
+
+
+def test_failed_scopes_lookup_is_indexed_on_the_whole_scope() -> None:
+    """O11 -- the scope lookup is indexed on the whole scope."""
+    conn = _fresh_conn()
+    plan = _plan(conn, FAILED_SCOPES_SQL, ("2026-07-07T12:00:00Z",))
+    assert any(
+        "SEARCH k" in line and "idx_jobs_type_key_site" in line and "site_id=?" in line
+        for line in plan
+    ), plan
+
+    # Negative control (a): rewriting the job_key comparison so it is no
+    # longer a bare column reference ends the usable index prefix at type,
+    # so no line can carry the index together with site_id=? any more.
+    degraded = FAILED_SCOPES_SQL.replace(
+        "k.job_key IS j.job_key", "COALESCE(k.job_key, '') = COALESCE(j.job_key, '')"
+    )
+    assert degraded != FAILED_SCOPES_SQL
+    degraded_plan = _plan(conn, degraded, ("2026-07-07T12:00:00Z",))
+    assert not any(
+        "SEARCH k" in line and "idx_jobs_type_key_site" in line and "site_id=?" in line
+        for line in degraded_plan
+    ), degraded_plan
+
+    # Negative control (b): with the index gone, no line can name it at all.
+    conn.execute("DROP INDEX idx_jobs_type_key_site")
+    no_index_plan = _plan(conn, FAILED_SCOPES_SQL, ("2026-07-07T12:00:00Z",))
+    assert not any("idx_jobs_type_key_site" in line for line in no_index_plan), (
+        no_index_plan
     )

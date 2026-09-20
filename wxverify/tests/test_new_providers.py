@@ -55,6 +55,7 @@ from wxverify.feeds.seam import FetchResult, ForecastRequest, NormalizedSample
 from wxverify.feeds.synthetic_run import snap_run
 from wxverify.feeds.visualcrossing import VisualCrossingAdapter
 from wxverify.feeds.weatherapi import WeatherApiAdapter
+from wxverify.worker.control import JobCancelled
 from wxverify.worker.domain_backoff import source_domain
 from wxverify.worker.processor import dispatch
 
@@ -313,6 +314,8 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
     The job must end with status='completed' and retry_count=0 — NOT re-queued
     via fail().  A churning impl that re-raises after _mark_feed_unavailable
     would land here with status='pending' / retry_count=1, catching that bug.
+    The row completes through the cancelled branch (JobCancelled), so
+    result stays NULL — this outcome is not a genuine success.
     """
     conn = _init_tmp_db(tmp_path)
     # Ensure visualcrossing key is genuinely unset (no env var, no options.json)
@@ -354,6 +357,9 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
         asyncio.run(dispatch(dispatch_db, dispatch_writer, job))
         # dispatch returned normally → complete (correct impl)
         complete(conn, job.id)
+    except JobCancelled:
+        # unavailable adapter → cancelled branch, complete without the marker
+        complete(conn, job.id)
     except Exception as exc:
         # dispatch raised → fail (wrong impl would land here)
         fail(conn, job.id, sanitized_exception(exc))
@@ -372,11 +378,12 @@ def test_missing_key_worker_marks_unavailable_and_completes_job(
 
     # Job row: terminal-clean (load-bearing assertion)
     job_row = conn.execute(
-        "SELECT status, retry_count FROM jobs WHERE id=?",
+        "SELECT status, retry_count, result FROM jobs WHERE id=?",
         (job.id,),
     ).fetchone()
     assert job_row["status"] == "completed"
     assert job_row["retry_count"] == 0
+    assert job_row["result"] is None
 
 
 # ---------------------------------------------------------------------------

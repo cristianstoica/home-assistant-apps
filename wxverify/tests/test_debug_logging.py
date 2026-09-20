@@ -520,7 +520,9 @@ def test_info_level_policy_only_sanctioned_milestones(
     _patch_worker_infra(monkeypatch)
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _succeed)
-    monkeypatch.setattr("wxverify.worker.processor.complete", lambda conn, jid: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.complete", lambda conn, jid, result=None: None
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
@@ -931,7 +933,9 @@ def test_worker_cycle_debug_lines_at_debug(
     _patch_worker_infra(monkeypatch)
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _succeed)
-    monkeypatch.setattr("wxverify.worker.processor.complete", lambda conn, jid: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.complete", lambda conn, jid, result=None: None
+    )
 
     with (
         caplog.at_level(logging.DEBUG, logger="wxverify.worker.processor"),
@@ -1154,7 +1158,9 @@ def test_bc1_cycle_info_line_present_for_completed_job(
     _patch_worker_infra(monkeypatch)
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _succeed)
-    monkeypatch.setattr("wxverify.worker.processor.complete", lambda conn, jid: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.complete", lambda conn, jid, result=None: None
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),
@@ -1546,7 +1552,9 @@ def test_cycle_info_line_carries_elapsed_field(
     _patch_worker_infra(monkeypatch)
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim_once(job))
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _succeed)
-    monkeypatch.setattr("wxverify.worker.processor.complete", lambda conn, jid: None)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.complete", lambda conn, jid, result=None: None
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="wxverify.worker.processor"),

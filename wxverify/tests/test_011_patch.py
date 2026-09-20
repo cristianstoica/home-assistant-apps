@@ -1415,7 +1415,8 @@ def test_worker_loop_survives_a_stale_generation_on_every_outcome(
     monkeypatch.setattr("wxverify.worker.processor.claim_next_job", _claim)
     monkeypatch.setattr("wxverify.worker.processor.dispatch", _fake_dispatch)
     monkeypatch.setattr(
-        "wxverify.worker.processor.complete", lambda c, jid: completed.append(jid)
+        "wxverify.worker.processor.complete",
+        lambda c, jid, result=None: completed.append(jid),
     )
 
     with (

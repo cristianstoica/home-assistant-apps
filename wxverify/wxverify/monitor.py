@@ -98,6 +98,42 @@ _ELIGIBLE_OBS_WHERE = """
     )
 """
 
+# Failed arm of problem_jobs: one row per (type, site_id, job_key) scope that
+# holds an unresolved terminal failure at or before the bound cutoff
+# (failed_cutoff, from FAILED_JOB_AGE_HOURS). "Unresolved" depends on the
+# type. The NOT IN list is the ALLOWLIST of single-row job types -- the ones
+# for which the worker's dispatch returns None, so one job row is one unit
+# of work and a later GENUINE success in the scope is a real recovery. A
+# genuine success is a completed row carrying result='ok', which only
+# _complete_and_continue writes, on a normal dispatch return; the worker's
+# JobCancelled branch (target deleted or disabled, or a feed adapter that
+# cannot be built) completes with result NULL, as did every completion
+# before the marker existed, and none of those rows resolves anything. The
+# chain types (verification_run, backfill_site, timezone_correction,
+# record_gap_scan, catchup) are deliberately absent: _complete_and_continue
+# completes every finished chunk under the chain's own key, so a later
+# completed row there is a chunk, not a resolution, and those scopes count by
+# age alone. A new job type stays OFF this list until it is classified. The
+# rule is explained where it is used, in _pipeline_conditions. Module-level so
+# the query-plan regression suite plans the statement that ships, not a copy.
+FAILED_SCOPES_SQL = """
+    SELECT COUNT(*) FROM (
+        SELECT 1 FROM jobs AS j
+        WHERE j.status = 'failed' AND j.updated_at <= ?
+          AND (j.type NOT IN ('fetch_feed', 'fetch_obs', 'fetch_current_obs',
+                              'pair_and_score', 'forecast_record')
+               OR NOT EXISTS (
+                   SELECT 1 FROM jobs AS k
+                   WHERE k.type = j.type
+                     AND k.site_id IS j.site_id
+                     AND k.job_key IS j.job_key
+                     AND k.status = 'completed'
+                     AND k.result = 'ok'
+                     AND k.id > j.id))
+        GROUP BY j.type, j.site_id, j.job_key
+    )
+"""
+
 
 def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> int:
     row = conn.execute(sql, params).fetchone()
@@ -177,8 +213,26 @@ def _pipeline_conditions(
         conn, "pair_and_score", pair_cutoff
     )
 
-    # problem_jobs: failed (>48h), stuck running (>20m), or overdue pending
-    # (>15m). The pending arm mirrors claim_next_job's claim contract, which
+    # problem_jobs = failed scopes + in-flight problems. The failed arm counts
+    # scopes -- (type, site_id, job_key), the queue's own identity in
+    # LATEST_JOB_SQL and idx_jobs_active_dedupe -- that hold an unresolved
+    # terminal failure older than FAILED_JOB_AGE_HOURS. For the single-row job
+    # types listed in FAILED_SCOPES_SQL a later completed row in the same scope
+    # that carries the success marker (result='ok', written only by
+    # _complete_and_continue on a normal dispatch return) supersedes the
+    # failure -- the rule the rescore cooldown already applies, narrowed to
+    # genuine successes: a cancelled or unavailable completion, and every row
+    # written before the marker existed, has result NULL and resolves nothing.
+    # For the chain types every finished chunk leaves a marked completed row
+    # under the chain's key (_complete_and_continue), so a chunk's completion
+    # proves nothing about the chain and those types count by age alone. The
+    # failed rows themselves stay until purge_failed_jobs_older_than removes
+    # them, so retention is unchanged and the count cannot be cleared by
+    # anything but a real success. "Later" is id order, matched NULL-safely
+    # with IS because job_key and site_id are nullable. The in-flight arm
+    # below is unchanged: stuck running (>20m) or overdue pending (>15m),
+    # counted per row.
+    # The pending arm mirrors claim_next_job's claim contract, which
     # treats `next_attempt_at IS NULL OR next_attempt_at <= now` as claimable —
     # so a stuck pending job can carry next_attempt_at=NULL. COALESCE(...,
     # updated_at) folds that NULL case in (a NULL-attempt pending job is overdue
@@ -207,12 +261,12 @@ def _pipeline_conditions(
     failed_cutoff = isoformat_utc(now - timedelta(hours=FAILED_JOB_AGE_HOURS))
     stuck_cutoff = isoformat_utc(now - timedelta(minutes=STUCK_RUNNING_MINUTES))
     pending_cutoff = isoformat_utc(now - timedelta(minutes=PENDING_OVERDUE_MINUTES))
-    problem_jobs_n = _count(
+    failed_scopes_n = _count(conn, FAILED_SCOPES_SQL, (failed_cutoff,))
+    inflight_n = _count(
         conn,
         """
         SELECT COUNT(*) FROM jobs
-        WHERE (status='failed' AND updated_at <= ?)
-           OR (status='running' AND updated_at <= ?)
+        WHERE (status='running' AND updated_at <= ?)
            OR (status='pending'
                AND (COALESCE(next_attempt_at, updated_at) <= ?
                     OR (next_attempt_at IS NOT NULL
@@ -220,8 +274,9 @@ def _pipeline_conditions(
                              OR next_attempt_at NOT GLOB
                                 '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*'))))
         """,
-        (failed_cutoff, stuck_cutoff, pending_cutoff),
+        (stuck_cutoff, pending_cutoff),
     )
+    problem_jobs_n = failed_scopes_n + inflight_n
 
     # forecast_record_gap (§16): enabled sites whose record log has begun
     # but which have no record/missed row for the most recent expected

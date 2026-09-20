@@ -24,4 +24,10 @@ class JobDeferred(JobControl):
 
 
 class JobCancelled(JobControl):
-    """Raised when site-scoped work has been deleted or disabled."""
+    """Raised when the job's work cannot or need not be done.
+
+    Its site-scoped target has been deleted or disabled, or (fetch_feed)
+    the feed's adapter cannot be built at all. The worker completes the row
+    WITHOUT the ``result='ok'`` success marker -- see
+    ``_complete_and_continue`` in ``wxverify.worker.processor``.
+    """
