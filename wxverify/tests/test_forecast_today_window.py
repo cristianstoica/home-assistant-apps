@@ -140,6 +140,7 @@ def test_today_high_includes_elapsed_hour_max() -> None:
         value=18.0,
     )
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -174,6 +175,7 @@ def test_today_high_without_elapsed_sample_is_future_only() -> None:
         value=18.0,
     )
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -204,6 +206,7 @@ def test_partial_badge_clears_after_local_morning_with_full_day_coverage() -> No
         value=15.0,
     )
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -227,6 +230,7 @@ def test_partial_badge_stays_set_under_eighteen_hour_coverage() -> None:
         value=15.0,
     )
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -265,6 +269,7 @@ def test_freshest_run_wins_for_elapsed_hour_via_build_hourly() -> None:
         value=25.0,
     )
 
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     assert payload["hours"] == [valid_at]
     blend = payload["blend"]
@@ -315,6 +320,7 @@ def test_window_lower_bound_excludes_yesterday_includes_local_midnight() -> None
         value=42.0,
     )
 
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="Europe/Berlin", day=0, now=now)
     hours = payload["hours"]
     assert isinstance(hours, list)
@@ -380,6 +386,7 @@ def test_build_hourly_day0_includes_elapsed_hours_with_lockstep_series() -> None
         value=22.0,
     )
 
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     hours = payload["hours"]
     assert isinstance(hours, list)
@@ -495,6 +502,7 @@ def test_only_elapsed_today_samples_render_tiles_not_empty() -> None:
         value=14.0,
     )
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )

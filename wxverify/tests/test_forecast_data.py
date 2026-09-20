@@ -545,6 +545,7 @@ def test_forecast_ranking_excludes_virtual_and_meteoblue_package_feeds() -> None
         conn, feed_ids=list(ids.values()), variable="temperature", day_ahead=0
     )
 
+    conn.commit()
     ranking = forecast_ranking(
         conn, site_id=1, variable="temperature", day_ahead=0, window="rolling"
     )
@@ -570,6 +571,7 @@ def test_forecast_ranking_is_keyed_per_day_ahead_cell() -> None:
     ids = _seed_ranking_exclusion_fixture(conn)
     # Pairs were seeded only at day_ahead=0; the neighboring cell must be
     # empty -- ranking is not accidentally shared across day_ahead cells.
+    conn.commit()
     ranking_day1 = forecast_ranking(
         conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
     )

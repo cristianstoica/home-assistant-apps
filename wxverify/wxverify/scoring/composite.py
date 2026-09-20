@@ -10,6 +10,7 @@ from typing import Literal
 
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.db.queue import enqueue_if_absent_with_cooldown
+from wxverify.db.snapshot import read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import (
@@ -69,26 +70,35 @@ def composite_with_status(
     writes ``w:{N}d`` cache keys, so they must not look like cache misses.
     Callers enqueue a rescore (after the read closes) only for ``stale`` and
     ``rebuilding``.
+
+    Every read the verdict depends on — the window setting, the site row,
+    ``_expected_active_cells`` and the ``score_cache`` rows — runs inside one
+    WAL read snapshot (``read_snapshot``), so ``rebuilding`` is only ever
+    reported for a mismatch that existed in one state of the database, never
+    for two reads that straddled a rescore commit. The block is read-only.
     """
-    resolved = resolve_window(conn, window)
-    if not resolved.cache_backed:
-        rows = _live_composite(
-            conn,
-            site_id=site_id,
-            window_key=resolved.window_key,
-            cutoff=resolved.cutoff,
+    with read_snapshot(conn, label="composite"):
+        resolved = resolve_window(conn, window)
+        if not resolved.cache_backed:
+            rows = _live_composite(
+                conn,
+                site_id=site_id,
+                window_key=resolved.window_key,
+                cutoff=resolved.cutoff,
+            )
+            return CompositeResult(rows=rows, status="live")
+        expected_cells = _expected_active_cells(
+            conn, site_id=site_id, resolved=resolved
         )
-        return CompositeResult(rows=rows, status="live")
-    expected_cells = _expected_active_cells(conn, site_id=site_id, resolved=resolved)
-    if not expected_cells or not _site_enabled(conn, site_id):
-        return CompositeResult(rows=[], status="empty")
-    cached = _cached_composite(
-        conn, site_id=site_id, resolved=resolved, expected_cells=expected_cells
-    )
-    if cached is None:
-        return CompositeResult(rows=[], status="rebuilding")
-    rows, fresh = cached
-    return CompositeResult(rows=rows, status="hit" if fresh else "stale")
+        if not expected_cells or not _site_enabled(conn, site_id):
+            return CompositeResult(rows=[], status="empty")
+        cached = _cached_composite(
+            conn, site_id=site_id, resolved=resolved, expected_cells=expected_cells
+        )
+        if cached is None:
+            return CompositeResult(rows=[], status="rebuilding")
+        rows, fresh = cached
+        return CompositeResult(rows=rows, status="hit" if fresh else "stale")
 
 
 def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:

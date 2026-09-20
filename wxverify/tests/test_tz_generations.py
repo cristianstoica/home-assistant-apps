@@ -266,6 +266,7 @@ def test_leaderboard_reads_only_the_published_generation() -> None:
     conn = _conn()
     site_id, feed_x, feed_y, _published_id, _building_id = _isolation_fixture(conn)
 
+    conn.commit()
     rows = {
         row.feed_id: row
         for row in leaderboard(
@@ -291,6 +292,7 @@ def test_pointer_flip_switches_readers_to_the_new_generation() -> None:
     # Simulate the completing publish transaction's pointer flip.
     set_runtime_state(conn, published_pointer_key(site_id), str(building_id))
 
+    conn.commit()
     rows = {
         row.feed_id: row
         for row in leaderboard(

@@ -100,6 +100,7 @@ def test_live_path_sql_never_carries_knowability_or_availability_clause() -> Non
         fetched_at=isoformat_utc(whole - timedelta(hours=11)),
     )
     statements: list[str] = []
+    conn.commit()
     conn.set_trace_callback(statements.append)
     try:
         live_rows = leaderboard(
@@ -192,6 +193,7 @@ def test_asof_at_now_equals_live_ranking_field_for_field() -> None:
         first_known_at=isoformat_utc(now - timedelta(days=40) + timedelta(hours=2)),
     )
     set_setting(conn, "min_n", "3")
+    conn.commit()
     live = forecast_ranking(
         conn, site_id=site_id, variable="temperature", day_ahead=1, window="30d"
     )
@@ -328,6 +330,7 @@ def test_asof_uses_declared_config_never_live_settings() -> None:
         return {row.feed_id: row for row in rows}[feed_id]
 
     # Live control: the live path DOES read the setting (confident at n=2).
+    conn.commit()
     live = {
         row.feed_id: row
         for row in leaderboard(

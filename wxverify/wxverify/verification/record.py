@@ -53,7 +53,10 @@ from wxverify.forecast.selection import (
     representative_day_ahead,
     select_cell_feeds,
 )
-from wxverify.scoring.leaderboard import LeaderboardRow, leaderboard_with_status
+from wxverify.scoring.leaderboard import (
+    LeaderboardRow,
+    leaderboard_with_status_in_transaction,
+)
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.verification.coverage import evaluate_variable, local_day_bounds
@@ -429,8 +432,12 @@ def _leaderboard_status_cell(
     §7: the record stores what the production leaderboard cache looked like
     at build time (status + window key + the cell's oldest snapshot stamp) —
     diagnostics only, never an input to the as-of ranking.
+
+    Calls the in-transaction variant: this runs inside the writer's
+    ``BEGIN IMMEDIATE``, which is already one snapshot, and
+    ``leaderboard_with_status``'s own snapshot would refuse to nest.
     """
-    result = leaderboard_with_status(
+    result = leaderboard_with_status_in_transaction(
         conn, site_id=site_id, variable=variable, day_ahead=day_ahead, window="rolling"
     )
     stamp_row = conn.execute(

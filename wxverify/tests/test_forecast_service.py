@@ -379,6 +379,7 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -414,6 +415,7 @@ def test_b2_paired_negative_wrong_cell_reads_low_confidence() -> None:
     # Wrong cell on purpose: pairs at day_ahead=0 (display), not 1 (issue).
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=0)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -443,6 +445,7 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -477,6 +480,7 @@ def test_partial_badge_when_under_coverage_tile_stays_populated() -> None:
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -530,6 +534,7 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
     # not "rebuilding" (an absent/mismatched cache snapshot over a REAL
     # expected feed universe) -- states why the cell stays low_confidence
     # rather than becoming rebuilding.
+    conn.commit()
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="wind", day_ahead=1, window="rolling"
@@ -639,6 +644,7 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     )
     # No score_cache seeded at (wind, 2) either -> "rebuilding".
 
+    conn.commit()
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
@@ -721,6 +727,7 @@ def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
         conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
     )
 
+    conn.commit()
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
@@ -784,6 +791,7 @@ def test_mixed_representative_leads_stay_low_confidence_unconfident_winner() -> 
         conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
     )
 
+    conn.commit()
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
@@ -854,6 +862,7 @@ def test_coverage_guard_splits_tile_and_drill_down_rebuilding_state() -> None:
         conn, feed_id=feed_b, variable="temperature", day_ahead=0, forecast=10.5
     )
 
+    conn.commit()
     assert (
         leaderboard_with_status(
             conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
@@ -931,6 +940,7 @@ def test_wind_tile_max_is_ms_to_kmh_converted() -> None:
         valid_ats=_hours("2026-07-20", 4, 3),
         value=5.0,  # m/s
     )
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -962,6 +972,7 @@ def test_rain_glyph_shown_at_threshold_hidden_just_below() -> None:
             lead_hours=i + 1,
             value=0.5 if i == 0 else 0.0,
         )
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -1027,6 +1038,7 @@ def test_build_hourly_hour_axis_reflects_selected_feed_only() -> None:
         valid_ats=_hours("2026-07-20", 10, 2),
     )
 
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     assert payload["hours"] == _hours("2026-07-20", 4, 2)  # winner's hours only
     assert payload["states"]["temperature"] == "normal"
@@ -1047,6 +1059,7 @@ def test_build_hourly_wind_series_already_kmh_converted() -> None:
         valid_ats=_hours("2026-07-20", 4, 1),
         value=5.0,
     )
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     assert payload["blend"]["wind_kmh"] == [18.0]
     assert payload["feeds"][0]["wind_kmh"] == [18.0]
@@ -1078,6 +1091,7 @@ def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
     _seed_far_horizon_collapse(conn)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -1132,6 +1146,7 @@ def test_near_tile_skill_still_decides_end_to_end() -> None:
     )  # lower skill
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -1153,6 +1168,7 @@ def test_build_hourly_far_tile_is_not_a_single_point() -> None:
     _seed_far_horizon_collapse(conn)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
+    conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
     hours = payload["hours"]
     assert isinstance(hours, list)
@@ -1229,6 +1245,7 @@ def test_coverage_gate_is_variable_agnostic_precip_and_wind() -> None:
     _seed_complete_score_cache(conn, variable="wind", day_ahead=5)
     _seed_complete_score_cache(conn, variable="precip", day_ahead=5)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -1293,6 +1310,7 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
     )  # lower skill
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
@@ -1372,6 +1390,7 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
     )
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=7)
 
+    conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
