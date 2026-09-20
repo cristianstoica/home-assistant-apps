@@ -25,7 +25,14 @@ def _executescript(conn: sqlite3.Connection, script: str) -> None:
     conn.executescript(script)
 
 
-def create_schema(conn: sqlite3.Connection) -> None:
+def create_tables(conn: sqlite3.Connection) -> None:
+    """Every CREATE TABLE IF NOT EXISTS of the current schema, verbatim.
+
+    Runs before the version migrations in `run_migrations`: `migrate_v3` and
+    `migrate_v4` seed tables a pre-v4 file does not have. No index lives here
+    -- an index may name a column that only a version migration adds (see
+    `create_indexes`).
+    """
     _executescript(
         conn,
         """
@@ -131,10 +138,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             fetched_at TEXT,
             UNIQUE(site_id, feed_id, variable, issued_at, valid_at)
         );
-        CREATE INDEX IF NOT EXISTS idx_samples_site_var_valid
-            ON forecast_samples(site_id, variable, valid_at);
-        CREATE INDEX IF NOT EXISTS idx_samples_runs
-            ON forecast_samples(site_id, feed_id, model_run_id);
 
         CREATE TABLE IF NOT EXISTS api_budget (
             source TEXT NOT NULL REFERENCES sources(source) ON DELETE RESTRICT,
@@ -162,8 +165,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             excluded_count INTEGER,
             provenance TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_tz_generations_site
-            ON timezone_generations(site_id, state);
 
         CREATE TABLE IF NOT EXISTS forecast_pairs (
             id INTEGER PRIMARY KEY,
@@ -192,14 +193,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
                    tz_generation_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
-            ON forecast_pairs(site_id, variable, day_ahead, valid_at);
-        CREATE INDEX IF NOT EXISTS idx_pairs_cell
-            ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
-        CREATE INDEX IF NOT EXISTS idx_pairs_winrate
-            ON forecast_pairs(site_id, variable, day_ahead, feed_id,
-                              valid_at, issued_at DESC, abs_error,
-                              tz_generation_id);
 
         CREATE TABLE IF NOT EXISTS daily_truth (
             id INTEGER PRIMARY KEY,
@@ -231,9 +224,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
                       OR admission_basis IN ('complete','deadline')),
             UNIQUE(site_id, quantity, local_date, tz_generation_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_daily_truth_stale
-            ON daily_truth(site_id, local_date, tz_generation_id)
-            WHERE stale = 1;
 
         CREATE TABLE IF NOT EXISTS forecast_of_record (
             id INTEGER PRIMARY KEY,
@@ -326,11 +316,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
                 )
             )
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
-            ON jobs(type, COALESCE(site_id, -1), job_key)
-            WHERE status IN ('pending','running') AND job_key IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
-            ON jobs(type, job_key, site_id, id);
 
         CREATE TABLE IF NOT EXISTS verification_runs (
             id INTEGER PRIMARY KEY,
@@ -356,8 +341,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             published_at TEXT,
             result_basis_fingerprint TEXT
         );
-        CREATE INDEX IF NOT EXISTS idx_verification_runs_site
-            ON verification_runs(site_id, state, id);
 
         CREATE TABLE IF NOT EXISTS verification_evidence (
             id INTEGER PRIMARY KEY,
@@ -395,9 +378,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(run_id, snapshot_local_date, lead, variable, quantity,
                    entity_type, entity_key)
         );
-        CREATE INDEX IF NOT EXISTS idx_verification_evidence_cell
-            ON verification_evidence(run_id, entity_type, quantity, lead,
-                                     target_local_date);
 
         CREATE TABLE IF NOT EXISTS verification_day_context (
             id INTEGER PRIMARY KEY,
@@ -471,8 +451,6 @@ def create_schema(conn: sqlite3.Connection) -> None:
             input_fingerprint TEXT,
             run_id INTEGER REFERENCES verification_runs(id)
         );
-        CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
-            ON verification_trigger_decisions(site_id, trigger_date, id);
 
         CREATE TABLE IF NOT EXISTS station_poll_state (
             station_id INTEGER PRIMARY KEY REFERENCES stations(id) ON DELETE CASCADE,
@@ -517,8 +495,72 @@ def create_schema(conn: sqlite3.Connection) -> None:
         );
         """,
     )
+
+
+def create_indexes(conn: sqlite3.Connection) -> None:
+    """Every CREATE INDEX IF NOT EXISTS of the current schema, verbatim, plus
+    the two code-generated forecast_samples indexes.
+
+    Runs after the version migrations in `run_migrations`: by then every
+    column an index names exists on any supported input (idx_pairs_winrate
+    names tz_generation_id, which `migrate_v4` adds by rebuilding
+    forecast_pairs), and an index a migration already recreated is skipped by
+    name. On a fresh file the order is immaterial.
+    """
+    _executescript(
+        conn,
+        """
+        CREATE INDEX IF NOT EXISTS idx_samples_site_var_valid
+            ON forecast_samples(site_id, variable, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_samples_runs
+            ON forecast_samples(site_id, feed_id, model_run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_tz_generations_site
+            ON timezone_generations(site_id, state);
+
+        CREATE INDEX IF NOT EXISTS idx_pairs_leaderboard
+            ON forecast_pairs(site_id, variable, day_ahead, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_pairs_cell
+            ON forecast_pairs(site_id, feed_id, variable, day_ahead, valid_at);
+        CREATE INDEX IF NOT EXISTS idx_pairs_winrate
+            ON forecast_pairs(site_id, variable, day_ahead, feed_id,
+                              valid_at, issued_at DESC, abs_error,
+                              tz_generation_id);
+
+        CREATE INDEX IF NOT EXISTS idx_daily_truth_stale
+            ON daily_truth(site_id, local_date, tz_generation_id)
+            WHERE stale = 1;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
+            ON jobs(type, COALESCE(site_id, -1), job_key)
+            WHERE status IN ('pending','running') AND job_key IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+            ON jobs(type, job_key, site_id, id);
+
+        CREATE INDEX IF NOT EXISTS idx_verification_runs_site
+            ON verification_runs(site_id, state, id);
+
+        CREATE INDEX IF NOT EXISTS idx_verification_evidence_cell
+            ON verification_evidence(run_id, entity_type, quantity, lead,
+                                     target_local_date);
+
+        CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
+            ON verification_trigger_decisions(site_id, trigger_date, id);
+        """,
+    )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
     _sync_forecast_sample_index(conn, "idx_samples_recent", SAMPLES_RECENT_INDEX_DDL)
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
+    """Fresh-database convenience: tables, then indexes, in one call.
+
+    Not used by `run_migrations`, which runs the version migrations between
+    the two halves. On a file whose tables predate a column an index names,
+    this raises `sqlite3.OperationalError` exactly as the pre-split runner did.
+    """
+    create_tables(conn)
+    create_indexes(conn)
 
 
 # Serves the bounded-window provider-health statements. The leading
@@ -678,10 +720,11 @@ def bootstrap_publish_hold(
     The SAVEPOINT buys bootstrap-write atomicity -- the hold setting row,
     its two last-transition metadata rows and the one-time marker land
     together or not at all -- NOT atomicity of the whole migration:
-    `create_schema` has already COMMITTED by the time we get here, because
-    executescript implicitly commits the pending transaction before running
-    its script, so the outer BEGIN IMMEDIATE from Database._run_immediate is
-    long gone and each statement below would otherwise land individually.
+    `create_tables` and `create_indexes` have already COMMITTED by the time
+    we get here, because executescript implicitly commits the pending
+    transaction before running its script, so the outer BEGIN IMMEDIATE from
+    Database._run_immediate is long gone and each statement below would
+    otherwise land individually.
     That commit boundary is pre-existing -- these bootstrap writes expose
     it, they do not introduce it. Unprotected, a failure after the hold
     write but before the marker write would leave the database HELD with no
@@ -780,8 +823,12 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     logger.debug(
         "migrations begin user_version=%s target=%s", current, TARGET_USER_VERSION
     )
-    create_schema(conn)
-    logger.debug("migrations schema ensured")
+    # Tables first, indexes last: a version migration may add a column an
+    # index names (migrate_v4 -> idx_pairs_winrate), and the migrations seed
+    # tables a pre-v4 file lacks. Both halves are IF NOT EXISTS throughout,
+    # so re-entry after a partial run converges.
+    create_tables(conn)
+    logger.debug("migrations tables ensured")
     if current < 2:
         logger.debug("migrations applying v2 backfill_status")
         migrate_v2_backfill_status(conn)
@@ -797,6 +844,8 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 6:
         logger.debug("migrations applying v6 daily-truth admission basis")
         migrate_v6_daily_truth_admission_basis(conn)
+    create_indexes(conn)
+    logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
@@ -865,13 +914,13 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
     Runs only under the ``current < 3`` gate in :func:`run_migrations`, so the
     live ``jobs`` table still carries the pre-v3 CHECK and the rebuild always
     applies cleanly. The two new tables (``station_poll_state``,
-    ``station_current_obs``) are created by :func:`create_schema`; this function
+    ``station_current_obs``) are created by :func:`create_tables`; this function
     rebuilds ``jobs`` to admit ``fetch_current_obs`` and backfills a staggered
     poll-state row per existing station.
     """
     # The whole v3 step (jobs rebuild + poll-state seed) must be all-or-nothing.
     # The outer BEGIN IMMEDIATE in Database._run_immediate does NOT protect us:
-    # create_schema's executescript issues an implicit COMMIT before migrate_v3
+    # create_tables' executescript issues an implicit COMMIT before migrate_v3
     # runs, so by here the connection is effectively back in autocommit and each
     # statement would land individually. An explicit SAVEPOINT opens (nests) a
     # transaction regardless of autocommit state, and execute/executemany (unlike
@@ -884,7 +933,7 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
     try:
         # Rebuild jobs to carry the widened CHECK (SQLite cannot ALTER a CHECK,
         # and CREATE TABLE IF NOT EXISTS is a no-op on the existing table). The
-        # jobs_new CHECK and column list must stay identical to create_schema's
+        # jobs_new CHECK and column list must stay identical to create_tables'
         # fresh DDL. The unconditional CREATE TABLE jobs_new is safe: the
         # savepoint rollback guarantees no orphan survives an aborted run.
         conn.execute(
@@ -984,9 +1033,9 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
        backfilling every existing row to its site's seeded ``initial``
        generation, then recreate the three pairs indexes.
 
-    ``timezone_generations`` itself comes from :func:`create_schema`, as in
+    ``timezone_generations`` itself comes from :func:`create_tables`, as in
     v3. On a fresh database (user_version 0) both rebuilds copy zero rows
-    from the already-new-shape tables created by :func:`create_schema`, so
+    from the already-new-shape tables created by :func:`create_tables`, so
     running the whole chain is harmless.
     """
     # Re-run guard: run_migrations writes PRAGMA user_version only AFTER the
@@ -1169,7 +1218,7 @@ def migrate_v5_result_basis_fingerprint(conn: sqlite3.Connection) -> None:
     :func:`migrate_v2_backfill_status`: ``run_migrations`` writes
     ``PRAGMA user_version`` only after this returns, so a crash in between
     leaves the column present at user_version 4 and the next boot re-enters
-    the ``current < 5`` gate. :func:`create_schema` already creates the
+    the ``current < 5`` gate. :func:`create_tables` already creates the
     column on a fresh database, where this is likewise a no-op -- which is
     why the DDL appends it after ``published_at``, so a fresh and a migrated
     database agree on column order, not just membership.
@@ -1193,13 +1242,13 @@ def migrate_v6_daily_truth_admission_basis(conn: sqlite3.Connection) -> None:
     :func:`migrate_v5_result_basis_fingerprint`: ``run_migrations`` writes
     ``PRAGMA user_version`` only after this returns, so a crash in between
     leaves the column present at user_version 5 and the next boot re-enters
-    the ``current < 6`` gate. :func:`create_schema` already creates the
+    the ``current < 6`` gate. :func:`create_tables` already creates the
     column on a fresh database, where this is likewise a no-op -- which is
     why the DDL appends it after ``tz_generation_id``, so a fresh and a
     migrated database agree on column order, not just membership.
 
     The ``CHECK`` predicate is repeated here, matching the one in the
-    ``create_schema`` DDL: ``ALTER TABLE ... ADD COLUMN`` accepts a bare
+    ``create_tables`` DDL: ``ALTER TABLE ... ADD COLUMN`` accepts a bare
     ``TEXT`` happily, so dropping it would leave migrated installs
     accepting values a fresh install rejects.
     """
