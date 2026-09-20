@@ -610,10 +610,18 @@ def test_o6_repeated_derivations_leak_no_readers(
 ) -> None:
     """O6 -> at qsize() after every request: correct = always
     _READ_POOL_SIZE, mutant M6 (put_nowait omitted) drops it by one on the
-    very first iteration."""
+    very first iteration. The startup read-cache warm is stubbed so the
+    only pooled readers in flight are the request's own derivations --
+    otherwise the warm can legitimately hold a reader across an iteration
+    on a slow runner."""
     conn = _open_app_db(tmp_path, monkeypatch)
     site_id = _make_site(conn, "o6-site")
     _seed_published_run(conn, site_id, fresh_fingerprint=True)
+
+    async def _no_warm(db: object) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.api.app.warm_read_cache", _no_warm)
     app = _make_app(monkeypatch)
     from fastapi.testclient import TestClient
 
