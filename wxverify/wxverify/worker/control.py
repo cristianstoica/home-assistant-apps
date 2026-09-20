@@ -26,8 +26,9 @@ class JobDeferred(JobControl):
 class JobCancelled(JobControl):
     """Raised when the job's work cannot or need not be done.
 
-    Its site-scoped target has been deleted or disabled, or (fetch_feed)
-    the feed's adapter cannot be built at all. The worker completes the row
-    WITHOUT the ``result='ok'`` success marker -- see
-    ``_complete_and_continue`` in ``wxverify.worker.processor``.
+    Reasons include a target that has been deleted or disabled, a feed
+    adapter that cannot be built, a malformed payload, a write window that
+    has closed, or a chain that a later state has superseded -- the list is
+    open. The worker completes the row WITHOUT the ``result='ok'`` success
+    marker -- see ``_complete_and_continue`` in ``wxverify.worker.processor``.
     """

@@ -115,7 +115,7 @@ def test_aged_failure_with_no_later_success_trips() -> None:
     cond = _problem_jobs(conn)
     assert cond["ok"] is False
     assert cond["count"] == 1
-    assert cond["detail"] == "1 stuck/failed/overdue jobs"
+    assert cond["detail"] == "1 unresolved failed scopes, 0 stuck/overdue jobs"
 
 
 @pytest.mark.parametrize(

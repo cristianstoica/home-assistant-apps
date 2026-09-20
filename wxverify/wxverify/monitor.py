@@ -348,7 +348,8 @@ def _pipeline_conditions(
             "problem_jobs",
             problem_jobs_n > 0,
             problem_jobs_n,
-            f"{problem_jobs_n} stuck/failed/overdue jobs",
+            f"{failed_scopes_n} unresolved failed scopes,"
+            f" {inflight_n} stuck/overdue jobs",
         ),
         _cond(
             "forecast_record_gap",
