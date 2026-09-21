@@ -44,7 +44,7 @@ from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.feeds.seam import CostEstimate, FetchResult
+from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import fetch_feed_once
 from wxverify.worker.processor import run_worker
@@ -1010,14 +1010,38 @@ def test_backfill_debug_lines_present(
 
 
 def test_catchup_debug_lines_present(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """T12-E: run_catchup at DEBUG emits sites/cursor debug lines."""
+    """T12-E: run_catchup at DEBUG emits sites/cursor debug lines.
+
+    The open-meteo adapter is stubbed so the seven due feeds are walked
+    without a request; the line under test is emitted before any fetch.
+    """
     conn = _init_tmp_db(tmp_path)
     _insert_site(conn)
     db = get_db()
 
     from wxverify.worker.catchup import run_catchup  # noqa: PLC0415
+
+    class _NoFetchAdapter:
+        supports_historical = True
+
+        def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
+            return CostEstimate(calls=1)
+
+        async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
+            raise AssertionError("catchup must not fetch a live forecast")
+
+        async def fetch_historical(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> FetchResult | None:
+            return None
+
+    def _fake_build_adapter(source: str, client: httpx.AsyncClient) -> _NoFetchAdapter:
+        assert source == "open-meteo"
+        return _NoFetchAdapter()
+
+    monkeypatch.setattr("wxverify.worker.catchup.build_adapter", _fake_build_adapter)
 
     writer = FencedWriter(db, db.generation)
 
