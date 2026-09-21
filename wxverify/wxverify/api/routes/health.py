@@ -27,7 +27,12 @@ router = APIRouter(prefix="/api", tags=["health"])
 FORECAST_SAMPLES_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_samples"
 FORECAST_PAIRS_COUNT_SQL = "SELECT COUNT(*) AS n FROM forecast_pairs"
 
-HEALTH_FEEDS_SQL = """
+# Two probes over one body: `/api/health/feeds` answers with an exact COUNT by
+# default, and with a plain EXISTS when the caller opts out of `sample_count`.
+# Both variants are formatted from this one template, so the rollup, the join
+# order and the published row order cannot drift apart between them -- only
+# the sample expression and its alias differ.
+_HEALTH_FEEDS_TEMPLATE = """
     WITH feed_rollup AS (
         SELECT m.id AS src_feed_id,
                CASE
@@ -45,20 +50,21 @@ HEALTH_FEEDS_SQL = """
            f.default_subscribed, f.disabled_reason,
            sfs.enabled AS override_enabled, sfs.last_run_at, sfs.last_error,
            sfs.error_count,
-           (
-               SELECT COUNT(*)
+           {probe_prefix}(
+               SELECT {probe_select}
                FROM feed_rollup r
                -- CROSS JOIN is load-bearing: it pins feed_rollup as the outer
-               -- loop so the probe binds BOTH (site_id, feed_id) on
-               -- sqlite_autoindex_forecast_samples_1 (from the
-               -- forecast_samples UNIQUE constraint). With a plain JOIN the
-               -- planner drives from forecast_samples, binds site_id only,
-               -- and the seek degrades to an index scan -- measured 5x
-               -- SLOWER than the full-table aggregate this replaced.
+               -- loop so the probe binds BOTH (site_id, feed_id) and SQLite
+               -- can seek a covering index for that pair -- which index it
+               -- picks is the planner's choice and is not guaranteed, so no
+               -- index name is pinned here. With a plain JOIN the planner
+               -- drives from forecast_samples, binds site_id only, and the
+               -- seek degrades to an index scan -- measured 5x SLOWER than
+               -- the full-table aggregate this replaced.
                CROSS JOIN forecast_samples fs
                  ON fs.site_id = s.id AND fs.feed_id = r.src_feed_id
                WHERE r.display_feed_id = f.id
-           ) AS sample_count
+           ) AS {probe_alias}
     FROM sites s
     JOIN feeds f
     LEFT JOIN site_feed_state sfs
@@ -67,6 +73,13 @@ HEALTH_FEEDS_SQL = """
       AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
     ORDER BY s.name, f.source, f.model
     """
+
+HEALTH_FEEDS_SQL = _HEALTH_FEEDS_TEMPLATE.format(
+    probe_prefix="", probe_select="COUNT(*)", probe_alias="sample_count"
+)
+HEALTH_FEEDS_HAS_SAMPLES_SQL = _HEALTH_FEEDS_TEMPLATE.format(
+    probe_prefix="EXISTS ", probe_select="1", probe_alias="has_samples"
+)
 
 
 @router.get("/health/keys")
@@ -110,9 +123,21 @@ async def health_budget() -> list[dict[str, object]]:
 
 
 @router.get("/health/feeds")
-async def health_feeds() -> list[dict[str, object]]:
+async def health_feeds(include_sample_count: bool = True) -> list[dict[str, object]]:
+    """Per (site, feed) health rows, ordered by site name.
+
+    ``sample_count`` is an exact lifetime count whose cost grows with the
+    retained history. A caller that only needs the ``status`` rungs can pass
+    ``?include_sample_count=false``: the response then omits ``sample_count``
+    and carries a boolean ``has_samples`` instead, and the statement asks
+    ``EXISTS`` rather than counting. Every other field, every ``status``
+    value, and the row order are identical in both modes.
+    """
+
     def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
-        rows = conn.execute(HEALTH_FEEDS_SQL).fetchall()
+        rows = conn.execute(
+            HEALTH_FEEDS_SQL if include_sample_count else HEALTH_FEEDS_HAS_SAMPLES_SQL
+        ).fetchall()
         out: list[dict[str, object]] = []
         for row in rows:
             subscribed = bool(
@@ -120,6 +145,12 @@ async def health_feeds() -> list[dict[str, object]]:
                 if row["override_enabled"] is not None
                 else row["default_subscribed"]
             )
+            # The two statements answer the same question about this row; only
+            # the default one also reports how many samples there are.
+            if include_sample_count:
+                has_samples = int(row["sample_count"]) > 0
+            else:
+                has_samples = bool(row["has_samples"])
             if not bool(row["site_enabled"]):
                 status = "site disabled"
             elif not bool(row["feed_enabled"]):
@@ -132,28 +163,32 @@ async def health_feeds() -> list[dict[str, object]]:
                 status = "error"
             elif row["last_run_at"] is None:
                 status = "never run / due"
-            elif int(row["sample_count"]) == 0:
+            elif not has_samples:
                 status = "ran / no usable data"
             else:
                 status = "ok"
-            out.append(
-                {
-                    "site_id": int(row["site_id"]),
-                    "site_name": str(row["site_name"]),
-                    "feed_id": int(row["feed_id"]),
-                    "source": str(row["source"]),
-                    "model": str(row["model"]),
-                    "subscribed": subscribed,
-                    "status": status,
-                    "disabled_reason": row["disabled_reason"],
-                    "last_run_at": row["last_run_at"],
-                    "last_error": row["last_error"],
-                    "error_count": int(row["error_count"] or 0),
-                    "feed_enabled": bool(row["feed_enabled"]),
-                    "site_enabled": bool(row["site_enabled"]),
-                    "sample_count": int(row["sample_count"]),
-                }
-            )
+            entry: dict[str, object] = {
+                "site_id": int(row["site_id"]),
+                "site_name": str(row["site_name"]),
+                "feed_id": int(row["feed_id"]),
+                "source": str(row["source"]),
+                "model": str(row["model"]),
+                "subscribed": subscribed,
+                "status": status,
+                "disabled_reason": row["disabled_reason"],
+                "last_run_at": row["last_run_at"],
+                "last_error": row["last_error"],
+                "error_count": int(row["error_count"] or 0),
+                "feed_enabled": bool(row["feed_enabled"]),
+                "site_enabled": bool(row["site_enabled"]),
+            }
+            # Last key either way, so the default response keeps the exact
+            # field order it publishes today.
+            if include_sample_count:
+                entry["sample_count"] = int(row["sample_count"])
+            else:
+                entry["has_samples"] = has_samples
+            out.append(entry)
         return out
 
     return await get_db().read(_read)
