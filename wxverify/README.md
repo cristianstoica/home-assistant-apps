@@ -7,6 +7,13 @@ It stores all state in SQLite, builds an observation consensus from enabled PWS
 stations, pairs forecasts against that consensus, and serves both a JSON API and
 a small HTMX/uPlot web UI.
 
+Weather Verify is self-contained. Its web panel, HTTP API, and command-line
+interface are the whole product; it registers no entities, devices, or services
+with Home Assistant, so no `sensor.wxverify_*` entity appears in your entity
+list unless you add one yourself. To bring its data into Home Assistant as an
+entity, define a REST sensor in your own configuration, as shown under
+[Home Assistant package (REST sensor + automations)](#home-assistant-package-rest-sensor--automations).
+
 ## What Operators Need
 
 - Python 3.13 for local standalone use.
