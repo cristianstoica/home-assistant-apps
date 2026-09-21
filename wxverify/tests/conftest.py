@@ -13,10 +13,19 @@ same reason and needs the same treatment: ``test_graceful_shutdown.py`` crashes
 a REAL lifespan's sweeper twice, which latches a death that is deliberately
 terminal for the process. Left standing, it would surface in ``test_monitor.py``
 as an ``overall == "critical"`` with no test to attribute it to.
+
+Real network access is denied for every test by ``_deny_network``; the
+mechanism, its ledger and its allowlist live in ``tests/network_guard.py`` so
+that ``tests/test_network_guard.py`` can import the same objects this fixture
+uses (this file is imported as a top-level ``conftest`` module and must not
+be imported by tests).
 """
+
+from collections.abc import Iterator
 
 import pytest
 
+from tests.network_guard import deny_network_scope
 from wxverify.api.routes.db_transfer import reset_export_sweeper_death
 from wxverify.verification.read_cache import reset_read_cache
 
@@ -31,3 +40,9 @@ def _reset_verification_read_cache() -> None:
 def _reset_export_sweeper_death() -> None:
     """Un-latch the export sweeper's death before each test."""
     reset_export_sweeper_death()
+
+
+@pytest.fixture(autouse=True)
+def _deny_network() -> Iterator[None]:
+    """Fail any test that tries to leave the process over a socket."""
+    yield from deny_network_scope()

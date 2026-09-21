@@ -46,6 +46,10 @@ from wxverify.worker.catchup import run_catchup
 from wxverify.worker.feed_fetch import fetch_feed_once
 
 
+async def _idle_worker(db: object) -> None:
+    await asyncio.Event().wait()
+
+
 def _make_site(conn: sqlite3.Connection, name: str) -> int:
     cur = conn.execute(
         "INSERT INTO sites "
@@ -258,6 +262,8 @@ def test_create_station_fence_rejects_a_write_after_a_replace(
         "wxverify.api.routes.stations.validate_station", _blocked_validate_station
     )
 
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
         csrf = client.get("/api/csrf").json()["csrf_token"]

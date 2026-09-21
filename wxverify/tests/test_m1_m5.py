@@ -1279,6 +1279,7 @@ def test_backfill_and_catchup_write_domain_state(
         "wxverify.worker.catchup.fetch_hourly_history_range", fake_history_range
     )
     monkeypatch.setattr("wxverify.worker.backfill.build_adapter", fake_build_adapter)
+    monkeypatch.setattr("wxverify.worker.catchup.build_adapter", fake_build_adapter)
     dispatch_db = get_db()
     continuation = asyncio.run(
         dispatch(
@@ -3250,6 +3251,8 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
     monkeypatch.setattr(
         "wxverify.api.routes.stations.lookup_elevation_m", fake_lookup_elevation_m
     )
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
         csrf = client.get("/api/csrf").json()["csrf_token"]
@@ -3535,6 +3538,8 @@ def test_site_create_does_not_require_weather_key_but_station_does(
     config.db_path = str(tmp_path / "nokey.db")
     config.options_path = str(tmp_path / "missing-options.json")
     monkeypatch.delenv("WXV_WEATHERCOM_KEY", raising=False)
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
         csrf = client.get("/api/csrf").json()["csrf_token"]
@@ -3559,11 +3564,15 @@ def test_site_create_does_not_require_weather_key_but_station_does(
         assert station.status_code == 503
 
 
-def test_ui_root_path_htmx_and_create_site_fragment(tmp_path: Path) -> None:
+def test_ui_root_path_htmx_and_create_site_fragment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     close_db()
     config.db_path = str(tmp_path / "ui.db")
     config.options_path = str(tmp_path / "missing-options.json")
     config.standalone_origin = None
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="/ingress/path/")
     with TestClient(app) as client:
         root = client.get("/", follow_redirects=False)
@@ -3674,6 +3683,8 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
             "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
         ).fetchone()["id"]
     )
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     app = create_app(root_path="")
     with TestClient(app) as client:
         dashboard = client.get(f"/dashboard?site={site_id}")
@@ -3947,7 +3958,9 @@ def test_meteoblue_parser_and_member_registration(
     asyncio.run(_run())
 
 
-def test_options_boot_apply_bad_options_and_packaging_files(tmp_path: Path) -> None:
+def test_options_boot_apply_bad_options_and_packaging_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     close_db()
     db_path = tmp_path / "boot.db"
     options_path = tmp_path / "options.json"
@@ -3987,6 +4000,8 @@ def test_options_boot_apply_bad_options_and_packaging_files(tmp_path: Path) -> N
         (site_id, feed_id),
     )
 
+    # network guard: idle the worker so the lifespan never reaches a provider
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     with TestClient(create_app(root_path="")) as client:
         assert client.get("/api/csrf").status_code == 200
         rows = {
