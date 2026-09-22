@@ -14,7 +14,7 @@ from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 6
+TARGET_USER_VERSION = 7
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -49,7 +49,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             backfill_status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(backfill_status IN ('pending','in_progress','complete')),
             backfill_through TEXT,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            last_obs_cycle_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS stations (
@@ -63,7 +64,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
             last_run_at TEXT,
             last_error TEXT,
             error_count INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            history_next_attempt_at TEXT,
+            history_last_error TEXT,
+            history_error_count INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS station_observations (
@@ -844,6 +848,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 6:
         logger.debug("migrations applying v6 daily-truth admission basis")
         migrate_v6_daily_truth_admission_basis(conn)
+    if current < 7:
+        logger.debug("migrations applying v7 obs cycle clock + station history")
+        migrate_v7_obs_cycle_and_station_history(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1258,6 +1265,56 @@ def migrate_v6_daily_truth_admission_basis(conn: sqlite3.Connection) -> None:
             "CHECK(admission_basis IS NULL "
             "OR admission_basis IN ('complete','deadline'))"
         )
+
+
+def migrate_v7_obs_cycle_and_station_history(conn: sqlite3.Connection) -> None:
+    """Split the obs cycle clock from obs freshness; add the station history trio.
+
+    ``sites.last_obs_cycle_at`` is the cycle-attempt clock the scheduler
+    reads, leaving ``sites.last_obs_at`` to mean data freshness alone.
+    ``stations.history_next_attempt_at`` / ``history_last_error`` /
+    ``history_error_count`` carry the per-station history-recovery state so
+    one station's empty hourly history can no longer abort its site's whole
+    observation cycle.
+
+    Column-probed idempotence, following
+    :func:`migrate_v6_daily_truth_admission_basis`: ``run_migrations`` writes
+    ``PRAGMA user_version`` only after this returns, so a crash in between
+    leaves the columns present at user_version 6 and the next boot re-enters
+    the ``current < 7`` gate. :func:`create_tables` already creates them on a
+    fresh database, where the probes are a no-op -- which is why the DDL
+    appends each one last in its table, so a fresh and a migrated database
+    agree on column order, not just membership.
+
+    ``history_error_count`` repeats its full ``NOT NULL DEFAULT 0``
+    definition, matching the ``create_tables`` DDL: ``ALTER TABLE ... ADD
+    COLUMN history_error_count INTEGER`` is accepted happily and would leave
+    every pre-existing station row holding NULL, which reads as neither
+    ``> 0`` nor ``<= 0`` in the monitor's condition. The other three are
+    nullable ``TEXT`` on both paths, so a bare type is their full definition.
+
+    The backfill runs outside the probe guards and is self-idempotent via its
+    own ``WHERE``, so a crash between the ``ALTER`` and the ``UPDATE``
+    converges on the next boot. It exists so an upgraded instance does not
+    become due for every site at once, and so no reader needs a permanent
+    ``COALESCE`` fallback.
+    """
+    if "last_obs_cycle_at" not in _table_columns(conn, "sites"):
+        conn.execute("ALTER TABLE sites ADD COLUMN last_obs_cycle_at TEXT")
+    station_columns = _table_columns(conn, "stations")
+    if "history_next_attempt_at" not in station_columns:
+        conn.execute("ALTER TABLE stations ADD COLUMN history_next_attempt_at TEXT")
+    if "history_last_error" not in station_columns:
+        conn.execute("ALTER TABLE stations ADD COLUMN history_last_error TEXT")
+    if "history_error_count" not in station_columns:
+        conn.execute(
+            "ALTER TABLE stations ADD COLUMN "
+            "history_error_count INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "UPDATE sites SET last_obs_cycle_at = last_obs_at "
+        "WHERE last_obs_cycle_at IS NULL"
+    )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

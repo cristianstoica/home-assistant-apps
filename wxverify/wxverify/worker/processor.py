@@ -9,6 +9,9 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+from math import ceil
+from typing import Final
 
 import httpx
 
@@ -21,7 +24,7 @@ from wxverify.collection.budget import (
 )
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.queue import (
     FailDisposition,
@@ -41,6 +44,7 @@ from wxverify.obs.pws_adapter import (
     PwsObservation,
     fetch_current_observation,
     fetch_hourly_history,
+    is_hourly_history_no_content,
 )
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_PHASES
@@ -95,6 +99,34 @@ logger = logging.getLogger(__name__)
 class StationFetchTarget:
     id: int
     pws_station_id: str
+    history_next_attempt_at: str | None
+    obs_watermark_at: str | None
+
+
+@dataclass(frozen=True)
+class HistoryPark:
+    """The ladder rung a park landed on, for the caller to log."""
+
+    error_count: int
+    next_attempt_at: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class StationPersistOutcome:
+    """What one station's persisted payload proved about this cycle.
+
+    Three independent facts, never inferred from one another:
+    ``usable`` gates history recovery, ``changed`` gates the
+    ``pair_and_score`` enqueue and ``newest_valid_at`` gates site
+    freshness. ``usable=True`` with ``newest_valid_at=None`` is reachable
+    -- a station whose every reading is future-dated.
+    """
+
+    usable: bool
+    changed: bool
+    newest_valid_at: str | None
+    parked: HistoryPark | None
 
 
 async def run_worker(db: Database) -> None:
@@ -486,9 +518,22 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
         raise JobCancelled()
     logger.debug("fetch_obs site=%s stations=%s", site_id, len(stations))
     changed = False
+    usable = False
+    newest_obs_at: str | None = None
+    skipped_parked = 0
     async with httpx.AsyncClient() as client:
         limiter = station_call_limiter()
+        now = utc_now()
         for index, station in enumerate(stations):
+            if _history_parked(station.history_next_attempt_at, now):
+                skipped_parked += 1
+                logger.debug(
+                    "fetch_obs station parked site=%s station=%s until=%s",
+                    site_id,
+                    station.id,
+                    station.history_next_attempt_at,
+                )
+                continue
             await pace_station_call(site_id, station.id, index)
             logger.debug(
                 "fetch_obs station attempt site=%s station=%s index=%s",
@@ -506,7 +551,7 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     observations = await fetch_hourly_history(
                         station.pws_station_id,
                         api_key,
-                        hours=RECENT_REFRESH_HOURS,
+                        hours=_retention_hours(station.obs_watermark_at, now),
                         timezone=timezone,
                         client=client,
                     )
@@ -525,10 +570,22 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                         raise JobDeferred(next_attempt_at) from exc
                     exc.add_note(
                         f"station={station.pws_station_id} "
-                        f"progress={index}/{len(stations)}"
+                        f"progress={index + 1}/{len(stations)}"
                     )
                     raise
                 except Exception as exc:
+                    if is_hourly_history_no_content(exc):
+                        error = sanitized_exception(exc)
+                        park = await write_after_reservation(
+                            db,
+                            writer,
+                            lambda conn, station_id=station.id, err=error: (
+                                _park_station_history(conn, station_id, err)
+                            ),
+                            reservation,
+                        )
+                        _log_history_park(site_id, station, park)
+                        continue
                     error = sanitized_exception(exc)
                     refund = reservation if is_refundable_transport_error(exc) else None
                     await write_after_reservation(
@@ -541,10 +598,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     )
                     exc.add_note(
                         f"station={station.pws_station_id} "
-                        f"progress={index}/{len(stations)}"
+                        f"progress={index + 1}/{len(stations)}"
                     )
                     raise
-                station_changed = await write_after_reservation(
+                outcome = await write_after_reservation(
                     db,
                     writer,
                     lambda conn, station_id=station.id, rows=observations: (
@@ -552,15 +609,38 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     ),
                     reservation,
                 )
+                if outcome.parked is not None:
+                    _log_history_park(site_id, station, outcome.parked)
                 logger.debug(
                     "fetch_obs station result site=%s station=%s changed=%s",
                     site_id,
                     station.id,
-                    station_changed,
+                    outcome.changed,
                 )
-                changed = changed or station_changed
-    logger.debug("fetch_obs cycle done site=%s changed=%s", site_id, changed)
-    await writer.write(lambda conn: _complete_obs_cycle(conn, site_id, changed))
+                changed = changed or outcome.changed
+                usable = usable or outcome.usable
+                if outcome.newest_valid_at is not None and (
+                    newest_obs_at is None or outcome.newest_valid_at > newest_obs_at
+                ):
+                    newest_obs_at = outcome.newest_valid_at
+    logger.debug(
+        "fetch_obs cycle done site=%s changed=%s usable=%s newest_obs_at=%s"
+        " skipped_parked=%s",
+        site_id,
+        changed,
+        usable,
+        newest_obs_at,
+        skipped_parked,
+    )
+    await writer.write(
+        lambda conn: _complete_obs_cycle(
+            conn,
+            site_id,
+            changed=changed,
+            usable=usable,
+            newest_obs_at=newest_obs_at,
+        )
+    )
 
 
 async def _fetch_current_obs(
@@ -753,7 +833,12 @@ def _enabled_stations(
 ) -> list[StationFetchTarget]:
     rows = conn.execute(
         """
-        SELECT st.id, st.pws_station_id
+        SELECT st.id,
+               st.pws_station_id,
+               st.history_next_attempt_at,
+               (SELECT MAX(o.valid_at)
+                  FROM station_observations o
+                 WHERE o.station_id = st.id) AS obs_watermark_at
         FROM stations st
         JOIN sites s ON s.id = st.site_id
         WHERE s.id = ?
@@ -763,10 +848,21 @@ def _enabled_stations(
         """,
         (site_id,),
     ).fetchall()
-    return [
-        StationFetchTarget(id=int(row["id"]), pws_station_id=str(row["pws_station_id"]))
-        for row in rows
-    ]
+    targets: list[StationFetchTarget] = []
+    for row in rows:
+        parked_until = row["history_next_attempt_at"]
+        watermark = row["obs_watermark_at"]
+        targets.append(
+            StationFetchTarget(
+                id=int(row["id"]),
+                pws_station_id=str(row["pws_station_id"]),
+                history_next_attempt_at=(
+                    None if parked_until is None else str(parked_until)
+                ),
+                obs_watermark_at=None if watermark is None else str(watermark),
+            )
+        )
+    return targets
 
 
 def _site_timezone(conn: sqlite3.Connection, site_id: int) -> str | None:
@@ -797,12 +893,87 @@ def _reserve_obs_call(
     return reserve_budget(conn, "weathercom", 1)
 
 
+_HISTORY_BACKOFF_BASE: Final = timedelta(hours=1)
+_HISTORY_BACKOFF_MAX: Final = timedelta(hours=24)
+_HISTORY_BACKOFF_MAX_SHIFT: Final = 5
+_HISTORY_RETENTION_MAX_HOURS: Final = 168  # the provider's seven-day path
+_HISTORY_RETENTION_OVERLAP_HOURS: Final = 1
+_EMPTY_HISTORY_REASON: Final = (
+    "hourly history returned no observations within the recency window"
+)
+
+
+def _history_parked(next_attempt_at: str | None, now: datetime) -> bool:
+    if next_attempt_at is None:
+        return False
+    try:
+        return parse_utc(next_attempt_at) > now
+    except ValueError:
+        # Unreadable marker: fail open and attempt the station, same rationale
+        # as the scheduler's unreadable-timestamp guard.
+        return False
+
+
+def _retention_hours(watermark: str | None, now: datetime) -> int:
+    """How much of the downloaded payload to keep for this station now."""
+    if watermark is None:
+        return _HISTORY_RETENTION_MAX_HOURS
+    try:
+        covered_through = parse_utc(watermark)
+    except ValueError:
+        # Unreadable watermark: keep everything, same fail-open rationale
+        # as the parked-station guard.
+        return _HISTORY_RETENTION_MAX_HOURS
+    gap_hours = ceil((now - covered_through) / timedelta(hours=1))
+    return max(
+        RECENT_REFRESH_HOURS,
+        min(gap_hours + _HISTORY_RETENTION_OVERLAP_HOURS, _HISTORY_RETENTION_MAX_HOURS),
+    )
+
+
+def _log_history_park(
+    site_id: int, station: StationFetchTarget, park: HistoryPark
+) -> None:
+    logger.warning(
+        "fetch_obs station history parked site=%s station=%s errors=%s until=%s: %s",
+        site_id,
+        station.id,
+        park.error_count,
+        park.next_attempt_at,
+        park.reason,
+    )
+
+
+def _park_station_history(
+    conn: sqlite3.Connection, station_id: int, error: str
+) -> HistoryPark:
+    row = conn.execute(
+        "SELECT history_error_count FROM stations WHERE id=? AND enabled=1",
+        (station_id,),
+    ).fetchone()
+    if row is None:
+        raise JobCancelled()
+    count = int(row["history_error_count"] or 0) + 1
+    shift = min(count - 1, _HISTORY_BACKOFF_MAX_SHIFT)
+    delay = min(_HISTORY_BACKOFF_BASE * (2**shift), _HISTORY_BACKOFF_MAX)
+    next_attempt_at = isoformat_utc(utc_now() + delay)
+    conn.execute(
+        """
+        UPDATE stations
+        SET history_error_count=?, history_last_error=?, history_next_attempt_at=?
+        WHERE id=?
+        """,
+        (count, error, next_attempt_at, station_id),
+    )
+    return HistoryPark(error_count=count, next_attempt_at=next_attempt_at, reason=error)
+
+
 def _persist_station_observations(
     conn: sqlite3.Connection,
     site_id: int,
     station_id: int,
     observations: list[PwsObservation],
-) -> bool:
+) -> StationPersistOutcome:
     row = conn.execute(
         """
         SELECT 1
@@ -813,6 +984,11 @@ def _persist_station_observations(
     ).fetchone()
     if row is None:
         raise JobCancelled()
+    usable = bool(observations)
+    now_stamp = isoformat_utc(utc_now().replace(microsecond=0))
+    newest_valid_at = max(
+        (o.valid_at for o in observations if o.valid_at <= now_stamp), default=None
+    )
     changed = False
     for observation in observations:
         changed = (
@@ -835,7 +1011,25 @@ def _persist_station_observations(
         """,
         (isoformat_utc(), station_id),
     )
-    return changed
+    if usable:
+        conn.execute(
+            """
+            UPDATE stations
+            SET history_next_attempt_at=NULL, history_last_error=NULL,
+                history_error_count=0
+            WHERE id=?
+            """,
+            (station_id,),
+        )
+        parked = None
+    else:
+        parked = _park_station_history(conn, station_id, _EMPTY_HISTORY_REASON)
+    return StationPersistOutcome(
+        usable=usable,
+        changed=changed,
+        newest_valid_at=newest_valid_at,
+        parked=parked,
+    )
 
 
 def _mark_station_error_and_backoff(
@@ -848,17 +1042,34 @@ def _mark_station_error_and_backoff(
     return record_http_backoff(conn, response)
 
 
-def _complete_obs_cycle(conn: sqlite3.Connection, site_id: int, changed: bool) -> None:
+def _complete_obs_cycle(
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    changed: bool,
+    usable: bool,
+    newest_obs_at: str | None,
+) -> None:
     cur = conn.execute(
         """
         UPDATE sites
-        SET last_obs_at=?
+        SET last_obs_cycle_at=?
         WHERE id=? AND enabled=1
         """,
         (isoformat_utc(), site_id),
     )
     if cur.rowcount != 1:
         raise JobCancelled()
+    if usable and newest_obs_at is not None:
+        conn.execute(
+            """
+            UPDATE sites
+            SET last_obs_at=?
+            WHERE id=? AND enabled=1
+              AND (last_obs_at IS NULL OR last_obs_at < ?)
+            """,
+            (newest_obs_at, site_id, newest_obs_at),
+        )
     if changed:
         enqueue_if_absent(
             conn, "pair_and_score", site_id, "score", {"site_id": site_id}

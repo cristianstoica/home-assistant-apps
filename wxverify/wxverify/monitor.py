@@ -140,6 +140,37 @@ def _count(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> in
     return 0 if row is None else int(row[0])
 
 
+def _station_history_failures(
+    conn: sqlite3.Connection,
+) -> tuple[int, int, str | None]:
+    """Enabled stations of enabled sites with an unresolved history failure.
+
+    Returns ``(count, worst_rung, earliest_next_attempt_at)``. Keyed on
+    ``history_error_count > 0`` -- unresolved failure -- not on the retry
+    deadline: a station on the 24h rung spends most of each rung with
+    ``history_next_attempt_at`` already in the past and no cycle yet run, so a
+    deadline-keyed count would blink healthy while nothing about the station
+    changed. SQLite's ``MIN`` skips NULLs, so the stamp is the earliest
+    outstanding retry among the failing stations, or NULL if none carries one.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*),
+               COALESCE(MAX(st.history_error_count), 0),
+               MIN(st.history_next_attempt_at)
+        FROM stations st
+        JOIN sites s ON s.id = st.site_id
+        WHERE s.enabled = 1
+          AND st.enabled = 1
+          AND st.history_error_count > 0
+        """
+    ).fetchone()
+    if row is None:
+        return (0, 0, None)
+    newest = row[2]
+    return (int(row[0]), int(row[1]), None if newest is None else str(newest))
+
+
 def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
     row = conn.execute(
         """
@@ -293,6 +324,16 @@ def _pipeline_conditions(
     # job completes, by design, so the failure is only visible here.
     gap_scan_failed_n, gap_scan_newest = gap_scan_degraded_sites(conn)
 
+    # obs_station_history_failing (Item B.7): enabled stations of enabled sites
+    # whose hourly history is failing. Trips on the first park and clears only
+    # when the station returns usable observations, which is the only thing
+    # that zeroes the counter.
+    (
+        history_failing_n,
+        history_worst_rung,
+        history_next_retry,
+    ) = _station_history_failures(conn)
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -363,6 +404,14 @@ def _pipeline_conditions(
             gap_scan_failed_n,
             f"{gap_scan_failed_n} sites with unassessed record gap-scan dates"
             f" (newest failure {gap_scan_newest})",
+        ),
+        _cond(
+            "obs_station_history_failing",
+            history_failing_n > 0,
+            history_failing_n,
+            f"{history_failing_n} stations with failing hourly history"
+            f" (worst rung {history_worst_rung},"
+            f" earliest retry {history_next_retry})",
         ),
     ]
 
@@ -596,6 +645,7 @@ def build_verdict(
                 "problem_jobs",
                 "forecast_record_gap",
                 "record_gap_scan_degraded",
+                "obs_station_history_failing",
             )
         )
 

@@ -48,7 +48,6 @@ from wxverify.feeds.seam import (
     GridProvenance,
     NormalizedSample,
 )
-from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import (
     PwsObservation,
     PwsStation,
@@ -926,7 +925,10 @@ def test_pws_parser_and_fetch_obs_refresh(
     ) -> list[PwsObservation]:
         assert station_id == "OBS1"
         assert api_key == "secret-weather"
-        assert hours == RECENT_REFRESH_HOURS == 6
+        # This station has no stored observations (obs_watermark_at is
+        # NULL), so _retention_hours falls back to the full seven-day
+        # history window rather than the steady-state refresh window.
+        assert hours == 168
         assert timezone == "UTC"
         assert client is not None
         return [
@@ -1135,7 +1137,10 @@ def test_station_call_pacing_is_seeded_bounded_and_used_by_fetch_obs(
         client: httpx.AsyncClient | None = None,
     ) -> list[PwsObservation]:
         assert api_key == "secret-weather"
-        assert hours == RECENT_REFRESH_HOURS
+        # These stations have no stored observations (obs_watermark_at is
+        # NULL), so _retention_hours falls back to the full seven-day
+        # history window rather than the steady-state refresh window.
+        assert hours == 168
         assert timezone == "UTC"
         assert client is not None
         history_calls.append(station_id_arg)

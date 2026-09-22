@@ -207,7 +207,28 @@ def _make_url(param: str, value: str = "SECRET123") -> str:
 
 @pytest.fixture()
 def restore_logging_state() -> Any:
-    """Snapshot and restore root + httpx/httpcore logger state."""
+    """Snapshot and restore root + httpx/httpcore logger state.
+
+    `_configure_logging()`'s `basicConfig(force=True)` installs a fresh
+    `StreamHandler` bound to *this test's* `sys.stdout` -- a per-test
+    capture proxy (`_pytest.capture.EncodedFile`) that pytest tears down
+    with the test. Blindly re-adding whatever handlers were on the root
+    logger before the test ran, and blindly leaving whatever
+    `_configure_logging` installed during the test still attached
+    afterward, both leak a handler bound to an already-expired capture
+    stream into later tests: the next unrelated `logging.warning(...)`
+    that reaches the root logger then tries to write to a closed file and
+    prints "--- Logging error ---" to the terminal instead of failing the
+    test that actually caused it.
+
+    So on teardown: (1) any handler installed during the test -- i.e. not
+    part of the original snapshot -- is explicitly closed, not merely
+    detached, so it can't be resurrected by identity elsewhere; (2) a
+    snapshotted handler is only reattached if its stream is still
+    writable -- one whose stream already closed during the test (e.g. via
+    `force=True` swapping streams out from under it) is dropped rather
+    than reattached in a broken state.
+    """
     root = logging.getLogger()
     saved_root_level = root.level
     saved_root_handlers = list(root.handlers)
@@ -219,11 +240,17 @@ def restore_logging_state() -> Any:
 
     yield
 
-    # Restore root
+    # Restore root: close/discard anything the test installed, and only
+    # reattach original handlers whose stream is still writable.
     root.setLevel(saved_root_level)
     for h in list(root.handlers):
         root.removeHandler(h)
+        if h not in saved_root_handlers:
+            h.close()
     for h in saved_root_handlers:
+        stream = getattr(h, "stream", None)
+        if stream is not None and getattr(stream, "closed", False):
+            continue
         root.addHandler(h)
 
     # Restore wire loggers

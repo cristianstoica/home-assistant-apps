@@ -464,10 +464,12 @@ Order matters. Run these steps in sequence:
 
 - SQLite runs in WAL mode.
 - All writes are serialized through one writer connection.
-- The observation refresh window is fixed at six hours in code, not a setting.
+- The observation refresh window is six hours in steady state and widens
+  automatically, up to the provider's seven-day limit, to cover a gap in stored
+  coverage. It is not a setting.
 - Weather.com PWS calls are budgeted per enabled station.
-- A site with no enabled stations is not observation-due and does not advance
-  `last_obs_at`.
+- A site with no enabled stations is not observation-due and advances neither
+  `last_obs_cycle_at` (cycle completion) nor `last_obs_at` (data freshness).
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
 - Audit queries against `verification_trigger_decisions` must select

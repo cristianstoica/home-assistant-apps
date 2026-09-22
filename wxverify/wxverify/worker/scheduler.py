@@ -316,7 +316,7 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
     now = utc_now()
     rows = conn.execute(
         """
-        SELECT s.id, s.last_obs_at
+        SELECT s.id, s.last_obs_cycle_at
         FROM sites s
         WHERE s.enabled=1
           AND EXISTS (
@@ -326,16 +326,17 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
         """
     ).fetchall()
     for row in rows:
-        last = row["last_obs_at"]
+        last = row["last_obs_cycle_at"]
         due = last is None
         if last is not None:
             try:
                 last_dt = parse_utc(str(last))
             except ValueError:
-                # Foreign/corrupt last_obs_at: fail open (treat as due), same
-                # rationale as the due-feed loop's last_run_at guard above.
+                # Foreign/corrupt last_obs_cycle_at: fail open (treat as due),
+                # same rationale as the due-feed loop's last_run_at guard above.
                 logger.warning(
-                    "scheduler: unreadable last_obs_at site=%s; treating obs as due",
+                    "scheduler: unreadable last_obs_cycle_at site=%s; "
+                    "treating obs as due",
                     int(row["id"]),
                 )
                 due = True

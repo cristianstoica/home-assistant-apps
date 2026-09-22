@@ -7,6 +7,7 @@ a 0.1.0-0.8.11 file.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -794,13 +795,135 @@ def _master(conn: sqlite3.Connection) -> Master:
     return {(r["type"], r["name"], r["tbl_name"], r["sql"]) for r in rows}
 
 
+# Matches a whole quoted span so its content is copied through verbatim by
+# `_normalise_whitespace_outside_quotes` below: a single-quoted string
+# literal (with the standard '' escape), a double-quoted identifier (with
+# "" escape), a backtick-quoted identifier, or a bracket-quoted identifier.
+_QUOTED_SPAN_RE = re.compile(
+    r"'(?:[^']|'')*'" r'|"(?:[^"]|"")*"' r"|`(?:[^`]|``)*`" r"|\[[^\]]*\]"
+)
+
+
+def _collapse_unquoted(segment: str) -> str:
+    """Collapse whitespace runs to one space, then drop the single space
+    SQLite's own DDL rewrite leaves before a comma or a closing paren.
+    Only ever called on text already known to sit OUTSIDE a quoted span."""
+    collapsed = re.sub(r"\s+", " ", segment)
+    return re.sub(r" +([,)])", r"\1", collapsed)
+
+
+def _normalise_whitespace_outside_quotes(sql: str) -> str:
+    out: list[str] = []
+    pos = 0
+    for m in _QUOTED_SPAN_RE.finditer(sql):
+        out.append(_collapse_unquoted(sql[pos : m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_collapse_unquoted(sql[pos:]))
+    return "".join(out).strip()
+
+
 def _normalised(master: Master) -> Master:
-    """Erase the two divergences SQLite itself introduces: the double quotes
-    `ALTER TABLE ... RENAME` puts around the name, and whitespace."""
+    """Erase the formatting divergences SQLite itself introduces between an
+    ALTER-migrated schema and a freshly-created one -- there are more than
+    the double quotes `ALTER TABLE ... RENAME` puts around the name: SQLite's
+    ADD COLUMN rewrite also leaves a stray space before the comma or closing
+    paren it inserts around, where fresh `create_tables` DDL does not (or
+    vice versa). Whitespace is normalised only OUTSIDE quoted spans (string
+    literals, quoted identifiers) so a genuinely different default value or
+    CHECK expression -- whose difference lives inside the quotes -- still
+    compares unequal.
+
+    This affects any future migration that ALTERs a table already present
+    in these fixtures (`sites`, `stations`, and the others `_build_historical`
+    seeds); it went unnoticed for v5 and v6 only because neither of those
+    migrations' ALTERed columns landed on a table these fixtures cover."""
     return {
-        (kind, name, tbl, " ".join(sql.split()).replace(f'"{name}"', name))
+        (
+            kind,
+            name,
+            tbl,
+            _normalise_whitespace_outside_quotes(sql).replace(f'"{name}"', name),
+        )
         for kind, name, tbl, sql in master
     }
+
+
+def test_normalised_treats_sqlite_add_column_spacing_as_equal() -> None:
+    """The two SQLite-introduced spacing divergences named in `_normalised`'s
+    docstring -- a stray space before a comma from the ADD COLUMN rewrite,
+    and a stray space before the closing paren in fresh DDL -- must compare
+    equal after normalisation."""
+    migrated: Master = {
+        (
+            "table",
+            "sites",
+            "sites",
+            "CREATE TABLE sites (id INTEGER, "
+            "created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            ", last_obs_cycle_at TEXT)",
+        )
+    }
+    fresh: Master = {
+        (
+            "table",
+            "sites",
+            "sites",
+            "CREATE TABLE sites (id INTEGER, "
+            "created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), "
+            "last_obs_cycle_at TEXT )",
+        )
+    }
+    assert _normalised(migrated) == _normalised(fresh)
+
+
+def test_normalised_still_distinguishes_real_schema_differences() -> None:
+    """Whitespace normalisation must never reach inside a quoted span:
+    a different default value, a different constraint, and different
+    literal content must all still compare unequal."""
+    base_default: Master = {
+        ("table", "stations", "stations", "CREATE TABLE stations (n TEXT DEFAULT 'a')")
+    }
+    other_default: Master = {
+        ("table", "stations", "stations", "CREATE TABLE stations (n TEXT DEFAULT 'b')")
+    }
+    assert _normalised(base_default) != _normalised(other_default)
+
+    base_check: Master = {
+        (
+            "table",
+            "stations",
+            "stations",
+            "CREATE TABLE stations (n INTEGER CHECK (n > 0))",
+        )
+    }
+    other_check: Master = {
+        (
+            "table",
+            "stations",
+            "stations",
+            "CREATE TABLE stations (n INTEGER CHECK (n >= 0))",
+        )
+    }
+    assert _normalised(base_check) != _normalised(other_check)
+
+    base_literal_whitespace: Master = {
+        (
+            "table",
+            "stations",
+            "stations",
+            "CREATE TABLE stations (n TEXT DEFAULT 'a b')",
+        )
+    }
+    other_literal_whitespace: Master = {
+        (
+            "table",
+            "stations",
+            "stations",
+            "CREATE TABLE stations (n TEXT DEFAULT 'a  b')",
+        )
+    }
+    assert _normalised(base_literal_whitespace) != _normalised(other_literal_whitespace)
 
 
 def _user_version(conn: sqlite3.Connection) -> int:

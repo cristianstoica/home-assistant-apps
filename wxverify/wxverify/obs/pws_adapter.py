@@ -7,7 +7,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -77,6 +77,9 @@ _CONTENT_TYPE_RE = re.compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
 _CONTENT_TYPE_MAX_LEN = 64
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 
+HOURLY_HISTORY_URL: Final = "https://api.weather.com/v2/pws/observations/hourly/7day"
+HOURLY_HISTORY_PATH: Final = "/v2/pws/observations/hourly/7day"
+
 
 @dataclass(frozen=True)
 class PayloadDiagnostics:
@@ -129,6 +132,21 @@ class UpstreamPayloadError(Exception):
     def __init__(self, diagnostics: PayloadDiagnostics) -> None:
         super().__init__(diagnostics.render())
         self.diagnostics = diagnostics
+
+
+def is_hourly_history_no_content(exc: BaseException) -> bool:
+    """True only for a 204 from the 7-day hourly-history endpoint.
+
+    An allowlist: the type, the diagnostic kind and the endpoint must all
+    match. Every other payload failure -- json_decode, invalid_structure,
+    provider_error -- and every 204 from another endpoint returns False and
+    keeps its existing path.
+    """
+    return (
+        isinstance(exc, UpstreamPayloadError)
+        and exc.diagnostics.kind == "no_content"
+        and exc.diagnostics.endpoint == HOURLY_HISTORY_PATH
+    )
 
 
 def decode_observations_payload(
@@ -285,7 +303,7 @@ async def fetch_hourly_history(
             )
     logger.debug("pws hourly_history request station=%s hours=%s", station_id, hours)
     response = await client.get(
-        "https://api.weather.com/v2/pws/observations/hourly/7day",
+        HOURLY_HISTORY_URL,
         params={
             "stationId": station_id,
             "format": "json",

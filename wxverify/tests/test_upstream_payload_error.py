@@ -610,9 +610,10 @@ def test_partial_progress_and_no_success_advance_end_to_end(
     assert "progress=" not in row3["last_error"]
 
     site_row = conn.execute(
-        "SELECT last_obs_at FROM sites WHERE id=?", (site_id,)
+        "SELECT last_obs_at, last_obs_cycle_at FROM sites WHERE id=?", (site_id,)
     ).fetchone()
     assert site_row["last_obs_at"] is None
+    assert site_row["last_obs_cycle_at"] is None
     pair_job = conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
     assert pair_job is None
 
@@ -622,7 +623,7 @@ def test_partial_progress_and_no_success_advance_end_to_end(
     assert budget["calls"] == 3
 
     sanitized = sanitized_exception(info.value)
-    assert sanitized.endswith("station=ISTATION03 progress=2/3")
+    assert sanitized.endswith("station=ISTATION03 progress=3/3")
     assert "SYNTHETIC-SECRET" not in sanitized
 
 
@@ -673,8 +674,8 @@ def test_second_station_failure_leaves_third_untouched(
         )
 
     assert sanitized_exception(info.value).endswith(
-        "station=ISTATION02 progress=1/3"
-    ), "the note pins the 0-based index of the failing station, not a 1-based ordinal"
+        "station=ISTATION02 progress=2/3"
+    ), "the note pins the 1-based ordinal of the failing station"
 
     assert call_log == ["ISTATION01", "ISTATION02"]
     row2 = _station_row(conn, s2)
@@ -746,9 +747,10 @@ def test_invalid_structure_no_longer_advances_the_station(
     assert row["last_run_at"] is None
     assert "kind=invalid_structure" in str(row["last_error"])
     site_row = conn.execute(
-        "SELECT last_obs_at FROM sites WHERE id=?", (site_id,)
+        "SELECT last_obs_at, last_obs_cycle_at FROM sites WHERE id=?", (site_id,)
     ).fetchone()
     assert site_row["last_obs_at"] is None
+    assert site_row["last_obs_cycle_at"] is None
     backoff_row = conn.execute(
         "SELECT 1 FROM domain_backoffs WHERE domain='api.weather.com'"
     ).fetchone()
