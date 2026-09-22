@@ -87,6 +87,11 @@ class OpenWeatherMapAdapter:
     ) -> FetchResult | None:
         return None
 
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        raise NotImplementedError("supports_historical is False")
+
 
 def _to_fetch_result(req: ForecastRequest, payload: OwmResponse) -> FetchResult:
     issued_at = snap_run()

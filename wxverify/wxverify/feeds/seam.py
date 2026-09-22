@@ -62,3 +62,7 @@ class ForecastAdapter(Protocol):
     async def fetch_historical(
         self, req: ForecastRequest, *, window_start: str, window_end: str
     ) -> FetchResult | None: ...
+
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate: ...

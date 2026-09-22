@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import ClassVar, Final, cast
 
 import httpx
@@ -37,6 +37,8 @@ VARIABLE_MAP: Final[dict[str, str]] = {
     "precip": "precipitation",
 }
 TRACE_NEGATIVE_PRECIP_MIN: Final = -0.1
+_METERED_REFERENCE_VARIABLES: Final = 10
+_METERED_REFERENCE_DAYS: Final = 14
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,26 @@ def _snap_run(model: str, fetch_time: str | None = None) -> str:
     return isoformat_utc(snapped)
 
 
+def _metered_calls(variables: int, days: int) -> int:
+    """Integer form of max(1, ceil((V / 10) * max(1, days / 14)))."""
+    if variables <= 0:
+        return 1
+    scale = _METERED_REFERENCE_VARIABLES * _METERED_REFERENCE_DAYS  # 140
+    numerator = variables * max(_METERED_REFERENCE_DAYS, days)
+    return max(1, -(-numerator // scale))
+
+
+def _historical_date_range(window_start: str, window_end: str) -> tuple[date, date]:
+    """The inclusive calendar dates fetch_historical sends as start_date/end_date."""
+    return parse_utc(window_start).date(), parse_utc(window_end).date()
+
+
+def _billed_days(window_start: str, window_end: str) -> int:
+    """Billed span of that request: inclusive date count, floored at 1."""
+    start, end = _historical_date_range(window_start, window_end)
+    return max(1, (end - start).days + 1)
+
+
 class OpenMeteoAdapter:
     supports_historical: ClassVar[bool] = True
 
@@ -66,7 +88,16 @@ class OpenMeteoAdapter:
         self._client = client
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
-        return CostEstimate(calls=1)
+        hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
+        return CostEstimate(calls=_metered_calls(len(hourly), _METERED_REFERENCE_DAYS))
+
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        names = _historical_hourly_names(req)
+        return CostEstimate(
+            calls=_metered_calls(len(names), _billed_days(window_start, window_end))
+        )
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
         hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
@@ -118,6 +149,7 @@ class OpenMeteoAdapter:
             window_start,
             window_end,
         )
+        start_date, end_date = _historical_date_range(window_start, window_end)
         response = await self._client.get(
             "https://previous-runs-api.open-meteo.com/v1/forecast",
             params={
@@ -126,8 +158,8 @@ class OpenMeteoAdapter:
                 "models": req.model,
                 "hourly": ",".join(hourly),
                 "timezone": "UTC",
-                "start_date": parse_utc(window_start).date().isoformat(),
-                "end_date": parse_utc(window_end).date().isoformat(),
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
             },
             timeout=httpx.Timeout(15.0, connect=5.0),
         )

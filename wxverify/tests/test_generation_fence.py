@@ -134,6 +134,11 @@ class _BlockingHistoricalAdapter:
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
         return CostEstimate(calls=1)
 
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        return CostEstimate(calls=1)
+
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
         raise AssertionError("backfill should use historical replay")
 

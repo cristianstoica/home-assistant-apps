@@ -11,6 +11,8 @@ import httpx
 
 from wxverify.collection.budget import (
     Reservation,
+    is_refundable_transport_error,
+    refund_budget,
     reserve_budget,
     write_after_reservation,
 )
@@ -309,7 +311,9 @@ async def _fetch_historical_forecasts(
                 variables=BACKFILL_VARIABLES,
                 max_lead_hours=feed.max_lead_hours,
             )
-            cost = adapter.estimate_cost(req)
+            cost = adapter.estimate_historical_cost(
+                req, window_start=window_start, window_end=window_end
+            )
             reservation = await writer.write(
                 lambda conn, f=feed, c=cost: _reserve_feed_call(conn, f, c)
             )
@@ -341,10 +345,13 @@ async def _fetch_historical_forecasts(
                 raise
             except Exception as exc:
                 error = sanitized_exception(exc)
+                refund = reservation if is_refundable_transport_error(exc) else None
                 await write_after_reservation(
                     db,
                     writer,
-                    lambda conn, f=feed, err=error: _mark_feed_error(conn, f, err),
+                    lambda conn, f=feed, err=error, res=refund: (
+                        _mark_feed_error_and_refund(conn, f, err, res)
+                    ),
                     reservation,
                 )
                 logger.debug(
@@ -443,6 +450,18 @@ def _mark_feed_error(
         """,
         (feed.site_id, feed.feed_id, error),
     )
+
+
+def _mark_feed_error_and_refund(
+    conn: sqlite3.Connection,
+    feed: HistoricalFeedTarget,
+    error: str,
+    reservation: Reservation | None,
+) -> None:
+    """Record the fetch failure and, atomically, refund a phantom reservation."""
+    _mark_feed_error(conn, feed, error)
+    if reservation is not None:
+        refund_budget(conn, reservation)
 
 
 def _enabled_stations(

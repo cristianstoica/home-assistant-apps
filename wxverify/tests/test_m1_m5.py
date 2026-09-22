@@ -1238,6 +1238,11 @@ def test_backfill_and_catchup_write_domain_state(
             assert req.model == "ecmwf_ifs"
             return CostEstimate(calls=1)
 
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
+            return CostEstimate(calls=1)
+
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
             raise AssertionError("backfill should use historical replay")
 
@@ -1457,6 +1462,11 @@ def test_backfill_fetches_pws_history_once_across_forecast_chunks(
             assert req.model == "ecmwf_ifs"
             return CostEstimate(calls=1)
 
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
+            return CostEstimate(calls=1)
+
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
             raise AssertionError("backfill should use historical replay")
 
@@ -1605,6 +1615,11 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
         supports_historical = True
 
         def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
+            return CostEstimate(calls=1)
+
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
             return CostEstimate(calls=1)
 
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:

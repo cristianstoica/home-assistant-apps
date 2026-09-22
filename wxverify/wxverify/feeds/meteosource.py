@@ -98,6 +98,11 @@ class MeteosourceAdapter:
     ) -> FetchResult | None:
         return None
 
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        raise NotImplementedError("supports_historical is False")
+
 
 def _force_utc_iso(value: str) -> str:
     """Parse a Meteosource timestamp and force UTC.
