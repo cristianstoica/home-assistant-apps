@@ -420,12 +420,13 @@ FEED_HEALTH_SQL = """
                SELECT 1
                FROM feed_rollup r
                -- CROSS JOIN is load-bearing: it pins feed_rollup as the outer
-               -- loop so the probe binds BOTH (site_id, feed_id) on
-               -- sqlite_autoindex_forecast_samples_1 (from the
-               -- forecast_samples UNIQUE constraint). With a plain JOIN the
-               -- planner drives from forecast_samples, binds site_id only,
-               -- and the seek degrades to an index scan -- measured 5x
-               -- SLOWER than the full-table aggregate this replaced.
+               -- loop so the probe binds BOTH (site_id, feed_id) and SQLite
+               -- can seek a covering index for that pair -- which index it
+               -- picks is the planner's choice and is not guaranteed, so no
+               -- index name is pinned here. With a plain JOIN the planner
+               -- drives from forecast_samples, binds site_id only, and the
+               -- seek degrades to an index scan -- measured 5x SLOWER than
+               -- the full-table aggregate this replaced.
                CROSS JOIN forecast_samples fs
                  ON fs.site_id = s.id AND fs.feed_id = r.src_feed_id
                WHERE r.display_feed_id = f.id
