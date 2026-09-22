@@ -819,6 +819,63 @@ def correct_google_horizon(conn: sqlite3.Connection) -> None:
     set_runtime_state(conn, GOOGLE_HORIZON_CORRECTION_KEY, "applied")
 
 
+#: One-shot marker for the 0.16.0 Open-Meteo horizon correction. Presence --
+#: not value -- is the gate, matching GOOGLE_HORIZON_CORRECTION_KEY.
+OPEN_METEO_HORIZON_CORRECTION_KEY = "open_meteo_horizon_correction_applied"
+
+
+def correct_open_meteo_horizons(conn: sqlite3.Connection) -> None:
+    """Move every Open-Meteo feed to its own request horizon, once.
+
+    All seven feeds were seeded at a uniform 168 h. The four longest
+    models -- `ecmwf_ifs`, `gfs_global`, `gem_global` and `jma_gsm` --
+    rise to `config.DISPLAY_REQUEST_HOURS`, the hours the eight-day
+    product can actually consume, rather than to their advertised
+    maxima, which run far past it. `icon_global` rises to its own
+    maximum, 180 h, which already sits below that cap.
+    `meteofrance_arpege_world` and `ukmo_global_deterministic_10km`
+    keep 168. `config.OPEN_METEO_MAX_LEAD_HOURS` is the same table
+    `FEED_SEEDS` seeds from, so a fresh database and an upgraded one
+    cannot drift apart.
+
+    Not a `user_version` migration: no schema shape changes, and older
+    code reads a corrected row correctly, so bumping the version would
+    assert an incompatibility that does not exist. The v7 obs-cycle
+    migration bumps the version for its own reasons; this correction
+    rides alongside it and leaves the version alone.
+
+    The `runtime_state` marker -- not the `WHERE` clause -- is what
+    makes this one-shot. The `max_lead_hours = 168` predicate is
+    self-idempotent only while `max_lead_hours` is not
+    operator-writable (`api/routes/feeds.py`), which is a fact about a
+    different module; the marker does not depend on it.
+
+    Statement order is the crash guard, so no SAVEPOINT is needed:
+    every `UPDATE` first, marker last. A crash in between leaves some
+    rows corrected with no marker, and the next boot re-runs `UPDATE`s
+    that match only the still-uncorrected rows before writing it.
+
+    Targeted, not a general seed reconciliation: `seed_default_feeds`
+    runs on every open, so an UPSERT-all pass would reset the
+    operator-writable columns (`enabled`, `disabled_reason`,
+    `fetch_interval_minutes`, `default_subscribed`) at every boot.
+
+    Two of the seven iterations write 168 over 168 -- a no-op by
+    arithmetic, not by a special case.
+    """
+    if get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) is not None:
+        return
+    for model, hours in config.OPEN_METEO_MAX_LEAD_HOURS.items():
+        conn.execute(
+            """
+            UPDATE feeds SET max_lead_hours = ?
+            WHERE source = 'open-meteo' AND model = ? AND max_lead_hours = 168
+            """,
+            (hours, model),
+        )
+    set_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY, "applied")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -854,6 +911,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
+    correct_open_meteo_horizons(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)

@@ -247,17 +247,43 @@ cells.
 
 ## Forecast Horizon
 
-wxverify is configured to request and score up to `168` lead hours, which is
-`7` days, for all forecast feeds.
+Two limits apply here, and they are not the same number.
 
-- Open-Meteo live forecasts request `forecast_hours=168`.
-- Meteoblue package data is filtered to `lead_hours <= 168`.
-- Open-Meteo historical backfill stores previous-run day-ahead leads from
-  day 1 through day 7.
+**Request horizon — per feed.** Every feed row carries its own
+`max_lead_hours`, and that value is what the fetcher asks the provider for. For
+Open-Meteo, `config.OPEN_METEO_MAX_LEAD_HOURS` maps each model to its horizon:
+the ceiling `config.DISPLAY_REQUEST_HOURS` for a model that reaches at least
+that far, and the model's own advertised maximum where that is shorter. Adding
+a model means adding an entry to that mapping — the fresh-database seed and
+the one-shot correction applied to existing databases both read it, so the two
+cannot drift apart. Meteoblue is unchanged: its seed stays at `168` and its
+package data is filtered to that feed's `max_lead_hours`. Open-Meteo historical
+backfill still stores previous-run day-ahead leads from day 1 through day 7.
 
-Actual stored coverage can be shorter when a provider or member model returns a
-shorter horizon. For example, some regional Meteoblue models may stop at 72, 96,
-120, or 144 hours even though wxverify's scoring limit is 168 hours.
+`DISPLAY_REQUEST_HOURS` is `217`, and it is a display figure, not a scoring
+one. The product displays `forecast.service.DAY_COUNT` days; the request has to
+cover one day beyond that, because the displayed span rolls over at local
+midnight while each feed refreshes only on its own fetch interval, and one hour
+beyond that, because a fall-back daylight-saving transition adds an hour to a
+local day.
+
+**Scoring ceiling — calendar-day buckets.** Pairing does not cut at an hour
+count. It admits issuance-relative local calendar-day buckets `0` through `7`:
+the local day a forecast was issued, plus the next seven. Within that, a sample
+still has to fall inside its own feed's `max_lead_hours`. The ceiling is stated
+in buckets and never in hours on purpose, because a bucket is a difference of
+local calendar dates: eight local days span 191 to 193 elapsed hours, depending
+on whether a daylight-saving transition falls inside the window. Any fixed hour
+count would be wrong on one side or the other.
+
+The two raised limits therefore buy two different things. For each feed whose
+horizon rose, the scorer gains the 169-192 h band that the old flat `168` was
+cutting off; the display gains a complete last day.
+
+Actual stored coverage can still be shorter than a feed's own request horizon,
+when the provider or a member model returns less — some regional Meteoblue
+member models stop at 72, 96, 120, or 144 hours. There is no single global
+limit to compare them against: each feed's `max_lead_hours` is the reference.
 
 ## Web UI
 
