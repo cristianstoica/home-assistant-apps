@@ -56,6 +56,28 @@ def parse_utc(value: str) -> datetime:
         ) from exc
 
 
+def is_canonical_utc_stamp(value: object) -> bool:
+    """Whether ``value`` is ``isoformat_utc``'s own whole-second UTC stamp.
+
+    An allowlist over the value, not its shape: a ``str`` that parses as a UTC
+    instant with ``microsecond == 0`` AND round-trips byte-identically through
+    ``isoformat_utc``. Both clauses carry weight. The equality rejects every
+    other spelling of a valid instant (lowercase ``t``, ``+00:00``, a naive
+    stamp, ``.000000Z``); the microsecond clause is the only thing rejecting
+    ``.500000Z``, which round-trips equal. Whole seconds are a storage policy
+    for identity stamps, not merely what ``isoformat_utc`` can produce. Only
+    ``ValueError`` is caught: ``parse_utc`` is total for ``str``, so anything
+    else it raises is a regression and propagates.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = parse_utc(value)
+    except ValueError:
+        return False
+    return parsed.microsecond == 0 and isoformat_utc(parsed) == value
+
+
 def floor_hour(value: datetime) -> datetime:
     return value.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
 

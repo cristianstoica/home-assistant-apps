@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.1
+
+Refuses a database import whose forecast times are not in the add-on's
+own UTC form.
+
+### Changed
+
+- Database Import now checks every forecast time in the uploaded file and
+  refuses the file if any is not in the add-on's own UTC form (for example
+  `2026-01-01T00:00:00Z`). The message names the column, and the live
+  database is left untouched. Before, such a file was accepted and could
+  make the rebuild after the import fail, or count one forecast hour twice.
+
 ## 0.16.0
 
 Sizes the budget reservation for Open-Meteo previous-runs requests by what

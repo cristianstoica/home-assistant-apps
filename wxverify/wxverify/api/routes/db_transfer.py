@@ -24,7 +24,7 @@ from starlette.responses import JSONResponse
 from wxverify import config
 from wxverify.api.errors import ApiError
 from wxverify.core.error_sanitize import safe_detail, sanitized_exception
-from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import reclaim_all_stale
@@ -77,6 +77,16 @@ _BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "variable"),
     ("forecast_pairs", "variable"),
     ("score_cache", "variable"),
+)
+# The forecast identity stamps, checked by VALUE at import. Downstream they
+# are string keys (the UNIQUE constraint, the pairing join, the latest-run
+# partition), so a second spelling of one instant splits a forecast hour in
+# two, and a stamp that does not parse makes pairing raise. The read-side
+# `FORECAST_TIMESTAMP_LIKE` filter is only a shape filter (LIKE is
+# case-insensitive and `_` matches any character), so it catches neither.
+_CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("forecast_samples", "issued_at"),
+    ("forecast_samples", "valid_at"),
 )
 # Anchored: only this producer's own output shapes are ever a sweep
 # candidate. The token group is optional on purpose -- it spans BOTH
@@ -697,6 +707,38 @@ async def _stream_to(request: Request, tmp: Path) -> int:
     return written
 
 
+def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
+    """Whether guarded ``table`` exists, matched the way SQLite resolves names.
+
+    SQLite matches identifiers ASCII-case-insensitively, so the code's
+    lowercase name reaches a table stored as `Forecast_Samples`, which an
+    exact Python test against `sqlite_master` names would skip.
+    `COLLATE NOCASE` folds ASCII only, the same rule. Tables, views and
+    indexes share one namespace, so the lookup covers all three: no row
+    means genuinely absent (skip it; `create_tables` recreates it after the
+    swap), exactly one `table` row means validate it, and anything else is
+    refused. A same-named view or index read as absent would pass admission
+    and then break the schema step at boot. ``table`` is always a code-owned
+    name, bound as a parameter.
+    """
+    try:
+        types = [
+            str(type_row[0])
+            for type_row in conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = ? COLLATE NOCASE"
+                " AND type IN ('table', 'view', 'index')",
+                (table,),
+            )
+        ]
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+    if not types:
+        return False
+    if types == ["table"]:
+        return True
+    raise ApiError(422, f"not a table: {table}")
+
+
 def _validate_upload(tmp: Path) -> None:
     """Validate the upload via a read-only open, without touching the live DB."""
     try:
@@ -732,7 +774,7 @@ def _validate_upload(tmp: Path) -> None:
             if table not in names:
                 raise ApiError(422, f"missing required table: {table}")
         for table, column in _BLOB_GUARDED_COLUMNS:
-            if table not in names:
+            if not _guarded_table_present(conn, table):
                 continue
             try:
                 blob_row = conn.execute(
@@ -742,6 +784,24 @@ def _validate_upload(tmp: Path) -> None:
                 raise ApiError(422, "not a valid SQLite database") from exc
             if blob_row is not None:
                 raise ApiError(422, f"invalid data in {table}.{column}")
+        for table, column in _CANONICAL_STAMP_COLUMNS:
+            if not _guarded_table_present(conn, table):
+                continue
+            try:
+                bad = any(
+                    not is_canonical_utc_stamp(stamp_row[0])
+                    for stamp_row in conn.execute(
+                        f"SELECT DISTINCT {column} COLLATE BINARY FROM {table}"
+                    )
+                )
+            except sqlite3.DatabaseError as exc:
+                raise ApiError(422, "not a valid SQLite database") from exc
+            if bad:
+                raise ApiError(
+                    422,
+                    f"invalid timestamp in {table}.{column}: "
+                    "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+                )
     finally:
         conn.close()
 
