@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wxverify.core.timeutil import isoformat_utc, lead_hours
 from wxverify.core.units import kmh_to_ms
+from wxverify.feeds.parse_cap_probe import emit_parse_cap_probe
 from wxverify.feeds.seam import (
     CostEstimate,
     FetchResult,
@@ -59,9 +60,12 @@ class VisualCrossingResponse(BaseModel):
 class VisualCrossingAdapter:
     supports_historical: ClassVar[bool] = False
 
-    def __init__(self, api_key: str, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, api_key: str, client: httpx.AsyncClient, *, parse_cap_probe: bool = False
+    ) -> None:
         self._api_key = api_key
         self._client = client
+        self._parse_cap_probe = parse_cap_probe
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
         return CostEstimate(calls=1)
@@ -81,6 +85,13 @@ class VisualCrossingAdapter:
         response.raise_for_status()
         payload = VisualCrossingResponse.model_validate(response.json())
         result = _to_fetch_result(req, payload)
+        if self._parse_cap_probe:
+            emit_parse_cap_probe(
+                source="visualcrossing",
+                req=req,
+                models=(req.model,),
+                reparse=lambda shadow_req: _to_fetch_result(shadow_req, payload),
+            )
         logger.debug(
             "visualcrossing forecast response status=%s samples=%s",
             response.status_code,

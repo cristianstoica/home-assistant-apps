@@ -44,6 +44,7 @@ class RuntimeOptions(BaseModel):
     monitor_pipeline: bool = True
     monitor_budget: bool = True
     monitor_db: bool = True
+    parse_cap_probe: bool = False
 
 
 def depth_option_values(options: RuntimeOptions) -> dict[str, int | None]:
@@ -115,6 +116,7 @@ def _from_env() -> RuntimeConfig:
             monitor_pipeline=_env_bool("WXV_MONITOR_PIPELINE") is not False,
             monitor_budget=_env_bool("WXV_MONITOR_BUDGET") is not False,
             monitor_db=_env_bool("WXV_MONITOR_DB") is not False,
+            parse_cap_probe=_env_bool("WXV_PARSE_CAP_PROBE") is True,
         ),
         log_level=os.environ.get("WXV_LOG_LEVEL"),
     )
@@ -155,6 +157,7 @@ def _from_options_json(path: Path) -> RuntimeConfig:
             monitor_pipeline=options.get("monitor_pipeline", True),
             monitor_budget=options.get("monitor_budget", True),
             monitor_db=options.get("monitor_db", True),
+            parse_cap_probe=options.get("parse_cap_probe") is True,
         ),
         log_level=_blank_to_none(options.get("log_level")),
     )

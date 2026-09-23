@@ -144,6 +144,26 @@ leaves no error behind:
 > overrides in the add-on configuration (or the matching `WXV_FORECAST_BLEND_DEPTH_*`
 > environment variables for a standalone run) and only then run the import.
 
+### Parse-cap probe (optional, temporary)
+
+`parse_cap_probe` is an optional switch, off unless you set it to `true`. A
+standalone run uses the environment variable `WXV_PARSE_CAP_PROBE` instead,
+where `1`, `true`, `yes` or `on` switch it on.
+
+When it is on, each fetch from Visual Crossing, Meteoblue or Meteosource writes
+one log line per model, starting with `parse_cap_probe`. The line says how many
+forecast hours the response held, how many of them the add-on keeps, and how
+far ahead they reach.
+
+Nothing new is stored, shown, scored or requested: the probe reads only the
+response the add-on has already fetched. Its lines hold no API key, location or
+forecast value.
+
+The lines are written at `info` level, so they appear when `log_level` is
+`info` or `debug`, and not when it is `warning` or `error`.
+
+The option is temporary and will be removed in a later release.
+
 ## First-run Workflow
 
 1. Start the app.
