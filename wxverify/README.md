@@ -185,9 +185,9 @@ The default is `0.2 mm`, which is a reasonable "trace rain counts as dry" floor.
 You usually do not need to change it unless your station reports noisy tiny
 precip amounts or you want a stricter definition such as `1.0 mm`.
 
-It only affects precipitation event scoring. Temperature and wind are
-unaffected. Changing it later recomputes precip pairs and cached scores for that
-site.
+It only affects precipitation: event scoring and the Forecast page's wet-hour
+count. Temperature and wind are unaffected. Changing it later recomputes precip
+pairs and cached scores for that site.
 
 `elevation_m` is the reference elevation for the verification location. wxverify
 uses it when building the temperature consensus: station temperatures are
@@ -358,7 +358,7 @@ Virtual feeds can appear beside provider feeds:
   lead. It is created only when at least two active real models contribute. It
   is not an external provider call.
 
-### Forecast page: daily high and low
+### Forecast page: daily high, low and rainfall
 
 A Forecast tile shows a temperature `High / Low` only when at least one of the
 feeds behind it covers every hour of that local day, from local midnight to the
@@ -379,7 +379,8 @@ Everything else stays as it was:
   of the selected feeds covers at least 18 hours of that day. It can appear
   with or without the unavailable label, because it answers a different
   question.
-- `Wind max` and `Rain` are not affected by this rule.
+- `Wind max` is not affected by this rule. `Rain` has a stricter rule of its
+  own, described below.
 
 The `Today` tile normally shows a high and low too. Adding a site's station
 starts a setup backfill, which fetches earlier forecast runs of every
@@ -410,16 +411,49 @@ earlier one left without one. At local midnight the next date becomes `Today`,
 and it shows a high and low only if a feed covers that whole date: the change
 of day fills in no missing hours.
 
+The `Rain` row has a stricter rule, because a daily total and a count of wet
+hours are only right if each hour is counted exactly once. A feed counts
+towards them only when it supplies exactly one value for every hour of the
+local day — 24, or 23 or 25 on a daylight-saving change day. A missing hour,
+an hour given twice, or a value that falls between two hours rules the feed
+out. Each feed is checked on its own, and among the feeds that qualify, the
+usual skill ranking and blend depth decide which ones are used. The reasons
+above why a feed can lack some of `Today`'s hours apply to rain too.
+
+The row then shows the day's rainfall and its number of wet hours, each
+averaged across those feeds, for example `3.1 mm · ~5 h wet`. The rainfall is
+shown to one decimal place and the wet hours are rounded to a whole number,
+hence the `~`. An hour is wet when its forecast rain is at or above the site's
+`rain_threshold_mm`; exactly at the threshold counts, and rain need not fall
+for the whole hour. A rain-cloud symbol follows when the row shows `~6 h wet`
+or more. The rain bars on the day's hourly chart come from the same feeds, so
+they add up to the tile's total before it is rounded for display;
+`Show individual feeds` still shows every selected feed.
+
+When feeds have rain forecasts for the day but none qualifies, the row reads
+`Daily rainfall unavailable — partial coverage` and the hourly chart has no
+rain bars. A `—` in the row means there are no rain forecasts for that day at
+all.
+
 A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
-feeds its daily high and low come from, which can differ from the feeds behind
-its hourly chart.
+feeds its daily high and low come from and the feeds its daily rain figures
+come from, which can differ from the selected feeds its hourly chart plots.
 
 The daily forecast record stores what the tile showed: when the label appears,
 the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
 `insufficient`, next to the `extrema_feed_ids` that were used (an empty list in
 that case) and `extrema_low_confidence` (also `null`, because there is no set of
-feeds to judge). Verification scoring is unchanged — this decides what is
-displayed, not what is scored.
+feeds to judge). For rain it records `total_mm` and `wet_hours` (the average
+before rounding) with the same three fields. When the rainfall label appears,
+both are `null`, never `0`, and the three fields read `insufficient`, an empty
+list and `null`. For rain, the record's `hourly_values` are the chart's rain
+bars: for each time, the average of the feeds the daily figures come from,
+`null` where one of them has no value, and `null` throughout when no feed
+qualifies. Rain records written before this rule have no `extrema_feed_ids`:
+they store `chance` (a 0-to-1 share of wet hours) instead of `wet_hours`, and
+their `hourly_values` average whichever selected feeds had a value at each
+time. Verification scoring is unchanged — this decides what is displayed, not
+what is scored.
 
 ## CLI
 

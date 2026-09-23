@@ -29,7 +29,7 @@ from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast.service import (
-    RAIN_GLYPH_MIN_CHANCE_PCT,
+    RAIN_GLYPH_MIN_WET_HOURS,
     build_forecast,
     build_hourly,
     relative_ago,
@@ -457,11 +457,12 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
 
 # ---------------------------------------------------------------------------
 # Minimum-coverage guard: a cell whose selected feeds don't reach
-# MIN_COVERAGE_HOURS still carries the "partial" badge. For wind and
-# precipitation the partial data still aggregates (tile stays populated).
-# For temperature (Item F), under-coverage means the feed is not
-# extrema-eligible (it does not cover the whole local day), so the daily
-# high/low are suppressed rather than aggregated from a partial range.
+# MIN_COVERAGE_HOURS still carries the "partial" badge. Wind alone still
+# aggregates its partial data (tile stays populated). For temperature
+# (Item F) and precipitation (Item G), under-coverage means the feed is not
+# extrema-eligible (it does not cover the whole local day exactly), so the
+# daily high/low, and the daily total/wet-hours, are suppressed rather than
+# aggregated from a partial range.
 # ---------------------------------------------------------------------------
 
 
@@ -500,11 +501,12 @@ def test_temperature_extrema_suppressed_under_coverage_partial_badge_set() -> No
 
 def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
     # Paired positive for the temperature suppression above: wind does not
-    # adopt the extrema-coverage rule (F.4 scopes it to temperature), so the
-    # SAME under-coverage shape still aggregates the partial data and just
-    # carries the "partial" badge -- the behaviour this test file originally
-    # pinned. If the eligibility filter ever leaked into wind's value path,
-    # this would fail where the temperature test above would not catch it.
+    # adopt the extrema-coverage rule (F.4/G.3 scope it to temperature and
+    # precipitation), so the SAME under-coverage shape still aggregates the
+    # partial data and just carries the "partial" badge -- the behaviour
+    # this test file originally pinned. If the eligibility filter ever
+    # leaked into wind's value path, this would fail where the temperature
+    # test above would not catch it.
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
@@ -989,8 +991,11 @@ def test_wind_tile_max_is_ms_to_kmh_converted() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rain glyph threshold: sourced from RAIN_GLYPH_MIN_CHANCE_PCT, not a
-# hardcoded literal.
+# Rain glyph threshold: sourced from RAIN_GLYPH_MIN_WET_HOURS, not a
+# hardcoded literal. The fixture must be a complete 24-hour local day so the
+# feed stays extrema-eligible under G.3 (covers_local_day_exactly); a
+# partial day would suppress the daily total/wet-hours entirely and the
+# glyph question would never get asked.
 # ---------------------------------------------------------------------------
 
 
@@ -998,28 +1003,156 @@ def test_rain_glyph_shown_at_threshold_hidden_just_below() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    assert RAIN_GLYPH_MIN_CHANCE_PCT == 25
+    assert RAIN_GLYPH_MIN_WET_HOURS == 6
 
-    # 1 of 4 covered hours wet -> wet_share exactly 0.25 -> chance_pct 25.
-    valid_ats = _hours("2026-07-20", 4, 4)
-    conn2 = conn
+    # A complete 24-hour local day with exactly RAIN_GLYPH_MIN_WET_HOURS wet
+    # hours (>=0.2mm) -> glyph shown.
+    valid_ats = _hours("2026-07-20", 0, 24)
     for i, valid_at in enumerate(valid_ats):
         _insert_sample(
-            conn2,
+            conn,
             feed_id=feed_id,
             variable="precip",
             issued_at="2026-07-19T20:00:00Z",
             valid_at=valid_at,
             lead_hours=i + 1,
-            value=0.5 if i == 0 else 0.0,
+            value=0.2 if i < RAIN_GLYPH_MIN_WET_HOURS else 0.0,
         )
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     precip = view.tiles[0].precip
-    assert precip.chance_pct == 25
+    assert precip.wet_hours == RAIN_GLYPH_MIN_WET_HOURS
     assert precip.show_rain_glyph is True
+
+    # Paired negative on a fresh connection/feed (never reuse the DB the
+    # positive already committed to): one hour below the threshold ->
+    # glyph hidden.
+    conn_below = _make_db()
+    feed_below = _feed_id(conn_below, "open-meteo", "ecmwf_ifs")
+    for i, valid_at in enumerate(valid_ats):
+        _insert_sample(
+            conn_below,
+            feed_id=feed_below,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < RAIN_GLYPH_MIN_WET_HOURS - 1 else 0.0,
+        )
+    conn_below.commit()
+    view_below = build_forecast(
+        conn_below, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    precip_below = view_below.tiles[0].precip
+    assert precip_below.wet_hours == RAIN_GLYPH_MIN_WET_HOURS - 1
+    assert precip_below.show_rain_glyph is False
+
+
+def test_rain_glyph_follows_the_rounded_blended_count() -> None:
+    """G-T32: the glyph follows the DISPLAYED, ROUNDED blend, not the raw mean.
+
+    Both cases blend per-feed wet-hour counts via ``blend_mean`` (a plain
+    mean, no rounding) and only THEN round for display (the
+    ``RAIN_GLYPH_MIN_WET_HOURS`` constant and the rain-glyph rule in
+    ``_build_tile``, both in ``wxverify/forecast/service.py``). Case A's
+    mean is 5.5 -- below RAIN_GLYPH_MIN_WET_HOURS as a
+    raw float -- but Python's round-half-to-even rounds 5.5 up to 6, so the
+    glyph shows. Case B's mean is 16/3 = 5.33..., which rounds down to 5,
+    below threshold. Each feed is a complete 24-hour local day so it clears
+    ``covers_local_day_exactly`` and stays extrema-eligible (G.3); a partial
+    day would suppress the wet-hour count entirely instead of exercising the
+    rounding rule.
+    """
+    assert RAIN_GLYPH_MIN_WET_HOURS == 6
+    valid_ats = _hours("2026-07-20", 0, 24)
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+
+    # --- Case A: two complete-day feeds, 5 and 6 wet hours -> mean 5.5,
+    # which Python's round() takes to 6 -> at threshold -> glyph shown.
+    # Default forecast_blend_depth (2) is exactly enough to include BOTH
+    # feeds; do not set it explicitly so the default stays the point.
+    conn_a = _make_db()
+    feed_5 = _feed_id(conn_a, "open-meteo", "ecmwf_ifs")
+    feed_6 = _feed_id(conn_a, "open-meteo", "gfs_global")
+    for i, valid_at in enumerate(valid_ats):
+        _insert_sample(
+            conn_a,
+            feed_id=feed_5,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < 5 else 0.0,
+        )
+        _insert_sample(
+            conn_a,
+            feed_id=feed_6,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < 6 else 0.0,
+        )
+    conn_a.commit()
+    view_a = build_forecast(
+        conn_a, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    precip_a = view_a.tiles[0].precip
+    # Fixture guard: both feeds must actually be in the aggregate, or the
+    # 5.5-mean this case pins never happens.
+    assert len(precip_a.meta.feeds) == 2
+    assert precip_a.wet_hours == 6
+    assert precip_a.show_rain_glyph is True
+
+    # --- Case B: three complete-day feeds, 5, 5 and 6 wet hours -> mean
+    # 16/3 = 5.33... -> rounds to 5 -> below threshold -> glyph hidden.
+    # Requires depth 3 to include all three feeds in the blend.
+    conn_b = _make_db()
+    set_setting(conn_b, "forecast_blend_depth", "3")
+    feed_5a = _feed_id(conn_b, "open-meteo", "ecmwf_ifs")
+    feed_5b = _feed_id(conn_b, "open-meteo", "icon_global")
+    feed_6b = _feed_id(conn_b, "open-meteo", "gfs_global")
+    for i, valid_at in enumerate(valid_ats):
+        _insert_sample(
+            conn_b,
+            feed_id=feed_5a,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < 5 else 0.0,
+        )
+        _insert_sample(
+            conn_b,
+            feed_id=feed_5b,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < 5 else 0.0,
+        )
+        _insert_sample(
+            conn_b,
+            feed_id=feed_6b,
+            variable="precip",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=0.2 if i < 6 else 0.0,
+        )
+    conn_b.commit()
+    view_b = build_forecast(
+        conn_b, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    precip_b = view_b.tiles[0].precip
+    # Fixture guard: all three feeds must be in the aggregate, or the
+    # 5.33-mean this case pins never happens (e.g. it would collapse to a
+    # 2-feed mean that could round differently).
+    assert len(precip_b.meta.feeds) == 3
+    assert precip_b.wet_hours == 5
+    assert precip_b.show_rain_glyph is False
 
 
 # ---------------------------------------------------------------------------
@@ -1236,16 +1369,21 @@ def test_build_hourly_far_tile_is_not_a_single_point() -> None:
     assert len(non_none) > 1
 
 
-def test_coverage_gate_is_variable_agnostic_precip_and_wind() -> None:
-    """The gate is not temperature-only: for BOTH precip total and wind max a
-    well-covered feed is preferred over a single-slot feed that out-ranks it.
+def test_coverage_gate_wind_aggregates_precip_suppresses() -> None:
+    """Wind and precipitation no longer share one story under this gate.
 
     Discriminating construction: the single-slot gfs feed carries scoring pairs
     (pair_n = 3, no persistence => not confident but on the SCORED rung), the
     15h ecmwf feed has none (pair_n = 0). Pre-fix the pool == candidates, so
     the scored rung selects the single-slot feed alone -> wind.max_kmh 108.0
-    (30 m/s) and precip.total 0.0. Post-fix the >=12h adequate pool excludes
-    the single-slot feed, so the covered feed's aggregates render instead."""
+    (30 m/s). Post-fix the >=12h adequate pool excludes the single-slot feed,
+    so wind's covered-feed aggregate (max 10.0 m/s) renders instead -- wind
+    still aggregates a partial range, unchanged from before Item G.
+
+    Precipitation's 15h feed, however, is short of a whole local day, so
+    under G.3 (``covers_local_day_exactly``) it is not extrema-eligible
+    either -- neither feed qualifies, so the daily total and wet-hour count
+    are suppressed rather than aggregated from the partial range."""
     conn = _make_db()
     single_id = _feed_id(conn, "open-meteo", "gfs_global")
     covered_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -1306,13 +1444,17 @@ def test_coverage_gate_is_variable_agnostic_precip_and_wind() -> None:
     )
     tile = view.tiles[5]
     assert tile.wind.max_kmh == ms_to_kmh(10.0)  # 36.0, not the single-slot's 108
-    assert tile.precip.total_mm == 7.5  # covered feed's total, not the 0.0 slot
     wind_labels = [ref.label for ref in tile.wind.meta.feeds]
-    precip_labels = [ref.label for ref in tile.precip.meta.feeds]
     assert feed_label("open-meteo", "gfs_global") not in wind_labels
-    assert feed_label("open-meteo", "gfs_global") not in precip_labels
     assert feed_label("open-meteo", "ecmwf_ifs") in wind_labels
-    assert feed_label("open-meteo", "ecmwf_ifs") in precip_labels
+
+    # Neither feed covers a whole local day exactly (15h < 24h, 1-sample
+    # single-slot feed), so precip's extrema set is empty: total/wet-hours
+    # are suppressed, not aggregated from the 15h partial range.
+    assert tile.precip.total_mm is None
+    assert tile.precip.wet_hours is None
+    assert tile.precip.meta.extrema_unavailable is True
+    assert tile.precip.meta.feeds == []
 
 
 def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:

@@ -8,13 +8,20 @@ A selection returns two products with different coverage requirements:
 
 * ``feeds`` — the hourly blend set. An hourly series needs no complete day:
   every plotted point is a real forecast for its hour. It drives the hourly
-  drill-down, the cell state and the ``partial`` badge.
-* ``extrema_feeds`` — the feed set a daily high/low is computed from, built
-  only when the caller passes ``extrema_coverage_required=True``. A daily
-  extremum is a claim about every hour of the day, so only candidates whose
-  own samples cover the whole target local day qualify
-  (``CellCandidate.extrema_eligible``, decided per feed by
-  :func:`wxverify.forecast.aggregate.covers_local_day`).
+  drill-down's per-feed series for every variable, its aggregate line for
+  temperature and wind, the cell state and the ``partial`` badge.
+* ``extrema_feeds`` — the feed set a displayed daily value is computed from
+  (temperature's high and low, precipitation's total and wet-hour count),
+  built only when the caller passes ``extrema_coverage_required=True``. It
+  also supplies precipitation's drill-down aggregate line. Eligibility
+  (``CellCandidate.extrema_eligible``) is specific to the variable: a
+  temperature candidate qualifies when its own samples cover the whole
+  target local day
+  (:func:`wxverify.forecast.aggregate.covers_local_day`), a precipitation
+  candidate when they supply each hour of it exactly once
+  (:func:`wxverify.forecast.aggregate.covers_local_day_exactly`), because a
+  sum and a count need each hour once where an extremum needs it at least
+  once.
 
 Blend set. Before the ladder ranks, candidates are first restricted to a
 coverage pool: those clearing ``MIN_SPREAD_HOURS`` when any do, else
@@ -24,8 +31,9 @@ that pool. This keeps a lone far-horizon single-point feed (whose daily
 high == low) from winning on skill alone while a multi-point feed is
 available. A max == min value from a single point is truthful only when it
 is labelled as a limited-period value, never under a daily high/low label;
-for temperature, whether a daily high and low are shown at all is decided
-by the coverage rule in ``aggregate.covers_local_day``, not by this pool.
+whether a displayed daily value is shown at all is decided by the
+variable's coverage rule, ``aggregate.covers_local_day`` or
+``aggregate.covers_local_day_exactly``, not by this pool.
 
 Extrema set. Eligibility is decided over the whole candidate list BEFORE any
 ranking; the eligible candidates are then ranked by the same ladder and cut
@@ -74,11 +82,14 @@ class CellCandidate:
     for this tile day — the selection-side coverage signal used to build the
     pre-ladder coverage pool.
 
-    ``extrema_eligible`` is whether the feed's own samples cover every UTC
-    hourly instant of the target local day
-    (:func:`wxverify.forecast.aggregate.covers_local_day`). It is computed
-    where the samples are, so selection stays free of timezones and dates,
-    and it has no default so every construction site must answer it.
+    ``extrema_eligible`` is whether the feed's own samples satisfy its
+    variable's coverage predicate for the target local day:
+    :func:`wxverify.forecast.aggregate.covers_local_day_exactly` for
+    precipitation, which also rejects a repeated or off-hour instant, and
+    :func:`wxverify.forecast.aggregate.covers_local_day` for every other
+    variable. It is computed where the samples are, so selection stays free
+    of timezones and dates, and it has no default so every construction site
+    must answer it.
     """
 
     feed_id: int

@@ -195,9 +195,9 @@ def _entities_for_selection(
     """Per-quantity entity rows for one blended feed selection.
 
     Displayed values come from the clearing-subset path (aggregate per
-    feed, then blend) the tile uses for wind and precipitation, and used for
-    temperature before 0.16.0; the simulator deliberately replays that
-    historical temperature path (F.7). Eligibility and the occurrence value
+    feed, then blend) the tile uses for wind alone, and used for temperature
+    and precipitation before 0.16.0; the simulator deliberately replays that
+    historical path for both (F.7, G.8). Eligibility and the occurrence value
     come from ``evaluate_variable`` over the blended hourly series (§5
     forecast-side eligibility — record.py parity).
 

@@ -19,8 +19,10 @@ there). This file covers F-T6 through F-T31:
   when their contributor sets differ, and roll up identically to
   ``today``'s state when the contributor set is shared, swept over fresh,
   stale, low-confidence and low-confidence-plus-rebuilding.
-* F-T27 — wind and precip stay immune to temperature's extrema-side state,
-  for both the warning badges and the stale badge.
+* F-T27 — wind stays immune to temperature's extrema-side state, for both
+  the warning badges and the stale badge. (Its precipitation half moved to
+  ``tests/test_forecast_precip_coverage.py`` G-T23 through G-T26 once
+  precipitation adopted its own extrema-coverage rule under Item G.)
 * F-T28 through F-T30 — tile-level state/confidence-state rollup across
   variables, badge/tooltip/persisted-metadata agreement, and rebuilding
   precedence on the extrema set.
@@ -685,11 +687,13 @@ def test_hourly_drilldown_survives_temperature_suppression() -> None:
 
 
 # ===========================================================================
-# F-T17 -- wind and precipitation are untouched while temperature suppresses.
+# F-T17 -- wind stays untouched while temperature suppresses; precipitation
+# now shares temperature's extrema-coverage rule (Item G), so the SAME 12h
+# partial fixture suppresses precip too.
 # ===========================================================================
 
 
-def test_wind_and_precip_untouched_while_temperature_suppresses() -> None:
+def test_wind_untouched_while_temperature_and_precip_suppress() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
@@ -726,17 +730,21 @@ def test_wind_and_precip_untouched_while_temperature_suppresses() -> None:
     today = view.tiles[0]
     assert today.temp.meta.extrema_unavailable is True  # temperature suppressed
 
-    # Wind and precip never consult extrema_eligible: same 12h partial
-    # fixture still aggregates for both, tagged "partial" rather than
-    # suppressed.
+    # Wind never consults extrema_eligible: the same 12h partial fixture
+    # still aggregates, tagged "partial" rather than suppressed.
     assert today.wind.meta.extrema_unavailable is False
     assert today.wind.max_kmh == ms_to_kmh(5.0)
     assert today.wind.meta.partial is True
-    assert today.precip.meta.extrema_unavailable is False
-    assert today.precip.total_mm == 12.0  # 12 hours * 1.0 mm
-    # wet-hour share: all 12 seeded hours are 1.0mm, >= the 0.2mm threshold,
-    # so the single feed's wet share is 12/12 == 1.0 -> chance_pct == 100.
-    assert today.precip.chance_pct == 100
+
+    # Precipitation (Item G) now shares temperature's rule: 12 of 24 hours
+    # is short of a whole local day covered exactly once, so the feed is
+    # not extrema-eligible and the daily total/wet-hours are suppressed --
+    # not aggregated from the 12h partial range.
+    assert today.precip.meta.extrema_unavailable is True
+    assert today.precip.total_mm is None
+    assert today.precip.wet_hours is None
+    # The >=18h clearing-subset guard is unaffected by the extrema rule, so
+    # "partial" still fires on this same 12h shape.
     assert today.precip.meta.partial is True
     assert today.partial is True  # tile-level badge still fires
 
@@ -1124,7 +1132,7 @@ def test_input_fingerprint_unchanged_across_a_call_that_uses_extrema_logic() -> 
 # ===========================================================================
 # F-T21 -- three-surface agreement.
 #
-# The tile uses the extrema set (temperature only); the simulator uses the
+# The tile uses the extrema set (temperature and precipitation); the simulator uses the
 # clearing subset of the BLEND set. The two agree only when every candidate
 # covers the whole day, so both fixtures below use a single feed -- with one
 # feed, "the extrema set" and "the clearing subset of the blend set" name
@@ -1919,12 +1927,14 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert '<span class="badge warn">low confidence</span>' not in html
 
 
-def test_wind_and_precip_warnings_unchanged_while_temperature_extrema_differs() -> None:
-    # F-T27: wind and precip never have an extrema set (``extrema_state``
-    # is always "not_available" for them per ``_cell_meta_and_values``), so
-    # their own state/stale/badge reads must be driven purely by their
-    # normal aggregate set, unaffected by the temperature extrema-side
-    # low-confidence signal this fixture also carries.
+def test_wind_warnings_unchanged_while_temperature_extrema_differs() -> None:
+    # F-T27: wind never has an extrema set (``extrema_state`` is always
+    # "not_available" for it per ``_cell_meta_and_values``), so its own
+    # state/stale/badge reads must be driven purely by its normal aggregate
+    # set, unaffected by the temperature extrema-side low-confidence signal
+    # this fixture also carries. Precipitation now shares temperature's
+    # extrema-coverage rule (Item G) and is covered separately by
+    # G-T23-G-T26, not re-derived here.
     conn = _make_db()
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     feed_a, feed_b = _seed_ab_fixture(conn, seed_b_scoring=False)
@@ -1936,14 +1946,6 @@ def test_wind_and_precip_warnings_unchanged_while_temperature_extrema_differs() 
         issued_at=_AB_FRESH_ISSUED,
         valid_ats=wind_ats,
         value=5.0,
-    )
-    _seed_hourly(
-        conn,
-        feed_id=feed_a,
-        variable="precip",
-        issued_at=_AB_FRESH_ISSUED,
-        valid_ats=wind_ats,
-        value=1.0,
     )
     # Give wind ITS OWN confident ranking (own scoring pairs + cache, same
     # shape as temperature's) -- so its "normal" read below is a genuine
@@ -1963,30 +1965,21 @@ def test_wind_and_precip_warnings_unchanged_while_temperature_extrema_differs() 
     )
     today = view.tiles[0]
     # Temperature's extrema side IS low-confidence (paired control: proves
-    # the fixture actually exercises the case wind/precip must stay
-    # immune to).
+    # the fixture actually exercises the case wind must stay immune to).
     assert today.temp.meta.extrema_state == "low_confidence"
     assert today.wind.meta.extrema_state == "not_available"
     assert today.wind.meta.extrema_unavailable is False
     assert today.wind.meta.state == "normal"
-    # Precip gets no scoring pairs of its own -- it stays low_confidence
-    # for ITS OWN reason (rung 3, no scored pairs at all), a DIFFERENT
-    # outcome from wind's "normal" and temperature's "low_confidence" via
-    # the extrema side -- three independently-arrived-at states from the
-    # same shared fixture, none inherited from another.
-    assert today.precip.meta.extrema_state == "not_available"
-    assert today.precip.meta.extrema_unavailable is False
-    assert today.precip.meta.state == "low_confidence"
 
 
-def test_wind_and_precip_stale_badge_unaffected_by_temperature_extrema_state() -> None:
-    # L4: paired stale variant of the test above -- wind and precip's own
-    # ``stale`` reads come from their own feeds' freshness, independent of
+def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
+    # L4: paired stale variant of the test above -- wind's own ``stale``
+    # read comes from its own feed's freshness, independent of
     # temperature's extrema-side state carried by the same shared fixture.
     # ``load_feed_freshness`` judges staleness PER FEED (MAX(issued_at)
-    # across ALL that feed's variables), so wind/precip use a feed
-    # EXCLUSIVE to them (icon_global) rather than feed_a, whose fresh
-    # temperature issued_at would otherwise mask a stale wind/precip one.
+    # across ALL that feed's variables), so wind uses a feed EXCLUSIVE to
+    # it (icon_global) rather than feed_a, whose fresh temperature
+    # issued_at would otherwise mask a stale wind one.
     conn = _make_db()
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     _seed_ab_fixture(conn, seed_b_scoring=False)
@@ -1999,14 +1992,6 @@ def test_wind_and_precip_stale_badge_unaffected_by_temperature_extrema_state() -
         issued_at=_AB_STALE_ISSUED,
         valid_ats=wind_ats,
         value=5.0,
-    )
-    _seed_hourly(
-        conn,
-        feed_id=wind_feed,
-        variable="precip",
-        issued_at=_AB_STALE_ISSUED,
-        valid_ats=wind_ats,
-        value=1.0,
     )
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
@@ -2025,8 +2010,6 @@ def test_wind_and_precip_stale_badge_unaffected_by_temperature_extrema_state() -
     assert today.temp.meta.extrema_state == "low_confidence"
     assert today.wind.meta.stale is True
     assert today.wind.meta.extrema_unavailable is False
-    assert today.precip.meta.stale is True
-    assert today.precip.meta.extrema_unavailable is False
     html = _render_tiles(site_id=1, view=view)
     assert '<span class="badge warn">stale</span>' in html
 

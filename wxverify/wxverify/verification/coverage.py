@@ -240,7 +240,7 @@ def evaluate_precip(
     Total: near-complete gate — an incomplete sum is never exact truth (the
     partial sum is still stored as a labeled diagnostic). Occurrence is
     asymmetric: one qualifying wet slot (``value >= rain_threshold_mm``,
-    inclusive, matching the production wet-share boundary) proves "wet" at
+    inclusive, matching the production wet-hour boundary) proves "wet" at
     ANY coverage; a "dry" verdict requires near-complete coverage, and a
     partial dry day carries no value at all.
     """

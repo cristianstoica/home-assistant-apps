@@ -415,10 +415,11 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
 # selected feed no longer clears the coverage guard. `clearing_subset` then
 # falls back to the full selection and reports `partial`, so the tile's
 # STATE and the drill-down's coincide -- and the two surfaces must agree on
-# `state`. (`clearing_subset` still narrows what wind and precipitation
-# aggregate and render, unchanged by Item F; for temperature, `meta.feeds`
-# names the extrema set -- feeds covering the whole local day -- not
-# `clearing_subset`'s output, so it is not asserted here.)
+# `state`. (`clearing_subset` narrows only what wind aggregates and renders;
+# for temperature and precipitation `meta.feeds` names the extrema set --
+# feeds covering the whole local day for temperature, feeds supplying each
+# of its hours exactly once for precipitation. The test seeds temperature
+# only, so none of that is asserted here.)
 # ---------------------------------------------------------------------------
 
 

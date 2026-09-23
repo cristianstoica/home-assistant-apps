@@ -32,8 +32,10 @@ from wxverify.forecast.aggregate import (
     clearing_subset,
     covered_hours,
     covers_local_day,
+    covers_local_day_exactly,
     display_day_index,
     displayed_daily,
+    fixed_membership_series,
 )
 from wxverify.forecast.data import (
     ForecastRanking,
@@ -55,9 +57,13 @@ from wxverify.web.context import feed_label
 DAY_COUNT = 8
 #: Page column order = the canonical roster (NB-4).
 VARIABLES = DEPTH_VARIABLES
-# Rain glyph appears when the blended chance is meaningful, i.e. a nontrivial
-# share of the day is expected wet — not on every 3% drizzle share.
-RAIN_GLYPH_MIN_CHANCE_PCT = 25
+# Rain glyph appears when a nontrivial part of the day is expected wet — not
+# on a single drizzly hour: when the displayed, rounded wet-hour count is at
+# least six, so the glyph always agrees with the "~N h wet" figure. Six hours
+# is a quarter of a 24-hour day, but the rule is not equivalent to the 25%
+# trigger it replaces: a blended count of 5.5 rounds to 6 and shows the
+# glyph, where the old rounded percentage (23%) did not.
+RAIN_GLYPH_MIN_WET_HOURS = 6
 
 
 @dataclass(frozen=True)
@@ -70,16 +76,21 @@ class FeedRef:
 class CellMeta:
     """Shared per-variable cell state: availability, ladder use, badges.
 
-    ``extrema_unavailable`` is True when the cell is available but no feed
-    covers the whole local day, so its daily high/low is suppressed. It is a
+    ``extrema_unavailable`` is True when the cell is available but its
+    displayed daily values are suppressed: a temperature cell's high and low
+    when no feed covers the whole local day, a precipitation cell's total and
+    wet-hour count when no feed supplies each hour of the local day exactly
+    once. Temperature and precipitation can set it; wind cannot. It is a
     separate flag rather than a ``state`` value because ``state`` describes
-    the cell's hourly product, which suppression does not touch. Only
-    temperature can set it.
+    the cell's hourly product: suppression leaves ``state`` and the per-feed
+    series untouched for every variable, but precipitation's drill-down
+    aggregate line is drawn from the extrema set and is uniformly null when
+    the cell is suppressed.
 
     ``extrema_state`` is the same four-valued verdict as ``state``, by the
-    same precedence (:func:`_state_of`), for the feeds the daily high/low
-    come from (``CellSelection.extrema_feeds``). It is "not_available" for
-    wind, precipitation, a suppressed high/low and an unavailable cell. The
+    same precedence (:func:`_state_of`), for the feeds the cell's displayed
+    daily values come from (``CellSelection.extrema_feeds``). It is
+    "not_available" for wind, a suppressed cell and an unavailable cell. The
     tile rolls it up with the cells' states into
     ``DayTile.confidence_state``; it never moves ``state``.
     """
@@ -117,7 +128,7 @@ class WindCell:
 class PrecipCell:
     meta: CellMeta
     total_mm: float | None
-    chance_pct: int | None
+    wet_hours: int | None
     show_rain_glyph: bool
 
 
@@ -242,9 +253,13 @@ def build_hourly(
 ) -> dict[str, object]:
     """Blended hourly drill-down payload for one display day.
 
-    Per-variable winner sets are the SAME selections the tile used; the blend
-    at each hour averages the selected feeds that cover that hour. Per-feed
-    series ride along for the "show individual feeds" toggle.
+    Per-variable winner sets are the SAME selections the tile used. For
+    temperature and wind the blend at each hour averages the selected feeds
+    that cover that hour. Precipitation's blend line averages its contributor
+    set (``selections["precip"].extrema_feeds``) with fixed membership and is
+    null at any hour a member does not supply; ``precip_aggregate`` names
+    those feeds. Per-feed series, drawn from ``feeds`` for every variable,
+    ride along for the "show individual feeds" toggle.
 
     The sample window starts at today's local midnight, so day 0 is the
     "forecast of record": each elapsed hour shows the freshest run that
@@ -279,14 +294,21 @@ def build_hourly(
             rank_cache=rank_cache,
         )
 
-    # Hour axis: union of covered hours across every selected feed/variable.
+    # Hour axis: union of covered hours across every selected feed/variable,
+    # plus the hours of precipitation's aggregate contributors
+    # (``extrema_feeds``), which can lie outside ``feeds``. Widened for
+    # precipitation only: no temperature or wind line is drawn from them.
     hour_set: set[str] = set()
     for variable in VARIABLES:
         feeds_samples = grouped.get(variable, {}).get(day, {})
-        for candidate in selections[variable].feeds:
+        axis_candidates = list(selections[variable].feeds)
+        if variable == "precip":
+            axis_candidates += selections[variable].extrema_feeds
+        for candidate in axis_candidates:
             for sample in feeds_samples.get(candidate.feed_id, []):
                 hour_set.add(sample.valid_at)
     hours = sorted(hour_set)
+    precip_samples = grouped.get("precip", {}).get(day, {})
     index = {valid_at: i for i, valid_at in enumerate(hours)}
 
     def series_for(variable: str, feed_id: int) -> list[float | None]:
@@ -338,7 +360,17 @@ def build_hourly(
         "blend": {
             "temp_c": blend_series("temperature"),
             "wind_kmh": blend_series("wind"),
-            "precip_mm": blend_series("precip"),
+            "precip_mm": fixed_membership_series(
+                hours,
+                [
+                    {s.valid_at: s.value for s in precip_samples.get(c.feed_id, [])}
+                    for c in selections["precip"].extrema_feeds
+                ],
+            ),
+        },
+        "precip_aggregate": {
+            "feed_ids": [c.feed_id for c in selections["precip"].extrema_feeds],
+            "coverage": selections["precip"].extrema_coverage,
         },
         "feeds": [
             {
@@ -362,7 +394,8 @@ def _state_of(
     A low-confidence verdict whose ranking is rebuilding reads "rebuilding":
     a rebuilding ranking has no rows, so its feeds are unconfident because of
     the rebuild. Shared by the cell ``state``, the drill-down ``states`` and
-    the temperature ``extrema_state``, so all three apply one precedence.
+    the temperature and precipitation ``extrema_state``, so all three apply
+    one precedence.
     """
     if not available:
         return "not_available"
@@ -416,10 +449,13 @@ def _select(
     """Build candidates for one cell and run the fallback ladder.
 
     ``local_date`` is the cell's target local day; each candidate's
-    ``extrema_eligible`` is whether its own samples cover all of it. Only
-    temperature asks for the extrema set: wind and precipitation keep the
-    clearing-subset path unchanged.
+    ``extrema_eligible`` is whether its own samples satisfy the coverage rule
+    its variable's displayed daily values need for that day —
+    :func:`covers_local_day_exactly` for precipitation and
+    :func:`covers_local_day` otherwise. Temperature and precipitation ask for
+    the extrema set, leaving wind alone on the clearing-subset path.
     """
+    covers = covers_local_day_exactly if variable == "precip" else covers_local_day
     candidates: list[CellCandidate] = []
     rebuilding_by_feed: dict[int, bool] = {}
     for feed_id, feed_samples in feeds_samples.items():
@@ -447,7 +483,7 @@ def _select(
                 mae=row.mae if row is not None else None,
                 future_sample_count=len(feed_samples),
                 covered_hours=covered_hours(s.valid_at for s in feed_samples),
-                extrema_eligible=covers_local_day(
+                extrema_eligible=covers(
                     (s.valid_at for s in feed_samples),
                     local_date=local_date,
                     timezone=timezone,
@@ -457,7 +493,7 @@ def _select(
     selection = select_cell_feeds(
         candidates,
         blend_depth=blend_depth,
-        extrema_coverage_required=(variable == "temperature"),
+        extrema_coverage_required=variable in ("temperature", "precip"),
     )
     return selection, rebuilding_by_feed
 
@@ -474,18 +510,21 @@ def _cell_meta_and_values(
 
     The >= 18-hour guard (:func:`clearing_subset` over the blend set) sets the
     orthogonal "partial" badge, the ``state`` rebuilding scan and ``stale``
-    for every variable. For wind and precipitation it also picks the values:
-    feeds clearing it aggregate alone, and when NO selected feed clears it
-    the partial data still aggregates (the tile stays populated).
+    for every variable. For wind alone it also picks the values: feeds
+    clearing it aggregate alone, and when NO selected feed clears it the
+    partial data still aggregates (the tile stays populated).
 
-    Temperature is different: its daily high/low come from the selection's
-    ``extrema_feeds`` — feeds covering the whole local day — and
-    ``meta.feeds`` names those feeds. When none qualifies the values are
-    empty (high/low render as unavailable, never as a partial range) and
-    ``extrema_unavailable`` is True; the partial data is NOT aggregated.
-    Because those feeds can lie outside the clearing subset, temperature's
-    ``stale`` also covers every extrema feed, and its ``extrema_state`` is
-    the extrema set's own verdict under :func:`_state_of`'s precedence.
+    Temperature and precipitation are different: a temperature cell's daily
+    high/low and a precipitation cell's total and wet-hour count come from
+    the selection's ``extrema_feeds`` — for temperature, feeds covering the
+    whole local day; for precipitation, feeds supplying each of its hours
+    exactly once — and ``meta.feeds`` names those feeds. When none qualifies
+    the values are empty (rendered as unavailable, never as a partial range
+    or a partial sum) and ``extrema_unavailable`` is True; the partial data
+    is NOT aggregated. Because those feeds can lie outside the clearing
+    subset, for both variables ``stale`` also covers every extrema feed, and
+    ``extrema_state`` is the extrema set's own verdict under
+    :func:`_state_of`'s precedence.
     """
     if not selection.available:
         return (
@@ -509,7 +548,7 @@ def _cell_meta_and_values(
         },
     )
     agg_feeds = [c for c in selection.feeds if c.feed_id in set(agg_ids)]
-    if variable == "temperature":
+    if variable in ("temperature", "precip"):
         value_feeds = selection.extrema_feeds
         extrema_unavailable = (
             selection.extrema_coverage == EXTREMA_COVERAGE_INSUFFICIENT
@@ -583,14 +622,13 @@ def _build_tile(
     precip_daily = displayed_daily(
         "precip", list(precip_values.values()), rain_threshold_mm=rain_threshold_mm
     )
-    chance = precip_daily["chance"]
-    chance_pct = None if chance is None else round(chance * 100)
+    raw_wet_hours = precip_daily["wet_hours"]
+    hours_wet = None if raw_wet_hours is None else round(raw_wet_hours)
     precip = PrecipCell(
         meta=precip_meta,
         total_mm=precip_daily["total_mm"],
-        chance_pct=chance_pct,
-        show_rain_glyph=chance_pct is not None
-        and chance_pct >= RAIN_GLYPH_MIN_CHANCE_PCT,
+        wet_hours=hours_wet,
+        show_rain_glyph=hours_wet is not None and hours_wet >= RAIN_GLYPH_MIN_WET_HOURS,
     )
     metas = (temp_meta, wind_meta, precip_meta)
     populated = [meta for meta in metas if meta.available]
