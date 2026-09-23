@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.16.2
+
+Refuses a database import when an app table name in the uploaded file is
+not really an ordinary table.
+
+### Changed
+
+- Database Import now checks, by exact name, that each app table in the
+  uploaded file is a genuine ordinary table, using SQLite's own PRAGMA
+  `table_list`, which a same-named object inside the uploaded file cannot
+  shadow. A file where that name is a view, index, virtual table, or FTS
+  shadow table is refused before staging and the swap, so the live
+  database is left untouched. The import route also now refuses to run on
+  a SQLite runtime older than 3.37.0, where this check is unavailable,
+  instead of silently skipping it.
+
 ## 0.16.1
 
 Refuses a database import whose forecast times are not in the add-on's
