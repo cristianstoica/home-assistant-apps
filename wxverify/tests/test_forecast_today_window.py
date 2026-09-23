@@ -18,7 +18,7 @@ test, same as the rest of the forecast test suite.
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from wxverify.core.timeutil import local_day_start
 from wxverify.db.migrations import run_migrations
@@ -98,6 +98,34 @@ def _seed_hourly(
         )
 
 
+def _seed_varying(
+    conn: sqlite3.Connection,
+    *,
+    feed_id: int,
+    variable: str,
+    issued_at: str,
+    valid_ats: list[str],
+    values: list[float],
+) -> None:
+    """Seed N hourly samples with DISTINCT per-hour values.
+
+    Item F requires complete coverage of the target local day for a
+    temperature cell's daily extrema to be shown at all, so any test that
+    needs a real (non-suppressed) high/low needs 24 distinct values, not
+    ``_seed_hourly``'s single constant.
+    """
+    for i, (valid_at, value) in enumerate(zip(valid_ats, values, strict=True)):
+        _insert_sample(
+            conn,
+            feed_id=feed_id,
+            variable=variable,
+            issued_at=issued_at,
+            valid_at=valid_at,
+            lead_hours=i + 1,
+            value=value,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 1. Real daily max from the full local day (elapsed hour carries the max).
 # ---------------------------------------------------------------------------
@@ -107,37 +135,27 @@ def test_today_high_includes_elapsed_hour_max() -> None:
     """Headline differential: pre-fix the 01:00 elapsed sample is outside the
     floor_hour(12:00) window, so high_c comes from the cooler future hours
     only (20.0). Post-fix the window starts at local midnight, so the elapsed
-    hour's 30.0 (the real daily max) is included."""
+    hour's 30.0 (the real daily max) is included.
+
+    Item F additionally requires COMPLETE coverage of the local day before a
+    temperature cell's high/low are shown at all (``covers_local_day``), so
+    the fixture seeds all 24 hours of 2026-07-20 -- not just the 3 samples
+    this test cares about -- to keep the daily extrema un-suppressed."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)  # mid-day, UTC site
 
-    _insert_sample(
+    valid_ats = _hours("2026-07-20", 0, 24)
+    values = [15.0] * 24
+    values[1] = 30.0  # elapsed (01:00, well before `now`): the day's real max
+    values[14] = 20.0  # future (14:00)
+    _seed_varying(
         conn,
         feed_id=feed_id,
         variable="temperature",
         issued_at="2026-07-20T00:00:00Z",
-        valid_at="2026-07-20T01:00:00Z",  # elapsed: well before `now`
-        lead_hours=1,
-        value=30.0,  # the day's real max
-    )
-    _insert_sample(
-        conn,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2026-07-20T00:00:00Z",
-        valid_at="2026-07-20T14:00:00Z",  # future
-        lead_hours=14,
-        value=20.0,
-    )
-    _insert_sample(
-        conn,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2026-07-20T00:00:00Z",
-        valid_at="2026-07-20T15:00:00Z",  # future
-        lead_hours=15,
-        value=18.0,
+        valid_ats=valid_ats,
+        values=values,
     )
 
     conn.commit()
@@ -147,32 +165,29 @@ def test_today_high_includes_elapsed_hour_max() -> None:
     assert view.tiles[0].temp.high_c == 30.0
 
 
-def test_today_high_without_elapsed_sample_is_future_only() -> None:
-    """Positive control for the test above: with the elapsed 30.0 sample
-    removed, the SAME fixture's high_c comes only from the future hours
-    (20.0) -- proving the prior test is discriminating on the elapsed
-    sample, not vacuously green."""
+def test_today_high_comes_from_future_hour_when_elapsed_sample_is_not_the_max() -> None:
+    """Positive control for the test above: with the elapsed hour's value no
+    longer the day's max (5.0, the fixture's minimum), the SAME
+    full-day fixture's high_c comes from a future hour instead (20.0) --
+    proving the prior test is discriminating on the elapsed sample's value,
+    not vacuously green. Both fixtures keep all 24 hours of local-day
+    coverage so neither test's high_c is suppressed by Item F's extrema
+    eligibility rule."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
 
-    _insert_sample(
+    valid_ats = _hours("2026-07-20", 0, 24)
+    values = [15.0] * 24
+    values[1] = 5.0  # elapsed (01:00): now the day's MINIMUM, not the max
+    values[14] = 20.0  # future (14:00): the day's real max
+    _seed_varying(
         conn,
         feed_id=feed_id,
         variable="temperature",
         issued_at="2026-07-20T00:00:00Z",
-        valid_at="2026-07-20T14:00:00Z",
-        lead_hours=14,
-        value=20.0,
-    )
-    _insert_sample(
-        conn,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2026-07-20T00:00:00Z",
-        valid_at="2026-07-20T15:00:00Z",
-        lead_hours=15,
-        value=18.0,
+        valid_ats=valid_ats,
+        values=values,
     )
 
     conn.commit()
@@ -293,13 +308,29 @@ def test_window_lower_bound_excludes_yesterday_includes_local_midnight() -> None
     sample AT that exact instant (00:00 local today) must land on day 0.
     Also a real differential: pre-fix floor_hour(12:00 UTC)=12:00 UTC excludes
     BOTH samples (22:00Z < 12:00Z), so the boundary sample would be missing
-    pre-fix too."""
+    pre-fix too.
+
+    Item F requires complete local-day coverage before a temperature cell's
+    high/low are shown at all, so the "excluded sample cannot leak onto any
+    tile" check needs the REST of the local day seeded too -- otherwise
+    Item F itself suppresses high_c to None on every tile and the
+    ``999.0 not in highs`` check passes vacuously over an empty list. The
+    fixture seeds all 24 hours of the Berlin local day starting at the
+    boundary instant, with the excluded prior-day sample kept genuinely
+    outside that window."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)  # Berlin local 14:00 (CEST)
 
     excluded_valid_at = "2026-07-19T21:00:00Z"  # Berlin 23:00 on 2026-07-19
     boundary_valid_at = "2026-07-19T22:00:00Z"  # Berlin 00:00 on 2026-07-20 (midnight)
+    local_day_valid_ats = [
+        (datetime(2026, 7, 19, 22, 0, tzinfo=UTC) + timedelta(hours=i)).strftime(
+            "%Y-%m-%dT%H:00:00Z"
+        )
+        for i in range(24)  # the full Berlin local day for 2026-07-20
+    ]
+    assert local_day_valid_ats[0] == boundary_valid_at
 
     _insert_sample(
         conn,
@@ -310,14 +341,16 @@ def test_window_lower_bound_excludes_yesterday_includes_local_midnight() -> None
         lead_hours=3,
         value=999.0,
     )
-    _insert_sample(
+    local_day_values = [15.0] * 24
+    local_day_values[0] = 42.0  # boundary hour keeps its original value
+    local_day_values[5] = 50.0  # the local day's real max
+    _seed_varying(
         conn,
         feed_id=feed_id,
         variable="temperature",
         issued_at="2026-07-19T18:00:00Z",
-        valid_at=boundary_valid_at,
-        lead_hours=4,
-        value=42.0,
+        valid_ats=local_day_valid_ats,
+        values=local_day_values,
     )
 
     conn.commit()
@@ -332,7 +365,9 @@ def test_window_lower_bound_excludes_yesterday_includes_local_midnight() -> None
         conn, site_id=1, timezone="Europe/Berlin", rain_threshold_mm=0.2, now=now
     )
     highs = [tile.temp.high_c for tile in view.tiles if tile.temp.high_c is not None]
+    assert highs  # non-vacuous: the full-day fixture yields a real high
     assert 999.0 not in highs
+    assert view.tiles[0].temp.high_c == 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +522,13 @@ def test_only_elapsed_today_samples_render_tiles_not_empty() -> None:
     """Documented behavior change: pre-fix, an elapsed-only sample set is
     entirely outside the floor_hour(now) window, so `samples` is empty and
     the view reads `empty=True`. Post-fix the local-midnight window includes
-    it, so tiles render (with the elapsed data)."""
+    it, so tiles render (with the elapsed data).
+
+    Item F is orthogonal to this: a single elapsed hour is far short of the
+    complete-local-day coverage ``covers_local_day`` requires, so
+    temperature's daily high/low are suppressed to None on this tile --
+    that suppression does not make the tile itself empty, which is what
+    this test actually pins (``view.empty``)."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
@@ -507,7 +548,8 @@ def test_only_elapsed_today_samples_render_tiles_not_empty() -> None:
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     assert view.empty is False
-    assert view.tiles[0].temp.high_c == 14.0
+    assert view.tiles[0].temp.high_c is None
+    assert view.tiles[0].temp.meta.extrema_unavailable is True
 
 
 def test_zero_samples_at_all_still_empty() -> None:

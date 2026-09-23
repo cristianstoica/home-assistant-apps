@@ -31,6 +31,7 @@ from wxverify.forecast.aggregate import (
     blend_mean,
     clearing_subset,
     covered_hours,
+    covers_local_day,
     display_day_index,
     displayed_daily,
 )
@@ -193,10 +194,12 @@ def _entities_for_selection(
 ) -> dict[str, _Entity]:
     """Per-quantity entity rows for one blended feed selection.
 
-    Displayed values come from the SAME production path the tile used
-    (clearing subset, aggregate per feed, then blend); eligibility and the
-    occurrence value come from ``evaluate_variable`` over the blended
-    hourly series (§5 forecast-side eligibility — record.py parity).
+    Displayed values come from the clearing-subset path (aggregate per
+    feed, then blend) the tile uses for wind and precipitation, and used for
+    temperature before 0.16.0; the simulator deliberately replays that
+    historical temperature path (F.7). Eligibility and the occurrence value
+    come from ``evaluate_variable`` over the blended hourly series (§5
+    forecast-side eligibility — record.py parity).
 
     One feed set describes the scored entity end to end: the clearing
     subset. Coverage, occurrence, eligibility and the contributor count all
@@ -705,12 +708,24 @@ def simulate_snapshot_day(
                         mae=row.mae if row is not None else None,
                         future_sample_count=len(feed_samples),
                         covered_hours=covered_hours(s.valid_at for s in feed_samples),
+                        extrema_eligible=covers_local_day(
+                            (s.valid_at for s in feed_samples),
+                            local_date=target_date,
+                            timezone=cfg.timezone,
+                        ),
                     )
                 )
 
             entities: list[dict[str, _Entity]] = []
             for depth in SIM_DEPTHS:
-                selection = select_cell_feeds(candidates, blend_depth=depth)
+                # The simulator replays the HISTORICAL display policy for
+                # every variable, so it never asks for the extrema set:
+                # adopting the complete-day rule here would turn every
+                # replayed day into an unlabelled counterfactual and move
+                # scored values. Only ``selection.feeds`` is consumed.
+                selection = select_cell_feeds(
+                    candidates, blend_depth=depth, extrema_coverage_required=False
+                )
                 entities.append(
                     _entities_for_selection(
                         entity_type="depth",

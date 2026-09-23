@@ -16,7 +16,13 @@ from __future__ import annotations
 
 import pytest
 
-from wxverify.forecast.aggregate import MIN_SPREAD_HOURS, MULTIPOINT_MIN_HOURS
+from wxverify.forecast.aggregate import (
+    EXTREMA_COVERAGE_COMPLETE,
+    EXTREMA_COVERAGE_INSUFFICIENT,
+    EXTREMA_COVERAGE_NOT_EVALUATED,
+    MIN_SPREAD_HOURS,
+    MULTIPOINT_MIN_HOURS,
+)
 from wxverify.forecast.selection import (
     CellCandidate,
     representative_day_ahead,
@@ -35,6 +41,7 @@ def _candidate(
     mae: float | None = None,
     future_sample_count: int = 0,
     covered_hours: int = 24,
+    extrema_eligible: bool = True,
 ) -> CellCandidate:
     return CellCandidate(
         feed_id=feed_id,
@@ -46,6 +53,7 @@ def _candidate(
         mae=mae,
         future_sample_count=future_sample_count,
         covered_hours=covered_hours,
+        extrema_eligible=extrema_eligible,
     )
 
 
@@ -60,7 +68,9 @@ def test_ge_n_confident_feeds_blends_top_n_by_skill() -> None:
         _candidate(2, model="b", confident=True, skill_score=0.7),
         _candidate(3, model="c", confident=True, skill_score=0.5),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [1, 2]
     assert selection.low_confidence is False
     assert selection.available is True
@@ -78,7 +88,9 @@ def test_exactly_one_confident_feed_shown_alone_ignores_louder_non_confident() -
         _candidate(2, model="loud", confident=False, skill_score=0.99),
         _candidate(3, model="loudest", confident=False, skill_score=0.999),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [1]
     assert selection.low_confidence is False
 
@@ -96,7 +108,9 @@ def test_zero_confident_falls_back_to_scored_ranked_by_pair_n_then_mae() -> None
         _candidate(2, model="many-pairs-worse-mae", pair_n=10, mae=2.0),
         _candidate(3, model="many-pairs-better-mae", pair_n=10, mae=1.5),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     # pair_n=10 beats pair_n=5 regardless of MAE; among the pair_n=10 tie,
     # lower MAE (1.5) ranks ahead of higher MAE (2.0).
     assert [c.feed_id for c in selection.feeds] == [3, 2]
@@ -108,7 +122,9 @@ def test_scored_rung_none_mae_sorts_last() -> None:
         _candidate(1, model="no-mae", pair_n=10, mae=None),
         _candidate(2, model="has-mae", pair_n=10, mae=0.5),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [2, 1]
     assert selection.low_confidence is True
 
@@ -125,7 +141,9 @@ def test_zero_confident_zero_scored_falls_back_to_sample_count() -> None:
         _candidate(2, model="thick", future_sample_count=24),
         _candidate(3, model="medium", future_sample_count=10),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [2, 3]
     assert selection.low_confidence is True
 
@@ -136,7 +154,7 @@ def test_zero_confident_zero_scored_falls_back_to_sample_count() -> None:
 
 
 def test_no_candidates_not_available() -> None:
-    selection = select_cell_feeds([], blend_depth=2)
+    selection = select_cell_feeds([], blend_depth=2, extrema_coverage_required=False)
     assert selection.feeds == []
     assert selection.low_confidence is False
     assert selection.available is False
@@ -147,7 +165,11 @@ def test_no_candidates_not_available() -> None:
 # empty-candidates assertion above could pass vacuously if `available` were
 # broken to always return False.
 def test_single_candidate_on_cheapest_rung_is_available() -> None:
-    selection = select_cell_feeds([_candidate(1, future_sample_count=1)], blend_depth=2)
+    selection = select_cell_feeds(
+        [_candidate(1, future_sample_count=1)],
+        blend_depth=2,
+        extrema_coverage_required=False,
+    )
     assert selection.available is True
     assert [c.feed_id for c in selection.feeds] == [1]
 
@@ -163,7 +185,9 @@ def test_exact_skill_tie_breaks_alphabetically_by_source_then_model() -> None:
         _candidate(1, source="zzz-source", model="a", confident=True, skill_score=0.5),
         _candidate(2, source="aaa-source", model="z", confident=True, skill_score=0.5),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [2, 1]
 
 
@@ -178,7 +202,9 @@ def test_blend_depth_non_positive_clamps_to_one() -> None:
         _candidate(1, model="a", confident=True, skill_score=0.9),
         _candidate(2, model="b", confident=True, skill_score=0.7),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=0)
+    selection = select_cell_feeds(
+        candidates, blend_depth=0, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [1]
 
 
@@ -207,7 +233,9 @@ def test_coverage_gate_demotes_degenerate_high_skill_feed() -> None:
     ]
     # blend_depth=2 leaves room for both; the pool -- not the depth cap --
     # excludes the degenerate feed.
-    selection = select_cell_feeds(candidates, blend_depth=2)
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [2]
     assert selection.low_confidence is False
 
@@ -220,7 +248,9 @@ def test_no_near_tile_regression_skill_decides_when_coverage_uniform() -> None:
         _candidate(1, model="high", confident=True, skill_score=0.9, covered_hours=24),
         _candidate(2, model="low", confident=True, skill_score=0.7, covered_hours=24),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=1)
+    selection = select_cell_feeds(
+        candidates, blend_depth=1, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [1]
     assert selection.low_confidence is False
 
@@ -238,7 +268,13 @@ def test_min_spread_hours_boundary_pins_adequate_tier() -> None:
         multipoint = _candidate(
             2, model="multipoint", confident=True, skill_score=0.9, covered_hours=5
         )
-        return select_cell_feeds([boundary, multipoint], blend_depth=1).feeds[0].feed_id
+        return (
+            select_cell_feeds(
+                [boundary, multipoint], blend_depth=1, extrema_coverage_required=False
+            )
+            .feeds[0]
+            .feed_id
+        )
 
     assert pick(MIN_SPREAD_HOURS) == 1  # inclusive: == threshold is adequate
     assert pick(MIN_SPREAD_HOURS - 1) == 2  # just below: not adequate, skill wins
@@ -265,7 +301,9 @@ def test_multipoint_floor_selects_multipoint_over_single_slot() -> None:
         skill_score=0.99,
         covered_hours=MULTIPOINT_MIN_HOURS - 1,
     )
-    selection = select_cell_feeds([multipoint, single_slot], blend_depth=2)
+    selection = select_cell_feeds(
+        [multipoint, single_slot], blend_depth=2, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [1]
 
 
@@ -277,7 +315,9 @@ def test_all_single_slot_falls_back_to_candidates_and_returns_a_feed() -> None:
         _candidate(1, model="a", confident=True, skill_score=0.5, covered_hours=1),
         _candidate(2, model="b", confident=True, skill_score=0.9, covered_hours=1),
     ]
-    selection = select_cell_feeds(candidates, blend_depth=1)
+    selection = select_cell_feeds(
+        candidates, blend_depth=1, extrema_coverage_required=False
+    )
     assert [c.feed_id for c in selection.feeds] == [2]
     assert selection.available is True
 
@@ -299,9 +339,171 @@ def test_coverage_pool_sits_above_confidence_ladder() -> None:
     confident_single = _candidate(
         2, model="degenerate", confident=True, skill_score=0.99, covered_hours=1
     )
-    selection = select_cell_feeds([adequate_unscored, confident_single], blend_depth=2)
+    selection = select_cell_feeds(
+        [adequate_unscored, confident_single],
+        blend_depth=2,
+        extrema_coverage_required=False,
+    )
     assert [c.feed_id for c in selection.feeds] == [1]
     assert selection.low_confidence is True
+
+
+# ---------------------------------------------------------------------------
+# Extrema eligibility (F-T1..F-T5): eligibility is decided over the WHOLE
+# candidate list before ranking, so a coverage-eligible candidate that ranks
+# below blend_depth on skill still appears in extrema_feeds, and the depth
+# budget is never backfilled with ineligible candidates.
+# ---------------------------------------------------------------------------
+
+
+def test_low_skill_eligible_candidate_survives_into_extrema_feeds() -> None:
+    # F-T1: candidate 2 is eligible (covers the whole local day) but ranks
+    # below blend_depth=1 on skill, so it is excluded from `feeds` (the
+    # blend set) -- the same narrowing `clearing_subset` used to apply after
+    # ranking. `extrema_feeds` is computed independently over the whole
+    # candidate list, so candidate 2 appears there despite losing the ladder.
+    candidates = [
+        _candidate(
+            1,
+            model="high-skill",
+            confident=True,
+            skill_score=0.9,
+            covered_hours=24,
+            extrema_eligible=False,
+        ),
+        _candidate(
+            2,
+            model="eligible",
+            confident=True,
+            skill_score=0.1,
+            covered_hours=24,
+            extrema_eligible=True,
+        ),
+    ]
+    selection = select_cell_feeds(
+        candidates, blend_depth=1, extrema_coverage_required=True
+    )
+    assert [c.feed_id for c in selection.feeds] == [1]
+    assert [c.feed_id for c in selection.extrema_feeds] == [2]
+    assert selection.extrema_coverage == EXTREMA_COVERAGE_COMPLETE
+    # `extrema_low_confidence` is `_rank(eligible)`'s own verdict -- the
+    # lone eligible candidate is confident, so this is False, not merely
+    # the field's absent-ranking default.
+    assert selection.extrema_low_confidence is False
+
+
+def test_extrema_depth_one_prefers_eligible_over_higher_skill_ineligible() -> None:
+    # F-T2: with blend_depth=1, the eligible-but-lower-skill candidate wins
+    # the extrema slot over the ineligible higher-skill one -- eligibility
+    # gates which candidates are even ranked, so skill never gets a say for
+    # the ineligible candidate.
+    candidates = [
+        _candidate(
+            1,
+            model="high-skill-ineligible",
+            confident=True,
+            skill_score=0.9,
+            extrema_eligible=False,
+        ),
+        _candidate(
+            2,
+            model="low-skill-eligible",
+            confident=True,
+            skill_score=0.1,
+            extrema_eligible=True,
+        ),
+    ]
+    selection = select_cell_feeds(
+        candidates, blend_depth=1, extrema_coverage_required=True
+    )
+    assert [c.feed_id for c in selection.extrema_feeds] == [2]
+
+
+def test_extrema_feeds_count_matches_eligible_count_not_depth() -> None:
+    # F-T3: blend_depth=3 but only two of three candidates are eligible --
+    # extrema_feeds has exactly those two, not padded to depth with the
+    # ineligible feed. Both eligible candidates are confident (same tier):
+    # `_rank` returns only its highest-populated tier, so an eligible feed
+    # sitting in a lower tier than another eligible feed would be dropped by
+    # the ladder rather than by depth, which would understate "eligible
+    # count" for the wrong reason. Keeping both eligible feeds confident
+    # isolates the depth-cut behaviour this test exists to pin.
+    candidates = [
+        _candidate(
+            1,
+            model="eligible-a",
+            confident=True,
+            skill_score=0.9,
+            extrema_eligible=True,
+        ),
+        _candidate(
+            2,
+            model="eligible-b",
+            confident=True,
+            skill_score=0.5,
+            extrema_eligible=True,
+        ),
+        _candidate(
+            3,
+            model="ineligible",
+            confident=True,
+            skill_score=0.99,
+            extrema_eligible=False,
+        ),
+    ]
+    selection = select_cell_feeds(
+        candidates, blend_depth=3, extrema_coverage_required=True
+    )
+    assert len(selection.extrema_feeds) == 2
+    assert [c.feed_id for c in selection.extrema_feeds] == [1, 2]
+
+
+def test_no_eligible_candidate_extrema_insufficient_but_feeds_unchanged() -> None:
+    # F-T4: no candidate is eligible -- extrema_feeds is empty and the
+    # verdict is EXTREMA_COVERAGE_INSUFFICIENT, while `feeds` (the blend
+    # set) is exactly what the unchanged ladder returns for the same input,
+    # proving the eligibility filter never reaches the blend set.
+    candidates = [
+        _candidate(
+            1, model="a", confident=True, skill_score=0.9, extrema_eligible=False
+        ),
+        _candidate(
+            2, model="b", confident=True, skill_score=0.5, extrema_eligible=False
+        ),
+    ]
+    baseline = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=True
+    )
+    assert selection.extrema_feeds == []
+    assert selection.extrema_coverage == EXTREMA_COVERAGE_INSUFFICIENT
+    # No eligible candidate to rank -- False (the "no ranking ran" value),
+    # not a genuine confidence verdict.
+    assert selection.extrema_low_confidence is False
+    assert [c.feed_id for c in selection.feeds] == [c.feed_id for c in baseline.feeds]
+    assert selection.low_confidence == baseline.low_confidence
+
+
+def test_extrema_coverage_not_required_leaves_blend_set_and_metadata_unchanged() -> (
+    None
+):
+    # F-T5: extrema_coverage_required=False must be byte-for-byte the
+    # pre-Item-F behaviour: `feeds` and `low_confidence` unchanged, and the
+    # new fields sit at their explicit "not asked" values.
+    candidates = [
+        _candidate(1, model="a", confident=True, skill_score=0.9),
+        _candidate(2, model="b", confident=True, skill_score=0.7),
+    ]
+    selection = select_cell_feeds(
+        candidates, blend_depth=2, extrema_coverage_required=False
+    )
+    assert [c.feed_id for c in selection.feeds] == [1, 2]
+    assert selection.low_confidence is False
+    assert selection.extrema_feeds == []
+    assert selection.extrema_coverage == EXTREMA_COVERAGE_NOT_EVALUATED
+    assert selection.extrema_low_confidence is False
 
 
 # ---------------------------------------------------------------------------

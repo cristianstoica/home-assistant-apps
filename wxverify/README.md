@@ -358,6 +358,69 @@ Virtual feeds can appear beside provider feeds:
   lead. It is created only when at least two active real models contribute. It
   is not an external provider call.
 
+### Forecast page: daily high and low
+
+A Forecast tile shows a temperature `High / Low` only when at least one of the
+feeds behind it covers every hour of that local day, from local midnight to the
+next local midnight — 24 hourly values, or 23 or 25 on a daylight-saving change
+day. Each feed is checked on its own. Two feeds that each cover part of the day
+do not add up to a covered day, because a feed's high and low only describe the
+hours that feed supplied. Among the feeds that qualify, the usual skill ranking
+and blend depth decide which ones are blended.
+
+When no feed covers the whole day, the row reads
+`Daily high/low unavailable — partial coverage` instead of a number. A high and
+low worked out from part of a day is never shown under the `High / Low` label.
+Everything else stays as it was:
+
+- The day's hourly chart still plots every selected feed, including feeds that
+  cover only part of the day.
+- The `partial` badge keeps its meaning: for temperature, wind or rain, none
+  of the selected feeds covers at least 18 hours of that day. It can appear
+  with or without the unavailable label, because it answers a different
+  question.
+- `Wind max` and `Rain` are not affected by this rule.
+
+The `Today` tile normally shows a high and low too. Adding a site's station
+starts a setup backfill, which fetches earlier forecast runs of every
+subscribed Open-Meteo feed up to the start of the hour the backfill began, and
+regular fetches supply the rest of the day from the hour they run. So once the
+backfill has finished, today's elapsed hours are already there. A feed can
+lack some of today's hours, and then cannot cover `Today`, when:
+
+- the setup backfill has not finished yet;
+- the feed comes from a provider other than Open-Meteo and was first fetched
+  today: those providers have no earlier runs to fetch, so the feed may lack
+  today's earliest hours (a feed already fetched before today normally has
+  them);
+- it is an Open-Meteo feed subscribed after the backfill finished, which the
+  backfill does not go back for (a catch-up, from the `Catch up` button on the
+  Ops page or the `catchup` command, may fetch its history);
+- the provider returned an hour without a value, or an hour fell after the
+  backfill's end and before the feed's first regular fetch.
+
+The label appears only when none of the feeds with forecasts for that day
+covers it, so a feed added later never blanks a day another feed already
+covers. Regular fetches never fill the hours before their own forecast run: a
+fetch keeps only hours at least an hour after its forecast run was issued, and
+Open-Meteo's regular fetches start at the hour they run. So when no feed covers
+today, `Today` shows the label for the rest of the date, unless the backfill or
+a catch-up fills the gap, or a later fetch returns a value for an hour an
+earlier one left without one. At local midnight the next date becomes `Today`,
+and it shows a high and low only if a feed covers that whole date: the change
+of day fills in no missing hours.
+
+A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
+feeds its daily high and low come from, which can differ from the feeds behind
+its hourly chart.
+
+The daily forecast record stores what the tile showed: when the label appears,
+the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
+`insufficient`, next to the `extrema_feed_ids` that were used (an empty list in
+that case) and `extrema_low_confidence` (also `null`, because there is no set of
+feeds to judge). Verification scoring is unchanged — this decides what is
+displayed, not what is scored.
+
 ## CLI
 
 All CLI commands use the same SQLite database path:

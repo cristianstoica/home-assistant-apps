@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
@@ -65,6 +65,28 @@ def local_day_start(now: datetime, timezone: str) -> datetime:
     local_now = now.astimezone(ZoneInfo(timezone))
     midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight.astimezone(UTC)
+
+
+def local_day_slots(local_date: date, timezone: str) -> tuple[datetime, datetime, int]:
+    """UTC window ``[local midnight, next local midnight)`` and its slot count.
+
+    The third element is the window's elapsed duration floored to whole
+    hours, kept for verification compatibility. It is not an enumeration
+    of UTC-hour instants, and the two can differ on a half-hour DST shift:
+    a 24.5-hour window can hold 25 on-the-hour instants yet floors to 24.
+    :func:`wxverify.forecast.aggregate.covers_local_day` enumerates the
+    instants exactly.
+    """
+    tz = ZoneInfo(timezone)
+    start = datetime(
+        local_date.year, local_date.month, local_date.day, tzinfo=tz
+    ).astimezone(UTC)
+    next_day = local_date + timedelta(days=1)
+    end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=tz).astimezone(
+        UTC
+    )
+    expected = int((end - start).total_seconds() // 3600)
+    return start, end, expected
 
 
 def lead_hours(issued_at: str, valid_at: str) -> int:

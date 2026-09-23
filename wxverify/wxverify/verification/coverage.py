@@ -23,10 +23,10 @@ clock reads — so every gate boundary is an independently testable unit.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from wxverify.core.timeutil import parse_utc
+from wxverify.core.timeutil import local_day_slots, parse_utc
 from wxverify.verification.methodology import (
     NEAR_COMPLETE_SLOT_ALLOWANCE,
     TEMP_PEAK_WINDOW_HIGH,
@@ -81,18 +81,12 @@ class DayBounds:
 def local_day_bounds(local_date: date, timezone: str) -> DayBounds:
     """UTC window ``[local midnight, next local midnight)`` and its slot count.
 
-    ``expected_slots`` is the number of UTC hourly instants inside the
-    window — 23, 24 or 25 on DST-transition days.
+    ``expected_slots`` is the window's elapsed duration floored to whole
+    hours, kept for verification compatibility. It is not an enumeration
+    of UTC-hour instants, and the two can differ on a half-hour DST shift
+    (see :func:`wxverify.forecast.aggregate.covers_local_day`).
     """
-    tz = ZoneInfo(timezone)
-    start = datetime(
-        local_date.year, local_date.month, local_date.day, tzinfo=tz
-    ).astimezone(UTC)
-    next_day = local_date + timedelta(days=1)
-    end = datetime(next_day.year, next_day.month, next_day.day, tzinfo=tz).astimezone(
-        UTC
-    )
-    expected = int((end - start).total_seconds() // 3600)
+    start, end, expected = local_day_slots(local_date, timezone)
     return DayBounds(
         local_date=local_date,
         timezone=timezone,

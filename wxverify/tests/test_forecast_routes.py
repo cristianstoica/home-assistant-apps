@@ -414,8 +414,11 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
 # hourly sample count is reduced to between 12 and 17, so the single
 # selected feed no longer clears the coverage guard. `clearing_subset` then
 # falls back to the full selection and reports `partial`, so the tile's
-# rendered feed set and the drill-down's coincide -- and the two surfaces
-# must agree.
+# STATE and the drill-down's coincide -- and the two surfaces must agree on
+# `state`. (`clearing_subset` still narrows what wind and precipitation
+# aggregate and render, unchanged by Item F; for temperature, `meta.feeds`
+# names the extrema set -- feeds covering the whole local day -- not
+# `clearing_subset`'s output, so it is not asserted here.)
 # ---------------------------------------------------------------------------
 
 
@@ -428,10 +431,13 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
     falls back to the full (single-feed) selection and sets `partial=True`,
     so `agg_feeds` and `selection.feeds` are the SAME list here: per-surface
     width is a non-issue on this fixture, and both the tile and the
-    drill-down must report the same state. If the tile's gate were resolved
-    over the raw coverage-guard filter instead of over `clearing_subset`'s
-    fallback return, it would see an empty rendered set here and read
-    low-confidence over numbers a rebuilding-ranked feed produced.
+    drill-down must report the same `state`. If the tile's gate were
+    resolved over the raw coverage-guard filter instead of over
+    `clearing_subset`'s fallback return, it would see an empty rendered set
+    here and read low-confidence over numbers a rebuilding-ranked feed
+    produced. (14 hours is also short of the 24 the target local day needs,
+    so the feed is not extrema-eligible; this test asserts `state`, not the
+    now-suppressed temperature extrema, so that is not a concern here.)
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn, "Forecast Partial Coverage")

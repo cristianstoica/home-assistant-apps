@@ -36,9 +36,11 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
 )
 from wxverify.forecast.aggregate import (
+    EXTREMA_COVERAGE_COMPLETE,
     blend_mean,
     clearing_subset,
     covered_hours,
+    covers_local_day,
     display_day_index,
     displayed_daily,
 )
@@ -400,6 +402,7 @@ def _candidate_records(
                 "mae": None,
                 "future_sample_count": 0,
                 "covered_hours": 0,
+                "extrema_eligible": False,
             }
         )
         record["participation"] = participation
@@ -589,22 +592,38 @@ def build_forecast_record(
                         mae=row.mae if row is not None else None,
                         future_sample_count=len(feed_samples),
                         covered_hours=covered_hours(s.valid_at for s in feed_samples),
+                        extrema_eligible=covers_local_day(
+                            (s.valid_at for s in feed_samples),
+                            local_date=target_date,
+                            timezone=timezone,
+                        ),
                     )
                 )
+            # Same per-variable eligibility policy as the Forecast page
+            # (forecast/service.py): only temperature asks for the extrema
+            # set, and only the ``displayed`` block below consumes it.
             selection = select_cell_feeds(
-                candidates, blend_depth=depths[variable].depth
+                candidates,
+                blend_depth=depths[variable].depth,
+                extrema_coverage_required=(variable == "temperature"),
             )
             selected_ids = [c.feed_id for c in selection.feeds]
             weight = 1.0 / len(selected_ids) if selected_ids else None
             # ``hourly`` is the FULL-selection blend on purpose: it exists to
             # reproduce the Forecast page's hourly drill-down, which blends
             # the whole selection (forecast/service.py) while only the tile's
-            # daily value uses the clearing subset. Do not unify it with the
-            # outcomes blend below.
+            # daily value uses a different set (the clearing subset, or for
+            # temperature the extrema set, which may include feeds outside
+            # the selection). Do not unify it with the outcomes blend below.
             hourly = _blend_hourly(selected_ids, feeds_samples)
             # The DISPLAYED daily quantities, computed exactly the production
-            # way (aggregate per feed over the clearing subset, then blend) —
-            # via the same shared helpers the Forecast page uses (§6/§7).
+            # way (aggregate per feed, then blend) — via the same shared
+            # helpers the Forecast page uses (§6/§7). Wind and precipitation
+            # aggregate over the clearing subset; temperature aggregates over
+            # the selection's extrema set (feeds covering the whole local
+            # day), so a suppressed tile is recorded as null high/low with
+            # ``extrema_coverage == "insufficient"``, never a partial range.
+            # ``partial`` keeps its clearing-subset meaning for every variable.
             if selection.available:
                 agg_ids, partial = clearing_subset(
                     selected_ids,
@@ -612,18 +631,33 @@ def build_forecast_record(
                 )
             else:
                 agg_ids, partial = [], False
+            extrema_ids = [c.feed_id for c in selection.extrema_feeds]
+            display_ids = extrema_ids if variable == "temperature" else agg_ids
             displayed: dict[str, object] = dict(
                 displayed_daily(
                     variable,
-                    [[s.value for s in feeds_samples[fid]] for fid in agg_ids],
+                    [[s.value for s in feeds_samples[fid]] for fid in display_ids],
                     rain_threshold_mm=rain_threshold_mm,
                 )
             )
             displayed["partial"] = partial
             displayed["low_confidence"] = selection.low_confidence
+            if variable == "temperature":
+                displayed["extrema_feed_ids"] = extrema_ids
+                displayed["extrema_coverage"] = selection.extrema_coverage
+                # The extrema set's own ladder verdict, raw: null when no
+                # feed qualified (no set to judge), and never the page's
+                # rebuilding precedence — this ranking is live as-of T.
+                displayed["extrema_low_confidence"] = (
+                    selection.extrema_low_confidence
+                    if selection.extrema_coverage == EXTREMA_COVERAGE_COMPLETE
+                    else None
+                )
             # Outcomes describe the SCORED product, so they are computed over
-            # the clearing subset — the same feed set ``displayed`` uses
-            # (simulate.py parity, W3).
+            # the clearing subset (simulate.py parity, W3) — the feed set
+            # ``displayed`` uses for wind and precipitation. For temperature
+            # the two sets may differ; ``extrema_feed_ids`` records the
+            # displayed one so the difference is readable, not silent.
             outcomes = evaluate_variable(
                 variable,
                 _blend_hourly(agg_ids, feeds_samples),

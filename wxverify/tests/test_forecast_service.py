@@ -457,17 +457,21 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
 
 # ---------------------------------------------------------------------------
 # Minimum-coverage guard: a cell whose selected feeds don't reach
-# MIN_COVERAGE_HOURS still aggregates (tile stays populated) but carries the
-# "partial" badge.
+# MIN_COVERAGE_HOURS still carries the "partial" badge. For wind and
+# precipitation the partial data still aggregates (tile stays populated).
+# For temperature (Item F), under-coverage means the feed is not
+# extrema-eligible (it does not cover the whole local day), so the daily
+# high/low are suppressed rather than aggregated from a partial range.
 # ---------------------------------------------------------------------------
 
 
-def test_partial_badge_when_under_coverage_tile_stays_populated() -> None:
+def test_temperature_extrema_suppressed_under_coverage_partial_badge_set() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
-    # Only 5 covered hours -- under MIN_COVERAGE_HOURS (18).
+    # Only 5 covered hours -- under MIN_COVERAGE_HOURS (18) and short of the
+    # 24 the target local day needs, so the feed is not extrema-eligible.
     valid_ats = _hours("2026-07-20", 4, 5)
     _seed_hourly(
         conn,
@@ -486,10 +490,42 @@ def test_partial_badge_when_under_coverage_tile_stays_populated() -> None:
     )
     today = view.tiles[0]
     assert today.temp.meta.partial is True
-    assert today.temp.meta.available is True  # tile stays populated
-    # The partial data is still aggregated, not dropped.
-    assert today.temp.high_c == 12.0
-    assert today.temp.low_c == 12.0
+    assert today.temp.meta.available is True  # cell/hourly product stays populated
+    # The daily extrema are suppressed, not aggregated from the partial range.
+    assert today.temp.high_c is None
+    assert today.temp.low_c is None
+    assert today.temp.meta.extrema_unavailable is True
+    assert today.partial is True
+
+
+def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
+    # Paired positive for the temperature suppression above: wind does not
+    # adopt the extrema-coverage rule (F.4 scopes it to temperature), so the
+    # SAME under-coverage shape still aggregates the partial data and just
+    # carries the "partial" badge -- the behaviour this test file originally
+    # pinned. If the eligibility filter ever leaked into wind's value path,
+    # this would fail where the temperature test above would not catch it.
+    conn = _make_db()
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+
+    valid_ats = _hours("2026-07-20", 4, 5)
+    _seed_hourly(
+        conn,
+        feed_id=feed_id,
+        variable="wind",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=valid_ats,
+        value=5.0,  # m/s
+    )
+    conn.commit()
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    today = view.tiles[0]
+    assert today.wind.meta.partial is True
+    assert today.wind.meta.available is True  # tile stays populated
+    assert today.wind.max_kmh == ms_to_kmh(5.0)
     assert today.partial is True
 
 
@@ -828,8 +864,8 @@ def test_coverage_guard_splits_tile_and_drill_down_rebuilding_state() -> None:
     rung 3 selects both feeds at the default blend depth of 2, ranked by
     future-sample count (A's 20 samples outrank B's 14).
 
-    ``clearing_subset`` then keeps A alone for the tile: the tile's own
-    rendered feed set never saw a rebuilding-keyed ranking, so it reads
+    ``clearing_subset`` then keeps A alone for the tile: the tile's clearing
+    subset (A alone) never saw a rebuilding-keyed ranking, so it reads
     low_confidence. ``build_hourly`` blends and plots the full selection,
     A AND B, so it reads rebuilding -- true of what it actually draws.
     """
@@ -882,13 +918,18 @@ def test_coverage_guard_splits_tile_and_drill_down_rebuilding_state() -> None:
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     today = view.tiles[0]
-    # Assertion 1: the tile's own rendered set (A alone) never saw a
+    # Assertion 1: the tile's clearing subset (A alone) never saw a
     # rebuilding-keyed ranking.
     assert today.temp.meta.state == "low_confidence"
-    # Assertion 2: the tile's width, made visible -- A is rendered, B is not.
+    # Assertion 2 (Item F): for temperature, ``meta.feeds`` names the
+    # EXTREMA set, not the blend set A/B were ranked into. Neither A (20 of
+    # 24 hours) nor B (14 of 24) covers the whole local day, so no candidate
+    # is extrema-eligible and the extrema set is empty -- neither feed is
+    # named, and the daily high/low are suppressed.
     feed_ids = {ref.feed_id for ref in today.temp.meta.feeds}
-    assert feed_a in feed_ids
+    assert feed_a not in feed_ids
     assert feed_b not in feed_ids
+    assert today.temp.meta.extrema_unavailable is True
 
     hourly = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     # Assertion 3: the ONLY kill in this plan for M9 (collapsing the
@@ -1075,15 +1116,23 @@ def test_build_hourly_wind_series_already_kmh_converted() -> None:
 
 
 def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
-    """Headline regression (FAILS pre-fix, PASSES post-fix).
+    """Headline regression (FAILS pre-fix, PASSES post-fix), updated for Item F.
 
     Pre-fix reasoning: with blend_depth=1 the selection pool == candidates, so
     the confidence ladder ranks the two confident feeds by skill and takes the
     top 1 -> the single-slot gfs_global feed (higher skill) is chosen ALONE ->
-    high_c == low_c == 25.0. The high_c == 17.0 / low_c == 9.1 assertions and
-    the "gfs absent" assertion all fail on that collapse.
-    Post-fix: the >=12h adequate pool restricts to the 15h ecmwf_ifs feed
-    (covered_hours 1 < 12 gates gfs out), so the real 9.1..17.0 spread renders.
+    the BLEND would collapse to high == low == 25.0.
+    Post-fix (pre-Item-F): the >=12h adequate pool restricts to the 15h
+    ecmwf_ifs feed (covered_hours 1 < 12 gates gfs out), so the blend never
+    collapses -- pinned below via ``build_hourly``'s per-feed series, since
+    ``meta.feeds`` now names the extrema set for temperature, not the blend
+    set (Item F).
+    Item F: neither feed covers the whole 24-hour local day (ecmwf_ifs
+    supplies 15, gfs_global 1), so neither is extrema-eligible; the daily
+    high/low are suppressed rather than aggregated from ecmwf_ifs's partial
+    9.1..17.0 range, and the tile's own coverage-guard "partial" badge (a
+    property of the >=18h blend-set guard, unrelated to extrema eligibility)
+    still fires.
     """
     conn = _make_db()
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)  # local date 2026-07-20
@@ -1096,13 +1145,19 @@ def test_far_horizon_multipoint_feed_rescues_collapsed_tile() -> None:
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     tile = view.tiles[7]  # D+7 far-horizon tile
-    assert tile.temp.high_c == 17.0
-    assert tile.temp.low_c == 9.1
-    assert tile.temp.high_c != tile.temp.low_c  # a real spread, not a collapse
+    assert tile.temp.high_c is None
+    assert tile.temp.low_c is None
+    assert tile.temp.meta.extrema_unavailable is True
     assert tile.temp.meta.partial is True  # 15 covered hours < 18-hour badge gate
-    labels = [ref.label for ref in tile.temp.meta.feeds]
-    assert feed_label("open-meteo", "gfs_global") not in labels  # single-slot gated out
-    assert feed_label("open-meteo", "ecmwf_ifs") in labels
+    # No feed is extrema-eligible, so meta.feeds (the extrema set) is empty --
+    # this does NOT mean the blend selection collapsed onto the single-slot
+    # feed; that is checked separately via build_hourly below.
+    assert tile.temp.meta.feeds == []
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
+    hourly_labels = [feed["label"] for feed in hourly["feeds"]]
+    assert feed_label("open-meteo", "gfs_global") not in hourly_labels
+    assert feed_label("open-meteo", "ecmwf_ifs") in hourly_labels
 
 
 def test_near_tile_skill_still_decides_end_to_end() -> None:
@@ -1267,12 +1322,19 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
 
     Pre-fix reasoning: pool == candidates, ladder ranks by skill under
     blend_depth=1 -> the single-slot gfs feed (higher skill) is selected alone
-    -> high == low == 25.0. high != low and high == 16.0 fail on that collapse.
-    Post-fix: adequate is empty (8h and 1h both < 12), so the pool falls to the
-    multipoint tier = the 8h feed (>= MULTIPOINT_MIN_HOURS; the 1-sample feed is
-    below it) -> the 8h feed's real 9.0..16.0 spread renders. WITHOUT the
-    multipoint tier the pool would fall straight to all candidates and
-    re-collapse -- which is exactly what this test guards."""
+    -> the BLEND would collapse to high == low == 25.0. Post-fix (pre-Item-F):
+    adequate is empty (8h and 1h both < 12), so the pool falls to the
+    multipoint tier = the 8h feed (>= MULTIPOINT_MIN_HOURS; the 1-sample feed
+    is below it) -> the blend never collapses. WITHOUT the multipoint tier the
+    pool would fall straight to all candidates and re-collapse -- which is
+    exactly what this test guards, pinned via ``build_hourly``'s per-feed
+    series since ``meta.feeds`` now names the extrema set for temperature
+    (Item F), not the blend set.
+
+    Item F: neither feed covers the whole 24-hour local day (partial_id
+    supplies 8, degenerate_id 1), so neither is extrema-eligible and the
+    daily high/low are suppressed rather than aggregated from partial_id's
+    9.0..16.0 range."""
     conn = _make_db()
     degenerate_id = _feed_id(conn, "open-meteo", "gfs_global")  # 1 sample, higher skill
     partial_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # 8 samples, lower skill
@@ -1315,12 +1377,16 @@ def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     tile = view.tiles[7]
-    assert tile.temp.high_c != tile.temp.low_c  # 8h feed's spread survives
-    assert tile.temp.high_c == 16.0
-    assert tile.temp.low_c == 9.0
-    labels = [ref.label for ref in tile.temp.meta.feeds]
-    assert feed_label("open-meteo", "gfs_global") not in labels  # single-slot gated out
-    assert feed_label("open-meteo", "ecmwf_ifs") in labels
+    assert tile.temp.high_c is None
+    assert tile.temp.low_c is None
+    assert tile.temp.meta.extrema_unavailable is True
+    assert tile.temp.meta.feeds == []
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
+    hourly_labels = [feed["label"] for feed in hourly["feeds"]]
+    # single-slot gated out
+    assert feed_label("open-meteo", "gfs_global") not in hourly_labels
+    assert feed_label("open-meteo", "ecmwf_ifs") in hourly_labels
 
 
 def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
@@ -1330,13 +1396,21 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
     feeds are blended and mean(maxes) == mean(mins), so high_c == low_c -- the
     mean-of-two collapse, distinct from the depth-1 single-feed collapse the
     tests above pin. Each single-slot feed's daily high == low (one point), and
-    two feeds blend by mean-of-highs / mean-of-lows, so the tile collapses to
-    mean(7.71, 10.43) == 9.07 for BOTH high and low. Two single-slot feeds
-    (7.71, 10.43) out-skill a 15h covered feed on the pre-fix ladder.
+    two feeds blend by mean-of-highs / mean-of-lows, so the BLEND would
+    collapse to mean(7.71, 10.43) == 9.07 for BOTH high and low. Two
+    single-slot feeds (7.71, 10.43) out-skill a 15h covered feed on the
+    pre-fix ladder.
     Pre-fix: pool == candidates -> top-2-by-skill picks both single slots ->
-    high == low == 9.07. Post-fix: the >=12h adequate pool (1 member < depth 2,
-    no top-up from outside the pool) restricts to the covered feed -> the real
-    9.0..16.0 spread renders.
+    the blend collapses. Post-fix (pre-Item-F): the >=12h adequate pool
+    (1 member < depth 2, no top-up from outside the pool) restricts to the
+    covered feed -> the blend never collapses. Pinned via ``build_hourly``'s
+    per-feed series since ``meta.feeds`` now names the extrema set for
+    temperature (Item F), not the blend set.
+
+    Item F: none of the three feeds covers the whole 24-hour local day (the
+    best, ``covered``, supplies 15), so no candidate is extrema-eligible and
+    the daily high/low are suppressed rather than aggregated from
+    ``covered``'s partial 9.0..16.0 range.
     """
     conn = _make_db()
     single_a = _feed_id(conn, "open-meteo", "gfs_global")
@@ -1395,10 +1469,14 @@ def test_far_horizon_two_single_slot_feeds_collapse_at_default_depth() -> None:
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     tile = view.tiles[7]  # D+7 far-horizon tile
-    assert tile.temp.high_c != tile.temp.low_c  # NOT the 9.07 mean-collapse
-    assert tile.temp.high_c == 16.0
-    assert tile.temp.low_c == 9.0
-    labels = [ref.label for ref in tile.temp.meta.feeds]
-    assert feed_label("open-meteo", "gfs_global") not in labels
-    assert feed_label("open-meteo", "icon_global") not in labels
-    assert feed_label("open-meteo", "ecmwf_ifs") in labels
+    assert tile.temp.high_c is None
+    assert tile.temp.low_c is None
+    assert tile.temp.meta.extrema_unavailable is True
+    assert tile.temp.meta.feeds == []
+
+    hourly = build_hourly(conn, site_id=1, timezone="UTC", day=7, now=now)
+    hourly_labels = [feed["label"] for feed in hourly["feeds"]]
+    # NOT the mean-collapse
+    assert feed_label("open-meteo", "gfs_global") not in hourly_labels
+    assert feed_label("open-meteo", "icon_global") not in hourly_labels
+    assert feed_label("open-meteo", "ecmwf_ifs") in hourly_labels
