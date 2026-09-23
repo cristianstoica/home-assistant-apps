@@ -32,9 +32,17 @@ _MIN_INTERVAL_SECONDS_DEFAULT = 300
 _MIN_INTERVAL_SECONDS_FLOOR = 60
 
 
-def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether a table ``name`` exists, matched the way SQLite resolves names.
+
+    SQLite matches identifiers ASCII-case-insensitively, and ``COLLATE
+    NOCASE`` folds ASCII only, the same rule, so ``jobs`` finds a table
+    stored as ``Jobs``. Only ``type = 'table'`` rows count: a view reads as
+    absent, as before.
+    """
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? COLLATE NOCASE",
+        (name,),
     ).fetchone()
     return row is not None
 
@@ -46,10 +54,10 @@ def sanitize_wedge_prone_timestamps(conn: sqlite3.Connection) -> None:
     ``stations``, and ``station_observations`` are required at import), so
     each pass is skipped rather than failing when its table is absent.
     """
-    if _table_exists(conn, "jobs"):
+    if table_exists(conn, "jobs"):
         _sanitize_jobs_next_attempt_at(conn)
-    if _table_exists(conn, "station_poll_state"):
-        _sanitize_station_poll_next_poll_at(conn, _table_exists(conn, "settings"))
+    if table_exists(conn, "station_poll_state"):
+        _sanitize_station_poll_next_poll_at(conn, table_exists(conn, "settings"))
 
 
 def _sanitize_jobs_next_attempt_at(conn: sqlite3.Connection) -> None:

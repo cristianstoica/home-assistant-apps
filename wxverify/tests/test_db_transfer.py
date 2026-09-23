@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from starlette.requests import Request
@@ -42,7 +42,11 @@ from wxverify.api.guard import MutationGuard
 from wxverify.api.routes import db_transfer
 from wxverify.db import connection as db_connection
 from wxverify.db.connection import Database, close_db, get_db, init_db
-from wxverify.db.migrations import TARGET_USER_VERSION
+from wxverify.db.migrations import (
+    TARGET_USER_VERSION,
+    run_migrations,
+    schema_table_names,
+)
 from wxverify.db.tz_generations import ensure_published_generation
 
 _SUPERVISOR_IP = "172.30.32.2"
@@ -3490,17 +3494,19 @@ def _sqlite_bytes_hand_built(
     path: Path, samples_ddl: str | None, rows: list[tuple[object, object, object]]
 ) -> bytes:
     """A minimal hand-built upload: ``sites``/``stations`` primary-key-only
-    tables, a ``station_observations(variable TEXT)`` table (so the BLOB
-    guard's query against it does not itself refuse the upload first), the
-    given ``samples_ddl`` for ``forecast_samples`` (skipped when ``None``,
-    modelling a genuinely absent table), one row per ``(variable, issued_at,
-    valid_at)`` tuple, and ``user_version = 7``.
+    tables, a ``station_observations(variable TEXT, valid_at TEXT)`` table
+    (so the BLOB guard's query against it does not itself refuse the upload
+    first, and so the new observation-stamp scan finds a real column rather
+    than raising `no such column`), the given ``samples_ddl`` for
+    ``forecast_samples`` (skipped when ``None``, modelling a genuinely
+    absent table), one row per ``(variable, issued_at, valid_at)`` tuple,
+    and ``user_version = 7``.
     """
     conn = sqlite3.connect(str(path))
     try:
         conn.execute("CREATE TABLE sites (id INTEGER PRIMARY KEY)")
         conn.execute("CREATE TABLE stations (id INTEGER PRIMARY KEY)")
-        conn.execute("CREATE TABLE station_observations (variable TEXT)")
+        conn.execute("CREATE TABLE station_observations (variable TEXT, valid_at TEXT)")
         if samples_ddl is not None:
             conn.execute(samples_ddl)
         for row in rows:
@@ -3857,3 +3863,733 @@ def test_import_resolves_forecast_samples_table_name_like_sqlite(
         db_transfer._validate_upload(view_target)  # noqa: SLF001
     assert exc_info.value.status_code == 422
     assert exc_info.value.message == "not a table: forecast_samples"
+
+
+# ---------------------------------------------------------------------------
+# S1-S11, A1-A2 (plan 2026-09-23-db-import-schema-checks.md): every schema
+# table name must be an ordinary table if present (D6), observation stamps
+# are checked by value like forecast stamps (D4), and import refuses a
+# too-old SQLite before any upload processing (D5).
+# ---------------------------------------------------------------------------
+
+_FIXTURE_VTAB_MODULE = "fts5"
+
+
+def _require_fixture_vtab_module() -> str:
+    """Confirm the fixture-only virtual-table module is available, loudly.
+
+    Never skips: a missing module fails the test with a message starting
+    ``fixture:`` so it can never be mistaken for the validator refusing to
+    admit a virtual table (the thing these tests actually check).
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute(
+            f"CREATE VIRTUAL TABLE fixture_probe USING {_FIXTURE_VTAB_MODULE}(a)"
+        )
+    except sqlite3.OperationalError as exc:
+        pytest.fail(
+            "fixture: cannot create virtual table with module "
+            f"{_FIXTURE_VTAB_MODULE} on SQLite {sqlite3.sqlite_version}: {exc}",
+            pytrace=False,
+        )
+    finally:
+        conn.close()
+    return _FIXTURE_VTAB_MODULE
+
+
+# Literal, hand-written -- never read from schema_table_names() or any
+# db_transfer constant, so no oracle here compares the code with itself.
+_CHECKED_TODAY_TABLES: tuple[str, ...] = (
+    "sites",
+    "stations",
+    "station_observations",
+    "observations",
+    "forecast_samples",
+    "forecast_pairs",
+    "score_cache",
+)
+_OTHER_APP_TABLES: tuple[str, ...] = (
+    "api_budget",
+    "daily_truth",
+    "domain_backoffs",
+    "feeds",
+    "forecast_of_record",
+    "jobs",
+    "runtime_state",
+    "settings",
+    "site_feed_state",
+    "sources",
+    "station_current_obs",
+    "station_poll_state",
+    "timezone_generations",
+    "verification_day_context",
+    "verification_evidence",
+    "verification_results",
+    "verification_run_inputs",
+    "verification_runs",
+    "verification_trigger_decisions",
+    "verification_verdicts",
+)
+
+
+def _insert_synthetic_site(
+    conn: sqlite3.Connection, name: str, *, enabled: int = 1
+) -> int:
+    """Insert a site with wholly synthetic values (0.0/0.0/100.0/UTC).
+
+    Distinct from the banned ``_make_site`` (`:84`), which hardcodes
+    non-synthetic coordinates (40.0/-105.0/900.0) -- the plan's harness
+    rules forbid reusing it for this feature's tests.
+    """
+    return int(
+        conn.execute(
+            """
+            INSERT INTO sites
+                (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
+            VALUES (?, 0.0, 0.0, 100.0, 'UTC', ?)
+            """,
+            (name, enabled),
+        ).lastrowid
+    )
+
+
+def test_import_rejects_virtual_optional_table(tmp_path: Path) -> None:
+    """S1: forecast_samples (optional -- absence is fine) as a virtual table
+    is refused as ``not a table``, never read as absent.
+    """
+    m = _require_fixture_vtab_module()
+    target = tmp_path / "virtual-optional.db"
+    _sqlite_bytes_hand_built(
+        target,
+        f"CREATE VIRTUAL TABLE forecast_samples "
+        f"USING {m}(variable, issued_at, valid_at)",
+        [("temperature", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")],
+    )
+    check_conn = sqlite3.connect(str(target))
+    try:
+        row = check_conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = 'forecast_samples'"
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert row is not None, "fixture: forecast_samples must exist"
+    assert str(row[0]) == "table", "fixture: a virtual table catalogues as 'table'"
+    assert str(row[1]).startswith("CREATE VIRTUAL TABLE"), (
+        "fixture: forecast_samples must be a virtual table"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a table: forecast_samples"
+
+
+_S2_REQUIRED_DDL: dict[str, str] = {
+    "sites": "CREATE TABLE sites (id INTEGER PRIMARY KEY)",
+    "stations": "CREATE TABLE stations (id INTEGER PRIMARY KEY)",
+    "station_observations": (
+        "CREATE TABLE station_observations (variable TEXT, valid_at TEXT)"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", ["sites", "stations", "station_observations"])
+def test_import_rejects_virtual_required_table(name: str, tmp_path: Path) -> None:
+    """S2: any of the three required tables as a virtual table is refused as
+    ``not a table``, never read as present (admitted) or absent (skipped,
+    then re-created empty by ``create_tables`` after the swap).
+    """
+    m = _require_fixture_vtab_module()
+    target = tmp_path / f"virtual-required-{name}.db"
+    conn = sqlite3.connect(str(target))
+    try:
+        for other, ddl in _S2_REQUIRED_DDL.items():
+            if other == name:
+                conn.execute(
+                    f"CREATE VIRTUAL TABLE {name} USING {m}(variable, valid_at)"
+                )
+            else:
+                conn.execute(ddl)
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        row = check_conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert row is not None, f"fixture: {name} must exist"
+    assert str(row[1]).startswith("CREATE VIRTUAL TABLE"), (
+        f"fixture: {name} must be a virtual table"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == f"not a table: {name}"
+
+
+def test_import_rejects_index_under_optional_table_name(tmp_path: Path) -> None:
+    """S3: an index named ``forecast_samples`` is refused as ``not a
+    table`` -- pins the new ``pragma_table_list`` classification against a
+    guard that reads any non-``table`` kind as genuine absence.
+    """
+    target = tmp_path / "index-optional.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    conn = sqlite3.connect(str(target))
+    try:
+        conn.execute("CREATE INDEX forecast_samples ON station_observations (variable)")
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        row = check_conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'forecast_samples'"
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert row is not None, "fixture: forecast_samples must exist"
+    assert str(row[0]) == "index", "fixture: forecast_samples must be an index"
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a table: forecast_samples"
+
+
+def test_import_fails_closed_when_pragma_table_list_is_shadowed(
+    tmp_path: Path,
+) -> None:
+    """S4: a user table named ``pragma_table_list`` cannot spoof the guard's
+    classification query -- the statement form, ``PRAGMA
+    main.table_list(...)``, never looks the name up among the file's own
+    tables, so it ignores this plain-table shadow entirely and classifies
+    the real ``forecast_samples`` virtual table on its own merits.
+    """
+    m = _require_fixture_vtab_module()
+    target = tmp_path / "shadowed-catalogue.db"
+    _sqlite_bytes_hand_built(
+        target,
+        f"CREATE VIRTUAL TABLE forecast_samples "
+        f"USING {m}(variable, issued_at, valid_at)",
+        [("temperature", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")],
+    )
+    conn = sqlite3.connect(str(target))
+    try:
+        conn.execute(
+            "CREATE TABLE pragma_table_list (schema TEXT, name TEXT, type TEXT)"
+        )
+        for n in ("sites", "stations", "station_observations", "forecast_samples"):
+            conn.execute(
+                "INSERT INTO pragma_table_list (schema, name, type)"
+                " VALUES (?, ?, 'table')",
+                ("main", n),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        row = check_conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'pragma_table_list'"
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert row is not None and str(row[0]) == "table", (
+        "fixture: pragma_table_list must exist as a user table"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a table: forecast_samples"
+
+
+_S4B_SHADOW_NAMES: tuple[str, ...] = ("pragma_table_list", "PRAGMA_Table_List")
+
+
+@pytest.mark.parametrize("shadow_name", _S4B_SHADOW_NAMES)
+def test_import_classifies_virtual_table_under_vtab_shadow(
+    shadow_name: str, tmp_path: Path
+) -> None:
+    """S4b: a virtual (fts5) table named ``pragma_table_list``, in any
+    letter case, cannot spoof the guard's classification either -- unlike a
+    plain-table shadow (S4), this one is the exact old attack (the
+    table-valued ``pragma_table_list(?)`` form looks the name up among the
+    file's own objects first), and the statement form still ignores it and
+    correctly classifies ``forecast_samples`` as a virtual table.
+    """
+    m = _require_fixture_vtab_module()
+    target = tmp_path / f"vtab-shadowed-catalogue-{shadow_name}.db"
+    _sqlite_bytes_hand_built(
+        target,
+        f"CREATE VIRTUAL TABLE forecast_samples "
+        f"USING {m}(variable, issued_at, valid_at)",
+        [("temperature", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")],
+    )
+    conn = sqlite3.connect(str(target))
+    try:
+        try:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {shadow_name} USING fts5(schema, name, type)"
+            )
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"fixture: fts5 unavailable on this SQLite build: {exc}")
+        for n in ("sites", "stations", "station_observations", "forecast_samples"):
+            conn.execute(
+                f"INSERT INTO {shadow_name} (schema, name, type)"
+                " VALUES (?, ?, 'table')",
+                ("main", n),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        shadow_row = check_conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ? COLLATE NOCASE",
+            (shadow_name,),
+        ).fetchone()
+        samples_row = check_conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'forecast_samples'"
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert shadow_row is not None, f"fixture: {shadow_name} must exist"
+    assert str(shadow_row[0]).startswith("CREATE VIRTUAL TABLE"), (
+        f"fixture: {shadow_name} must be a virtual table"
+    )
+    assert samples_row is not None, "fixture: forecast_samples must exist"
+    assert str(samples_row[0]).startswith("CREATE VIRTUAL TABLE"), (
+        "fixture: forecast_samples must be a virtual table"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a table: forecast_samples"
+
+
+class _NoTypeColumnCursor:
+    """Proxy a real cursor but hide the ``type`` column from ``description``.
+
+    Simulates a pre-3.37 SQLite, where ``PRAGMA table_list`` is unknown and
+    returns rows (or none) with no ``type`` column -- without needing an
+    actual old SQLite build.
+    """
+
+    def __init__(self, real: sqlite3.Cursor) -> None:
+        self._real = real
+
+    @property
+    def description(self) -> None:
+        return None
+
+    def __iter__(self) -> _NoTypeColumnCursor:
+        return self
+
+    def __next__(self) -> tuple[object, ...]:
+        return next(self._real)
+
+
+class _NoTypeColumnConnection:
+    """Wrap a real connection; only ``PRAGMA main.table_list(`` statements
+    get a cursor whose ``description`` hides the ``type`` column. Every
+    other statement (the ``sqlite_master`` lookup) passes straight through
+    to the real connection unchanged.
+    """
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def execute(self, sql: str, *args: object) -> object:
+        cursor = self._real.execute(sql, *args)
+        if sql.startswith("PRAGMA main.table_list("):
+            return _NoTypeColumnCursor(cursor)
+        return cursor
+
+
+def test_import_guard_fails_closed_when_table_list_pragma_has_no_type_column(
+    tmp_path: Path,
+) -> None:
+    """Task 3 (0.16.2 fix/import-schema-checks): simulating a pre-3.37
+    SQLite, where ``PRAGMA table_list`` is unknown and returns no ``type``
+    column, ``_guarded_table_present`` fails closed as 422 'not a valid
+    SQLite database' rather than raising an unhandled ``ValueError`` from
+    ``columns.index('type')`` or silently admitting the table.
+    """
+    target = tmp_path / "no-type-column.db"
+    _sqlite_bytes_hand_built(
+        target,
+        "CREATE TABLE forecast_samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [],
+    )
+    real_conn = sqlite3.connect(str(target))
+    try:
+        wrapped = _NoTypeColumnConnection(real_conn)
+        with pytest.raises(ApiError) as exc_info:
+            db_transfer._guarded_table_present(  # noqa: SLF001
+                cast(sqlite3.Connection, wrapped), "forecast_samples"
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.message == "not a valid SQLite database"
+    finally:
+        real_conn.close()
+
+
+@pytest.mark.parametrize("shadow_name", _S4B_SHADOW_NAMES)
+def test_import_accepts_real_table_alongside_vtab_name_shadow(
+    shadow_name: str, tmp_path: Path
+) -> None:
+    """Positive control for S4/S4b: an ordinary, non-virtual
+    ``forecast_samples`` table, alongside an fts5 table named
+    ``pragma_table_list`` (in either letter case), is still admitted. This
+    is the paired positive to S4b's suppression -- it proves the guard
+    ignores the name-shadow rather than refusing every upload that merely
+    contains a table by that name, which would make S4b's refusal vacuous.
+    """
+    target = tmp_path / f"vtab-shadow-ordinary-samples-{shadow_name}.db"
+    conn = sqlite3.connect(str(target))
+    try:
+        conn.execute(
+            "CREATE TABLE forecast_samples "
+            "(variable TEXT, issued_at TEXT, valid_at TEXT)"
+        )
+        try:
+            conn.execute(
+                f"CREATE VIRTUAL TABLE {shadow_name} USING fts5(schema, name, type)"
+            )
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"fixture: fts5 unavailable on this SQLite build: {exc}")
+        conn.execute(
+            f"INSERT INTO {shadow_name} (schema, name, type)"
+            " VALUES ('main', 'forecast_samples', 'shadow')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        samples_row = check_conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'forecast_samples'"
+        ).fetchone()
+        shadow_row = check_conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = ? COLLATE NOCASE",
+            (shadow_name,),
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert samples_row is not None, "fixture: forecast_samples must exist"
+    assert str(samples_row[0]).startswith("CREATE TABLE"), (
+        "fixture: forecast_samples must be an ordinary table"
+    )
+    assert shadow_row is not None, f"fixture: {shadow_name} must exist"
+    assert str(shadow_row[0]).startswith("CREATE VIRTUAL TABLE"), (
+        f"fixture: {shadow_name} must be a virtual table"
+    )
+    real_conn = sqlite3.connect(str(target))
+    try:
+        assert (
+            db_transfer._guarded_table_present(  # noqa: SLF001
+                real_conn, "forecast_samples"
+            )
+            is True
+        )
+    finally:
+        real_conn.close()
+
+
+def test_import_rejects_fts5_shadow_table_name(tmp_path: Path) -> None:
+    """Shadow-table rejection: an fts5 virtual table ``x`` creates shadow
+    tables (``x_data``, ``x_idx``, ...) that ``sqlite_master`` catalogues as
+    plain ``table`` but ``PRAGMA table_list`` correctly classifies as
+    ``shadow``. No app-owned name (``schema_table_names()``,
+    ``_BLOB_GUARDED_COLUMNS``, ``_CANONICAL_STAMP_COLUMNS``) ends in an fts5
+    or rtree shadow suffix (``_data``/``_idx``/``_content``/``_docsize``/
+    ``_config``/``_node``/``_rowid``/``_parent``), so this cannot be driven
+    through ``_validate_upload`` with a real app table name -- it is pinned
+    directly at the guard with a synthetic name instead.
+    """
+    target = tmp_path / "fts5-shadow.db"
+    conn = sqlite3.connect(str(target))
+    try:
+        try:
+            conn.execute("CREATE VIRTUAL TABLE x USING fts5(a)")
+        except sqlite3.OperationalError as exc:
+            pytest.skip(f"fixture: fts5 unavailable on this SQLite build: {exc}")
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        master_row = check_conn.execute(
+            "SELECT type FROM sqlite_master WHERE name = 'x_data'"
+        ).fetchone()
+        pragma_row = check_conn.execute("PRAGMA main.table_list('x_data')").fetchone()
+        pragma_columns = [
+            column[0]
+            for column in check_conn.execute(
+                "PRAGMA main.table_list('x_data')"
+            ).description
+        ]
+    finally:
+        check_conn.close()
+    assert master_row is not None and str(master_row[0]) == "table", (
+        "fixture: x_data must catalogue as an ordinary table in sqlite_master"
+    )
+    assert pragma_row is not None, "fixture: x_data must appear in PRAGMA table_list"
+    assert str(pragma_row[pragma_columns.index("type")]) == "shadow", (
+        "fixture: PRAGMA table_list must classify x_data as 'shadow'"
+    )
+    real_conn = sqlite3.connect(str(target))
+    try:
+        with pytest.raises(ApiError) as exc_info:
+            db_transfer._guarded_table_present(  # noqa: SLF001
+                real_conn, "x_data"
+            )
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.message == "not a table: x_data"
+    finally:
+        real_conn.close()
+
+
+_S7_BAD_STAMPS: tuple[tuple[str, object], ...] = (
+    ("not_a_stamp", "not-a-stamp"),
+    ("hour_24", "2026-01-01T24:00:00Z"),
+    ("offset", "2026-01-01T06:00:00+00:00"),
+    ("micro_zero", "2026-01-01T06:00:00.000000Z"),
+    ("lower_t", "2026-01-01t06:00:00Z"),
+    ("null", None),
+    ("blob", b"2026-01-01T06:00:00Z"),
+)
+
+
+@pytest.mark.parametrize("table", ["station_observations", "observations"])
+@pytest.mark.parametrize(
+    "case, bad", _S7_BAD_STAMPS, ids=[c[0] for c in _S7_BAD_STAMPS]
+)
+def test_import_rejects_noncanonical_observation_stamp(
+    table: str, case: str, bad: object, tmp_path: Path
+) -> None:
+    """S7: a non-canonical ``valid_at`` in ``station_observations`` or
+    ``observations`` is refused the same way a ``forecast_samples`` stamp is
+    (D4's sibling of O2's case matrix).
+    """
+    target = tmp_path / f"obs-stamp-{table}-{case}.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    conn = sqlite3.connect(str(target))
+    try:
+        if table == "observations":
+            conn.execute("CREATE TABLE observations (variable TEXT, valid_at TEXT)")
+        conn.execute(
+            f"INSERT INTO {table} (variable, valid_at) VALUES (?, ?)",
+            ("temperature", "2026-01-01T05:00:00Z"),
+        )
+        conn.execute(
+            f"INSERT INTO {table} (variable, valid_at) VALUES (?, ?)",
+            ("temperature", bad),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == (
+        f"invalid timestamp in {table}.valid_at: expected UTC form YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+
+@pytest.mark.parametrize("table", ["station_observations", "observations"])
+def test_import_accepts_canonical_observation_stamps(
+    table: str, tmp_path: Path
+) -> None:
+    """S8: canonical accept control -- a leap-day, a half-hour and an
+    on-the-hour ``valid_at`` in ``station_observations``/``observations``
+    must not trip the new D4 stamp guard.
+    """
+    target = tmp_path / f"obs-stamp-accept-{table}.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    conn = sqlite3.connect(str(target))
+    try:
+        if table == "observations":
+            conn.execute("CREATE TABLE observations (variable TEXT, valid_at TEXT)")
+        for stamp in (
+            "2026-01-01T05:00:00Z",
+            "2024-02-29T23:00:00Z",
+            "2026-12-31T23:30:00Z",
+        ):
+            conn.execute(
+                f"INSERT INTO {table} (variable, valid_at) VALUES (?, ?)",
+                ("temperature", stamp),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    db_transfer._validate_upload(target)  # must not raise  # noqa: SLF001
+
+
+@pytest.mark.parametrize("name", _OTHER_APP_TABLES)
+@pytest.mark.parametrize("kind", ["view", "virtual"])
+def test_import_rejects_non_table_under_app_table_name(
+    kind: str, name: str, tmp_path: Path
+) -> None:
+    """S10: every one of the other 20 schema table names, held by a view or
+    a virtual table, is refused -- the D6 loop over ``schema_table_names()``
+    reaches names none of the pre-0.16.2 checks ever looked at.
+    """
+    target = tmp_path / f"other-table-{kind}-{name}.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    conn = sqlite3.connect(str(target))
+    try:
+        if kind == "view":
+            conn.execute(f"CREATE VIEW {name} AS SELECT 1 AS x")
+        else:
+            m = _require_fixture_vtab_module()
+            conn.execute(f"CREATE VIRTUAL TABLE {name} USING {m}(a)")
+        conn.commit()
+    finally:
+        conn.close()
+    check_conn = sqlite3.connect(str(target))
+    try:
+        row = check_conn.execute(
+            "SELECT type, sql FROM sqlite_master WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        check_conn.close()
+    assert row is not None, f"fixture: {name} must exist"
+    if kind == "view":
+        assert str(row[0]) == "view", f"fixture: {name} must be a view"
+    else:
+        assert str(row[0]) == "table", f"fixture: {name} must catalogue as table"
+        assert str(row[1]).startswith("CREATE VIRTUAL TABLE"), (
+            f"fixture: {name} must be a virtual table"
+        )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == f"not a table: {name}"
+
+
+def test_admission_table_list_matches_the_migrated_schema() -> None:
+    """S11: ``schema_table_names()`` is complete and current against a
+    freshly migrated schema -- a name dropped from the derived list, or
+    from either hand-written oracle tuple, shows up here.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        run_migrations(conn)
+        migrated = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'"
+            )
+        }
+    finally:
+        conn.close()
+    assert set(schema_table_names()) == migrated
+    assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
+        _CHECKED_TODAY_TABLES
+    )
+    assert len(schema_table_names()) == 27
+
+
+def test_import_refused_below_sqlite_3_37_before_processing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1: below SQLite 3.37, ``import_db`` must refuse with 501 before ANY
+    of the upload work runs -- ``_stream_to``, ``_validate_upload`` and
+    ``_stage_pending_rebuild_state`` (recorded here, each delegating to the
+    real function) are never called, nothing is staged or swapped, and the
+    admission guard is released.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _insert_synthetic_site(conn, "site-live", enabled=1)
+    conn.commit()
+    db_dir = Path(config.db_path).parent
+
+    replacement_path = tmp_path / "replacement.db"
+    db = Database(str(replacement_path))
+    try:
+        _insert_synthetic_site(db._conn, "site-synthetic")  # noqa: SLF001
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+    finally:
+        db.close()
+    payload = replacement_path.read_bytes()
+
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+
+        sites = client.get("/api/sites").json()
+        names = {s["name"] for s in sites}
+        assert names == {"site-live"}, "precondition: only the live site exists"
+        assert list(db_dir.glob("*.db.bak")) == [], "precondition: no backup exists yet"
+
+        calls: list[str] = []
+        real_stream_to = db_transfer._stream_to  # noqa: SLF001
+        real_validate_upload = db_transfer._validate_upload  # noqa: SLF001
+        real_stage_pending_rebuild_state = (
+            db_transfer._stage_pending_rebuild_state  # noqa: SLF001
+        )
+
+        async def _record_stream_to(request: Request, tmp: Path) -> int:
+            calls.append("read")
+            return await real_stream_to(request, tmp)
+
+        def _record_validate_upload(tmp: Path) -> None:
+            calls.append("validate")
+            real_validate_upload(tmp)
+
+        def _record_stage_pending_rebuild_state(tmp: Path) -> None:
+            calls.append("stage")
+            real_stage_pending_rebuild_state(tmp)
+
+        monkeypatch.setattr(db_transfer, "_stream_to", _record_stream_to)
+        monkeypatch.setattr(db_transfer, "_validate_upload", _record_validate_upload)
+        monkeypatch.setattr(
+            db_transfer,
+            "_stage_pending_rebuild_state",
+            _record_stage_pending_rebuild_state,
+        )
+        monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 36, 0))
+
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+        sites_after = client.get("/api/sites").json()
+
+    assert resp.status_code == 501
+    assert resp.json() == {
+        "error": (
+            "database import needs SQLite 3.37.0 or newer; "
+            "this add-on is running SQLite 3.36.0"
+        )
+    }
+    assert calls == [], "no upload work may run before the version gate"
+    names_after = {s["name"] for s in sites_after}
+    assert names_after == {"site-live"}, "the live database must be unchanged"
+    assert list(db_dir.glob("*.db.bak")) == [], "no backup may be created"
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        "no import temp may remain"
+    )
+    assert db_transfer._import_in_progress is False  # noqa: SLF001
+
+
+def test_import_proceeds_at_sqlite_3_37(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2: boundary control -- exactly SQLite 3.37.0 must NOT be refused by
+    the version gate; the request reaches the existing empty-upload check
+    (422 ``empty upload``) instead of the 501 version refusal.
+    """
+    _init_tmp_db(tmp_path)
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 37, 0))
+        resp = client.post("/api/import/db", content=b"", headers=headers)
+    assert resp.status_code == 422
+    assert resp.json() == {"error": "empty upload"}
+    assert db_transfer._import_in_progress is False  # noqa: SLF001

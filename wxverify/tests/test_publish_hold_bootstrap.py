@@ -32,6 +32,7 @@ from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
+from wxverify.api.routes import db_transfer
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.migrations import (
     PUBLISH_HOLD_BOOTSTRAP_KEY,
@@ -1075,5 +1076,123 @@ def test_o17d_companion_runtime_state_table_is_created_not_skipped(
             "ensure_runtime_state_table must CREATE the table when it is absent "
             "(this is the one guard that is create-if-absent, not skip)"
         )
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# S6 (0.16.2 plan 2026-09-23-db-import-schema-checks.md): the neutralizer's
+# table-presence gates (jobs / _VERIFICATION_RUN_TABLES) must resolve
+# case-insensitively via table_exists, D2.
+# ---------------------------------------------------------------------------
+
+
+def test_s6_case_variant_active_chain_neutralized_before_promotion(
+    tmp_path: Path,
+) -> None:
+    """S6: a donor whose ``jobs`` and ``verification_runs`` tables were
+    renamed to mixed case (``Jobs``/``Verification_Runs``) still gets its
+    in-flight chain neutralized exactly as the ordinary-case O17a donor does
+    -- pins that the neutralizer's own gates use the same case-insensitive
+    ``table_exists`` the rest of D2 does, not an exact-name lookup.
+    """
+    donor_path = tmp_path / "donor-case-variant.db"
+    conn = _emulated_0_11_0_donor(donor_path)
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites"
+            " (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)"
+            " VALUES ('site-synthetic', 0.0, 0.0, 100.0, 'UTC', 1)"
+        ).lastrowid
+    )
+    gen = ensure_published_generation(conn, site_id)
+
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
+        "('verification_run', ?, ?, 'pending')",
+        (site_id, verification_job_key(site_id)),
+    )
+    running = _insert_run(conn, site_id, state="running", tz_generation_id=gen)
+    _insert_evidence_all_tables(conn, running)
+    set_runtime_state(conn, verification_state_key(site_id), '{"phase":"scoring"}')
+    set_runtime_state(conn, verification_heartbeat_key(site_id), "2026-06-01T02:05:00Z")
+
+    published = _insert_run(conn, site_id, state="published", tz_generation_id=gen)
+    _insert_evidence_all_tables(conn, published)
+    set_runtime_state(conn, published_run_key(site_id), str(published))
+
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, status) "
+        "VALUES ('forecast_record', ?, 'pending')",
+        (site_id,),
+    )
+    conn.commit()
+
+    # SQLite refuses a case-ONLY rename, so each goes through a temp name.
+    conn.execute("ALTER TABLE jobs RENAME TO jobs_case_tmp")
+    conn.execute("ALTER TABLE jobs_case_tmp RENAME TO Jobs")
+    conn.execute("ALTER TABLE verification_runs RENAME TO verification_runs_case_tmp")
+    conn.execute("ALTER TABLE verification_runs_case_tmp RENAME TO Verification_Runs")
+    conn.commit()
+    conn.close()
+
+    # Precondition, on a fresh connection.
+    check_conn = sqlite3.connect(str(donor_path))
+    try:
+        names = {
+            str(row[0])
+            for row in check_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert "Jobs" in names and "Verification_Runs" in names, (
+            "fixture: both tables must be stored under mixed-case names"
+        )
+        assert "jobs" not in names and "verification_runs" not in names, (
+            "fixture: the ordinary-case names must not exist"
+        )
+        fk_violations = check_conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert fk_violations == [], (
+            "fixture: the case-only rename must not break a foreign key"
+        )
+    finally:
+        check_conn.close()
+
+    db_transfer._neutralize_imported_verification_chains(donor_path)  # noqa: SLF001
+
+    conn = sqlite3.connect(str(donor_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        job = conn.execute(
+            "SELECT status, last_error FROM jobs WHERE type = 'verification_run'"
+        ).fetchone()
+        assert job is not None
+        assert str(job["status"]) == "failed"
+        assert str(job["last_error"]) == IMPORT_SUPPRESSED_REASON
+
+        assert _run_state(conn, running)[0] == "failed"
+        assert _evidence_row_counts(conn, running) == {
+            "verification_evidence": 0,
+            "verification_day_context": 0,
+            "verification_results": 0,
+            "verification_verdicts": 0,
+        }
+        assert get_runtime_state(conn, verification_state_key(site_id)) is None
+        assert get_runtime_state(conn, verification_heartbeat_key(site_id)) is None
+
+        assert _run_state(conn, published)[0] == "published"
+        assert _evidence_row_counts(conn, published) == {
+            "verification_evidence": 1,
+            "verification_day_context": 1,
+            "verification_results": 1,
+            "verification_verdicts": 1,
+        }
+        assert get_runtime_state(conn, published_run_key(site_id)) == str(published)
+
+        other_job = conn.execute(
+            "SELECT status FROM jobs WHERE type = 'forecast_record'"
+        ).fetchone()
+        assert other_job is not None
+        assert str(other_job["status"]) == "pending"
     finally:
         conn.close()

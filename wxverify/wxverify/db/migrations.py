@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import sqlite3
 import time
@@ -501,6 +502,28 @@ def create_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+@functools.cache
+def schema_table_names() -> tuple[str, ...]:
+    """Names of every table `create_tables` makes, sorted, read back from SQLite.
+
+    Built on first use against a private in-memory database, so the list
+    cannot drift from the DDL, and importing this module runs no SQL.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        create_tables(conn)
+        return tuple(
+            sorted(
+                str(name_row[0])
+                for name_row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            )
+        )
+    finally:
+        conn.close()
+
+
 def create_indexes(conn: sqlite3.Connection) -> None:
     """Every CREATE INDEX IF NOT EXISTS of the current schema, verbatim, plus
     the two code-generated forecast_samples indexes.
@@ -624,11 +647,13 @@ def _sync_forecast_sample_index(conn: sqlite3.Connection, name: str, ddl: str) -
     conn.execute(f"SAVEPOINT {name}_sync")
     try:
         stored = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+            "SELECT sql FROM sqlite_master WHERE type = 'index'"
+            " AND name = ? COLLATE NOCASE",
             (name,),
         ).fetchone()
-        if stored is not None and _index_predicate(stored["sql"]) != _index_predicate(
-            ddl
+        if stored is not None and (
+            "ON forecast_samples" not in str(stored["sql"])
+            or _index_predicate(str(stored["sql"])) != _index_predicate(ddl)
         ):
             logger.info("rebuilding %s: stored definition changed", name)
             conn.execute(f"DROP INDEX {name}")
