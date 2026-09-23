@@ -3333,7 +3333,7 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
         assert cross.status_code == 403
         simple = client.put(
             f"/api/sites/{site_id}",
-            data="enabled=true",
+            content="enabled=true",
             headers={
                 "Origin": "http://testserver",
                 "X-CSRF-Token": csrf,
