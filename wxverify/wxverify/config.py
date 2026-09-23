@@ -54,16 +54,21 @@ class FeedSeed:
 #: test pins the two together.
 DISPLAY_REQUEST_HOURS: Final = 217
 
-#: Each Open-Meteo model's request horizon, in hours: its own maximum where
-#: that falls below `DISPLAY_REQUEST_HOURS`, and the ceiling itself where the
-#: model reaches past what the displayed product can consume. Single source
-#: for both the fresh-database seed below and the one-shot correction
+#: Each Open-Meteo model's request horizon, in hours: its longest-run maximum
+#: where that falls below `DISPLAY_REQUEST_HOURS`, and the ceiling itself
+#: where the model reaches past what the displayed product can consume. One
+#: exception: `meteofrance_arpege_world` stays at 168, above its advertised
+#: duration, to preserve its existing scoring eligibility. The request length
+#: counts from the fetch hour and a stored lead from the estimated issue
+#: time, so the advertised duration alone does not justify lowering a bound
+#: that pairing also applies. Single source for both the fresh-database seed
+#: below and the one-shot correction
 #: `db.migrations.correct_open_meteo_horizons` applies to existing databases,
 #: so the two cannot drift apart.
 OPEN_METEO_MAX_LEAD_HOURS: Final[Mapping[str, int]] = {
     "ecmwf_ifs": DISPLAY_REQUEST_HOURS,
     "gfs_global": DISPLAY_REQUEST_HOURS,
-    "icon_global": 180,  # the model's own maximum, below the ceiling
+    "icon_global": 180,  # the model's longest-run maximum, below the ceiling
     "gem_global": DISPLAY_REQUEST_HOURS,
     "meteofrance_arpege_world": 168,
     "jma_gsm": DISPLAY_REQUEST_HOURS,

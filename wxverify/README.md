@@ -272,8 +272,14 @@ Two limits apply here, and they are not the same number.
 **Request horizon — per feed.** Every feed row carries its own
 `max_lead_hours`, and that value is what the fetcher asks the provider for. For
 Open-Meteo, `config.OPEN_METEO_MAX_LEAD_HOURS` maps each model to its horizon:
-the ceiling `config.DISPLAY_REQUEST_HOURS` for a model that reaches at least
-that far, and the model's own advertised maximum where that is shorter. Adding
+`ecmwf_ifs`, `gfs_global`, `gem_global` and `jma_gsm` are requested to the
+ceiling `config.DISPLAY_REQUEST_HOURS` (`217`); `icon_global` to `180` and
+`ukmo_global_deterministic_10km` to `168`, each model's longest-run maximum;
+and `meteofrance_arpege_world` stays at `168` to preserve its existing scoring
+eligibility. The request length counts from the hour of the fetch, but a stored
+lead counts from the estimated issue time, so the model's advertised duration
+of about four days does not by itself justify lowering its `max_lead_hours`,
+which also bounds scoring. No feed's horizon is lowered in 0.16.0. Adding
 a model means adding an entry to that mapping — the fresh-database seed and
 the one-shot correction applied to existing databases both read it, so the two
 cannot drift apart. Meteoblue is unchanged: its seed stays at `168` and its
@@ -296,9 +302,15 @@ local calendar dates: eight local days span 191 to 193 elapsed hours, depending
 on whether a daylight-saving transition falls inside the window. Any fixed hour
 count would be wrong on one side or the other.
 
-The two raised limits therefore buy two different things. For each feed whose
-horizon rose, the scorer gains the 169-192 h band that the old flat `168` was
-cutting off; the display gains a complete last day.
+Raising a feed's `max_lead_hours` extends both its request window and its
+scoring admission bound, but scoring still stops at the calendar-day buckets
+described just above. For a feed now at `217`, scoring can admit additional
+leads above `168`, up to that bound and subject to those buckets, and the
+display can fill its last day as far as the model actually returns usable
+hours: a longer request improves last-day coverage but does not guarantee a
+complete day. `icon_global`, raised to `180`, gains at most leads 169-180 for
+scoring, and its last displayed day can still be incomplete, because its
+request can end before that day ends. Both feeds kept at `168` are unchanged.
 
 Actual stored coverage can still be shorter than a feed's own request horizon,
 when the provider or a member model returns less — some regional Meteoblue
@@ -840,7 +852,15 @@ that clears on its own is consistent with a Watchdog-triggered restart —
 confirm in the Supervisor log, which shows
 a `Watchdog found app Weather Verify ...` line.
 The runtime health routes `/api/health/*` and
-`/api/worker/status` remain available for ad-hoc inspection. `/api/worker/status`
+`/api/worker/status` remain available for ad-hoc inspection.
+`GET /api/health/feeds` returns one row per site and provider feed, each with
+its `status`; Meteoblue's member models are reported under its package row. By
+default each row carries `sample_count`, an exact count of every sample stored
+for that site and feed, which gets slower to compute as history grows. Add
+`?include_sample_count=false` for a lighter check: each row then carries a
+boolean `has_samples` in place of `sample_count`, and every other field, every
+`status` value and the row order are the same as in the default response. The
+default response is unchanged from 0.15.0. `/api/worker/status`
 also carries `read_cache_warm` — the read cache's own report of its most recent
 warm (`state`, `at`, `detail`, `derivations_failed`), or `null` before any warm
 has run. Read `state` together with `at`, never on its own: one slot is shared by
@@ -939,6 +959,16 @@ With the default cadences, each enabled site makes:
   aligned to publication, so fetching every published run is not guaranteed.
 - Meteoblue: one multimodel package call every `360` minutes, or `4` calls per
   enabled site per day. The current package costs `16000` credits per call.
+
+The run a forward Open-Meteo forecast is labelled with, and the time it is
+recorded as issued, are estimated from the time of the fetch: the add-on
+subtracts a flat `90`-minute availability lag and rounds the result down to the
+model's run cadence in UTC, to `00`, `06`, `12` or `18` UTC, or to `00` or `12`
+UTC for `gem_global`. No run identifier is read from the provider, and nothing
+confirms which provider run a stored forecast came from. `gem_global`'s
+estimated labels are now twelve-hourly, matching the model's twelve-hour run
+schedule; forward `gem_global` forecasts stored before 0.16.0 keep their
+six-hourly estimated labels, and no stored row is relabelled.
 
 For an example deployment with one enabled site, 8 enabled stations, 7 enabled
 Open-Meteo models, and the Meteoblue package enabled, the expected steady-state
