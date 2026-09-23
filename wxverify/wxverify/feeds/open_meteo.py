@@ -23,7 +23,7 @@ RUN_CADENCE_HOURS: Final[dict[str, int]] = {
     "ecmwf_ifs": 6,
     "gfs_global": 6,
     "icon_global": 6,
-    "gem_global": 6,
+    "gem_global": 12,
     "meteofrance_arpege_world": 6,
     "jma_gsm": 6,
     "ukmo_global_deterministic_10km": 6,
@@ -52,10 +52,35 @@ class OpenMeteoResponse(BaseModel):
     hourly: dict[str, list[str | int | float | None]]
 
 
+def _run_shape(model: str) -> tuple[int, int]:
+    """Cadence hours and availability-lag minutes for one model.
+
+    ``RUN_CADENCE_HOURS`` is the roster; ``RUN_AVAILABILITY_LAG_MINUTES`` is
+    derived from it, so one membership test governs both lookups. No default:
+    a model absent from the roster cannot be assigned a run label, and
+    inventing one silently mis-attributes every sample it produces for the
+    life of the feed.
+    """
+    if model not in RUN_CADENCE_HOURS:
+        raise ValueError(f"open-meteo model has no run cadence: {model}")
+    return RUN_CADENCE_HOURS[model], RUN_AVAILABILITY_LAG_MINUTES[model]
+
+
 def _snap_run(model: str, fetch_time: str | None = None) -> str:
+    """Estimate the run boundary of a forecast fetched at ``fetch_time``.
+
+    Subtracts the model's availability lag from the fetch time (default:
+    now) and floors the UTC hour to the model's run cadence. The result is
+    an estimate derived from the fetch clock alone, not a provider-reported
+    run time: no field of the Open-Meteo response is consulted, and the lag
+    is a flat allowance rather than a measured publication delay. It could
+    only become authoritative with a run identifier carried in the forecast
+    payload, or with a documented endpoint that selects a forecast by run;
+    Open-Meteo documents neither for this request.
+    """
+    cadence, lag_minutes = _run_shape(model)
     now = parse_utc(fetch_time) if fetch_time else utc_now()
-    lagged = now - timedelta(minutes=RUN_AVAILABILITY_LAG_MINUTES.get(model, 90))
-    cadence = RUN_CADENCE_HOURS.get(model, 6)
+    lagged = now - timedelta(minutes=lag_minutes)
     hour = (lagged.hour // cadence) * cadence
     snapped = lagged.replace(hour=hour, minute=0, second=0, microsecond=0)
     return isoformat_utc(snapped)
@@ -123,8 +148,8 @@ class OpenMeteoAdapter:
         response.raise_for_status()
         payload = OpenMeteoResponse.model_validate(response.json())
         data = payload.model_dump()
-        issued_at = _snap_run(req.model)
-        samples = _samples_from_hourly(req.model, issued_at, data)
+        estimated_issued_at = _snap_run(req.model)
+        samples = _samples_from_hourly(req.model, estimated_issued_at, data)
         logger.debug(
             "open_meteo forecast response status=%s samples=%s",
             response.status_code,

@@ -876,6 +876,59 @@ def correct_open_meteo_horizons(conn: sqlite3.Connection) -> None:
     set_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY, "applied")
 
 
+#: One-shot marker for the 0.16.0 Open-Meteo fetch-interval correction.
+#: Presence -- not value -- is the gate, matching
+#: OPEN_METEO_HORIZON_CORRECTION_KEY.
+OPEN_METEO_INTERVAL_CORRECTION_KEY = "open_meteo_interval_correction_applied"
+
+
+def correct_open_meteo_fetch_intervals(conn: sqlite3.Connection) -> None:
+    """Move every Open-Meteo feed to one poll per published run, once.
+
+    All seven feeds were seeded at a uniform 360 minutes. `gem_global`
+    updates every 12 hours, so a 6-hour poll collected each update twice;
+    it moves to 720. The other six update every 6 hours and keep 360.
+    `config.OPEN_METEO_FETCH_INTERVAL_MINUTES` is the same table
+    `FEED_SEEDS` seeds from, so a fresh database and an upgraded one
+    cannot drift apart.
+
+    Not a `user_version` migration: no schema shape changes, and older
+    code reads a corrected row correctly, so bumping the version would
+    assert an incompatibility that does not exist.
+
+    `fetch_interval_minutes` IS operator-writable (`update_feed` in
+    `api/routes/feeds.py`), so the `fetch_interval_minutes = 360`
+    predicate is what leaves an interval the operator has already changed
+    exactly as the operator set it. The `runtime_state` marker -- not
+    that predicate -- is what makes this one-shot: once it is written, a
+    row the operator later sets back to 360 stays at 360.
+
+    Statement order is the crash guard, so no SAVEPOINT is needed:
+    every `UPDATE` first, marker last. A crash in between leaves some
+    rows corrected with no marker, and the next boot re-runs `UPDATE`s
+    that match only the still-uncorrected rows before writing it.
+
+    Targeted, not a general seed reconciliation: `seed_default_feeds`
+    runs on every open, so an UPSERT-all pass would reset the
+    operator-writable columns (`enabled`, `disabled_reason`,
+    `fetch_interval_minutes`, `default_subscribed`) at every boot.
+
+    Six of the seven iterations write 360 over 360 -- a no-op by
+    arithmetic, not by a special case.
+    """
+    if get_runtime_state(conn, OPEN_METEO_INTERVAL_CORRECTION_KEY) is not None:
+        return
+    for model, minutes in config.OPEN_METEO_FETCH_INTERVAL_MINUTES.items():
+        conn.execute(
+            """
+            UPDATE feeds SET fetch_interval_minutes = ?
+            WHERE source = 'open-meteo' AND model = ? AND fetch_interval_minutes = 360
+            """,
+            (minutes, model),
+        )
+    set_runtime_state(conn, OPEN_METEO_INTERVAL_CORRECTION_KEY, "applied")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -912,6 +965,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
     correct_open_meteo_horizons(conn)
+    correct_open_meteo_fetch_intervals(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)

@@ -908,8 +908,10 @@ With the default cadences, each enabled site makes:
 - Weather.com PWS: one call per enabled station per observation cycle. With the
   default `obs_interval_minutes=180` and up to `obs_jitter_minutes=20`, that is
   roughly `7.2` to `8` cycles per day.
-- Open-Meteo forecasts: one call per enabled Open-Meteo model every
-  `360` minutes, or `4` calls per model per day.
+- Open-Meteo forecasts: each enabled Open-Meteo model is polled every `360`
+  minutes (`4` calls per day), except `gem_global`, polled every `720` minutes
+  (`2` calls per day). Polling follows each model's run cadence but is not
+  aligned to publication, so fetching every published run is not guaranteed.
 - Meteoblue: one multimodel package call every `360` minutes, or `4` calls per
   enabled site per day. The current package costs `16000` credits per call.
 
@@ -920,7 +922,7 @@ use is:
 | Provider        |          Expected steady-state use |
 | --------------- | ---------------------------------: |
 | Weather.com PWS |            about `56-64` calls/day |
-| Open-Meteo      |                     `28` calls/day |
+| Open-Meteo      |                     `26` calls/day |
 | Meteoblue       | `4` calls/day, `64000` credits/day |
 
 The default wxverify caps are:

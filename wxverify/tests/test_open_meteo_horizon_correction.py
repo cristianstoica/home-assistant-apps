@@ -278,14 +278,30 @@ def test_correction_updates_every_matching_model_not_just_the_first() -> None:
 
 def test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds() -> None:
     """The key set of ``OPEN_METEO_MAX_LEAD_HOURS`` equals the key set of
-    ``feeds.open_meteo.RUN_CADENCE_HOURS`` and the set of Open-Meteo models
-    ``FEED_SEEDS`` builds. The expected hours are pinned as literals here,
-    not read back from ``OPEN_METEO_MAX_LEAD_HOURS`` -- ``FEED_SEEDS``
-    derives from that mapping, so comparing the two would be
-    self-confirming.
+    ``feeds.open_meteo.RUN_CADENCE_HOURS`` AND the key set of
+    ``OPEN_METEO_FETCH_INTERVAL_MINUTES`` (Item E's fetch-interval table),
+    and all three equal the set of Open-Meteo models ``FEED_SEEDS`` builds.
+    Updated by Item E (E-T9) to cover the third, independently authored
+    mapping rather than duplicating this test -- adding a model to one of
+    the three without the other two now fails here. The expected hours are
+    pinned as literals here, not read back from ``OPEN_METEO_MAX_LEAD_HOURS``
+    -- ``FEED_SEEDS`` derives from that mapping, so comparing the two would
+    be self-confirming.
+
+    ``RUN_AVAILABILITY_LAG_MINUTES`` is deliberately excluded from this
+    parity: it is a comprehension over ``RUN_CADENCE_HOURS``
+    (``wxverify/feeds/open_meteo.py``), so a fourth key-set conjunct would be
+    true for every possible program state and would weaken the assertion by
+    making one of its terms unfalsifiable. ``test_open_meteo_run_attribution
+    .py``'s E-T18 covers that table with the property it can actually
+    violate.
     """
     assert dict(config.OPEN_METEO_MAX_LEAD_HOURS) == _EXPECTED_HOURS
-    assert set(config.OPEN_METEO_MAX_LEAD_HOURS) == set(RUN_CADENCE_HOURS)
+    assert (
+        set(config.OPEN_METEO_MAX_LEAD_HOURS)
+        == set(config.OPEN_METEO_FETCH_INTERVAL_MINUTES)
+        == set(RUN_CADENCE_HOURS)
+    )
     seed_models = {
         seed.model for seed in config.FEED_SEEDS if seed.source == "open-meteo"
     }

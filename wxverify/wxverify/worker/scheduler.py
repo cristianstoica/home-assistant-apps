@@ -34,8 +34,8 @@ _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 # late-write window is open. A success-retry cadence, deliberately distinct
 # from _DUE_JOB_FAILURE_COOLDOWN above (same value today, different
 # decision, and they will drift apart): one hour is strictly finer than the
-# fastest cadence of the thing being waited on -- the seeded feeds carry
-# fetch_interval_minutes = 360 and the obs poll defaults to 180 -- so an
+# fastest cadence of the thing being waited on -- every seeded feed carries
+# fetch_interval_minutes >= 180 and the obs poll defaults to 180 -- so an
 # hourly retry never delays an arriving sample, while capping the day's
 # re-runs at 24 instead of one per worker-loop iteration.
 RECORD_RETRY_INTERVAL = timedelta(hours=1)
