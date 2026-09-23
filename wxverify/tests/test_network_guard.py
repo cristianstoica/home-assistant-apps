@@ -319,12 +319,14 @@ def test_positive_controls_record_nothing() -> None:
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter
         ) -> None:
             writer.close()
+            await writer.wait_closed()
 
         server = await asyncio.start_server(_handle, "127.0.0.1", 0)
         try:
             host, port = server.sockets[0].getsockname()[:2]
             reader, writer = await asyncio.open_connection(host, port)
             writer.close()
+            await writer.wait_closed()
         finally:
             server.close()
             await server.wait_closed()
@@ -341,6 +343,7 @@ def test_positive_controls_record_nothing() -> None:
             writer.write(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
             await writer.drain()
             writer.close()
+            await writer.wait_closed()
 
         server = await asyncio.start_server(_handle, "127.0.0.1", 0)
         try:
