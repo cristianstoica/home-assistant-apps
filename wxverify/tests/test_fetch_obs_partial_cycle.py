@@ -1,7 +1,7 @@
 """Tests for Item B -- one station's HTTP 204 must not abort the site's
 observation cycle (plan section 6, B.10 roster).
 
-This file covers **B-T1 through B-T34**. B-T18 has three parts; the
+This file covers **B-T1 through B-T41**. B-T18 has three parts; the
 first two (``progress=3/3`` and ``progress=2/3``) already live in
 ``tests/test_upstream_payload_error.py`` and are not repeated here -- only
 the third case (``progress=2/6``) is authored below.
@@ -50,6 +50,7 @@ from wxverify.verification.truth import (
     regenerate_marked_truth_chunk,
 )
 from wxverify.worker.processor import (
+    _NO_RECENT_HISTORY_REASON,  # noqa: PLC2701 -- private, exercised directly (see B-T35)
     _park_station_history,  # noqa: PLC2701 -- private, exercised directly (see B-T10)
     _retention_hours,  # noqa: PLC2701 -- private, exercised directly (see B-T31)
     dispatch,
@@ -753,7 +754,7 @@ def test_recovery_clears_the_trio_both_halves(
         is None
     )
 
-    # --- half (b): a 200 fully outside the recency window re-parks. --------
+    # --- half (b): a 200 fully outside the retention window re-parks. ------
     site_id2, (station_id2,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
         _seed_site_and_stations(conn, ["ISTATION02"])
     )
@@ -762,8 +763,8 @@ def test_recovery_clears_the_trio_both_halves(
     assert _station_state(conn, station_id2)["history_error_count"] == 1
 
     _freeze(monkeypatch, now + timedelta(hours=1, minutes=1))  # past the 1h park
-    # No watermark was ever set (the station has never had usable data), so
-    # _retention_hours (processor.py:917-931) returns
+    # No watermark was ever set (the station has never stored an
+    # observation), so _retention_hours (processor.py:917-931) returns
     # _HISTORY_RETENTION_MAX_HOURS=168; 200h back is outside that cutoff.
     cutoff_base = now + timedelta(hours=1, minutes=1)
     stale_stamp = isoformat_utc(cutoff_base - timedelta(hours=200))
@@ -1097,8 +1098,8 @@ def test_the_three_outcomes_are_not_collapsed_into_one_flag(
 
     s1 = _station_state(conn, ids["ISTATION01"])
     s2 = _station_state(conn, ids["ISTATION02"])
-    assert s1["history_error_count"] == 0  # cleared: usable, even though unchanged
-    assert s2["history_error_count"] == 1  # not usable: parked
+    assert s1["history_error_count"] == 0  # cleared: recent, even though unchanged
+    assert s2["history_error_count"] == 1  # not recent: parked
     assert (
         conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
         is None
@@ -1453,9 +1454,8 @@ def test_widened_window_empty_payload_still_parks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Half (a): widening retention must not turn an empty payload into a
-    success -- ``usable = bool(observations)`` (processor.py:987) is still
-    False regardless of how wide ``hours`` was computed, so the station
-    still parks."""
+    success -- ``recent`` is ``False`` for an empty observation list
+    however wide ``hours`` was computed, so the station still parks."""
     conn = _init_tmp_db(tmp_path)
     t0 = datetime(2026, 9, 20, 0, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, t0)
@@ -2140,6 +2140,7 @@ def test_deferred_day_is_admitted_once_coverage_completes_and_settles(
     readings = [
         (isoformat_utc(day_start + timedelta(hours=h)), 10.0) for h in range(16, 24)
     ]
+    # Under B2 this station parks at rung 1; park fields belong to the B2 tests.
     _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=1)
 
     recovered_stamp = isoformat_utc(day_start + timedelta(hours=20))
@@ -2212,3 +2213,446 @@ def test_deferred_day_is_admitted_once_coverage_completes_and_settles(
     assert rows["wind_max"][2] == 5.0
     assert rows["precip_total"][2] == 0.0
     assert rows["precip_occurrence"][2] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# B-T35
+# ---------------------------------------------------------------------------
+
+
+def test_stalled_station_is_parked_though_endpoint_keeps_answering(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A station whose endpoint keeps answering 200 with only its already-
+    stored newest hour is not "reporting" (B.3, outcome 1) -- the retention
+    window always reaches back to the watermark hour, so the list is never
+    empty. This is the test that fails against a clear-on-non-empty gate."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    site_id, (station_id,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION01"])
+    )
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+
+    readings = [
+        (isoformat_utc(t - timedelta(hours=h)), 10.0) for h in (3, 2, 1)
+    ]  # 09:00Z, 10:00Z, 11:00Z
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=1)
+    assert _station_state(conn, station_id)["history_error_count"] == 0
+    assert _site_state(conn, site_id)["last_obs_at"] == isoformat_utc(
+        t - timedelta(hours=1)
+    )
+
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now2 = t + timedelta(hours=8)  # 20:00:00Z
+    _freeze(monkeypatch, now2)
+    # watermark=11:00Z, gap=ceil(9h)=9, window=max(6,min(9+1,168))=10h, so the
+    # fetch cutoff (_retention_hours, processor.py:917-931; the cutoff
+    # comprehension in fetch_hourly_history, pws_adapter.py:317-325) is
+    # 20:00Z-10h=10:00Z: the persisted list is [10:00Z, 11:00Z], never empty.
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=2)
+
+    state = _station_state(conn, station_id)
+    assert state["history_error_count"] == 1
+    assert state["history_next_attempt_at"] == isoformat_utc(now2 + timedelta(hours=1))
+    assert state["history_last_error"] == _NO_RECENT_HISTORY_REASON
+    # last_obs_at is byte-identical to its pre-cycle-2 value.
+    assert _site_state(conn, site_id)["last_obs_at"] == isoformat_utc(
+        t - timedelta(hours=1)
+    )
+    assert (
+        conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
+        is None
+    )
+
+    verdict = build_verdict(
+        conn,
+        pipeline_enabled=True,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now2,
+        export_sweeper_dead=None,
+    )
+    history_cond = _condition(verdict, "obs_station_history_failing")
+    assert history_cond["ok"] is False
+    assert history_cond["count"] == 1
+    stale_cond = _condition(verdict, "obs_stale")
+    assert stale_cond["ok"] is True  # nine hours since the newest reading, < 12h
+
+
+# ---------------------------------------------------------------------------
+# B-T36
+# ---------------------------------------------------------------------------
+
+
+def test_recent_duplicates_never_park(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same site and cycle 1 as B-T35: the payload holds nothing new and
+    nothing newer than the stored watermark, yet the station stays clear.
+    Kills a clear condition keyed on ``changed`` and one keyed on "a
+    reading newer than the watermark" -- both park this healthy station."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    site_id, (station_id,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION01"])
+    )
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+
+    readings = [
+        (isoformat_utc(t - timedelta(hours=h)), 10.0) for h in (3, 2, 1)
+    ]  # 09:00Z, 10:00Z, 11:00Z
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=1)
+
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now2 = t + timedelta(hours=2)  # 14:00:00Z
+    _freeze(monkeypatch, now2)
+    caplog.set_level(logging.WARNING)
+    caplog.clear()
+    # watermark=11:00Z, gap=ceil(3h)=3, window=max(6,min(3+1,168))=6h: the
+    # fetch cutoff is 14:00Z-6h=08:00Z, fresh_since is also 08:00:00Z, and
+    # the newest reading (11:00Z) sits inside [08:00Z, 14:00Z].
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=2)
+
+    state = _station_state(conn, station_id)
+    assert state["history_error_count"] == 0
+    assert state["history_next_attempt_at"] is None
+    assert (
+        conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
+        is None
+    )
+    records = [r for r in caplog.records if r.name == "wxverify.worker.processor"]
+    assert not any("history parked" in r.getMessage() for r in records)
+
+
+# ---------------------------------------------------------------------------
+# B-T37
+# ---------------------------------------------------------------------------
+
+
+def test_recency_range_is_closed_at_both_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The range is closed at both ends, at second precision, on the persist
+    clock (B.3). Freeze one second-and-change into an hour so the unfloored
+    clock and the floored one disagree, and pin all four boundary stations
+    in one cycle."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, 312000, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    now_stamp = isoformat_utc(t.replace(microsecond=0))  # "2026-09-22T12:00:00Z"
+    fresh_since = isoformat_utc(
+        (t - timedelta(hours=6)).replace(microsecond=0)
+    )  # "2026-09-22T06:00:00Z"
+    station_ids = ["ISTATION01", "ISTATION02", "ISTATION03", "ISTATION04"]
+    site_id, ids = _seed_site_and_stations(conn, station_ids)
+
+    readings_by_station = {
+        "ISTATION01": fresh_since,  # exactly fresh_since -> recent
+        "ISTATION02": isoformat_utc(
+            parse_utc(fresh_since) - timedelta(hours=1)
+        ),  # an hour below -> parked
+        "ISTATION03": isoformat_utc(
+            parse_utc(now_stamp) + timedelta(hours=1)
+        ),  # an hour ahead of the clock -> parked
+        "ISTATION04": now_stamp,  # exactly now_stamp -> recent
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        station = str(request.url.params["stationId"])
+        return _obs_response([(readings_by_station[station], 10.0)])
+
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+    _run_fetch_obs(db, writer, site_id, handler)
+
+    assert _station_state(conn, ids["ISTATION01"])["history_error_count"] == 0
+    assert _station_state(conn, ids["ISTATION02"])["history_error_count"] == 1
+    assert _station_state(conn, ids["ISTATION03"])["history_error_count"] == 1
+    assert _station_state(conn, ids["ISTATION04"])["history_error_count"] == 0
+    assert (
+        _station_state(conn, ids["ISTATION02"])["history_last_error"]
+        == _NO_RECENT_HISTORY_REASON
+    )
+    assert (
+        _station_state(conn, ids["ISTATION03"])["history_last_error"]
+        == _NO_RECENT_HISTORY_REASON
+    )
+    # station 3's reading is future-dated, so outcome 3 ignores it; the
+    # newest non-future stamp among the four is station 4's, at now_stamp.
+    assert _site_state(conn, site_id)["last_obs_at"] == now_stamp
+
+
+# ---------------------------------------------------------------------------
+# B-T38
+# ---------------------------------------------------------------------------
+
+
+def test_old_hours_new_to_us_are_stored_while_the_station_stays_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Old hours new to us are stored and queued for scoring while the station stays
+    parked, and site freshness follows the data -- not withheld by a recency conjunct on
+    the freshness write."""
+    conn = _init_tmp_db(tmp_path)
+    t0 = datetime(2026, 9, 20, 0, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t0)
+    site_id, (station_id,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION01"])
+    )
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+    _run_fetch_obs(
+        db,
+        writer,
+        site_id,
+        lambda r: _obs_response([(isoformat_utc(t0), 5.0)]),
+        job_id=1,
+    )
+
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now = t0 + timedelta(hours=30)
+    _freeze(monkeypatch, now)
+    # watermark=t0, gap=ceil(30h)=30, window=max(6,min(30+1,168))=31h, so
+    # the cutoff (t0-1h) keeps every one of these 20 readings, and
+    # fresh_since (t0+24h) is above all of them -- none is recent.
+    readings = _hourly_readings(t0 + timedelta(hours=1), t0 + timedelta(hours=20))
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings), job_id=2)
+
+    stored = {
+        str(r["valid_at"])
+        for r in conn.execute(
+            "SELECT valid_at FROM station_observations WHERE station_id=? "
+            "AND variable='temperature' AND valid_at >= ?",
+            (station_id, isoformat_utc(t0 + timedelta(hours=1))),
+        )
+    }
+    expected = {isoformat_utc(t0 + timedelta(hours=h)) for h in range(1, 21)}
+    assert stored == expected
+    assert (
+        conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
+        is not None
+    )
+    watermark = conn.execute(
+        "SELECT MAX(valid_at) FROM station_observations WHERE station_id=?",
+        (station_id,),
+    ).fetchone()[0]
+    assert str(watermark) == isoformat_utc(t0 + timedelta(hours=20))
+    assert _station_state(conn, station_id)["history_error_count"] == 1
+    assert _site_state(conn, site_id)["last_obs_at"] == isoformat_utc(
+        t0 + timedelta(hours=20)
+    )
+
+    verdict = build_verdict(
+        conn,
+        pipeline_enabled=True,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now,
+        export_sweeper_dead=None,
+    )
+    history_cond = _condition(verdict, "obs_station_history_failing")
+    assert history_cond["ok"] is False
+    assert history_cond["count"] == 1
+    stale_cond = _condition(verdict, "obs_stale")
+    assert stale_cond["ok"] is True  # cutoff t0+18h; last_obs_at is t0+20h
+
+
+# ---------------------------------------------------------------------------
+# B-T39
+# ---------------------------------------------------------------------------
+
+
+def test_a_recent_reading_clears_the_park(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Continues B-T35's database: recovery takes the first attempt after
+    the rung expires, and no second clean cycle is needed."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    site_id, (station_id,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION01"])
+    )
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+
+    readings1 = [
+        (isoformat_utc(t - timedelta(hours=h)), 10.0) for h in (3, 2, 1)
+    ]  # 09:00Z, 10:00Z, 11:00Z
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings1), job_id=1)
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now2 = t + timedelta(hours=8)  # 20:00:00Z
+    _freeze(monkeypatch, now2)
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings1), job_id=2)
+    parked = _station_state(conn, station_id)
+    assert parked["history_error_count"] == 1
+    next_attempt = parse_utc(str(parked["history_next_attempt_at"]))
+    assert next_attempt == now2 + timedelta(hours=1)  # rung 1
+
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now3 = next_attempt + timedelta(minutes=1)  # one minute past the rung
+    _freeze(monkeypatch, now3)
+    # watermark=11:00Z, now3=21:01Z, gap=ceil(10h1min)=11, window=
+    # max(6,min(11+1,168))=12h, so the cutoff (now3-12h=09:01Z) keeps every
+    # hour from 12:00Z onward; fresh_since (now3-6h=15:01Z) puts the newest
+    # served hour (20:00Z) inside [15:01Z, 21:01Z] -- recent.
+    readings3 = _hourly_readings(t, now3 - timedelta(hours=1, minutes=1))
+    _run_fetch_obs(db, writer, site_id, lambda r: _obs_response(readings3), job_id=3)
+
+    recovered = _station_state(conn, station_id)
+    assert recovered["history_error_count"] == 0
+    assert recovered["history_next_attempt_at"] is None
+    assert recovered["history_last_error"] is None
+    verdict = build_verdict(
+        conn,
+        pipeline_enabled=True,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now3,
+        export_sweeper_dead=None,
+    )
+    history_cond = _condition(verdict, "obs_station_history_failing")
+    assert history_cond["ok"] is True
+    assert history_cond["count"] == 0
+    assert _site_state(conn, site_id)["last_obs_at"] == isoformat_utc(
+        now3 - timedelta(hours=1, minutes=1)
+    )
+    assert (
+        conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
+        is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# B-T40
+# ---------------------------------------------------------------------------
+
+
+def test_a_stalled_station_beside_a_healthy_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One site, two stations: the site signal stays correctly quiet and
+    the station signal alone reports the stall (B.7(2))."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    site_id, ids = _seed_site_and_stations(conn, ["ISTATION01", "ISTATION02"])
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+
+    seed_readings = [
+        (isoformat_utc(t - timedelta(hours=h)), 10.0) for h in (3, 2, 1)
+    ]  # 09:00Z, 10:00Z, 11:00Z
+    _run_fetch_obs(
+        db, writer, site_id, lambda r: _obs_response(seed_readings), job_id=1
+    )
+
+    conn.execute("DELETE FROM jobs")
+    conn.commit()
+    now2 = t + timedelta(hours=8)  # 20:00:00Z
+    _freeze(monkeypatch, now2)
+    healthy_readings = _hourly_readings(t, now2 - timedelta(hours=1))  # 12:00Z..19:00Z
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        station = str(request.url.params["stationId"])
+        if station == "ISTATION01":
+            return _obs_response(healthy_readings)
+        return _obs_response(seed_readings)  # ISTATION02 re-serves the stale set
+
+    _run_fetch_obs(db, writer, site_id, handler, job_id=2)
+
+    assert _station_state(conn, ids["ISTATION01"])["history_error_count"] == 0
+    assert _station_state(conn, ids["ISTATION02"])["history_error_count"] == 1
+    assert _site_state(conn, site_id)["last_obs_at"] == isoformat_utc(
+        now2 - timedelta(hours=1)
+    )
+    assert (
+        conn.execute("SELECT 1 FROM jobs WHERE type='pair_and_score'").fetchone()
+        is not None
+    )
+    verdict = build_verdict(
+        conn,
+        pipeline_enabled=True,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now2,
+        export_sweeper_dead=None,
+    )
+    history_cond = _condition(verdict, "obs_station_history_failing")
+    assert history_cond["ok"] is False
+    assert history_cond["count"] == 1
+    stale_cond = _condition(verdict, "obs_stale")
+    assert stale_cond["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# B-T41
+# ---------------------------------------------------------------------------
+
+
+def test_a_station_with_no_watermark(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A station with no stored observation gets the widest window
+    (``_retention_hours``'s ``watermark is None`` branch), and that width
+    neither hides a genuine stall nor manufactures one for a reporting
+    station."""
+    conn = _init_tmp_db(tmp_path)
+    t = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t)
+    db = get_db()
+    writer = FencedWriter(db, db.generation)
+
+    # Half (a): only old hours on first contact -- ingested in full and
+    # reported, never taken as proof the station is live.
+    site_id1, (station_id1,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION01"])
+    )
+    readings1 = _hourly_readings(t - timedelta(hours=30), t - timedelta(hours=20))
+    _run_fetch_obs(db, writer, site_id1, lambda r: _obs_response(readings1), job_id=1)
+
+    stored1 = {
+        str(r["valid_at"])
+        for r in conn.execute(
+            "SELECT valid_at FROM station_observations WHERE station_id=? "
+            "AND variable='temperature'",
+            (station_id1,),
+        )
+    }
+    expected1 = {isoformat_utc(t - timedelta(hours=h)) for h in range(20, 31)}
+    assert stored1 == expected1
+    state1 = _station_state(conn, station_id1)
+    assert state1["history_error_count"] == 1
+    assert state1["history_next_attempt_at"] == isoformat_utc(t + timedelta(hours=1))
+    assert state1["history_last_error"] == _NO_RECENT_HISTORY_REASON
+    assert (
+        conn.execute(
+            "SELECT 1 FROM jobs WHERE type='pair_and_score' AND site_id=?",
+            (site_id1,),
+        ).fetchone()
+        is not None
+    )
+    assert _site_state(conn, site_id1)["last_obs_at"] == isoformat_utc(
+        t - timedelta(hours=20)
+    )
+
+    # Half (b): a reporting station's first contact does not look stalled
+    # even under the widest window.
+    site_id2, (station_id2,) = (lambda pair: (pair[0], tuple(pair[1].values())))(
+        _seed_site_and_stations(conn, ["ISTATION02"])
+    )
+    readings2 = _hourly_readings(t - timedelta(hours=10), t - timedelta(hours=1))
+    _run_fetch_obs(db, writer, site_id2, lambda r: _obs_response(readings2), job_id=2)
+    state2 = _station_state(conn, station_id2)
+    assert state2["history_error_count"] == 0
+    assert state2["history_next_attempt_at"] is None

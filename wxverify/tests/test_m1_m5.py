@@ -942,6 +942,7 @@ def test_pws_parser_and_fetch_obs_refresh(
 
     monkeypatch.setattr("wxverify.worker.processor.fetch_hourly_history", fake_history)
     dispatch_db = get_db()
+    # Under B2 this station parks at rung 1; park fields belong to the B2 tests.
     asyncio.run(
         dispatch(
             dispatch_db,

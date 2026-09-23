@@ -117,13 +117,15 @@ class StationPersistOutcome:
     """What one station's persisted payload proved about this cycle.
 
     Three independent facts, never inferred from one another:
-    ``usable`` gates history recovery, ``changed`` gates the
-    ``pair_and_score`` enqueue and ``newest_valid_at`` gates site
-    freshness. ``usable=True`` with ``newest_valid_at=None`` is reachable
-    -- a station whose every reading is future-dated.
+    ``changed`` gates the ``pair_and_score`` enqueue, ``newest_valid_at``
+    gates site freshness and ``parked`` carries history recovery --
+    ``None`` when a reading no older than ``RECENT_REFRESH_HOURS`` before
+    the persist clock and not after it arrived, the rung otherwise.
+    ``parked`` and ``newest_valid_at`` disagree in one direction only: a
+    station can be parked while supplying a newest time, but a station
+    that is not parked always supplies one.
     """
 
-    usable: bool
     changed: bool
     newest_valid_at: str | None
     parked: HistoryPark | None
@@ -518,7 +520,6 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
         raise JobCancelled()
     logger.debug("fetch_obs site=%s stations=%s", site_id, len(stations))
     changed = False
-    usable = False
     newest_obs_at: str | None = None
     skipped_parked = 0
     async with httpx.AsyncClient() as client:
@@ -618,17 +619,14 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                     outcome.changed,
                 )
                 changed = changed or outcome.changed
-                usable = usable or outcome.usable
                 if outcome.newest_valid_at is not None and (
                     newest_obs_at is None or outcome.newest_valid_at > newest_obs_at
                 ):
                     newest_obs_at = outcome.newest_valid_at
     logger.debug(
-        "fetch_obs cycle done site=%s changed=%s usable=%s newest_obs_at=%s"
-        " skipped_parked=%s",
+        "fetch_obs cycle done site=%s changed=%s newest_obs_at=%s skipped_parked=%s",
         site_id,
         changed,
-        usable,
         newest_obs_at,
         skipped_parked,
     )
@@ -637,7 +635,6 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
             conn,
             site_id,
             changed=changed,
-            usable=usable,
             newest_obs_at=newest_obs_at,
         )
     )
@@ -898,8 +895,8 @@ _HISTORY_BACKOFF_MAX: Final = timedelta(hours=24)
 _HISTORY_BACKOFF_MAX_SHIFT: Final = 5
 _HISTORY_RETENTION_MAX_HOURS: Final = 168  # the provider's seven-day path
 _HISTORY_RETENTION_OVERLAP_HOURS: Final = 1
-_EMPTY_HISTORY_REASON: Final = (
-    "hourly history returned no observations within the recency window"
+_NO_RECENT_HISTORY_REASON: Final = (
+    f"hourly history returned no observation from the last {RECENT_REFRESH_HOURS} hours"
 )
 
 
@@ -984,8 +981,10 @@ def _persist_station_observations(
     ).fetchone()
     if row is None:
         raise JobCancelled()
-    usable = bool(observations)
-    now_stamp = isoformat_utc(utc_now().replace(microsecond=0))
+    now = utc_now().replace(microsecond=0)
+    now_stamp = isoformat_utc(now)
+    fresh_since = isoformat_utc(now - timedelta(hours=RECENT_REFRESH_HOURS))
+    recent = any(fresh_since <= o.valid_at <= now_stamp for o in observations)
     newest_valid_at = max(
         (o.valid_at for o in observations if o.valid_at <= now_stamp), default=None
     )
@@ -1011,7 +1010,7 @@ def _persist_station_observations(
         """,
         (isoformat_utc(), station_id),
     )
-    if usable:
+    if recent:
         conn.execute(
             """
             UPDATE stations
@@ -1023,9 +1022,8 @@ def _persist_station_observations(
         )
         parked = None
     else:
-        parked = _park_station_history(conn, station_id, _EMPTY_HISTORY_REASON)
+        parked = _park_station_history(conn, station_id, _NO_RECENT_HISTORY_REASON)
     return StationPersistOutcome(
-        usable=usable,
         changed=changed,
         newest_valid_at=newest_valid_at,
         parked=parked,
@@ -1047,7 +1045,6 @@ def _complete_obs_cycle(
     site_id: int,
     *,
     changed: bool,
-    usable: bool,
     newest_obs_at: str | None,
 ) -> None:
     cur = conn.execute(
@@ -1060,7 +1057,7 @@ def _complete_obs_cycle(
     )
     if cur.rowcount != 1:
         raise JobCancelled()
-    if usable and newest_obs_at is not None:
+    if newest_obs_at is not None:
         conn.execute(
             """
             UPDATE sites

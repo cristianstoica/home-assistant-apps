@@ -590,6 +590,11 @@ Order matters. Run these steps in sequence:
 - The observation refresh window is six hours in steady state and widens
   automatically, up to the provider's seven-day limit, to cover a gap in stored
   coverage. It is not a setting.
+- A station for which the provider returns no data, or no reading from the last
+  six hours, is retried on a growing delay, from one hour doubling to
+  twenty-four hours, while the site's other stations keep being fetched. The
+  health monitor (`/api/health/monitor`) flags the station until it reports a
+  recent reading again. Older hours it does return are still stored and used.
 - Weather.com PWS calls are budgeted per enabled station.
 - A site with no enabled stations is not observation-due and advances neither
   `last_obs_cycle_at` (cycle completion) nor `last_obs_at` (data freshness).

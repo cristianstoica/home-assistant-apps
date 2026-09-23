@@ -326,8 +326,8 @@ def _pipeline_conditions(
 
     # obs_station_history_failing (Item B.7): enabled stations of enabled sites
     # whose hourly history is failing. Trips on the first park and clears only
-    # when the station returns usable observations, which is the only thing
-    # that zeroes the counter.
+    # when the station returns a recent observation (B.3 outcome 1), the only
+    # thing that zeroes the counter.
     (
         history_failing_n,
         history_worst_rung,
