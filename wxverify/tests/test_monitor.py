@@ -546,6 +546,98 @@ def test_obs_stale_uses_sites_last_obs_at(
         assert _cond(body, "fetch_obs_live")["ok"] is False
 
 
+def test_obs_stale_at_cutoff_boundary_does_not_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Threshold boundary: a site with last_obs_at exactly equal to obs_cutoff
+    # must NOT count, because the SQL uses `s.last_obs_at < ?` (strict). A
+    # mutant that widened this to `<=` would count the at-boundary site and
+    # fail this assertion. Paired with the "one second earlier" test below to
+    # pin both sides of the `<` operator.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "obs-stale-at-boundary.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            # Eligible site: enabled, with >=1 enabled station.
+            site_id = _seed_site(conn)
+            conn.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'FAKE2', 40.0, -105.0, 900.0, 1)
+                """,
+                (site_id,),
+            )
+            # obs_cutoff = fixed_now - 12h = 2026-07-09T00:00:00Z exactly.
+            conn.execute(
+                "UPDATE sites SET last_obs_at='2026-07-09T00:00:00Z' WHERE id=?",
+                (site_id,),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "obs_stale")["ok"] is True
+        assert _cond(body, "obs_stale")["count"] == 0
+
+
+def test_obs_stale_one_second_past_cutoff_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Paired: a site with last_obs_at one second OLDER than obs_cutoff must
+    # count. Together with the at-boundary test above this pins both sides of
+    # the `<` operator so a misplaced `<=` or a reversed comparison would be
+    # caught by at least one of the pair.
+    fixed_now = datetime(2026, 7, 9, 12, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.api.routes.health.utc_now", lambda: fixed_now)
+
+    close_db()
+    config.db_path = str(tmp_path / "obs-stale-past-boundary.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker_async)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE runtime_state SET value='2000-01-01T00:00:00Z' "
+                "WHERE key='worker_started_at'"
+            )
+            # Eligible site: enabled, with >=1 enabled station.
+            site_id = _seed_site(conn)
+            conn.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'FAKE2', 40.0, -105.0, 900.0, 1)
+                """,
+                (site_id,),
+            )
+            # obs_cutoff = 2026-07-09T00:00:00Z;
+            # 2026-07-08T23:59:59Z is 1 second older → stale.
+            conn.execute(
+                "UPDATE sites SET last_obs_at='2026-07-08T23:59:59Z' WHERE id=?",
+                (site_id,),
+            )
+
+        db.write_sync(_seed)
+        body = client.get("/api/health/monitor").json()
+        assert _cond(body, "obs_stale")["ok"] is False
+        assert _cond(body, "obs_stale")["count"] == 1
+
+
 def test_feed_stale_old_timestamp_trips(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
