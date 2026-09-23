@@ -361,10 +361,12 @@ def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
     now = isoformat_utc()
     rows = conn.execute(
         """
-        SELECT st.id, st.site_id, st.pws_station_id
+        SELECT st.id, st.site_id, st.pws_station_id, s.id AS site_row
         FROM stations st
+        LEFT JOIN sites s ON s.id = st.site_id
         LEFT JOIN station_poll_state sps ON sps.station_id = st.id
         WHERE st.enabled = 1
+          AND (s.id IS NULL OR s.enabled = 1)
           AND (sps.next_poll_at IS NULL OR sps.next_poll_at <= ?)
         """,
         (now,),
@@ -380,6 +382,13 @@ def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
             # site now owns that id. Every other station still runs.
             logger.warning(
                 "scheduler: unreadable site_id station=%s; skipping station this tick",
+                station_id,
+            )
+            continue
+        if row["site_row"] is None:
+            logger.warning(
+                "scheduler: station=%s references a missing site; "
+                "skipping station this tick",
                 station_id,
             )
             continue
