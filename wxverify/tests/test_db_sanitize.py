@@ -163,7 +163,7 @@ def test_malformed_settings_table_falls_back_to_default_interval(
 ) -> None:
     """A ``settings`` table of the wrong shape (missing ``value``) raises
     ``sqlite3.OperationalError`` from ``get_number_setting``'s SELECT --
-    guarded only by ``_table_exists``, which only checks the table exists,
+    guarded only by ``table_exists``, which only checks the table exists,
     not its columns. This must fall back to the default interval rather than
     aborting the whole station-poll sanitize pass.
     """
@@ -314,3 +314,56 @@ def test_stage_pending_rebuild_state_sanitizes_the_staged_upload(
         "the staged file must be sanitized before promotion, so the wedge "
         "never survives into the live database"
     )
+
+
+# ---------------------------------------------------------------------------
+# S5 (0.16.2 plan): table_exists resolves case-insensitively.
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_finds_mixed_case_jobs_and_station_poll_state() -> None:
+    """S5: ``table_exists`` matches the way SQLite itself resolves names
+    (``COLLATE NOCASE``), so a mixed-case ``Jobs``/``Station_Poll_State``
+    pair still gets repaired rather than silently skipped -- the exact-name
+    Python lookup this replaces would leave both wedged rows untouched.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(
+        """
+        CREATE TABLE Jobs (
+            id INTEGER PRIMARY KEY,
+            next_attempt_at TEXT
+        );
+        CREATE TABLE Station_Poll_State (
+            station_id INTEGER PRIMARY KEY,
+            next_poll_at TEXT
+        );
+        """
+    )
+    conn.execute("INSERT INTO Jobs (next_attempt_at) VALUES ('zzzz')")
+    conn.execute(
+        "INSERT INTO Station_Poll_State (station_id, next_poll_at) VALUES (1, 'zzzz')"
+    )
+    # Precondition: only the mixed-case names exist, so a lowercase `jobs`/
+    # `station_poll_state` cannot be what the lookup finds.
+    names = {
+        str(row[0])
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert names == {"Jobs", "Station_Poll_State"}, (
+        "fixture: only the mixed-case table names must exist"
+    )
+
+    before = datetime.now(UTC)
+    sanitize_wedge_prone_timestamps(conn)
+
+    job_row = conn.execute("SELECT next_attempt_at FROM Jobs").fetchone()
+    assert job_row["next_attempt_at"] is None
+
+    poll_row = conn.execute(
+        "SELECT next_poll_at FROM Station_Poll_State WHERE station_id = 1"
+    ).fetchone()
+    assert poll_row["next_poll_at"] is not None
+    fixed = parse_utc(poll_row["next_poll_at"])
+    assert before < fixed <= before + timedelta(seconds=300 + 5)

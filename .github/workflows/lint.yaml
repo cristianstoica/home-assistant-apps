@@ -199,11 +199,18 @@ jobs:
       - name: Install test dependencies
         run: uv sync --locked
 
-      - name: Query-plan regression tests
+      - name: Query-plan and import-classification tests
         run: >-
           uv run --locked pytest
           tests/test_query_plan_regressions.py
           tests/test_index_predicate_reconciliation.py
+          tests/test_db_transfer.py::test_import_rejects_virtual_optional_table
+          tests/test_db_transfer.py::test_import_rejects_virtual_required_table
+          tests/test_db_transfer.py::test_import_rejects_index_under_optional_table_name
+          tests/test_db_transfer.py::test_import_fails_closed_when_pragma_table_list_is_shadowed
+          tests/test_db_transfer.py::test_import_classifies_virtual_table_under_vtab_shadow
+          tests/test_db_transfer.py::test_import_guard_fails_closed_when_table_list_pragma_has_no_type_column
+          tests/test_db_transfer.py::test_import_rejects_non_table_under_app_table_name
         env:
           WXV_WEATHERCOM_KEY: "ci-placeholder"
           WXV_EQP_SHIPPING: "1"

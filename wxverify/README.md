@@ -729,13 +729,20 @@ a standalone, checkpointed copy — safe to take while the worker is running.
 Ops → Database Import uploads a previously exported `.db` file and **fully
 replaces** the live database with it. Any data collected since that export is
 lost. The upload is validated first (integrity check, wxverify schema version,
-required tables, and that every forecast time is in the add-on's own UTC form,
-`YYYY-MM-DDTHH:MM:SSZ`), and the current database is automatically backed up
-to `/data/wxverify-<timestamp>-<id>Z.db.bak` before the swap. Only the newest
-`.bak` file is kept; older ones are swept automatically after each import and
-on every add-on startup, so the operator never needs to remove them by hand.
-After a successful import the add-on rebuilds consensus observations,
-forecast pairs, and cached scores in the background — no restart is needed.
+required tables, that each of the add-on's own tables present in the file is
+an ordinary table, and that every forecast and observation time is in the
+add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
+automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
+the swap. Only the newest `.bak` file is kept; older ones are swept
+automatically after each import and on every add-on startup, so the operator
+never needs to remove them by hand. After a successful import the add-on
+rebuilds consensus observations, forecast pairs, and cached scores in the
+background — no restart is needed. Import needs SQLite 3.37 or newer. The
+add-on image ships a newer SQLite, so this matters only for local standalone
+use. There, on an older SQLite, every import is refused before the add-on
+starts processing the uploaded file (reading, checking or swapping it in), the
+current database is left untouched, and the message names the version it
+found.
 
 **An import discards any verification run that was in progress in the donor.**
 Its `verification_run` job is failed with `suppressed: imported active
@@ -1026,7 +1033,9 @@ only 225 when scoped to `wxverify tests`, which drops `scripts/`.
 
 CI additionally runs the query-plan tests inside the add-on's base image with
 `WXV_EQP_SHIPPING=1`, so they check the SQLite build that actually ships rather
-than the local one. A green local run does not cover them.
+than the local one. A green local run does not cover them. The same job also
+runs the import checks that rely on SQLite's own table classification
+(`PRAGMA table_list`), so they are checked against that build as well.
 
 Cite code by its owning symbol, never by `file.py:<line>`: a line number
 drifts the moment the file changes. The pytest suite includes a guard

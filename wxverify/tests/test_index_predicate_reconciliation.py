@@ -22,7 +22,11 @@ from wxverify.db.migrations import (
     invalid_sample_index_ddl,
     run_migrations,
 )
-from wxverify.provider_ops import bad_sample_count_sql
+from wxverify.provider_ops import (
+    bad_sample_count_sql,
+    recent_sample_metrics,
+    sample_metrics,
+)
 
 
 def _insert_site(conn: sqlite3.Connection) -> int:
@@ -276,3 +280,98 @@ def test_missing_recent_index_is_created_by_create_schema(tmp_path: Path) -> Non
 
     stored_sql = _stored_index_sql(db_path, "idx_samples_recent")
     assert _index_predicate(stored_sql) == _index_predicate(SAMPLES_RECENT_INDEX_DDL)
+
+
+# ---------------------------------------------------------------------------
+# S9 (0.16.2 plan): case-insensitive idx_samples_invalid lookup (D3).
+# ---------------------------------------------------------------------------
+
+_S9_STALE_DDL_CASES: tuple[tuple[str, str], ...] = (
+    ("lowercase_anchor", "ON forecast_samples(site_id) WHERE issued_at = 'stale'"),
+    ("mixedcase_anchor", "on Forecast_Samples(site_id) WHERE issued_at = 'stale'"),
+)
+
+
+@pytest.mark.parametrize(
+    "case, stale_clause",
+    _S9_STALE_DDL_CASES,
+    ids=[c[0] for c in _S9_STALE_DDL_CASES],
+)
+def test_case_variant_stale_index_is_reconciled_and_reads_recover(
+    case: str, stale_clause: str, tmp_path: Path
+) -> None:
+    """S9: a case-variant ``IDX_SAMPLES_INVALID`` with a stale definition is
+    dropped and rebuilt as ``idx_samples_invalid``, and the feed sample-count
+    reads that failed before it (``sample_metrics``, ``recent_sample_metrics``)
+    succeed and count an invalid sample. The ``mixedcase_anchor`` case also
+    lacks the literal ``ON forecast_samples`` anchor D3 requires, so it pins
+    that a missing anchor is treated as a mismatch (rebuilt) rather than
+    reaching ``_index_predicate`` and raising ``ValueError``.
+    """
+    db_path = tmp_path / f"case-variant-index-{case}.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites"
+            " (name, forecast_lat, forecast_lon, elevation_m, timezone)"
+            " VALUES ('site-synthetic', 0.0, 0.0, 100.0, 'UTC')"
+        ).lastrowid
+    )
+    feed_row = conn.execute(
+        "SELECT id FROM feeds WHERE is_virtual = 0 ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert feed_row is not None
+    feed_id = int(feed_row["id"])
+
+    conn.execute("DROP INDEX idx_samples_invalid")
+    conn.execute(f"CREATE INDEX IDX_SAMPLES_INVALID {stale_clause}")
+    conn.commit()
+
+    # Precondition: the NOCASE lookup finds exactly one row, stored under
+    # the mixed-case name the fixture actually wrote.
+    precondition = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index'"
+        " AND name = 'idx_samples_invalid' COLLATE NOCASE"
+    ).fetchone()
+    assert precondition is not None, "fixture: the stale index must exist"
+    assert str(precondition[0]) == "IDX_SAMPLES_INVALID", (
+        "fixture: the stale index must be stored under the mixed-case name"
+    )
+
+    sql = bad_sample_count_sql("?")
+    with pytest.raises(sqlite3.OperationalError, match="no query solution"):
+        conn.execute(sql, (site_id, feed_id)).fetchone()
+    with pytest.raises(sqlite3.OperationalError, match="no query solution"):
+        sample_metrics(conn, site_id, feed_id)
+    with pytest.raises(sqlite3.OperationalError, match="no query solution"):
+        recent_sample_metrics(
+            conn, site_id, feed_id, window_start="2026-01-01T00:00:00Z"
+        )
+
+    create_schema(conn)
+
+    rebuilt = conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        " AND name = 'idx_samples_invalid' COLLATE NOCASE"
+    ).fetchall()
+    assert len(rebuilt) == 1
+    assert str(rebuilt[0]["name"]) == "idx_samples_invalid"
+    assert _index_predicate(str(rebuilt[0]["sql"])) == _index_predicate(
+        invalid_sample_index_ddl()
+    )
+
+    _insert_sample(conn, site_id=site_id, feed_id=feed_id, value=999.0)
+    row = conn.execute(sql, (site_id, feed_id)).fetchone()
+    assert int(row[0]) == 1
+    assert sample_metrics(conn, site_id, feed_id).bad_sample_count == 1
+    assert (
+        recent_sample_metrics(
+            conn, site_id, feed_id, window_start="2026-01-01T00:00:00Z"
+        ).bad_sample_count
+        == 1
+    )
+    conn.close()

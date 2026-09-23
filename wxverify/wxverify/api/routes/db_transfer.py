@@ -26,7 +26,7 @@ from wxverify.api.errors import ApiError
 from wxverify.core.error_sanitize import safe_detail, sanitized_exception
 from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, utc_now
 from wxverify.db.connection import get_db
-from wxverify.db.migrations import TARGET_USER_VERSION
+from wxverify.db.migrations import TARGET_USER_VERSION, schema_table_names
 from wxverify.db.queue import reclaim_all_stale
 from wxverify.db.runtime_state import (
     delete_runtime_state,
@@ -34,7 +34,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
     set_runtime_state_now,
 )
-from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
+from wxverify.db.sanitize import sanitize_wedge_prone_timestamps, table_exists
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -84,9 +84,14 @@ _BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
 # two, and a stamp that does not parse makes pairing raise. The read-side
 # `FORECAST_TIMESTAMP_LIKE` filter is only a shape filter (LIKE is
 # case-insensitive and `_` matches any character), so it catches neither.
+# The observation stamps are keys in the same way, and the post-import
+# rebuild parses every one with no catch, so one bad stamp fails the whole
+# rebuild.
 _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "issued_at"),
     ("forecast_samples", "valid_at"),
+    ("station_observations", "valid_at"),
+    ("observations", "valid_at"),
 )
 # Anchored: only this producer's own output shapes are ever a sweep
 # candidate. The token group is optional on purpose -- it spans BOTH
@@ -548,6 +553,32 @@ def _release_import_guard() -> None:
     _import_in_progress = False
 
 
+# The PRAGMA table_list, which the table guard relies on, arrived in 3.37.0.
+_IMPORT_MIN_SQLITE: tuple[int, int, int] = (3, 37, 0)
+
+
+def _require_import_sqlite() -> None:
+    """Refuse the import when this SQLite cannot classify tables.
+
+    The table guard asks SQLite's own PRAGMA ``table_list`` whether a name is
+    an ordinary table, and that PRAGMA arrived in SQLite 3.37.0, while the
+    add-on itself starts on 3.35. The version is read from the ``sqlite3``
+    module on every call, never copied at import, so the refusal follows the
+    library actually loaded.
+
+    ``import_db`` calls this first, before the app reads, validates, stages
+    or swaps in the upload, so a refusal leaves the database untouched.
+    """
+    running = sqlite3.sqlite_version_info
+    if running < _IMPORT_MIN_SQLITE:
+        found = ".".join(str(part) for part in running)
+        raise ApiError(
+            501,
+            "database import needs SQLite 3.37.0 or newer; "
+            f"this add-on is running SQLite {found}",
+        )
+
+
 @router.post("/import/db")
 async def import_db(request: Request) -> JSONResponse:
     """Replace the live database with an uploaded export (full overwrite).
@@ -560,6 +591,7 @@ async def import_db(request: Request) -> JSONResponse:
     """
     _acquire_import_guard()
     try:
+        _require_import_sqlite()
         declared = int(request.headers.get("content-length", "0") or "0")
         if declared > MAX_IMPORT_BYTES:
             raise ApiError(
@@ -720,6 +752,25 @@ def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
     refused. A same-named view or index read as absent would pass admission
     and then break the schema step at boot. ``table`` is always a code-owned
     name, bound as a parameter.
+
+    A `table` row alone does not prove an ordinary table: SQLite records a
+    virtual table, and each of its shadow tables, as `table` in
+    `sqlite_master`. So the kind is confirmed with SQLite's own
+    classification, the PRAGMA `table_list`, and only an object both
+    catalogues call a plain `table` passes. It runs as a statement,
+    `PRAGMA main.table_list(...)`, on purpose. The table-valued form,
+    `pragma_table_list`, is looked up among the file's own tables first, so
+    an object in the upload with that name, in any letter case, can take its
+    place and answer with rows of its choosing. SQLite never looks a PRAGMA
+    statement's name up among the file's objects, so nothing in the file can
+    stand in for it. A PRAGMA argument cannot be bound, so, unlike the
+    lookup above, the code-owned name goes in as a string literal with any
+    `'` doubled, and the kind is read from the `type` column by name. The
+    `sqlite_master` lookup stays because the PRAGMA does not list indexes.
+    `table_list` needs SQLite 3.37: the import route refuses an older
+    runtime before this runs, and on an older SQLite, which ignores the
+    unknown PRAGMA and returns no `type` column, the file is still refused
+    as an invalid database.
     """
     try:
         types = [
@@ -730,11 +781,19 @@ def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
                 (table,),
             )
         ]
+        if not types:
+            return False
+        literal = "'" + table.replace("'", "''") + "'"
+        cursor = conn.execute(f"PRAGMA main.table_list({literal})")
+        columns = [column[0] for column in cursor.description or ()]
+        if "type" not in columns:
+            # Routed to the same invalid-database refusal as any other error.
+            raise sqlite3.DatabaseError("PRAGMA table_list returned no type")
+        type_at = columns.index("type")
+        kinds = [str(kind_row[type_at]) for kind_row in cursor]
     except sqlite3.DatabaseError as exc:
         raise ApiError(422, "not a valid SQLite database") from exc
-    if not types:
-        return False
-    if types == ["table"]:
+    if types == ["table"] and kinds == ["table"]:
         return True
     raise ApiError(422, f"not a table: {table}")
 
@@ -773,6 +832,10 @@ def _validate_upload(tmp: Path) -> None:
         for table in _REQUIRED_TABLES:
             if table not in names:
                 raise ApiError(422, f"missing required table: {table}")
+        # Absence is fine here: the result is dropped on purpose, and the call
+        # is kept only for the refusals it raises.
+        for table in schema_table_names():
+            _guarded_table_present(conn, table)
         for table, column in _BLOB_GUARDED_COLUMNS:
             if not _guarded_table_present(conn, table):
                 continue
@@ -818,11 +881,12 @@ def _stage_pending_rebuild_state(tmp: Path) -> None:
     this one, and nothing else clears them.
 
     `_validate_upload` only requires `_REQUIRED_TABLES` (sites, stations,
-    station_observations) plus an in-range `user_version`; it never checks
-    for `runtime_state`. A genuine prior export always has it -- this app's
-    own `create_schema` creates it unconditionally, ahead of any version
-    gate, on every boot of the exporting instance -- but `_validate_upload`
-    cannot distinguish a genuine export from a file that was merely built to
+    station_observations) plus an in-range `user_version`; it never requires
+    `runtime_state` (it only refuses one that is present but is not an
+    ordinary table). A genuine prior export always has it -- this app's own
+    `create_schema` creates it unconditionally, ahead of any version gate,
+    on every boot of the exporting instance -- but `_validate_upload` cannot
+    distinguish a genuine export from a file that was merely built to
     satisfy those same checks without ever passing through this app's
     `create_schema` (e.g. hand-assembled from the three required tables plus
     a plausible `user_version`). `ensure_runtime_state_table` guards that
@@ -895,13 +959,7 @@ def _neutralize_imported_verification_chains(tmp: Path) -> None:
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            names = {
-                str(name_row[0])
-                for name_row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            if "jobs" in names:
+            if table_exists(conn, "jobs"):
                 conn.execute(
                     """
                     UPDATE jobs SET status = 'failed', last_error = ?,
@@ -911,7 +969,7 @@ def _neutralize_imported_verification_chains(tmp: Path) -> None:
                     """,
                     (IMPORT_SUPPRESSED_REASON, isoformat_utc()),
                 )
-            if all(table in names for table in _VERIFICATION_RUN_TABLES):
+            if all(table_exists(conn, table) for table in _VERIFICATION_RUN_TABLES):
                 for site_row in conn.execute("SELECT id FROM sites").fetchall():
                     fail_incomplete_attempts(
                         conn, int(site_row["id"]), error=IMPORT_SUPPRESSED_REASON
