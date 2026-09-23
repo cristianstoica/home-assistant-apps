@@ -749,11 +749,10 @@ container unhealthy — a deliberately lax envelope (60 s interval × 10 retries
 so ~10-11 minutes to trip). With the toggle off, neither triggers a restart: a
 crashed worker stays halted and data collection stops silently.
 
-The generous healthcheck envelope is deliberate: a long scoring transaction or
-boot-time catchup can starve the event loop and miss a probe or two, and a
-tighter envelope would restart a healthy add-on mid-run — a false restart with
-no actual hang. The cost is the ~10-11 minute detection window for an app that
-is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
+The generous healthcheck envelope is deliberate: the five-minute start period
+and the ten consecutive failed probes it takes to mark the container unhealthy
+are meant to tolerate temporary response delays. The cost is the ~10-11 minute
+detection window for an app that is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
 only — it disables all Supervisor restarts, including crash recovery.
 
 **Proactive alerting** is HA-native. The add-on exposes a read-only verdict
