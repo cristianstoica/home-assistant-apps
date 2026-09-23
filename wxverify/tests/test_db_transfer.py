@@ -3441,3 +3441,419 @@ def test_export_begin_sweeps_stale_gz_keeps_fresh_gz(
         assert not stale.exists(), "an aged orphaned .db.gz must be swept on begin"
         assert fresh.exists(), "a fresh .db.gz must survive the sweep"
         _await_ready(client, resp.json()["export_id"])
+
+
+# ---------------------------------------------------------------------------
+# Part H -- Import admission checks a forecast_samples timestamp BY VALUE
+# (O1-O8, plan 2026-09-23-db-import-timestamp-validation.md). O1 (the
+# predicate's own truth table) lives in tests/test_canonical_utc_stamp.py.
+# ---------------------------------------------------------------------------
+
+_STAMP_CANONICAL_ISSUED = "2026-01-01T00:00:00Z"
+_STAMP_CANONICAL_VALID = "2026-01-01T01:00:00Z"
+
+
+def _sqlite_bytes_with_forecast_stamps(
+    path: Path,
+    stamps: list[tuple[object, object]],
+    *,
+    extra_sql: tuple[str, ...] = (),
+) -> bytes:
+    """A fully migrated DB with site "stamp-site" and one forecast_samples
+    row per ``(issued_at, valid_at)`` pair, plus each ``extra_sql`` statement
+    run on the same connection afterward.
+    """
+    db = Database(str(path))
+    try:
+        site_id = _make_site(db._conn, "stamp-site")  # noqa: SLF001
+        feed_id = _feed_id(db._conn, "ecmwf_ifs")  # noqa: SLF001
+        for issued_at, valid_at in stamps:
+            db._conn.execute(  # noqa: SLF001
+                """
+                INSERT INTO forecast_samples
+                    (site_id, feed_id, variable, issued_at, valid_at,
+                     lead_hours, value, source_raw, model_run_id, fetched_at)
+                VALUES (?, ?, 'temperature', ?, ?, 1, 10.0, '{}', 'run-x', NULL)
+                """,
+                (site_id, feed_id, issued_at, valid_at),
+            )
+        for stmt in extra_sql:
+            db._conn.execute(stmt)  # noqa: SLF001
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+    finally:
+        db.close()
+    return path.read_bytes()
+
+
+def _sqlite_bytes_hand_built(
+    path: Path, samples_ddl: str | None, rows: list[tuple[object, object, object]]
+) -> bytes:
+    """A minimal hand-built upload: ``sites``/``stations`` primary-key-only
+    tables, a ``station_observations(variable TEXT)`` table (so the BLOB
+    guard's query against it does not itself refuse the upload first), the
+    given ``samples_ddl`` for ``forecast_samples`` (skipped when ``None``,
+    modelling a genuinely absent table), one row per ``(variable, issued_at,
+    valid_at)`` tuple, and ``user_version = 7``.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("CREATE TABLE sites (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE stations (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE station_observations (variable TEXT)")
+        if samples_ddl is not None:
+            conn.execute(samples_ddl)
+        for row in rows:
+            conn.execute(
+                "INSERT INTO forecast_samples (variable, issued_at, valid_at)"
+                " VALUES (?, ?, ?)",
+                row,
+            )
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+    finally:
+        conn.close()
+    return path.read_bytes()
+
+
+_O2_CASES: tuple[tuple[str, object, bool], ...] = (
+    # (case id, bad value, sorts_first)
+    ("lower_t", "2026-01-01t06:00:00Z", False),
+    ("lower_z", "2026-01-01T06:00:00z", False),
+    ("hour_24", "2026-01-01T24:00:00Z", False),
+    ("second_60", "2026-01-01T06:00:60Z", False),
+    ("feb_30", "2026-02-30T00:00:00Z", False),
+    ("micro_half", "2026-01-01T06:00:00.500000Z", False),
+    ("micro_zero", "2026-01-01T06:00:00.000000Z", False),
+    ("offset", "2026-01-01T06:00:00+00:00", False),
+    ("blob", b"2026-01-01T06:00:00Z", False),
+    ("sorts_first", "2025-02-29T00:00:00Z", True),
+)
+
+
+@pytest.mark.parametrize("column", ["issued_at", "valid_at"])
+@pytest.mark.parametrize(
+    "case, bad_value, sorts_first", _O2_CASES, ids=[c[0] for c in _O2_CASES]
+)
+def test_import_rejects_noncanonical_forecast_stamp(
+    case: str,
+    bad_value: object,
+    sorts_first: bool,
+    column: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """O2: the case matrix, through the real HTTP route."""
+    canonical_value = (
+        _STAMP_CANONICAL_ISSUED if column == "issued_at" else _STAMP_CANONICAL_VALID
+    )
+    if column == "issued_at":
+        bad_pair = (bad_value, _STAMP_CANONICAL_VALID)
+    else:
+        bad_pair = (_STAMP_CANONICAL_ISSUED, bad_value)
+    canonical_pair = (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)
+    target = tmp_path / f"stamps-{case}-{column}.db"
+    payload = _sqlite_bytes_with_forecast_stamps(target, [canonical_pair, bad_pair])
+
+    # Precondition (plan Sec 9): without an ORDER BY, SQLite has no ordering
+    # guarantee for DISTINCT; this asserts the iteration order this fixture
+    # actually observes under the current query plan, which the assertions
+    # below depend on.
+    check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        values = [
+            row[0]
+            for row in check_conn.execute(
+                f"SELECT DISTINCT {column} COLLATE BINARY FROM forecast_samples"
+            )
+        ]
+    finally:
+        check_conn.close()
+    assert len(values) == 2, f"{case}/{column}: expected exactly 2 distinct values"
+    if sorts_first:
+        assert values[-1] == canonical_value, (
+            f"{case}/{column}: canonical value must sort LAST"
+        )
+    else:
+        assert values[0] == canonical_value, (
+            f"{case}/{column}: canonical value must sort FIRST"
+        )
+
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Guarded Site")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+    assert resp.status_code == 422, (
+        f"{case}/{column}: expected 422, got {resp.status_code}"
+    )
+    assert resp.json() == {
+        "error": (
+            f"invalid timestamp in forecast_samples.{column}: "
+            "expected UTC form YYYY-MM-DDTHH:MM:SSZ"
+        )
+    }, f"{case}/{column}: unexpected error body"
+    with TestClient(app, raise_server_exceptions=False) as client:
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert names == {"Guarded Site"}, f"{case}/{column}: live DB must be untouched"
+    db_dir = Path(config.db_path).parent
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        f"{case}/{column}: import temp must not remain"
+    )
+    assert list(db_dir.glob("*.db.bak")) == [], (
+        f"{case}/{column}: no backup must be created before validation passes"
+    )
+
+
+def _o3_extra_sql(column: str) -> str:
+    bad_expr = "CAST(x'ff61' AS TEXT)"
+    issued_expr = bad_expr if column == "issued_at" else "issued_at"
+    valid_expr = bad_expr if column == "valid_at" else "valid_at"
+    return (
+        "INSERT INTO forecast_samples "
+        "(site_id, feed_id, variable, issued_at, valid_at, lead_hours, "
+        "value, source_raw, model_run_id) "
+        f"SELECT site_id, feed_id, variable, {issued_expr}, {valid_expr}, "
+        "lead_hours, value, source_raw, model_run_id FROM forecast_samples"
+    )
+
+
+@pytest.mark.parametrize("column", ["issued_at", "valid_at"])
+def test_import_rejects_invalid_utf8_forecast_stamp(
+    column: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O3: an undecodable byte sequence in the stamp column fails closed as
+    422 'not a valid SQLite database', never a 500 -- the decode error
+    surfaces at fetch time, inside the loop's ``try``, not at ``execute``.
+    """
+    target = tmp_path / f"utf8-{column}.db"
+    canonical_pair = (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)
+    payload = _sqlite_bytes_with_forecast_stamps(
+        target, [canonical_pair], extra_sql=(_o3_extra_sql(column),)
+    )
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Guarded Site")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 422, (
+            f"{column}: expected 422, got {resp.status_code}"
+        )
+        assert resp.json() == {"error": "not a valid SQLite database"}
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert names == {"Guarded Site"}, f"{column}: live DB must be untouched"
+    db_dir = Path(config.db_path).parent
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        f"{column}: import temp must not remain"
+    )
+    assert list(db_dir.glob("*.db.bak")) == [], (
+        f"{column}: no backup must be created before validation passes"
+    )
+
+
+def test_import_rejects_null_forecast_stamp(tmp_path: Path) -> None:
+    """O4: NULL fails the isinstance guard, not an AttributeError escaping
+    from ``value.replace`` inside ``parse_utc``.
+    """
+    target = tmp_path / "null-stamp.db"
+    _sqlite_bytes_hand_built(
+        target,
+        "CREATE TABLE forecast_samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [
+            ("temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID),
+            ("temperature", None, _STAMP_CANONICAL_VALID),
+        ],
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == (
+        "invalid timestamp in forecast_samples.issued_at: "
+        "expected UTC form YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+
+def test_import_rejects_forecast_stamp_under_folding_collation(tmp_path: Path) -> None:
+    """O5: an upload-declared ``COLLATE NOCASE`` column would fold a
+    lowercase-``t`` twin into the canonical value under a bare
+    ``SELECT DISTINCT`` -- ``COLLATE BINARY`` in the query must stop that.
+    """
+    target = tmp_path / "nocase-collation.db"
+    _sqlite_bytes_hand_built(
+        target,
+        "CREATE TABLE forecast_samples"
+        " (variable TEXT, issued_at TEXT COLLATE NOCASE, valid_at TEXT)",
+        [
+            ("temperature", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
+            ("temperature", "2026-01-01t00:00:00Z", "2026-01-01T00:00:00Z"),
+        ],
+    )
+    # Precondition: the upload's own NOCASE collation folds the two spellings
+    # into one row under a bare (non-BINARY) DISTINCT.
+    check_conn = sqlite3.connect(str(target))
+    try:
+        values = [
+            row[0]
+            for row in check_conn.execute(
+                "SELECT DISTINCT issued_at FROM forecast_samples"
+            )
+        ]
+    finally:
+        check_conn.close()
+    assert values == ["2026-01-01T00:00:00Z"], (
+        "precondition: NOCASE must fold the two spellings to one row"
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == (
+        "invalid timestamp in forecast_samples.issued_at: "
+        "expected UTC form YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+
+def test_import_accepts_all_canonical_forecast_stamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """O6: the accept control, in one TestClient. A non-canonical upload is
+    refused (422), and then a leap-day/half-hour/on-the-hour canonical
+    upload is admitted (200) on the SAME client -- also showing the import
+    guard is released after a stamp refusal.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Guarded Site")
+    conn.commit()
+    reject_target = tmp_path / "reject.db"
+    reject_payload = _sqlite_bytes_with_forecast_stamps(
+        reject_target,
+        [
+            (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID),
+            ("2026-01-01t06:00:00Z", _STAMP_CANONICAL_VALID),
+        ],
+    )
+    accept_target = tmp_path / "accept.db"
+    accept_payload = _sqlite_bytes_with_forecast_stamps(
+        accept_target,
+        [
+            ("2024-02-29T00:00:00Z", "2024-02-29T00:30:00Z"),
+            ("2024-02-29T00:00:00Z", "2024-02-29T01:00:00Z"),
+        ],
+    )
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        reject_resp = client.post(
+            "/api/import/db", content=reject_payload, headers=headers
+        )
+        assert reject_resp.status_code == 422
+        accept_resp = client.post(
+            "/api/import/db", content=accept_payload, headers=headers
+        )
+        assert accept_resp.status_code == 200
+        assert accept_resp.json()["status"] == "imported"
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert "stamp-site" in names
+
+
+def test_import_skips_genuinely_absent_forecast_samples_table(tmp_path: Path) -> None:
+    """O7: the genuine-absence control -- no ``forecast_samples`` at all, in
+    any case, among tables/views/indexes. ``_validate_upload`` must not
+    raise; both the BLOB guard and the stamp loop skip it.
+    """
+    target = tmp_path / "absent-table.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    db_transfer._validate_upload(target)  # must not raise  # noqa: SLF001
+
+
+def test_import_resolves_forecast_samples_table_name_like_sqlite(
+    tmp_path: Path,
+) -> None:
+    """O8: table-name resolution follows SQLite's own ASCII-case-insensitive
+    rule, and a same-named view is refused rather than read as absent.
+    """
+    # (a) A mixed-case table is still checked BY VALUE.
+    mixed_case_target = tmp_path / "mixed-case-stamp.db"
+    _sqlite_bytes_hand_built(
+        mixed_case_target,
+        "CREATE TABLE Forecast_Samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [
+            ("temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID),
+            ("temperature", "2026-01-01T24:00:00Z", _STAMP_CANONICAL_VALID),
+        ],
+    )
+    check_conn = sqlite3.connect(str(mixed_case_target))
+    try:
+        table_names = {
+            row[0]
+            for row in check_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        row_count = check_conn.execute(
+            "SELECT count(*) FROM forecast_samples"
+        ).fetchone()[0]
+    finally:
+        check_conn.close()
+    assert "forecast_samples" not in table_names, (
+        "precondition: the table must be stored under a mixed-case name"
+    )
+    assert row_count == 2, "precondition: both hand-built rows must be present"
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(mixed_case_target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == (
+        "invalid timestamp in forecast_samples.issued_at: "
+        "expected UTC form YYYY-MM-DDTHH:MM:SSZ"
+    )
+
+    # (b) The BLOB guard, sharing the same lookup, still catches a mixed-
+    # case table too -- with canonical stamps, so only the BLOB guard fires.
+    mixed_case_blob_target = tmp_path / "mixed-case-blob.db"
+    _sqlite_bytes_hand_built(
+        mixed_case_blob_target,
+        "CREATE TABLE Forecast_Samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [(b"temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)],
+    )
+    check_conn = sqlite3.connect(str(mixed_case_blob_target))
+    try:
+        table_names = {
+            row[0]
+            for row in check_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        row_count = check_conn.execute(
+            "SELECT count(*) FROM forecast_samples"
+        ).fetchone()[0]
+    finally:
+        check_conn.close()
+    assert "forecast_samples" not in table_names, (
+        "precondition: the table must be stored under a mixed-case name"
+    )
+    assert row_count == 1, "precondition: the hand-built row must be present"
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(mixed_case_blob_target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "invalid data in forecast_samples.variable"
+
+    # (c) A view carrying the guarded name is refused outright, never read
+    # as absent.
+    view_target = tmp_path / "view.db"
+    _sqlite_bytes_hand_built(
+        view_target,
+        "CREATE VIEW forecast_samples AS SELECT 'temperature' AS variable,"
+        " '2026-01-01T24:00:00Z' AS issued_at,"
+        " '2026-01-01T01:00:00Z' AS valid_at",
+        [],
+    )
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(view_target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a table: forecast_samples"

@@ -14,6 +14,10 @@ FORECAST_VALUE_RANGES: Final[dict[str, tuple[float, float]]] = {
     "wind": (0.0, 150.0),
     "precip": (0.0, 500.0),
 }
+#: Shape pre-filter for reads, not a validity proof: LIKE is ASCII
+#: case-insensitive and ``_`` matches any character. Imports are checked by
+#: value (``is_canonical_utc_stamp``). This text generates
+#: ``idx_samples_invalid``; editing it rebuilds that index at boot.
 FORECAST_TIMESTAMP_LIKE: Final = "____-__-__T__:__:__Z"
 
 
