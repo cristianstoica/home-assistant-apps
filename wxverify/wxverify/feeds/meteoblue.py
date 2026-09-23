@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from wxverify.core.timeutil import isoformat_utc, lead_hours, parse_utc
 from wxverify.core.units import kmh_to_ms
+from wxverify.feeds.parse_cap_probe import emit_parse_cap_probe
 from wxverify.feeds.seam import (
     CostEstimate,
     FetchResult,
@@ -68,9 +69,12 @@ class MeteoblueResponse(BaseModel):
 class MeteoblueAdapter:
     supports_historical: ClassVar[bool] = False
 
-    def __init__(self, api_key: str, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self, api_key: str, client: httpx.AsyncClient, *, parse_cap_probe: bool = False
+    ) -> None:
         self._api_key = api_key
         self._client = client
+        self._parse_cap_probe = parse_cap_probe
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
         return CostEstimate(calls=1, credits=16000)
@@ -94,6 +98,13 @@ class MeteoblueAdapter:
         response.raise_for_status()
         payload = MeteoblueResponse.model_validate(response.json())
         result = _to_fetch_result(req, payload)
+        if self._parse_cap_probe:
+            emit_parse_cap_probe(
+                source="meteoblue",
+                req=req,
+                models=tuple(payload.metadata.models),
+                reparse=lambda shadow_req: _to_fetch_result(shadow_req, payload),
+            )
         logger.debug(
             "meteoblue forecast response status=%s samples=%s",
             response.status_code,
@@ -105,6 +116,11 @@ class MeteoblueAdapter:
         self, req: ForecastRequest, *, window_start: str, window_end: str
     ) -> FetchResult | None:
         return None
+
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        raise NotImplementedError("supports_historical is False")
 
 
 def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchResult:

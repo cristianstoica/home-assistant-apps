@@ -38,7 +38,7 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.forecast.service import build_forecast
+from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.settings.keys import set_setting
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
 from wxverify.verification.record import (
@@ -866,34 +866,42 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
 
     precip = displayed("precip")
     assert precip["total_mm"] == tile.precip.total_mm
-    chance = precip["chance"]
-    assert isinstance(chance, float)
-    assert tile.precip.chance_pct == round(chance * 100)
-    assert chance == 0.25  # 6 wet hours of A's 24; B's all-wet share excluded
+    # ``displayed_daily`` returns the raw, unrounded blended count (native
+    # units, per its own docstring); the tile rounds it for presentation.
+    wet_hours_raw = precip["wet_hours"]
+    assert isinstance(wet_hours_raw, float)
+    assert tile.precip.wet_hours == round(wet_hours_raw)
+    # Feed A is the only extrema-eligible feed (24h exact); B's 14h partial
+    # coverage (and its all-wet-but-partial share) is excluded entirely.
+    assert wet_hours_raw == 6.0  # A's hours 12-17 clear the threshold
     assert precip["total_mm"] == pytest.approx(6 * threshold)
 
 
-def test_record_outcomes_score_the_clearing_subset_and_keep_the_full_hourly() -> None:
+def test_record_outcomes_score_clearing_subset_hourly_follows_drill_down() -> None:
     """§17 family 4 (W3), record side: the stored OUTCOMES describe the
     clearing subset — the same feed set the displayed value uses — while
-    ``hourly_values`` deliberately stays the FULL-selection blend that
-    reproduces the Forecast page's hourly drill-down.
+    ``hourly_values`` (Item G) now reproduces the Forecast page's
+    precipitation drill-down line, which is built from the selection's
+    EXTREMA set (:func:`_precip_aggregate_hourly`), not the full selection.
 
-    Fixture: feed A covers all 24 hours dry (0.0 mm, clears coverage);
-    feed B covers hours 0-13 only (14 hours, selected but NOT clearing) at
+    Fixture: feed A covers all 24 hours dry (0.0 mm, clears coverage AND is
+    the only 24h-exact, extrema-eligible feed); feed B covers hours 0-13
+    only (14 hours, selected but NOT clearing and NOT extrema-eligible) at
     ``threshold + 1.0`` mm. Hand-computed from the code path:
 
     * outcomes blend = feed A alone -> 24 covered hours, zero wet slots,
       near-complete -> ``precip_occurrence`` value 0.0 (DRY, eligible) and
       ``precip_total`` 0.0;
-    * ``hourly_values`` = both feeds -> 24 entries, hours 0-13 at
-      ``(threshold + 1.0) / 2`` (wet) and hours 14-23 at 0.0.
+    * ``hourly_values`` = the extrema set alone (feed A, the only feed
+      covering the whole local day exactly) -> 24 entries, every hour 0.0 --
+      feed B's wet hours never enter the drill-down line at all, because B
+      never qualified for the extrema set in the first place.
 
     Kills the 0.11.0 implementation, which evaluated the outcomes over the
     full-selection blend and so reported ``precip_occurrence`` 1.0 (WET,
-    14 wet slots) beside a displayed total of 0.0. Kills the opposite
-    over-correction too — unifying ``hourly_values`` onto ``agg_ids``
-    drops every wet hour from the drill-down series.
+    14 wet slots) beside a displayed total of 0.0. Kills a
+    full-selection-blend regression of the hourly line too: that would put
+    B's wet value at hours 0-13 instead of the extrema set's dry 0.0.
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-w3-site")
@@ -942,10 +950,316 @@ def test_record_outcomes_score_the_clearing_subset_and_keep_the_full_hourly() ->
     assert total["value"] == pytest.approx(0.0)
     assert total["eligible"] is True
 
-    hourly = [(str(at), float(v)) for at, v in json.loads(str(row["hourly_values"]))]
+    hourly = [(str(at), v) for at, v in json.loads(str(row["hourly_values"]))]
     assert len(hourly) == 24
-    # The drill-down series keeps feed B: hours 0-13 blend to the mean of
-    # the two feeds, which is wet — exactly what the outcomes must ignore.
-    assert [v for _at, v in hourly[:14]] == [pytest.approx(wet_value / 2)] * 14
-    assert [v for _at, v in hourly[14:]] == [0.0] * 10
-    assert wet_value / 2 >= threshold
+    # The drill-down series is the extrema set alone (feed A): every hour
+    # reads dry, never feed B's wet value — B never qualified for the
+    # extrema set (only 14 of 24 hours), so it never reaches this line,
+    # exactly what the outcomes above must also ignore.
+    assert [v for _at, v in hourly] == [0.0] * 24
+    assert wet_value >= threshold  # fixture guard: B's value really is wet
+
+
+# ---------------------------------------------------------------------------
+# Oracle 9 (G-T29/G-T30) — the recorded precipitation hourly series IS the
+# Forecast page's drill-down aggregate line, byte-for-byte, including its
+# null at an off-hour member gap; the recorded total is exactly what that
+# same series sums to.
+# ---------------------------------------------------------------------------
+
+
+def _insert_off_hour_sample(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    variable: str,
+    valid_at: str,
+    issued_at: str,
+    fetched_at: str,
+    value: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO forecast_samples
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             value, source_raw, model_run_id, fetched_at)
+        VALUES (?, ?, ?, ?, ?, 24, ?, '{}', 'run-x', ?)
+        """,
+        (site_id, feed_id, variable, issued_at, valid_at, value, fetched_at),
+    )
+
+
+def _seed_g29_g30_fixture(conn: sqlite3.Connection) -> tuple[int, int, int, int]:
+    """G.11's shared G-T29/G-T30 fixture.
+
+    Precipitation: feed A supplies the 24 on-the-hour instants of ``_DAY``
+    at ``0.1 * (h % 3)``; feed B supplies the same 24 at ``0.4`` for hours
+    < 9, else ``0.0``; feed C supplies hours 0-13 at ``2.0`` plus one
+    off-hour sample at ``10:30`` (15 samples covering 14 hours).
+    Temperature: feed A supplies the 24 on-the-hour instants at ``10.0``
+    plus one off-hour sample at ``05:30`` -- present only to prove that
+    axis's off-hour instant is a ``drill`` key withOUT ever becoming a
+    recorded precipitation instant (G-T29's non-vacuity clause).
+
+    All three precipitation feeds clear the 12-hour pool and fit depth 3,
+    ranked A, B, C by sample count then model, so the blend set is
+    ``[A, B, C]``; A and B supply each hour exactly once and C does not, so
+    the contributor (extrema) set is ``[A, B]``.
+    """
+    site_id = asof_make_site(conn, "record-g29-site")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    feed_b = asof_make_real_feed(conn, "model-b")
+    feed_c = asof_make_real_feed(conn, "model-c")
+    set_setting(conn, "forecast_blend_depth", "3")
+
+    issued = f"{(_DAY - timedelta(days=1)).isoformat()}T06:00:00Z"
+    fetched = f"{(_DAY - timedelta(days=1)).isoformat()}T06:05:00Z"
+
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda h: 0.1 * (h % 3),
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_b,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda h: 0.4 if h < 9 else 0.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_c,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(14),
+        value_fn=lambda _h: 2.0,
+    )
+    _insert_off_hour_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_c,
+        variable="precip",
+        valid_at=f"{_DAY.isoformat()}T10:30:00Z",
+        issued_at=issued,
+        fetched_at=fetched,
+        value=2.0,
+    )
+
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="temperature",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 10.0,
+    )
+    _insert_off_hour_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="temperature",
+        valid_at=f"{_DAY.isoformat()}T05:30:00Z",
+        issued_at=issued,
+        fetched_at=fetched,
+        value=10.0,
+    )
+    return site_id, feed_a, feed_b, feed_c
+
+
+def test_record_precip_hourly_is_exactly_the_drill_down_aggregate_line() -> None:
+    """G-T29: the recorded precipitation series is the drill-down's
+    aggregate line, including its null at C's off-hour gap.
+
+    Kills, one at a time (each is the one G.11 names for G-T29):
+    - ``hourly`` left as ``_blend_hourly(selected_ids, ...)`` for
+      precipitation: C's ``2.0`` would enter hours 0-13 and ``10:30`` would
+      take a value instead of ``None``;
+    - ``_blend_hourly(agg_ids, ...)``: the ``10:30`` entry disappears
+      (``agg_ids`` is the clearing subset ``[A, B]`` here too, with no
+      off-hour instant of its own);
+    - an axis built from the extrema members alone: the ``10:30`` entry
+      disappears (the record's own axis must widen to the blend set's
+      instants, as the live drill-down's axis does);
+    - ``selection.feeds`` passed as the aggregate members: hours 14-23 turn
+      ``None`` and hours 0-13 take C's ``2.0`` value.
+
+    Does NOT claim a renormalising mutant or a swapped member order: every
+    instant of this axis is supplied by both members or by neither, and
+    addition of two values commutes, so both are equivalent on this
+    fixture (test_forecast_aggregate.py's
+    test_fixed_membership_series_gap_in_one_member_is_null_not_the_other_value
+    carries renormalisation).
+    """
+    conn = asof_conn()
+    site_id, feed_a, feed_b, feed_c = _seed_g29_g30_fixture(conn)
+    t = _t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
+    payload = build_hourly(conn, site_id=site_id, timezone="UTC", day=0, now=t)
+
+    row = _cell(conn, site_id, _DAY.isoformat(), "precip", 0)
+    assert json.loads(str(row["selected_feed_ids"])) == [feed_a, feed_b, feed_c]
+    displayed = dict(json.loads(str(row["daily_quantities"]))["displayed"])
+    assert displayed["extrema_feed_ids"] == [feed_a, feed_b]
+    assert payload["precip_aggregate"]["feed_ids"] == [feed_a, feed_b]
+
+    drill = dict(
+        zip(
+            [str(h) for h in payload["hours"]],
+            payload["blend"]["precip_mm"],
+            strict=True,
+        )
+    )
+    hourly = [(str(at), v) for at, v in json.loads(str(row["hourly_values"]))]
+    recorded_ats = [at for at, _v in hourly]
+
+    assert recorded_ats == sorted(recorded_ats)
+    assert len(recorded_ats) == len(set(recorded_ats))
+    for at, value in hourly:
+        assert at in drill
+        assert value == drill[at]
+    for at, drill_value in drill.items():
+        if at not in recorded_ats:
+            assert drill_value is None
+
+    off_hour_precip = f"{_DAY.isoformat()}T10:30:00Z"
+    off_hour_temp = f"{_DAY.isoformat()}T05:30:00Z"
+    assert len(hourly) == 25
+    none_ats = [at for at, v in hourly if v is None]
+    assert none_ats == [off_hour_precip]
+    assert off_hour_temp in drill
+    assert off_hour_temp not in recorded_ats
+
+
+def test_record_precip_total_sums_the_recorded_hourly_series() -> None:
+    """G-T30: the recorded total is exactly what the recorded hourly series
+    sums to -- an independent hand anchor, not a re-derivation of G-T29's
+    own value, so the identity cannot pass on two equal wrong numbers.
+
+    Kills the whole-selection series (feed C's ``2.0`` would raise the sum);
+    and any arithmetic change inside the shared blending helper that moves
+    both sides of G-T29 together -- blending the first member (A) alone
+    sums to 2.4 against the true 3.0.
+    """
+    conn = asof_conn()
+    site_id, _feed_a, _feed_b, _feed_c = _seed_g29_g30_fixture(conn)
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=_t())
+    row = _cell(conn, site_id, _DAY.isoformat(), "precip", 0)
+    displayed = dict(json.loads(str(row["daily_quantities"]))["displayed"])
+    hourly = json.loads(str(row["hourly_values"]))
+
+    # Independent anchor computed by hand from the two value functions:
+    # sum_A = sum(0.1 * (h % 3) for h in range(24)) == 2.4
+    # sum_B = sum(0.4 if h < 9 else 0.0 for h in range(24)) == 3.6
+    # (sum_A + sum_B) / 2 == 3.0
+    assert displayed["total_mm"] is not None
+    assert displayed["total_mm"] == pytest.approx(3.0, abs=1e-9)
+    assert sum(v for _at, v in hourly if v is not None) == pytest.approx(
+        displayed["total_mm"], abs=1e-9
+    )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 10 (G-T31) — a day no feed covers exactly is recorded as a
+# uniformly null precipitation series, and the scored outcomes never fall
+# back to the whole selection or the clearing subset.
+# ---------------------------------------------------------------------------
+
+
+def test_record_precip_null_series_and_outcomes_when_no_feed_covers_exactly() -> None:
+    """G-T31: with no feed clearing ``covers_local_day_exactly``, the
+    recorded precipitation series is uniformly ``null`` and the scored
+    outcomes are hand-derived from :func:`evaluate_precip` over the
+    clearing subset (feed A) alone -- default blend depth, 2.
+
+    Feed A supplies hours ``range(20)`` and ``range(21, 24)`` at ``0.0``
+    (23 instants: clears the 18-hour guard, fails the exact-coverage
+    predicate by missing hour 20). Feed B supplies hours 10-23 at
+    ``threshold + 1.0`` (14 instants: in the blend set, does not clear).
+    The contributor (extrema) set is empty; the clearing subset is
+    ``[A]``.
+
+    Kills, one at a time:
+    - zeros written in place of ``null``s;
+    - a fallback to the whole selection's blend (hours 10-23 would take
+      ``(0.0 + threshold + 1.0) / 2``, never uniformly ``None``);
+    - a fallback to the clearing subset's own blend (23 entries of
+      ``0.0``, hour 20 missing instead of a full 24-entry ``null`` axis);
+    - outcomes computed over the whole selection instead of the clearing
+      subset (``precip_occurrence`` would read ``1.0`` WET from B's
+      values, not the clearing subset's dry ``0.0``).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "record-g31-site")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    feed_b = asof_make_real_feed(conn, "model-b")
+    site = conn.execute(
+        "SELECT rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
+    ).fetchone()
+    assert site is not None
+    threshold = float(site["rain_threshold_mm"])
+
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(20),
+        value_fn=lambda _h: 0.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(21, 24),
+        value_fn=lambda _h: 0.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_b,
+        variable="precip",
+        local_date=_DAY,
+        hours=range(10, 24),
+        value_fn=lambda _h: threshold + 1.0,
+    )
+
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=_t())
+    row = _cell(conn, site_id, _DAY.isoformat(), "precip", 0)
+    # Fixture validity.
+    assert json.loads(str(row["selected_feed_ids"])) == [feed_a, feed_b]
+    quantities = json.loads(str(row["daily_quantities"]))
+    displayed = dict(quantities["displayed"])
+    assert displayed["extrema_coverage"] == "insufficient"
+    assert displayed["extrema_feed_ids"] == []
+
+    hourly = [(str(at), v) for at, v in json.loads(str(row["hourly_values"]))]
+    expected_ats = [f"{_DAY.isoformat()}T{h:02d}:00:00Z" for h in range(24)]
+    assert [at for at, _v in hourly] == expected_ats
+    assert all(v is None for _at, v in hourly)
+
+    outcomes = {str(o["quantity"]): o for o in quantities["outcomes"]}
+    occurrence = outcomes["precip_occurrence"]
+    assert occurrence["value"] == 0.0
+    assert occurrence["eligible"] is True
+    assert occurrence["wet_hours"] == 0
+    assert occurrence["covered_hours"] == 23
+    total = outcomes["precip_total"]
+    assert total["value"] == pytest.approx(0.0)
+    assert total["eligible"] is True
+    assert total["covered_hours"] == 23

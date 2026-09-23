@@ -144,6 +144,26 @@ leaves no error behind:
 > overrides in the add-on configuration (or the matching `WXV_FORECAST_BLEND_DEPTH_*`
 > environment variables for a standalone run) and only then run the import.
 
+### Parse-cap probe (optional, temporary)
+
+`parse_cap_probe` is an optional switch, off unless you set it to `true`. A
+standalone run uses the environment variable `WXV_PARSE_CAP_PROBE` instead,
+where `1`, `true`, `yes` or `on` switch it on.
+
+When it is on, each fetch from Visual Crossing, Meteoblue or Meteosource writes
+one log line per model, starting with `parse_cap_probe`. The line says how many
+forecast hours the response held, how many of them the add-on keeps, and how
+far ahead they reach.
+
+Nothing new is stored, shown, scored or requested: the probe reads only the
+response the add-on has already fetched. Its lines hold no API key, location or
+forecast value.
+
+The lines are written at `info` level, so they appear when `log_level` is
+`info` or `debug`, and not when it is `warning` or `error`.
+
+The option is temporary and will be removed in a later release.
+
 ## First-run Workflow
 
 1. Start the app.
@@ -185,9 +205,9 @@ The default is `0.2 mm`, which is a reasonable "trace rain counts as dry" floor.
 You usually do not need to change it unless your station reports noisy tiny
 precip amounts or you want a stricter definition such as `1.0 mm`.
 
-It only affects precipitation event scoring. Temperature and wind are
-unaffected. Changing it later recomputes precip pairs and cached scores for that
-site.
+It only affects precipitation: event scoring and the Forecast page's wet-hour
+count. Temperature and wind are unaffected. Changing it later recomputes precip
+pairs and cached scores for that site.
 
 `elevation_m` is the reference elevation for the verification location. wxverify
 uses it when building the temperature consensus: station temperatures are
@@ -247,17 +267,55 @@ cells.
 
 ## Forecast Horizon
 
-wxverify is configured to request and score up to `168` lead hours, which is
-`7` days, for all forecast feeds.
+Two limits apply here, and they are not the same number.
 
-- Open-Meteo live forecasts request `forecast_hours=168`.
-- Meteoblue package data is filtered to `lead_hours <= 168`.
-- Open-Meteo historical backfill stores previous-run day-ahead leads from
-  day 1 through day 7.
+**Request horizon — per feed.** Every feed row carries its own
+`max_lead_hours`, and that value is what the fetcher asks the provider for. For
+Open-Meteo, `config.OPEN_METEO_MAX_LEAD_HOURS` maps each model to its horizon:
+`ecmwf_ifs`, `gfs_global`, `gem_global` and `jma_gsm` are requested to the
+ceiling `config.DISPLAY_REQUEST_HOURS` (`217`); `icon_global` to `180` and
+`ukmo_global_deterministic_10km` to `168`, each model's longest-run maximum;
+and `meteofrance_arpege_world` stays at `168` to preserve its existing scoring
+eligibility. The request length counts from the hour of the fetch, but a stored
+lead counts from the estimated issue time, so the model's advertised duration
+of about four days does not by itself justify lowering its `max_lead_hours`,
+which also bounds scoring. No feed's horizon is lowered in 0.16.0. Adding
+a model means adding an entry to that mapping — the fresh-database seed and
+the one-shot correction applied to existing databases both read it, so the two
+cannot drift apart. Meteoblue is unchanged: its seed stays at `168` and its
+package data is filtered to that feed's `max_lead_hours`. Open-Meteo historical
+backfill still stores previous-run day-ahead leads from day 1 through day 7.
 
-Actual stored coverage can be shorter when a provider or member model returns a
-shorter horizon. For example, some regional Meteoblue models may stop at 72, 96,
-120, or 144 hours even though wxverify's scoring limit is 168 hours.
+`DISPLAY_REQUEST_HOURS` is `217`, and it is a display figure, not a scoring
+one. The product displays `forecast.service.DAY_COUNT` days; the request has to
+cover one day beyond that, because the displayed span rolls over at local
+midnight while each feed refreshes only on its own fetch interval, and one hour
+beyond that, because a fall-back daylight-saving transition adds an hour to a
+local day.
+
+**Scoring ceiling — calendar-day buckets.** Pairing does not cut at an hour
+count. It admits issuance-relative local calendar-day buckets `0` through `7`:
+the local day a forecast was issued, plus the next seven. Within that, a sample
+still has to fall inside its own feed's `max_lead_hours`. The ceiling is stated
+in buckets and never in hours on purpose, because a bucket is a difference of
+local calendar dates: eight local days span 191 to 193 elapsed hours, depending
+on whether a daylight-saving transition falls inside the window. Any fixed hour
+count would be wrong on one side or the other.
+
+Raising a feed's `max_lead_hours` extends both its request window and its
+scoring admission bound, but scoring still stops at the calendar-day buckets
+described just above. For a feed now at `217`, scoring can admit additional
+leads above `168`, up to that bound and subject to those buckets, and the
+display can fill its last day as far as the model actually returns usable
+hours: a longer request improves last-day coverage but does not guarantee a
+complete day. `icon_global`, raised to `180`, gains at most leads 169-180 for
+scoring, and its last displayed day can still be incomplete, because its
+request can end before that day ends. Both feeds kept at `168` are unchanged.
+
+Actual stored coverage can still be shorter than a feed's own request horizon,
+when the provider or a member model returns less — some regional Meteoblue
+member models stop at 72, 96, 120, or 144 hours. There is no single global
+limit to compare them against: each feed's `max_lead_hours` is the reference.
 
 ## Web UI
 
@@ -331,6 +389,103 @@ Virtual feeds can appear beside provider feeds:
   model forecasts for the same site, variable, issued time, valid time, and
   lead. It is created only when at least two active real models contribute. It
   is not an external provider call.
+
+### Forecast page: daily high, low and rainfall
+
+A Forecast tile shows a temperature `High / Low` only when at least one of the
+feeds behind it covers every hour of that local day, from local midnight to the
+next local midnight — 24 hourly values, or 23 or 25 on a daylight-saving change
+day. Each feed is checked on its own. Two feeds that each cover part of the day
+do not add up to a covered day, because a feed's high and low only describe the
+hours that feed supplied. Among the feeds that qualify, the usual skill ranking
+and blend depth decide which ones are blended.
+
+When no feed covers the whole day, the row reads
+`Daily high/low unavailable — partial coverage` instead of a number. A high and
+low worked out from part of a day is never shown under the `High / Low` label.
+Everything else stays as it was:
+
+- The day's hourly chart still plots every selected feed, including feeds that
+  cover only part of the day.
+- The `partial` badge keeps its meaning: for temperature, wind or rain, none
+  of the selected feeds covers at least 18 hours of that day. It can appear
+  with or without the unavailable label, because it answers a different
+  question.
+- `Wind max` is not affected by this rule. `Rain` has a stricter rule of its
+  own, described below.
+
+The `Today` tile normally shows a high and low too. Adding a site's station
+starts a setup backfill, which fetches earlier forecast runs of every
+subscribed Open-Meteo feed up to the start of the hour the backfill began, and
+regular fetches supply the rest of the day from the hour they run. So once the
+backfill has finished, today's elapsed hours are already there. A feed can
+lack some of today's hours, and then cannot cover `Today`, when:
+
+- the setup backfill has not finished yet;
+- the feed comes from a provider other than Open-Meteo and was first fetched
+  today: those providers have no earlier runs to fetch, so the feed may lack
+  today's earliest hours (a feed already fetched before today normally has
+  them);
+- it is an Open-Meteo feed subscribed after the backfill finished, which the
+  backfill does not go back for (a catch-up, from the `Catch up` button on the
+  Ops page or the `catchup` command, may fetch its history);
+- the provider returned an hour without a value, or an hour fell after the
+  backfill's end and before the feed's first regular fetch.
+
+The label appears only when none of the feeds with forecasts for that day
+covers it, so a feed added later never blanks a day another feed already
+covers. Regular fetches never fill the hours before their own forecast run: a
+fetch keeps only hours at least an hour after its forecast run was issued, and
+Open-Meteo's regular fetches start at the hour they run. So when no feed covers
+today, `Today` shows the label for the rest of the date, unless the backfill or
+a catch-up fills the gap, or a later fetch returns a value for an hour an
+earlier one left without one. At local midnight the next date becomes `Today`,
+and it shows a high and low only if a feed covers that whole date: the change
+of day fills in no missing hours.
+
+The `Rain` row has a stricter rule, because a daily total and a count of wet
+hours are only right if each hour is counted exactly once. A feed counts
+towards them only when it supplies exactly one value for every hour of the
+local day — 24, or 23 or 25 on a daylight-saving change day. A missing hour,
+an hour given twice, or a value that falls between two hours rules the feed
+out. Each feed is checked on its own, and among the feeds that qualify, the
+usual skill ranking and blend depth decide which ones are used. The reasons
+above why a feed can lack some of `Today`'s hours apply to rain too.
+
+The row then shows the day's rainfall and its number of wet hours, each
+averaged across those feeds, for example `3.1 mm · ~5 h wet`. The rainfall is
+shown to one decimal place and the wet hours are rounded to a whole number,
+hence the `~`. An hour is wet when its forecast rain is at or above the site's
+`rain_threshold_mm`; exactly at the threshold counts, and rain need not fall
+for the whole hour. A rain-cloud symbol follows when the row shows `~6 h wet`
+or more. The rain bars on the day's hourly chart come from the same feeds, so
+they add up to the tile's total before it is rounded for display;
+`Show individual feeds` still shows every selected feed.
+
+When feeds have rain forecasts for the day but none qualifies, the row reads
+`Daily rainfall unavailable — partial coverage` and the hourly chart has no
+rain bars. A `—` in the row means there are no rain forecasts for that day at
+all.
+
+A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
+feeds its daily high and low come from and the feeds its daily rain figures
+come from, which can differ from the selected feeds its hourly chart plots.
+
+The daily forecast record stores what the tile showed: when the label appears,
+the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
+`insufficient`, next to the `extrema_feed_ids` that were used (an empty list in
+that case) and `extrema_low_confidence` (also `null`, because there is no set of
+feeds to judge). For rain it records `total_mm` and `wet_hours` (the average
+before rounding) with the same three fields. When the rainfall label appears,
+both are `null`, never `0`, and the three fields read `insufficient`, an empty
+list and `null`. For rain, the record's `hourly_values` are the chart's rain
+bars: for each time, the average of the feeds the daily figures come from,
+`null` where one of them has no value, and `null` throughout when no feed
+qualifies. Rain records written before this rule have no `extrema_feed_ids`:
+they store `chance` (a 0-to-1 share of wet hours) instead of `wet_hours`, and
+their `hourly_values` average whichever selected feeds had a value at each
+time. Verification scoring is unchanged — this decides what is displayed, not
+what is scored.
 
 ## CLI
 
@@ -464,10 +619,17 @@ Order matters. Run these steps in sequence:
 
 - SQLite runs in WAL mode.
 - All writes are serialized through one writer connection.
-- The observation refresh window is fixed at six hours in code, not a setting.
+- The observation refresh window is six hours in steady state and widens
+  automatically, up to the provider's seven-day limit, to cover a gap in stored
+  coverage. It is not a setting.
+- A station for which the provider returns no data, or no reading from the last
+  six hours, is retried on a growing delay, from one hour doubling to
+  twenty-four hours, while the site's other stations keep being fetched. The
+  health monitor (`/api/health/monitor`) flags the station until it reports a
+  recent reading again. Older hours it does return are still stored and used.
 - Weather.com PWS calls are budgeted per enabled station.
-- A site with no enabled stations is not observation-due and does not advance
-  `last_obs_at`.
+- A site with no enabled stations is not observation-due and advances neither
+  `last_obs_cycle_at` (cycle completion) nor `last_obs_at` (data freshness).
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
 - Audit queries against `verification_trigger_decisions` must select
@@ -658,11 +820,10 @@ container unhealthy — a deliberately lax envelope (60 s interval × 10 retries
 so ~10-11 minutes to trip). With the toggle off, neither triggers a restart: a
 crashed worker stays halted and data collection stops silently.
 
-The generous healthcheck envelope is deliberate: a long scoring transaction or
-boot-time catchup can starve the event loop and miss a probe or two, and a
-tighter envelope would restart a healthy add-on mid-run — a false restart with
-no actual hang. The cost is the ~10-11 minute detection window for an app that
-is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
+The generous healthcheck envelope is deliberate: the five-minute start period
+and the ten consecutive failed probes it takes to mark the container unhealthy
+are meant to tolerate temporary response delays. The cost is the ~10-11 minute
+detection window for an app that is genuinely wedged. Turning the Watchdog toggle off is an emergency stopgap
 only — it disables all Supervisor restarts, including crash recovery.
 
 **Proactive alerting** is HA-native. The add-on exposes a read-only verdict
@@ -691,7 +852,15 @@ that clears on its own is consistent with a Watchdog-triggered restart —
 confirm in the Supervisor log, which shows
 a `Watchdog found app Weather Verify ...` line.
 The runtime health routes `/api/health/*` and
-`/api/worker/status` remain available for ad-hoc inspection. `/api/worker/status`
+`/api/worker/status` remain available for ad-hoc inspection.
+`GET /api/health/feeds` returns one row per site and provider feed, each with
+its `status`; Meteoblue's member models are reported under its package row. By
+default each row carries `sample_count`, an exact count of every sample stored
+for that site and feed, which gets slower to compute as history grows. Add
+`?include_sample_count=false` for a lighter check: each row then carries a
+boolean `has_samples` in place of `sample_count`, and every other field, every
+`status` value and the row order are the same as in the default response. The
+default response is unchanged from 0.15.0. `/api/worker/status`
 also carries `read_cache_warm` — the read cache's own report of its most recent
 warm (`state`, `at`, `detail`, `derivations_failed`), or `null` before any warm
 has run. Read `state` together with `at`, never on its own: one slot is shared by
@@ -784,10 +953,22 @@ With the default cadences, each enabled site makes:
 - Weather.com PWS: one call per enabled station per observation cycle. With the
   default `obs_interval_minutes=180` and up to `obs_jitter_minutes=20`, that is
   roughly `7.2` to `8` cycles per day.
-- Open-Meteo forecasts: one call per enabled Open-Meteo model every
-  `360` minutes, or `4` calls per model per day.
+- Open-Meteo forecasts: each enabled Open-Meteo model is polled every `360`
+  minutes (`4` calls per day), except `gem_global`, polled every `720` minutes
+  (`2` calls per day). Polling follows each model's run cadence but is not
+  aligned to publication, so fetching every published run is not guaranteed.
 - Meteoblue: one multimodel package call every `360` minutes, or `4` calls per
   enabled site per day. The current package costs `16000` credits per call.
+
+The run a forward Open-Meteo forecast is labelled with, and the time it is
+recorded as issued, are estimated from the time of the fetch: the add-on
+subtracts a flat `90`-minute availability lag and rounds the result down to the
+model's run cadence in UTC, to `00`, `06`, `12` or `18` UTC, or to `00` or `12`
+UTC for `gem_global`. No run identifier is read from the provider, and nothing
+confirms which provider run a stored forecast came from. `gem_global`'s
+estimated labels are now twelve-hourly, matching the model's twelve-hour run
+schedule; forward `gem_global` forecasts stored before 0.16.0 keep their
+six-hourly estimated labels, and no stored row is relabelled.
 
 For an example deployment with one enabled site, 8 enabled stations, 7 enabled
 Open-Meteo models, and the Meteoblue package enabled, the expected steady-state
@@ -796,7 +977,7 @@ use is:
 | Provider        |          Expected steady-state use |
 | --------------- | ---------------------------------: |
 | Weather.com PWS |            about `56-64` calls/day |
-| Open-Meteo      |                     `28` calls/day |
+| Open-Meteo      |                     `26` calls/day |
 | Meteoblue       | `4` calls/day, `64000` credits/day |
 
 The default wxverify caps are:

@@ -21,15 +21,20 @@ from __future__ import annotations
 import asyncio
 import re
 import sqlite3
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import pytest
 from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.api.routes.health import HEALTH_FEEDS_SQL
+from wxverify.api.routes.health import (
+    HEALTH_FEEDS_HAS_SAMPLES_SQL,
+    HEALTH_FEEDS_SQL,
+    health_feeds,
+)
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.migrations import run_migrations
 from wxverify.web.context import FEED_HEALTH_SQL, load_feed_health
@@ -674,3 +679,267 @@ def test_backfill_site_htmx_fragment_does_not_load_ops(
             )
             is not None
         )
+
+
+# --- The opt-out ?include_sample_count=false mode ---------------------------
+
+
+def test_health_feeds_default_matches_explicit_include_sample_count_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default and ``?include_sample_count=true`` must be indistinguishable:
+    the whole point of the opt-in design is that the published contract does
+    not move for a caller that never passes the new parameter.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "default-vs-explicit-true.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        ids = db.write_sync(lambda conn: _seed_into(conn, package_present=True))
+        default_resp = client.get("/api/health/feeds")
+        explicit_resp = client.get(
+            "/api/health/feeds", params={"include_sample_count": "true"}
+        )
+    assert default_resp.status_code == 200
+    assert explicit_resp.status_code == 200
+    default_rows = default_resp.json()
+    assert default_rows == explicit_resp.json(), (
+        "default and ?include_sample_count=true diverge; the opt-in default "
+        "must be byte-identical to the explicit true case"
+    )
+    assert default_rows, "fixture produced no rows; the parity check is vacuous"
+    for row in default_rows:
+        assert set(row.keys()) == _PUBLISHED_HEALTH_FEEDS_KEYS
+        assert "has_samples" not in row
+
+    by_key = {(row["site_id"], row["feed_id"]): row for row in default_rows}
+    # Alpha/modelA was seeded with exactly TWO samples and Charlie's
+    # meteoblue package with exactly THREE, carried directly on the package
+    # row itself -- a regression that collapsed the count to a 0/1 presence
+    # flag would still pass a `> 0` check, so both are pinned to their real,
+    # non-boolean value.
+    alpha_model_a = by_key[(ids.alpha, ids.model_a_with_samples)]
+    assert alpha_model_a["sample_count"] == 2
+    assert ids.meteoblue_package is not None
+    charlie_package = by_key[(ids.charlie, ids.meteoblue_package)]
+    assert charlie_package["sample_count"] == 3
+
+
+def test_health_feeds_lightweight_mode_omits_count_and_carries_has_samples_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``?include_sample_count=false`` drops ``sample_count``, adds a JSON
+    boolean ``has_samples`` as the last key, and leaves every other field
+    byte-equal to the default response, row for row.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "lightweight-parity.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+        db.write_sync(lambda conn: _seed_into(conn, package_present=True))
+        default_resp = client.get("/api/health/feeds")
+        light_resp = client.get(
+            "/api/health/feeds", params={"include_sample_count": "false"}
+        )
+    assert default_resp.status_code == 200
+    assert light_resp.status_code == 200
+    default_rows = default_resp.json()
+    light_rows = light_resp.json()
+    assert default_rows, "fixture produced no rows; the parity check is vacuous"
+    assert len(default_rows) == len(light_rows)
+    expected_light_keys = (_PUBLISHED_HEALTH_FEEDS_KEYS - {"sample_count"}) | {
+        "has_samples"
+    }
+    for default_row, light_row in zip(default_rows, light_rows, strict=True):
+        assert set(light_row.keys()) == expected_light_keys
+        assert list(light_row.keys())[-1] == "has_samples", (
+            "has_samples must be the last key, matching where sample_count "
+            "sits in the default response"
+        )
+        # A JSON boolean decodes as `bool`; a leftover 0/1 int would not --
+        # `isinstance(1, bool)` is False, so this discriminates the two shapes.
+        assert isinstance(light_row["has_samples"], bool), (
+            "has_samples decoded as something other than a JSON boolean "
+            f"(got {light_row['has_samples']!r})"
+        )
+        # Same (site, feed) row in both modes: the ORDER BY is identical, so
+        # zip is a valid row-for-row pairing without re-keying.
+        assert (light_row["site_id"], light_row["feed_id"]) == (
+            default_row["site_id"],
+            default_row["feed_id"],
+        )
+        shared_keys = set(default_row.keys()) - {"sample_count"}
+        for key in shared_keys:
+            assert light_row[key] == default_row[key], key
+        assert light_row["has_samples"] == (int(default_row["sample_count"]) > 0)
+
+    has_samples_values = {row["has_samples"] for row in light_rows}
+    assert has_samples_values == {True, False}, (
+        "fixture never exercises both has_samples outcomes; the parity "
+        "oracle is vacuous"
+    )
+
+
+def test_health_feeds_status_agrees_between_default_and_lightweight_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ``status`` rung derived from ``has_samples`` must agree between
+    the two modes for every row, including empty feeds, feeds with samples,
+    and the meteoblue rolled-up (multimodel) case.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "status-both-modes.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    config.standalone_origin = None
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _build(conn: sqlite3.Connection) -> _FeedHealthIds:
+            ids = _seed_into(conn, package_present=True)
+            # Alpha's meteoblue package carries its samples ONLY through its
+            # two member feeds (see _seed_into) -- that is what makes it a
+            # genuinely rolled-up row. Give it a site_feed_state row so it
+            # actually reaches the has_samples branch too, so the fixture
+            # exercises the rollup path, not just plain feeds, for the
+            # has_samples-dependent statuses.
+            assert ids.meteoblue_package is not None
+            conn.execute(
+                """
+                INSERT INTO site_feed_state
+                    (site_id, feed_id, enabled, last_run_at, last_error, error_count)
+                VALUES (?, ?, 1, '2035-01-01T00:00:00Z', NULL, 0)
+                """,
+                (ids.alpha, ids.meteoblue_package),
+            )
+            return ids
+
+        ids = db.write_sync(_build)
+        default_resp = client.get("/api/health/feeds")
+        light_resp = client.get(
+            "/api/health/feeds", params={"include_sample_count": "false"}
+        )
+    assert default_resp.status_code == 200
+    assert light_resp.status_code == 200
+    default_by_key = {(r["site_id"], r["feed_id"]): r for r in default_resp.json()}
+    light_by_key = {(r["site_id"], r["feed_id"]): r for r in light_resp.json()}
+    assert default_by_key.keys() == light_by_key.keys()
+    assert ids.meteoblue_package is not None
+    rollup_key = (ids.alpha, ids.meteoblue_package)
+    assert default_by_key[rollup_key]["status"] == "ok"
+    assert light_by_key[rollup_key]["status"] == "ok"
+    assert default_by_key, (
+        "fixture produced no rows; the status-parity oracle is vacuous"
+    )
+    for key, default_row in default_by_key.items():
+        assert default_row["status"] == light_by_key[key]["status"], (
+            f"status disagreement for {key}: "
+            f"{default_row['status']!r} vs {light_by_key[key]['status']!r}"
+        )
+    has_samples_outcomes = {
+        int(row["sample_count"]) > 0 for row in default_by_key.values()
+    }
+    assert has_samples_outcomes == {True, False}, (
+        "fixture never reaches both has_samples outcomes; the status-parity "
+        "oracle is vacuous"
+    )
+    statuses = {row["status"] for row in default_by_key.values()}
+    assert {"ok", "ran / no usable data"} <= statuses, (
+        "fixture never reaches the has_samples-dependent status branches"
+    )
+
+
+def test_health_feeds_has_samples_sql_contains_no_count() -> None:
+    assert "COUNT(" not in HEALTH_FEEDS_HAS_SAMPLES_SQL
+
+
+_Parameters = Sequence[Any] | Mapping[str, Any]
+
+
+def test_health_feeds_lightweight_request_executes_the_exists_statement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The route must actually run ``HEALTH_FEEDS_HAS_SAMPLES_SQL`` when the
+    caller opts out, not merely carry a statement that would be cheaper if it
+    ran -- traced at the connection level so a regression that keeps calling
+    the COUNT statement under both flags is caught even though its JSON
+    output could otherwise look identical for an all-empty fixture.
+    """
+    executed: list[str] = []
+    real_execute = sqlite3.Connection.execute
+
+    class _TracingConnection(sqlite3.Connection):
+        def execute(self, sql: str, parameters: _Parameters = (), /) -> sqlite3.Cursor:
+            if isinstance(sql, str):
+                executed.append(sql)
+            return real_execute(self, sql, parameters)
+
+    conn = sqlite3.connect(":memory:", factory=_TracingConnection)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    _seed_into(conn, package_present=True)
+    executed.clear()  # drop migration/seed statements; only the route's own count
+
+    class _FakeDb:
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+
+        async def read(
+            self, fn: Callable[[sqlite3.Connection], list[dict[str, object]]]
+        ) -> list[dict[str, object]]:
+            return fn(self._conn)
+
+    monkeypatch.setattr("wxverify.api.routes.health.get_db", lambda: _FakeDb(conn))
+    rows = asyncio.run(health_feeds(include_sample_count=False))
+    assert rows, "fixture produced no rows; the trace is vacuous"
+
+    feed_health_statements = [sql for sql in executed if "feed_rollup" in sql]
+    assert feed_health_statements, "no feed-health statement executed at all"
+    assert all("EXISTS (" in sql for sql in feed_health_statements)
+    assert not any("COUNT(*)" in sql for sql in feed_health_statements), (
+        "lightweight request executed the COUNT statement, not the EXISTS one"
+    )
+
+
+def test_health_feeds_has_samples_probe_binds_site_and_feed() -> None:
+    conn, _ids = _seed(package_present=True)
+    assert _binds_site_and_feed(conn, HEALTH_FEEDS_HAS_SAMPLES_SQL)
+    degraded = HEALTH_FEEDS_HAS_SAMPLES_SQL.replace(
+        "CROSS JOIN forecast_samples", "JOIN forecast_samples"
+    )
+    assert degraded != HEALTH_FEEDS_HAS_SAMPLES_SQL, (
+        "CROSS JOIN keyword not found in HEALTH_FEEDS_HAS_SAMPLES_SQL; "
+        "negative control is vacuous"
+    )
+    assert not _binds_site_and_feed(conn, degraded)
+
+
+def test_health_feeds_template_constants_share_body_and_differ_in_probe_only() -> None:
+    """``HEALTH_FEEDS_SQL`` and ``HEALTH_FEEDS_HAS_SAMPLES_SQL`` are both
+    formatted from ``_HEALTH_FEEDS_TEMPLATE``; this pins that the only
+    differences are the probe prefix/expression and its alias, so the shared
+    CTE, join order, and ORDER BY cannot silently drift apart between them.
+    """
+    normalized_count = HEALTH_FEEDS_SQL.replace(
+        "(\n               SELECT COUNT(*)", "PROBE_SLOT", 1
+    ).replace("AS sample_count", "AS PROBE_ALIAS", 1)
+    normalized_exists = HEALTH_FEEDS_HAS_SAMPLES_SQL.replace(
+        "EXISTS (\n               SELECT 1", "PROBE_SLOT", 1
+    ).replace("AS has_samples", "AS PROBE_ALIAS", 1)
+    # Sanity: both replacements must actually have fired, or the equality
+    # below would pass vacuously by comparing each constant to itself.
+    assert normalized_count != HEALTH_FEEDS_SQL
+    assert normalized_exists != HEALTH_FEEDS_HAS_SAMPLES_SQL
+    assert normalized_count == normalized_exists, (
+        "the two statements diverge outside the probe expression and alias"
+    )

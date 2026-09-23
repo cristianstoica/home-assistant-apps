@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,7 @@ from tests.helpers import asof_conn
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import RuntimeOptions, load_runtime_options
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, close_db, init_db
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.settings.depth import (
@@ -95,6 +97,50 @@ def _make_site(conn: sqlite3.Connection, name: str = "Verify Town") -> int:
     )
     ensure_published_generation(conn, site_id)
     return site_id
+
+
+def _seed_full_day_precip(
+    conn: sqlite3.Connection, site_id: int, *, now: datetime
+) -> None:
+    """A complete 24-hour UTC local day of precip samples, from ``now``'s
+    midnight, so ``/forecast`` both renders a real tile (instead of the
+    "still collecting" empty state) AND the tile's precip feed is
+    extrema-eligible under G.3 (``covers_local_day_exactly``) -- required
+    to reach the Rain ``tile-row``'s tooltip markup, not just its
+    unconditional ``<span>Rain</span>`` label (see
+    ``test_forecast_page_ride_alongs``).
+
+    ``now`` MUST be the same fixed instant the page handler's own
+    ``utc_now()`` call is pinned to (see that test): seeding from a live
+    ``utc_now()`` here while the handler reads a separately-called live
+    ``utc_now()`` risks a UTC-midnight rollover landing between the two
+    calls, which would seed one local day and render another.
+    """
+    row = conn.execute(
+        "SELECT id FROM feeds WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
+    ).fetchone()
+    assert row is not None
+    feed_id = int(row["id"])
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    issued_at = isoformat_utc(day_start - timedelta(hours=6))
+    for hour in range(24):
+        valid_at = day_start + timedelta(hours=hour)
+        conn.execute(
+            """
+            INSERT INTO forecast_samples
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 value, source_raw, model_run_id, fetched_at)
+            VALUES (?, ?, 'precip', ?, ?, ?, 0.0, '{}', 'run-x', ?)
+            """,
+            (
+                site_id,
+                feed_id,
+                issued_at,
+                isoformat_utc(valid_at),
+                hour + 6,
+                issued_at,
+            ),
+        )
 
 
 def _seed_published_run(
@@ -834,7 +880,19 @@ def test_forecast_page_ride_alongs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
-    _make_site(conn)
+    site_id = _make_site(conn)
+    # ONE fixed instant for both the seeding below and the page handler's
+    # own clock, pinned at its real seam (`wxverify.forecast.service`'s
+    # module-level `utc_now` binding, which `build_forecast`/`build_hourly`
+    # read via `now or utc_now()`): a live `utc_now()` read separately by
+    # the seeding helper and by the handler could straddle a UTC-midnight
+    # rollover and seed one local day while the handler renders another.
+    fixed_now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.forecast.service.utc_now", lambda: fixed_now)
+    # A real tile is required to reach the Rain tile-row's tooltip markup at
+    # all; an empty-state site (zero samples) never renders "tile-row" or
+    # "Rain", so the tooltip assertion below would silently never execute.
+    _seed_full_day_precip(conn, site_id, now=fixed_now)
     conn.commit()
     # The override must arrive via options.json: startup's
     # apply_plain_settings CLEARS any depth-override row whose key is
@@ -851,10 +909,13 @@ def test_forecast_page_ride_alongs(
         assert "Blend depth" in page.text
         assert "wind 4 (override)" in page.text
         assert "temperature 2 (global)" in page.text
-        # Relabel: "predicted wet-hour share" replaces "chance of rain".
+        # Relabel: the old "Chance of rain" copy is gone entirely (G.5).
         assert "Chance of rain" not in page.text
-        if "tile-row" in page.text and "Rain" in page.text:
-            assert "Predicted wet-hour share" in page.text or "title=" not in page.text
+        # Fixture guard: the tile actually rendered, so the assertion below
+        # is not vacuous.
+        assert "tile-row" in page.text
+        assert "Rain" in page.text
+        assert "Wet hours:" in page.text
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ import json
 import logging
 import sqlite3
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
@@ -36,11 +36,15 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
 )
 from wxverify.forecast.aggregate import (
+    EXTREMA_COVERAGE_COMPLETE,
     blend_mean,
     clearing_subset,
     covered_hours,
+    covers_local_day,
+    covers_local_day_exactly,
     display_day_index,
     displayed_daily,
+    fixed_membership_series,
 )
 from wxverify.forecast.data import (
     FutureSampleRow,
@@ -50,6 +54,7 @@ from wxverify.forecast.data import (
 )
 from wxverify.forecast.selection import (
     CellCandidate,
+    CellSelection,
     representative_day_ahead,
     select_cell_feeds,
 )
@@ -400,6 +405,7 @@ def _candidate_records(
                 "mae": None,
                 "future_sample_count": 0,
                 "covered_hours": 0,
+                "extrema_eligible": False,
             }
         )
         record["participation"] = participation
@@ -422,6 +428,33 @@ def _blend_hourly(
         if mean is not None:
             out.append((valid_at, mean))
     return out
+
+
+def _precip_aggregate_hourly(
+    selection: CellSelection,
+    feeds_samples: dict[int, list[FutureSampleRow]],
+) -> list[tuple[str, float | None]]:
+    """Precipitation's recorded hourly series: the drill-down's aggregate line.
+
+    The axis is precipitation's share of the drill-down axis, the instants of
+    every feed in ``selection.feeds`` and ``selection.extrema_feeds``; the
+    values are :func:`fixed_membership_series` over ``extrema_feeds``, in
+    selection order. Null where a member does not supply an instant, and at
+    every instant when no feed qualified. Never zero-filled, and never a
+    blend of any other feed set.
+    """
+    hours = sorted(
+        {
+            sample.valid_at
+            for candidate in (*selection.feeds, *selection.extrema_feeds)
+            for sample in feeds_samples.get(candidate.feed_id, [])
+        }
+    )
+    members = [
+        {sample.valid_at: sample.value for sample in feeds_samples.get(c.feed_id, [])}
+        for c in selection.extrema_feeds
+    ]
+    return list(zip(hours, fixed_membership_series(hours, members), strict=True))
 
 
 def _leaderboard_status_cell(
@@ -554,6 +587,9 @@ def build_forecast_record(
                 continue
             candidates: list[CellCandidate] = []
             effective_cells: dict[str, int] = {}
+            covers = (
+                covers_local_day_exactly if variable == "precip" else covers_local_day
+            )
             for feed_id, feed_samples in feeds_samples.items():
                 rep = representative_day_ahead(
                     [
@@ -589,22 +625,53 @@ def build_forecast_record(
                         mae=row.mae if row is not None else None,
                         future_sample_count=len(feed_samples),
                         covered_hours=covered_hours(s.valid_at for s in feed_samples),
+                        extrema_eligible=covers(
+                            (s.valid_at for s in feed_samples),
+                            local_date=target_date,
+                            timezone=timezone,
+                        ),
                     )
                 )
+            # Same per-variable eligibility policy as the Forecast page
+            # (forecast/service.py): temperature and precipitation ask for
+            # the extrema set, each judged by its own variable's coverage
+            # predicate, and only the ``displayed`` block and precipitation's
+            # ``hourly`` below consume it.
             selection = select_cell_feeds(
-                candidates, blend_depth=depths[variable].depth
+                candidates,
+                blend_depth=depths[variable].depth,
+                extrema_coverage_required=variable in ("temperature", "precip"),
             )
             selected_ids = [c.feed_id for c in selection.feeds]
             weight = 1.0 / len(selected_ids) if selected_ids else None
-            # ``hourly`` is the FULL-selection blend on purpose: it exists to
-            # reproduce the Forecast page's hourly drill-down, which blends
-            # the whole selection (forecast/service.py) while only the tile's
-            # daily value uses the clearing subset. Do not unify it with the
-            # outcomes blend below.
-            hourly = _blend_hourly(selected_ids, feeds_samples)
+            # For temperature and wind ``hourly`` is the FULL-selection blend
+            # on purpose (``_blend_hourly``): it exists to reproduce those
+            # variables' hourly drill-down lines, which blend the whole
+            # selection (forecast/service.py) while only the tile's daily
+            # value uses a different set (the clearing subset, or for
+            # temperature and precipitation the extrema set, which may
+            # include feeds outside the selection). For precipitation it is
+            # built by ``_precip_aggregate_hourly`` through
+            # ``fixed_membership_series`` and reproduces the drill-down's
+            # precipitation aggregate line, which is the extrema set's. Do
+            # not unify it with the outcomes blend below.
+            hourly: Sequence[tuple[str, float | None]] = (
+                _precip_aggregate_hourly(selection, feeds_samples)
+                if variable == "precip"
+                else _blend_hourly(selected_ids, feeds_samples)
+            )
             # The DISPLAYED daily quantities, computed exactly the production
-            # way (aggregate per feed over the clearing subset, then blend) —
-            # via the same shared helpers the Forecast page uses (§6/§7).
+            # way (aggregate per feed, then blend) — via the same shared
+            # helpers the Forecast page uses (§6/§7). Wind aggregates over the
+            # clearing subset; temperature and precipitation aggregate over
+            # the selection's extrema set (feeds covering the whole local day
+            # for temperature, feeds supplying each of its hours exactly once
+            # for precipitation). A suppressed temperature cell is recorded
+            # as null high/low and a suppressed precipitation cell as null
+            # ``total_mm`` and ``wet_hours``, each with
+            # ``extrema_coverage == "insufficient"``, never a partial range
+            # or a partial sum.
+            # ``partial`` keeps its clearing-subset meaning for every variable.
             if selection.available:
                 agg_ids, partial = clearing_subset(
                     selected_ids,
@@ -612,18 +679,36 @@ def build_forecast_record(
                 )
             else:
                 agg_ids, partial = [], False
+            extrema_ids = [c.feed_id for c in selection.extrema_feeds]
+            display_ids = (
+                extrema_ids if variable in ("temperature", "precip") else agg_ids
+            )
             displayed: dict[str, object] = dict(
                 displayed_daily(
                     variable,
-                    [[s.value for s in feeds_samples[fid]] for fid in agg_ids],
+                    [[s.value for s in feeds_samples[fid]] for fid in display_ids],
                     rain_threshold_mm=rain_threshold_mm,
                 )
             )
             displayed["partial"] = partial
             displayed["low_confidence"] = selection.low_confidence
+            if variable in ("temperature", "precip"):
+                displayed["extrema_feed_ids"] = extrema_ids
+                displayed["extrema_coverage"] = selection.extrema_coverage
+                # The extrema set's own ladder verdict, raw: null when no
+                # feed qualified (no set to judge), and never the page's
+                # rebuilding precedence — this ranking is live as-of T.
+                displayed["extrema_low_confidence"] = (
+                    selection.extrema_low_confidence
+                    if selection.extrema_coverage == EXTREMA_COVERAGE_COMPLETE
+                    else None
+                )
             # Outcomes describe the SCORED product, so they are computed over
-            # the clearing subset — the same feed set ``displayed`` uses
-            # (simulate.py parity, W3).
+            # the clearing subset (simulate.py parity, W3) — the feed set
+            # ``displayed`` uses for wind. For temperature and precipitation
+            # the two sets may differ; ``extrema_feed_ids`` records the
+            # displayed one for both so the difference is readable, not
+            # silent.
             outcomes = evaluate_variable(
                 variable,
                 _blend_hourly(agg_ids, feeds_samples),

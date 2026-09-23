@@ -245,9 +245,11 @@ def load_feed_freshness(
 def samples_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
     """Monotonic change token for the auto-poll: MAX(rowid) of site samples.
 
-    Every fetch inserts new rows (the unique key includes ``issued_at``), so
-    any new run advances the fingerprint; an unchanged fingerprint means the
-    tiles fragment can answer 204 and leave the open drill-down untouched.
+    Inserting a previously absent sample key (the unique key includes
+    ``issued_at``) advances the fingerprint. A fetch whose samples are all
+    already stored inserts nothing and leaves it unchanged, which is correct
+    because nothing stored changed. An unchanged fingerprint lets the tiles
+    fragment answer 204 and leave the open drill-down untouched.
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS fp FROM forecast_samples WHERE site_id = ?",

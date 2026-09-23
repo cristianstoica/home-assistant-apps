@@ -1,5 +1,75 @@
 # Changelog
 
+## 0.16.0
+
+Sizes the budget reservation for Open-Meteo previous-runs requests by what
+they ask for, keeps an observation cycle running past one station's empty
+response, raises most Open-Meteo forecast horizons, and moves `gem_global`
+to a twelve-hour polling interval and estimated run-label cadence.
+
+### Added
+
+- A new optional setting, off unless switched on (`parse_cap_probe`), writes
+  one log line per model on each Visual Crossing, Meteoblue or Meteosource
+  fetch, saying how many forecast hours the response held, how many the
+  add-on keeps and how far ahead they reach. It changes nothing that is
+  requested, stored or shown, and it is temporary.
+- `GET /api/health/feeds` accepts `?include_sample_count=false` for a
+  lighter check: each row then carries a boolean `has_samples` in place of
+  the exact `sample_count`. The default response is unchanged.
+
+### Changed
+
+- Open-Meteo previous-runs requests, which backfill and catch-up both
+  use, now reserve budget from how many values they ask for and how many
+  calendar days they span, following Open-Meteo's documented metering
+  rule and rounded up to whole calls, instead of a flat one call.
+- Open-Meteo requests for `ecmwf_ifs`, `gfs_global`, `gem_global` and
+  `jma_gsm` are extended from 168 to 217 hours, and `icon_global` to 180
+  hours, its longest-run maximum; `ukmo_global_deterministic_10km` and
+  `meteofrance_arpege_world` stay at 168 hours. Estimated API-call usage is
+  unchanged, but more data is stored and processed. A longer request does
+  not guarantee a complete last day on the page, because a model may
+  return fewer usable hours than requested, and `icon_global`'s 180 hours
+  do not always reach the end of that day.
+- `gem_global`'s default polling interval and estimated run-label cadence
+  change from six to twelve hours, because six-hour labels could imply
+  `gem_global` runs outside its twelve-hour schedule. Polling is not
+  aligned to provider publication and does not guarantee capturing every
+  run. At the default polling intervals, estimated scheduled Open-Meteo
+  usage moves from 28 to 26 calls per day, per site with all seven
+  models enabled. The issue time assigned to each forward Open-Meteo
+  forecast is still estimated from the time of the fetch, not read from
+  the provider, and this release does not correct which model run a
+  stored forecast is attributed to.
+- The Forecast page now shows a daily high and low only when a feed
+  covers the whole local day, and says so plainly instead of printing a
+  partial-coverage figure when none does.
+- Each tile's rain line now states how many hours of the day are expected
+  to be wet instead of a percentage. The millimetre total and the
+  wet-hour count are both shown only when a feed covers the whole local
+  day. When the tile shows a total, the hourly chart's rain bars now come
+  from the same feeds and add up to it before it is rounded for display;
+  when it does not, the chart has no rain bars.
+
+### Fixed
+
+- A single station's empty response no longer stops the rest of a site's
+  observation cycle. A station returning from a history failure now
+  keeps the older observations already present in the same seven-day
+  response it downloads, so the hours missed while it was unreachable
+  are stored without any additional requests, as far back as the
+  provider still holds them, up to seven days. A station that stops
+  reporting while the provider keeps answering for it is now retried on
+  the same growing delay and flagged by the health monitor
+  (`/api/health/monitor`), instead of being treated as healthy, while
+  any older hours it returns are still stored.
+
+The database schema moves to `user_version 7`. Once a database has been
+opened by this version, it can no longer be opened by 0.15.0 or earlier.
+Back up the add-on before upgrading; going back means restoring that
+backup.
+
 ## 0.15.0
 
 Makes the results and health pages report the state they actually read

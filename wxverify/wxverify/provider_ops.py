@@ -24,11 +24,14 @@ from wxverify.worker.feed_fetch import feed_fetch_target
 
 # Days of history the provider-health route aggregates per feed. A display
 # bound, not an operator-tunable analysis parameter (the settings row
-# `rolling_window_days` is the unrelated *scoring* window): 7 days is 28
-# seeded 6-hour poll cycles and ~5.6x the worst-case retry-exhaustion span,
-# so a feed surviving a multi-day outage still shows recent activity. A feed
-# configured slower than this legitimately reports zero recent samples while
-# healthy; `status` stays anchored to lifetime existence, never this window.
+# `rolling_window_days` is the unrelated *scoring* window): 7 days holds
+# 10080 / fetch_interval_minutes poll cycles of each feed (28 at 360
+# minutes, 14 at 720). Those counts are nominal (scheduled poll
+# opportunities, not guaranteed samples), and the window keeps activity
+# from before an outage only when that outage is shorter than the window.
+# A feed configured slower than this legitimately reports zero recent
+# samples while healthy; `status` stays anchored to lifetime existence,
+# never this window.
 HEALTH_METRICS_WINDOW_DAYS = 7
 
 # Contract marker published on every per-feed dict of /api/health/providers

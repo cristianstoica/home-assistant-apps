@@ -40,7 +40,7 @@ from wxverify.core.options import RuntimeOptions, _from_env
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.forecast.service import build_forecast
+from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
 from wxverify.scoring.metrics import strategy_for
@@ -268,6 +268,16 @@ def _seed_score_cache_for_fixture(conn: sqlite3.Connection) -> None:
 
 
 def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None:
+    """Touch point 6: the resolved ``forecast_blend_depth`` setting reaches
+    the BLEND-set selection. `_seed_two_confident_feeds` covers hours 04-23
+    (20 hours) -- short of the complete local day Item F's extrema
+    eligibility rule requires -- so for temperature `tile.temp.meta.feeds`
+    now names the (empty) extrema set regardless of blend depth, not the
+    depth-narrowed blend set this test is pinning. Read the blend set from
+    ``build_hourly``'s per-feed series instead (drawn from
+    ``selections[variable].feeds``, unaffected by extrema filtering) --
+    the same substitution already used for the far-horizon suppression
+    tests in test_forecast_service.py."""
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
     conn_default = _make_db()
@@ -277,7 +287,12 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
     view_default = build_forecast(
         conn_default, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
-    assert len(view_default.tiles[0].temp.meta.feeds) == 2  # default depth = 2
+    payload_default = build_hourly(
+        conn_default, site_id=1, timezone="UTC", day=0, now=now
+    )
+    feeds_default = payload_default["feeds"]
+    assert isinstance(feeds_default, list)
+    assert len(feeds_default) == 2  # default depth = 2
     assert view_default.tiles[0].temp.meta.state != "low_confidence"
 
     conn_narrow = _make_db()
@@ -288,5 +303,10 @@ def test_end_to_end_default_blends_two_explicit_setting_narrows_to_one() -> None
     view_narrow = build_forecast(
         conn_narrow, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
-    assert len(view_narrow.tiles[0].temp.meta.feeds) == 1
+    payload_narrow = build_hourly(
+        conn_narrow, site_id=1, timezone="UTC", day=0, now=now
+    )
+    feeds_narrow = payload_narrow["feeds"]
+    assert isinstance(feeds_narrow, list)
+    assert len(feeds_narrow) == 1
     assert view_narrow.tiles[0].temp.meta.state != "low_confidence"

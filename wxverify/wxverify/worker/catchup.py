@@ -286,7 +286,9 @@ async def _fetch_due_open_meteo(
                 variables=BACKFILL_VARIABLES,
                 max_lead_hours=target.max_lead_hours,
             )
-            cost = adapter.estimate_cost(req)
+            cost = adapter.estimate_historical_cost(
+                req, window_start=window_start, window_end=window_end
+            )
             reservation = await writer.write(
                 lambda conn, feed=target, reserve=cost: _reserve_feed_call(
                     conn, feed, reserve

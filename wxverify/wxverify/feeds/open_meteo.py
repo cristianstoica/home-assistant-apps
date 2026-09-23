@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import ClassVar, Final, cast
 
 import httpx
@@ -23,7 +23,7 @@ RUN_CADENCE_HOURS: Final[dict[str, int]] = {
     "ecmwf_ifs": 6,
     "gfs_global": 6,
     "icon_global": 6,
-    "gem_global": 6,
+    "gem_global": 12,
     "meteofrance_arpege_world": 6,
     "jma_gsm": 6,
     "ukmo_global_deterministic_10km": 6,
@@ -37,6 +37,8 @@ VARIABLE_MAP: Final[dict[str, str]] = {
     "precip": "precipitation",
 }
 TRACE_NEGATIVE_PRECIP_MIN: Final = -0.1
+_METERED_REFERENCE_VARIABLES: Final = 10
+_METERED_REFERENCE_DAYS: Final = 14
 
 logger = logging.getLogger(__name__)
 
@@ -50,13 +52,58 @@ class OpenMeteoResponse(BaseModel):
     hourly: dict[str, list[str | int | float | None]]
 
 
+def _run_shape(model: str) -> tuple[int, int]:
+    """Cadence hours and availability-lag minutes for one model.
+
+    ``RUN_CADENCE_HOURS`` is the roster; ``RUN_AVAILABILITY_LAG_MINUTES`` is
+    derived from it, so one membership test governs both lookups. No default:
+    a model absent from the roster cannot be assigned a run label, and
+    inventing one silently mis-attributes every sample it produces for the
+    life of the feed.
+    """
+    if model not in RUN_CADENCE_HOURS:
+        raise ValueError(f"open-meteo model has no run cadence: {model}")
+    return RUN_CADENCE_HOURS[model], RUN_AVAILABILITY_LAG_MINUTES[model]
+
+
 def _snap_run(model: str, fetch_time: str | None = None) -> str:
+    """Estimate the run boundary of a forecast fetched at ``fetch_time``.
+
+    Subtracts the model's availability lag from the fetch time (default:
+    now) and floors the UTC hour to the model's run cadence. The result is
+    an estimate derived from the fetch clock alone, not a provider-reported
+    run time: no field of the Open-Meteo response is consulted, and the lag
+    is a flat allowance rather than a measured publication delay. It could
+    only become authoritative with a run identifier carried in the forecast
+    payload, or with a documented endpoint that selects a forecast by run;
+    Open-Meteo documents neither for this request.
+    """
+    cadence, lag_minutes = _run_shape(model)
     now = parse_utc(fetch_time) if fetch_time else utc_now()
-    lagged = now - timedelta(minutes=RUN_AVAILABILITY_LAG_MINUTES.get(model, 90))
-    cadence = RUN_CADENCE_HOURS.get(model, 6)
+    lagged = now - timedelta(minutes=lag_minutes)
     hour = (lagged.hour // cadence) * cadence
     snapped = lagged.replace(hour=hour, minute=0, second=0, microsecond=0)
     return isoformat_utc(snapped)
+
+
+def _metered_calls(variables: int, days: int) -> int:
+    """Integer form of max(1, ceil((V / 10) * max(1, days / 14)))."""
+    if variables <= 0:
+        return 1
+    scale = _METERED_REFERENCE_VARIABLES * _METERED_REFERENCE_DAYS  # 140
+    numerator = variables * max(_METERED_REFERENCE_DAYS, days)
+    return max(1, -(-numerator // scale))
+
+
+def _historical_date_range(window_start: str, window_end: str) -> tuple[date, date]:
+    """The inclusive calendar dates fetch_historical sends as start_date/end_date."""
+    return parse_utc(window_start).date(), parse_utc(window_end).date()
+
+
+def _billed_days(window_start: str, window_end: str) -> int:
+    """Billed span of that request: inclusive date count, floored at 1."""
+    start, end = _historical_date_range(window_start, window_end)
+    return max(1, (end - start).days + 1)
 
 
 class OpenMeteoAdapter:
@@ -66,7 +113,16 @@ class OpenMeteoAdapter:
         self._client = client
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
-        return CostEstimate(calls=1)
+        hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
+        return CostEstimate(calls=_metered_calls(len(hourly), _METERED_REFERENCE_DAYS))
+
+    def estimate_historical_cost(
+        self, req: ForecastRequest, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        names = _historical_hourly_names(req)
+        return CostEstimate(
+            calls=_metered_calls(len(names), _billed_days(window_start, window_end))
+        )
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
         hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
@@ -92,8 +148,8 @@ class OpenMeteoAdapter:
         response.raise_for_status()
         payload = OpenMeteoResponse.model_validate(response.json())
         data = payload.model_dump()
-        issued_at = _snap_run(req.model)
-        samples = _samples_from_hourly(req.model, issued_at, data)
+        estimated_issued_at = _snap_run(req.model)
+        samples = _samples_from_hourly(req.model, estimated_issued_at, data)
         logger.debug(
             "open_meteo forecast response status=%s samples=%s",
             response.status_code,
@@ -118,6 +174,7 @@ class OpenMeteoAdapter:
             window_start,
             window_end,
         )
+        start_date, end_date = _historical_date_range(window_start, window_end)
         response = await self._client.get(
             "https://previous-runs-api.open-meteo.com/v1/forecast",
             params={
@@ -126,8 +183,8 @@ class OpenMeteoAdapter:
                 "models": req.model,
                 "hourly": ",".join(hourly),
                 "timezone": "UTC",
-                "start_date": parse_utc(window_start).date().isoformat(),
-                "end_date": parse_utc(window_end).date().isoformat(),
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
             },
             timeout=httpx.Timeout(15.0, connect=5.0),
         )

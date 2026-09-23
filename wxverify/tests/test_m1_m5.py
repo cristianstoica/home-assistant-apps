@@ -48,7 +48,6 @@ from wxverify.feeds.seam import (
     GridProvenance,
     NormalizedSample,
 )
-from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import (
     PwsObservation,
     PwsStation,
@@ -926,7 +925,10 @@ def test_pws_parser_and_fetch_obs_refresh(
     ) -> list[PwsObservation]:
         assert station_id == "OBS1"
         assert api_key == "secret-weather"
-        assert hours == RECENT_REFRESH_HOURS == 6
+        # This station has no stored observations (obs_watermark_at is
+        # NULL), so _retention_hours falls back to the full seven-day
+        # history window rather than the steady-state refresh window.
+        assert hours == 168
         assert timezone == "UTC"
         assert client is not None
         return [
@@ -940,6 +942,7 @@ def test_pws_parser_and_fetch_obs_refresh(
 
     monkeypatch.setattr("wxverify.worker.processor.fetch_hourly_history", fake_history)
     dispatch_db = get_db()
+    # Under B2 this station parks at rung 1; park fields belong to the B2 tests.
     asyncio.run(
         dispatch(
             dispatch_db,
@@ -1135,7 +1138,10 @@ def test_station_call_pacing_is_seeded_bounded_and_used_by_fetch_obs(
         client: httpx.AsyncClient | None = None,
     ) -> list[PwsObservation]:
         assert api_key == "secret-weather"
-        assert hours == RECENT_REFRESH_HOURS
+        # These stations have no stored observations (obs_watermark_at is
+        # NULL), so _retention_hours falls back to the full seven-day
+        # history window rather than the steady-state refresh window.
+        assert hours == 168
         assert timezone == "UTC"
         assert client is not None
         history_calls.append(station_id_arg)
@@ -1236,6 +1242,11 @@ def test_backfill_and_catchup_write_domain_state(
 
         def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
             assert req.model == "ecmwf_ifs"
+            return CostEstimate(calls=1)
+
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
             return CostEstimate(calls=1)
 
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
@@ -1457,6 +1468,11 @@ def test_backfill_fetches_pws_history_once_across_forecast_chunks(
             assert req.model == "ecmwf_ifs"
             return CostEstimate(calls=1)
 
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
+            return CostEstimate(calls=1)
+
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
             raise AssertionError("backfill should use historical replay")
 
@@ -1605,6 +1621,11 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
         supports_historical = True
 
         def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
+            return CostEstimate(calls=1)
+
+        def estimate_historical_cost(
+            self, req: ForecastRequest, *, window_start: str, window_end: str
+        ) -> CostEstimate:
             return CostEstimate(calls=1)
 
         async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
@@ -3312,7 +3333,7 @@ def test_api_guard_and_routes(tmp_path: Path, monkeypatch) -> None:  # type: ign
         assert cross.status_code == 403
         simple = client.put(
             f"/api/sites/{site_id}",
-            data="enabled=true",
+            content="enabled=true",
             headers={
                 "Origin": "http://testserver",
                 "X-CSRF-Token": csrf,

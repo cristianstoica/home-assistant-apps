@@ -7,6 +7,7 @@ plain seed values here and perform insert-only seeding inside their transaction.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -43,15 +44,54 @@ class FeedSeed:
     is_virtual: bool = False
 
 
-OPEN_METEO_MODELS: Final[tuple[str, ...]] = (
-    "ecmwf_ifs",
-    "gfs_global",
-    "icon_global",
-    "gem_global",
-    "meteofrance_arpege_world",
-    "jma_gsm",
-    "ukmo_global_deterministic_10km",
-)
+#: Hours of forecast a request must reach for the last displayed day to be
+#: complete. `forecast.service.DAY_COUNT` days are displayed; the request must
+#: cover one day beyond that, because the displayed span rolls over at local
+#: midnight while each feed refreshes only on its own fetch interval, and one
+#: hour beyond that, because a fall-back daylight-saving transition adds an
+#: hour to a local day.
+#: Not imported from `forecast.service` -- `config` must not depend on it; a
+#: test pins the two together.
+DISPLAY_REQUEST_HOURS: Final = 217
+
+#: Each Open-Meteo model's request horizon, in hours: its longest-run maximum
+#: where that falls below `DISPLAY_REQUEST_HOURS`, and the ceiling itself
+#: where the model reaches past what the displayed product can consume. One
+#: exception: `meteofrance_arpege_world` stays at 168, above its advertised
+#: duration, to preserve its existing scoring eligibility. The request length
+#: counts from the fetch hour and a stored lead from the estimated issue
+#: time, so the advertised duration alone does not justify lowering a bound
+#: that pairing also applies. Single source for both the fresh-database seed
+#: below and the one-shot correction
+#: `db.migrations.correct_open_meteo_horizons` applies to existing databases,
+#: so the two cannot drift apart.
+OPEN_METEO_MAX_LEAD_HOURS: Final[Mapping[str, int]] = {
+    "ecmwf_ifs": DISPLAY_REQUEST_HOURS,
+    "gfs_global": DISPLAY_REQUEST_HOURS,
+    "icon_global": 180,  # the model's longest-run maximum, below the ceiling
+    "gem_global": DISPLAY_REQUEST_HOURS,
+    "meteofrance_arpege_world": 168,
+    "jma_gsm": DISPLAY_REQUEST_HOURS,
+    "ukmo_global_deterministic_10km": 168,
+}
+
+#: Each Open-Meteo model's fetch interval, in minutes: one poll per published
+#: run, i.e. the model's run cadence (`feeds.open_meteo.RUN_CADENCE_HOURS`)
+#: times 60. A second poll inside one run window gets the same run key: every
+#: sample already stored keeps its first value, so the poll cannot refresh it,
+#: though it can still insert hours not yet stored. Single source for both the
+#: fresh-database seed below and the one-shot correction
+#: `db.migrations.correct_open_meteo_fetch_intervals` applies to existing
+#: databases, so the two cannot drift apart.
+OPEN_METEO_FETCH_INTERVAL_MINUTES: Final[Mapping[str, int]] = {
+    "ecmwf_ifs": 360,
+    "gfs_global": 360,
+    "icon_global": 360,
+    "gem_global": 720,
+    "meteofrance_arpege_world": 360,
+    "jma_gsm": 360,
+    "ukmo_global_deterministic_10km": 360,
+}
 
 SOURCE_SEEDS: Final[tuple[SourceSeed, ...]] = (
     SourceSeed("open-meteo", 10000, None, "UTC"),
@@ -80,10 +120,10 @@ FEED_SEEDS: Final[tuple[FeedSeed, ...]] = (
             enabled=True,
             disabled_reason=None,
             default_subscribed=True,
-            fetch_interval_minutes=360,
-            max_lead_hours=168,
+            fetch_interval_minutes=OPEN_METEO_FETCH_INTERVAL_MINUTES[model],
+            max_lead_hours=hours,
         )
-        for model in OPEN_METEO_MODELS
+        for model, hours in OPEN_METEO_MAX_LEAD_HOURS.items()
     )
     + (
         FeedSeed(

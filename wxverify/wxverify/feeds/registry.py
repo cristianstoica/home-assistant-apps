@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 
+from wxverify.core.options import load_runtime_options
 from wxverify.core.secrets import resolve_secret
 from wxverify.feeds.google import GoogleAdapter
 from wxverify.feeds.meteoblue import MeteoblueAdapter
@@ -19,15 +20,27 @@ def build_adapter(source: str, client: httpx.AsyncClient) -> ForecastAdapter:
     if source == "open-meteo":
         return OpenMeteoAdapter(client)
     if source == "meteoblue":
-        return MeteoblueAdapter(_require_key("meteoblue"), client)
+        return MeteoblueAdapter(
+            _require_key("meteoblue"),
+            client,
+            parse_cap_probe=_parse_cap_probe_enabled(),
+        )
     if source == "visualcrossing":
-        return VisualCrossingAdapter(_require_key("visualcrossing"), client)
+        return VisualCrossingAdapter(
+            _require_key("visualcrossing"),
+            client,
+            parse_cap_probe=_parse_cap_probe_enabled(),
+        )
     if source == "openweathermap":
         return OpenWeatherMapAdapter(_require_key("openweathermap"), client)
     if source == "weatherapi":
         return WeatherApiAdapter(_require_key("weatherapi"), client)
     if source == "meteosource":
-        return MeteosourceAdapter(_require_key("meteosource"), client)
+        return MeteosourceAdapter(
+            _require_key("meteosource"),
+            client,
+            parse_cap_probe=_parse_cap_probe_enabled(),
+        )
     if source == "google":
         return GoogleAdapter(_require_key("google"), client)
     raise ValueError(f"no adapter for source {source}")
@@ -38,3 +51,7 @@ def _require_key(provider: str) -> str:
     if not key:
         raise RuntimeError(f"{provider} key is not configured")
     return key
+
+
+def _parse_cap_probe_enabled() -> bool:
+    return load_runtime_options().parse_cap_probe

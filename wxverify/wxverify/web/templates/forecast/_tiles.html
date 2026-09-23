@@ -18,9 +18,11 @@
             <p class="empty">Not available yet</p>
           {% else %}
             <div class="tile-rows">
-              <div class="tile-row" {% if tile.temp.meta.available %}title="Feeds: {{ tile.temp.meta.feed_labels }}"{% endif %}>
+              <div class="tile-row" {% if tile.temp.meta.available and not tile.temp.meta.extrema_unavailable %}title="Feeds: {{ tile.temp.meta.feed_labels }}"{% endif %}>
                 <span>High / Low</span>
-                {% if tile.temp.meta.available and tile.temp.high_c is not none and tile.temp.low_c is not none %}
+                {% if tile.temp.meta.extrema_unavailable %}
+                  <strong class="muted">Daily high/low unavailable &mdash; partial coverage</strong>
+                {% elif tile.temp.meta.available and tile.temp.high_c is not none and tile.temp.low_c is not none %}
                   <strong>{{ '%.0f'|format(tile.temp.high_c) }}° / {{ '%.0f'|format(tile.temp.low_c) }}°</strong>
                 {% else %}
                   <strong class="muted">&mdash;</strong>
@@ -34,12 +36,14 @@
                   <strong class="muted">&mdash;</strong>
                 {% endif %}
               </div>
-              <div class="tile-row" {% if tile.precip.meta.available %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Predicted wet-hour share: the share of forecast hours at or above this site's rain threshold, not a true probability."{% endif %}>
+              <div class="tile-row" {% if tile.precip.meta.available and not tile.precip.meta.extrema_unavailable %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Wet hours: the average number of hourly intervals forecast to meet this site's rain threshold, rounded for display. Rain need not fall throughout each interval."{% endif %}>
                 <span>Rain</span>
-                {% if tile.precip.meta.available and tile.precip.total_mm is not none %}
+                {% if tile.precip.meta.extrema_unavailable %}
+                  <strong class="muted">Daily rainfall unavailable &mdash; partial coverage</strong>
+                {% elif tile.precip.meta.available and tile.precip.total_mm is not none %}
                   <strong>
                     {{ '%.1f'|format(tile.precip.total_mm) }} mm
-                    {%- if tile.precip.chance_pct is not none %} &middot; {{ tile.precip.chance_pct }}%{% endif %}
+                    {%- if tile.precip.wet_hours is not none %} &middot; ~{{ tile.precip.wet_hours }} h wet{% endif %}
                     {%- if tile.precip.show_rain_glyph %} &#127783;{% endif %}
                   </strong>
                 {% else %}
@@ -47,10 +51,10 @@
                 {% endif %}
               </div>
             </div>
-            {% if tile.state == 'low_confidence' or tile.state == 'rebuilding' or tile.stale or tile.partial %}
+            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.partial %}
               <div class="tile-badges">
-                {% if tile.state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
-                {% if tile.state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
+                {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
+                {% if tile.confidence_state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
                 {% if tile.stale %}<span class="badge warn">stale</span>{% endif %}
                 {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
               </div>

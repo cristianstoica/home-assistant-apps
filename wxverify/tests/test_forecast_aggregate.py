@@ -1,8 +1,8 @@
 """Unit tests for ``wxverify.forecast.aggregate`` and ``core.units.ms_to_kmh``.
 
 This file covers ms_to_kmh conversion,
-precip total (with a stray negative filtered out), chance-of-rain at the
-threshold boundary, and a partially-covered day flagged 'partial'.
+precip total (with a stray negative filtered out), the wet-hour count at the
+rain-threshold boundary, and a partially-covered day flagged 'partial'.
 
 The stray-negative-filtered and partial-day-flagged parts of that are
 DB-facing (the negative is dropped by `invalid_forecast_sample_sql` in the
@@ -10,9 +10,11 @@ data layer, and the "partial" badge is assembled in the service layer from
 `clears_coverage`) — those live in test_forecast_data.py / test_forecast_service.py.
 This file owns everything pure: `ms_to_kmh`, `display_day_index` (the display
 half of the day-boundary gate), `covered_hours`, `clears_coverage` (pinned
-against `MIN_COVERAGE_HOURS`, not a hardcoded 18), `blend_mean`, `wet_share`
-(the rain-threshold inclusive boundary), and `predicted_wet_hour_share` (per-feed
-average, proven distinct from a naive pooled share).
+against `MIN_COVERAGE_HOURS`, not a hardcoded 18), `blend_mean`,
+`wet_hours` (the rain-threshold inclusive boundary and per-feed-then-blend
+counting, proven distinct from a naive thresholded mean), and
+`fixed_membership_series` (null at any instant a member does not supply,
+never renormalised over the members present).
 
 No SQLite anywhere in this module — nothing to isolate.
 """
@@ -29,8 +31,9 @@ from wxverify.forecast.aggregate import (
     clears_coverage,
     covered_hours,
     display_day_index,
-    predicted_wet_hour_share,
-    wet_share,
+    displayed_daily,
+    fixed_membership_series,
+    wet_hours,
 )
 
 # ---------------------------------------------------------------------------
@@ -182,50 +185,95 @@ def test_blend_mean_averages() -> None:
 
 
 # ---------------------------------------------------------------------------
-# wet_share — inclusive `>= threshold` boundary.
+# wet_hours — inclusive `>= threshold` boundary (G-T15, successor to the
+# `wet_share` boundary tests).
 # ---------------------------------------------------------------------------
 
 
-def test_wet_share_value_exactly_at_threshold_counts_as_wet() -> None:
-    share = wet_share([0.2, 0.1], threshold_mm=0.2)
-    assert share == 0.5
+def test_wet_hours_value_exactly_at_threshold_counts_as_wet() -> None:
+    count = wet_hours([0.2, 0.1], threshold_mm=0.2)
+    assert count == 1
 
 
-def test_wet_share_value_just_below_threshold_does_not_count() -> None:
-    share = wet_share([0.19, 0.1], threshold_mm=0.2)
-    assert share == 0.0
+def test_wet_hours_value_just_below_threshold_does_not_count() -> None:
+    count = wet_hours([0.19, 0.1], threshold_mm=0.2)
+    assert count == 0
 
 
-def test_wet_share_empty_is_none() -> None:
-    assert wet_share([], threshold_mm=0.2) is None
+def test_wet_hours_empty_is_none() -> None:
+    assert wet_hours([], threshold_mm=0.2) is None
 
 
 # ---------------------------------------------------------------------------
-# predicted_wet_hour_share — equal-weight average of PER-FEED shares, proven distinct
-# from a naive pooled share (this keeps one feed's longer horizon from
-# out-voting a shorter one).
+# wet_hours (blended across feeds by the caller, via blend_mean) — per-feed
+# counting, proven distinct from a naive thresholded mean (G-T14, successor
+# to `test_predicted_wet_hour_share_is_per_feed_averaged_not_pooled`). This
+# keeps one feed's longer horizon from out-voting a shorter one, and proves
+# the count is not a threshold applied to the hourly mean.
 # ---------------------------------------------------------------------------
 
 
-def test_predicted_wet_hour_share_is_per_feed_averaged_not_pooled() -> None:
-    # Feed A: 2 of 2 covered hours wet -> share 1.0.
-    # Feed B: 1 of 4 covered hours wet -> share 0.25.
-    feed_a = [0.5, 0.5]
-    feed_b = [0.5, 0.0, 0.0, 0.0]
+def test_wet_hours_count_is_not_a_thresholded_mean() -> None:
+    # Feed A: 12 hours at 0.4mm (wet), 12 at 0.0mm (dry) -> count 12.
+    # Feed B: 24 hours at 0.15mm (dry, below 0.2 threshold) -> count 0.
     threshold = 0.2
+    feed_a = [0.4] * 12 + [0.0] * 12
+    feed_b = [0.15] * 24
 
-    share_a = wet_share(feed_a, threshold_mm=threshold)
-    share_b = wet_share(feed_b, threshold_mm=threshold)
-    assert share_a is not None
-    assert share_b is not None
+    count_a = wet_hours(feed_a, threshold_mm=threshold)
+    count_b = wet_hours(feed_b, threshold_mm=threshold)
+    assert count_a is not None
+    assert count_b is not None
+    assert count_a == 12  # fixture sanity check
+    assert count_b == 0  # fixture sanity check
 
-    per_feed_averaged = predicted_wet_hour_share([share_a, share_b])
-    # Naive pooled share across all 6 raw hourly slots (3 wet of 6): what a
-    # POOLED implementation would (wrongly) produce.
-    pooled = 3 / 6
-    assert per_feed_averaged == 0.625
-    assert per_feed_averaged != pooled
+    # The shipped value, from the production entry point (`displayed_daily`),
+    # not re-derived inside the test.
+    shipped = displayed_daily("precip", [feed_a, feed_b], rain_threshold_mm=threshold)
+    assert shipped["wet_hours"] == 6.0
+
+    # A thresholded-mean implementation would instead blend the raw hourly
+    # values first, hour by hour, and threshold THAT mean: hours 0-11 blend
+    # to (0.4 + 0.15) / 2 == 0.275mm (>= threshold, wet), hours 12-23 blend
+    # to (0.0 + 0.15) / 2 == 0.075mm (dry) -- computed independently here,
+    # inside the test, from the same two feeds.
+    hourly_blend = [(a + b) / 2 for a, b in zip(feed_a, feed_b, strict=True)]
+    thresholded_mean_count = sum(1 for v in hourly_blend if v >= threshold)
+    assert shipped["wet_hours"] != thresholded_mean_count
+    assert thresholded_mean_count == 12  # hours 0-11 alone clear the threshold
 
 
-def test_predicted_wet_hour_share_empty_is_none() -> None:
-    assert predicted_wet_hour_share([]) is None
+def test_wet_hours_blend_empty_is_none() -> None:
+    assert blend_mean([]) is None
+
+
+# ---------------------------------------------------------------------------
+# fixed_membership_series -- null at any instant a member does not supply,
+# never renormalised over the members present (G-T12's underlying rule,
+# proven directly here rather than through the drill-down's rendered
+# series -- see test_aggregate_null_axis_instant_and_total_agrees_with_tile).
+# ---------------------------------------------------------------------------
+
+
+def test_fixed_membership_series_gap_in_one_member_is_null_not_the_other_value() -> (
+    None
+):
+    # Member "a" has a nonzero value at the instant; member "b" lacks it
+    # entirely. A renormalising bug would fall back to "a"'s lone value
+    # (1.0); the fixed-membership rule requires null instead.
+    result = fixed_membership_series(["h0"], [{"h0": 1.0}, {}])
+    assert result == [None]
+    assert result != [1.0]
+
+
+def test_fixed_membership_series_both_members_present_is_their_blend() -> None:
+    # Paired positive for the gap case above: when every member supplies
+    # the instant, the series is not null -- it is their blend_mean.
+    result = fixed_membership_series(
+        ["h0", "h1"], [{"h0": 1.0, "h1": 3.0}, {"h0": 2.0}]
+    )
+    assert result == [1.5, None]
+
+
+def test_fixed_membership_series_empty_members_is_all_null() -> None:
+    assert fixed_membership_series(["h0", "h1"], []) == [None, None]

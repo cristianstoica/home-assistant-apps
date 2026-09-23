@@ -243,7 +243,7 @@ def test_occurrence_wet_at_any_coverage_dry_needs_near_complete() -> None:
     assert occurrence.eligible and occurrence.value == 0.0
     assert occurrence.dry_hours == 23
 
-    # Threshold boundary is inclusive (matches production wet-share rule).
+    # Threshold boundary is inclusive (matches production wet-hour rule).
     _, occurrence = evaluate_precip(
         [("2026-06-10T09:00:00Z", 0.2)],
         timezone="UTC",

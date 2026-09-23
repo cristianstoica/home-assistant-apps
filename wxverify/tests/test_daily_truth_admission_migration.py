@@ -268,9 +268,9 @@ def test_o14b_migration_from_v5_is_idempotent() -> None:
     conn = _v5_db()
     _assert_pregate_absent(conn)
     run_migrations(conn)
-    assert TARGET_USER_VERSION == 6
+    assert TARGET_USER_VERSION == 7
     user_version_after_first = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    assert user_version_after_first == 6
+    assert user_version_after_first == 7
     cols_after_first = _column_list(conn, "daily_truth")
     assert cols_after_first.count("admission_basis") == 1
 
