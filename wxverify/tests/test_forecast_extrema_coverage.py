@@ -2633,11 +2633,11 @@ _LORD_HOWE_CONTROL_DATE = date(2026, 10, 4)
 
 def test_lord_howe_spring_forward_day_requires_all_23_utc_hour_instants() -> None:
     # F-T31 control: the spring-forward day in the same zone also has a
-    # window starting off the hour (2026-10-03T13:30Z -> 2026-10-04T13:00Z,
-    # 23.5 hours), but its floored count (23) DOES match the actual
-    # required on-the-hour instant count (23) -- so this day does not
-    # distinguish old from new code. It pins that the fix left ordinary
-    # (non-mismatching) days unchanged.
+    # window that is a fractional number of hours (2026-10-03T13:30Z ->
+    # 2026-10-04T13:00Z, 23.5 hours), but it starts off the hour, so its
+    # floored count (23) matches the 23 required on-the-hour instants --
+    # so this day does not distinguish old from new code. It pins that
+    # the fix left ordinary (non-mismatching) days unchanged.
     full = _instants(_LORD_HOWE_CONTROL_START, 23)
     assert len(full) == 23
     assert covers_local_day(

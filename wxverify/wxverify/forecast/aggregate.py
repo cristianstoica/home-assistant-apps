@@ -94,8 +94,9 @@ def covers_local_day(
     The required hours are enumerated explicitly: every on-the-hour UTC
     instant from the first one at or after ``start`` up to, but not
     including, ``end``. They are not counted from the window's floored
-    duration, which undercounts a window that starts off the hour: a
-    half-hour DST shift can put 25 such instants in 24.5 hours.
+    duration, because the two need not agree: a 24.5-hour window that starts
+    on the hour, as on a half-hour DST shift, holds 25 on-the-hour instants
+    but floors to 24.
     """
     start, end, _ = local_day_slots(local_date, timezone)
     slot = start.replace(minute=0, second=0, microsecond=0)
