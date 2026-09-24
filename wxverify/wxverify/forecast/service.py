@@ -265,8 +265,9 @@ def _last_fetched_at(
     Takes the union of ``contributor_ids`` over every populated cell of every
     tile and maps each feed to its evidence feed's ``last_usable_fetch_at``
     through ``freshness``. Stamps that do not parse are skipped. Stamps are
-    compared as parsed instants, never as strings: ``isoformat_utc`` omits the
-    fraction at microsecond 0 and ``'.' < 'Z'``. The newest is returned as a
+    compared as parsed UTC instants, never as strings, so stamps with
+    different UTC offsets are ordered chronologically, and the newest instant
+    is chosen before it is cut to the whole second. It is returned as a
     whole-second ``isoformat_utc`` stamp, which the browser's ``Date.parse``
     reads as-is; ``None`` when no stamp parses.
     """
