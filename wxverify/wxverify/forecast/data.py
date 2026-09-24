@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Literal
 
 from wxverify.collection.forecast_validation import (
     FORECAST_VARIABLES,
@@ -54,14 +55,34 @@ class FutureSampleRow:
     value: float
 
 
+FetchState = Literal["fresh", "stale", "unknown"]
+
+
 @dataclass(frozen=True)
 class FeedFreshness:
-    """Per-feed freshest run, judged against the feed's own cadence."""
+    """Per-feed collection freshness, judged against the evidence feed's cadence.
+
+    ``fetch_state`` compares ``last_usable_fetch_at`` (when the app last
+    completed a forward fetch that returned a usable sample) with twice
+    ``fetch_interval_minutes``. Both are read from ``evidence_feed_id``: the
+    site's ``(meteoblue, multimodel)`` package for a meteoblue member feed,
+    otherwise the feed itself. ``fetch_interval_minutes`` is ``None`` when the
+    evidence feed's cadence is unreadable, which reads as stale.
+    ``latest_issued_at`` is the feed's newest displayable run; it does not
+    decide staleness.
+    """
 
     feed_id: int
     latest_issued_at: str
     fetch_interval_minutes: int | None
-    stale: bool
+    fetch_state: FetchState
+    last_usable_fetch_at: str | None
+    evidence_feed_id: int
+
+    @property
+    def stale(self) -> bool:
+        """True when the feed has not been usefully fetched within 2x its cadence."""
+        return self.fetch_state == "stale"
 
 
 @dataclass(frozen=True)
@@ -180,11 +201,17 @@ def count_null_availability_samples(
 def load_feed_freshness(
     conn: sqlite3.Connection, *, site_id: int, now: datetime
 ) -> dict[int, FeedFreshness]:
-    """Per-feed freshest ``issued_at`` vs 2x that feed's own fetch interval.
+    """Per-feed collection freshness vs 2x the evidence feed's fetch interval.
 
-    Staleness is judged per feed against its OWN ``fetch_interval_minutes``
-    (never a global constant) so a slow-cadence feed is not falsely
-    flagged and a fast one is not silently excused.
+    Candidates are the displayable feeds with at least one valid sample for
+    the site (a feed with none has no entry). Each is judged on
+    its evidence feed's ``site_feed_state.last_usable_fetch_at`` and its own
+    ``fetch_interval_minutes`` (never a global constant), in this order: an
+    unreadable interval is ``stale`` (fail closed); a missing or unparseable
+    stamp is ``unknown``; a stamp older than ``now - 2 x interval`` is
+    ``stale``; otherwise ``fresh`` (the boundary itself is fresh). A meteoblue
+    member feed is fetched on its package's cadence, so the package is its
+    evidence feed.
     """
     invalid = invalid_forecast_sample_sql("fs")
     grid = ", ".join(f"('{variable}')" for variable in FORECAST_VARIABLES)
@@ -192,54 +219,80 @@ def load_feed_freshness(
         f"""
         WITH grid_variables(variable) AS (VALUES {grid}),
         candidates AS (
-            SELECT f.id AS feed_id, f.fetch_interval_minutes, v.variable
+            SELECT f.id AS feed_id, v.variable
             FROM feeds f, grid_variables v
             WHERE {_EXCLUDED_FEEDS_SQL}
+        ),
+        latest AS (
+            SELECT c.feed_id,
+                   MAX((
+                       SELECT fs.issued_at
+                       FROM forecast_samples fs
+                       WHERE fs.site_id = ?
+                         AND fs.feed_id = c.feed_id
+                         AND fs.variable = c.variable
+                         AND NOT {invalid}
+                       ORDER BY fs.issued_at DESC
+                       LIMIT 1
+                   )) AS latest_issued_at
+            FROM candidates c
+            GROUP BY c.feed_id
+            HAVING latest_issued_at IS NOT NULL
         )
-        SELECT c.feed_id, c.fetch_interval_minutes,
-               MAX((
-                   SELECT fs.issued_at
-                   FROM forecast_samples fs
-                   WHERE fs.site_id = ?
-                     AND fs.feed_id = c.feed_id
-                     AND fs.variable = c.variable
-                     AND NOT {invalid}
-                   ORDER BY fs.issued_at DESC
-                   LIMIT 1
-               )) AS latest_issued_at
-        FROM candidates c
-        GROUP BY c.feed_id, c.fetch_interval_minutes
-        HAVING latest_issued_at IS NOT NULL
+        SELECT l.feed_id, l.latest_issued_at, e.id AS evidence_feed_id,
+               e.fetch_interval_minutes, sfs.last_usable_fetch_at
+        FROM latest l
+        JOIN feeds f ON f.id = l.feed_id
+        LEFT JOIN feeds pkg
+          ON f.source = 'meteoblue' AND f.model != 'multimodel'
+         AND pkg.source = 'meteoblue' AND pkg.model = 'multimodel'
+        JOIN feeds e ON e.id = COALESCE(pkg.id, f.id)
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = ? AND sfs.feed_id = e.id
         """,
-        (site_id,),
+        (site_id, site_id),
     ).fetchall()
     out: dict[int, FeedFreshness] = {}
     for row in rows:
         feed_id = int(row["feed_id"])
-        latest = str(row["latest_issued_at"])
+        evidence_feed_id = int(row["evidence_feed_id"])
+        raw_stamp: object = row["last_usable_fetch_at"]
+        stamp = raw_stamp if isinstance(raw_stamp, str) else None
+        # Foreign/corrupt or out-of-range cadence parses to None and fails
+        # closed (stale) rather than dropping the feed from the map or
+        # inventing a cadence to judge it against.
         interval = parse_fetch_interval_minutes(
             row["fetch_interval_minutes"],
-            context=f"feed freshness feed_id={feed_id}",
+            context=(
+                f"feed freshness feed_id={feed_id} evidence_feed_id={evidence_feed_id}"
+            ),
         )
-        if interval is None:
-            # Foreign/corrupt or out-of-range cadence: fail closed (stale)
-            # rather than silently dropping the feed from the freshness map
-            # or inventing a cadence to judge it against.
-            out[feed_id] = FeedFreshness(
-                feed_id=feed_id,
-                latest_issued_at=latest,
-                fetch_interval_minutes=None,
-                stale=True,
-            )
-            continue
-        stale = parse_utc(latest) < now - timedelta(minutes=2 * interval)
         out[feed_id] = FeedFreshness(
             feed_id=feed_id,
-            latest_issued_at=latest,
+            latest_issued_at=str(row["latest_issued_at"]),
             fetch_interval_minutes=interval,
-            stale=stale,
+            fetch_state=_fetch_state(stamp, interval=interval, now=now),
+            last_usable_fetch_at=stamp,
+            evidence_feed_id=evidence_feed_id,
         )
     return out
+
+
+def _fetch_state(
+    stamp: str | None, *, interval: int | None, now: datetime
+) -> FetchState:
+    """Apply the freshness precedence: bad interval, then no stamp, then age."""
+    if interval is None:
+        return "stale"
+    if stamp is None:
+        return "unknown"
+    try:
+        fetched = parse_utc(stamp)
+    except ValueError:
+        return "unknown"
+    if fetched < now - timedelta(minutes=2 * interval):
+        return "stale"
+    return "fresh"
 
 
 def samples_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:

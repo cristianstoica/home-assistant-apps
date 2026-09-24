@@ -471,6 +471,12 @@ A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
 feeds its daily high and low come from and the feeds its daily rain figures
 come from, which can differ from the selected feeds its hourly chart plots.
 
+A feed counts as `stale` when the app has not completed a successful forecast
+download for it within twice its fetch interval. Only a download that returned
+usable forecast values counts; a download that returned values already stored
+counts too. `fetch time unknown` means no such download has been recorded yet,
+for example right after an upgrade.
+
 The daily forecast record stores what the tile showed: when the label appears,
 the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
 `insufficient`, next to the `extrema_feed_ids` that were used (an empty list in

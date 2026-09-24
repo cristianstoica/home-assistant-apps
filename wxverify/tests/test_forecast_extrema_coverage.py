@@ -1372,6 +1372,33 @@ _AB_VALID_DAY = "2026-07-20"
 _AB_NOW = datetime(2026, 7, 20, 23, 0, tzinfo=UTC)
 _AB_FRESH_ISSUED = "2026-07-20T20:00:00Z"  # 3h before _AB_NOW -- fresh.
 _AB_STALE_ISSUED = "2026-07-20T02:00:00Z"  # 21h before _AB_NOW -- stale.
+# The fixtures below stamp each feed's last usable fetch at the issued_at they
+# are given, so "fresh"/"stale" above are fetch ages (the stale badge's basis)
+# as well as run ages.
+_STALE_BADGE = (
+    '<span class="badge warn" title="A contributing feed hasn\'t been '
+    "successfully refreshed within its allowance (twice its fetch interval)."
+    '">stale</span>'
+)
+_UNKNOWN_BADGE = (
+    '<span class="badge muted" title="No successful fetch has been recorded '
+    'yet for a contributing feed.">fetch time unknown</span>'
+)
+
+
+def _stamp_usable_fetch(conn: sqlite3.Connection, *, feed_id: int, at: str) -> None:
+    """Record ``at`` as site 1's last usable forward fetch of ``feed_id``."""
+    conn.execute(
+        """
+        INSERT INTO site_feed_state
+            (site_id, feed_id, last_run_at, last_usable_fetch_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(site_id, feed_id) DO UPDATE SET
+            last_run_at=excluded.last_run_at,
+            last_usable_fetch_at=excluded.last_usable_fetch_at
+        """,
+        (feed_id, at, at),
+    )
 
 
 def _seed_ab_fixture(
@@ -1414,6 +1441,8 @@ def _seed_ab_fixture(
         valid_ats=b_ats,
         values=[10.0 + i * 0.05 for i in range(24)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
+    _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
 
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
@@ -1450,7 +1479,7 @@ def test_stale_extrema_contributor_alone_sets_the_stale_badge() -> None:
     today = view.tiles[0]
     assert today.temp.meta.stale is True
     html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
 
     both_fresh = _make_db()
     _seed_ab_fixture(
@@ -1462,7 +1491,7 @@ def test_stale_extrema_contributor_alone_sets_the_stale_badge() -> None:
     )
     assert fresh_view.tiles[0].temp.meta.stale is False
     fresh_html = _render_tiles(site_id=1, view=fresh_view)
-    assert '<span class="badge warn">stale</span>' not in fresh_html
+    assert _STALE_BADGE not in fresh_html
 
 
 def test_stale_hourly_contributor_alone_still_sets_the_stale_badge() -> None:
@@ -1481,7 +1510,73 @@ def test_stale_hourly_contributor_alone_still_sets_the_stale_badge() -> None:
     )
     assert view.tiles[0].temp.meta.stale is True
     html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
+
+
+def test_unknown_badge_fires_when_a_contributor_has_no_fetch_stamp() -> None:
+    # A (blend winner) freshly stamped, B (extrema winner) has NEVER been
+    # stamped (last_usable_fetch_at nulled after the fixture seeds it) --
+    # fetch_unknown must fire without stale firing. Paired positive: both
+    # stamped fresh (the base _seed_ab_fixture shape used elsewhere in this
+    # file) shows neither badge, proving the unknown badge isn't ambiently
+    # on.
+    conn = _make_db()
+    feed_a, feed_b = _seed_ab_fixture(
+        conn, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
+    )
+    conn.execute(
+        "UPDATE site_feed_state SET last_usable_fetch_at = NULL "
+        "WHERE site_id=1 AND feed_id=?",
+        (feed_b,),
+    )
+    conn.commit()
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
+    )
+    today = view.tiles[0]
+    assert today.temp.meta.stale is False
+    assert today.temp.meta.fetch_unknown is True
+    html = _render_tiles(site_id=1, view=view)
+    assert _STALE_BADGE not in html
+    assert _UNKNOWN_BADGE in html
+
+    both_known = _make_db()
+    _seed_ab_fixture(
+        both_known, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
+    )
+    both_known.commit()
+    known_view = build_forecast(
+        both_known, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
+    )
+    assert known_view.tiles[0].temp.meta.fetch_unknown is False
+    known_html = _render_tiles(site_id=1, view=known_view)
+    assert _UNKNOWN_BADGE not in known_html
+
+
+def test_stale_plus_unknown_shows_only_the_stale_badge() -> None:
+    # A (blend winner) stale, B (extrema winner) unknown (never stamped).
+    # The template guards the unknown badge with ``and not tile.stale``, so
+    # when both conditions hold simultaneously only "stale" renders -- this
+    # pins that suppression rather than assuming "both fire".
+    conn = _make_db()
+    feed_a, feed_b = _seed_ab_fixture(
+        conn, feed_a_issued_at=_AB_STALE_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
+    )
+    conn.execute(
+        "UPDATE site_feed_state SET last_usable_fetch_at = NULL "
+        "WHERE site_id=1 AND feed_id=?",
+        (feed_b,),
+    )
+    conn.commit()
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
+    )
+    today = view.tiles[0]
+    assert today.temp.meta.stale is True
+    assert today.temp.meta.fetch_unknown is True
+    html = _render_tiles(site_id=1, view=view)
+    assert _STALE_BADGE in html
+    assert _UNKNOWN_BADGE not in html
 
 
 def test_confident_blend_set_with_unscored_extrema_set() -> None:
@@ -1579,6 +1674,7 @@ def test_suppressed_extrema_contribute_to_neither_warning() -> None:
         valid_ats=a_ats,
         values=[10.0 + i * 0.1 for i in range(20)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_FRESH_ISSUED)
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
     )
@@ -1599,7 +1695,7 @@ def test_suppressed_extrema_contribute_to_neither_warning() -> None:
     html = _render_tiles(site_id=1, view=view)
     assert '<span class="badge warn">low confidence</span>' not in html
     assert '<span class="badge muted">ranking updating</span>' not in html
-    assert '<span class="badge warn">stale</span>' not in html
+    assert _STALE_BADGE not in html
 
     # Record side: extrema_coverage stays INSUFFICIENT, extrema_low_confidence
     # is None (never resolved -- F.7's guard), high/low suppressed.
@@ -1646,7 +1742,7 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
     None
 ):
     # Positive pair to the test above: same suppressed-extrema shape, but
-    # the blend feed's issued_at is stale -- the stale badge is driven by
+    # the blend feed's last fetch is stale -- the stale badge is driven by
     # the blend set on its own, still independent of the suppressed
     # extrema side.
     conn = _make_db()
@@ -1662,6 +1758,7 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
         valid_ats=a_ats,
         values=[10.0 + i * 0.1 for i in range(20)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_STALE_ISSUED)
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
     )
@@ -1679,7 +1776,7 @@ def test_stale_blend_set_alone_still_sets_the_stale_badge_with_extrema_suppresse
     assert today.temp.meta.state == "normal"
     assert today.temp.meta.stale is True
     html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
 
 
 def test_shared_contributor_set_confidence_states_are_independent_per_side() -> None:
@@ -1833,6 +1930,8 @@ def _seed_shared_ab_fixture(
         valid_ats=ats,
         values=[10.0 + i * 0.05 for i in range(24)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
+    _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
     )
@@ -1870,9 +1969,9 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert '<article class="tile state-normal">' in html
     assert '<span class="badge warn">low confidence</span>' not in html
     assert '<span class="badge muted">ranking updating</span>' not in html
-    assert '<span class="badge warn">stale</span>' not in html
+    assert _STALE_BADGE not in html
 
-    # Stale: both feeds issued stale, so both the blend and extrema sides
+    # Stale: both feeds fetched stale, so both the blend and extrema sides
     # (and hence their union) see it, keeping the shared-set property.
     conn = _make_db()
     _seed_shared_ab_fixture(
@@ -1888,7 +1987,7 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert today.temp.meta.stale is True
     html = _render_tiles(site_id=1, view=view)
     assert '<article class="tile state-normal">' in html
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
     assert '<span class="badge warn">low confidence</span>' not in html
     assert '<span class="badge muted">ranking updating</span>' not in html
 
@@ -1976,10 +2075,10 @@ def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
     # L4: paired stale variant of the test above -- wind's own ``stale``
     # read comes from its own feed's freshness, independent of
     # temperature's extrema-side state carried by the same shared fixture.
-    # ``load_feed_freshness`` judges staleness PER FEED (MAX(issued_at)
-    # across ALL that feed's variables), so wind uses a feed EXCLUSIVE to
-    # it (icon_global) rather than feed_a, whose fresh temperature
-    # issued_at would otherwise mask a stale wind one.
+    # ``load_feed_freshness`` judges staleness PER FEED (one last usable
+    # fetch shared by ALL that feed's variables), so wind uses a feed
+    # EXCLUSIVE to it (icon_global) rather than feed_a, whose fresh fetch
+    # stamp would otherwise mask a stale wind one.
     conn = _make_db()
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     _seed_ab_fixture(conn, seed_b_scoring=False)
@@ -1993,6 +2092,7 @@ def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
         valid_ats=wind_ats,
         value=5.0,
     )
+    _stamp_usable_fetch(conn, feed_id=wind_feed, at=_AB_STALE_ISSUED)
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
     )
@@ -2011,7 +2111,7 @@ def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
     assert today.wind.meta.stale is True
     assert today.wind.meta.extrema_unavailable is False
     html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
 
 
 def _seed_wind_confident(
@@ -2029,6 +2129,7 @@ def _seed_wind_confident(
         valid_ats=wind_ats,
         value=5.0,
     )
+    _stamp_usable_fetch(conn, feed_id=feed_id, at=issued_at)
     _seed_scoring_pairs(
         conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
     )
@@ -2064,10 +2165,10 @@ def test_tile_level_rollup_across_variables() -> None:
     # fresh, proving the tile-level ``stale`` union reaches wind's cell too,
     # not only temperature's. Wind uses a THIRD feed (never touched by
     # temperature) rather than feed_a: ``load_feed_freshness`` judges
-    # staleness per FEED as the MAX ``issued_at`` across ALL that feed's
-    # variables (``wxverify/forecast/data.py``), so a stale wind sample on
-    # feed_a would be masked by that same feed's fresh temperature sample
-    # -- the trap this isolation avoids.
+    # staleness per FEED on one last usable fetch shared by ALL that feed's
+    # variables (``wxverify/forecast/data.py``), so a stale wind cell on
+    # feed_a would be masked by that same feed's fresh stamp -- the trap
+    # this isolation avoids.
     conn = _make_db()
     _feed_a, _feed_b = _seed_ab_fixture(conn)
     wind_feed = _feed_id(conn, "open-meteo", "icon_global")

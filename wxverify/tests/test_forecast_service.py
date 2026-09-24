@@ -93,6 +93,23 @@ def _insert_sample(
     )
 
 
+def _stamp_usable_fetch(
+    conn: sqlite3.Connection, *, site_id: int = 1, feed_id: int, at: str
+) -> None:
+    """Record ``at`` as the feed's last usable forward fetch (the v8 column)."""
+    conn.execute(
+        """
+        INSERT INTO site_feed_state
+            (site_id, feed_id, last_run_at, last_usable_fetch_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(site_id, feed_id) DO UPDATE SET
+            last_run_at=excluded.last_run_at,
+            last_usable_fetch_at=excluded.last_usable_fetch_at
+        """,
+        (site_id, feed_id, at, at),
+    )
+
+
 def _insert_pair(
     conn: sqlite3.Connection,
     *,
@@ -370,9 +387,11 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
         conn,
         feed_id=feed_id,
         variable="temperature",
-        issued_at="2026-07-19T20:00:00Z",  # 6h before `now` -> NOT stale (<12h)
+        issued_at="2026-07-19T20:00:00Z",
         valid_ats=valid_ats,
     )
+    # Fetched 6h before `now` -> NOT stale (<12h for a 360min-interval feed).
+    _stamp_usable_fetch(conn, feed_id=feed_id, at="2026-07-19T20:00:00Z")
     # Confident ONLY at day_ahead=1 (the correct, issue-relative cell). If the
     # service wrongly ranked by the display day index (0) instead, this feed
     # would find no ranking row there and read as not-confident.
@@ -392,6 +411,7 @@ def test_b2_prior_day_run_in_todays_tile_ranks_by_issue_relative_day_ahead() -> 
     # 20 covered hours clears MIN_COVERAGE_HOURS
     assert today.temp.meta.partial is False
     assert today.temp.meta.stale is False
+    assert today.temp.meta.fetch_unknown is False
     assert today.state == "normal"
 
 
@@ -424,7 +444,7 @@ def test_b2_paired_negative_wrong_cell_reads_low_confidence() -> None:
 
 # ---------------------------------------------------------------------------
 # Stale badge is orthogonal to state -- same confident/normal construction as
-# the B2 positive, only the issued_at lag differs.
+# the B2 positive, only the last usable fetch lag differs.
 # ---------------------------------------------------------------------------
 
 
@@ -438,10 +458,12 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
         conn,
         feed_id=feed_id,
         variable="temperature",
-        # 18h before `now` -> stale (>=12h threshold for a 360min-interval feed)
         issued_at="2026-07-19T08:00:00Z",
         valid_ats=valid_ats,
     )
+    # Fetched 18h before `now` -> stale (>12h threshold for a 360min-interval
+    # feed).
+    _stamp_usable_fetch(conn, feed_id=feed_id, at="2026-07-19T08:00:00Z")
     _make_confident(conn, feed_id=feed_id, variable="temperature", day_ahead=1)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 

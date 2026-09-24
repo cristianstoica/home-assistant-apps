@@ -93,6 +93,12 @@ class CellMeta:
     "not_available" for wind, a suppressed cell and an unavailable cell. The
     tile rolls it up with the cells' states into
     ``DayTile.confidence_state``; it never moves ``state``.
+
+    ``contributor_ids`` are the feeds whose collection freshness the cell
+    reports (the clearing subset plus, for temperature and precipitation, the
+    extrema feeds), in selection order without repeats. ``stale`` is True if
+    any of them is stale; ``fetch_unknown`` is True if any of them has no
+    usable fetch on record.
     """
 
     state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
@@ -101,6 +107,8 @@ class CellMeta:
     stale: bool
     extrema_unavailable: bool
     extrema_state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
+    contributor_ids: tuple[int, ...]
+    fetch_unknown: bool
 
     @property
     def available(self) -> bool:
@@ -145,6 +153,7 @@ class DayTile:
     confidence_state: str  # tile.state's rollup over cell and extrema states
     stale: bool
     partial: bool
+    fetch_unknown: bool
 
 
 @dataclass(frozen=True)
@@ -196,6 +205,9 @@ def build_forecast(
     grouped = _group_samples(samples, timezone=timezone, now=at)
     freshness = load_feed_freshness(conn, site_id=site_id, now=at)
     stale_ids = {feed_id for feed_id, row in freshness.items() if row.stale}
+    unknown_ids = {
+        feed_id for feed_id, row in freshness.items() if row.fetch_state == "unknown"
+    }
     depths = effective_blend_depths(conn)
     rank_cache: _RankCache = {}
 
@@ -221,6 +233,7 @@ def build_forecast(
                 variable=variable,
                 feeds_samples=feeds_samples,
                 stale_ids=stale_ids,
+                unknown_ids=unknown_ids,
                 rebuilding_by_feed=rebuilding_by_feed,
             )
             cells[variable] = (meta, selection, values)
@@ -504,6 +517,7 @@ def _cell_meta_and_values(
     variable: str,
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
+    unknown_ids: set[int],
     rebuilding_by_feed: dict[int, bool],
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage rules; return cell meta + per-feed value lists.
@@ -524,7 +538,8 @@ def _cell_meta_and_values(
     is NOT aggregated. Because those feeds can lie outside the clearing
     subset, for both variables ``stale`` also covers every extrema feed, and
     ``extrema_state`` is the extrema set's own verdict under
-    :func:`_state_of`'s precedence.
+    :func:`_state_of`'s precedence. ``fetch_unknown`` covers the same
+    contributor feeds as ``stale``.
     """
     if not selection.available:
         return (
@@ -535,6 +550,8 @@ def _cell_meta_and_values(
                 stale=False,
                 extrema_unavailable=False,
                 extrema_state="not_available",
+                contributor_ids=(),
+                fetch_unknown=False,
             ),
             {},
         )
@@ -570,6 +587,9 @@ def _cell_meta_and_values(
         candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
         for candidate in value_feeds
     }
+    contributor_ids = tuple(
+        dict.fromkeys(candidate.feed_id for candidate in stale_feeds)
+    )
     meta = CellMeta(
         state=_state_of(
             available=selection.available,
@@ -587,6 +607,8 @@ def _cell_meta_and_values(
         stale=any(candidate.feed_id in stale_ids for candidate in stale_feeds),
         extrema_unavailable=extrema_unavailable,
         extrema_state=extrema_state,
+        contributor_ids=contributor_ids,
+        fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
     )
     return meta, values
 
@@ -650,6 +672,7 @@ def _build_tile(
         confidence_state=confidence_state,
         stale=any(meta.stale for meta in populated),
         partial=any(meta.partial for meta in populated),
+        fetch_unknown=any(meta.fetch_unknown for meta in populated),
     )
 
 

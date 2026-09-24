@@ -241,29 +241,41 @@ def test_load_feed_freshness_omits_feeds_with_no_valid_samples() -> None:
 
 def test_load_feed_freshness_uses_per_feed_interval() -> None:
     """Staleness is judged per-feed against its OWN fetch_interval_minutes,
-    never a global constant: at the SAME issued_at, a fast-cadence feed past
-    its own 2x-interval threshold is genuinely stale, and a slow-cadence
-    feed within its own (much larger) threshold is not falsely flagged."""
+    never a global constant: at the SAME last usable fetch, a fast-cadence
+    feed past its own 2x-interval threshold is genuinely stale, and a
+    slow-cadence feed within its own (much larger) threshold is not falsely
+    flagged."""
     conn = _make_db()
     fast_feed = _insert_custom_feed(conn, model="fast_test", fetch_interval_minutes=60)
     slow_feed = _insert_custom_feed(conn, model="slow_test", fetch_interval_minutes=720)
-    issued_at = "2030-01-02T08:40:00Z"  # 200 minutes before _FIXED_NOW
+    fetched_at = "2030-01-02T08:40:00Z"  # 200 minutes before _FIXED_NOW
 
     for feed_id in (fast_feed, slow_feed):
         _insert_sample(
             conn,
             feed_id=feed_id,
             variable="temperature",
-            issued_at=issued_at,
+            # 36 h old: the old issued_at rule would call even the slow feed
+            # stale, so the verdicts below come from the fetch stamp.
+            issued_at="2030-01-01T00:00:00Z",
             valid_at="2030-01-03T00:00:00Z",
             value=10.0,
+        )
+        conn.execute(
+            """
+            INSERT INTO site_feed_state
+                (site_id, feed_id, last_run_at, last_usable_fetch_at)
+            VALUES (1, ?, ?, ?)
+            """,
+            (feed_id, fetched_at, fetched_at),
         )
 
     freshness = load_feed_freshness(conn, site_id=1, now=_FIXED_NOW)
     # fast: threshold = 2*60 = 120min; 200min old -> stale.
+    assert freshness[fast_feed].fetch_state == "stale"
     assert freshness[fast_feed].stale is True
     # slow: threshold = 2*720 = 1440min; 200min old -> NOT stale.
-    assert freshness[slow_feed].stale is False
+    assert freshness[slow_feed].fetch_state == "fresh"
 
 
 def test_load_feed_freshness_skips_newest_invalid_run() -> None:

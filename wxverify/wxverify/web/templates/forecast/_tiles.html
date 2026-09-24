@@ -51,11 +51,12 @@
                 {% endif %}
               </div>
             </div>
-            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.partial %}
+            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.fetch_unknown or tile.partial %}
               <div class="tile-badges">
                 {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
                 {% if tile.confidence_state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
-                {% if tile.stale %}<span class="badge warn">stale</span>{% endif %}
+                {% if tile.stale %}<span class="badge warn" title="A contributing feed hasn't been successfully refreshed within its allowance (twice its fetch interval).">stale</span>{% endif %}
+                {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="No successful fetch has been recorded yet for a contributing feed.">fetch time unknown</span>{% endif %}
                 {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
               </div>
             {% endif %}
