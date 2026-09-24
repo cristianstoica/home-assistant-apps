@@ -4000,7 +4000,7 @@ def test_import_rejects_invalid_utf8_text(
     payload = _sqlite_bytes_migrated_with(target, statements)
 
     if case in ("pws_first", "pws_last"):
-        check_conn = sqlite3.connect(str(target))
+        check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
         try:
             cursor = check_conn.execute("SELECT * FROM stations")
             idx = [d[0] for d in cursor.description].index("pws_station_id")
@@ -4053,7 +4053,7 @@ def _u2_odd_name_case(path: Path, name: str) -> None:
             " VALUES (1, CAST(x'ff61' AS TEXT))",
         ),
     )
-    check_conn = sqlite3.connect(str(path))
+    check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         cursor = check_conn.execute("SELECT * FROM stations")
         assert cursor.description[1][0] == name, (
@@ -4089,7 +4089,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
                 " VALUES (1, CAST(x'4900ff' AS TEXT))",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             length = check_conn.execute(
                 "SELECT length(CAST(pws_station_id AS BLOB)) FROM stations"
@@ -4109,7 +4109,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
                 "INSERT INTO stations DEFAULT VALUES",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             plain = {
                 row[1] for row in check_conn.execute("PRAGMA table_info(stations)")
@@ -4156,7 +4156,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
                 "PRAGMA writable_schema = OFF",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
             marked = check_conn.execute(
@@ -4167,7 +4167,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
             check_conn.close()
         assert integrity == "ok", "precondition: integrity_check must be ok"
         assert marked == 1, "precondition: stations.sql must carry the FF byte"
-        default_conn = sqlite3.connect(str(path))
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             with pytest.raises(UnicodeDecodeError):
                 default_conn.execute("SELECT * FROM stations").fetchall()
@@ -4189,7 +4189,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
                 "PRAGMA writable_schema = OFF",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
             count = check_conn.execute(
@@ -4198,7 +4198,9 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
         finally:
             check_conn.close()
         assert integrity == "ok", "precondition: integrity_check must be ok"
-        assert count == 1, "precondition: exactly one row must carry the BLOB name"
+        assert count == 1, (
+            "precondition: exactly one row must carry the undecodable name"
+        )
         return "invalid text in sqlite_master.name: expected valid UTF-8"
 
     if case == "index_sql":
@@ -4223,7 +4225,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
 
     if case == "utf16_surrogate":
         _sqlite_bytes_utf16(path, "610000D8")
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             encoding = check_conn.execute("PRAGMA encoding").fetchone()[0]
             hex_name = check_conn.execute("SELECT hex(name) FROM sites").fetchone()[0]
@@ -4231,7 +4233,7 @@ def _validate_upload_u2_case(case: str, path: Path) -> str:
             check_conn.close()
         assert encoding == "UTF-16le", "precondition: database must be UTF-16le"
         assert hex_name == "610000D8", "precondition: stored bytes must match"
-        default_conn = sqlite3.connect(str(path))
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             with pytest.raises(sqlite3.OperationalError):
                 default_conn.execute("SELECT name FROM sites").fetchall()
@@ -4329,7 +4331,7 @@ def _validate_upload_u4_case(case: str, path: Path) -> None:
                 "INSERT INTO stations (id, last_error) VALUES (1, x'ff61')",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             kind = check_conn.execute(
                 "SELECT typeof(last_error) FROM stations"
@@ -4348,7 +4350,7 @@ def _validate_upload_u4_case(case: str, path: Path) -> None:
                 "INSERT INTO extra_notes (note) VALUES (CAST(x'ff61' AS TEXT))",
             ),
         )
-        default_conn = sqlite3.connect(str(path))
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             with pytest.raises(sqlite3.OperationalError):
                 default_conn.execute("SELECT note FROM extra_notes").fetchall()
@@ -4367,7 +4369,7 @@ def _validate_upload_u4_case(case: str, path: Path) -> None:
                 "INSERT INTO stations (id, pws_station_id) VALUES (3, 'I\U0010ffff')",
             ),
         )
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             values = [
                 row[0]
@@ -4384,13 +4386,13 @@ def _validate_upload_u4_case(case: str, path: Path) -> None:
 
     if case == "utf16_cafe":
         _sqlite_bytes_utf16(path, "630061006600E900")
-        check_conn = sqlite3.connect(str(path))
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             encoding = check_conn.execute("PRAGMA encoding").fetchone()[0]
         finally:
             check_conn.close()
         assert encoding == "UTF-16le", "precondition: database must be UTF-16le"
-        default_conn = sqlite3.connect(str(path))
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
             name = default_conn.execute("SELECT name FROM sites").fetchone()[0]
         finally:
@@ -4452,6 +4454,7 @@ def test_import_accepts_valid_file_after_utf8_refusal(
                 " ('fetch_current_obs', (SELECT id FROM sites), '{}')",
             ),
         )
+        headers = _csrf_headers(client)
         accept_resp = client.post(
             "/api/import/db", content=accept_payload, headers=headers
         )
@@ -4495,7 +4498,7 @@ def test_validate_upload_timestamp_read_error_fails_closed(
 def test_validate_upload_blob_refusal_precedes_text_check(tmp_path: Path) -> None:
     """U7: D2 runs after the BLOB guard, so an existing BLOB-guard refusal
     keeps its message even when the same file also holds undecodable text
-    elsewhere (D5's judgment call 6, M26).
+    elsewhere (§14 judgment call 6, M26).
     """
     target = tmp_path / "utf8-blob-precedence.db"
     _sqlite_bytes_hand_built(
@@ -4510,7 +4513,7 @@ def test_validate_upload_blob_refusal_precedes_text_check(tmp_path: Path) -> Non
             "INSERT INTO sites (id, name) VALUES (1, CAST(x'ff61' AS TEXT))",
         ),
     )
-    check_conn = sqlite3.connect(str(target))
+    check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
     try:
         integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
         kind = check_conn.execute(
@@ -4520,7 +4523,7 @@ def test_validate_upload_blob_refusal_precedes_text_check(tmp_path: Path) -> Non
         check_conn.close()
     assert integrity == "ok", "precondition: integrity_check must be ok"
     assert kind == "blob", "precondition: variable must be stored as BLOB"
-    default_conn = sqlite3.connect(str(target))
+    default_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
     try:
         with pytest.raises(sqlite3.OperationalError):
             default_conn.execute("SELECT name FROM sites").fetchall()
