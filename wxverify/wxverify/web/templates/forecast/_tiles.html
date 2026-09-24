@@ -43,7 +43,7 @@
                 {% elif tile.precip.meta.available and tile.precip.total_mm is not none %}
                   <strong>
                     {{ '%.1f'|format(tile.precip.total_mm) }} mm
-                    {%- if tile.precip.wet_hours is not none %} &middot; ~{{ tile.precip.wet_hours }} h wet{% endif %}
+                    {%- if tile.precip.wet_hours is not none %} &middot; {{ tile.precip.wet_hours }} h{% endif %}
                     {%- if tile.precip.show_rain_glyph %} &#127783;{% endif %}
                   </strong>
                 {% else %}

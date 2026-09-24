@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -916,6 +917,16 @@ def test_forecast_page_ride_alongs(
         assert "tile-row" in page.text
         assert "Rain" in page.text
         assert "Wet hours:" in page.text
+        # Wording regression (0.16.3): the rain row dropped the "wet"
+        # qualifier and the "~" approximation glyph from the wet-hours
+        # figure, leaving a bare "<n> h".
+        assert "h wet" not in page.text, "stale ' h wet' wording still rendered"
+        assert "&middot; ~" not in page.text, (
+            "stale '~' approximation glyph still rendered"
+        )
+        assert re.search(r"0\.0 mm &middot; 0 h\s*</strong>", page.text), (
+            "rain row did not render the bare '<n> h' wet-hours figure"
+        )
 
 
 # ---------------------------------------------------------------------------
