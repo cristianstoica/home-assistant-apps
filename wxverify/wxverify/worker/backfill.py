@@ -40,7 +40,7 @@ from wxverify.worker.domain_backoff import (
     record_http_backoff,
     source_domain,
 )
-from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
+from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 
 SETUP_BACKFILL_DAYS = 30
 BACKFILL_CHUNK_DAYS = 7
@@ -166,10 +166,9 @@ async def fetch_station_history_window(
         raise JobCancelled()
     changed = False
     async with httpx.AsyncClient() as client:
-        limiter = station_call_limiter()
         for index, station in enumerate(stations):
             await pace_station_call(site_id, station.id, index)
-            async with limiter:
+            async with weathercom_call_lock():
                 reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site_id, station_id

@@ -76,7 +76,7 @@ from wxverify.worker.feed_fetch import (
 )
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import run_batched_scoring
-from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
+from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 from wxverify.worker.tz_correction import (
     advance_correction,
     build_continuation,
@@ -523,7 +523,6 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
     newest_obs_at: str | None = None
     skipped_parked = 0
     async with httpx.AsyncClient() as client:
-        limiter = station_call_limiter()
         now = utc_now()
         for index, station in enumerate(stations):
             if _history_parked(station.history_next_attempt_at, now):
@@ -542,7 +541,7 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                 station.id,
                 index,
             )
-            async with limiter:
+            async with weathercom_call_lock():
                 reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_obs_call(
                         conn, site_id, station_id
@@ -661,71 +660,77 @@ async def _fetch_current_obs(
     if pws_station_id is None:
         raise JobCancelled()
 
-    # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
-    # gate first (raises JobDeferred if active), then budget (raises JobDeferred
-    # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
-    # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
-    # design.
-    reservation = await writer.write(
-        lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
-    )
-
     # Operator-configurable read timeout; default 30s, floored at 1s to
-    # match the config.yaml int(1,300) schema.
+    # match the config.yaml int(1,300) schema. Read before the call lock is
+    # taken, so it does not hold up the other weather.com callers.
     timeout_seconds = await db.read(
         lambda conn: get_number_setting(conn, "request_timeout_seconds", 30, minimum=1)
     )
 
-    try:
-        response = await fetch_current_observation(
-            pws_station_id, api_key, timeout_seconds=timeout_seconds
+    # The shared weather.com call lock covers the reserve, the call and the
+    # outcome write (see worker.station_pacing.weathercom_call_lock).
+    async with weathercom_call_lock():
+        # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
+        # gate first (raises JobDeferred if active), then budget (raises JobDeferred
+        # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
+        # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
+        # design.
+        reservation = await writer.write(
+            lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
         )
-        # Classifying inside the try, not after: a malformed 2xx body raises
-        # from classify_current_obs (response.json()), and that failure must
-        # land on the same transient-floor path as a transport error rather
-        # than escape uncaught to the job-level retry, which never touches
-        # station_poll_state.next_poll_at.
-        outcome = classify_current_obs(response)
-    except Exception as exc:
-        # Transport-level failure (timeout / connect / read) or a malformed
-        # response body: transient, retry at the floor. Do not record a
-        # domain backoff (no reliable HTTP status to key on here).
-        error = sanitized_exception(exc)
-        transient = PollOutcome(Health.TRANSIENT, error=error)
-        refund = reservation if is_refundable_transport_error(exc) else None
+
+        try:
+            response = await fetch_current_observation(
+                pws_station_id, api_key, timeout_seconds=timeout_seconds
+            )
+            # Classifying inside the try, not after: a malformed 2xx body raises
+            # from classify_current_obs (response.json()), and that failure must
+            # land on the same transient-floor path as a transport error rather
+            # than escape uncaught to the job-level retry, which never touches
+            # station_poll_state.next_poll_at.
+            outcome = classify_current_obs(response)
+        except Exception as exc:
+            # Transport-level failure (timeout / connect / read) or a malformed
+            # response body: transient, retry at the floor. Do not record a
+            # domain backoff (no reliable HTTP status to key on here).
+            error = sanitized_exception(exc)
+            transient = PollOutcome(Health.TRANSIENT, error=error)
+            refund = reservation if is_refundable_transport_error(exc) else None
+            await write_after_reservation(
+                db,
+                writer,
+                lambda conn, out=transient, res=refund: _persist_poll_result_and_refund(
+                    conn, site_id, station_id, out, res
+                ),
+                reservation,
+            )
+            raise
+
+        status = response.status_code
+
+        # 429 / >=500: record the shared domain backoff (single write with the
+        # transient poll-state) and defer, exactly as the hourly stream does.
+        # Classification already returned TRANSIENT for these codes.
+        if status == 429 or status >= 500:
+            next_attempt_at = await write_after_reservation(
+                db,
+                writer,
+                lambda conn, resp=response, out=outcome: _record_current_obs_backoff(
+                    conn, site_id, station_id, resp, out
+                ),
+                reservation,
+            )
+            # record_http_backoff always returns a next-attempt for 429/>=500.
+            raise JobDeferred(next_attempt_at or isoformat_utc())
+
         await write_after_reservation(
             db,
             writer,
-            lambda conn, out=transient, res=refund: _persist_poll_result_and_refund(
-                conn, site_id, station_id, out, res
+            lambda conn, out=outcome: persist_poll_result(
+                conn, site_id, station_id, out
             ),
             reservation,
         )
-        raise
-
-    status = response.status_code
-
-    # 429 / >=500: record the shared domain backoff (single write with the
-    # transient poll-state) and defer, exactly as the hourly stream does.
-    # Classification already returned TRANSIENT for these codes.
-    if status == 429 or status >= 500:
-        next_attempt_at = await write_after_reservation(
-            db,
-            writer,
-            lambda conn, resp=response, out=outcome: _record_current_obs_backoff(
-                conn, site_id, station_id, resp, out
-            ),
-            reservation,
-        )
-        # record_http_backoff always returns a next-attempt for 429/>=500.
-        raise JobDeferred(next_attempt_at or isoformat_utc())
-
-    await write_after_reservation(
-        db,
-        writer,
-        lambda conn, out=outcome: persist_poll_result(conn, site_id, station_id, out),
-        reservation,
-    )
 
 
 def _reserve_current_obs_call(

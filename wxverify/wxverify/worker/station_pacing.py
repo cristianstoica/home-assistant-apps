@@ -1,18 +1,48 @@
-"""Bounded pacing for per-station PWS calls."""
+"""Bounded pacing and the shared call lock for per-station PWS calls."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import weakref
 from typing import Final
 
-PWS_STATION_CONCURRENCY: Final = 1
 PWS_STATION_MIN_DELAY_SECONDS: Final = 0.05
 PWS_STATION_MAX_DELAY_SECONDS: Final = 0.25
 
+# One lock serializes every weather.com call in the process, across the worker
+# and the add-station route: the reserve, the call and the outcome write run
+# under it; the pace sleep stays outside. Lock order: always this lock, then
+# the database write lock; never taken while the write lock is held. Created
+# lazily, one per running event loop, because a module-level asyncio.Lock()
+# binds to the first loop that contends it. The loop is held through a weak
+# reference, so a new loop that reuses a dead loop's id gets a fresh lock.
+_call_lock: asyncio.Lock | None = None
+_call_lock_loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
 
-def station_call_limiter() -> asyncio.Semaphore:
-    return asyncio.Semaphore(PWS_STATION_CONCURRENCY)
+
+def weathercom_call_lock() -> asyncio.Lock:
+    """The one weather.com call lock for the running event loop."""
+    global _call_lock, _call_lock_loop
+    loop = asyncio.get_running_loop()
+    if _call_lock is None or _call_lock_loop is None or _call_lock_loop() is not loop:
+        _call_lock = asyncio.Lock()
+        _call_lock_loop = weakref.ref(loop)
+    return _call_lock
+
+
+async def acquire_within(lock: asyncio.Lock, timeout_s: float) -> bool:
+    """Acquire ``lock`` within ``timeout_s``.
+
+    True: held by the caller. False: not held. A cancellation while queued
+    propagates unchanged, and the caller does not hold the lock.
+    """
+    try:
+        async with asyncio.timeout(timeout_s):
+            await lock.acquire()
+    except TimeoutError:
+        return False
+    return True
 
 
 def station_call_delay_seconds(

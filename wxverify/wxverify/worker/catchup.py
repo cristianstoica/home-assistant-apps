@@ -42,7 +42,7 @@ from wxverify.worker.domain_backoff import (
 )
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import run_batched_scoring
-from wxverify.worker.station_pacing import pace_station_call, station_call_limiter
+from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 
 CATCHUP_SITE_CHUNK = 2
 TARGET_VARIABLE_LIST = tuple(sorted(TARGET_VARIABLES))
@@ -185,22 +185,23 @@ async def _fetch_missing_station_history(
     stations = await db.read(lambda conn: _enabled_stations(conn, site.site_id))
     changed = False
     async with httpx.AsyncClient() as client:
-        limiter = station_call_limiter()
         for index, station in enumerate(stations):
             await pace_station_call(site.site_id, station.id, index)
-            async with limiter:
-                has_gap = await db.read(
-                    lambda conn, st=station: _station_has_gap(
-                        conn, st.id, window_start=window_start, window_end=window_end
-                    )
+            # Outside the call lock: a read that decides to skip the station
+            # must not hold up the other weather.com callers.
+            has_gap = await db.read(
+                lambda conn, st=station: _station_has_gap(
+                    conn, st.id, window_start=window_start, window_end=window_end
                 )
-                if not has_gap:
-                    continue
-                logger.debug(
-                    "catchup station gap site=%s station=%s",
-                    site.site_id,
-                    station.id,
-                )
+            )
+            if not has_gap:
+                continue
+            logger.debug(
+                "catchup station gap site=%s station=%s",
+                site.site_id,
+                station.id,
+            )
+            async with weathercom_call_lock():
                 reservation = await writer.write(
                     lambda conn, station_id=station.id: _reserve_station_history_call(
                         conn, site.site_id, station_id
