@@ -93,6 +93,12 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("station_observations", "valid_at"),
     ("observations", "valid_at"),
 )
+# What `_flag_invalid_utf8` returns in place of text that is not valid UTF-8.
+# A bare object equals no value a row can hold, so a row test finds only it.
+_INVALID_UTF8 = object()
+# A column name read from the upload is echoed in a refusal only when it
+# fully matches this; any other name is shown by its position instead.
+_SAFE_COLUMN_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 # Anchored: only this producer's own output shapes are ever a sweep
 # candidate. The token group is optional on purpose -- it spans BOTH
 # `_new_backup_path`'s suffixed name and the pre-0.9 bare-timestamp name,
@@ -798,6 +804,55 @@ def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
     raise ApiError(422, f"not a table: {table}")
 
 
+def _flag_invalid_utf8(raw: bytes) -> object:
+    """A text factory that marks undecodable text instead of raising.
+
+    It applies the same strict ``bytes.decode("utf-8")`` that the default
+    ``str`` factory applies to the same bytes, so it flags exactly the
+    values the app's own reads would fail on, in a UTF-8 or a UTF-16 file
+    alike. It is called for TEXT values only, so a BLOB never reaches it.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _INVALID_UTF8
+
+
+def _refuse_invalid_text(conn: sqlite3.Connection, table: str, sql: str) -> None:
+    """Refuse the upload if ``sql`` yields any text that is not valid UTF-8.
+
+    The refusal names ``table``, always a code-owned name, and the column,
+    taken from the cursor and shown only when it fully matches
+    ``_SAFE_COLUMN_NAME``; any other name is shown as its 1-based position.
+    The value itself is never shown. Decoding happens row by row as the
+    cursor advances, so the ``try`` encloses the whole iteration: a read
+    error at any row becomes the house invalid-database refusal, and only
+    ``sqlite3.DatabaseError`` is caught, so the ``ApiError`` passes
+    through. Rows are streamed, one at a time. The factory is looked up by
+    name on every call, and ``str`` is restored for every later read on
+    the connection.
+    """
+    conn.text_factory = _flag_invalid_utf8
+    try:
+        cursor = conn.execute(sql)
+        for row in cursor:
+            if _INVALID_UTF8 in row:
+                index: int = row.index(_INVALID_UTF8)
+                name = str(cursor.description[index][0])
+                column = (
+                    name
+                    if _SAFE_COLUMN_NAME.fullmatch(name)
+                    else f"<column {index + 1}>"
+                )
+                raise ApiError(
+                    422, f"invalid text in {table}.{column}: expected valid UTF-8"
+                )
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+    finally:
+        conn.text_factory = str
+
+
 def _validate_upload(tmp: Path) -> None:
     """Validate the upload via a read-only open, without touching the live DB."""
     try:
@@ -823,6 +878,31 @@ def _validate_upload(tmp: Path) -> None:
             raise ApiError(422, "not a wxverify database")
         if version > TARGET_USER_VERSION:
             raise ApiError(422, "exported by a newer wxverify")
+        # The catalogue comes before any read that decodes a name from it.
+        # First its shape, as an allowlist of what SQLite itself writes: a
+        # `type` spelled or stored any other way, or a name that is not TEXT,
+        # lets a table SQLite still loads read as absent to
+        # `_guarded_table_present`, and a `sql` that is neither TEXT nor NULL
+        # carries column names the text scan never sees. Then its text: an
+        # undecodable name or `sql` breaks the reads that follow, and an
+        # undecodable column name breaks `SELECT *` with an error that is not
+        # a `sqlite3` error.
+        try:
+            odd_entry = conn.execute(
+                "SELECT 1 FROM sqlite_master"
+                " WHERE typeof(type) != 'text'"
+                " OR type NOT IN ('table', 'index', 'view', 'trigger')"
+                " OR typeof(name) != 'text' OR typeof(tbl_name) != 'text'"
+                " OR typeof(sql) NOT IN ('text', 'null')"
+                " LIMIT 1"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise ApiError(422, "not a valid SQLite database") from exc
+        if odd_entry is not None:
+            raise ApiError(422, "invalid schema entry in sqlite_master")
+        _refuse_invalid_text(
+            conn, "sqlite_master", "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        )
         names = {
             str(name_row[0])
             for name_row in conn.execute(
@@ -847,6 +927,12 @@ def _validate_upload(tmp: Path) -> None:
                 raise ApiError(422, "not a valid SQLite database") from exc
             if blob_row is not None:
                 raise ApiError(422, f"invalid data in {table}.{column}")
+        # Every column of every row of each app table present, after the BLOB
+        # guard so its refusals keep their messages, and before the timestamp
+        # check so an undecodable stamp gets this specific one.
+        for table in schema_table_names():
+            if _guarded_table_present(conn, table):
+                _refuse_invalid_text(conn, table, f"SELECT * FROM {table}")
         for table, column in _CANONICAL_STAMP_COLUMNS:
             if not _guarded_table_present(conn, table):
                 continue

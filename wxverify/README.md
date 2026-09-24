@@ -730,7 +730,8 @@ Ops → Database Import uploads a previously exported `.db` file and **fully
 replaces** the live database with it. Any data collected since that export is
 lost. The upload is validated first (integrity check, wxverify schema version,
 required tables, that each of the add-on's own tables present in the file is
-an ordinary table, and that every forecast and observation time is in the
+an ordinary table, that the file's schema and the add-on's own tables hold
+only valid UTF-8 text, and that every forecast and observation time is in the
 add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
 automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
 the swap. Only the newest `.bak` file is kept; older ones are swept
