@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.16.3
+
+Current-condition polls now run in their own lane instead of waiting
+behind history or scoring jobs, adds two new health-monitor warnings for
+a stalled main worker and delayed current-condition polling, and makes
+weather.com requests safer to retry. There is no database schema change
+in this release; going back to 0.16.2 means reinstalling that version.
+
+### Added
+
+- New health-monitor condition `obs_collection_delayed` (pipeline group,
+  severity warning). It trips when a station's current-condition poll is
+  15 minutes or more overdue; a due time that cannot be parsed counts as
+  overdue. Stations in retry backoff are left out until their own next
+  attempt is itself 15 minutes overdue, and the detail shows how many are
+  in backoff: `N stations overdue at least 15 min; oldest due
+  <time|unknown>; M in backoff`. The condition reads ok during the
+  startup grace window.
+- New health-monitor condition `main_worker_liveness` (pipeline group,
+  severity warning). It trips when the main worker's last loop stamp is
+  15 minutes or more old and no main-lane job claimed since then is still
+  running, or when there is no liveness evidence at all. Its detail says
+  the evidence is stale or missing and never says the worker is hung.
+- New log lines. A `current-obs claim …` line is written for each
+  current-condition poll, at INFO when the poll's lateness or queue wait
+  is 60 s or more and DEBUG otherwise. A `slow db write … lock_wait=…
+  hold=…` line is written when a database write takes 1000 ms or more.
+- `/api/observations/current` rows now carry a boolean
+  `provider_reported_offline`, true exactly when the station's health
+  state is `offline`.
+
+### Changed
+
+- Current-condition polls now run in their own scheduling lane, so they
+  no longer wait behind history or scoring jobs.
+- An enabled station whose site is disabled is no longer queued over and
+  over. A station whose site no longer exists is now logged as a warning
+  (`scheduler: station=… references a missing site; skipping station
+  this tick`) instead of being skipped with no message.
+- At most one weather.com request is in flight at a time. Adding a
+  station waits at most 30 s for a weather.com request already in
+  progress; if the wait runs out, the add-on answers HTTP 503 `Weather
+  provider busy; station was not added. Try again shortly.`. In that
+  case it makes no provider request, uses no budget and adds nothing, so
+  repeating the request is safe.
+- Every weather.com request now has an overall deadline of its read
+  timeout plus 5 s. The read timeouts are 10 s for validate and hourly
+  history, 20 s for a history range, and the `request_timeout_seconds`
+  setting (default 30) for current conditions. When the deadline passes,
+  the error reads `weather.com call exceeded its N s deadline`.
+- Forecast tiles: the rain row now reads "3.1 mm · 5 h" (wet hours
+  without "~" or "wet").
+
 ## 0.16.2
 
 Refuses a database import when an app table name in the uploaded file is
