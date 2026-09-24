@@ -32,6 +32,15 @@ _db_instance: Database | None = None
 # outlier.
 SLOW_READ_MS = 250.0
 
+# A write whose wait for the write lock, or whose hold of it, reaches this
+# gets an INFO line. INFO rather than the slow-read WARNING: a slow write is
+# diagnostic, not a fault. The two halves are checked separately because
+# they have different causes -- `lock_wait` is time queued behind other
+# writers, `hold` is this write's own transaction. With INFO enabled, a log
+# with no such line means every `write`/`write_fenced` that acquired the
+# lock and reached its timing `finally` kept both under a second.
+SLOW_WRITE_MS = 1000.0
+
 # SQLite in WAL mode lets any number of readers run concurrently with no
 # reader blocking another, but this pool shares the interpreter's default
 # executor with every other asyncio.to_thread() call (writes, transfer
@@ -65,6 +74,29 @@ def _read_label(fn: object) -> str:
     # DEFINITION rather than per call site, and takes the operator from a
     # WARNING straight to the defining line.
     return label if code is None else f"{label}:{code.co_firstlineno}"
+
+
+def _log_slow_write(
+    fn: object, requested: float, acquired: float, released: float
+) -> None:
+    """Log a write whose lock wait or lock hold reached ``SLOW_WRITE_MS``.
+
+    ``requested`` is taken just before ``async with self._write_lock``,
+    ``acquired`` as the first statement inside it, and ``released`` in a
+    ``finally`` inside it, so a write that raises or is cancelled while
+    holding the lock is measured too. A write cancelled while still queued
+    for the lock never holds it and logs nothing. There is deliberately no
+    per-write DEBUG line, for volume.
+    """
+    lock_wait_ms = (acquired - requested) * 1000
+    hold_ms = (released - acquired) * 1000
+    if lock_wait_ms >= SLOW_WRITE_MS or hold_ms >= SLOW_WRITE_MS:
+        logger.info(
+            "slow db write %s lock_wait=%.0f hold=%.0f",
+            _read_label(fn),
+            lock_wait_ms,
+            hold_ms,
+        )
 
 
 class StaleGenerationError(Exception):
@@ -218,17 +250,24 @@ class Database:
         return result
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        requested = time.perf_counter()
         async with self._write_lock:
-            # A nested zero-arg closure, not `self._run_immediate` passed
-            # directly: `_run_immediate` is itself generic, and
-            # run_to_completion's `Callable[..., T]` erases per-argument
-            # types, so a bare method reference loses the binding between
-            # its own T and this T. Closing over the already-bound `fn`
-            # here resolves `_run_immediate`'s T against it first.
-            def _call() -> T:
-                return self._run_immediate(fn)
+            acquired = time.perf_counter()
+            try:
+                # A nested zero-arg closure, not `self._run_immediate` passed
+                # directly: `_run_immediate` is itself generic, and
+                # run_to_completion's `Callable[..., T]` erases per-argument
+                # types, so a bare method reference loses the binding between
+                # its own T and this T. Closing over the already-bound `fn`
+                # here resolves `_run_immediate`'s T against it first.
+                def _call() -> T:
+                    return self._run_immediate(fn)
 
-            return await run_to_completion(_call)
+                return await run_to_completion(_call)
+            finally:
+                # The stop time is taken here, inside the lock, so the raise
+                # and cancellation paths are measured too.
+                _log_slow_write(fn, requested, acquired, time.perf_counter())
 
     @property
     def generation(self) -> int:
@@ -262,14 +301,19 @@ class Database:
         a ``replace_from`` racing the caller between its generation read and
         this call is exactly what the lock boundary is meant to close.
         """
+        requested = time.perf_counter()
         async with self._write_lock:
-            if generation != self._generation:
-                raise StaleGenerationError(generation, self._generation)
+            acquired = time.perf_counter()
+            try:
+                if generation != self._generation:
+                    raise StaleGenerationError(generation, self._generation)
 
-            def _call() -> T:
-                return self._run_immediate(fn)
+                def _call() -> T:
+                    return self._run_immediate(fn)
 
-            return await run_to_completion(_call)
+                return await run_to_completion(_call)
+            finally:
+                _log_slow_write(fn, requested, acquired, time.perf_counter())
 
     async def read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         label = _read_label(fn)
