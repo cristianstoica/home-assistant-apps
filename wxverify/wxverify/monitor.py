@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from typing import Final
 
 from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
@@ -34,6 +35,7 @@ PAIR_SCORE_LIVE_HOURS = 12
 FAILED_JOB_AGE_HOURS = 48
 STUCK_RUNNING_MINUTES = 20
 PENDING_OVERDUE_MINUTES = 15
+OBS_COLLECTION_DELAY_MINUTES: Final = 15
 GRACE_MINUTES = 10
 COSTED_NOOP_MIN_ERRORS = 3
 
@@ -169,6 +171,99 @@ def _station_history_failures(
         return (0, 0, None)
     newest = row[2]
     return (int(row[0]), int(row[1]), None if newest is None else str(newest))
+
+
+# The due-scan's failure cooldown for fetch_current_obs, mirrored from
+# worker.scheduler._DUE_JOB_FAILURE_COOLDOWN (enqueue_due_current_obs).
+_CURRENT_OBS_FAILURE_COOLDOWN: Final = timedelta(hours=1)
+
+_OBS_COLLECTION_SQL: Final = """
+    SELECT st.id,
+           COALESCE(sps.next_poll_at, sps.updated_at, st.created_at) AS due_basis,
+           (SELECT j.next_attempt_at FROM jobs j
+            WHERE j.type = 'fetch_current_obs' AND j.job_key = 'curobs:' || st.id
+              AND j.site_id IS st.site_id AND j.status = 'pending'
+            ORDER BY j.id DESC LIMIT 1) AS pending_attempt,
+           latest.status AS latest_status, latest.updated_at AS latest_updated_at,
+           EXISTS (SELECT 1 FROM jobs a
+                   WHERE a.type = 'fetch_current_obs'
+                     AND a.job_key = 'curobs:' || st.id
+                     AND a.site_id IS st.site_id
+                     AND a.status IN ('pending', 'running')) AS has_active
+    FROM stations st JOIN sites s ON s.id = st.site_id
+    LEFT JOIN station_poll_state sps ON sps.station_id = st.id
+    LEFT JOIN jobs latest ON latest.id = (
+        SELECT j2.id FROM jobs j2
+        WHERE j2.type = 'fetch_current_obs' AND j2.job_key = 'curobs:' || st.id
+          AND j2.site_id IS st.site_id
+        ORDER BY j2.id DESC LIMIT 1)
+    WHERE st.enabled = 1 AND s.enabled = 1
+"""
+
+
+def _parse_or_none(value: object) -> datetime | None:
+    """``parse_utc(str(value))``, or ``None`` for NULL or a value that fails.
+
+    ``str()`` first, so a non-text value such as an imported BLOB gives
+    ``None``; ``parse_utc`` raises only ``ValueError``.
+    """
+    if value is None:
+        return None
+    try:
+        return parse_utc(str(value))
+    except ValueError:
+        return None
+
+
+def _obs_collection_delays(
+    conn: sqlite3.Connection, now: datetime
+) -> tuple[int, int, datetime | None]:
+    """Current-obs collection lateness over enabled stations of enabled sites.
+
+    Returns ``(overdue, in_backoff, oldest)``. A station's effective next
+    attempt is the latest parseable of its due basis, its pending job's
+    ``next_attempt_at`` and, when its latest job failed and none is active,
+    the failure-cooldown end. A cooldown end past ``datetime``'s range
+    saturates at ``datetime.max``, a cooldown that has not ended, as the
+    scheduler's own check still suppresses the enqueue there. It is overdue
+    once ``now`` reaches the effective time plus
+    ``OBS_COLLECTION_DELAY_MINUTES``, or when its due basis does not parse
+    (fail toward alerting; such a station has no stamp). It is in backoff
+    while its due basis alone is overdue but the effective time is not, and
+    is then excluded from ``overdue``. ``oldest`` is the earliest effective
+    time among the overdue stations that have one.
+    """
+    cutoff = now - timedelta(minutes=OBS_COLLECTION_DELAY_MINUTES)
+    overdue = 0
+    in_backoff = 0
+    oldest: datetime | None = None
+    for row in conn.execute(_OBS_COLLECTION_SQL):
+        due = _parse_or_none(row[1])
+        if due is None:
+            overdue += 1
+            continue
+        effective = due
+        pending = _parse_or_none(row[2])
+        if pending is not None and pending > effective:
+            effective = pending
+        failed_at = _parse_or_none(row[4]) if row[3] == "failed" else None
+        if failed_at is not None and not row[5]:
+            try:
+                cooldown_end = failed_at + _CURRENT_OBS_FAILURE_COOLDOWN
+            except OverflowError:
+                # Past datetime's range: saturate, since the cooldown has not
+                # ended -- the scheduler's utc_now() - updated_at < cooldown
+                # still holds for a stamp this far ahead.
+                cooldown_end = datetime.max.replace(tzinfo=UTC)
+            if cooldown_end > effective:
+                effective = cooldown_end
+        if effective <= cutoff:
+            overdue += 1
+            if oldest is None or effective < oldest:
+                oldest = effective
+        elif due <= cutoff:
+            in_backoff += 1
+    return (overdue, in_backoff, oldest)
 
 
 def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
@@ -334,6 +429,18 @@ def _pipeline_conditions(
         history_next_retry,
     ) = _station_history_failures(conn)
 
+    # obs_collection_delayed (D1.3): enabled stations of enabled sites whose
+    # current-obs poll is overdue. Reads schedule and job rows only, never the
+    # poller heartbeat, so a dead or stalled poller cannot hold it green.
+    (
+        collection_overdue_n,
+        collection_backoff_n,
+        collection_oldest,
+    ) = _obs_collection_delays(conn, now)
+    collection_oldest_text = (
+        "unknown" if collection_oldest is None else isoformat_utc(collection_oldest)
+    )
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -412,6 +519,15 @@ def _pipeline_conditions(
             f"{history_failing_n} stations with failing hourly history"
             f" (worst rung {history_worst_rung},"
             f" earliest retry {history_next_retry})",
+        ),
+        _cond(
+            "obs_collection_delayed",
+            collection_overdue_n > 0,
+            collection_overdue_n,
+            f"{collection_overdue_n} stations overdue"
+            f" at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+            f" oldest due {collection_oldest_text};"
+            f" {collection_backoff_n} in backoff",
         ),
     ]
 
@@ -646,6 +762,7 @@ def build_verdict(
                 "forecast_record_gap",
                 "record_gap_scan_degraded",
                 "obs_station_history_failing",
+                "obs_collection_delayed",
             )
         )
 

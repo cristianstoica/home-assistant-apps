@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -15,9 +15,19 @@ from wxverify.core.options import (
     _env_bool,
     load_runtime_options,
 )
-from wxverify.core.timeutil import parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import close_db, get_db
-from wxverify.monitor import Condition, _grace_active
+from wxverify.db.migrations import create_schema
+from wxverify.monitor import (
+    _CURRENT_OBS_FAILURE_COOLDOWN,  # noqa: PLC2701
+    OBS_COLLECTION_DELAY_MINUTES,
+    Condition,
+    _grace_active,
+    build_verdict,
+)
+from wxverify.worker.scheduler import (
+    _DUE_JOB_FAILURE_COOLDOWN,  # noqa: PLC2701
+)
 
 
 async def _idle_worker_async(db: object) -> None:  # keep the real worker idle
@@ -2375,3 +2385,531 @@ def test_key_missing_weathercom_arm_key_present_negative(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert _cond(body, "key_missing")["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# obs_collection_delayed (D1.3, plan §14.4)
+#
+# Every case calls build_verdict directly (pipeline_enabled=True,
+# budget_enabled=False, db_enabled=False, now=_OCD_N, export_sweeper_dead=None)
+# against a bare in-memory schema-current connection, so every boundary is
+# exact.
+# ---------------------------------------------------------------------------
+
+_OCD_N = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
+
+
+def _ocd_t(minutes: float) -> str:
+    return isoformat_utc(_OCD_N + timedelta(minutes=minutes))
+
+
+def _ocd_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    create_schema(conn)
+    return conn
+
+
+def _ocd_station(
+    conn: sqlite3.Connection, site_id: int, *, pws_id: str, enabled: int = 1
+) -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO stations"
+            " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)"
+            " VALUES (?, ?, 40.0, -105.0, 900.0, ?)",
+            (site_id, pws_id, enabled),
+        ).lastrowid
+    )
+
+
+def _ocd_poll_state(
+    conn: sqlite3.Connection,
+    station_id: int,
+    *,
+    next_poll_at: str | None,
+    updated_at: str | None = None,
+    health_state: str = "cold",
+) -> None:
+    if updated_at is None:
+        conn.execute(
+            "INSERT INTO station_poll_state (station_id, next_poll_at, health_state)"
+            " VALUES (?, ?, ?)",
+            (station_id, next_poll_at, health_state),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO station_poll_state"
+            " (station_id, next_poll_at, updated_at, health_state)"
+            " VALUES (?, ?, ?, ?)",
+            (station_id, next_poll_at, updated_at, health_state),
+        )
+
+
+def _ocd_job(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    *,
+    status: str,
+    next_attempt_at: str | None = None,
+    updated_at: str | None = None,
+) -> None:
+    key = f"curobs:{station_id}"
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+        " next_attempt_at, updated_at)"
+        " VALUES ('fetch_current_obs', ?, ?, '{}', ?, ?,"
+        " COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+        (site_id, key, status, next_attempt_at, updated_at),
+    )
+
+
+def _ocd_verdict(
+    conn: sqlite3.Connection, *, now: datetime = _OCD_N, pipeline_enabled: bool = True
+) -> dict[str, object]:
+    return build_verdict(
+        conn,
+        pipeline_enabled=pipeline_enabled,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now,
+        export_sweeper_dead=None,
+    )
+
+
+def _ocd(conn: sqlite3.Connection, *, now: datetime = _OCD_N) -> dict[str, object]:
+    return _cond(_ocd_verdict(conn, now=now), "obs_collection_delayed")
+
+
+def test_ocd_due_16_min_overdue_trips_with_full_detail() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+@pytest.mark.parametrize("order", ["older_station_first", "older_station_second"])
+def test_ocd_oldest_among_two_overdue_selects_the_earlier_effective_time(
+    order: str,
+) -> None:
+    """Two overdue stations at -20 min and -16 min: -20 min is earlier (more
+    overdue), so it must be `oldest` regardless of insertion order.
+
+    Mutant: `effective < oldest` -> `effective > oldest` -- would instead
+    keep the later (-16 min) station as oldest.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    minutes = (-20, -16) if order == "older_station_first" else (-16, -20)
+    station_a = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_a, next_poll_at=_ocd_t(minutes[0]))
+    station_b = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, station_b, next_poll_at=_ocd_t(minutes[1]))
+    cond = _ocd(conn)
+    assert cond["count"] == 2
+    assert f"oldest due {_ocd_t(-20)}" in cond["detail"]
+
+
+def test_ocd_due_exactly_15_min_overdue_trips_at_the_boundary() -> None:
+    """Mutant: `>=` -> `>` on the threshold -- this exact-boundary row would
+    then read ok=True where the correct code trips.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-15))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_due_14_min_overdue_is_not_yet_tripped() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-14))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+    assert "detail" not in cond
+
+
+def test_ocd_pending_deferral_holds_off_the_only_station() -> None:
+    """Mutant: count backoff stations -- this row's station would incorrectly
+    add to `overdue` if the code counted a still-in-backoff station.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(10))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+    assert "detail" not in cond
+
+
+def test_ocd_pending_deferral_itself_becomes_overdue() -> None:
+    """Mutant: exclude backoff stations permanently -- this row would
+    incorrectly read ok=True forever if a backoff station could never
+    graduate into `overdue` once its own deferred time elapses.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-60))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_pending_deferral_not_yet_overdue_itself_stays_ok() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-60))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-14))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_mixed_overdue_and_backoff_detail_counts_both() -> None:
+    """Mutant: drop the backoff suffix -- the detail string would lose its
+    trailing "; N in backoff" clause, differing from this row's expectation.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    backoff_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, backoff_station, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn, site_id, backoff_station, status="pending", next_attempt_at=_ocd_t(10)
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 1 in backoff"
+    )
+
+
+def test_ocd_cooldown_from_recent_failure_suppresses_the_trip() -> None:
+    """Mutant: drop the cooldown term -- without it, this row's due basis
+    (-30) alone is past the 15-min cutoff and would trip.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-30))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-30))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_cooldown_expired_exactly_at_the_threshold_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-90))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-75))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_unparseable_pending_next_attempt_is_ignored() -> None:
+    """Mutant: fail closed on an unparseable pending stamp -- this row would
+    trip if the garbage stamp were treated as overdue instead of ignored.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-10))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at="garbage")
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_unparseable_due_basis_fails_open_to_alerting() -> None:
+    """Mutant: treat an unparseable next_poll_at as not overdue -- this row
+    would read ok=True if the garbage due basis failed closed instead of
+    open; oldest stays "unknown" since a None due never sets `oldest`.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at="not-a-timestamp")
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due unknown; 0 in backoff"
+    )
+
+
+def test_ocd_dead_poller_no_heartbeat_row_still_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    # No runtime_state row at all for current_obs_poller_last_loop_at.
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_fresh_poller_heartbeat_does_not_suppress_the_trip() -> None:
+    """Mutant: read the poller heartbeat -- a fresh heartbeat would then
+    incorrectly hold this row ok=True. Paired with the dead-poller test
+    above: both a missing and a live heartbeat trip identically, which is
+    the point -- this condition reads only schedule/job rows, never the
+    poller's own liveness stamp.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    conn.execute(
+        "INSERT INTO runtime_state (key, value) VALUES"
+        " ('current_obs_poller_last_loop_at', ?)",
+        (isoformat_utc(_OCD_N),),
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_pending_job_never_claimed_still_measures_lateness() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_stuck_running_job_does_not_exempt_the_station() -> None:
+    """Mutant: exempt stations with a running job -- this row would read
+    ok=True if a running job suppressed the due-basis lateness.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="running", updated_at=_ocd_t(-20))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_disabled_site_excludes_its_station() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn, enabled=0)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_disabled_station_is_excluded() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01", enabled=0)
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_grace_active_reports_ok_with_count_passed_through_no_detail() -> None:
+    conn = _ocd_conn()
+    conn.execute(
+        "INSERT INTO runtime_state (key, value) VALUES ('worker_started_at', ?)",
+        (isoformat_utc(_OCD_N - timedelta(minutes=5)),),
+    )
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 1
+    assert "detail" not in cond
+
+
+def test_ocd_pipeline_disabled_reports_skipped() -> None:
+    conn = _ocd_conn()
+    cond = _ocd(conn, now=_OCD_N)
+    verdict = _ocd_verdict(conn, pipeline_enabled=False)
+    skipped_cond = _cond(verdict, "obs_collection_delayed")
+    assert skipped_cond["skipped"] is True
+    # sanity: with pipeline enabled the same empty DB reports not-skipped.
+    assert cond["skipped"] is False
+
+
+# --- Extra: monitor-side fallbacks, cooldown edges, the constant pin --------
+
+
+def test_ocd_missing_poll_state_row_falls_back_to_station_created_at() -> None:
+    """No station_poll_state row at all: due basis must fall back to the
+    station's own created_at, not to an absent/unparseable value. created_at
+    is set 5 min in the future here -- if the fallback did not reach it, the
+    NULL due basis would instead read as unconditionally overdue.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    conn.execute(
+        "INSERT INTO stations"
+        " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled, created_at)"
+        " VALUES (?, 'ISTATION01', 40.0, -105.0, 900.0, 1, ?)",
+        (site_id, _ocd_t(5)),
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_null_next_poll_at_falls_back_to_poll_state_updated_at() -> None:
+    """next_poll_at is NULL but the station_poll_state row exists: due basis
+    must fall back to that row's updated_at, not skip straight past it to
+    station.created_at. created_at is seeded overdue (-16) and updated_at is
+    seeded not-yet-due (+5) so the two fallbacks diverge.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    conn.execute(
+        "INSERT INTO stations"
+        " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled, created_at)"
+        " VALUES (?, 'ISTATION01', 40.0, -105.0, 900.0, 1, ?)",
+        (site_id, _ocd_t(-16)),
+    )
+    station_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    _ocd_poll_state(conn, station_id, next_poll_at=None, updated_at=_ocd_t(5))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_malformed_failure_stamp_is_ignored() -> None:
+    """A garbage failure updated_at must not apply any cooldown: the station
+    is judged on its due basis alone, exactly as if it had never failed.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at="not-a-timestamp")
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_active_job_suppresses_the_failure_cooldown() -> None:
+    """The latest job is 'failed' (recent, still inside its cooldown), but an
+    OLDER job for the same key is still pending/running -- has_active is
+    True, so the cooldown term must be skipped and the station judged on its
+    due basis alone (overdue). Without the `not has_active` guard, the
+    cooldown would hold it ok=True until the cooldown itself elapses.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="running", updated_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-5))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_cooldown_overflow_saturates_to_not_ended() -> None:
+    """A failure stamp so far in the future that stamp + 1h overflows
+    datetime's range must saturate the cooldown end at datetime.max, i.e.
+    "has not ended" -- not raise and not treat the cooldown as expired.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn,
+        site_id,
+        station_id,
+        status="failed",
+        updated_at="9999-12-31T23:30:00Z",
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_cooldown_overflow_station_counts_as_backoff_when_another_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overflow_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overflow_station, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn,
+        site_id,
+        overflow_station,
+        status="failed",
+        updated_at="9999-12-31T23:30:00Z",
+    )
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 1 in backoff"
+    )
+
+
+def test_ocd_fresh_pending_station_does_not_inflate_the_backoff_count() -> None:
+    """A station whose due basis is not itself overdue (a fresh pending
+    deferral, both in the future) must not be counted as "in backoff" just
+    because it sits next to a genuinely overdue station.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    fresh_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, fresh_station, next_poll_at=_ocd_t(30))
+    _ocd_job(conn, site_id, fresh_station, status="pending", next_attempt_at=_ocd_t(35))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_failure_cooldown_constant_matches_the_schedulers_enqueue_cooldown() -> (
+    None
+):
+    assert _CURRENT_OBS_FAILURE_COOLDOWN == _DUE_JOB_FAILURE_COOLDOWN
