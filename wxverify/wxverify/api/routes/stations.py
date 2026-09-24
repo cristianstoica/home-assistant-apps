@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Final
 
 import httpx
 from fastapi import APIRouter, Request
@@ -25,8 +26,15 @@ from wxverify.worker.domain_backoff import (
     record_http_backoff,
     source_domain,
 )
+from wxverify.worker.station_pacing import acquire_within, weathercom_call_lock
 
 router = APIRouter(prefix="/api/sites/{site_id}/stations", tags=["stations"])
+
+# How long create_station waits for the weather.com call lock before giving up
+# with a 503. Provisional: meant to sit inside common reverse-proxy request
+# timeouts; the ingress proxy's own timeout is not verified. Read at call time
+# from the module, never bound as a default argument, so tests can shorten it.
+ADD_STATION_CALL_WAIT_SECONDS: Final = 30.0
 
 
 def _station_out(row: sqlite3.Row) -> StationOut:
@@ -68,7 +76,7 @@ async def create_station(
     # lookup_elevation_m) is then rejected at the write instead of silently
     # attaching this station to whatever now owns that site_id in the
     # replacement database. Same disposition as the worker's (see
-    # worker.processor.run_worker).
+    # worker.processor.run_claimed_job).
     writer = FencedWriter(get_db(), get_db().generation)
 
     def _reserve(conn: sqlite3.Connection) -> None:
@@ -80,18 +88,32 @@ async def create_station(
         check_domain_backoff(conn, source_domain("weathercom"))
         reserve_budget(conn, "weathercom", 1)
 
-    await writer.write(_reserve)
-    try:
-        pws = await validate_station(body.pws_station_id, api_key)
-    except httpx.HTTPStatusError as exc:
-        # Exempt: domain_backoffs is keyed by domain, not by site/station --
-        # no entity for a swap to contaminate, so this runs unfenced.
-        next_attempt_at = await get_db().write(
-            lambda conn, response=exc.response: record_http_backoff(conn, response)
+    # The shared weather.com call lock covers the reserve, the call and the
+    # backoff write, and is taken before any of them, so a timed-out wait
+    # means no provider request, no budget change and no station row. The
+    # lock's release() does not check ownership, so it runs only in the
+    # finally of the try entered straight after a True result, with no await
+    # in between. The Open-Meteo elevation lookup below stays outside it.
+    lock = weathercom_call_lock()
+    if not await acquire_within(lock, ADD_STATION_CALL_WAIT_SECONDS):
+        raise ApiError(
+            503, "Weather provider busy; station was not added. Try again shortly."
         )
-        if next_attempt_at is not None:
-            raise JobDeferred(next_attempt_at) from exc
-        raise
+    try:
+        await writer.write(_reserve)
+        try:
+            pws = await validate_station(body.pws_station_id, api_key)
+        except httpx.HTTPStatusError as exc:
+            # Exempt: domain_backoffs is keyed by domain, not by site/station --
+            # no entity for a swap to contaminate, so this runs unfenced.
+            next_attempt_at = await get_db().write(
+                lambda conn, response=exc.response: record_http_backoff(conn, response)
+            )
+            if next_attempt_at is not None:
+                raise JobDeferred(next_attempt_at) from exc
+            raise
+    finally:
+        lock.release()
 
     def _reserve_elevation(conn: sqlite3.Connection) -> None:
         if (

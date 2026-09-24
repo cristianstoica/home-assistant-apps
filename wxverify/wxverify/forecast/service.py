@@ -59,7 +59,7 @@ DAY_COUNT = 8
 VARIABLES = DEPTH_VARIABLES
 # Rain glyph appears when a nontrivial part of the day is expected wet — not
 # on a single drizzly hour: when the displayed, rounded wet-hour count is at
-# least six, so the glyph always agrees with the "~N h wet" figure. Six hours
+# least six, so the glyph always agrees with the "N h" figure. Six hours
 # is a quarter of a 24-hour day, but the rule is not equivalent to the 25%
 # trigger it replaces: a blended count of 5.5 rounds to 6 and shows the
 # glyph, where the old rounded percentage (23%) did not.

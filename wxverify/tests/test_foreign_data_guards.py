@@ -32,7 +32,7 @@ from wxverify.db.queue import (
     fail,
 )
 from wxverify.worker.processor import run_worker
-from wxverify.worker.scheduler import scheduler_tick
+from wxverify.worker.scheduler import enqueue_due_current_obs, scheduler_tick
 
 
 def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
@@ -466,6 +466,10 @@ def test_scheduler_tick_survives_hostile_reader_values(
 
     with caplog.at_level(logging.WARNING, logger=case.logger_name):
         scheduler_tick(conn)  # must not raise
+        # The current-obs due-scan moved out of scheduler_tick and into the
+        # poller's own write transaction (plan §6.3.5); drive it explicitly so
+        # the stations_site_id_* cases still see their expected job land.
+        enqueue_due_current_obs(conn)  # must not raise
 
     for job_type, site_id, job_key in expected.must_exist:
         assert _pending_job_exists(conn, job_type, site_id, job_key), (
@@ -789,7 +793,9 @@ def test_fail_clamps_below_range_retry_count_instead_of_raising(
 
 
 def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_current_obs_poller: None,
 ) -> None:
     """The same row driven through the real dispatcher path that calls
     fail(): the pass completes, the row ends 'failed', and a second claim
@@ -843,7 +849,9 @@ def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
 
 
 def test_worker_loop_dispositions_below_range_retry_count_without_a_crash_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_current_obs_poller: None,
 ) -> None:
     """The below-range REAL carrier driven through the real dispatcher path
     that calls fail(): with max_retries=0 the clamped count (1) is terminal,

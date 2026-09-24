@@ -2,7 +2,7 @@
 
 Poll state-machine (classify_current_obs + persist_poll_result).
 current_obs_from_payload field mapping.
-Post-migration station scheduling via _enqueue_due_current_obs.
+Post-migration station scheduling via enqueue_due_current_obs.
 _obs_instant sub-hour resolution vs _valid_at hour-flooring.
 
 All wall-clock reads are patched; DB isolation is per-test :memory: SQLite.
@@ -14,7 +14,9 @@ file for the handoff detail).
 
 from __future__ import annotations
 
+import itertools
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -28,6 +30,7 @@ from wxverify.db.migrations import (
     seed_default_settings,
     seed_default_sources,
 )
+from wxverify.db.queue import claim_next_current_obs_job, claim_next_job
 from wxverify.obs.cadence import (
     WINDOW_N,
     base_interval,
@@ -39,6 +42,7 @@ from wxverify.obs.pws_adapter import (
     _valid_at,  # noqa: PLC2701
     current_obs_from_payload,
 )
+from wxverify.worker.control import JobCancelled
 from wxverify.worker.current_obs import (
     MAX_BACKOFF_SECONDS,
     MIN_INTERVAL_SECONDS,
@@ -47,7 +51,11 @@ from wxverify.worker.current_obs import (
     classify_current_obs,
     persist_poll_result,
 )
-from wxverify.worker.scheduler import _enqueue_due_current_obs  # noqa: PLC2701
+from wxverify.worker.processor import (
+    _pws_station_id,  # noqa: PLC2701
+    _reserve_current_obs_call,  # noqa: PLC2701
+)
+from wxverify.worker.scheduler import enqueue_due_current_obs
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1301,7 +1309,7 @@ class TestObsInstantSubHourResolution:
 
 
 class TestEnqueueDueCurrentObs:
-    """_enqueue_due_current_obs LEFT JOIN due-query picks up unseeded stations."""
+    """enqueue_due_current_obs LEFT JOIN due-query picks up unseeded stations."""
 
     def _setup_db_with_station(
         self,
@@ -1320,13 +1328,13 @@ class TestEnqueueDueCurrentObs:
     def test_station_with_no_poll_state_enqueued_immediately(self) -> None:
         """Station with no station_poll_state row is returned by the due-query.
 
-        The LEFT JOIN in _enqueue_due_current_obs returns stations where
+        The LEFT JOIN in enqueue_due_current_obs returns stations where
         sps.next_poll_at IS NULL — i.e. no poll-state row yet.
         """
         conn, site_id, station_id = self._setup_db_with_station()
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         job = conn.execute(
             "SELECT * FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
@@ -1345,7 +1353,7 @@ class TestEnqueueDueCurrentObs:
         _seed_poll_state(conn, station_id, next_poll_at=future)
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         job = conn.execute(
             "SELECT * FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
@@ -1361,7 +1369,7 @@ class TestEnqueueDueCurrentObs:
         _seed_poll_state(conn, station_id, next_poll_at=_NOW_ISO)
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         job = conn.execute(
             "SELECT * FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
@@ -1374,8 +1382,8 @@ class TestEnqueueDueCurrentObs:
         conn, site_id, station_id = self._setup_db_with_station()
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         count = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
@@ -1397,7 +1405,7 @@ class TestEnqueueDueCurrentObs:
         station_id = _seed_station(conn, site_id)
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         # No poll-state row yet
         assert _poll_state(conn, station_id) is None
@@ -1420,7 +1428,7 @@ class TestEnqueueDueCurrentObs:
         _seed_station(conn, site_id, enabled=0)
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         count = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE type='fetch_current_obs'"
@@ -1432,7 +1440,7 @@ class TestEnqueueDueCurrentObs:
         conn, site_id, station_id = self._setup_db_with_station()
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         job = conn.execute(
             "SELECT job_key FROM jobs WHERE type='fetch_current_obs'"
@@ -1456,7 +1464,7 @@ class TestEnqueueDueCurrentObs:
         )
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         count = conn.execute(
             "SELECT COUNT(*) FROM jobs WHERE type='fetch_current_obs' AND site_id=?",
@@ -1482,7 +1490,7 @@ class TestEnqueueDueCurrentObs:
         )
 
         with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
-            _enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
 
         pending = conn.execute(
             "SELECT COUNT(*) FROM jobs"
@@ -1492,6 +1500,193 @@ class TestEnqueueDueCurrentObs:
         assert pending == 1, (
             "a terminal failure past the cooldown must allow re-enqueue"
         )
+
+
+# ---------------------------------------------------------------------------
+# D0 (0.16.3 §5 / §14.1): the site-aware due-scan WHERE and the orphan
+# warning. A well-formed but non-existent site_id (never a hostile literal --
+# those are covered in test_foreign_data_guards.py) is planted with
+# foreign_keys temporarily OFF, mirroring
+# test_foreign_data_guards.py::_setup_stations_site_id_hostile.
+# ---------------------------------------------------------------------------
+
+# A syntactically valid integer id that this test DB never assigns to any
+# site (no test in this class seeds more than a handful of sites), so it is
+# a safe "the site referenced does not exist" carrier.
+_MISSING_SITE_ID = 999999
+
+
+class TestD0SiteAwareDueScan:
+    """D0 (§5): the due-scan's pollable set equals what the claim path
+    accepts, and an orphaned station is warned about, not silently dropped
+    or endlessly re-enqueued (plan §14.1)."""
+
+    def _seed_orphan_station(
+        self, conn: sqlite3.Connection, *, pws_id: str, enabled: int = 1
+    ) -> int:
+        """A station whose site_id names no row in sites."""
+        throwaway_site_id = _seed_site(conn, name=f"SITE-THROWAWAY-{pws_id}")
+        station_id = _seed_station(
+            conn, throwaway_site_id, pws_id=pws_id, enabled=enabled
+        )
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(
+            "UPDATE stations SET site_id=? WHERE id=?",
+            (_MISSING_SITE_ID, station_id),
+        )
+        conn.execute("PRAGMA foreign_keys=ON")
+        return station_id
+
+    @pytest.mark.parametrize(
+        ("station_enabled", "site_enabled", "site_exists"),
+        list(itertools.product([True, False], repeat=3)),
+        ids=[
+            f"station_enabled={a},site_enabled={b},site_exists={c}"
+            for a, b, c in itertools.product([True, False], repeat=3)
+        ],
+    )
+    def test_parity_oracle(
+        self,
+        *,
+        station_enabled: bool,
+        site_enabled: bool,
+        site_exists: bool,
+    ) -> None:
+        """The due-scan's enqueue decision must equal both processor-layer
+        gates it is a proxy for: ``_pws_station_id`` returning non-None, and
+        ``_reserve_current_obs_call`` not raising ``JobCancelled``. No
+        backoff row is seeded and the default per-source budget is
+        untouched, so backoff/budget never enter this equality (§5.2)."""
+        conn = _make_conn()
+        pws_id = (
+            f"ISTATION-PARITY-{int(station_enabled)}"
+            f"{int(site_enabled)}{int(site_exists)}"
+        )
+        if site_exists:
+            site_id = _seed_site(conn, name=f"SITE-PARITY-{pws_id}")
+            conn.execute(
+                "UPDATE sites SET enabled=? WHERE id=?",
+                (1 if site_enabled else 0, site_id),
+            )
+            station_id = _seed_station(
+                conn, site_id, pws_id=pws_id, enabled=1 if station_enabled else 0
+            )
+            call_site_id = site_id
+        else:
+            station_id = self._seed_orphan_station(
+                conn, pws_id=pws_id, enabled=1 if station_enabled else 0
+            )
+            call_site_id = _MISSING_SITE_ID
+
+        with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
+            enqueue_due_current_obs(conn)
+
+        job = conn.execute(
+            "SELECT 1 FROM jobs WHERE type='fetch_current_obs' AND job_key=?"
+            " AND status='pending'",
+            (f"curobs:{station_id}",),
+        ).fetchone()
+        enqueued = job is not None
+
+        pws_station_id = _pws_station_id(conn, call_site_id, station_id)
+
+        cancelled = False
+        try:
+            _reserve_current_obs_call(conn, call_site_id, station_id)
+        except JobCancelled:
+            cancelled = True
+
+        expected = station_enabled and site_exists and site_enabled
+        assert enqueued is expected, (
+            f"due-scan enqueue={enqueued} but expected={expected} for "
+            f"station_enabled={station_enabled} site_enabled={site_enabled} "
+            f"site_exists={site_exists}"
+        )
+        assert (pws_station_id is not None) is expected, (
+            f"_pws_station_id non-None={pws_station_id is not None} but "
+            f"expected={expected}"
+        )
+        assert (not cancelled) is expected, (
+            f"_reserve_current_obs_call cancelled={cancelled} but "
+            f"expected non-cancelled={expected}"
+        )
+
+    def test_orphan_station_warns_once_and_enqueues_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A station whose site_id names no site: exactly one WARNING
+        containing 'references a missing site', and no job (§5.1).
+
+        Paired positive: TestEnqueueDueCurrentObs::
+        test_station_with_no_poll_state_enqueued_immediately shows the same
+        due-scan enqueues a job for a station whose site genuinely exists;
+        this test's absence of a job is not an artifact of an empty DB."""
+        conn = _make_conn()
+        station_id = self._seed_orphan_station(conn, pws_id="ISTATION-ORPHAN")
+
+        with (
+            patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO),
+            caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"),
+        ):
+            enqueue_due_current_obs(conn)
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, (
+            f"expected exactly one WARNING, got {[r.getMessage() for r in warnings]}"
+        )
+        assert "references a missing site" in warnings[0].getMessage()
+
+        job = conn.execute(
+            "SELECT 1 FROM jobs WHERE type='fetch_current_obs' AND job_key=?",
+            (f"curobs:{station_id}",),
+        ).fetchone()
+        assert job is None, "an orphaned station must never reach the queue"
+
+    def test_disabled_site_station_does_not_starve_main_claim(self) -> None:
+        """A disabled-site station plus one pending verification_run: two
+        due-scan ticks enqueue nothing for the station, the current-obs
+        lane's own claim (``claim_next_current_obs_job``) finds nothing to
+        run, and the main lane's claim (``claim_next_job``) still claims the
+        verification_run next (§5.2's 'no starvation' case, plan §14.1).
+
+        Two repeated ticks stand in for two poller iterations: the due-scan
+        itself never enqueues a job for a disabled-site station, so there is
+        nothing for either lane's claim to pick up across repeated passes.
+        """
+        conn = _make_conn()
+        starved_site_id = _seed_site(conn, name="SITE-STARVE")
+        conn.execute("UPDATE sites SET enabled=0 WHERE id=?", (starved_site_id,))
+        _seed_station(conn, starved_site_id, pws_id="ISTATION-STARVE", enabled=1)
+
+        verification_site_id = _seed_site(conn, name="SITE-VERIFY-RUN")
+        conn.execute(
+            "INSERT INTO jobs (type, site_id, job_key, payload, status)"
+            " VALUES ('verification_run', ?, 'nightly', '{}', 'pending')",
+            (verification_site_id,),
+        )
+
+        with patch("wxverify.worker.scheduler.isoformat_utc", return_value=_NOW_ISO):
+            enqueue_due_current_obs(conn)
+            enqueue_due_current_obs(conn)
+
+        pending_current_obs = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE type='fetch_current_obs'"
+        ).fetchone()[0]
+        assert pending_current_obs == 0, (
+            "a disabled-site station must never reach the queue as a "
+            "fetch_current_obs job across repeated due-scan ticks"
+        )
+
+        assert claim_next_current_obs_job(conn) is None, (
+            "the current-obs lane must find nothing to claim for a "
+            "disabled-site station"
+        )
+
+        claimed = claim_next_job(conn)
+        assert claimed is not None, (
+            "the pending verification_run must still be claimable"
+        )
+        assert claimed.type == "verification_run"
 
 
 # ---------------------------------------------------------------------------

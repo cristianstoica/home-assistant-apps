@@ -1,6 +1,6 @@
 """Contract tests: GET /api/observations/current.
 
-Six oracles:
+Eight oracles:
 
 1. Cold station (sps.health_state='cold', no station_current_obs row)
    → all obs fields null; health_state == "cold".
@@ -23,9 +23,18 @@ Six oracles:
 6. Additive keys: error_count is int when the sps row exists, null when the
    LEFT JOIN misses; last_poll_at is present in the shape.
 
+7. provider_reported_offline, parametrized over health_state in
+   {offline, online, transient, terminal, cold}: True only for "offline",
+   and always a JSON bool (never the raw string).
+
+8. provider_reported_offline when the station has no station_poll_state row
+   at all (precedent: test_error_count_null_when_poll_state_absent): False,
+   not None.
+
 Cold (1) and Offline-with-last-good (2) form the required paired positive/negative:
 cold-null is meaningful only because the offline-non-null case can go red — the
-pair ensures neither assertion is vacuous.
+pair ensures neither assertion is vacuous. Likewise, oracle 7's offline case
+verifies True; its other states and oracle 8's missing-row case verify False.
 
 Isolation: per-test tmp-file DB via TestClient + the standard _init_tmp_db pattern
 (close_db → config.db_path → init_db via create_app). The idle-worker stub keeps
@@ -57,6 +66,8 @@ _PWS_COLD = "ISTATION01"
 _PWS_OFFLINE = "ISTATION02"
 _PWS_DISABLED = "ISTATION03"
 _PWS_UNITS = "ISTATION04"
+# Synthetic station id, distinct from the other oracles' constants.
+_PWS_PROV = "ISTATION05"
 
 # Units oracle: 18.0 km/h is unambiguous vs m/s conversion (÷3.6 → 5.0).
 _WIND_SPEED_KMH = 18.0
@@ -337,6 +348,10 @@ def test_offline_station_retains_last_good_obs(
         assert row["health_state"] == "offline", (
             f"health_state must be 'offline', got {row['health_state']!r}"
         )
+        assert row["provider_reported_offline"] is True, (
+            "offline station retaining last-good obs must still report "
+            f"provider_reported_offline True, got {row['provider_reported_offline']!r}"
+        )
 
         # Anti-conflation: obs fields must be the RETAINED non-null last-good values.
         assert row["temp"] == pytest.approx(21.0), (
@@ -606,4 +621,127 @@ def test_error_count_null_when_poll_state_absent(
         )
         assert row["health_state"] is None, (
             "health_state must be null when station_poll_state row is absent"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 7 — provider_reported_offline: True for "offline" only, always bool
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "health_state",
+    ["offline", "online", "transient", "terminal", "cold"],
+)
+def test_provider_reported_offline_true_only_for_offline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, health_state: str
+) -> None:
+    """provider_reported_offline is True iff health_state == "offline".
+
+    Every non-offline health_state in the CHECK's allowed set is exercised so
+    the suppression (False for online/transient/terminal/cold) is checked
+    against real, distinct states rather than one convenient stand-in — and
+    the "offline" case is the paired positive that proves the field can fire
+    at all, so the False cases are not vacuous.
+
+    Every case also asserts the JSON type is exactly bool, never the raw
+    health_state string — pins the field as a real boolean, not a truthy
+    passthrough.
+    """
+    close_db()
+    config.db_path = str(tmp_path / f"prov-{health_state}.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> int:
+            site_id = _seed_site(conn)
+            station_id = _seed_station(conn, site_id, pws_id=_PWS_PROV)
+            _seed_poll_state(conn, station_id, health_state=health_state)
+            return station_id
+
+        station_id = db.write_sync(_seed)
+
+        resp = client.get("/api/observations/current")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["station_id"] == station_id
+        assert row["health_state"] == health_state
+
+        value = row["provider_reported_offline"]
+        assert type(value) is bool, (
+            "provider_reported_offline must be a JSON bool, "
+            f"got {value!r} (type {type(value)}) for health_state={health_state!r}"
+        )
+        if health_state == "offline":
+            assert value is True, (
+                f"provider_reported_offline must be True for health_state="
+                f"'offline', got {value!r}"
+            )
+        else:
+            assert value is False, (
+                "provider_reported_offline must be False for health_state="
+                f"{health_state!r}, got {value!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 8 — provider_reported_offline: False (not None) when the
+#            station_poll_state row is absent entirely
+# ---------------------------------------------------------------------------
+
+
+def test_provider_reported_offline_false_when_poll_state_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """provider_reported_offline is False, not null, when sps row is absent.
+
+    Precedent: test_error_count_null_when_poll_state_absent (oracle 6), which
+    seeds the same no-poll-state precondition and shows error_count/last_poll_at/
+    health_state all come back null. provider_reported_offline must NOT follow
+    that pattern: it is a comparison (row["health_state"] == "offline"), which
+    is well-defined (False) even when health_state is SQL NULL — the field is
+    always a JSON bool, never null.
+
+    Paired positive: test_provider_reported_offline_true_only_for_offline's
+    "offline" case proves the field is capable of being True, so this False
+    assertion is not vacuously trivial.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "prov-no-sps.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> int:
+            site_id = _seed_site(conn)
+            # Enabled station with NO station_poll_state row.
+            station_id = _seed_station(conn, site_id, pws_id=_PWS_PROV, enabled=1)
+            return station_id
+
+        station_id = db.write_sync(_seed)
+
+        resp = client.get("/api/observations/current")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert len(rows) == 1
+        row = rows[0]
+
+        assert row["station_id"] == station_id
+        assert row["health_state"] is None
+
+        value = row["provider_reported_offline"]
+        assert type(value) is bool, (
+            "provider_reported_offline must be a JSON bool even when "
+            f"station_poll_state is absent, got {value!r} (type {type(value)})"
+        )
+        assert value is False, (
+            "provider_reported_offline must be False (not null) when "
+            f"station_poll_state row is absent, got {value!r}"
         )

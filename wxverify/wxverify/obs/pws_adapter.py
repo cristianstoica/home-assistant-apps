@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -245,6 +246,43 @@ def _request_id(headers: httpx.Headers) -> str | None:
     return None
 
 
+PROVIDER_DEADLINE_MARGIN_SECONDS: Final = 5.0
+
+
+class ProviderDeadlineExceeded(TimeoutError):
+    """A weather.com call ran past its total deadline (read timeout + margin)."""
+
+
+async def _get_with_deadline(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict[str, str],
+    read_seconds: float,
+) -> httpx.Response:
+    """One weather.com GET, bounded by a total deadline of read timeout + margin.
+
+    httpx timeouts apply per operation, so a body that delivers each chunk before
+    the read timeout expires can keep the call open indefinitely. Only this
+    deadline's own expiry is converted to ``ProviderDeadlineExceeded``; a
+    transport ``TimeoutError`` re-raises unchanged and an external cancel stays
+    ``CancelledError``. The message carries no URL, key or station id.
+    """
+    deadline = read_seconds + PROVIDER_DEADLINE_MARGIN_SECONDS
+    cm = asyncio.timeout(deadline)
+    try:
+        async with cm:
+            return await client.get(
+                url, params=params, timeout=httpx.Timeout(read_seconds, connect=5.0)
+            )
+    except TimeoutError as exc:
+        if cm.expired():
+            raise ProviderDeadlineExceeded(
+                f"weather.com call exceeded its {deadline:.0f} s deadline"
+            ) from exc
+        raise
+
+
 async def validate_station(
     station_id: str, api_key: str, *, lat: float | None = None, lon: float | None = None
 ) -> PwsStation:
@@ -254,7 +292,8 @@ async def validate_station(
         return PwsStation(station_id=station_id, lat=lat, lon=lon)
     logger.debug("pws validate_station station=%s", station_id)
     async with httpx.AsyncClient() as client:
-        response = await client.get(
+        response = await _get_with_deadline(
+            client,
             "https://api.weather.com/v2/pws/observations/current",
             params={
                 "stationId": station_id,
@@ -262,7 +301,7 @@ async def validate_station(
                 "units": "m",
                 "apiKey": api_key,
             },
-            timeout=httpx.Timeout(10.0, connect=5.0),
+            read_seconds=10.0,
         )
         response.raise_for_status()
         data = decode_observations_payload(response, station_id=station_id)
@@ -302,7 +341,8 @@ async def fetch_hourly_history(
                 client=owned_client,
             )
     logger.debug("pws hourly_history request station=%s hours=%s", station_id, hours)
-    response = await client.get(
+    response = await _get_with_deadline(
+        client,
         HOURLY_HISTORY_URL,
         params={
             "stationId": station_id,
@@ -311,7 +351,7 @@ async def fetch_hourly_history(
             "numericPrecision": "decimal",
             "apiKey": api_key,
         },
-        timeout=httpx.Timeout(10.0, connect=5.0),
+        read_seconds=10.0,
     )
     response.raise_for_status()
     cutoff = utc_now() - timedelta(hours=hours)
@@ -361,7 +401,8 @@ async def fetch_hourly_history_range(
         window_start,
         window_end,
     )
-    response = await client.get(
+    response = await _get_with_deadline(
+        client,
         "https://api.weather.com/v2/pws/history/hourly",
         params={
             "stationId": station_id,
@@ -372,7 +413,7 @@ async def fetch_hourly_history_range(
             "numericPrecision": "decimal",
             "apiKey": api_key,
         },
-        timeout=httpx.Timeout(20.0, connect=5.0),
+        read_seconds=20.0,
     )
     response.raise_for_status()
     observations = observations_from_payload(
@@ -582,9 +623,10 @@ async def fetch_current_observation(
     un-parsed and does NOT call ``raise_for_status`` — the caller classifies. A
     transport-level failure propagates as the corresponding ``httpx`` exception.
 
-    ``timeout_seconds`` is the overall/read timeout (the connect timeout stays at
-    5.0s); the caller passes the operator-configured ``request_timeout_seconds``
-    setting, defaulting to the previous 10.0s literal.
+    ``timeout_seconds`` is the read timeout (the connect timeout stays at 5.0s),
+    and the whole call is bounded by ``timeout_seconds`` + 5 s, past which it
+    raises ``ProviderDeadlineExceeded``; the caller passes the operator-configured
+    ``request_timeout_seconds`` setting, defaulting to the previous 10.0s literal.
     """
     if client is None:
         async with httpx.AsyncClient() as owned_client:
@@ -595,7 +637,8 @@ async def fetch_current_observation(
                 timeout_seconds=timeout_seconds,
             )
     logger.debug("pws current_obs request station=%s", pws_station_id)
-    return await client.get(
+    return await _get_with_deadline(
+        client,
         "https://api.weather.com/v2/pws/observations/current",
         params={
             "stationId": pws_station_id,
@@ -604,7 +647,7 @@ async def fetch_current_observation(
             "numericPrecision": "decimal",
             "apiKey": api_key,
         },
-        timeout=httpx.Timeout(timeout_seconds, connect=5.0),
+        read_seconds=timeout_seconds,
     )
 
 

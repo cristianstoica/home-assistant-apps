@@ -396,7 +396,9 @@ def test_idle_worker_stamps_runtime_heartbeats(tmp_path: Path) -> None:
 
 
 def test_worker_heartbeat_write_failure_logs_and_loop_continues(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    idle_current_obs_poller: None,
 ) -> None:
     class ReachedClaim(Exception):
         pass
@@ -429,7 +431,7 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
 
 
 def test_worker_permission_error_is_process_fatal(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, idle_current_obs_poller: None
 ) -> None:
     job = Job(
         id=99,
@@ -4310,7 +4312,7 @@ def test_operator_backfill_retry_ignores_recent_terminal_failure_cooldown(
 ) -> None:
     """POST /api/sites/<id>/backfill must never be suppressed by a cooldown.
 
-    _enqueue_due_feeds/_enqueue_due_obs/_enqueue_due_current_obs opt into
+    _enqueue_due_feeds/_enqueue_due_obs/enqueue_due_current_obs opt into
     enqueue_if_absent_with_cooldown for scheduler-driven retries; an
     operator-initiated retry through this route must keep using
     enqueue_if_absent directly, so a job that failed seconds ago can still

@@ -274,6 +274,11 @@ async def observations_current(
     stream resets on success). Obs values are the stored native ``units:"m"``
     form (km/h wind, hPa, mm) — no conversion in the route. Optional
     ``?station=<id>`` filter; empty registry → ``[]``.
+
+    ``provider_reported_offline`` is ``true`` exactly when the latest persisted
+    poll classification is a provider no-data reply (``health_state="offline"``).
+    It is always a JSON bool, never ``null``: ``false`` for every other state and
+    for a missing ``station_poll_state`` row.
     """
 
     def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
@@ -309,6 +314,7 @@ async def observations_current(
                 "station_id": int(row["station_id"]),
                 "pws_station_id": str(row["pws_station_id"]),
                 "health_state": row["health_state"],
+                "provider_reported_offline": row["health_state"] == "offline",
                 "obs_time_utc": row["obs_time_utc"],
                 "temp": row["temp"],
                 "humidity": row["humidity"],

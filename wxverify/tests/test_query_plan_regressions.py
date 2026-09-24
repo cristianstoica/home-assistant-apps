@@ -29,7 +29,12 @@ from wxverify.api.routes.health import (
     FORECAST_SAMPLES_COUNT_SQL,
 )
 from wxverify.db.migrations import run_migrations
-from wxverify.db.queue import ACTIVE_JOB_SQL, LATEST_JOB_SQL
+from wxverify.db.queue import (
+    _CURRENT_OBS_LANE_CLAUSE,  # noqa: PLC2701 -- the constant IS the plan input under test
+    _MAIN_LANE_CLAUSE,  # noqa: PLC2701
+    ACTIVE_JOB_SQL,
+    LATEST_JOB_SQL,
+)
 from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
@@ -1172,3 +1177,63 @@ def test_failed_scopes_lookup_is_indexed_on_the_whole_scope() -> None:
     assert not any("idx_jobs_type_key_site" in line for line in no_index_plan), (
         no_index_plan
     )
+
+
+def _claim_subselect_plan(conn: sqlite3.Connection, type_clause: str) -> list[str]:
+    """The claim's inner pending-row subselect, isolated from the outer
+    UPDATE ... RETURNING (§6.3.4, ``db/queue.py``'s ``_claim``). The outer
+    UPDATE always resolves by rowid regardless of ``type_clause``, so only
+    this subselect's plan can move -- reproduced here (not imported: it is
+    not a module-level constant) with the same ``type_clause`` splice point
+    ``_claim`` uses, so this test drives the SAME clause CONSTANTS production
+    claims with, not a hand-copied literal.
+    """
+    return _plan(
+        conn,
+        f"""
+        SELECT id FROM jobs
+        WHERE status = 'pending'
+          AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          {type_clause}
+        ORDER BY
+            CASE
+                WHEN type IN ('forecast_record','record_gap_scan') THEN 0
+                WHEN type IN ('verification_run','timezone_correction') THEN 2
+                ELSE 1
+            END,
+            created_at, id
+        LIMIT 1
+        """,
+        ("2026-07-07T12:00:00Z",),
+    )
+
+
+def test_eqp_claim_partition_clauses_keep_todays_claim_plan() -> None:
+    """EQP -- for both lane clauses, the EQP rows equal today's (pre-split,
+    no type clause at all) claim's EQP rows: a bare ``SCAN jobs`` plus a
+    ``USE TEMP B-TREE FOR ORDER BY``, never a seek through
+    ``idx_jobs_type_key_site``. This is a relationship assertion (plan
+    equality), not a pin on the exact plan text.
+
+    Mutant: dropping the unary ``+`` from ``_CURRENT_OBS_LANE_CLAUSE`` lets
+    the planner choose ``idx_jobs_type_key_site`` instead (a ``SEARCH``
+    line), which this test's baseline-equality assertion catches.
+    """
+    conn = _fresh_conn()
+    baseline_plan = _claim_subselect_plan(conn, "")
+    main_lane_plan = _claim_subselect_plan(conn, _MAIN_LANE_CLAUSE)
+    current_obs_plan = _claim_subselect_plan(conn, _CURRENT_OBS_LANE_CLAUSE)
+
+    assert main_lane_plan == baseline_plan
+    assert current_obs_plan == baseline_plan
+    assert any("SCAN jobs" in line for line in baseline_plan)
+    assert not any("idx_jobs_type_key_site" in line for line in baseline_plan)
+
+    # Negative control: dropping the unary `+` really does move the planner
+    # onto idx_jobs_type_key_site, proving this fixture can distinguish the
+    # two plans instead of the assertion being vacuously true here.
+    degraded_clause = _CURRENT_OBS_LANE_CLAUSE.replace("+type", "type")
+    assert degraded_clause != _CURRENT_OBS_LANE_CLAUSE
+    degraded_plan = _claim_subselect_plan(conn, degraded_clause)
+    assert degraded_plan != baseline_plan
+    assert any("idx_jobs_type_key_site" in line for line in degraded_plan)

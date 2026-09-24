@@ -2,22 +2,35 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import asof_conn, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import (
     _env_bool,
     load_runtime_options,
 )
-from wxverify.core.timeutil import parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import close_db, get_db
-from wxverify.monitor import Condition, _grace_active
+from wxverify.db.migrations import create_schema
+from wxverify.monitor import (
+    _CURRENT_OBS_FAILURE_COOLDOWN,  # noqa: PLC2701
+    OBS_COLLECTION_DELAY_MINUTES,
+    Condition,
+    _grace_active,
+    build_verdict,
+)
+from wxverify.worker.processor import _maybe_stamp_runtime_heartbeat
+from wxverify.worker.scheduler import (
+    _DUE_JOB_FAILURE_COOLDOWN,  # noqa: PLC2701
+)
 
 
 async def _idle_worker_async(db: object) -> None:  # keep the real worker idle
@@ -2218,7 +2231,7 @@ def test_db_readable_green_on_healthy_db(
         assert len(db_readable_conds) == 1
 
 
-def test_missing_db_recreation_reports_ok_documented_limitation(
+def test_missing_db_recreation_reports_missing_liveness_documented_limitation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     close_db()
@@ -2248,10 +2261,21 @@ def test_missing_db_recreation_reports_ok_documented_limitation(
                 p.unlink()
         body = client.get("/api/health/monitor").json()
         # Connection layer recreates an empty readable DB via init_db():
-        # db_readable is green and overall is ok. This is the v1 documented
-        # limitation (identity-loss is out of db_readable scope).
+        # db_readable is green. This is the v1 documented limitation
+        # (identity-loss is out of db_readable scope). But the fresh
+        # runtime_state is empty, so main_worker_liveness has no evidence
+        # at all (wording 3) -- in production the real worker's next loop
+        # stamp would clear it, but this test's idle worker stub
+        # (_idle_worker_async) never stamps -- so overall degrades to
+        # warning.
         assert _cond(body, "db_readable")["ok"] is True
-        assert body["overall"] == "ok"
+        liveness = _cond(body, "main_worker_liveness")
+        assert liveness["ok"] is False
+        assert liveness["detail"] == (
+            "main-worker liveness evidence missing:"
+            " no loop stamp, worker start or import time"
+        )
+        assert body["overall"] == "warning"
 
 
 def test_normal_shutdown_cancels_and_awaits_the_boot_warm(
@@ -2375,3 +2399,960 @@ def test_key_missing_weathercom_arm_key_present_negative(
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
         assert _cond(body, "key_missing")["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# obs_collection_delayed (D1.3, plan §14.4)
+#
+# Every case calls build_verdict directly (pipeline_enabled=True,
+# budget_enabled=False, db_enabled=False, now=_OCD_N, export_sweeper_dead=None)
+# against a bare in-memory schema-current connection, so every boundary is
+# exact.
+# ---------------------------------------------------------------------------
+
+_OCD_N = datetime(2026, 9, 24, 12, 0, 0, tzinfo=UTC)
+
+
+def _ocd_t(minutes: float) -> str:
+    return isoformat_utc(_OCD_N + timedelta(minutes=minutes))
+
+
+def _ocd_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    create_schema(conn)
+    return conn
+
+
+def _ocd_station(
+    conn: sqlite3.Connection, site_id: int, *, pws_id: str, enabled: int = 1
+) -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO stations"
+            " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)"
+            " VALUES (?, ?, 40.0, -105.0, 900.0, ?)",
+            (site_id, pws_id, enabled),
+        ).lastrowid
+    )
+
+
+def _ocd_poll_state(
+    conn: sqlite3.Connection,
+    station_id: int,
+    *,
+    next_poll_at: str | None,
+    updated_at: str | None = None,
+    health_state: str = "cold",
+) -> None:
+    if updated_at is None:
+        conn.execute(
+            "INSERT INTO station_poll_state (station_id, next_poll_at, health_state)"
+            " VALUES (?, ?, ?)",
+            (station_id, next_poll_at, health_state),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO station_poll_state"
+            " (station_id, next_poll_at, updated_at, health_state)"
+            " VALUES (?, ?, ?, ?)",
+            (station_id, next_poll_at, updated_at, health_state),
+        )
+
+
+def _ocd_job(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    *,
+    status: str,
+    next_attempt_at: str | None = None,
+    updated_at: str | None = None,
+) -> None:
+    key = f"curobs:{station_id}"
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+        " next_attempt_at, updated_at)"
+        " VALUES ('fetch_current_obs', ?, ?, '{}', ?, ?,"
+        " COALESCE(?, strftime('%Y-%m-%dT%H:%M:%fZ','now')))",
+        (site_id, key, status, next_attempt_at, updated_at),
+    )
+
+
+def _ocd_verdict(
+    conn: sqlite3.Connection, *, now: datetime = _OCD_N, pipeline_enabled: bool = True
+) -> dict[str, object]:
+    return build_verdict(
+        conn,
+        pipeline_enabled=pipeline_enabled,
+        budget_enabled=False,
+        db_enabled=False,
+        now=now,
+        export_sweeper_dead=None,
+    )
+
+
+def _ocd(conn: sqlite3.Connection, *, now: datetime = _OCD_N) -> dict[str, object]:
+    return _cond(_ocd_verdict(conn, now=now), "obs_collection_delayed")
+
+
+def test_ocd_due_16_min_overdue_trips_with_full_detail() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+@pytest.mark.parametrize("order", ["older_station_first", "older_station_second"])
+def test_ocd_oldest_among_two_overdue_selects_the_earlier_effective_time(
+    order: str,
+) -> None:
+    """Two overdue stations at -20 min and -16 min: -20 min is earlier (more
+    overdue), so it must be `oldest` regardless of insertion order.
+
+    Mutant: `effective < oldest` -> `effective > oldest` -- would instead
+    keep the later (-16 min) station as oldest.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    minutes = (-20, -16) if order == "older_station_first" else (-16, -20)
+    station_a = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_a, next_poll_at=_ocd_t(minutes[0]))
+    station_b = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, station_b, next_poll_at=_ocd_t(minutes[1]))
+    cond = _ocd(conn)
+    assert cond["count"] == 2
+    assert f"oldest due {_ocd_t(-20)}" in cond["detail"]
+
+
+def test_ocd_due_exactly_15_min_overdue_trips_at_the_boundary() -> None:
+    """Mutant: `>=` -> `>` on the threshold -- this exact-boundary row would
+    then read ok=True where the correct code trips.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-15))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_due_14_min_overdue_is_not_yet_tripped() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-14))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+    assert "detail" not in cond
+
+
+def test_ocd_pending_deferral_holds_off_the_only_station() -> None:
+    """Mutant: count backoff stations -- this row's station would incorrectly
+    add to `overdue` if the code counted a still-in-backoff station.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(10))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+    assert "detail" not in cond
+
+
+def test_ocd_pending_deferral_itself_becomes_overdue() -> None:
+    """Mutant: exclude backoff stations permanently -- this row would
+    incorrectly read ok=True forever if a backoff station could never
+    graduate into `overdue` once its own deferred time elapses.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-60))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_pending_deferral_not_yet_overdue_itself_stays_ok() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-60))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-14))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_mixed_overdue_and_backoff_detail_counts_both() -> None:
+    """Mutant: drop the backoff suffix -- the detail string would lose its
+    trailing "; N in backoff" clause, differing from this row's expectation.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    backoff_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, backoff_station, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn, site_id, backoff_station, status="pending", next_attempt_at=_ocd_t(10)
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 1 in backoff"
+    )
+
+
+def test_ocd_cooldown_from_recent_failure_suppresses_the_trip() -> None:
+    """Mutant: drop the cooldown term -- without it, this row's due basis
+    (-30) alone is past the 15-min cutoff and would trip.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-30))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-30))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_cooldown_expired_exactly_at_the_threshold_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-90))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-75))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_unparseable_pending_next_attempt_is_ignored() -> None:
+    """Mutant: fail closed on an unparseable pending stamp -- this row would
+    trip if the garbage stamp were treated as overdue instead of ignored.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-10))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at="garbage")
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_unparseable_due_basis_fails_open_to_alerting() -> None:
+    """Mutant: treat an unparseable next_poll_at as not overdue -- this row
+    would read ok=True if the garbage due basis failed closed instead of
+    open; oldest stays "unknown" since a None due never sets `oldest`.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at="not-a-timestamp")
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due unknown; 0 in backoff"
+    )
+
+
+def test_ocd_dead_poller_no_heartbeat_row_still_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    # No runtime_state row at all for current_obs_poller_last_loop_at.
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_fresh_poller_heartbeat_does_not_suppress_the_trip() -> None:
+    """Mutant: read the poller heartbeat -- a fresh heartbeat would then
+    incorrectly hold this row ok=True. Paired with the dead-poller test
+    above: both a missing and a live heartbeat trip identically, which is
+    the point -- this condition reads only schedule/job rows, never the
+    poller's own liveness stamp.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    conn.execute(
+        "INSERT INTO runtime_state (key, value) VALUES"
+        " ('current_obs_poller_last_loop_at', ?)",
+        (isoformat_utc(_OCD_N),),
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_pending_job_never_claimed_still_measures_lateness() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="pending", next_attempt_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_stuck_running_job_does_not_exempt_the_station() -> None:
+    """Mutant: exempt stations with a running job -- this row would read
+    ok=True if a running job suppressed the due-basis lateness.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="running", updated_at=_ocd_t(-20))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+
+
+def test_ocd_disabled_site_excludes_its_station() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn, enabled=0)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_disabled_station_is_excluded() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01", enabled=0)
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_grace_active_reports_ok_with_count_passed_through_no_detail() -> None:
+    conn = _ocd_conn()
+    conn.execute(
+        "INSERT INTO runtime_state (key, value) VALUES ('worker_started_at', ?)",
+        (isoformat_utc(_OCD_N - timedelta(minutes=5)),),
+    )
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 1
+    assert "detail" not in cond
+
+
+def test_ocd_pipeline_disabled_reports_skipped() -> None:
+    conn = _ocd_conn()
+    cond = _ocd(conn, now=_OCD_N)
+    verdict = _ocd_verdict(conn, pipeline_enabled=False)
+    skipped_cond = _cond(verdict, "obs_collection_delayed")
+    assert skipped_cond["skipped"] is True
+    # sanity: with pipeline enabled the same empty DB reports not-skipped.
+    assert cond["skipped"] is False
+
+
+# --- Extra: monitor-side fallbacks, cooldown edges, the constant pin --------
+
+
+def test_ocd_missing_poll_state_row_falls_back_to_station_created_at() -> None:
+    """No station_poll_state row at all: due basis must fall back to the
+    station's own created_at, not to an absent/unparseable value. created_at
+    is set 5 min in the future here -- if the fallback did not reach it, the
+    NULL due basis would instead read as unconditionally overdue.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    conn.execute(
+        "INSERT INTO stations"
+        " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled, created_at)"
+        " VALUES (?, 'ISTATION01', 40.0, -105.0, 900.0, 1, ?)",
+        (site_id, _ocd_t(5)),
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_null_next_poll_at_falls_back_to_poll_state_updated_at() -> None:
+    """next_poll_at is NULL but the station_poll_state row exists: due basis
+    must fall back to that row's updated_at, not skip straight past it to
+    station.created_at. created_at is seeded overdue (-16) and updated_at is
+    seeded not-yet-due (+5) so the two fallbacks diverge.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    conn.execute(
+        "INSERT INTO stations"
+        " (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled, created_at)"
+        " VALUES (?, 'ISTATION01', 40.0, -105.0, 900.0, 1, ?)",
+        (site_id, _ocd_t(-16)),
+    )
+    station_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    _ocd_poll_state(conn, station_id, next_poll_at=None, updated_at=_ocd_t(5))
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_malformed_failure_stamp_is_ignored() -> None:
+    """A garbage failure updated_at must not apply any cooldown: the station
+    is judged on its due basis alone, exactly as if it had never failed.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at="not-a-timestamp")
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_active_job_suppresses_the_failure_cooldown() -> None:
+    """The latest job is 'failed' (recent, still inside its cooldown), but an
+    OLDER job for the same key is still pending/running -- has_active is
+    True, so the cooldown term must be skipped and the station judged on its
+    due basis alone (overdue). Without the `not has_active` guard, the
+    cooldown would hold it ok=True until the cooldown itself elapses.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(conn, site_id, station_id, status="running", updated_at=_ocd_t(-20))
+    _ocd_job(conn, site_id, station_id, status="failed", updated_at=_ocd_t(-5))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_ocd_cooldown_overflow_saturates_to_not_ended() -> None:
+    """A failure stamp so far in the future that stamp + 1h overflows
+    datetime's range must saturate the cooldown end at datetime.max, i.e.
+    "has not ended" -- not raise and not treat the cooldown as expired.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    station_id = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, station_id, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn,
+        site_id,
+        station_id,
+        status="failed",
+        updated_at="9999-12-31T23:30:00Z",
+    )
+    cond = _ocd(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_ocd_cooldown_overflow_station_counts_as_backoff_when_another_trips() -> None:
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overflow_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overflow_station, next_poll_at=_ocd_t(-16))
+    _ocd_job(
+        conn,
+        site_id,
+        overflow_station,
+        status="failed",
+        updated_at="9999-12-31T23:30:00Z",
+    )
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 1 in backoff"
+    )
+
+
+def test_ocd_fresh_pending_station_does_not_inflate_the_backoff_count() -> None:
+    """A station whose due basis is not itself overdue (a fresh pending
+    deferral, both in the future) must not be counted as "in backoff" just
+    because it sits next to a genuinely overdue station.
+    """
+    conn = _ocd_conn()
+    site_id = _seed_site(conn)
+    overdue_station = _ocd_station(conn, site_id, pws_id="ISTATION01")
+    _ocd_poll_state(conn, overdue_station, next_poll_at=_ocd_t(-16))
+    fresh_station = _ocd_station(conn, site_id, pws_id="ISTATION02")
+    _ocd_poll_state(conn, fresh_station, next_poll_at=_ocd_t(30))
+    _ocd_job(conn, site_id, fresh_station, status="pending", next_attempt_at=_ocd_t(35))
+    cond = _ocd(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    assert cond["detail"] == (
+        f"1 stations overdue at least {OBS_COLLECTION_DELAY_MINUTES} min;"
+        f" oldest due {_ocd_t(-16)}; 0 in backoff"
+    )
+
+
+def test_ocd_failure_cooldown_constant_matches_the_schedulers_enqueue_cooldown() -> (
+    None
+):
+    assert _CURRENT_OBS_FAILURE_COOLDOWN == _DUE_JOB_FAILURE_COOLDOWN
+
+
+# ---------------------------------------------------------------------------
+# WL1-WL16 -- main_worker_liveness monitor condition (§14.12, 0.16.3 commit 9).
+# Every case runs on asof_conn() and calls build_verdict with the fixed
+# synthetic _WL_N below. Times are minutes relative to _WL_N, and every
+# seeded stamp is isoformat_utc(_WL_N + offset), matching the plan's W/S/I/C
+# notation.
+# ---------------------------------------------------------------------------
+
+_WL_N = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+
+_WL_WORDING_3 = (
+    "main-worker liveness evidence missing: no loop stamp, worker start or import time"
+)
+
+
+def _wl_stamp(offset_minutes: float) -> str:
+    return isoformat_utc(_WL_N + timedelta(minutes=offset_minutes))
+
+
+def _wl_wording1(offset_minutes: float) -> str:
+    return (
+        "main-worker liveness evidence stale: last loop stamp"
+        f" {_wl_stamp(offset_minutes)};"
+        " no main-lane job claimed since then is running"
+    )
+
+
+def _wl_wording2(offset_minutes: float) -> str:
+    return (
+        "main-worker liveness evidence missing: no loop stamp since worker"
+        f" start or import at {_wl_stamp(offset_minutes)};"
+        " no main-lane job claimed since then is running"
+    )
+
+
+def _wl_seed_w(conn: sqlite3.Connection, offset_minutes: float) -> None:
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES ('worker_started_at', ?)",
+        (_wl_stamp(offset_minutes),),
+    )
+
+
+def _wl_seed_s(conn: sqlite3.Connection, value: str) -> None:
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES ('worker_last_loop_at', ?)",
+        (value,),
+    )
+
+
+def _wl_seed_i(conn: sqlite3.Connection, offset_minutes: float) -> None:
+    conn.execute(
+        """
+        INSERT INTO runtime_state(key, value, updated_at)
+        VALUES ('import_rebuild_state', 'done', ?)
+        """,
+        (_wl_stamp(offset_minutes),),
+    )
+
+
+def _wl_seed_running(
+    conn: sqlite3.Connection, site_id: int, job_type: str, offset_minutes: float
+) -> None:
+    # job_key is nullable (migrations.py), but a synthetic literal keeps the
+    # row self-documenting; the jobs CHECK requires site_id for both types
+    # used here (fetch_obs, fetch_current_obs).
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, status, updated_at)
+        VALUES (?, ?, 'wl-test', 'running', ?)
+        """,
+        (job_type, site_id, _wl_stamp(offset_minutes)),
+    )
+
+
+def _wl_verdict(
+    conn: sqlite3.Connection, *, pipeline_enabled: bool = True
+) -> dict[str, object]:
+    return build_verdict(
+        conn,
+        pipeline_enabled=pipeline_enabled,
+        budget_enabled=False,
+        db_enabled=False,
+        now=_WL_N,
+        export_sweeper_dead=None,
+    )
+
+
+def test_wl1_stale_loop_stamp_trips_wording1_and_degrades_overall() -> None:
+    """W -30, S -16: tripped, wording 1 with <N-16>, no count key, severity
+    warning, group pipeline, and overall degrades to warning -- no site is
+    seeded, so no other pipeline condition trips alongside it.
+
+    Kills: a severity other than warning on this condition (a mutant naming
+    "critical" or "ok" here would fail the severity assertion); count ever
+    populated on this condition (the count assertion would fail).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+    assert "count" not in cond
+    assert cond["severity"] == "warning"
+    assert cond["group"] == "pipeline"
+    assert verdict["overall"] == "warning"
+
+
+def test_wl2_threshold_boundary_at_exactly_15_min_trips() -> None:
+    """W -30, S exactly -15: tripped -- the threshold uses >=, not >.
+
+    Kills: `>` in place of `>=` on the threshold comparison (this exact
+    15-min boundary would read ok instead of tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-15))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+
+
+def test_wl3_just_inside_threshold_reads_ok() -> None:
+    """W -30, S -14: ok -- paired with WL2 so the boundary is pinned from
+    both sides.
+
+    Kills: a mutant that trips whenever no running row is current,
+    regardless of age (this 14-min-old, job-free evidence would flip to
+    tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-14))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl4_running_job_claimed_after_the_stamp_keeps_it_ok() -> None:
+    """W -30, S -16, running fetch_obs C -15: ok, and problem_jobs is ok too
+    (-15 is inside its own 20-min running-arm window).
+
+    Kills: measuring age from max(S, C) instead of from B (S alone) -- C -15
+    is newer than S -16, so such a mutant would measure the age from C and
+    trip at exactly the 15-min threshold, flipping this fixture from ok to
+    tripped.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -15)
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+    assert _cond(verdict, "problem_jobs")["ok"] is True
+
+
+def test_wl4_running_job_claimed_exactly_at_the_stamp_counts_as_current() -> None:
+    """W -30, S -16, running fetch_obs C -16 (C equals B, and B is already
+    stale): ok, with no detail.
+
+    Kills: `>` in place of `>=` on the current-row test (C >= B) -- this C
+    equals B exactly, so such a mutant would read this running row as not
+    current and trip on the stale S, same as WL6.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -16)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl5_current_job_older_than_stuck_window_stays_ok_here() -> None:
+    """W -60, S -40, running fetch_obs C -39: ok here; problem_jobs trips
+    instead -- a wedge inside a job stays with the running arm, not this
+    condition.
+
+    Kills: a staleness cap on a current row, such as requiring
+    `now - C < 20 min` (this C is 39 min old, so such a cap would flip this
+    condition to tripped AND double-report the wedge in problem_jobs too).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-40))
+    _wl_seed_running(conn, site_id, "fetch_obs", -39)
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+    assert _cond(verdict, "problem_jobs")["ok"] is False
+
+
+def test_wl6_running_row_claimed_before_the_last_stamp_is_abandoned() -> None:
+    """W -60, S -16, running fetch_obs C -20 (claimed before the last
+    stamp): tripped, wording 1 with <N-16> -- an abandoned row claimed
+    before B cannot mask the condition.
+
+    Kills: counting every running row as current, dropping C >= B (this C
+    is older than B, so such a mutant would read ok instead of tripped).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -20)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+
+
+def test_wl7_loop_stamp_older_than_import_falls_back_to_wording2() -> None:
+    """W -60, S -40, I -20, running fetch_obs C -30 (an exporter's row):
+    tripped, wording 2 with <N-20> -- S is older than F, so it is ignored
+    and the basis falls back to F=I.
+
+    Kills: leaving I out of F (B would fall back to S at -40 instead, and
+    C -30 >= -40, so this fixture would read ok); using S even when it is
+    older than F (B would then be S -40, and C -30 >= -40, so this fixture
+    would read ok).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-40))
+    _wl_seed_i(conn, -20)
+    _wl_seed_running(conn, site_id, "fetch_obs", -30)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl8_running_current_obs_poller_row_never_counts_as_current() -> None:
+    """W -60, S -16, running fetch_current_obs C -1, and a fresh poller
+    heartbeat at N: tripped, wording 1 with <N-16> -- the poller lane's
+    running row and heartbeat are outside this condition's evidence.
+
+    Kills: dropping the lane filter from the jobs arm, so a poller row
+    counts as current (this C -1 is well inside B -16, so such a mutant
+    would read ok instead of tripped); reading the poller heartbeat into B
+    (the fresh N-stamped poller heartbeat would then read ok).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_current_obs", -1)
+    conn.execute(
+        "INSERT INTO runtime_state(key, value)"
+        " VALUES ('current_obs_poller_last_loop_at', ?)",
+        (_wl_stamp(0),),
+    )
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+
+
+def test_wl9_start_only_with_no_loop_stamp_trips_wording2() -> None:
+    """W -20 only: tripped, wording 2 with <N-20>.
+
+    Kills: treating missing evidence as ok (this fixture has W but no S,
+    C, or I, and would read ok under such a mutant); B = S* only, ignoring
+    F (with no S at all, B would be None here, giving wording 3 instead of
+    wording 2).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl10_loop_stamp_older_than_start_is_ignored() -> None:
+    """W -20, S -30 (a stamp from before this start): tripped, wording 2
+    with <N-20> -- S older than F is not S*, so the basis falls back to F.
+
+    Kills: using S even when it is older than F (would give wording 1 with
+    <N-30> instead of wording 2 with <N-20>).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    _wl_seed_s(conn, _wl_stamp(-30))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl11_unparseable_loop_stamp_is_missing_evidence_not_an_escaped_error() -> None:
+    """W -20, S 'garbage': tripped, wording 2 with <N-20>, and build_verdict
+    returns normally -- an unparseable stamp becomes missing evidence, not
+    a raised ValueError.
+
+    Kills: letting parse_utc's ValueError escape the helper (calling
+    _wl_verdict itself would raise instead of returning a verdict).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    _wl_seed_s(conn, "garbage")
+    verdict = _wl_verdict(conn)  # must not raise
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl12_no_evidence_at_all_trips_wording3() -> None:
+    """Nothing seeded: tripped, wording 3 exactly.
+
+    Kills: treating missing evidence as ok (an empty runtime_state and no
+    running rows would read ok under such a mutant).
+    """
+    conn = asof_conn()
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _WL_WORDING_3
+
+
+def test_wl13_fresh_start_inside_15_min_reads_ok() -> None:
+    """W -14 only (a fresh start; grace ended at -4): ok.
+
+    Kills: B = S* only, ignoring F (with no S, B would be None here, which
+    is always tripped -- this fixture would flip from ok to tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -14)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl14_skipped_when_pipeline_disabled() -> None:
+    """pipeline_enabled=False: main_worker_liveness is present with
+    skipped True.
+
+    Kills: omitting the id from the skipped tuple (the id would be absent
+    from the verdict's conditions entirely, and _cond would raise
+    StopIteration instead of returning a skipped condition).
+    """
+    conn = asof_conn()
+    cond = _cond(_wl_verdict(conn, pipeline_enabled=False), "main_worker_liveness")
+    assert cond["skipped"] is True
+    assert cond["ok"] is True
+
+
+def test_wl15_evidence_is_read_in_exactly_one_statement() -> None:
+    """WL1's seed, traced with set_trace_callback around build_verdict:
+    exactly one traced statement contains 'worker_last_loop_at', and that
+    statement also contains 'worker_started_at', 'import_rebuild_state' and
+    'FROM jobs' -- confirming the one-snapshot compound read.
+
+    Kills: reading the evidence in two statements (a second, separate read
+    naming 'worker_last_loop_at' would make the match count 2, or split the
+    four substrings across two different statements).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        _wl_verdict(conn)
+    finally:
+        conn.set_trace_callback(None)
+    matches = [s for s in statements if "worker_last_loop_at" in s]
+    assert len(matches) == 1
+    (statement,) = matches
+    assert "worker_started_at" in statement
+    assert "import_rebuild_state" in statement
+    assert "FROM jobs" in statement
+
+
+def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A heartbeat write failure (tests/test_m1_m5.py:398-428's pattern)
+    logs the ERROR and returns `now` unchanged, leaving S exactly where it
+    was: build_verdict then reports wording 1 with <N-16>, never a "hung"
+    claim.
+
+    Kills: the heartbeat's failure path writing a fallback stamp by another
+    route (S would move, and the verdict would read ok instead of tripped);
+    wording that says the worker is hung (the exact-text assertion below).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    conn.commit()
+
+    def _fail_heartbeat(_conn: sqlite3.Connection, key: str) -> None:
+        raise sqlite3.OperationalError("synthetic heartbeat failure")
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.set_runtime_state_now", _fail_heartbeat
+    )
+
+    class FakeDb:
+        async def write(self, fn):  # type: ignore[no-untyped-def]
+            return fn(conn)
+
+    result = asyncio.run(
+        _maybe_stamp_runtime_heartbeat(
+            FakeDb(),  # type: ignore[arg-type]
+            "worker_last_loop_at",
+            0.0,
+            1234.0,
+        )
+    )
+
+    assert result == 1234.0
+    assert any(
+        r.levelno == logging.ERROR
+        and r.getMessage() == "runtime heartbeat write failed key=worker_last_loop_at"
+        for r in caplog.records
+    )
+    row = conn.execute(
+        "SELECT value FROM runtime_state WHERE key = 'worker_last_loop_at'"
+    ).fetchone()
+    assert row["value"] == _wl_stamp(-16)
+
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+    assert "hung" not in cond["detail"]

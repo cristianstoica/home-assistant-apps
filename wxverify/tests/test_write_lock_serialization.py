@@ -218,13 +218,30 @@ def _claim_once(job: Job) -> Any:
     return _claim
 
 
+async def _idle_poller(db: object, *, run_job: object) -> None:
+    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    await asyncio.Event().wait()
+
+
 def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Silence heartbeats, scheduler, and purge in worker loop tests.
+
+    Also idles the current-obs lane (plan §6.3.6): the one caller of this
+    helper (E4) pins an exact mid-run crash/retry sequence and an exact
+    ``score_cache`` row count via a patched ``claim_next_job``. A real
+    current-obs lane running concurrently against the same real ``db``
+    would add unrelated claim/write activity this test never seeded for
+    and was never written to tolerate.
+    """
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
+    )
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _idle_poller
     )
 
 

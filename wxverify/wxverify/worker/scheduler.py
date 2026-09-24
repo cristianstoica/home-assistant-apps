@@ -60,7 +60,6 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
-    _enqueue_due_current_obs(conn)
     _enqueue_due_forecast_records(conn)
     _enqueue_due_verification_runs(conn)
 
@@ -357,14 +356,21 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
             )
 
 
-def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
+def enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
+    """Enqueue a ``fetch_current_obs`` job for every due, enabled station.
+
+    Runs inside the current-obs lane's claim transaction
+    (worker.current_obs_poller), not in ``scheduler_tick``.
+    """
     now = isoformat_utc()
     rows = conn.execute(
         """
-        SELECT st.id, st.site_id, st.pws_station_id
+        SELECT st.id, st.site_id, st.pws_station_id, s.id AS site_row
         FROM stations st
+        LEFT JOIN sites s ON s.id = st.site_id
         LEFT JOIN station_poll_state sps ON sps.station_id = st.id
         WHERE st.enabled = 1
+          AND (s.id IS NULL OR s.enabled = 1)
           AND (sps.next_poll_at IS NULL OR sps.next_poll_at <= ?)
         """,
         (now,),
@@ -380,6 +386,13 @@ def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
             # site now owns that id. Every other station still runs.
             logger.warning(
                 "scheduler: unreadable site_id station=%s; skipping station this tick",
+                station_id,
+            )
+            continue
+        if row["site_row"] is None:
+            logger.warning(
+                "scheduler: station=%s references a missing site; "
+                "skipping station this tick",
                 station_id,
             )
             continue

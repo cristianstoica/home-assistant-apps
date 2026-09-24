@@ -453,14 +453,14 @@ usual skill ranking and blend depth decide which ones are used. The reasons
 above why a feed can lack some of `Today`'s hours apply to rain too.
 
 The row then shows the day's rainfall and its number of wet hours, each
-averaged across those feeds, for example `3.1 mm · ~5 h wet`. The rainfall is
-shown to one decimal place and the wet hours are rounded to a whole number,
-hence the `~`. An hour is wet when its forecast rain is at or above the site's
-`rain_threshold_mm`; exactly at the threshold counts, and rain need not fall
-for the whole hour. A rain-cloud symbol follows when the row shows `~6 h wet`
-or more. The rain bars on the day's hourly chart come from the same feeds, so
-they add up to the tile's total before it is rounded for display;
-`Show individual feeds` still shows every selected feed.
+averaged across those feeds, for example `3.1 mm · 5 h`. The rainfall is shown
+to one decimal place and the wet hours are rounded to a whole number. An hour
+is wet when its forecast rain is at or above the site's `rain_threshold_mm`;
+exactly at the threshold counts, and rain need not fall for the whole hour. A
+rain-cloud symbol follows when the row shows `6 h` or more. The rain bars on
+the day's hourly chart come from the same feeds, so they add up to the tile's
+total before it is rounded for display; `Show individual feeds` still shows
+every selected feed.
 
 When feeds have rain forecasts for the day but none qualifies, the row reads
 `Daily rainfall unavailable — partial coverage` and the hourly chart has no

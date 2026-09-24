@@ -7,7 +7,7 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import cast
+from typing import Final, cast
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 
@@ -245,7 +245,35 @@ def enqueue_if_absent_with_cooldown(
     )
 
 
+# The claim partition: each lane's claim splices one of these clauses into the
+# pending-row subselect. Both are built only from string literals. The main
+# lane's type set has exactly one definition, MAIN_LANE_TYPE_SQL; it is the
+# complement of the current-obs lane, so every other row -- including one
+# whose type bypassed the table CHECK -- lands in the main lane. The unary
+# ``+`` keeps the planner off idx_jobs_type_key_site, whose cost grows with
+# the stored fetch_current_obs rows, so both claims keep today's plan.
+MAIN_LANE_TYPE_SQL: Final = "type IS NOT 'fetch_current_obs'"
+_MAIN_LANE_CLAUSE: Final = "AND " + MAIN_LANE_TYPE_SQL
+_CURRENT_OBS_LANE_CLAUSE: Final = "AND +type = 'fetch_current_obs'"
+
+
 def claim_next_job(conn: sqlite3.Connection) -> Job | None:
+    """Claim one pending main-lane job: any type but ``fetch_current_obs``.
+
+    See ``_claim`` for the claim order and the unreadable-row disposition.
+    """
+    return _claim(conn, _MAIN_LANE_CLAUSE)
+
+
+def claim_next_current_obs_job(conn: sqlite3.Connection) -> Job | None:
+    """Claim one pending ``fetch_current_obs`` job for the current-obs lane.
+
+    See ``_claim`` for the claim order and the unreadable-row disposition.
+    """
+    return _claim(conn, _CURRENT_OBS_LANE_CLAUSE)
+
+
+def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
     """Claim and disposition exactly one pending row.
 
     Design goal: no unreadable row may ever be re-claimed. An unreadable
@@ -260,18 +288,19 @@ def claim_next_job(conn: sqlite3.Connection) -> Job | None:
     and the resumable chain chunks (``verification_run`` /
     ``timezone_correction``) claim LAST -- each chunk re-enqueues its own
     continuation, so under plain FIFO a long chain would monopolize the
-    single worker and starve record derivation; the tier lets other work
-    interleave between chunks by construction.
+    single main worker lane and starve record derivation; the tier lets
+    other work interleave between chunks by construction.
     """
     now = isoformat_utc()
     row = conn.execute(
-        """
+        f"""
         UPDATE jobs
         SET status = 'running', updated_at = ?
         WHERE id = (
             SELECT id FROM jobs
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+              {type_clause}
             ORDER BY
                 CASE
                     WHEN type IN ('forecast_record','record_gap_scan') THEN 0
