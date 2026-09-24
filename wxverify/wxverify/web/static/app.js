@@ -749,8 +749,8 @@
     });
   });
 
-  // "Updated X ago" stays honest between polls: the tiles fragment answers
-  // 204 (no swap) while data is unchanged, so the text is re-derived
+  // "Last fetched X ago" stays honest between polls: the tiles fragment
+  // answers 204 (no swap) while data is unchanged, so the text is re-derived
   // client-side from the data-updated-at timestamp once a minute.
   function refreshRelativeTimes() {
     document.querySelectorAll("[data-updated-at]").forEach(function (el) {
@@ -769,7 +769,7 @@
       } else {
         text = Math.floor(seconds / 86400) + " d ago";
       }
-      el.textContent = "Updated " + text;
+      el.textContent = "Last fetched: " + text;
     });
   }
   setInterval(refreshRelativeTimes, 60000);

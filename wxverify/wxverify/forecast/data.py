@@ -296,19 +296,58 @@ def _fetch_state(
 
 
 def samples_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
-    """Monotonic change token for the auto-poll: MAX(rowid) of site samples.
+    """Monotonic change token for a site's stored samples: MAX(rowid).
 
     Inserting a previously absent sample key (the unique key includes
     ``issued_at``) advances the fingerprint. A fetch whose samples are all
     already stored inserts nothing and leaves it unchanged, which is correct
-    because nothing stored changed. An unchanged fingerprint lets the tiles
-    fragment answer 204 and leave the open drill-down untouched.
+    because nothing stored changed. The tiles auto-poll reads it through
+    :func:`forecast_fingerprint`, which also follows the fetch stamps.
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS fp FROM forecast_samples WHERE site_id = ?",
         (site_id,),
     ).fetchone()
     return str(int(row["fp"]))
+
+
+def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
+    """Change token for the tiles auto-poll: samples plus usable-fetch stamps.
+
+    A fetch whose samples are all already stored leaves
+    :func:`samples_fingerprint` unchanged but advances the evidence feed's
+    ``site_feed_state.last_usable_fetch_at``, which moves the "Last fetched"
+    label and the stale badges. The token is ``"<samples>-<total>"``, where
+    ``total`` sums the whole-second POSIX times of the site's stamps that are
+    text and parse; the rest are skipped. The writer sets a stamp to its
+    fetch's ``fetched_at`` without forcing it forward, so the sum changes when
+    one stamp moves to another whole second, though stamps moving in opposite
+    directions can cancel out; a move within the same whole second changes
+    neither the token nor the whole-second "Last fetched" label. With no
+    parseable stamp the token is :func:`samples_fingerprint` alone, so a site
+    with no samples and no stamps stays ``"0"``. An unchanged token lets the
+    tiles fragment answer 204 and leave the open drill-down untouched.
+    """
+    samples = samples_fingerprint(conn, site_id=site_id)
+    rows = conn.execute(
+        "SELECT last_usable_fetch_at FROM site_feed_state WHERE site_id = ?",
+        (site_id,),
+    ).fetchall()
+    total = 0
+    parsed_any = False
+    for row in rows:
+        raw_stamp: object = row["last_usable_fetch_at"]
+        if not isinstance(raw_stamp, str):
+            continue
+        try:
+            fetched = parse_utc(raw_stamp)
+        except ValueError:
+            continue
+        total += int(fetched.timestamp())
+        parsed_any = True
+    if not parsed_any:
+        return samples
+    return f"{samples}-{total}"
 
 
 def forecast_ranking(

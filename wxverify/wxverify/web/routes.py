@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
 from wxverify.db.connection import get_db
-from wxverify.forecast.data import samples_fingerprint
+from wxverify.forecast.data import forecast_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.settings.depth import effective_blend_depths
@@ -95,23 +95,27 @@ async def forecast_page(request: Request, site: int | None = None) -> HTMLRespon
 async def forecast_tiles(
     request: Request, site: int, fingerprint: str = ""
 ) -> Response:
-    """Auto-poll target: 204 (no swap) unless newer samples have landed.
+    """Auto-poll target: 204 (no swap) unless the site's forecast fingerprint moved.
 
-    The fingerprint is computed BEFORE the view is built. It is a single
-    MAX(id) over the site's samples and is the same value the full build would
-    have reported, so an unchanged fingerprint is answered without paying for a
-    build whose result would be discarded. On a 204 htmx leaves the DOM
+    The fingerprint is computed BEFORE the view is built. It is
+    :func:`forecast_fingerprint`, which moves when a new sample is stored for
+    the site or one of its last-usable-fetch stamps moves to another whole
+    second. A stamp move within the same second leaves it unchanged, and stamp
+    moves in opposite directions can cancel out. Unless a write commits
+    between the request's reads, it is the same value the full build would
+    have reported, so an unchanged fingerprint is answered without paying for
+    a build whose result would be discarded. On a 204 htmx leaves the DOM
     untouched -- including the hx-get that carries the old fingerprint, which
-    stays correct precisely because nothing changed. When the data did change,
-    the outerHTML swap replaces only #forecast-tiles, so an open day detail (a
-    sibling element) is left intact across a tile poll.
+    retains the token for subsequent comparisons. When a changed fingerprint
+    causes a rebuild, the outerHTML swap replaces only #forecast-tiles, so an
+    open day detail (a sibling element) is left intact across a tile poll.
     """
 
     def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
         site_view = _resolve_site(conn, site)
         if site_view is None:
             return None
-        if samples_fingerprint(conn, site_id=site_view.id) == fingerprint:
+        if forecast_fingerprint(conn, site_id=site_view.id) == fingerprint:
             return None
         return _load_forecast_context(conn, site)
 

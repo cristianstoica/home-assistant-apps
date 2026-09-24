@@ -6,7 +6,7 @@
   {% if view.empty %}
     <p class="empty">Still collecting forecasts — check back shortly.</p>
   {% else %}
-    <p class="muted forecast-updated" data-updated-at="{{ view.updated_at }}">Updated {{ view.updated_ago }}</p>
+    <p class="muted forecast-updated" {% if view.updated_at %}data-updated-at="{{ view.updated_at }}" {% endif %}title="When the app last downloaded forecasts.">Last fetched: {{ view.updated_ago or "unknown" }}</p>
     <div class="tile-grid">
       {% for tile in view.tiles %}
         <article class="tile state-{{ tile.state }}">

@@ -38,12 +38,13 @@ from wxverify.forecast.aggregate import (
     fixed_membership_series,
 )
 from wxverify.forecast.data import (
+    FeedFreshness,
     ForecastRanking,
     FutureSampleRow,
+    forecast_fingerprint,
     forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
-    samples_fingerprint,
 )
 from wxverify.forecast.selection import (
     CellCandidate,
@@ -193,7 +194,7 @@ def build_forecast(
         site_id=site_id,
         since_valid_at=isoformat_utc(local_day_start(at, timezone)),
     )
-    fingerprint = samples_fingerprint(conn, site_id=site_id)
+    fingerprint = forecast_fingerprint(conn, site_id=site_id)
     if not samples:
         return ForecastView(
             empty=True,
@@ -246,14 +247,51 @@ def build_forecast(
                 rain_threshold_mm=rain_threshold_mm,
             )
         )
-    updated_at = max(sample.issued_at for sample in samples)
+    updated_at = _last_fetched_at(tiles, freshness)
     return ForecastView(
         empty=False,
         tiles=tiles,
         updated_at=updated_at,
-        updated_ago=relative_ago(updated_at, now=at),
+        updated_ago=None if updated_at is None else relative_ago(updated_at, now=at),
         fingerprint=fingerprint,
     )
+
+
+def _last_fetched_at(
+    tiles: list[DayTile], freshness: dict[int, FeedFreshness]
+) -> str | None:
+    """The "Last fetched" instant: the newest usable-fetch stamp on the page.
+
+    Takes the union of ``contributor_ids`` over every populated cell of every
+    tile and maps each feed to its evidence feed's ``last_usable_fetch_at``
+    through ``freshness``. Stamps that do not parse are skipped. Stamps are
+    compared as parsed instants, never as strings: ``isoformat_utc`` omits the
+    fraction at microsecond 0 and ``'.' < 'Z'``. The newest is returned as a
+    whole-second ``isoformat_utc`` stamp, which the browser's ``Date.parse``
+    reads as-is; ``None`` when no stamp parses.
+    """
+    contributor_ids = {
+        feed_id
+        for tile in tiles
+        for meta in (tile.temp.meta, tile.wind.meta, tile.precip.meta)
+        if meta.available
+        for feed_id in meta.contributor_ids
+    }
+    newest: datetime | None = None
+    for feed_id in contributor_ids:
+        row = freshness.get(feed_id)
+        stamp = None if row is None else row.last_usable_fetch_at
+        if stamp is None:
+            continue
+        try:
+            fetched = parse_utc(stamp)
+        except ValueError:
+            continue
+        if newest is None or fetched > newest:
+            newest = fetched
+    if newest is None:
+        return None
+    return isoformat_utc(newest.replace(microsecond=0))
 
 
 def build_hourly(
@@ -424,7 +462,7 @@ def _any_rebuilding(
 
 
 def relative_ago(timestamp: str, *, now: datetime) -> str:
-    """Human 'Updated X ago' text for a UTC ISO timestamp."""
+    """Human "X ago" text for the "Last fetched" label, from a UTC ISO stamp."""
     seconds = (now - parse_utc(timestamp)).total_seconds()
     if seconds < 60:
         return "just now"
