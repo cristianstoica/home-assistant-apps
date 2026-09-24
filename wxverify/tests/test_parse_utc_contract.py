@@ -131,5 +131,6 @@ def test_monitor_route_survives_boundary_offset_worker_started_at(
             "fetch_feed_live",
             "pair_score_live",
             "problem_jobs",
+            "main_worker_liveness",
         ):
             assert cond_id in ids

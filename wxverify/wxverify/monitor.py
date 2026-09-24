@@ -21,6 +21,7 @@ from wxverify.collection.budget import current_billing_day
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.db.queue import MAIN_LANE_TYPE_SQL
 from wxverify.verification.record import (
     gap_scan_degraded_sites,
     sites_with_record_gap,
@@ -35,6 +36,7 @@ PAIR_SCORE_LIVE_HOURS = 12
 FAILED_JOB_AGE_HOURS = 48
 STUCK_RUNNING_MINUTES = 20
 PENDING_OVERDUE_MINUTES = 15
+MAIN_WORKER_LIVENESS_MINUTES: Final = 15
 OBS_COLLECTION_DELAY_MINUTES: Final = 15
 GRACE_MINUTES = 10
 COSTED_NOOP_MIN_ERRORS = 3
@@ -266,6 +268,110 @@ def _obs_collection_delays(
     return (overdue, in_backoff, oldest)
 
 
+# The main lane's liveness evidence, read in ONE compound statement so every
+# value comes from one read snapshot: with two reads, a long job could finish
+# between them, and a pre-job loop stamp would pair with no running row -- a
+# trip on a healthy lane. Each runtime_state row is ('state', key, value,
+# updated_at); each running main-lane row is ('job', NULL, NULL, updated_at).
+# The lane filter is the claim partition's own MAIN_LANE_TYPE_SQL, so a
+# running fetch_current_obs row never counts, and the poller heartbeat is not
+# read.
+_LIVENESS_EVIDENCE_SQL: Final = f"""
+    SELECT 'state', key, value, updated_at FROM runtime_state
+     WHERE key IN ('worker_started_at', 'worker_last_loop_at', 'import_rebuild_state')
+    UNION ALL
+    SELECT 'job', NULL, NULL, updated_at FROM jobs
+     WHERE status = 'running' AND {MAIN_LANE_TYPE_SQL}
+"""
+
+
+@dataclass(frozen=True)
+class _LivenessEvidence:
+    started: datetime | None  # W: worker_started_at's value
+    import_changed: datetime | None  # I: import_rebuild_state's updated_at
+    last_loop: datetime | None  # S: worker_last_loop_at's value
+    running_claims: tuple[datetime, ...]  # C: running main-lane rows' updated_at
+
+
+def _main_liveness_evidence(conn: sqlite3.Connection) -> _LivenessEvidence:
+    """Read the main lane's liveness evidence with ``_LIVENESS_EVIDENCE_SQL``.
+
+    Rows are read by position, so tuple rows and ``sqlite3.Row`` both work.
+    Every value goes through ``_parse_or_none``, so a missing or unparseable
+    stamp is ``None``, and a running row whose ``updated_at`` does not parse
+    is left out of ``running_claims`` (fail toward alerting). A
+    ``sqlite3.Error`` is not caught: ``build_verdict`` reports it as
+    ``db_readable`` false.
+    """
+    started: datetime | None = None
+    import_changed: datetime | None = None
+    last_loop: datetime | None = None
+    running_claims: list[datetime] = []
+    for row in conn.execute(_LIVENESS_EVIDENCE_SQL):
+        if row[0] == "job":
+            claimed = _parse_or_none(row[3])
+            if claimed is not None:
+                running_claims.append(claimed)
+        elif row[1] == "worker_started_at":
+            started = _parse_or_none(row[2])
+        elif row[1] == "worker_last_loop_at":
+            last_loop = _parse_or_none(row[2])
+        elif row[1] == "import_rebuild_state":
+            import_changed = _parse_or_none(row[3])
+    return _LivenessEvidence(
+        started=started,
+        import_changed=import_changed,
+        last_loop=last_loop,
+        running_claims=tuple(running_claims),
+    )
+
+
+def _main_liveness_check(
+    evidence: _LivenessEvidence, now: datetime
+) -> tuple[bool, str]:
+    """``(tripped, detail)`` for ``main_worker_liveness``; pure, no I/O.
+
+    F is the later parseable of the worker start and the last import state
+    change. S* is the loop stamp if it parses and is not older than F, and
+    the basis B is S*, else F. A running main-lane row is current if it was
+    claimed at or after B, with no upper cap: how long a job may run is for
+    the running arm of ``problem_jobs`` to judge. Tripped when B is missing,
+    or when B is at least ``MAIN_WORKER_LIVENESS_MINUTES`` old and no
+    running row is current. Evidence in the future is not clamped, so it
+    reads ok. The detail says which evidence is stale or missing; it never
+    says the worker is hung, since a lane whose stamp write fails may still
+    be running jobs.
+    """
+    floor = max(
+        (t for t in (evidence.started, evidence.import_changed) if t is not None),
+        default=None,
+    )
+    last_loop = evidence.last_loop
+    if last_loop is not None and (floor is None or last_loop >= floor):
+        basis = last_loop
+        detail = (
+            "main-worker liveness evidence stale: last loop stamp"
+            f" {isoformat_utc(last_loop)};"
+            " no main-lane job claimed since then is running"
+        )
+    elif floor is not None:
+        basis = floor
+        detail = (
+            "main-worker liveness evidence missing: no loop stamp since worker"
+            f" start or import at {isoformat_utc(floor)};"
+            " no main-lane job claimed since then is running"
+        )
+    else:
+        return (
+            True,
+            "main-worker liveness evidence missing:"
+            " no loop stamp, worker start or import time",
+        )
+    current = any(claimed >= basis for claimed in evidence.running_claims)
+    stale = now - basis >= timedelta(minutes=MAIN_WORKER_LIVENESS_MINUTES)
+    return (stale and not current, detail)
+
+
 def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
     row = conn.execute(
         """
@@ -441,6 +547,16 @@ def _pipeline_conditions(
         "unknown" if collection_oldest is None else isoformat_utc(collection_oldest)
     )
 
+    # main_worker_liveness: the main lane's loop stamp is at least
+    # MAIN_WORKER_LIVENESS_MINUTES old and no main-lane job claimed since it
+    # is still running. That can indicate a loop stalled between jobs, which
+    # leaves no row running for problem_jobs to see; a wedge inside a job
+    # stays with the running arm above. The main lane only: the poller lane is
+    # covered by obs_collection_delayed.
+    liveness_tripped, liveness_detail = _main_liveness_check(
+        _main_liveness_evidence(conn), now
+    )
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -529,6 +645,7 @@ def _pipeline_conditions(
             f" oldest due {collection_oldest_text};"
             f" {collection_backoff_n} in backoff",
         ),
+        _cond("main_worker_liveness", liveness_tripped, None, liveness_detail),
     ]
 
 
@@ -763,6 +880,7 @@ def build_verdict(
                 "record_gap_scan_degraded",
                 "obs_station_history_failing",
                 "obs_collection_delayed",
+                "main_worker_liveness",
             )
         )
 

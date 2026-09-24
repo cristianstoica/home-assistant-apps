@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import asof_conn, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import (
@@ -25,6 +27,7 @@ from wxverify.monitor import (
     _grace_active,
     build_verdict,
 )
+from wxverify.worker.processor import _maybe_stamp_runtime_heartbeat
 from wxverify.worker.scheduler import (
     _DUE_JOB_FAILURE_COOLDOWN,  # noqa: PLC2701
 )
@@ -2228,7 +2231,7 @@ def test_db_readable_green_on_healthy_db(
         assert len(db_readable_conds) == 1
 
 
-def test_missing_db_recreation_reports_ok_documented_limitation(
+def test_missing_db_recreation_reports_missing_liveness_documented_limitation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     close_db()
@@ -2258,10 +2261,21 @@ def test_missing_db_recreation_reports_ok_documented_limitation(
                 p.unlink()
         body = client.get("/api/health/monitor").json()
         # Connection layer recreates an empty readable DB via init_db():
-        # db_readable is green and overall is ok. This is the v1 documented
-        # limitation (identity-loss is out of db_readable scope).
+        # db_readable is green. This is the v1 documented limitation
+        # (identity-loss is out of db_readable scope). But the fresh
+        # runtime_state is empty, so main_worker_liveness has no evidence
+        # at all (wording 3) -- in production the real worker's next loop
+        # stamp would clear it, but this test's idle worker stub
+        # (_idle_worker_async) never stamps -- so overall degrades to
+        # warning.
         assert _cond(body, "db_readable")["ok"] is True
-        assert body["overall"] == "ok"
+        liveness = _cond(body, "main_worker_liveness")
+        assert liveness["ok"] is False
+        assert liveness["detail"] == (
+            "main-worker liveness evidence missing:"
+            " no loop stamp, worker start or import time"
+        )
+        assert body["overall"] == "warning"
 
 
 def test_normal_shutdown_cancels_and_awaits_the_boot_warm(
@@ -2913,3 +2927,432 @@ def test_ocd_failure_cooldown_constant_matches_the_schedulers_enqueue_cooldown()
     None
 ):
     assert _CURRENT_OBS_FAILURE_COOLDOWN == _DUE_JOB_FAILURE_COOLDOWN
+
+
+# ---------------------------------------------------------------------------
+# WL1-WL16 -- main_worker_liveness monitor condition (§14.12, 0.16.3 commit 9).
+# Every case runs on asof_conn() and calls build_verdict with the fixed
+# synthetic _WL_N below. Times are minutes relative to _WL_N, and every
+# seeded stamp is isoformat_utc(_WL_N + offset), matching the plan's W/S/I/C
+# notation.
+# ---------------------------------------------------------------------------
+
+_WL_N = datetime(2026, 1, 15, 12, 0, tzinfo=UTC)
+
+_WL_WORDING_3 = (
+    "main-worker liveness evidence missing: no loop stamp, worker start or import time"
+)
+
+
+def _wl_stamp(offset_minutes: float) -> str:
+    return isoformat_utc(_WL_N + timedelta(minutes=offset_minutes))
+
+
+def _wl_wording1(offset_minutes: float) -> str:
+    return (
+        "main-worker liveness evidence stale: last loop stamp"
+        f" {_wl_stamp(offset_minutes)};"
+        " no main-lane job claimed since then is running"
+    )
+
+
+def _wl_wording2(offset_minutes: float) -> str:
+    return (
+        "main-worker liveness evidence missing: no loop stamp since worker"
+        f" start or import at {_wl_stamp(offset_minutes)};"
+        " no main-lane job claimed since then is running"
+    )
+
+
+def _wl_seed_w(conn: sqlite3.Connection, offset_minutes: float) -> None:
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES ('worker_started_at', ?)",
+        (_wl_stamp(offset_minutes),),
+    )
+
+
+def _wl_seed_s(conn: sqlite3.Connection, value: str) -> None:
+    conn.execute(
+        "INSERT INTO runtime_state(key, value) VALUES ('worker_last_loop_at', ?)",
+        (value,),
+    )
+
+
+def _wl_seed_i(conn: sqlite3.Connection, offset_minutes: float) -> None:
+    conn.execute(
+        """
+        INSERT INTO runtime_state(key, value, updated_at)
+        VALUES ('import_rebuild_state', 'done', ?)
+        """,
+        (_wl_stamp(offset_minutes),),
+    )
+
+
+def _wl_seed_running(
+    conn: sqlite3.Connection, site_id: int, job_type: str, offset_minutes: float
+) -> None:
+    # job_key is nullable (migrations.py), but a synthetic literal keeps the
+    # row self-documenting; the jobs CHECK requires site_id for both types
+    # used here (fetch_obs, fetch_current_obs).
+    conn.execute(
+        """
+        INSERT INTO jobs (type, site_id, job_key, status, updated_at)
+        VALUES (?, ?, 'wl-test', 'running', ?)
+        """,
+        (job_type, site_id, _wl_stamp(offset_minutes)),
+    )
+
+
+def _wl_verdict(
+    conn: sqlite3.Connection, *, pipeline_enabled: bool = True
+) -> dict[str, object]:
+    return build_verdict(
+        conn,
+        pipeline_enabled=pipeline_enabled,
+        budget_enabled=False,
+        db_enabled=False,
+        now=_WL_N,
+        export_sweeper_dead=None,
+    )
+
+
+def test_wl1_stale_loop_stamp_trips_wording1_and_degrades_overall() -> None:
+    """W -30, S -16: tripped, wording 1 with <N-16>, no count key, severity
+    warning, group pipeline, and overall degrades to warning -- no site is
+    seeded, so no other pipeline condition trips alongside it.
+
+    Kills: a severity other than warning on this condition (a mutant naming
+    "critical" or "ok" here would fail the severity assertion); count ever
+    populated on this condition (the count assertion would fail).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+    assert "count" not in cond
+    assert cond["severity"] == "warning"
+    assert cond["group"] == "pipeline"
+    assert verdict["overall"] == "warning"
+
+
+def test_wl2_threshold_boundary_at_exactly_15_min_trips() -> None:
+    """W -30, S exactly -15: tripped -- the threshold uses >=, not >.
+
+    Kills: `>` in place of `>=` on the threshold comparison (this exact
+    15-min boundary would read ok instead of tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-15))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+
+
+def test_wl3_just_inside_threshold_reads_ok() -> None:
+    """W -30, S -14: ok -- paired with WL2 so the boundary is pinned from
+    both sides.
+
+    Kills: a mutant that trips whenever no running row is current,
+    regardless of age (this 14-min-old, job-free evidence would flip to
+    tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-14))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl4_running_job_claimed_after_the_stamp_keeps_it_ok() -> None:
+    """W -30, S -16, running fetch_obs C -15: ok, and problem_jobs is ok too
+    (-15 is inside its own 20-min running-arm window).
+
+    Kills: measuring age from max(S, C) instead of from B (S alone) -- C -15
+    is newer than S -16, so such a mutant would measure the age from C and
+    trip at exactly the 15-min threshold, flipping this fixture from ok to
+    tripped.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -15)
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+    assert _cond(verdict, "problem_jobs")["ok"] is True
+
+
+def test_wl4_running_job_claimed_exactly_at_the_stamp_counts_as_current() -> None:
+    """W -30, S -16, running fetch_obs C -16 (C equals B, and B is already
+    stale): ok, with no detail.
+
+    Kills: `>` in place of `>=` on the current-row test (C >= B) -- this C
+    equals B exactly, so such a mutant would read this running row as not
+    current and trip on the stale S, same as WL6.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -16)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl5_current_job_older_than_stuck_window_stays_ok_here() -> None:
+    """W -60, S -40, running fetch_obs C -39: ok here; problem_jobs trips
+    instead -- a wedge inside a job stays with the running arm, not this
+    condition.
+
+    Kills: a staleness cap on a current row, such as requiring
+    `now - C < 20 min` (this C is 39 min old, so such a cap would flip this
+    condition to tripped AND double-report the wedge in problem_jobs too).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-40))
+    _wl_seed_running(conn, site_id, "fetch_obs", -39)
+    verdict = _wl_verdict(conn)
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+    assert _cond(verdict, "problem_jobs")["ok"] is False
+
+
+def test_wl6_running_row_claimed_before_the_last_stamp_is_abandoned() -> None:
+    """W -60, S -16, running fetch_obs C -20 (claimed before the last
+    stamp): tripped, wording 1 with <N-16> -- an abandoned row claimed
+    before B cannot mask the condition.
+
+    Kills: counting every running row as current, dropping C >= B (this C
+    is older than B, so such a mutant would read ok instead of tripped).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_obs", -20)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+
+
+def test_wl7_loop_stamp_older_than_import_falls_back_to_wording2() -> None:
+    """W -60, S -40, I -20, running fetch_obs C -30 (an exporter's row):
+    tripped, wording 2 with <N-20> -- S is older than F, so it is ignored
+    and the basis falls back to F=I.
+
+    Kills: leaving I out of F (B would fall back to S at -40 instead, and
+    C -30 >= -40, so this fixture would read ok); using S even when it is
+    older than F (B would then be S -40, and C -30 >= -40, so this fixture
+    would read ok).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-40))
+    _wl_seed_i(conn, -20)
+    _wl_seed_running(conn, site_id, "fetch_obs", -30)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl8_running_current_obs_poller_row_never_counts_as_current() -> None:
+    """W -60, S -16, running fetch_current_obs C -1, and a fresh poller
+    heartbeat at N: tripped, wording 1 with <N-16> -- the poller lane's
+    running row and heartbeat are outside this condition's evidence.
+
+    Kills: dropping the lane filter from the jobs arm, so a poller row
+    counts as current (this C -1 is well inside B -16, so such a mutant
+    would read ok instead of tripped); reading the poller heartbeat into B
+    (the fresh N-stamped poller heartbeat would then read ok).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wl-site")
+    _wl_seed_w(conn, -60)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    _wl_seed_running(conn, site_id, "fetch_current_obs", -1)
+    conn.execute(
+        "INSERT INTO runtime_state(key, value)"
+        " VALUES ('current_obs_poller_last_loop_at', ?)",
+        (_wl_stamp(0),),
+    )
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+
+
+def test_wl9_start_only_with_no_loop_stamp_trips_wording2() -> None:
+    """W -20 only: tripped, wording 2 with <N-20>.
+
+    Kills: treating missing evidence as ok (this fixture has W but no S,
+    C, or I, and would read ok under such a mutant); B = S* only, ignoring
+    F (with no S at all, B would be None here, giving wording 3 instead of
+    wording 2).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl10_loop_stamp_older_than_start_is_ignored() -> None:
+    """W -20, S -30 (a stamp from before this start): tripped, wording 2
+    with <N-20> -- S older than F is not S*, so the basis falls back to F.
+
+    Kills: using S even when it is older than F (would give wording 1 with
+    <N-30> instead of wording 2 with <N-20>).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    _wl_seed_s(conn, _wl_stamp(-30))
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl11_unparseable_loop_stamp_is_missing_evidence_not_an_escaped_error() -> None:
+    """W -20, S 'garbage': tripped, wording 2 with <N-20>, and build_verdict
+    returns normally -- an unparseable stamp becomes missing evidence, not
+    a raised ValueError.
+
+    Kills: letting parse_utc's ValueError escape the helper (calling
+    _wl_verdict itself would raise instead of returning a verdict).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -20)
+    _wl_seed_s(conn, "garbage")
+    verdict = _wl_verdict(conn)  # must not raise
+    cond = _cond(verdict, "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording2(-20)
+
+
+def test_wl12_no_evidence_at_all_trips_wording3() -> None:
+    """Nothing seeded: tripped, wording 3 exactly.
+
+    Kills: treating missing evidence as ok (an empty runtime_state and no
+    running rows would read ok under such a mutant).
+    """
+    conn = asof_conn()
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _WL_WORDING_3
+
+
+def test_wl13_fresh_start_inside_15_min_reads_ok() -> None:
+    """W -14 only (a fresh start; grace ended at -4): ok.
+
+    Kills: B = S* only, ignoring F (with no S, B would be None here, which
+    is always tripped -- this fixture would flip from ok to tripped).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -14)
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is True
+    assert "detail" not in cond
+
+
+def test_wl14_skipped_when_pipeline_disabled() -> None:
+    """pipeline_enabled=False: main_worker_liveness is present with
+    skipped True.
+
+    Kills: omitting the id from the skipped tuple (the id would be absent
+    from the verdict's conditions entirely, and _cond would raise
+    StopIteration instead of returning a skipped condition).
+    """
+    conn = asof_conn()
+    cond = _cond(_wl_verdict(conn, pipeline_enabled=False), "main_worker_liveness")
+    assert cond["skipped"] is True
+    assert cond["ok"] is True
+
+
+def test_wl15_evidence_is_read_in_exactly_one_statement() -> None:
+    """WL1's seed, traced with set_trace_callback around build_verdict:
+    exactly one traced statement contains 'worker_last_loop_at', and that
+    statement also contains 'worker_started_at', 'import_rebuild_state' and
+    'FROM jobs' -- confirming the one-snapshot compound read.
+
+    Kills: reading the evidence in two statements (a second, separate read
+    naming 'worker_last_loop_at' would make the match count 2, or split the
+    four substrings across two different statements).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        _wl_verdict(conn)
+    finally:
+        conn.set_trace_callback(None)
+    matches = [s for s in statements if "worker_last_loop_at" in s]
+    assert len(matches) == 1
+    (statement,) = matches
+    assert "worker_started_at" in statement
+    assert "import_rebuild_state" in statement
+    assert "FROM jobs" in statement
+
+
+def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A heartbeat write failure (tests/test_m1_m5.py:398-428's pattern)
+    logs the ERROR and returns `now` unchanged, leaving S exactly where it
+    was: build_verdict then reports wording 1 with <N-16>, never a "hung"
+    claim.
+
+    Kills: the heartbeat's failure path writing a fallback stamp by another
+    route (S would move, and the verdict would read ok instead of tripped);
+    wording that says the worker is hung (the exact-text assertion below).
+    """
+    conn = asof_conn()
+    _wl_seed_w(conn, -30)
+    _wl_seed_s(conn, _wl_stamp(-16))
+    conn.commit()
+
+    def _fail_heartbeat(_conn: sqlite3.Connection, key: str) -> None:
+        raise sqlite3.OperationalError("synthetic heartbeat failure")
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.set_runtime_state_now", _fail_heartbeat
+    )
+
+    class FakeDb:
+        async def write(self, fn):  # type: ignore[no-untyped-def]
+            return fn(conn)
+
+    result = asyncio.run(
+        _maybe_stamp_runtime_heartbeat(
+            FakeDb(),  # type: ignore[arg-type]
+            "worker_last_loop_at",
+            0.0,
+            1234.0,
+        )
+    )
+
+    assert result == 1234.0
+    assert any(
+        r.levelno == logging.ERROR
+        and r.getMessage() == "runtime heartbeat write failed key=worker_last_loop_at"
+        for r in caplog.records
+    )
+    row = conn.execute(
+        "SELECT value FROM runtime_state WHERE key = 'worker_last_loop_at'"
+    ).fetchone()
+    assert row["value"] == _wl_stamp(-16)
+
+    cond = _cond(_wl_verdict(conn), "main_worker_liveness")
+    assert cond["ok"] is False
+    assert cond["detail"] == _wl_wording1(-16)
+    assert "hung" not in cond["detail"]
