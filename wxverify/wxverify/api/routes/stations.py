@@ -76,7 +76,7 @@ async def create_station(
     # lookup_elevation_m) is then rejected at the write instead of silently
     # attaching this station to whatever now owns that site_id in the
     # replacement database. Same disposition as the worker's (see
-    # worker.processor.run_worker).
+    # worker.processor.run_claimed_job).
     writer = FencedWriter(get_db(), get_db().generation)
 
     def _reserve(conn: sqlite3.Connection) -> None:

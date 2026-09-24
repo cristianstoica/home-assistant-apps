@@ -19,9 +19,19 @@ mechanism, its ledger and its allowlist live in ``tests/network_guard.py`` so
 that ``tests/test_network_guard.py`` can import the same objects this fixture
 uses (this file is imported as a top-level ``conftest`` module and must not
 be imported by tests).
+
+``idle_current_obs_poller`` (plan §6.3.6) patches the real current-obs lane
+out of ``run_worker`` for tests that drive it directly against a fake
+``db`` (a ``_FakeDb`` with no real ``jobs``/``station_poll_state`` schema
+behind it). Without it, the second lane created inside ``run_worker`` would
+issue its own ``db.write`` calls against that fake and crash on data the
+fake was never built to hold. It is NOT autouse: tests that exercise the
+real poller (the supervisor contract tests, the app-level stop test, DL5)
+must not have it applied.
 """
 
-from collections.abc import Iterator
+import asyncio
+from collections.abc import Awaitable, Callable, Iterator
 
 import pytest
 
@@ -46,3 +56,21 @@ def _reset_export_sweeper_death() -> None:
 def _deny_network() -> Iterator[None]:
     """Fail any test that tries to leave the process over a socket."""
     yield from deny_network_scope()
+
+
+async def _idle_poller(db: object, *, run_job: Callable[..., Awaitable[None]]) -> None:
+    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    await asyncio.Event().wait()
+
+
+@pytest.fixture
+def idle_current_obs_poller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace the current-obs lane inside ``run_worker`` with an idle stub.
+
+    The patch target is ``wxverify.worker.processor.run_current_obs_poller``
+    -- the name ``run_worker`` resolves at call time -- never the defining
+    module, ``wxverify.worker.current_obs_poller``.
+    """
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _idle_poller
+    )

@@ -190,8 +190,10 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
 
     That distinction is the whole point: `Task.cancel()` only REQUESTS
     cancellation. The `CancelledError` is delivered on the task's next
-    scheduling turn, and a handler that itself awaits -- `run_worker`'s is
-    the shutdown job reclaim, an `await db.write(...)` -- needs several more
+    scheduling turn, and a handler that itself awaits -- `run_worker` first
+    drains both lanes, each bounded by its own in-flight transaction (every
+    `db.write` runs through `run_to_completion`), and then runs the one
+    shutdown job reclaim, an `await db.write(...)` -- needs several more
     turns to finish. Nothing keeps the loop running to grant them once the
     lifespan has returned, so a cancelled-but-unawaited task can be torn
     down with its reclaim half-done, leaving a claimed job stranded at
@@ -212,16 +214,16 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
     an unshielded `await` of the gathering future does not stop it.
     `_GatheringFuture.cancel()` re-cancels every unfinished child, so the
     request lands INSIDE a cancellation handler that is itself awaiting --
-    delivering a fresh `CancelledError` at `run_worker`'s reclaim write --
-    and it additionally makes `gather` raise instead of returning results,
-    discarding every outcome reported below. Awaiting under
-    `asyncio.shield` leaves the children untouched, and re-establishing the
-    shield after each delivered cancellation is what makes that hold for
-    the second, third and Nth cancel rather than only the first: N cancels
-    cost N iterations, never a dropped reap. The cancellation is deferred,
-    not swallowed -- it is re-raised once the reap is complete.
-    `core/aio.py` runs the same loop for the same reason one layer down,
-    around the executor thread.
+    delivering a fresh `CancelledError` into `run_worker`'s lane drain or
+    its reclaim write -- and it additionally makes `gather` raise instead
+    of returning results, discarding every outcome reported below. Awaiting
+    under `asyncio.shield` leaves the children untouched, and
+    re-establishing the shield after each delivered cancellation is what
+    makes that hold for the second, third and Nth cancel rather than only
+    the first: N cancels cost N iterations, never a dropped reap. The
+    cancellation is deferred, not swallowed -- it is re-raised once the
+    reap is complete. `core/aio.py` runs the same loop for the same reason
+    one layer down, around the executor thread.
 
     A hand-rolled `for task in handles: await task` loop has neither
     property -- cancel it and every task it has not reached yet is
@@ -230,9 +232,11 @@ async def _cancel_and_reap(tasks: list[tuple[str, asyncio.Task[None]]]) -> None:
 
     Shielding gives up the escalation path: a child that SWALLOWED
     cancellation would hang shutdown here with no second cancel able to
-    push it along. None of the three does. `run_worker` re-raises after a
-    reclaim whose SQLite wait is capped by `PRAGMA busy_timeout=30000`, and
-    neither `run_export_sweeper` nor `warm_read_cache` handles
+    push it along. None of the three does. `run_worker` first drains both
+    lanes, each bounded by its own in-flight transaction (every `db.write`
+    runs through `run_to_completion`), and then re-raises after the one
+    reclaim, whose SQLite wait is capped by `PRAGMA busy_timeout=30000`;
+    and neither `run_export_sweeper` nor `warm_read_cache` handles
     `CancelledError` at all, so the wait is bounded. A fourth task added to
     `tasks` owes that same check.
 

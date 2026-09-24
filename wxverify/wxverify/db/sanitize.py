@@ -2,7 +2,7 @@
 
 ``jobs.next_attempt_at`` and ``station_poll_state.next_poll_at`` both gate a
 ``<= isoformat_utc()`` due-comparison (``db.queue.claim_next_job``,
-``worker.scheduler._enqueue_due_current_obs``, and ``monitor``'s overdue-job
+``worker.scheduler.enqueue_due_current_obs``, and ``monitor``'s overdue-job
 scan). A value that sorts AFTER the current ISO-8601 stamp -- a garbage
 string like ``'zzzz'``, or a plausible far-future date -- is never SELECTED
 by that comparison, so none of those paths' own unreadable-row handling ever
@@ -68,7 +68,7 @@ def _sanitize_jobs_next_attempt_at(conn: sqlite3.Connection) -> None:
     for row in rows:
         try:
             parse_utc(str(row["next_attempt_at"]))
-        except Exception:  # see db.queue.claim_next_job's
+        except Exception:  # see db.queue._claim's
             # comment: the carrier set here is not enumerable -- a value
             # shaped like a timestamp is not guaranteed to parse as one
             # (an enumerated allowlist has already missed a carrier once),
@@ -76,7 +76,7 @@ def _sanitize_jobs_next_attempt_at(conn: sqlite3.Connection) -> None:
             # deliberately even though parse_utc now raises ValueError for
             # every str input.
             #
-            # NULL is already the claimable state (claim_next_job's WHERE
+            # NULL is already the claimable state (_claim's WHERE
             # clause), so the row goes straight back through that function's
             # own unreadable-row disposition instead of being discarded here
             # on the strength of one column. This disposition is its own

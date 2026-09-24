@@ -1,15 +1,19 @@
 """Shared weather.com call lock (§6.3.10) and the add-station route's
-bounded wait (§17 item 11) -- commit 4 of the 2026-09-23
-station-health-and-retries plan. Covers K2-K5d of plan §14.2.
+bounded wait (§17 item 11) -- commits 4 and 5 of the 2026-09-23
+station-health-and-retries plan. Covers K2-K5d of plan §14.2 (commit 4) plus
+K1 (commit 5, added once the current-obs lane exists).
 
-Out of scope here (plan §14.2, commit 4 row of §16.1):
+Out of scope here (plan §14.2):
 
-- K1 (the limit across lanes) and the shared-lock assertion inside the
-  supervisor's C4 stale-generation case need the separate current-obs lane
-  introduced in commit 5 (``run_claimed_job``, ``run_current_obs_poller``),
-  which does not exist at this commit.
-- DL1 and DL2 (the provider-call deadline) live in ``test_provider_deadline.py``;
-  DL3-DL5 need commit 5's claimed-job lane and land with it.
+- The supervisor's C4 stale-generation case (the shared-lock assertion
+  inside a full two-lane cancellation/reclaim scenario) lives in
+  ``test_graceful_shutdown.py`` alongside the rest of the C-series
+  supervisor-contract tests, not here.
+- DL1 and DL2 (the provider-call deadline) live in ``test_provider_deadline.py``.
+  DL3-DL5 (the deadline observed through the current-obs/history lanes and
+  under cancellation) live in ``test_current_obs_poller.py`` and
+  ``test_graceful_shutdown.py`` respectively, alongside the harnesses that
+  already drive those lanes -- not duplicated here.
 
 Adaptation from the plan's literal wording: every K2/K5 case that the plan
 describes via ``run_claimed_job`` (a commit-5 name) is instead driven
@@ -62,6 +66,11 @@ from starlette.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import Database, FencedWriter, close_db
+from wxverify.db.queue import (
+    claim_next_current_obs_job,
+    claim_next_job,
+    enqueue_if_absent,
+)
 from wxverify.obs.pws_adapter import PwsObservation, PwsStation
 from wxverify.worker import processor as processor_module
 from wxverify.worker.backfill import fetch_station_history_window
@@ -73,6 +82,7 @@ from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import (
     _fetch_current_obs,  # noqa: PLC2701
     _fetch_obs,  # noqa: PLC2701
+    run_claimed_job,
 )
 from wxverify.worker.station_pacing import acquire_within, weathercom_call_lock
 
@@ -482,6 +492,126 @@ def test_k2_lock_held_at_add_station_route(
         assert response.status_code == 200
 
     assert locked_at == {"validate_station": True}
+
+
+# ---------------------------------------------------------------------------
+# K1 -- one shared lock serializes both lanes
+# ---------------------------------------------------------------------------
+
+
+def test_k1_shared_lock_serializes_both_lanes_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """K1: the current-obs lane's call site and the main lane's history call
+    site share the *same* process-wide lock, so running one claimed job of
+    each type concurrently through ``run_claimed_job`` never overlaps their
+    weather.com calls -- even though the two claims come from different
+    partitions (§6.3.4) and could otherwise run truly in parallel.
+
+    Mutant: restore a per-job ``station_call_limiter()`` at either call site
+    in place of the shared lock -- killed by ``max_in_flight`` rising to 2.
+    """
+    close_db()
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "secret-weather")
+    db = Database(str(db_path))
+
+    async def _run() -> None:
+        try:
+            site_id = _seed_site(db._conn, "K1 Site")  # noqa: SLF001
+            station_a = _seed_station(db._conn, site_id, "ISTATION-K1-A")
+            _seed_station(db._conn, site_id, "ISTATION-K1-B")
+            enqueue_if_absent(db._conn, "fetch_obs", site_id, "obs", {})  # noqa: SLF001
+            enqueue_if_absent(  # noqa: SLF001
+                db._conn,
+                "fetch_current_obs",
+                site_id,
+                f"curobs:{station_a}",
+                {"station_id": station_a},
+            )
+
+            job_main = await db.write(claim_next_job)
+            job_current_obs = await db.write(claim_next_current_obs_job)
+            assert job_main is not None
+            assert job_current_obs is not None
+
+            in_flight = {"n": 0, "max": 0}
+            called: dict[str, bool] = {}
+
+            async def fake_current_obs(
+                pws_station_id: str,
+                api_key: str,
+                *,
+                client: httpx.AsyncClient | None = None,
+                timeout_seconds: float = 10.0,
+            ) -> httpx.Response:
+                called["current_obs"] = True
+                in_flight["n"] += 1
+                in_flight["max"] = max(in_flight["max"], in_flight["n"])
+                await asyncio.sleep(0.05)
+                in_flight["n"] -= 1
+                return _online_response()
+
+            async def fake_history(
+                station_id_arg: str,
+                api_key: str,
+                *,
+                hours: int = 0,
+                timezone: str | None = None,
+                client: httpx.AsyncClient | None = None,
+            ) -> list[PwsObservation]:
+                called["history"] = True
+                in_flight["n"] += 1
+                in_flight["max"] = max(in_flight["max"], in_flight["n"])
+                await asyncio.sleep(0.05)
+                in_flight["n"] -= 1
+                return []
+
+            async def fake_history_range(
+                station_id_arg: str,
+                api_key: str,
+                *,
+                window_start: str,
+                window_end: str,
+                timezone: str | None = None,
+                client: httpx.AsyncClient | None = None,
+            ) -> list[PwsObservation]:
+                called["range"] = True
+                in_flight["n"] += 1
+                in_flight["max"] = max(in_flight["max"], in_flight["n"])
+                await asyncio.sleep(0.05)
+                in_flight["n"] -= 1
+                return []
+
+            monkeypatch.setattr(
+                "wxverify.worker.processor.fetch_current_observation",
+                fake_current_obs,
+            )
+            monkeypatch.setattr(
+                "wxverify.worker.processor.fetch_hourly_history", fake_history
+            )
+            monkeypatch.setattr(
+                "wxverify.worker.catchup.fetch_hourly_history_range",
+                fake_history_range,
+            )
+            monkeypatch.setattr(
+                "wxverify.worker.backfill.fetch_hourly_history_range",
+                fake_history_range,
+            )
+
+            await asyncio.gather(
+                run_claimed_job(db, job_main, lane="main"),
+                run_claimed_job(db, job_current_obs, lane="current_obs"),
+            )
+
+            assert in_flight["max"] == 1
+            assert called == {"current_obs": True, "history": True}
+        finally:
+            db.close()
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

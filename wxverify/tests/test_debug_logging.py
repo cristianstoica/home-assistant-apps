@@ -180,14 +180,28 @@ def _claim_once(job: Job):  # type: ignore[no-untyped-def]
     return claim
 
 
+async def _idle_poller(db: object, *, run_job: object) -> None:
+    """A current-obs lane that never claims anything (plan §6.3.6)."""
+    await asyncio.Event().wait()
+
+
 def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Silence heartbeats, scheduler, and purge in worker loop tests."""
+    """Silence heartbeats, scheduler, and purge in worker loop tests.
+
+    Also idles the current-obs lane (plan §6.3.6): every caller of this
+    helper drives ``run_worker`` directly against a fake ``db`` with no
+    real ``jobs``/``station_poll_state`` schema behind it, and the real
+    poller would issue its own ``db.write`` calls against that fake.
+    """
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
+    )
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _idle_poller
     )
 
 

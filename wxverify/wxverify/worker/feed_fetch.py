@@ -113,7 +113,7 @@ async def fetch_feed_once(
     """Fetch one feed's forecast and persist it.
 
     ``writer`` fences every write here to the generation it was obtained at
-    (see ``worker.processor.run_worker``): a database replace landing
+    (see ``worker.processor.run_claimed_job``): a database replace landing
     mid-fetch is then rejected instead of silently persisting against the
     replacement database. ``writer=None`` (the CLI entry point's case) runs
     plain, unfenced writes -- a one-shot operator command has no claimed

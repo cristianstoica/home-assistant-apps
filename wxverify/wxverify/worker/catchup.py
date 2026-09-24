@@ -125,14 +125,16 @@ async def run_catchup(
     for site_id in changed_sites:
         # Same shape as the worker's pair_and_score dispatch: one write
         # transaction per pair phase, then the shared batched scoring
-        # orchestrator. Both lanes run inside the single worker job executor,
-        # so the convergence invariant documented at the pair_and_score
-        # dispatch site (worker/processor.py) applies here too — read it
-        # there rather than restating it. Per-site guard: the batched path
-        # runs a per-batch enabled check (a named, deliberate semantic
-        # change — today's rescore lane had none), so a site vanished or
-        # disabled mid-catchup raises JobCancelled mid-rescore; the continue
-        # ensures one vanished site does not abort rescoring the others.
+        # orchestrator. Both rescore lanes run as jobs on the main worker
+        # lane, the only executor of jobs that write station_observations or
+        # any scoring input, so the convergence invariant documented at the
+        # pair_and_score dispatch site (worker/processor.py) applies here
+        # too — read it there rather than restating it. Per-site guard: the
+        # batched path runs a per-batch enabled check (a named, deliberate
+        # semantic change — today's rescore lane had none), so a site
+        # vanished or disabled mid-catchup raises JobCancelled mid-rescore;
+        # the continue ensures one vanished site does not abort rescoring
+        # the others.
         try:
             for phase in PAIR_PHASES:
                 await writer.write(lambda conn, sid=site_id, run=phase: run(conn, sid))

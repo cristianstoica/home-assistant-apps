@@ -60,7 +60,6 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
-    _enqueue_due_current_obs(conn)
     _enqueue_due_forecast_records(conn)
     _enqueue_due_verification_runs(conn)
 
@@ -357,7 +356,12 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
             )
 
 
-def _enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
+def enqueue_due_current_obs(conn: sqlite3.Connection) -> None:
+    """Enqueue a ``fetch_current_obs`` job for every due, enabled station.
+
+    Runs inside the current-obs lane's claim transaction
+    (worker.current_obs_poller), not in ``scheduler_tick``.
+    """
     now = isoformat_utc()
     rows = conn.execute(
         """

@@ -12,7 +12,10 @@ RUNTIME_STATE_KEYS = (
     "import_rebuild_done_at",
     "import_rebuild_state",
     "import_rebuild_error",
+    "current_obs_poller_last_loop_at",
 )
+
+RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 60.0
 
 # Mirrors create_schema()'s runtime_state DDL in db/migrations.py -- update
 # both if this table's shape ever changes. Needed here because a caller may

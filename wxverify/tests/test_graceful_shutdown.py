@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import sqlite3
 import threading
@@ -26,14 +27,26 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import _cancel_and_reap, create_app, lifespan
+from wxverify.collection.budget import is_refundable_transport_error
 from wxverify.db.connection import Database, close_db, get_db, init_db
-from wxverify.db.queue import claim_next_job
-from wxverify.worker.processor import run_worker
+from wxverify.db.queue import (
+    claim_next_current_obs_job,
+    claim_next_job,
+    reclaim_all_stale,
+)
+from wxverify.obs.pws_adapter import ProviderDeadlineExceeded
+from wxverify.worker.processor import (
+    _shutdown_reclaim,  # noqa: PLC2701
+    run_claimed_job,
+    run_worker,
+)
+from wxverify.worker.station_pacing import weathercom_call_lock
 
 # ---------------------------------------------------------------------------
 # Harness (verbatim idiom from test_write_lock_serialization.py).
@@ -106,6 +119,29 @@ async def _await_status(
                 f"(last={_job_status(conn, job_id)!r})"
             )
         await asyncio.sleep(0.01)
+
+
+async def _await_task_done(task: asyncio.Task[Any], *, timeout: float = 5.0) -> None:
+    """Bound a completion wait for a task that may absorb cancellation.
+
+    ``asyncio.wait_for(task, timeout=...)`` is not sufficient here: cancelling
+    the ``wait_for`` itself does not stop ``task`` when ``task`` catches and
+    holds through its own ``CancelledError`` (e.g. behind a shield) -- the
+    wait_for would raise on schedule but the task keeps running unobserved.
+    Instead, observe completion with a bounded ``asyncio.wait`` first; only
+    once ``task`` is actually done does the caller ``await`` it (which
+    returns/raises immediately, no further blocking). On a genuine hang,
+    cancel ``task`` and wait up to 1s more for it before failing; a task
+    that still absorbs the cancel (e.g. behind a shield) can remain
+    pending after that.
+    """
+    done, pending = await asyncio.wait({task}, timeout=timeout)
+    if pending:
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await asyncio.wait({task}, timeout=1.0)
+        raise AssertionError(f"task did not complete within {timeout}s")
+    assert task in done
 
 
 # ---------------------------------------------------------------------------
@@ -1470,3 +1506,859 @@ def test_startup_failure_after_task_creation_still_closes_the_database(
 
     asyncio.run(_run())
     assert stopped == [], "the default hard-kill stop_process must never fire"
+
+
+# ---------------------------------------------------------------------------
+# D1.2 two-lane supervisor contracts (plan §6.3.1, §14.2 C1-C5 and the two
+# further supervisor cases) plus the app-level stop test and DL4/DL5 (the
+# provider-call deadline observed through the history lane and under
+# cancellation). `run_worker` now supervises two lanes -- `_run_main_lane`
+# and `run_current_obs_poller` -- via `asyncio.wait(FIRST_COMPLETED)` +
+# `_cancel_and_drain` + `_shutdown_reclaim` + `_raise_lane_outcome`, never an
+# `asyncio.TaskGroup` (which would wrap a lane's exception in an
+# ExceptionGroup). C1/C2/the two further cases/the app-level stop test drive
+# `run_worker` with both lanes replaced by fakes (patched at their
+# `wxverify.worker.processor` import-site attributes, the same seam
+# `idle_current_obs_poller` uses elsewhere); C3's plain-cancel/interrupted-
+# drain cases do the same; C3's repeated-cancel case unit-tests
+# `_shutdown_reclaim` directly; C4's stale-generation case and DL4/DL5 drive
+# a REAL tmp `Database` end to end, matching this file's existing idiom.
+# ---------------------------------------------------------------------------
+
+
+class _StopLoop(Exception):
+    """Local stand-in exception a fake lane raises to end a test
+    deterministically -- same idiom as ``test_011_patch.py``'s
+    module-private ``_StopLoop``, not a shared production symbol."""
+
+
+class _RecordingDb:
+    """Fake ``Database``: the only method the supervisor calls on it is
+    ``_shutdown_reclaim``'s ``db.write(reclaim_all_stale)``. Records call
+    order into a shared list so a test can assert the reclaim landed AFTER
+    both lanes' own cancellation markers, not merely that it happened."""
+
+    def __init__(self, order: list[str] | None = None) -> None:
+        self.order: list[str] = order if order is not None else []
+        self.reclaim_calls = 0
+
+    async def write(self, fn: Any) -> None:
+        assert fn is reclaim_all_stale, fn
+        self.reclaim_calls += 1
+        self.order.append("reclaim")
+
+
+def test_c1_lane_failure_raises_by_identity_after_draining_the_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C1 -- Failure. A lane that raises makes `run_worker` raise that same
+    exception object, after the other lane is done. No reclaim runs.
+
+    Mutant: re-raise without draining -- the other lane would still be
+    pending (`other_cancelled` unset) when `run_worker` raises.
+    """
+    raised: dict[str, BaseException] = {}
+    other_cancelled = asyncio.Event()
+
+    async def _failing_main(_db: Any) -> None:
+        exc = _StopLoop("boom")
+        raised["main"] = exc
+        raise exc
+
+    async def _blocking_poller(_db: Any, *, run_job: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            other_cancelled.set()
+            raise
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _failing_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _blocking_poller
+    )
+    db = _RecordingDb()
+
+    async def _run() -> None:
+        with pytest.raises(_StopLoop) as excinfo:
+            await run_worker(db)  # type: ignore[arg-type]
+        assert excinfo.value is raised["main"]
+        assert other_cancelled.is_set()
+        assert db.reclaim_calls == 0
+
+    asyncio.run(_run())
+
+
+def test_c2_repeated_cancellation_still_drains_both_lanes_before_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C2 -- Cancellation. Cancelling `run_worker` any number of times ends
+    with both lanes done before `CancelledError` leaves it.
+
+    Mutant: a single `await asyncio.wait(...)` in place of `_cancel_and_drain`'s
+    loop -- the SECOND cancel would land inside that lone `asyncio.wait` and
+    propagate `CancelledError` straight out, skipping `_shutdown_reclaim` and
+    leaving `done` at `{"main": False, "poller": False}` when `run_worker`
+    finishes.
+    """
+    gate = asyncio.Event()
+    done = {"main": False, "poller": False}
+
+    async def _gated_main(_db: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await gate.wait()
+            done["main"] = True
+            raise
+
+    async def _gated_poller(_db: Any, *, run_job: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await gate.wait()
+            done["poller"] = True
+            raise
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _gated_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _gated_poller
+    )
+    db = _RecordingDb()
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))  # type: ignore[arg-type]
+        # Let run_worker create both lane tasks and reach `await
+        # asyncio.wait(lanes, FIRST_COMPLETED)` before the first cancel.
+        await asyncio.sleep(0)
+        try:
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            assert done == {"main": False, "poller": False}, (
+                "both lanes must still be parked on the shut gate"
+            )
+            assert not task.done(), (
+                "run_worker must not finish before both lanes are done -- a "
+                "single asyncio.wait in place of _cancel_and_drain's loop "
+                "would let the second cancel escape and finish run_worker "
+                "while both lanes are still parked on the gate"
+            )
+        finally:
+            gate.set()
+        await _await_task_done(task)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert done == {"main": True, "poller": True}
+
+    asyncio.run(_run())
+
+
+def test_c3_plain_cancel_reclaims_exactly_once_after_both_lanes_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C3 -- Shutdown and reclaim, plain-cancel case. Exactly one
+    `reclaim_all_stale` runs on a cancellation, after both lanes are done.
+
+    Mutant: reclaim before the drain -- the "reclaim" marker would appear
+    before one or both of the lane-cancelled markers in `order`.
+    """
+    order: list[str] = []
+
+    async def _idle_main(_db: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            order.append("main-cancelled")
+            raise
+
+    async def _idle_poller(_db: Any, *, run_job: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            order.append("poller-cancelled")
+            raise
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _idle_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _idle_poller
+    )
+    db = _RecordingDb(order)
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))  # type: ignore[arg-type]
+        await asyncio.sleep(0)
+        task.cancel()
+        await _await_task_done(task)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert order[-1] == "reclaim"
+        assert set(order[:-1]) == {"main-cancelled", "poller-cancelled"}
+        assert db.reclaim_calls == 1
+
+    asyncio.run(_run())
+
+
+def test_c3_cancel_during_a_failure_drain_logs_reclaims_once_and_raises_cancelled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C3 -- Shutdown and reclaim, interrupted-drain case. A cancel that
+    arrives while a lane failure is being drained logs the failure, reclaims
+    once, and raises `CancelledError` (not the failure).
+
+    Mutant: drop `_log_lane_failures` from the interrupted path -- no ERROR
+    record would be emitted for the main lane's failure.
+    """
+    order: list[str] = []
+    main_exc = RuntimeError("main boom")
+
+    async def _failing_main(_db: Any) -> None:
+        raise main_exc
+
+    gate = asyncio.Event()
+    poller_cancel_entered = asyncio.Event()
+
+    async def _gated_poller(_db: Any, *, run_job: Any) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            poller_cancel_entered.set()
+            await gate.wait()
+            order.append("poller-cancelled")
+            raise
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _failing_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _gated_poller
+    )
+    db = _RecordingDb(order)
+
+    async def _run() -> None:
+        task = asyncio.create_task(run_worker(db))  # type: ignore[arg-type]
+        # Rendezvous, not a sleep: this fires only once run_worker's own
+        # `_cancel_and_drain(lanes)` (the non-except, lane-failure branch) has
+        # already cancelled the poller and is awaiting it -- exactly the
+        # window "a cancel arrives while a lane failure is being drained".
+        try:
+            await asyncio.wait_for(poller_cancel_entered.wait(), timeout=2.0)
+            with caplog.at_level(logging.ERROR, logger="wxverify.worker.processor"):
+                task.cancel()
+                await asyncio.sleep(0)
+        finally:
+            gate.set()
+        with caplog.at_level(logging.ERROR, logger="wxverify.worker.processor"):
+            await _await_task_done(task)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert order == ["poller-cancelled", "reclaim"]
+        assert db.reclaim_calls == 1
+        failed = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.worker.processor"
+            and r.getMessage() == "worker lane worker-main-lane failed"
+        ]
+        assert len(failed) == 1, [r.getMessage() for r in caplog.records]
+        exc_info = failed[0].exc_info
+        assert exc_info is not None and exc_info[1] is main_exc
+
+    asyncio.run(_run())
+
+
+def test_c3_repeated_cancel_reclaims_exactly_once_under_a_shielded_write() -> None:
+    """C3 (repeated-cancel, code-review finding): `_shutdown_reclaim`'s
+    single retained write task stays shielded across N cancellations of the
+    caller -- the write is issued exactly once and finishes, however many
+    times the awaiting task is cancelled while it is still in flight.
+
+    Mutants: (a) a bare, unshielded `await db.write(reclaim_all_stale)` in
+    place of the shield loop -- the first cancel would cancel the write's
+    own task directly, so it would never reach `release.wait()` a second
+    time and `write_calls` would never advance past being cancelled
+    mid-write; (b) re-issuing the write on each absorbed cancel instead of
+    retaining the one task -- `write_calls` would rise to 3 (one per
+    cancel), not stay at 1.
+    """
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    write_calls = 0
+
+    class _SlowReclaimDb:
+        async def write(self, fn: Any) -> None:
+            nonlocal write_calls
+            assert fn is reclaim_all_stale, fn
+            write_calls += 1
+            entered.set()
+            await release.wait()
+
+    db = _SlowReclaimDb()
+
+    async def _run() -> None:
+        nonlocal write_calls
+        task = asyncio.create_task(_shutdown_reclaim(db))  # type: ignore[arg-type]
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        try:
+            for _ in range(3):
+                task.cancel()
+                await asyncio.sleep(0)
+            assert not task.done(), "the shield must keep the caller loop alive"
+            assert write_calls == 1
+        finally:
+            release.set()
+        await _await_task_done(task)
+        assert task.done() and not task.cancelled()
+        assert write_calls == 1
+
+    asyncio.run(_run())
+
+
+def test_both_lanes_raise_main_precedence_poller_logged_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both lanes raise: `run_worker` raises main's exception object; the
+    poller's is logged exactly once at ERROR with `exc_info` carrying that
+    object.
+
+    Mutant: poller-first precedence -- `excinfo.value is main_exc` would
+    fail (poller_exc would be raised instead), and the logged failure would
+    name the main lane instead of the poller.
+    """
+    main_exc = RuntimeError("main boom")
+    poller_exc = RuntimeError("poller boom")
+
+    async def _failing_main(_db: Any) -> None:
+        raise main_exc
+
+    async def _failing_poller(_db: Any, *, run_job: Any) -> None:
+        raise poller_exc
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _failing_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _failing_poller
+    )
+    db = _RecordingDb()
+
+    async def _run() -> None:
+        with (
+            caplog.at_level(logging.ERROR, logger="wxverify.worker.processor"),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            await run_worker(db)  # type: ignore[arg-type]
+        assert excinfo.value is main_exc
+        error_records = [
+            r
+            for r in caplog.records
+            if r.name == "wxverify.worker.processor" and r.levelno == logging.ERROR
+        ]
+        poller_records = [
+            r
+            for r in error_records
+            if r.getMessage() == "worker lane worker-current-obs-lane failed"
+        ]
+        assert len(poller_records) == 1, [r.getMessage() for r in error_records]
+        exc_info = poller_records[0].exc_info
+        assert exc_info is not None and exc_info[1] is poller_exc
+        assert db.reclaim_calls == 0
+
+    asyncio.run(_run())
+
+
+def test_a_lane_returning_normally_raises_a_named_runtime_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lane returns normally: `RuntimeError` whose message names the lane.
+
+    Mutant: treat a normal return as success, so `run_worker` returns
+    `None` -- `pytest.raises(RuntimeError)` would fail with no exception
+    raised at all.
+    """
+
+    async def _idle_main(_db: Any) -> None:
+        await asyncio.Event().wait()
+
+    async def _returning_poller(_db: Any, *, run_job: Any) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _idle_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _returning_poller
+    )
+    db = _RecordingDb()
+
+    async def _run() -> None:
+        with pytest.raises(
+            RuntimeError, match="worker-current-obs-lane returned unexpectedly"
+        ):
+            await run_worker(db)  # type: ignore[arg-type]
+
+    asyncio.run(_run())
+
+
+def test_app_level_stop_reports_the_failing_lanes_exception_by_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """App-level stop: a lane failure surfaces through the real ASGI wiring
+    -- `_stop_on_worker_done` (wxverify.api.app) reports the FAILING lane's
+    exception object, never the supervisor's own machinery.
+
+    Mutants: a supervisor that awaits only the main lane -- it would never
+    observe the poller's failure, so `stopped` would stay empty and the
+    deadline loop below would time out; and one that wraps the lane
+    exception (e.g. in a `RuntimeError`) instead of re-raising it by
+    identity -- `exc_info[1] is poller_exc` would then fail.
+    """
+    _init_tmp_db(tmp_path)
+
+    async def _idle_main(_db: Any) -> None:
+        await asyncio.Event().wait()
+
+    poller_exc = RuntimeError("poller boom")
+
+    async def _failing_poller(_db: Any, *, run_job: Any) -> None:
+        raise poller_exc
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _idle_main)
+    monkeypatch.setattr(
+        "wxverify.worker.processor.run_current_obs_poller", _failing_poller
+    )
+
+    stopped: list[None] = []
+    app = create_app(root_path="", _stop_process=lambda: stopped.append(None))
+    with (
+        caplog.at_level(logging.CRITICAL, logger="wxverify.api.app"),
+        TestClient(app) as client,
+    ):
+        deadline = time.monotonic() + 5.0
+        while not stopped:
+            if time.monotonic() > deadline:
+                raise TimeoutError("worker task crash was never reported")
+            time.sleep(0.02)
+        del client  # unused past this point; the with drives shutdown
+
+    assert stopped == [None]
+    crashed = [
+        r
+        for r in caplog.records
+        if r.name == "wxverify.api.app" and r.getMessage() == "worker task crashed"
+    ]
+    assert len(crashed) == 1, [r.getMessage() for r in caplog.records]
+    exc_info = crashed[0].exc_info
+    assert exc_info is not None and exc_info[1] is poller_exc
+
+
+def test_c4_stale_generation_between_reserve_and_outcome_abandons_only_that_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """C4 -- the stale-generation case: a database replacement (import) that
+    lands between the current-obs lane's reserve and its outcome write
+    abandons only that job, releases the call lock, and does not disturb
+    the other lane's ability to keep claiming.
+
+    Construction: `wxverify.worker.processor.fetch_current_observation` --
+    the provider call that runs strictly BETWEEN the reserve write and the
+    outcome write inside `_fetch_current_obs` -- bumps `db._generation` as a
+    side effect before returning its canned reply, landing the swap in
+    exactly that window without a real import.
+
+    NOTE on the "ordinary failure" mutant (`run_claimed_job` letting
+    `StaleGenerationError` fall into the generic `except Exception` branch
+    instead of the immediate `raise`): empirically verified EQUIVALENT under
+    every assertion in THIS test. `FencedWriter.write` rejects with
+    `StaleGenerationError` before its callback ever runs (the generation
+    check happens inside `write_fenced`, before `_call()`), so the generic
+    branch's own `_fail_job` write raises the identical
+    `StaleGenerationError`, which is caught by this same outer handler --
+    same INFO log, same untouched job row, same released lock. The one real
+    divergence is write-lock contention (the mutant's doomed write briefly
+    queues on `Database._write_lock`; the immediate raise never touches it)
+    -- see `test_c4_ordinary_failure_mutant_would_block_on_the_write_lock`
+    below for the oracle that samples inside that window.
+    """
+    conn = _init_tmp_db(tmp_path)
+    Path(config.options_path).write_text(
+        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
+    )
+    db = get_db()
+
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
+        "enabled) VALUES ('C4 Site', 40.0, -105.0, 900.0, 'UTC', 1)"
+    )
+    site_id = cur.lastrowid
+    assert site_id is not None
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
+        "VALUES (?, 'ISTATION-C4', 40.0, -105.0, 900.0)",
+        (site_id,),
+    )
+    station_id = cur.lastrowid
+    assert station_id is not None
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
+        "VALUES ('fetch_current_obs', ?, ?, ?, 'pending', 3)",
+        (site_id, f"curobs:{station_id}", json.dumps({"station_id": station_id})),
+    )
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
+        "VALUES ('fetch_obs', ?, 'obs', '{}', 'pending', 3)",
+        (site_id,),
+    )
+    conn.commit()
+
+    def _online_body() -> bytes:
+        return json.dumps(
+            {
+                "observations": [
+                    {
+                        "obsTimeUtc": "2026-07-10T11:55:00Z",
+                        "humidity": 50.0,
+                        "winddir": 180.0,
+                        "uv": 1.0,
+                        "neighborhood": "Test Quarter",
+                        "metric": {
+                            "temp": 20.0,
+                            "dewpt": 10.0,
+                            "windSpeed": 5.0,
+                            "windGust": 8.0,
+                            "pressure": 1012.0,
+                            "precipRate": 0.0,
+                            "precipTotal": 0.0,
+                        },
+                    }
+                ]
+            }
+        ).encode()
+
+    async def _bump_generation_then_reply(
+        pws_station_id: str,
+        api_key: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> httpx.Response:
+        db._generation += 1  # noqa: SLF001 -- simulates an import replacing the db
+        return httpx.Response(
+            200,
+            content=_online_body(),
+            headers={"content-type": "application/json"},
+            request=httpx.Request(
+                "GET", "https://api.weather.com/v2/pws/observations/current"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_current_observation",
+        _bump_generation_then_reply,
+    )
+
+    async def _run() -> None:
+        lock = weathercom_call_lock()
+        job = await db.write(claim_next_current_obs_job)
+        assert job is not None
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.processor"):
+            await run_claimed_job(db, job, lane="current_obs")
+
+        row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job.id,)).fetchone()
+        assert row is not None and row["status"] == "running", (
+            "an abandoned job is left exactly as claimed -- no further write "
+            "is safe against a generation it no longer belongs to"
+        )
+        assert lock.locked() is False
+        abandoned = [r for r in caplog.records if "job abandoned id=" in r.getMessage()]
+        assert len(abandoned) == 1, [r.getMessage() for r in caplog.records]
+
+        # The other lane keeps claiming: the unrelated main-lane job seeded
+        # above is still claimable after the current-obs lane's abandon.
+        other = await db.write(claim_next_job)
+        assert other is not None and other.type == "fetch_obs"
+
+    asyncio.run(_run())
+
+
+def test_c4_ordinary_failure_mutant_attempts_a_second_fenced_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C4 discriminator: exactly two fenced writes are attempted while
+    abandoning a stale-generation job -- the reserve (which still matches
+    the generation it was captured under) and the outcome write that
+    discovers the swap and raises `StaleGenerationError`. Nothing
+    downstream retries a further write against a generation the job no
+    longer belongs to.
+
+    This is the oracle that samples INSIDE the window the main C4 test
+    cannot see: the "ordinary failure" mutant (letting `StaleGenerationError`
+    fall into the generic `except Exception` branch instead of the immediate
+    `raise`) is equivalent to the correct code at every END state the main
+    C4 test asserts -- same log, same job row, same released call lock --
+    because `FencedWriter.write` rejects with `StaleGenerationError` before
+    its callback ever runs, so the generic branch's own `_fail_job` write
+    raises the identical error, caught by the same outer handler. The
+    divergence is COUNT, not outcome: the mutant issues a second, doomed
+    `writer.write` call (the generic branch's `_fail_job` attempt) that the
+    correct code never reaches.
+
+    Mutant: `run_claimed_job` letting `StaleGenerationError` propagate via
+    the generic branch instead of raising immediately -- `write_fenced`
+    call count would be 3, not 2.
+    """
+    conn = _init_tmp_db(tmp_path)
+    Path(config.options_path).write_text(
+        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
+    )
+    db = get_db()
+
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
+        "enabled) VALUES ('C4b Site', 40.0, -105.0, 900.0, 'UTC', 1)"
+    )
+    site_id = cur.lastrowid
+    assert site_id is not None
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
+        "VALUES (?, 'ISTATION-C4B', 40.0, -105.0, 900.0)",
+        (site_id,),
+    )
+    station_id = cur.lastrowid
+    assert station_id is not None
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
+        "VALUES ('fetch_current_obs', ?, ?, ?, 'pending', 3)",
+        (site_id, f"curobs:{station_id}", json.dumps({"station_id": station_id})),
+    )
+    conn.commit()
+
+    def _online_body() -> bytes:
+        return json.dumps(
+            {
+                "observations": [
+                    {
+                        "obsTimeUtc": "2026-07-10T11:55:00Z",
+                        "humidity": 50.0,
+                        "winddir": 180.0,
+                        "uv": 1.0,
+                        "neighborhood": "Test Quarter",
+                        "metric": {
+                            "temp": 20.0,
+                            "dewpt": 10.0,
+                            "windSpeed": 5.0,
+                            "windGust": 8.0,
+                            "pressure": 1012.0,
+                            "precipRate": 0.0,
+                            "precipTotal": 0.0,
+                        },
+                    }
+                ]
+            }
+        ).encode()
+
+    async def _bump_generation_then_reply(
+        pws_station_id: str,
+        api_key: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> httpx.Response:
+        db._generation += 1  # noqa: SLF001 -- simulates an import replacing the db
+        return httpx.Response(
+            200,
+            content=_online_body(),
+            headers={"content-type": "application/json"},
+            request=httpx.Request(
+                "GET", "https://api.weather.com/v2/pws/observations/current"
+            ),
+        )
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_current_observation",
+        _bump_generation_then_reply,
+    )
+
+    fenced_write_calls = 0
+    real_write_fenced = type(db).write_fenced
+
+    async def _counting_write_fenced(self: Any, fn: Any, *, generation: int) -> Any:
+        nonlocal fenced_write_calls
+        fenced_write_calls += 1
+        return await real_write_fenced(self, fn, generation=generation)
+
+    monkeypatch.setattr(type(db), "write_fenced", _counting_write_fenced)
+
+    async def _run() -> None:
+        job = await db.write(claim_next_current_obs_job)
+        assert job is not None
+
+        nonlocal fenced_write_calls
+        fenced_write_calls = 0  # exclude the claim write above
+        await run_claimed_job(db, job, lane="current_obs")
+
+        assert fenced_write_calls == 2, (
+            "exactly two fenced writes (the reserve, then the outcome write "
+            f"that discovers the stale generation) should be attempted; "
+            f"saw {fenced_write_calls}"
+        )
+
+    asyncio.run(_run())
+
+
+def test_dl4_history_call_deadline_is_not_refunded_and_marks_the_station(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DL4: a provider-call deadline through the main lane's history call
+    site (`_fetch_obs` -> `fetch_hourly_history`) behaves like DL3's
+    current-obs case -- no refund (`ProviderDeadlineExceeded` is a
+    `TimeoutError`, not one of `_REFUNDABLE_TRANSPORT_ERRORS`), the job
+    fails/retries, the call lock is released -- and additionally the
+    station's `error_count` rises by exactly 1 with `last_error` set
+    (`_mark_station_error`, the generic-exception branch of `_fetch_obs`).
+
+    Mutant: accepting `TimeoutError` into `is_refundable_transport_error` --
+    the same mutant DL3 targets, killed here through the history call site.
+    """
+    conn = _init_tmp_db(tmp_path)
+    Path(config.options_path).write_text(
+        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
+    )
+    db = get_db()
+
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
+        "enabled) VALUES ('DL4 Site', 40.0, -105.0, 900.0, 'UTC', 1)"
+    )
+    site_id = cur.lastrowid
+    assert site_id is not None
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
+        "VALUES (?, 'ISTATION-DL4', 40.0, -105.0, 900.0)",
+        (site_id,),
+    )
+    station_id = cur.lastrowid
+    assert station_id is not None
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
+        "VALUES ('fetch_obs', ?, 'obs', '{}', 'pending', 3)",
+        (site_id,),
+    )
+    conn.commit()
+
+    async def _raise_deadline(*_args: object, **_kwargs: object) -> list[object]:
+        raise ProviderDeadlineExceeded("provider call exceeded its deadline")
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_hourly_history", _raise_deadline
+    )
+
+    async def _run() -> None:
+        lock = weathercom_call_lock()
+
+        def _weathercom_calls() -> int:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(calls), 0) AS c FROM api_budget"
+                " WHERE source = 'weathercom'"
+            ).fetchone()
+            return int(row["c"])
+
+        before = _weathercom_calls()
+        job = await db.write(claim_next_job)
+        assert job is not None and job.type == "fetch_obs"
+
+        assert not is_refundable_transport_error(
+            ProviderDeadlineExceeded("provider call exceeded its deadline")
+        )
+
+        await run_claimed_job(db, job, lane="main")
+
+        after = _weathercom_calls()
+        assert after == before + 1, "a refund would bring the call count back down by 1"
+
+        station_row = conn.execute(
+            "SELECT error_count, last_error FROM stations WHERE id=?", (station_id,)
+        ).fetchone()
+        assert station_row["error_count"] == 1
+        assert station_row["last_error"] is not None
+
+        job_row = conn.execute(
+            "SELECT status, retry_count FROM jobs WHERE id=?", (job.id,)
+        ).fetchone()
+        assert job_row["status"] in ("pending", "failed")
+        assert job_row["retry_count"] == 1
+
+        assert lock.locked() is False
+
+    asyncio.run(_run())
+
+
+def test_dl5_cancel_mid_call_releases_the_lock_and_reclaims_the_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DL5: cancelling `run_worker` while the current-obs lane is mid-call
+    (holding the shared weathercom call lock) still releases the lock and
+    reclaims the claimed job -- the one shutdown reclaim (C3), reached
+    through the real lane, not a fake.
+
+    Mutants: holding the lock through a bare `acquire()` with no
+    `try/finally` -- the lock would stay held after cancellation; and
+    dropping the reclaim from the cancel path -- the job would stay
+    `running`.
+    """
+    conn = _init_tmp_db(tmp_path)
+    Path(config.options_path).write_text(
+        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
+    )
+    db = get_db()
+
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
+        "enabled) VALUES ('DL5 Site', 40.0, -105.0, 900.0, 'UTC', 1)"
+    )
+    site_id = cur.lastrowid
+    assert site_id is not None
+    conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
+        "VALUES (?, 'ISTATION-DL5', 40.0, -105.0, 900.0)",
+        (site_id,),
+    )
+    conn.commit()
+
+    async def _idle_main(_db: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("wxverify.worker.processor._run_main_lane", _idle_main)
+
+    entered = asyncio.Event()
+    finally_ran: list[bool] = []
+
+    async def _hanging_current_obs(
+        pws_station_id: str,
+        api_key: str,
+        *,
+        client: httpx.AsyncClient | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> httpx.Response:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finally_ran.append(True)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_current_observation", _hanging_current_obs
+    )
+
+    async def _run() -> None:
+        lock = weathercom_call_lock()
+        task = asyncio.create_task(run_worker(db))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        assert lock.locked() is True
+        task.cancel()
+        await _await_task_done(task)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finally_ran == [True]
+        assert lock.locked() is False
+        row = conn.execute(
+            "SELECT status FROM jobs WHERE type='fetch_current_obs'"
+        ).fetchone()
+        assert row is not None and row["status"] == "pending"
+
+    asyncio.run(_run())
