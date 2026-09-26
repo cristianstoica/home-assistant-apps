@@ -159,7 +159,9 @@ class _FakeDb:
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
-    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+    async def write_fenced(  # type: ignore[no-untyped-def]
+        self, fn, *, generation, epoch_exempt=False
+    ):
         return fn(None)
 
 

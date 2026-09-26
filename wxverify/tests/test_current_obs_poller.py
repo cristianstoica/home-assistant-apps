@@ -556,7 +556,9 @@ class _PollerFakeDb:
         self._claimed = False
         self.generation = 5
 
-    async def write(self, fn: object) -> ClaimedCurrentObs | None:
+    async def write(
+        self, fn: object, *, epoch_exempt: bool = False
+    ) -> ClaimedCurrentObs | None:
         if self._claimed:
             return None
         self._claimed = True
@@ -692,9 +694,11 @@ def test_f3_real_run_claimed_jobs_fence_capture_observes_the_pre_bump_generation
     real_fenced_writer = FencedWriter
 
     class _RecordingWriter(real_fenced_writer):  # type: ignore[misc]
-        def __init__(self, db: object, generation: int) -> None:
+        def __init__(
+            self, db: object, generation: int, *, epoch_exempt: bool = False
+        ) -> None:
             captured["generation"] = generation
-            super().__init__(db, generation)
+            super().__init__(db, generation, epoch_exempt=epoch_exempt)
 
     monkeypatch.setattr("wxverify.worker.processor.FencedWriter", _RecordingWriter)
 
@@ -742,6 +746,26 @@ _ALLOWED_CURRENT_OBS_TABLES = frozenset(
 )
 
 
+def _runtime_state_snapshot(conn: sqlite3.Connection) -> dict[str, str]:
+    """Every ``runtime_state`` row, keyed for a before/after diff.
+
+    The only ``runtime_state`` keys a compute reads are published-generation
+    pointer keys; T-E4b's whole point is proving the current-obs lane never
+    writes one of those, so the diff is over KEYS, not just row count.
+    """
+    return {
+        row["key"]: row["value"]
+        for row in conn.execute("SELECT key, value FROM runtime_state")
+    }
+
+
+def _changed_runtime_state_keys(
+    before: dict[str, str], after: dict[str, str]
+) -> set[str]:
+    """The set of ``runtime_state`` keys ``after`` added or changed vs ``before``."""
+    return {key for key, value in after.items() if before.get(key) != value}
+
+
 def test_w_current_obs_lane_write_set_stays_within_its_allowlist(
     tmp_path: Path,
 ) -> None:
@@ -750,6 +774,7 @@ def test_w_current_obs_lane_write_set_stays_within_its_allowlist(
     site_id = _seed_site(conn)
     station_id = _seed_station(conn, site_id)
 
+    before_runtime_state = _runtime_state_snapshot(conn)
     written_tables: set[str] = set()
 
     def _authorizer(
@@ -823,6 +848,13 @@ def test_w_current_obs_lane_write_set_stays_within_its_allowlist(
         conn.set_authorizer(None)
 
     assert written_tables <= _ALLOWED_CURRENT_OBS_TABLES
+    # T-E4b (key-scoped): the only runtime_state key this whole scenario
+    # touches is the heartbeat -- never a published-generation pointer key,
+    # the only kind a scoring compute reads.
+    after_runtime_state = _runtime_state_snapshot(conn)
+    assert _changed_runtime_state_keys(before_runtime_state, after_runtime_state) == {
+        HEARTBEAT_KEY
+    }
 
 
 def _online_obs() -> Any:
@@ -1467,3 +1499,211 @@ def test_false_station_id_payload_renders_station_0_on_the_claim_line(
     record = _log_message(monkeypatch, caplog, claimed)
     assert " station=0 " in record.getMessage()
     assert " station=False " not in record.getMessage()
+
+
+# ---------------------------------------------------------------------------
+# T-E4a/T-E4b: the current-obs lane's writes are exempt from the input epoch
+# ---------------------------------------------------------------------------
+
+
+def _online_current_obs_body() -> bytes:
+    return json.dumps(
+        {
+            "observations": [
+                {
+                    "obsTimeUtc": "2026-07-10T11:55:00Z",
+                    "humidity": 50.0,
+                    "winddir": 180.0,
+                    "uv": 1.0,
+                    "neighborhood": "Test Quarter",
+                    "metric": {
+                        "temp": 20.0,
+                        "dewpt": 10.0,
+                        "windSpeed": 5.0,
+                        "windGust": 8.0,
+                        "pressure": 1012.0,
+                        "precipRate": 0.0,
+                        "precipTotal": 0.0,
+                    },
+                }
+            ]
+        }
+    ).encode()
+
+
+async def _fake_fetch_current_observation_online(
+    pws_station_id: str,
+    api_key: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout_seconds: float = 10.0,
+) -> httpx.Response:
+    return httpx.Response(
+        200,
+        content=_online_current_obs_body(),
+        headers={"content-type": "application/json"},
+        request=httpx.Request(
+            "GET", "https://api.weather.com/v2/pws/observations/current"
+        ),
+    )
+
+
+def test_e4a_a_current_obs_lane_run_does_not_move_the_input_epoch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T-E4a(a) (M4, MX-lane), plus T-E4b's empty-case key-scoped check and
+    the W test's table-scoped write-set check, both replayed here.
+
+    An ONLINE ``fetch_current_obs`` job run through ``run_claimed_job(...,
+    lane="current_obs")`` must not move ``Database.input_epoch``, must
+    actually persist the observation (so the unchanged epoch is not just a
+    no-op run), must touch no ``runtime_state`` key at all, and must write
+    only tables inside ``_ALLOWED_CURRENT_OBS_TABLES``.
+
+    Control: the identical job, claimed and run in a FRESH database with
+    ``lane="main"``, DOES move the epoch. Kept alongside the primary
+    assertion (not in its place) because the two together are what pin
+    which lane the exemption is on, whichever way a swap-the-condition
+    mutant shapes it: the exemption must be absent exactly on the "main"
+    run and present exactly on the "current_obs" run.
+    """
+    monkeypatch.setattr(
+        "wxverify.worker.processor.fetch_current_observation",
+        _fake_fetch_current_observation_online,
+    )
+
+    async def run_current_obs_lane() -> None:
+        db = _init_tmp_db(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        site_id = _seed_site(conn)
+        station_id = _seed_station(conn, site_id)
+        _seed_current_obs_job(conn, site_id, station_id)
+
+        enabled_before = conn.execute(
+            "SELECT enabled FROM stations WHERE id = ?", (station_id,)
+        ).fetchone()[0]
+        assert enabled_before == 1, (
+            "seeding must leave the station enabled, or an unwritten row "
+            "would make the epoch/effect assertion below vacuous"
+        )
+
+        before_runtime_state = _runtime_state_snapshot(conn)
+        written_tables: set[str] = set()
+
+        def _authorizer(
+            action_code: int,
+            arg1: str | None,
+            arg2: str | None,
+            dbname: str | None,
+            source: str | None,
+        ) -> int:
+            if (
+                action_code
+                in (
+                    sqlite3.SQLITE_INSERT,
+                    sqlite3.SQLITE_UPDATE,
+                    sqlite3.SQLITE_DELETE,
+                )
+                and arg1 is not None
+            ):
+                written_tables.add(arg1)
+            return sqlite3.SQLITE_OK
+
+        job = await db.write(claim_next_current_obs_job)
+        assert job is not None
+        e0 = db.input_epoch
+
+        conn.set_authorizer(_authorizer)
+        try:
+            await run_claimed_job(db, job, lane="current_obs")
+        finally:
+            conn.set_authorizer(None)
+
+        assert db.input_epoch == e0
+        row = conn.execute(
+            "SELECT 1 FROM station_current_obs WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        assert row is not None, "the ONLINE observation must have been persisted"
+
+        after_runtime_state = _runtime_state_snapshot(conn)
+        assert (
+            _changed_runtime_state_keys(before_runtime_state, after_runtime_state)
+            == set()
+        )
+        assert written_tables <= _ALLOWED_CURRENT_OBS_TABLES
+
+    asyncio.run(run_current_obs_lane())
+
+    control_dir = tmp_path / "control"
+    control_dir.mkdir()
+
+    async def run_main_lane_control() -> None:
+        db = _init_tmp_db(control_dir)
+        conn = db._conn  # noqa: SLF001
+        site_id = _seed_site(conn)
+        station_id = _seed_station(conn, site_id)
+        _seed_current_obs_job(conn, site_id, station_id)
+
+        job = await db.write(claim_next_current_obs_job)
+        assert job is not None
+        e0 = db.input_epoch
+
+        await run_claimed_job(db, job, lane="main")
+
+        assert db.input_epoch != e0, (
+            "the control run (lane='main') must move the epoch, or this "
+            "test cannot discriminate M4 (the exemption on the wrong lane)"
+        )
+
+    asyncio.run(run_main_lane_control())
+
+
+def test_e4a_b_poller_heartbeat_write_does_not_move_the_input_epoch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T-E4a(b) (MX-poller) and T-E4b's non-empty-case key-scoped check.
+
+    No station is seeded, so the poller's pass claims nothing and only its
+    heartbeat write runs (``epoch_exempt=True``, no job-scoped read behind
+    it). That write must not move the input epoch, and the only
+    ``runtime_state`` key it changes is ``HEARTBEAT_KEY``.
+
+    Mutant MX-poller drops ``epoch_exempt=True`` from the heartbeat write:
+    it would then move the epoch, failing the primary assertion here.
+    """
+    gate = _SleepGate()
+    monkeypatch.setattr(
+        current_obs_poller_module, "asyncio", SimpleNamespace(sleep=gate.sleep)
+    )
+
+    async def _run_job_raises(db: object, job: object, *, lane: str) -> None:
+        raise AssertionError(
+            "no job should ever be claimed in this test: no stations are seeded"
+        )
+
+    async def run() -> None:
+        db = _init_tmp_db(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        before_runtime_state = _runtime_state_snapshot(conn)
+        e0 = db.input_epoch
+
+        task = asyncio.create_task(run_current_obs_poller(db, run_job=_run_job_raises))
+        try:
+            await asyncio.wait_for(gate.wait_reached(), timeout=5)
+            assert db.input_epoch == e0
+            row = conn.execute(
+                "SELECT 1 FROM runtime_state WHERE key = ?", (HEARTBEAT_KEY,)
+            ).fetchone()
+            assert row is not None
+            after_runtime_state = _runtime_state_snapshot(conn)
+            assert _changed_runtime_state_keys(
+                before_runtime_state, after_runtime_state
+            ) == {HEARTBEAT_KEY}
+        finally:
+            task.cancel()
+            await _await_task_done(task)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())

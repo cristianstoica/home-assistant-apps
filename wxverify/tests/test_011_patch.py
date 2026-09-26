@@ -136,7 +136,9 @@ class _FakeDb:
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
-    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+    async def write_fenced(  # type: ignore[no-untyped-def]
+        self, fn, *, generation, epoch_exempt=False
+    ):
         return fn(None)
 
 
@@ -158,9 +160,13 @@ class _WriteCountDb:
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return await self._inner.read(fn)
 
-    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+    async def write_fenced(  # type: ignore[no-untyped-def]
+        self, fn, *, generation, epoch_exempt=False
+    ):
         self.count += 1
-        return await self._inner.write_fenced(fn, generation=generation)
+        return await self._inner.write_fenced(
+            fn, generation=generation, epoch_exempt=epoch_exempt
+        )
 
 
 class _GenerationFenceDb:
@@ -178,7 +184,9 @@ class _GenerationFenceDb:
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
-    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+    async def write_fenced(  # type: ignore[no-untyped-def]
+        self, fn, *, generation, epoch_exempt=False
+    ):
         if generation != self.generation:
             raise StaleGenerationError(generation, self.generation)
         return fn(None)

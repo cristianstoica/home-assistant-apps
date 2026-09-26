@@ -87,7 +87,11 @@ class _RealDb:
         return fn(self._conn)
 
     async def write_fenced(
-        self, fn: Callable[[sqlite3.Connection], T], *, generation: int
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        generation: int,
+        epoch_exempt: bool = False,
     ) -> T:
         return fn(self._conn)
 

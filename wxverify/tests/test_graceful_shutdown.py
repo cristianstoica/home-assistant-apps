@@ -285,8 +285,10 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     release = asyncio.Event()
     real_write = Database.write
 
-    async def _write_with_barrier(self: Database, fn: Any) -> Any:
-        result = await real_write(self, fn)
+    async def _write_with_barrier(
+        self: Database, fn: Any, *, epoch_exempt: bool = False
+    ) -> Any:
+        result = await real_write(self, fn, epoch_exempt=epoch_exempt)
         if fn is claim_next_job:
             claimed.set()
             await release.wait()
@@ -2176,10 +2178,14 @@ def test_c4_ordinary_failure_mutant_attempts_a_second_fenced_write(
     fenced_write_calls = 0
     real_write_fenced = type(db).write_fenced
 
-    async def _counting_write_fenced(self: Any, fn: Any, *, generation: int) -> Any:
+    async def _counting_write_fenced(
+        self: Any, fn: Any, *, generation: int, epoch_exempt: bool = False
+    ) -> Any:
         nonlocal fenced_write_calls
         fenced_write_calls += 1
-        return await real_write_fenced(self, fn, generation=generation)
+        return await real_write_fenced(
+            self, fn, generation=generation, epoch_exempt=epoch_exempt
+        )
 
     monkeypatch.setattr(type(db), "write_fenced", _counting_write_fenced)
 

@@ -13,13 +13,14 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import Final, TypeVar
 
 from wxverify import config
 from wxverify.core.aio import run_to_completion
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
+from wxverify.db.snapshot import read_only_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +38,9 @@ SLOW_READ_MS = 250.0
 # diagnostic, not a fault. The two halves are checked separately because
 # they have different causes -- `lock_wait` is time queued behind other
 # writers, `hold` is this write's own transaction. With INFO enabled, a log
-# with no such line means every `write`/`write_fenced` that acquired the
-# lock and reached its timing `finally` kept both under a second.
+# with no such line means every `write`/`write_fenced`/`write_if_current`
+# that acquired the lock and reached its timing `finally` kept both under a
+# second.
 SLOW_WRITE_MS = 1000.0
 
 # SQLite in WAL mode lets any number of readers run concurrently with no
@@ -102,8 +104,10 @@ def _log_slow_write(
 class StaleGenerationError(Exception):
     """A fenced write's captured generation no longer matches the live database.
 
-    Raised by ``Database.write_fenced`` when the database has been replaced
-    (see ``replace_from``) since the caller captured ``Database.generation``.
+    Raised by ``Database.write_fenced`` and ``Database.write_if_current``
+    when the database has been replaced (see ``replace_from``) since the
+    caller captured ``Database.generation``; ``write_if_current`` checks the
+    generation before the input epoch.
     Whatever the caller read before is no longer known to describe the
     current database, so the write is rejected outright instead of risking
     it landing against unrelated data.
@@ -116,6 +120,26 @@ class StaleGenerationError(Exception):
         )
         self.requested_generation = requested
         self.current_generation = current
+
+
+class EpochMoved:
+    """The outcome of a ``write_if_current`` whose input epoch had moved.
+
+    Returned, never raised: a miss is an expected outcome that the caller
+    answers by recomputing from committed state. ``fn`` did not run and the
+    transaction changed nothing. Compare against the ``EPOCH_MOVED``
+    singleton or with ``isinstance``.
+    """
+
+    __slots__ = ()
+
+
+EPOCH_MOVED: Final = EpochMoved()
+
+
+class _EpochMovedSignal(Exception):
+    """Raised inside a ``write_if_current`` transaction, before ``fn`` runs,
+    when the input epoch no longer matches; caught by ``write_if_current``."""
 
 
 class Database:
@@ -156,6 +180,13 @@ class Database:
         # of this Database instance; never reset.
         self._read_stats: dict[str, ReadTiming] = {}
         self._read_stats_since = isoformat_utc()
+        # The input epoch moves on every commit that could change a scoring
+        # input: a non-exempt write on the writer connection that changed a
+        # row, a commit by any other connection (seen through
+        # `PRAGMA data_version`, tracked in `_dv_seen`), and every `_open`.
+        # See `_run_epoch_txn`.
+        self._input_epoch = 0
+        self._dv_seen = 0
         self._open()
         self._stock_pool()
 
@@ -203,6 +234,10 @@ class Database:
                 self._conn.rollback()
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
         self._read_sync_conn = self._connect_reader()
+        # The migrations and the sanitizer above ran through `_run_immediate`
+        # directly; this bump covers both, and an import's reopen with them.
+        self._dv_seen = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+        self._input_epoch += 1
 
     def _stock_pool(self) -> None:
         """Publish ``self._read_conns`` into the pool queue.
@@ -249,19 +284,66 @@ class Database:
         logger.debug("db txn commit")
         return result
 
-    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _run_epoch_txn(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        expected: int | None,
+        exempt: bool,
+    ) -> T:
+        """Run ``fn`` in one ``_run_immediate`` transaction, moving the epoch.
+
+        Every write transaction on ``self._conn`` except ``_open``'s own
+        passes through here. Inside ``BEGIN IMMEDIATE`` a changed
+        ``PRAGMA data_version`` (a commit by another connection) moves the
+        epoch; then, when ``expected`` is given and no longer matches, the
+        transaction ends before ``fn`` runs (``_EpochMovedSignal``). After
+        the commit or rollback, a non-exempt ``fn`` that changed at least one
+        row (``total_changes`` moved) moves the epoch once more.
+        """
+        # `_body` records the connection and its `total_changes` just before
+        # `fn` runs. A list, not `nonlocal` flags: pyright does not see a
+        # nested function's writes, narrows such flags to their initial
+        # values here, and would treat the bump below as unreachable.
+        ran: list[tuple[sqlite3.Connection, int]] = []
+
+        def _body(conn: sqlite3.Connection) -> T:
+            dv = int(conn.execute("PRAGMA data_version").fetchone()[0])
+            if dv != self._dv_seen:
+                self._dv_seen = dv
+                self._input_epoch += 1
+            if expected is not None and expected != self._input_epoch:
+                raise _EpochMovedSignal
+            ran.append((conn, conn.total_changes))
+            return fn(conn)
+
+        try:
+            # Looked up on the instance: tests and the bench patch it there.
+            return self._run_immediate(_body)
+        finally:
+            if ran and not exempt:
+                used, before = ran[-1]
+                if used.total_changes != before:
+                    self._input_epoch += 1
+
+    async def write(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        epoch_exempt: bool = False,
+    ) -> T:
         requested = time.perf_counter()
         async with self._write_lock:
             acquired = time.perf_counter()
             try:
-                # A nested zero-arg closure, not `self._run_immediate` passed
-                # directly: `_run_immediate` is itself generic, and
+                # A nested zero-arg closure, not `self._run_epoch_txn` passed
+                # directly: `_run_epoch_txn` is itself generic, and
                 # run_to_completion's `Callable[..., T]` erases per-argument
                 # types, so a bare method reference loses the binding between
                 # its own T and this T. Closing over the already-bound `fn`
-                # here resolves `_run_immediate`'s T against it first.
+                # here resolves `_run_epoch_txn`'s T against it first.
                 def _call() -> T:
-                    return self._run_immediate(fn)
+                    return self._run_epoch_txn(fn, expected=None, exempt=epoch_exempt)
 
                 return await run_to_completion(_call)
             finally:
@@ -275,12 +357,24 @@ class Database:
 
         Safe to read from the event loop with no lock: it is only ever
         mutated while ``_write_lock`` is held (inside ``_replace_sync``), and
-        ``write_fenced`` re-checks it again under that same lock at write
-        time. An unlocked read here is just an optimistic snapshot for the
-        caller's own bookkeeping -- the actual guarantee comes from the
-        locked recheck, not from this read.
+        ``write_fenced`` and ``write_if_current`` re-check it again under
+        that same lock at write time. An unlocked read here is just an
+        optimistic snapshot for the caller's own bookkeeping -- the actual
+        guarantee comes from the locked recheck, not from this read.
         """
         return self._generation
+
+    @property
+    def input_epoch(self) -> int:
+        """Input epoch: moves on every commit that could change a scoring input.
+
+        Safe to read from the event loop with no lock, exactly like
+        ``generation``: an unlocked read is an optimistic snapshot for the
+        caller's bookkeeping, and the guarantee comes from the recheck that
+        ``_run_epoch_txn`` makes under the write lock, inside
+        ``BEGIN IMMEDIATE``, in ``write_if_current``.
+        """
+        return self._input_epoch
 
     @property
     def last_import_swap_at(self) -> str | None:
@@ -292,7 +386,11 @@ class Database:
         return self._last_import_swap_at
 
     async def write_fenced(
-        self, fn: Callable[[sqlite3.Connection], T], *, generation: int
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        generation: int,
+        epoch_exempt: bool = False,
     ) -> T:
         """Like ``write``, but rejects a write submitted against a generation
         the database has since moved past.
@@ -309,9 +407,47 @@ class Database:
                     raise StaleGenerationError(generation, self._generation)
 
                 def _call() -> T:
-                    return self._run_immediate(fn)
+                    return self._run_epoch_txn(fn, expected=None, exempt=epoch_exempt)
 
                 return await run_to_completion(_call)
+            finally:
+                _log_slow_write(fn, requested, acquired, time.perf_counter())
+
+    async def write_if_current(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        generation: int,
+        epoch: int,
+    ) -> tuple[T, int] | EpochMoved:
+        """Apply ``fn`` only if the input epoch is still ``epoch``.
+
+        Three outcomes. ``StaleGenerationError`` when the database was
+        replaced since ``generation`` was captured -- checked first, so after
+        an import the caller fails as it does on ``write_fenced`` instead of
+        recomputing against the new database. ``EPOCH_MOVED`` when a commit
+        that could change a scoring input landed since ``epoch`` was read;
+        ``fn`` did not run. Otherwise ``(result, epoch_after)``, where
+        ``epoch_after`` includes this write's own bump, so a caller applying
+        the next chunk of the same delta passes it and its own earlier chunk
+        does not count as a foreign change.
+        """
+        requested = time.perf_counter()
+        async with self._write_lock:
+            acquired = time.perf_counter()
+            try:
+                if generation != self._generation:
+                    raise StaleGenerationError(generation, self._generation)
+
+                def _call() -> T:
+                    return self._run_epoch_txn(fn, expected=epoch, exempt=False)
+
+                try:
+                    result = await run_to_completion(_call)
+                except _EpochMovedSignal:
+                    return EPOCH_MOVED
+                # Read under the lock: includes this write's own bump.
+                return result, self._input_epoch
             finally:
                 _log_slow_write(fn, requested, acquired, time.perf_counter())
 
@@ -555,7 +691,7 @@ class Database:
         return self._read_stats_since
 
     def write_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return self._run_immediate(fn)
+        return self._run_epoch_txn(fn, expected=None, exempt=False)
 
     def read_sync(self, fn: Callable[[sqlite3.Connection], T]) -> T:
         return fn(self._read_sync_conn)
@@ -584,8 +720,9 @@ class Database:
         Both checks run on the event-loop thread with no ``await`` between
         them and the ``close()`` they guard, so what they report cannot go
         stale before it is used: a writer holds ``_write_lock`` for the
-        whole of ``write``/``write_fenced``, and a reader holds its
-        connection OUT of ``_read_pool`` for the whole of ``read``.
+        whole of ``write``/``write_fenced``/``write_if_current``, and a
+        reader holds its connection OUT of ``_read_pool`` for the whole of
+        ``read``.
 
         State what that buys exactly, because it is narrower than
         "nothing is going on": when both predicates read idle, no thread
@@ -744,17 +881,56 @@ class FencedWriter:
     Obtained once (via ``Database.generation``) at the point a caller's read
     is known to be current, then threaded through everything downstream that
     writes based on that read. Every write through this handle is rejected
-    with ``StaleGenerationError`` if the database has since been replaced;
-    reads are unaffected by generation and keep using ``Database.read``
-    directly.
+    with ``StaleGenerationError`` if the database has since been replaced.
+    A read whose result feeds a later ``write_if_current`` must come from
+    ``read_at_epoch``, which pairs it with the input epoch it was read at.
+    ``epoch_exempt`` marks every write through this handle as unable to
+    change a scoring input, so none of them moves the input epoch.
     """
 
-    def __init__(self, db: Database, generation: int) -> None:
+    def __init__(
+        self, db: Database, generation: int, *, epoch_exempt: bool = False
+    ) -> None:
         self._db = db
         self.generation = generation
+        self._epoch_exempt = epoch_exempt
+
+    @property
+    def input_epoch(self) -> int:
+        """The database's current input epoch (``Database.input_epoch``)."""
+        return self._db.input_epoch
 
     async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return await self._db.write_fenced(fn, generation=self.generation)
+        return await self._db.write_fenced(
+            fn, generation=self.generation, epoch_exempt=self._epoch_exempt
+        )
+
+    async def read_at_epoch(
+        self, fn: Callable[[sqlite3.Connection], T], *, label: str
+    ) -> tuple[int, T]:
+        """Run ``fn`` in one read-only snapshot; return ``(epoch, result)``.
+
+        The epoch is read BEFORE the read is submitted, so it always precedes
+        the snapshot: a commit between the two lies inside the snapshot but
+        after the epoch, and the later ``write_if_current`` misses spuriously
+        (safe). The reverse order would let a commit land after the snapshot
+        and before the epoch read, and a stale apply would pass.
+        """
+        epoch = self._db.input_epoch
+
+        def _snap(conn: sqlite3.Connection) -> T:
+            with read_only_snapshot(conn, label=label):
+                return fn(conn)
+
+        return epoch, await self._db.read(_snap)
+
+    async def write_if_current(
+        self, fn: Callable[[sqlite3.Connection], T], *, epoch: int
+    ) -> tuple[T, int] | EpochMoved:
+        """``Database.write_if_current`` at this handle's generation."""
+        return await self._db.write_if_current(
+            fn, generation=self.generation, epoch=epoch
+        )
 
 
 def init_db(path: str | None = None) -> Database:

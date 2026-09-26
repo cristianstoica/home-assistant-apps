@@ -328,7 +328,9 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     # job: every write below goes through `writer`, fenced to this
     # generation, so one that lands after a swap is rejected instead
     # of silently landing against whatever now owns this job's rows.
-    writer = FencedWriter(db, db.generation)
+    # A current-obs job's writes are also exempt from the input epoch:
+    # they touch only the current-obs lane's tables.
+    writer = FencedWriter(db, db.generation, epoch_exempt=(lane == "current_obs"))
     job_id = job.id
     claimed_at = time.monotonic()
     logger.info(
