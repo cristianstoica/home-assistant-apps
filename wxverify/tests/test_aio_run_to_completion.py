@@ -14,12 +14,19 @@ the last thing it does, from inside a ``finally``.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import threading
+import weakref
 
 import pytest
 
+from tests.helpers import alive_after_wait
 from wxverify.core.aio import run_to_completion
+
+
+class _Payload:
+    pass
 
 
 async def _settle() -> None:
@@ -246,3 +253,51 @@ def test_an_unrecoverable_style_error_from_the_thread_is_logged_despite_cancella
         assert matching[0].message == "executor call failed while cancelled"
 
     asyncio.run(_drive())
+
+
+def test_raised_exception_does_not_keep_the_callable_alive() -> None:
+    """A raised exception's traceback keeps the callable's payload alive only
+    as long as the caller's own exception handling is in progress; once the
+    exception has been handled and the loop has moved past the wakeup batch
+    that delivered it, nothing of the callable may still be reachable.
+
+    The cyclic collector is disabled for the whole test: it pins what the
+    code keeps by reference, and a collection would free a task/exception
+    cycle that ought to be broken explicitly, letting a broken
+    implementation pass anyway.
+    """
+    was = gc.isenabled()
+    gc.disable()
+    try:
+
+        async def _call_once(refs: list[weakref.ReferenceType[_Payload]]) -> None:
+            payload = _Payload()
+            refs.append(weakref.ref(payload))
+
+            def fn(p: _Payload = payload) -> None:
+                raise ValueError("boom")
+
+            await run_to_completion(fn)
+
+        async def _drive() -> None:
+            refs: list[weakref.ReferenceType[_Payload]] = []
+            try:
+                await _call_once(refs)
+            except ValueError:
+                inside = refs[0]() is not None
+            await _settle()
+            after = alive_after_wait([refs[0]])[0]
+
+            assert inside is True, (
+                "expected the payload still alive inside the except block "
+                "(otherwise this test proves nothing)"
+            )
+            assert after is False, (
+                "expected the payload released once the exception has been "
+                "handled and the loop has moved past the wakeup batch"
+            )
+
+        asyncio.run(_drive())
+    finally:
+        if was:
+            gc.enable()

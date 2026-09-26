@@ -64,8 +64,10 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
 
     HTTP routes and the CLI call this inside a single write transaction.
     The worker's ``pair_and_score`` dispatch and catchup's rescore lane
-    instead run the three ``PAIR_PHASES`` with one write transaction per
-    phase and then the batched scoring orchestrator
+    instead run ``SPLIT_PAIR_PHASES`` through
+    ``worker/score_batches.run_split_pair_phases``, computing each phase
+    outside the write lock and applying it in chunks under the input-epoch
+    compare-and-set, and then the batched scoring orchestrator
     (``worker/score_batches.run_batched_scoring``) so the write lock is
     never held for a whole rebuild — see the convergence-invariant comment
     at the worker dispatch site (worker/processor.py).
@@ -256,10 +258,12 @@ def _distinct_cells(
 # by earlier phases (samples/observations -> pairs -> score cache), so
 # running them in separate write transactions is end-state equivalent to the
 # monolithic run as long as no observation write interleaves between phases.
-# The worker lanes run PAIR_PHASES one-transaction-per-phase and then the
-# batched scoring orchestrator (worker/score_batches.py); the monolithic
-# callers (inline route rescores, CLI `_score`) run PAIR_AND_SCORE_PHASES
-# in a single transaction via pair_and_score.
+# The worker lanes run SPLIT_PAIR_PHASES through run_split_pair_phases
+# (worker/score_batches.py), computing each phase outside the write lock and
+# applying it in chunks under the input-epoch compare-and-set, and then the
+# batched scoring orchestrator; the monolithic callers (inline route
+# rescores, CLI `_score`) run PAIR_AND_SCORE_PHASES in a single transaction
+# via pair_and_score.
 PAIR_PHASES: Final[tuple[Callable[[sqlite3.Connection, int | None], object], ...]] = (
     pair_real_models,
     materialize_persistence,

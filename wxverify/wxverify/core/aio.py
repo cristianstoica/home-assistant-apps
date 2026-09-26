@@ -67,4 +67,12 @@ async def run_to_completion[T](fn: Callable[..., T], /, *args: object) -> T:
         # call task.uncancel() here -- the cancel count must keep
         # reflecting that a cancellation was requested.
         raise cancelled
-    return task.result()
+    try:
+        return task.result()
+    finally:
+        # task.result() re-raises the child's exception, whose traceback
+        # holds this frame; this frame's `task` holds the exception again
+        # (Task._exception). Dropping `task` breaks that cycle, so the
+        # traceback's frames, and the `fn` they reference, are freed when
+        # the caller's handler ends, not at the next cyclic collection.
+        del task

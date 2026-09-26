@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,9 @@ from wxverify.db.queue import (
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.obs.pws_adapter import decode_observations_payload
 from wxverify.provider_ops import enqueue_fetch_for_feed
+from wxverify.scoring.engine import SplitPhase
+from wxverify.scoring.split import PairDelta
+from wxverify.worker import score_batches
 from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
 from wxverify.worker.feed_fetch import (
@@ -153,6 +157,10 @@ class _WriteCountDb:
     def generation(self) -> int:
         return self._inner.generation  # type: ignore[no-any-return]
 
+    @property
+    def input_epoch(self) -> int:
+        return self._inner.input_epoch  # type: ignore[no-any-return]
+
     async def write(self, fn):  # type: ignore[no-untyped-def]
         self.count += 1
         return await self._inner.write(fn)
@@ -166,6 +174,12 @@ class _WriteCountDb:
         self.count += 1
         return await self._inner.write_fenced(
             fn, generation=generation, epoch_exempt=epoch_exempt
+        )
+
+    async def write_if_current(self, fn, *, generation, epoch):  # type: ignore[no-untyped-def]
+        self.count += 1
+        return await self._inner.write_if_current(
+            fn, generation=generation, epoch=epoch
         )
 
 
@@ -1675,10 +1689,12 @@ def test_idx_pairs_cell_created_on_pre_existing_v2_db(tmp_path: Path) -> None:
     )
 
 
-def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(
+def test_pair_and_score_dispatch_issues_exactly_five_write_transactions(
     tmp_path: Path,
 ) -> None:
-    """pair_and_score dispatches each phase in its own db.write (≥4 transactions)."""
+    """pair_and_score dispatches each split-pair phase's single (empty) chunk through
+    its own write_if_current, then batched scoring's discovery write and final sweep;
+    windows with no cells issue no batch write (3 + 2 = 5 transactions)."""
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     db = get_db()
@@ -1688,29 +1704,64 @@ def test_pair_and_score_dispatch_issues_at_least_four_write_transactions(
     job = _make_job(job_type="pair_and_score", site_id=site_id)
     asyncio.run(dispatch(spy, writer, job))  # type: ignore[arg-type]
 
-    assert spy.count >= 4, f"Expected ≥4 write transactions, got {spy.count}"
+    assert spy.count == 5, f"Expected exactly 5 write transactions, got {spy.count}"
 
 
 def test_pair_and_score_stops_when_site_disabled_between_phases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Enabled gate re-checked per phase: disabling mid-run aborts remaining phases."""
+    """Enabled gate re-checked per chunk apply: disabling mid-run blocks phase 1's
+    apply. MX-proc-enabled (the processor passes require_enabled=False) still ends
+    in JobCancelled, raised by batched scoring's sweep check, so an exception-only
+    assertion passes it; the oracle is the applied list."""
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     db = get_db()
 
-    phases_called: list[int] = []
+    computed: list[int] = []
+    applied: list[int] = []
+    real_apply = score_batches._apply_split_chunk  # noqa: SLF001
 
-    def _phase0(c: sqlite3.Connection, sid: int | None) -> None:
-        phases_called.append(0)
-        c.execute("UPDATE sites SET enabled=0 WHERE id=?", (sid,))
+    def _make_phase_compute(index: int) -> Callable[..., PairDelta]:
+        def _compute(c: sqlite3.Connection, sid: int | None) -> PairDelta:
+            computed.append(index)
+            return PairDelta((), (), "", count=index)
 
-    def _phase1(c: sqlite3.Connection, sid: int | None) -> None:
-        phases_called.append(1)  # must never run
+        return _compute
+
+    def _tracking_apply_split_chunk(
+        conn: sqlite3.Connection,
+        sid: int,
+        delta: PairDelta,
+        ops: tuple[object, ...],
+        resolver: object,
+        *,
+        first: bool,
+        require_enabled: bool,
+    ) -> int:
+        result = real_apply(
+            conn,
+            sid,
+            delta,
+            ops,
+            resolver,
+            first=first,
+            require_enabled=require_enabled,
+        )
+        applied.append(delta.count)
+        conn.execute("UPDATE sites SET enabled=0 WHERE id=?", (sid,))
+        return result
 
     monkeypatch.setattr(
-        "wxverify.worker.processor.PAIR_PHASES",
-        (_phase0, _phase1),
+        "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+        (
+            SplitPhase("phase0", _make_phase_compute(0)),
+            SplitPhase("phase1", _make_phase_compute(1)),
+        ),
+    )
+    monkeypatch.setattr(
+        "wxverify.worker.score_batches._apply_split_chunk",
+        _tracking_apply_split_chunk,
     )
 
     job = _make_job(job_type="pair_and_score", site_id=site_id)
@@ -1718,6 +1769,8 @@ def test_pair_and_score_stops_when_site_disabled_between_phases(
     with pytest.raises(JobCancelled):
         asyncio.run(dispatch(db, writer, job))
 
-    assert phases_called == [0], (
-        "phase 0 must run; phase 1 must be blocked by the enabled gate"
+    assert computed == [0, 1], "both phases must be computed before the gate bites"
+    assert applied == [0], (
+        "phase 0's chunk must apply and disable the site; phase 1's apply "
+        "must be blocked by the enabled gate before it does anything"
     )

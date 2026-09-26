@@ -8,15 +8,23 @@ the T-rollback section below). All fixture data is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import gc
+import json
+import logging
 import sqlite3
+import threading
 import tracemalloc
+import weakref
+from collections import Counter
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
 from tests.helpers import (
+    alive_after_wait,
     asof_conn,
     asof_insert_observation,
     asof_insert_pair,
@@ -25,13 +33,25 @@ from tests.helpers import (
     asof_make_site,
 )
 from tests.scoring_ref_0164 import materialize_multimodel_mean_0164
-from wxverify.db.connection import Database
+from wxverify import config
+from wxverify.core.timeutil import parse_utc, utc_now
+from wxverify.db.connection import (
+    Database,
+    EpochMoved,
+    FencedWriter,
+    StaleGenerationError,
+    close_db,
+    get_db,
+    init_db,
+)
+from wxverify.db.queue import Job
 from wxverify.db.snapshot import read_only_snapshot
 from wxverify.db.tz_generations import (
+    apply_prospective_change,
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.scoring.engine import PAIR_PHASES, SPLIT_PAIR_PHASES
+from wxverify.scoring.engine import PAIR_PHASES, SPLIT_PAIR_PHASES, SplitPhase
 from wxverify.scoring.multimodel import compute_multimodel_mean
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.pairing import compute_real_model_pairs
@@ -49,6 +69,10 @@ from wxverify.scoring.split import (
     apply_pair_ops,
     chunk_ops,
 )
+from wxverify.worker.catchup import run_catchup
+from wxverify.worker.control import JobDeferred
+from wxverify.worker.processor import dispatch
+from wxverify.worker.score_batches import run_split_pair_phases
 
 # --------------------------------------------------------------------------
 # T-chunk (M19, M22).
@@ -1010,3 +1034,661 @@ def test_computes_never_write_the_published_generation() -> None:
 
 def test_split_pair_phase_names_match_pair_phases_order() -> None:
     assert [p.name for p in SPLIT_PAIR_PHASES] == [f.__name__ for f in PAIR_PHASES]
+
+
+# ---------------------------------------------------------------------------
+# Step 3 -- run_split_pair_phases / dispatch / run_catchup end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
+    close_db()
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    options_path = tmp_path / "options.json"
+    options_path.write_text("{}", encoding="utf-8")
+    config.options_path = str(options_path)
+    db = init_db(str(db_path))
+    return db._conn  # noqa: SLF001 - tests inspect the real writer connection
+
+
+def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO sites
+            (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
+        VALUES (?, 40.0, -105.0, 900.0, 'UTC', ?)
+        """,
+        (name, enabled),
+    )
+    return int(cur.lastrowid)
+
+
+def _probe_compute(conn: sqlite3.Connection, site_id: int | None) -> PairDelta:
+    """A 3-op insert-only delta into a private ``_probe`` table."""
+    ops = tuple(InsertOp(site_id, (i,)) for i in range(3))
+    return PairDelta(
+        seed_sites=(site_id,) if site_id is not None else (),
+        ops=ops,
+        insert_sql="INSERT INTO _probe(a, g) VALUES (?, ?)",
+        count=None,
+    )
+
+
+def _job(site_id: int) -> Job:
+    return Job(
+        id=1,
+        type="pair_and_score",
+        site_id=site_id,
+        job_key="score",
+        payload={"site_id": site_id},
+        status="running",
+        retry_count=0,
+        max_retries=3,
+    )
+
+
+def test_split_pair_attempt_threads_the_returned_epoch_across_chunks_m6(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-m6-site")
+        conn.execute("CREATE TABLE _probe(a, g)")
+        ensure_published_generation(conn, site)
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _probe_compute),),
+        )
+        monkeypatch.setattr("wxverify.worker.score_batches.SCORING_APPLY_CHUNK_ROWS", 2)
+
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+            await run_split_pair_phases(writer, site, require_enabled=True)
+
+        rows = conn.execute("SELECT a FROM _probe ORDER BY a").fetchall()
+        assert [r["a"] for r in rows] == [0, 1, 2]
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not [m for m in messages if "cas_miss" in m]
+        phase_lines = [m for m in messages if m.startswith("score phase=probe ")]
+        assert len(phase_lines) == 1
+        assert phase_lines[0].startswith(f"score phase=probe site={site} elapsed=")
+        assert "chunks=2 ops=3 attempts=1" in phase_lines[0]
+
+    asyncio.run(_run())
+
+
+def test_split_pair_attempt_recomputes_after_a_generation_flip_m18(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-flip-site")
+        conn.execute("CREATE TABLE _probe(a, g)")
+        ensure_published_generation(conn, site)
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _probe_compute),),
+        )
+        monkeypatch.setattr("wxverify.worker.score_batches.SCORING_APPLY_CHUNK_ROWS", 2)
+
+        db = get_db()
+
+        class _FlipOnceWriter(FencedWriter):
+            def __init__(self) -> None:
+                super().__init__(db, db.generation)
+                self._flipped = False
+
+            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                result = await super().write_if_current(fn, epoch=epoch)
+                if not self._flipped and not isinstance(result, EpochMoved):
+                    self._flipped = True
+                    await self._db.write(
+                        lambda c: apply_prospective_change(
+                            c, site, "Etc/GMT-3", "2035-01-01T00:00:00Z"
+                        )
+                    )
+                return result
+
+        writer = _FlipOnceWriter()
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+            await run_split_pair_phases(writer, site, require_enabled=True)
+
+        rows = conn.execute("SELECT a, g FROM _probe").fetchall()
+        assert len(rows) == 5
+        gens = Counter(int(r["g"]) for r in rows)
+        assert sorted(gens.values()) == [2, 3]
+        larger_gen = max(gens, key=lambda g: gens[g])
+        assert larger_gen == published_generation_id(conn, site)
+
+        messages = [r.getMessage() for r in caplog.records]
+        cas_miss = [m for m in messages if "cas_miss" in m]
+        assert cas_miss == [f"score phase=probe site={site} cas_miss attempt=1"]
+        phase_lines = [m for m in messages if "elapsed=" in m]
+        assert len(phase_lines) == 1
+        assert "attempts=2" in phase_lines[0]
+
+    asyncio.run(_run())
+
+
+def test_split_pair_attempt_ops_log_counts_ops_not_insert_rowcount_m20(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-info-site")
+        conn.execute("CREATE TABLE _probe_pk(a INTEGER PRIMARY KEY, g)")
+        ensure_published_generation(conn, site)
+
+        def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
+            ops = tuple(InsertOp(site_id, (i % 2000,)) for i in range(2500))
+            return PairDelta(
+                seed_sites=(site_id,) if site_id is not None else (),
+                ops=ops,
+                insert_sql="INSERT OR IGNORE INTO _probe_pk(a, g) VALUES (?, ?)",
+                count=None,
+            )
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _compute),),
+        )
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SCORING_APPLY_CHUNK_ROWS", 1000
+        )
+
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+            await run_split_pair_phases(writer, site, require_enabled=True)
+
+        row_count = conn.execute("SELECT count(*) FROM _probe_pk").fetchone()[0]
+        assert row_count == 2000
+
+        phase_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("score phase=probe ")
+        ]
+        assert len(phase_lines) == 1
+        assert "chunks=3 ops=2500" in phase_lines[0]
+
+    asyncio.run(_run())
+
+
+def test_pair_and_score_dispatch_defers_when_every_cas_attempt_misses_m13(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-busy-proc-site")
+        conn.execute("CREATE TABLE _probe(a, g)")
+        conn.execute("CREATE TABLE _probe_bump(x)")
+        ensure_published_generation(conn, site)
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _probe_compute),),
+        )
+
+        db = get_db()
+
+        class _AlwaysBumpWriter(FencedWriter):
+            def __init__(self) -> None:
+                super().__init__(db, db.generation)
+
+            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                await self._db.write(
+                    lambda c: c.execute("INSERT INTO _probe_bump VALUES (1)")
+                )
+                return await super().write_if_current(fn, epoch=epoch)
+
+        writer = _AlwaysBumpWriter()
+
+        before = utc_now()
+        with caplog.at_level(logging.INFO), pytest.raises(JobDeferred) as excinfo:
+            await dispatch(db, writer, _job(site))
+        after = utc_now()
+
+        next_attempt = parse_utc(excinfo.value.next_attempt_at)
+        assert before + timedelta(seconds=60) <= next_attempt
+        assert next_attempt <= after + timedelta(seconds=60)
+
+        deferred = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("pair_and_score deferred")
+            and r.levelno == logging.WARNING
+        ]
+        assert deferred == [
+            f"pair_and_score deferred site={site} step=probe: inputs changed "
+            "on every one of 3 attempts"
+        ]
+
+        cas_miss = [
+            r.getMessage() for r in caplog.records if "cas_miss" in r.getMessage()
+        ]
+        assert cas_miss == [
+            f"score phase=probe site={site} cas_miss attempt=1",
+            f"score phase=probe site={site} cas_miss attempt=2",
+            f"score phase=probe site={site} cas_miss attempt=3",
+        ]
+
+    asyncio.run(_run())
+
+
+def test_pair_and_score_dispatch_raises_stale_generation_on_db_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-import-site")
+        conn.execute("CREATE TABLE _probe(a, g)")
+        ensure_published_generation(conn, site)
+
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        g0 = db.generation
+
+        backup_src = tmp_path / "pre.db"
+
+        def _backup(c: sqlite3.Connection) -> None:
+            dest = sqlite3.connect(str(backup_src))
+            try:
+                c.backup(dest)
+            finally:
+                dest.close()
+
+        await db.read(_backup)
+        marker_conn = sqlite3.connect(str(backup_src))
+        try:
+            marker_conn.execute("CREATE TABLE _swap_marker(x)")
+            marker_conn.commit()
+        finally:
+            marker_conn.close()
+
+        entered = threading.Event()
+        release = threading.Event()
+        computed = 0
+
+        def _gated_compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
+            nonlocal computed
+            computed += 1
+            entered.set()
+            if not release.wait(timeout=5.0):
+                raise TimeoutError("release was never set")
+            return _probe_compute(c, site_id)
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _gated_compute),),
+        )
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker"):
+            dispatch_task = asyncio.create_task(dispatch(db, writer, _job(site)))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5.0)
+                unused_backup = tmp_path / "unused-backup.db"
+                replace_task = asyncio.create_task(
+                    db.replace_from(backup_src, unused_backup)
+                )
+                deadline = asyncio.get_event_loop().time() + 5.0
+                while (
+                    db._read_gate.is_set() or db._read_pool.qsize() > 0  # noqa: SLF001
+                ):
+                    if asyncio.get_event_loop().time() > deadline:
+                        pytest.fail(
+                            "replace_from never reached its blocked-on-drain state"
+                        )
+                    await asyncio.sleep(0)
+                assert not db._read_gate.is_set()  # noqa: SLF001
+                assert db._write_lock.locked()  # noqa: SLF001
+                assert not replace_task.done()
+                assert db.generation == g0
+
+                probe_task = asyncio.create_task(
+                    db.read(
+                        lambda c: c.execute(
+                            "SELECT count(*) FROM sqlite_master "
+                            "WHERE name='_swap_marker'"
+                        ).fetchone()[0]
+                    )
+                )
+                for _ in range(3):
+                    await asyncio.sleep(0)
+                assert not probe_task.done()
+            finally:
+                release.set()
+                with pytest.raises(StaleGenerationError):
+                    await dispatch_task
+                await replace_task
+
+        assert db.generation == g0 + 1
+        assert await probe_task == 1
+        assert computed == 1
+
+        replacement_probe_rows = await db.read(
+            lambda c: c.execute("SELECT count(*) FROM _probe").fetchone()[0]
+        )
+        assert replacement_probe_rows == 0
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not [m for m in messages if "cas_miss" in m]
+        assert not [m for m in messages if m.startswith("pair_and_score deferred")]
+
+    asyncio.run(_run())
+
+
+def test_run_catchup_enqueues_pair_and_score_when_a_site_is_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-busy-catchup-site")
+        conn.execute("CREATE TABLE _probe_bump(x)")
+
+        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
+
+        async def _fake_catchup_site(*args: object, **kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
+
+        calls: list[int] = []
+
+        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
+            calls.append(sid)
+
+        monkeypatch.setattr(
+            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
+        )
+
+        db = get_db()
+
+        class _AlwaysBumpWriter(FencedWriter):
+            def __init__(self) -> None:
+                super().__init__(db, db.generation)
+
+            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                await self._db.write(
+                    lambda c: c.execute("INSERT INTO _probe_bump VALUES (1)")
+                )
+                return await super().write_if_current(fn, epoch=epoch)
+
+        writer = _AlwaysBumpWriter()
+
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM jobs WHERE type='pair_and_score'"
+            ).fetchone()[0]
+            == 0
+        )
+
+        with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
+            result = await run_catchup(db, writer, {})
+
+        assert result is None
+        assert calls == []
+
+        rows = conn.execute(
+            "SELECT job_key, status, payload FROM jobs WHERE type='pair_and_score'"
+        ).fetchall()
+        assert len(rows) == 1
+        job_row = rows[0]
+        assert job_row["job_key"] == "score"
+        assert job_row["status"] == "pending"
+        assert json.loads(job_row["payload"]) == {"site_id": site}
+
+        busy_warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith("catchup rescore busy")
+        ]
+        assert busy_warnings == [
+            f"catchup rescore busy site={site} step=pair_real_models; "
+            "enqueued pair_and_score"
+        ]
+
+    asyncio.run(_run())
+
+
+def test_run_catchup_reports_and_skips_a_site_whose_chunk_raises_integrity_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_a = _make_site(conn, "t-catchup-integrity-a")
+        site_b = _make_site(conn, "t-catchup-integrity-b")
+        conn.execute("CREATE TABLE _probe_pk(a INTEGER PRIMARY KEY, g)")
+
+        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
+
+        async def _fake_catchup_site(*args: object, **kwargs: object) -> bool:
+            return True
+
+        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
+
+        calls: list[int] = []
+
+        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
+            calls.append(sid)
+
+        monkeypatch.setattr(
+            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
+        )
+
+        def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
+            if site_id == site_a:
+                ops = (InsertOp(site_id, (1,)), InsertOp(site_id, (1,)))
+            else:
+                ops = (InsertOp(site_id, (2,)),)
+            return PairDelta(
+                seed_sites=(site_id,) if site_id is not None else (),
+                ops=ops,
+                insert_sql="INSERT INTO _probe_pk(a, g) VALUES (?, ?)",
+                count=None,
+            )
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _compute),),
+        )
+
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+
+        with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
+            result = await run_catchup(db, writer, {})
+
+        assert result is None
+        assert calls == [site_b]
+
+        rows = conn.execute("SELECT a FROM _probe_pk").fetchall()
+        assert [r["a"] for r in rows] == [2]
+
+        failed_warnings = [
+            r.getMessage()
+            for r in caplog.records
+            if r.getMessage().startswith(f"catchup rescore failed site={site_a}:")
+        ]
+        assert len(failed_warnings) == 1
+
+    asyncio.run(_run())
+
+
+def test_run_catchup_pair_phases_run_without_an_enabled_check_m12(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site = _make_site(conn, "t-catchup-enabled-site")
+        conn.execute("CREATE TABLE _probe(a, g)")
+
+        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
+
+        db = get_db()
+
+        async def _fake_catchup_site(
+            db_arg: object, writer_arg: FencedWriter, catchup_site: object, plan: object
+        ) -> bool:
+            await writer_arg.write(
+                lambda c: c.execute(
+                    "UPDATE sites SET enabled=0 WHERE id=?",
+                    (catchup_site.site_id,),
+                )
+            )
+            return True
+
+        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
+
+        calls: list[int] = []
+
+        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
+            calls.append(sid)
+
+        monkeypatch.setattr(
+            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
+        )
+
+        monkeypatch.setattr(
+            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+            (SplitPhase("probe", _probe_compute),),
+        )
+
+        writer = FencedWriter(db, db.generation)
+        result = await run_catchup(db, writer, {})
+
+        assert result is None
+
+        row_count = conn.execute("SELECT count(*) FROM _probe").fetchone()[0]
+        assert row_count == 3
+        assert calls == [site]
+
+    asyncio.run(_run())
+
+
+def test_split_pair_attempt_releases_payload_before_next_compute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M23/M24: a broken implementation that keeps an extra reference to a
+    delta or op past the point it should have been released is caught by a
+    weak-reference liveness check at three observation points: mid-flight
+    (still alive, proving the checks below are not vacuous), on the retry
+    after a miss, and at the phase transition.
+    """
+    was = gc.isenabled()
+    gc.disable()
+    try:
+
+        class _RefDelta(PairDelta):
+            __slots__ = ("__weakref__",)
+
+        class _RefInsert(InsertOp):
+            __slots__ = ("__weakref__",)
+
+        async def _run() -> None:
+            conn = _init_tmp_db(tmp_path)
+            site = _make_site(conn, "t-lifetime-site")
+            conn.execute("CREATE TABLE _probe(a, g)")
+            conn.execute("CREATE TABLE _probe_bump(x)")
+
+            refs: list[list[weakref.ReferenceType[object]]] = []
+            calls_a = 0
+            calls_b = 0
+            seen_a: list[bool] = []
+            seen_b: list[bool] = []
+
+            def _delta(ops: tuple[object, ...]) -> PairDelta:
+                return _RefDelta(
+                    seed_sites=(site,),
+                    ops=ops,
+                    insert_sql="INSERT INTO _probe(a, g) VALUES (?, ?)",
+                    count=None,
+                )
+
+            def compute_a(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
+                nonlocal calls_a
+                calls_a += 1
+                if calls_a == 2:
+                    seen_a.extend(alive_after_wait(refs[0]))
+                ops = tuple(_RefInsert(site_id, (i,)) for i in range(3))
+                delta = _delta(ops)
+                refs.append([weakref.ref(delta), *(weakref.ref(op) for op in ops)])
+                return delta
+
+            def compute_b(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
+                nonlocal calls_b
+                calls_b += 1
+                if calls_b == 1:
+                    seen_b.extend(alive_after_wait(refs[1]))
+                ops = (_RefInsert(site_id, (99,)),)
+                delta = _delta(ops)
+                refs.append([weakref.ref(delta), *(weakref.ref(op) for op in ops)])
+                return delta
+
+            monkeypatch.setattr(
+                "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
+                (SplitPhase("probe_a", compute_a), SplitPhase("probe_b", compute_b)),
+            )
+            monkeypatch.setattr(
+                "wxverify.worker.score_batches.SCORING_APPLY_CHUNK_ROWS", 2
+            )
+
+            db = get_db()
+            alive: list[bool] = []
+            wic_calls = 0
+
+            class _RecordingWriter(FencedWriter):
+                def __init__(self) -> None:
+                    super().__init__(db, db.generation)
+
+                async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                    nonlocal wic_calls
+                    wic_calls += 1
+                    if wic_calls == 2:
+                        alive.extend(r() is not None for r in refs[0])
+                        await self._db.write(
+                            lambda c: c.execute("INSERT INTO _probe_bump VALUES (1)")
+                        )
+                    return await super().write_if_current(fn, epoch=epoch)
+
+            writer = _RecordingWriter()
+            with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+                await run_split_pair_phases(writer, site, require_enabled=True)
+
+            assert alive == [True] * 4
+            assert seen_a == [False] * 4
+            assert seen_b == [False] * 4
+
+            row_count = conn.execute("SELECT count(*) FROM _probe").fetchone()[0]
+            assert row_count == 6
+
+            messages = [r.getMessage() for r in caplog.records]
+            cas_miss = [m for m in messages if "cas_miss" in m]
+            assert cas_miss == [f"score phase=probe_a site={site} cas_miss attempt=1"]
+            phase_a_lines = [
+                m
+                for m in messages
+                if m.startswith("score phase=probe_a ") and "elapsed=" in m
+            ]
+            assert len(phase_a_lines) == 1
+            assert "attempts=2" in phase_a_lines[0]
+            phase_b_lines = [
+                m
+                for m in messages
+                if m.startswith("score phase=probe_b ") and "elapsed=" in m
+            ]
+            assert len(phase_b_lines) == 1
+            assert "attempts=1" in phase_b_lines[0]
+
+        asyncio.run(_run())
+    finally:
+        if was:
+            gc.enable()
