@@ -30,6 +30,7 @@ from wxverify.scoring.leaderboard import (
     LeaderboardStatus,
     asof_leaderboard,
     leaderboard_with_status,
+    leaderboard_with_status_in_transaction,
 )
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
@@ -399,6 +400,13 @@ def forecast_ranking_with_status(
     as-of branch reports ``live`` — it never reads ``score_cache``, and
     that is the status ``leaderboard_with_status`` assigns to a
     non-cache-backed window.
+
+    The live path (``as_of`` is None) reads the verdict inside one read
+    snapshot either way. With no transaction open on ``conn`` it calls the
+    ``leaderboard_with_status`` facade, which opens its own. Inside a forecast
+    route's read snapshot it calls ``leaderboard_with_status_in_transaction``,
+    because the facade's snapshot refuses to nest; the route's snapshot then
+    covers the verdict and every other read the response renders.
     """
     excluded = {
         int(row["id"])
@@ -425,13 +433,22 @@ def forecast_ranking_with_status(
         )
         status = "live"
     else:
-        result = leaderboard_with_status(
-            conn,
-            site_id=site_id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window=window,
-        )
+        if conn.in_transaction:
+            result = leaderboard_with_status_in_transaction(
+                conn,
+                site_id=site_id,
+                variable=variable,
+                day_ahead=day_ahead,
+                window=window,
+            )
+        else:
+            result = leaderboard_with_status(
+                conn,
+                site_id=site_id,
+                variable=variable,
+                day_ahead=day_ahead,
+                window=window,
+            )
         rows = result.rows
         status = result.status
     return ForecastRanking(
