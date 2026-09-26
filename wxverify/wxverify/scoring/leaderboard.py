@@ -98,7 +98,8 @@ def leaderboard_with_status(
     for a mismatch that existed in one state of the database, never for two
     reads that straddled a rescore commit. The block is read-only. A caller
     that already holds a transaction on ``conn`` — the forecast-record builder,
-    inside the writer's ``BEGIN IMMEDIATE`` — must call
+    inside a caller-held snapshot (the record job's ``read_snapshot``, or a
+    writer's ``BEGIN IMMEDIATE`` on the synchronous path) — must call
     ``leaderboard_with_status_in_transaction`` instead; the snapshot refuses to
     nest.
     """
@@ -124,9 +125,9 @@ def leaderboard_with_status_in_transaction(
 
     Identical verdict logic; issues no transaction of its own and requires
     none. The one production caller is the forecast-record builder, which runs
-    inside the writer's ``BEGIN IMMEDIATE`` — already a single snapshot — where
-    the facade's ``read_snapshot`` would refuse to nest. Read paths call the
-    facade.
+    inside a caller-held snapshot (the record job's ``read_snapshot``, or a
+    writer's ``BEGIN IMMEDIATE`` on the synchronous path), where the facade's
+    ``read_snapshot`` would refuse to nest. Read paths call the facade.
     """
     resolved = resolve_window(conn, window)
     if not resolved.cache_backed:

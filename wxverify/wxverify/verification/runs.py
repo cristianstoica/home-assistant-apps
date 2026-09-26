@@ -29,11 +29,12 @@ The basis is pinned once, at ``start_run``. Two NARROW stability claims
 hold across the run's life, and neither is absolute:
 
 * configuration and roster are guarded by
-  :func:`assert_inputs_unpinned_unchanged`, which fails the run on
-  divergence — but it compares RESOLVED depths only, so a
-  ``blend_depth_sources`` provenance flip (an override set equal to the
-  global value) passes that guard by design and still moves this digest,
-  which hashes the whole snapshot;
+  :func:`assert_inputs_unpinned_unchanged` and its read-only twin
+  :func:`assert_inputs_unchanged_readonly` (each simulate and baseline
+  day re-checks), which fail the run on divergence — but they compare
+  RESOLVED depths only, so a ``blend_depth_sources`` provenance flip (an
+  override set equal to the global value) passes that guard by design
+  and still moves this digest, which hashes the whole snapshot;
 * no remaining HASHED truth column is written between ``regen`` and
   ``publish`` through the normal run and ingest paths. Ordinary
   observation ingest DOES write ``daily_truth`` in that window —
@@ -147,8 +148,10 @@ def roster_feeds(conn: sqlite3.Connection, site_id: int) -> tuple[RosterFeed, ..
     Same membership rule as the live scheduler/leaderboard (enabled +
     subscribed real feeds; meteoblue members resolve through the package
     feed; virtual feeds excluded), evaluated ONCE — the run start pins the
-    result, and every simulate chunk re-checks it against the live tables,
-    failing the run on divergence instead of mixing two configurations.
+    result, and each simulate and baseline day re-checks it against the
+    live tables (:func:`assert_inputs_unpinned_unchanged`, or its read-only
+    twin :func:`assert_inputs_unchanged_readonly`), failing the run on
+    divergence instead of mixing two configurations.
     """
     clause = active_competitor_clause(site_expr=str(int(site_id)))
     rows = conn.execute(
@@ -735,12 +738,39 @@ def assert_inputs_unpinned_unchanged(conn: sqlite3.Connection, cfg: RunConfig) -
     ``feeds``/``site_feed_state`` tables, so a mid-run subscription or
     settings change could silently mix two configurations. Rather than
     thread a parallel roster through every production query, each simulate
-    chunk re-derives the pinned inputs and raises on divergence — the job
-    fails, the run is marked failed, and the next nightly trigger re-runs
-    under the NEW fingerprint. Data growth (new samples/observations) is
-    expected mid-run and deliberately not checked here.
+    and baseline day re-derives the pinned inputs and raises on divergence
+    (production through :func:`assert_inputs_unchanged_readonly`, inside
+    the day's read snapshot; this write-path check serves the synchronous
+    reference path, once per chunk). The job fails, the run is marked
+    failed, and the next nightly trigger re-runs under the NEW fingerprint.
+    Data growth (new samples/observations) is expected mid-run and
+    deliberately not checked here.
     """
     current = capture_config_snapshot(conn, cfg.site_id)
+    _raise_if_inputs_changed(cfg, _input_mismatches(current, cfg))
+
+
+def assert_inputs_unchanged_readonly(conn: sqlite3.Connection, cfg: RunConfig) -> None:
+    """READ PATH twin of :func:`assert_inputs_unpinned_unchanged`.
+
+    Runs inside a read snapshot under ``PRAGMA query_only``: it never seeds
+    a timezone generation. A missing published pointer is itself a
+    mismatch (the write-path check would seed a new generation whose id
+    differs from the pinned one and fail the same way).
+    """
+    pointer = published_generation_id(conn, cfg.site_id)
+    current = _config_snapshot(
+        conn,
+        cfg.site_id,
+        tz_generation_id=cfg.tz_generation_id if pointer is None else pointer,
+    )
+    mismatches = _input_mismatches(current, cfg)
+    if pointer is None:
+        mismatches.append("tz_generation_id")
+    _raise_if_inputs_changed(cfg, mismatches)
+
+
+def _input_mismatches(current: dict[str, object], cfg: RunConfig) -> list[str]:
     current_roster = _parse_roster(current.get("roster"))
     mismatches: list[str] = []
     if current_roster != cfg.roster:
@@ -761,6 +791,10 @@ def assert_inputs_unpinned_unchanged(conn: sqlite3.Connection, cfg: RunConfig) -
     ):
         if current.get(key) != pinned:
             mismatches.append(key)
+    return mismatches
+
+
+def _raise_if_inputs_changed(cfg: RunConfig, mismatches: list[str]) -> None:
     if mismatches:
         raise RuntimeError(
             f"verification run {cfg.run_id} inputs changed mid-run: "

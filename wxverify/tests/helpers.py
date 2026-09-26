@@ -6,8 +6,10 @@ modules belong here. Anything used by a single file stays local to it.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
@@ -318,6 +320,211 @@ def asof_insert_pair(
             generation_id,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Synthetic verification-site builder (write-lock-fix plan §5.2).
+# Shared by the day-pipeline / day-differential / write-lock-starvation
+# tests and by the one-shot T5 golden script. All values are synthetic.
+# ---------------------------------------------------------------------------
+
+_SYNTH_TRUTH_DAYS = [
+    f"2026-01-{d:02d}" for d in range(1, 25)
+]  # 2026-01-01 .. 2026-01-24
+_SYNTH_TRUTH_QUANTITIES = {
+    "temperature_high": 15.0,
+    "temperature_low": 15.0,
+    "wind_max": 5.0,
+    "precip_total": 0.0,
+    "precip_occurrence": 0.0,
+}
+_SYNTH_FEED_OFFSETS = {"synthetic-a": 0.5, "synthetic-b": 1.0, "synthetic-c": 1.5}
+_SYNTH_ANOMALY_CUTOFF = datetime(2026, 1, 16, tzinfo=UTC)
+_SYNTH_ANOMALY_VALUES = {"temperature": 45.5, "wind": 35.5, "precip": 2.0}
+_SYNTH_BASE_VALUES = {"temperature": 15.0, "wind": 5.0, "precip": 0.0}
+
+
+def build_synthetic_verification_site(
+    conn: sqlite3.Connection,
+) -> tuple[int, list[int], int]:
+    """Build the write-lock-fix plan's §5.2 synthetic verification site.
+
+    Runs in one ``BEGIN ... COMMIT`` and rolls back on error. Returns
+    ``(site_id, [feed_a, feed_b, feed_c], station_id)``.
+    """
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN")
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
+            VALUES ('site-synthetic', 0.0, 0.0, 0.0, 'UTC')
+            """
+        )
+        assert cur.lastrowid is not None
+        site_id = int(cur.lastrowid)
+
+        feeds: list[int] = []
+        for model in ("synthetic-a", "synthetic-b", "synthetic-c"):
+            fcur = conn.execute(
+                """
+                INSERT INTO feeds
+                    (source, model, default_subscribed,
+                     fetch_interval_minutes, max_lead_hours)
+                VALUES ('synthetic-src', ?, 1, 360, 216)
+                """,
+                (model,),
+            )
+            assert fcur.lastrowid is not None
+            feeds.append(int(fcur.lastrowid))
+        feed_a, feed_b, feed_c = feeds
+
+        generation_id = ensure_published_generation(conn, site_id)
+
+        scur = conn.execute(
+            """
+            INSERT INTO stations
+                (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+            VALUES (?, 'SYNTH-LOCKFIX-01', 0.0, 0.0, 0.0, 1)
+            """,
+            (site_id,),
+        )
+        assert scur.lastrowid is not None
+        station_id = int(scur.lastrowid)
+
+        # Truth.
+        for day in _SYNTH_TRUTH_DAYS:
+            for quantity, value in _SYNTH_TRUTH_QUANTITIES.items():
+                is_precip = quantity.startswith("precip")
+                conn.execute(
+                    """
+                    INSERT INTO daily_truth
+                        (site_id, local_date, quantity, value, eligible,
+                         covered_hours, expected_slots, wet_hours, dry_hours,
+                         rain_threshold_mm, day_start_utc, day_end_utc, timezone,
+                         tz_generation_id)
+                    VALUES (?, ?, ?, ?, 1, 24, 24, ?, ?, 0.2, ?, ?, 'UTC', ?)
+                    """,
+                    (
+                        site_id,
+                        day,
+                        quantity,
+                        value,
+                        0 if is_precip else None,
+                        24 if is_precip else None,
+                        f"{day}T00:00:00Z",
+                        f"{day}T23:59:59Z",
+                        generation_id,
+                    ),
+                )
+
+        # Samples: one issuance per snapshot day S, hourly out to 192h.
+        for feed_id, model in zip(
+            feeds, ("synthetic-a", "synthetic-b", "synthetic-c"), strict=True
+        ):
+            offset = _SYNTH_FEED_OFFSETS[model]
+            for day in _SYNTH_TRUTH_DAYS:
+                snapshot_date = datetime.fromisoformat(day + "T00:00:00+00:00")
+                issued = snapshot_date - timedelta(hours=6)  # (S-1)T18:00:00Z
+                for hour in range(1, 193):
+                    valid_at = issued + timedelta(hours=hour)
+                    for variable, base in _SYNTH_BASE_VALUES.items():
+                        if model == "synthetic-a" and valid_at >= _SYNTH_ANOMALY_CUTOFF:
+                            value = _SYNTH_ANOMALY_VALUES[variable]
+                        else:
+                            value = base + offset
+                        conn.execute(
+                            """
+                            INSERT INTO forecast_samples
+                                (site_id, feed_id, variable, issued_at, valid_at,
+                                 lead_hours, value, source_raw, model_run_id,
+                                 fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-synthetic', ?)
+                            """,
+                            (
+                                site_id,
+                                feed_id,
+                                variable,
+                                issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                valid_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                hour,
+                                value,
+                                issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            ),
+                        )
+
+        # Pairs: temperature, every 6h from 2025-12-02T00:00Z to
+        # 2026-01-24T18:00Z, day_ahead 1..7.
+        persistence_feed_id = asof_persistence_feed_id(conn)
+        pair_feeds = {
+            feed_a: _SYNTH_FEED_OFFSETS["synthetic-a"],
+            feed_b: _SYNTH_FEED_OFFSETS["synthetic-b"],
+            feed_c: _SYNTH_FEED_OFFSETS["synthetic-c"],
+            persistence_feed_id: 2.0,
+        }
+        pair_start = datetime(2025, 12, 2, tzinfo=UTC)
+        pair_end = datetime(2026, 1, 24, 18, tzinfo=UTC)
+        valid_at = pair_start
+        while valid_at <= pair_end:
+            for day_ahead in range(1, 8):
+                lead_hours = 24 * day_ahead + 6
+                issued_at = valid_at - timedelta(hours=lead_hours)
+                first_known_at = valid_at + timedelta(hours=1)
+                for feed_id, feed_offset in pair_feeds.items():
+                    asof_insert_pair(
+                        conn,
+                        site_id=site_id,
+                        feed_id=feed_id,
+                        valid_at=valid_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        issued_at=issued_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        forecast=15.0 + feed_offset,
+                        observed=15.0,
+                        first_known_at=first_known_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        day_ahead=day_ahead,
+                        lead_hours=lead_hours,
+                        generation_id=generation_id,
+                    )
+            valid_at += timedelta(hours=6)
+
+        conn.commit()
+        return site_id, feeds, station_id
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def evidence_digest(conn: sqlite3.Connection, run_id: int) -> str:
+    """sha256 over every ``verification_evidence`` and
+    ``verification_day_context`` row for ``run_id`` (plan §5.2).
+    """
+    digest = hashlib.sha256()
+
+    ev_cols = [
+        r["name"] for r in conn.execute("PRAGMA table_info(verification_evidence)")
+    ]
+    quoted_ev = ", ".join(f"quote({c})" for c in ev_cols)
+    for row in conn.execute(
+        f"SELECT {quoted_ev} FROM verification_evidence"  # noqa: S608
+        " WHERE run_id = ? ORDER BY id",
+        (run_id,),
+    ):
+        digest.update("|".join(str(v) for v in row).encode())
+        digest.update(b"\n")
+
+    ctx_cols = [
+        r["name"] for r in conn.execute("PRAGMA table_info(verification_day_context)")
+    ]
+    quoted_ctx = ", ".join(f"quote({c})" for c in ctx_cols)
+    for row in conn.execute(
+        f"SELECT {quoted_ctx} FROM verification_day_context"  # noqa: S608
+        " WHERE run_id = ? ORDER BY snapshot_local_date",
+        (run_id,),
+    ):
+        digest.update("|".join(str(v) for v in row).encode())
+        digest.update(b"\n")
+
+    return digest.hexdigest()
 
 
 def asof_insert_observation(

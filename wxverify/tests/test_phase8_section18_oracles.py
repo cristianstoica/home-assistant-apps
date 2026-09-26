@@ -1700,6 +1700,8 @@ def test_page_still_performs_no_simulation_or_bootstrap_work(
         raise AssertionError("the /verification page must not simulate per request")
 
     monkeypatch.setattr("wxverify.verification.simulate.simulate_snapshot_day", _boom)
+    monkeypatch.setattr("wxverify.verification.simulate.compute_snapshot_day", _boom)
+    monkeypatch.setattr("wxverify.verification.simulate.compute_baseline_day", _boom)
     monkeypatch.setattr("wxverify.verification.engine.prepare_bootstrap_inputs", _boom)
 
     page = _fetch_page(monkeypatch, site_id)
