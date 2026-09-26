@@ -23,10 +23,14 @@ All fixture data is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import math
 import sqlite3
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
+
+import pytest
 
 from tests.scoring_ref_0164 import materialize_multimodel_mean_0164
 from wxverify.core.timeutil import (
@@ -37,6 +41,7 @@ from wxverify.core.timeutil import (
     utc_now,
     window_cutoff,
 )
+from wxverify.db.connection import FencedWriter, close_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import (
     ensure_published_generation,
@@ -48,6 +53,7 @@ from wxverify.scoring.engine import pair_and_score
 from wxverify.scoring.metrics import strategy_for
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.settings.keys import get_number_setting
+from wxverify.worker.score_batches import run_batched_scoring, run_split_pair_phases
 
 # --------------------------------------------------------------------------
 # Reference implementations (verbatim 0.1.0 behavior — do not "improve").
@@ -624,5 +630,117 @@ def test_pipeline_equivalent_to_reference_rebuild() -> None:
             pair_and_score(live, site_arg)
             _assert_end_state_equal(live, ref, label=name)
     finally:
+        ref.close()
+        live.close()
+
+
+_PAIR_CROSS_ARM_EXCLUDE = frozenset({"id", "created_at", "tz_generation_id"})
+
+
+def _pairs_snapshot_excluding(
+    conn: sqlite3.Connection, exclude: frozenset[str]
+) -> list[dict[str, object]]:
+    cols = [
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(forecast_pairs)").fetchall()
+        if row["name"] not in exclude
+    ]
+    col_list = ", ".join(cols)
+    rows = conn.execute(
+        f"""
+        SELECT {col_list} FROM forecast_pairs
+        ORDER BY site_id, feed_id, variable, issued_at, valid_at
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def test_split_and_monolithic_equivalent_to_0164_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three arms per scenario, all against the same frozen 0.16.4 reference:
+
+    A. ``ref`` -- the frozen reference rebuild (``_ref_pair_and_score``).
+    B. ``live`` -- the monolithic live pipeline (``pair_and_score``).
+    C. ``split`` -- the same live pairing/persistence/multimodel/scoring
+       logic run through the write-lock-fix split path
+       (``run_split_pair_phases`` then ``run_batched_scoring``), on a real
+       ``Database``/``FencedWriter`` rather than a bare connection.
+
+    C vs A and B vs A are checked with the full ``_assert_end_state_equal``
+    oracle (``forecast_pairs``/``score_cache``, §5.4). C vs B additionally
+    checks every ``forecast_pairs`` column except ``id``, ``created_at`` and
+    ``tz_generation_id`` -- the split path must not just agree with the
+    frozen reference, it must reproduce the *live* incremental path's own
+    output, not some other value that happens to also satisfy the reference.
+
+    §5.3 scenario clock: ``utc_now`` is frozen to one instant per scenario
+    (``t0`` for the initial build, ``t0 + k`` seconds for scenario ``k``) so
+    all three arms see the same wall clock when they stamp
+    ``first_known_at``/``source_computed_at`` (``persistence.py``). Without
+    this, the three sequential ``_make_db()`` calls below would each read a
+    genuinely different real ``utc_now()`` while seeding
+    ``station_observations.fetched_at`` (via ``insert_station_observation`` /
+    ``materialize_consensus``), and the arms would diverge on
+    ``first_known_at`` for a reason that has nothing to do with the code
+    under test.
+    """
+    t0 = utc_now()
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: t0)
+
+    ref = _make_db()
+    live = _make_db()
+    seed = _make_db()
+    db_path = tmp_path / "equivalence-split.db"
+    seed.execute(f"VACUUM INTO '{db_path.as_posix()}'")
+    seed.close()
+
+    close_db()
+    split_db = init_db(str(db_path))
+    writer = FencedWriter(split_db, split_db.generation)
+    split_conn = split_db._conn  # noqa: SLF001 - test inspects the real writer conn
+
+    async def _run_split(site_arg: int | None) -> None:
+        if site_arg is not None:
+            site_ids: tuple[int, ...] = (site_arg,)
+        else:
+            site_ids = tuple(
+                int(row["id"])
+                for row in split_conn.execute(
+                    "SELECT id FROM sites ORDER BY id"
+                ).fetchall()
+            )
+        for site_id in site_ids:
+            await run_split_pair_phases(writer, site_id, require_enabled=True)
+            await run_batched_scoring(writer, site_id)
+
+    async def _run_all_scenarios() -> None:
+        for k, (name, mutate, site_arg) in enumerate(_SCENARIOS):
+            monkeypatch.setattr(
+                "wxverify.core.timeutil.utc_now",
+                lambda k=k: t0 + timedelta(seconds=k),
+            )
+
+            mutate(ref)
+            mutate(live)
+            mutate(split_conn)
+
+            _ref_pair_and_score(ref, site_arg)
+            pair_and_score(live, site_arg)
+            await _run_split(site_arg)
+
+            _assert_end_state_equal(live, ref, label=f"{name} (live vs ref)")
+            _assert_end_state_equal(split_conn, ref, label=f"{name} (split vs ref)")
+
+            live_pairs = _pairs_snapshot_excluding(live, _PAIR_CROSS_ARM_EXCLUDE)
+            split_pairs = _pairs_snapshot_excluding(split_conn, _PAIR_CROSS_ARM_EXCLUDE)
+            assert split_pairs == live_pairs, (
+                f"split forecast_pairs diverged from the live path: {name}"
+            )
+
+    try:
+        asyncio.run(_run_all_scenarios())
+    finally:
+        close_db()
         ref.close()
         live.close()

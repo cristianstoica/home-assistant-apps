@@ -4,8 +4,9 @@ Two families:
 
 - R1-R4: the leaderboard route's fire-and-forget rescore scheduling no
   longer blocks the read behind a held write lock.
-- E1-E8: ``run_batched_scoring`` (bounded per-window write transactions)
-  reaches the same end state as the monolithic ``_score_all_windows`` run it
+- E1-E8: ``run_batched_scoring`` (a read-side compute and bounded batch
+  applies under the input-epoch CAS) reaches the same end state as the
+  monolithic ``_score_all_windows`` run it
   replaces, never exposes a half-populated cache mid-run, and survives a
   mid-run crash, site-disable, or an in-flight concurrent writer.
 
@@ -644,8 +645,8 @@ def test_batched_scoring_matches_monolithic_end_state_e1(
         # batching is actually exercised.
         monkeypatch.setattr("wxverify.worker.score_batches.SCORE_BATCH_CELLS", 2)
         db_b = init_db(str(copy_b))
-        await run_batched_scoring(db_b, site_a)
-        await run_batched_scoring(db_b, site_b)
+        await run_batched_scoring(FencedWriter(db_b, db_b.generation), site_a)
+        await run_batched_scoring(FencedWriter(db_b, db_b.generation), site_b)
         end_b = _dump_score_cache(db_b._conn)  # noqa: SLF001
         keys_b = _keys(db_b._conn)  # noqa: SLF001
 
@@ -714,12 +715,18 @@ def test_score_run_stamp_fixed_width_spares_same_second_inline_row_e1b(
 
 
 class _UpsertCountingDb:
-    """Counts real ``score_cache`` upserts per ``db.write`` call via a real
-    SQL trace on the real connection -- not a mock of ``score_cell_batch``.
+    """Writer-shaped spy: counts real ``score_cache`` upserts per ``write``
+    and per ``write_if_current`` call, via a real SQL trace on the real
+    connection -- not a mock of ``apply_cell_batch``. It wraps a
+    ``FencedWriter`` bound to ``inner``'s current generation and forwards
+    ``read_at_epoch``, ``read`` and ``input_epoch`` to it/``inner``, so
+    ``run_batched_scoring`` drives it exactly as it would a bare
+    ``FencedWriter``.
     """
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
+        self._writer = FencedWriter(inner, inner.generation)
         self.per_call_upserts: list[int] = []
         self._current: list[str] = []
         inner._conn.set_trace_callback(self._trace)  # noqa: SLF001
@@ -728,11 +735,24 @@ class _UpsertCountingDb:
         if sql.strip().upper().startswith("INSERT INTO SCORE_CACHE"):
             self._current.append(sql)
 
+    @property
+    def input_epoch(self) -> int:
+        return self._writer.input_epoch
+
     async def write(self, fn: Any) -> Any:
         self._current = []
-        result = await self._inner.write(fn)
+        result = await self._writer.write(fn)
         self.per_call_upserts.append(len(self._current))
         return result
+
+    async def write_if_current(self, fn: Any, *, epoch: int) -> Any:
+        self._current = []
+        result = await self._writer.write_if_current(fn, epoch=epoch)
+        self.per_call_upserts.append(len(self._current))
+        return result
+
+    async def read_at_epoch(self, fn: Any, *, label: str) -> Any:
+        return await self._writer.read_at_epoch(fn, label=label)
 
     async def read(self, fn: Any) -> Any:
         return await self._inner.read(fn)
@@ -768,7 +788,7 @@ def test_batched_scoring_bounds_upserts_per_transaction_e2(
         # ceil(5/2)=3 batches per window * 2 windows.
         assert len(batch_calls) == 6
         assert sum(batch_calls) == 10  # 5 cells * 2 windows, all n>=1
-        # discovery + 6 batch transactions + final sweep.
+        # stamp + 6 batch applies + final sweep.
         assert len(spy.per_call_upserts) == 8
 
     asyncio.run(_run())
@@ -816,7 +836,9 @@ def test_batched_scoring_mid_run_leaderboard_reads_never_partial_e3(
             )
             observed.append(len(result.rows))
 
-        await run_batched_scoring(db, site_id, _on_batch_committed)
+        await run_batched_scoring(
+            FencedWriter(db, db.generation), site_id, _on_batch_committed
+        )
 
         assert observed  # non-vacuity: the hook actually fired
         assert all(count in (0, 3) for count in observed)
@@ -1042,7 +1064,9 @@ def test_batched_scoring_same_day_rerun_mixed_generation_bounded_e5(
             if ns == [1, 2]:
                 observed_mixed = True
 
-        await run_batched_scoring(db, site_id, _on_batch_committed)
+        await run_batched_scoring(
+            FencedWriter(db, db.generation), site_id, _on_batch_committed
+        )
 
         assert observed_mixed  # the accepted same-day mixed-generation window
 
@@ -1066,7 +1090,7 @@ def test_batched_scoring_same_day_rerun_mixed_generation_bounded_e5(
 
 
 def test_batched_scoring_mid_run_site_disable_cancels_e6(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def _run() -> None:
         conn = _init_tmp_db(tmp_path)
@@ -1107,8 +1131,13 @@ def test_batched_scoring_mid_run_site_disable_cancels_e6(
                     )
                 )
 
-        with pytest.raises(JobCancelled):
-            await run_batched_scoring(db, site_id, _disable_after_first_batch)
+        with (
+            caplog.at_level(logging.INFO, logger="wxverify.worker"),
+            pytest.raises(JobCancelled),
+        ):
+            await run_batched_scoring(
+                FencedWriter(db, db.generation), site_id, _disable_after_first_batch
+            )
 
         # No further writes occurred: the guard's raise rolled back the
         # transaction that would have scored the second cell.
@@ -1117,6 +1146,15 @@ def test_batched_scoring_mid_run_site_disable_cancels_e6(
         ).fetchall()
         assert len(rows) == 1
         assert rows[0]["window_key"] == "w:14"
+
+        # Batch 1 committed under the epoch the disable hook then moved (its
+        # UPDATE runs through a plain db.write, not the fenced apply), so
+        # batch 2's CAS misses exactly once before the recompute re-applies
+        # batch 1 and its enabled check raises.
+        messages = [r.getMessage() for r in caplog.records]
+        expected_cas_miss = f"score window=w:14 site={site_id} cas_miss attempt=1"
+        cas_miss_lines = [m for m in messages if m == expected_cas_miss]
+        assert len(cas_miss_lines) == 1, f"got: {messages}"
 
     asyncio.run(_run())
 
@@ -1127,7 +1165,7 @@ def test_batched_scoring_mid_run_site_disable_cancels_e6(
 
 
 def test_batched_scoring_discovery_blocks_on_inline_writer_e7(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     async def _run() -> None:
         conn = _init_tmp_db(tmp_path)
@@ -1168,13 +1206,18 @@ def test_batched_scoring_discovery_blocks_on_inline_writer_e7(
         entered_ok = await asyncio.to_thread(entered.wait, 5.0)
         assert entered_ok  # the inline write is genuinely mid-transaction
 
-        run_task = asyncio.create_task(run_batched_scoring(db, site_id))
-        await asyncio.sleep(0.05)
-        assert not run_task.done()  # discovery is genuinely blocked on the lock
+        with caplog.at_level(logging.INFO, logger="wxverify.worker"):
+            run_task = asyncio.create_task(
+                run_batched_scoring(FencedWriter(db, db.generation), site_id)
+            )
+            await asyncio.sleep(0.05)
+            # the stamp transaction cannot run while the inline write holds
+            # the lock
+            assert not run_task.done()
 
-        release.set()
-        await hold_task
-        await run_task
+            release.set()
+            await hold_task
+            await run_task
 
         rows = conn.execute(
             "SELECT feed_id, window_key FROM score_cache WHERE site_id=?", (site_id,)
@@ -1186,6 +1229,15 @@ def test_batched_scoring_discovery_blocks_on_inline_writer_e7(
         assert (feed1, "w:all") in feed_windows
         assert (feed2, "w:14") in feed_windows
         assert (feed2, "w:all") in feed_windows
+
+        # The run task's first step read the epoch in read_at_epoch (during
+        # its 0.05s sleep, before release fired), then the inline write
+        # committed and moved it: the stamp CAS misses exactly once before
+        # the recompute sees the inline cell.
+        messages = [r.getMessage() for r in caplog.records]
+        expected_cas_miss = f"score discovery site={site_id} cas_miss attempt=1"
+        cas_miss_lines = [m for m in messages if m == expected_cas_miss]
+        assert len(cas_miss_lines) == 1, f"got: {messages}"
 
     asyncio.run(_run())
 

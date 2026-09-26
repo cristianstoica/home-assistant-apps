@@ -1681,11 +1681,16 @@ def test_batched_scoring_orchestrator_info_lines_actually_emitted(
     )
     assert "elapsed=" in discovery[0], f"got: {discovery[0]!r}"
     assert f"site={site_id}" in discovery[0], f"got: {discovery[0]!r}"
+    assert "attempts=1" in discovery[0], f"got: {discovery[0]!r}"
 
     windows = [m for m in info_msgs if m.startswith("score window=")]
-    # discover_score_work builds exactly 2 windows (rolling + all-time).
+    # stamp_score_work builds exactly 2 windows (rolling + all-time).
     assert len(windows) == 2, f"expected 2 'score window=' INFO lines; got: {info_msgs}"
     assert all("elapsed=" in m for m in windows), f"got: {windows}"
+    assert all("compute=" in m for m in windows), f"got: {windows}"
+    assert all("apply=" in m for m in windows), f"got: {windows}"
+    assert all("apply_max=" in m for m in windows), f"got: {windows}"
+    assert all("attempts=1" in m for m in windows), f"got: {windows}"
 
     sweep = [m for m in info_msgs if m.startswith("score sweep")]
     assert len(sweep) == 1, (
@@ -1694,6 +1699,10 @@ def test_batched_scoring_orchestrator_info_lines_actually_emitted(
     assert "elapsed=" in sweep[0], f"got: {sweep[0]!r}"
     assert f"site={site_id}" in sweep[0], f"got: {sweep[0]!r}"
 
+    assert not [m for m in info_msgs if "cas_miss" in m], (
+        f"a single-writer run must never CAS-miss; got: {info_msgs}"
+    )
+
 
 def test_score_batch_line_is_debug_only_never_info(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1701,7 +1710,7 @@ def test_score_batch_line_is_debug_only_never_info(
     """L3 (score batch): the per-batch 'score batch' line is DEBUG-only.
 
     Positive: with caplog at DEBUG, 'score batch' fires from
-    wxverify.scoring.engine.score_cell_batch (called once per batch by
+    wxverify.scoring.engine.apply_cell_batch (called once per batch by
     run_batched_scoring). Paired negative, from the SAME capture (not an
     ambient absence): none of those records carry levelno INFO — this is the
     regression a silent logger.debug -> logger.info promotion would trip.
@@ -1721,7 +1730,7 @@ def test_score_batch_line_is_debug_only_never_info(
 
     debug_batch = [r for r in batch_records if r.levelno == logging.DEBUG]
     assert len(debug_batch) > 0, (
-        "positive: 'score batch' must fire at DEBUG from score_cell_batch; "
+        "positive: 'score batch' must fire at DEBUG from apply_cell_batch; "
         f"engine records: {[r.getMessage() for r in engine_records]}"
     )
 

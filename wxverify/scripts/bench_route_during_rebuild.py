@@ -8,10 +8,13 @@ structurally blind to this defect; this sibling gates it.
 Dual-mode, feature-detected:
 
 - **post-fix-batched** — ``wxverify.scoring.rescore`` and
-  ``wxverify.worker.score_batches`` both import: the contended hold is the
-  public batched orchestrator ``run_batched_scoring``. Routes must answer
-  from the stale snapshot between batch transactions (max < 3.0 s,
-  p95 < 1.5 s) and no single write-transaction hold may reach 1.0 s.
+  ``wxverify.worker.score_batches`` both import: the public batched
+  orchestrator ``run_batched_scoring`` computes each window on a read
+  connection and applies it in batches under the input-epoch
+  compare-and-set. Routes must answer from the stale snapshot between batch
+  transactions (max < 3.0 s, p95 < 1.5 s) and no single write-transaction
+  hold may reach 1.0 s. A route's rescore enqueue commits a write, so it
+  may cost the run one compare-and-set miss and a recompute.
 - **pre-fix-monolithic** — fallback on revisions without the fix: the hold
   is one monolithic ``db.write(_score_all_windows)`` transaction, and the
   pre-fix routes themselves await their rescore enqueue behind it. The
@@ -160,9 +163,12 @@ async def _run_contended(app: Any, db: Any, site_id: int, mode: str) -> dict[str
     db._run_immediate = timed_run_immediate
 
     if mode == "post-fix-batched":
+        from wxverify.db.connection import FencedWriter
         from wxverify.worker.score_batches import run_batched_scoring
 
-        rebuild = asyncio.create_task(run_batched_scoring(db, site_id))
+        rebuild = asyncio.create_task(
+            run_batched_scoring(FencedWriter(db, db.generation), site_id)
+        )
     else:
         from wxverify.scoring.engine import _score_all_windows
 
@@ -170,7 +176,7 @@ async def _run_contended(app: Any, db: Any, site_id: int, mode: str) -> dict[str
             db.write(lambda conn: _score_all_windows(conn, site_id))
         )
     rebuild_start_offset = time.perf_counter() - t0
-    # Let the rebuild task actually reach its first write before sampling.
+    # Let the rebuild task actually reach its first step before sampling.
     await asyncio.sleep(0)
 
     samples: list[dict[str, Any]] = []

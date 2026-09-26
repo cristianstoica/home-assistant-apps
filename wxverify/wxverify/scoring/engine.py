@@ -11,7 +11,7 @@ from typing import Final
 from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import upsert_score_cache
-from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.metrics import MetricResult, strategy_for
 from wxverify.scoring.multimodel import (
     compute_multimodel_mean,
     materialize_multimodel_mean,
@@ -59,6 +59,20 @@ class ScoreWork:
     windows: tuple[ScoreWindow, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ScoreInputs:
+    """What scoring discovery reads: the settings and the cell universe.
+
+    Read on one connection by ``discover_score_inputs``; ``stamp_score_work``
+    turns it into a ``ScoreWork`` without touching the database.
+    """
+
+    site_id: int | None
+    rolling_days: int
+    min_n: int
+    cells: tuple[ScoreCell, ...]
+
+
 def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None:
     """Run the full scoring pipeline monolithically on one connection.
 
@@ -87,6 +101,51 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
     )
 
 
+def discover_score_inputs(conn: sqlite3.Connection, site_id: int | None) -> ScoreInputs:
+    """Read the scoring settings and the cell universe for ``site_id``.
+
+    Read-only, so it can run on a pooled read connection. One ``DISTINCT``
+    serves both windows: they always share one cell universe.
+    """
+    rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
+    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    return ScoreInputs(site_id, rolling_days, min_n, _distinct_cells(conn, site_id))
+
+
+def stamp_score_work(inputs: ScoreInputs) -> ScoreWork:
+    """Take the run's fixed-width ``run_stamp`` and the window cutoffs.
+
+    Reads the clock (the stamp first, then ``window_cutoff``) and never the
+    database, so it can run inside a transaction that runs no SQL.
+
+    Callers that split the run across transactions must take the stamp
+    under the write lock at the epoch the inputs were read at (a
+    compare-and-set transaction, worker/score_batches.py). An inline
+    rescore is one write transaction: if it committed after the inputs
+    were read, it moved the epoch, so the stamp misses and discovery
+    re-reads and sees its cells, which then get re-upserted rather than
+    swept. One that starts after the stamp writes a later stamp and
+    survives the sweep.
+    """
+    run_stamp = isoformat_utc_micro()
+    windows = (
+        ScoreWindow(
+            window_key=f"w:{inputs.rolling_days}",
+            cutoff=window_cutoff(inputs.rolling_days),
+            cells=inputs.cells,
+        ),
+        ScoreWindow(window_key="w:all", cutoff=None, cells=inputs.cells),
+    )
+    logger.debug(
+        "score discovery site=%s rolling_days=%s min_n=%s cells=%s",
+        inputs.site_id,
+        inputs.rolling_days,
+        inputs.min_n,
+        [len(window.cells) for window in windows],
+    )
+    return ScoreWork(run_stamp=run_stamp, min_n=inputs.min_n, windows=windows)
+
+
 def discover_score_work(conn: sqlite3.Connection, site_id: int | None) -> ScoreWork:
     """Snapshot settings, window keys/cutoffs, cell universes, and run stamp.
 
@@ -97,30 +156,81 @@ def discover_score_work(conn: sqlite3.Connection, site_id: int | None) -> ScoreW
     ``isoformat_utc`` collapses whole seconds to ``…:00Z`` and ``'.' <
     'Z'`` would order a later same-second stamp before it).
 
-    Callers that split the run across transactions must run discovery
-    inside the run's FIRST write transaction so any in-flight inline
-    rescore has committed before the stamp is taken — its cells are then
-    visible here and get re-upserted rather than swept
-    (worker/score_batches.py).
+    ``discover_score_inputs`` then ``stamp_score_work`` on one connection,
+    for the single-transaction ``_score_all_windows``.
     """
-    rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    run_stamp = isoformat_utc_micro()
-    windows = tuple(
-        ScoreWindow(window_key=key, cutoff=cutoff, cells=_distinct_cells(conn, site_id))
-        for key, cutoff in (
-            (f"w:{rolling_days}", window_cutoff(rolling_days)),
-            ("w:all", None),
+    return stamp_score_work(discover_score_inputs(conn, site_id))
+
+
+def compute_cell_scores(
+    conn: sqlite3.Connection,
+    *,
+    cells: Sequence[ScoreCell],
+    cutoff: str | None,
+    min_n: int,
+) -> tuple[tuple[ScoreCell, MetricResult], ...]:
+    """Aggregate every cell for one window; read-only.
+
+    Returns one ``(cell, result)`` per cell, in order, ``n == 0`` results
+    included (``apply_cell_batch`` skips them). The aggregates read only
+    ``forecast_pairs``, so this can run on a pooled read connection.
+    """
+    return tuple(
+        (
+            cell,
+            strategy_for(cell.variable).aggregate(
+                conn,
+                site_id=cell.site_id,
+                feed_id=cell.feed_id,
+                variable=cell.variable,
+                day_ahead=cell.day_ahead,
+                window_cutoff=cutoff,
+                min_n=min_n,
+            ),
         )
+        for cell in cells
     )
+
+
+def apply_cell_batch(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int | None,
+    window_key: str,
+    results: Sequence[tuple[ScoreCell, MetricResult]],
+    computed_at: str,
+) -> int:
+    """Upsert one window's computed results; returns upserts.
+
+    ``computed_at`` is the caller's run stamp. Results with ``n == 0`` are
+    skipped (not upserted), exactly as before — the run's final
+    ``sweep_score_orphans`` removes their stale rows. ``site_id`` mirrors
+    the run scope for callers/logging; each cell carries its own full
+    identity. Runs no aggregate: only the upserts.
+    """
+    upserts = 0
+    for cell, result in results:
+        if result.n == 0:
+            continue
+        upsert_score_cache(
+            conn,
+            site_id=cell.site_id,
+            feed_id=cell.feed_id,
+            variable=cell.variable,
+            day_ahead=cell.day_ahead,
+            window_key=window_key,
+            result=result,
+            computed_at=computed_at,
+        )
+        upserts += 1
     logger.debug(
-        "score discovery site=%s rolling_days=%s min_n=%s cells=%s",
+        "score batch site=%s window=%s cells=%s upserts=%s",
         site_id,
-        rolling_days,
-        min_n,
-        [len(window.cells) for window in windows],
+        window_key,
+        len(results),
+        upserts,
     )
-    return ScoreWork(run_stamp=run_stamp, min_n=min_n, windows=windows)
+    return upserts
 
 
 def score_cell_batch(
@@ -139,40 +249,16 @@ def score_cell_batch(
     ``n == 0`` are skipped (not upserted), exactly as before — the run's
     final ``sweep_score_orphans`` removes their stale rows. ``site_id``
     mirrors the run scope for callers/logging; each cell carries its own
-    full identity.
+    full identity. ``compute_cell_scores`` then ``apply_cell_batch`` on the
+    same connection.
     """
-    upserts = 0
-    for cell in cells:
-        result = strategy_for(cell.variable).aggregate(
-            conn,
-            site_id=cell.site_id,
-            feed_id=cell.feed_id,
-            variable=cell.variable,
-            day_ahead=cell.day_ahead,
-            window_cutoff=cutoff,
-            min_n=min_n,
-        )
-        if result.n == 0:
-            continue
-        upsert_score_cache(
-            conn,
-            site_id=cell.site_id,
-            feed_id=cell.feed_id,
-            variable=cell.variable,
-            day_ahead=cell.day_ahead,
-            window_key=window_key,
-            result=result,
-            computed_at=computed_at,
-        )
-        upserts += 1
-    logger.debug(
-        "score batch site=%s window=%s cells=%s upserts=%s",
-        site_id,
-        window_key,
-        len(cells),
-        upserts,
+    return apply_cell_batch(
+        conn,
+        site_id=site_id,
+        window_key=window_key,
+        results=compute_cell_scores(conn, cells=cells, cutoff=cutoff, min_n=min_n),
+        computed_at=computed_at,
     )
-    return upserts
 
 
 def sweep_score_orphans(

@@ -9,6 +9,7 @@ the T-rollback section below). All fixture data is synthetic.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import logging
@@ -17,8 +18,8 @@ import threading
 import tracemalloc
 import weakref
 from collections import Counter
-from collections.abc import Callable
-from datetime import datetime, timedelta
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -51,7 +52,16 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.scoring.engine import PAIR_PHASES, SPLIT_PAIR_PHASES, SplitPhase
+from wxverify.scoring.engine import (
+    PAIR_PHASES,
+    SPLIT_PAIR_PHASES,
+    ScoreCell,
+    SplitPhase,
+    _distinct_cells,  # noqa: SLF001 - T-M11 wraps the real callable as a spy
+    _score_all_windows,  # noqa: SLF001 - the rerun oracle for T-stale-batch/T-window-reapply
+    compute_cell_scores,
+)
+from wxverify.scoring.metrics import MetricResult
 from wxverify.scoring.multimodel import compute_multimodel_mean
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.pairing import compute_real_model_pairs
@@ -69,10 +79,11 @@ from wxverify.scoring.split import (
     apply_pair_ops,
     chunk_ops,
 )
+from wxverify.settings.keys import set_setting
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import dispatch
-from wxverify.worker.score_batches import run_split_pair_phases
+from wxverify.worker.score_batches import run_batched_scoring, run_split_pair_phases
 
 # --------------------------------------------------------------------------
 # T-chunk (M19, M22).
@@ -1331,9 +1342,18 @@ def test_pair_and_score_dispatch_raises_stale_generation_on_db_replacement(
             (SplitPhase("probe", _gated_compute),),
         )
 
+        dispatch_task: asyncio.Task[None] | None = None
+        replace_task: asyncio.Task[None] | None = None
+        probe_task: asyncio.Task[int] | None = None
+        dispatch_exc: BaseException | None = None
+        replace_exc: BaseException | None = None
+        probe_result: int | None = None
+        probe_exc: BaseException | None = None
+        preconditions_ok = False
+
         with caplog.at_level(logging.INFO, logger="wxverify.worker"):
-            dispatch_task = asyncio.create_task(dispatch(db, writer, _job(site)))
             try:
+                dispatch_task = asyncio.create_task(dispatch(db, writer, _job(site)))
                 assert await asyncio.to_thread(entered.wait, 5.0)
                 unused_backup = tmp_path / "unused-backup.db"
                 replace_task = asyncio.create_task(
@@ -1364,14 +1384,55 @@ def test_pair_and_score_dispatch_raises_stale_generation_on_db_replacement(
                 for _ in range(3):
                     await asyncio.sleep(0)
                 assert not probe_task.done()
+                preconditions_ok = True
             finally:
+                # Always release the gated compute so nothing can hang here,
+                # regardless of whether the preconditions above held.
                 release.set()
-                with pytest.raises(StaleGenerationError):
-                    await dispatch_task
-                await replace_task
+                if preconditions_ok:
+                    # Every task handle exists and is expected to settle on
+                    # its own now that the gate is released -- await ALL
+                    # THREE in dependency order without cancelling, so the
+                    # racing tasks resolve for real rather than against our
+                    # own cancellation, and none is left pending if a later
+                    # assert (outside this block) fails. Results/exceptions
+                    # are captured into variables here; the behavioural
+                    # asserts on them live outside this block, not in the
+                    # finally.
+                    assert dispatch_task is not None
+                    assert replace_task is not None
+                    assert probe_task is not None
+                    try:
+                        await dispatch_task
+                    except BaseException as exc:  # noqa: BLE001 - asserted below
+                        dispatch_exc = exc
+                    try:
+                        await replace_task
+                    except BaseException as exc:  # noqa: BLE001 - asserted below
+                        replace_exc = exc
+                    try:
+                        probe_result = await probe_task
+                    except BaseException as exc:  # noqa: BLE001 - asserted below
+                        probe_exc = exc
+                else:
+                    # An earlier assertion failed before every task handle
+                    # was even created (some may still be None). Settle
+                    # whatever DID start so nothing is left pending, without
+                    # letting cleanup mask the original failure already
+                    # propagating out of this frame.
+                    for task in (dispatch_task, replace_task, probe_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    for task in (dispatch_task, replace_task, probe_task):
+                        if task is not None:
+                            with contextlib.suppress(BaseException):
+                                await task
 
+        assert isinstance(dispatch_exc, StaleGenerationError)
+        assert replace_exc is None
         assert db.generation == g0 + 1
-        assert await probe_task == 1
+        assert probe_exc is None
+        assert probe_result == 1
         assert computed == 1
 
         replacement_probe_rows = await db.read(
@@ -1687,6 +1748,334 @@ def test_split_pair_attempt_releases_payload_before_next_compute(
             ]
             assert len(phase_b_lines) == 1
             assert "attempts=1" in phase_b_lines[0]
+
+        asyncio.run(_run())
+    finally:
+        if was:
+            gc.enable()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 -- discovery/stamp split and the window compute/apply split.
+# ---------------------------------------------------------------------------
+
+_FROZEN_NOW = datetime(2035, 6, 15, 12, 0, 0, tzinfo=UTC)
+
+
+def _freeze_now(monkeypatch: pytest.MonkeyPatch, when: datetime = _FROZEN_NOW) -> None:
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: when)
+
+
+def _open_meteo_feed_ids(conn: sqlite3.Connection, count: int) -> list[int]:
+    rows = conn.execute(
+        "SELECT id FROM feeds WHERE source='open-meteo' ORDER BY id LIMIT ?",
+        (count,),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
+
+
+def _seed_pair(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    variable: str,
+    valid_at: str,
+    day_ahead: int = 1,
+    issued_at: str = "2035-06-01T00:00:00Z",
+    forecast: float = 11.0,
+    observed: float = 10.0,
+) -> None:
+    error = forecast - observed
+    conn.execute(
+        """
+        INSERT INTO forecast_pairs
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,
+             forecast, observed, error, abs_error, sq_error, tz_generation_id)
+        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            site_id,
+            feed_id,
+            variable,
+            issued_at,
+            valid_at,
+            day_ahead,
+            forecast,
+            observed,
+            error,
+            abs(error),
+            error * error,
+            ensure_published_generation(conn, site_id),
+        ),
+    )
+
+
+def _seed_five_cell_window(conn: sqlite3.Connection, site_id: int) -> None:
+    """E2-style fixture: min_n=1, rolling_window_days=14, five w:14 cells."""
+    set_setting(conn, "min_n", "1")
+    set_setting(conn, "rolling_window_days", "14")
+    feed_ids = _open_meteo_feed_ids(conn, 5)
+    for i, feed_id in enumerate(feed_ids):
+        _seed_pair(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=1,
+            valid_at=f"2035-06-15T0{i}:00:00Z",
+        )
+
+
+def _score_cache_snapshot(conn: sqlite3.Connection) -> list[dict[str, object]]:
+    """Full ``score_cache`` snapshot excluding ``computed_at`` (the only
+    column two independent runs may legitimately differ on)."""
+    rows = conn.execute(
+        """
+        SELECT site_id, feed_id, variable, day_ahead, window_key,
+               n, bias, mae, rmse, pod, far, csi, ets, hss, skill_score
+        FROM score_cache
+        ORDER BY site_id, feed_id, variable, day_ahead, window_key
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+_FOREIGN_PAIR_BUMP_SQL = (
+    "UPDATE forecast_pairs SET "
+    "forecast = forecast + 5.0, "
+    "error = error + 5.0, "
+    "abs_error = ABS(error + 5.0), "
+    "sq_error = (error + 5.0) * (error + 5.0) "
+    "WHERE site_id = ?"
+)
+
+
+def test_discover_score_inputs_calls_distinct_cells_exactly_once_m11(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M11: both scoring windows share one cell universe, so discovery must
+    run exactly one ``DISTINCT``. A broken discovery that runs one per
+    window (rather than once for the whole run) calls ``_distinct_cells``
+    twice on this single-site, two-window run."""
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        _freeze_now(monkeypatch)
+        site_id = _make_site(conn, "t-m11-site")
+        _seed_five_cell_window(conn, site_id)
+
+        calls = 0
+        real = _distinct_cells
+
+        def _spy(c: sqlite3.Connection, sid: int | None) -> tuple[ScoreCell, ...]:
+            nonlocal calls
+            calls += 1
+            return real(c, sid)
+
+        monkeypatch.setattr("wxverify.scoring.engine._distinct_cells", _spy)
+
+        db = get_db()
+        await run_batched_scoring(FencedWriter(db, db.generation), site_id)
+
+        assert calls == 1
+
+    asyncio.run(_run())
+
+
+def test_window_recompute_matches_reference_after_cas_miss_mx_plain_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MX-plain-write: a broken window apply that persists results already
+    computed at a stale epoch (instead of discarding them and recomputing on
+    a miss) would upsert scores against pre-mutation ``forecast_pairs``
+    values. This fires one foreign write while ``w:14`` is mid-compute (after
+    its epoch was captured but before the CAS applies), forcing a miss, then
+    checks the split run's final ``score_cache`` against what a fresh
+    monolithic rerun (``_score_all_windows``, same connection, later clock)
+    produces from the same, now-mutated, committed state.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        _freeze_now(monkeypatch, _FROZEN_NOW)
+        site_id = _make_site(conn, "t-stale-batch-site")
+        _seed_five_cell_window(conn, site_id)
+
+        db = get_db()
+
+        class _ForeignWriteOnCompute(FencedWriter):
+            def __init__(self) -> None:
+                super().__init__(db, db.generation)
+                self.fired = False
+
+            async def read_at_epoch(self, fn, *, label):  # type: ignore[override]
+                epoch, result = await super().read_at_epoch(fn, label=label)
+                if label == "score compute w:14" and not self.fired:
+                    self.fired = True
+                    await self._db.write(
+                        lambda c: c.execute(_FOREIGN_PAIR_BUMP_SQL, (site_id,))
+                    )
+                return epoch, result
+
+        writer = _ForeignWriteOnCompute()
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+            await run_batched_scoring(writer, site_id)
+
+        split_snapshot = _score_cache_snapshot(conn)
+
+        _freeze_now(monkeypatch, _FROZEN_NOW + timedelta(seconds=1))
+        _score_all_windows(conn, site_id)
+        rerun_snapshot = _score_cache_snapshot(conn)
+
+        assert split_snapshot == rerun_snapshot
+
+        messages = [r.getMessage() for r in caplog.records]
+        expected_cas_miss = f"score window=w:14 site={site_id} cas_miss attempt=1"
+        cas_miss_lines = [m for m in messages if m == expected_cas_miss]
+        assert len(cas_miss_lines) == 1, f"got: {messages}"
+
+    asyncio.run(_run())
+
+
+def test_window_batch_recompute_matches_reference_after_cas_miss_mx_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """MX-partial: with one cell per batch, a broken window apply that keeps
+    the batches it already committed at a stale epoch (instead of discarding
+    the whole window and recomputing every batch on a miss) would leave a
+    stale row from the batch committed just before this test's foreign
+    write. The write lands on the third ``write_if_current`` call
+    (module-wide: #1 is the discovery stamp, #2 is ``w:14``'s first batch),
+    i.e. mid-window, after one batch has already committed -- forcing a miss
+    that must discard and redo the whole window, not just resume it."""
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        _freeze_now(monkeypatch, _FROZEN_NOW)
+        monkeypatch.setattr("wxverify.worker.score_batches.SCORE_BATCH_CELLS", 1)
+        site_id = _make_site(conn, "t-window-reapply-site")
+        _seed_five_cell_window(conn, site_id)
+
+        db = get_db()
+
+        class _ForeignWriteOnThirdCall(FencedWriter):
+            def __init__(self) -> None:
+                super().__init__(db, db.generation)
+                self.calls = 0
+                self.fired = False
+
+            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                self.calls += 1
+                if self.calls == 3 and not self.fired:
+                    self.fired = True
+                    await self._db.write(
+                        lambda c: c.execute(_FOREIGN_PAIR_BUMP_SQL, (site_id,))
+                    )
+                return await super().write_if_current(fn, epoch=epoch)
+
+        writer = _ForeignWriteOnThirdCall()
+
+        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+            await run_batched_scoring(writer, site_id)
+
+        split_snapshot = _score_cache_snapshot(conn)
+
+        _freeze_now(monkeypatch, _FROZEN_NOW + timedelta(seconds=1))
+        _score_all_windows(conn, site_id)
+        rerun_snapshot = _score_cache_snapshot(conn)
+
+        assert split_snapshot == rerun_snapshot
+
+        messages = [r.getMessage() for r in caplog.records]
+        expected_cas_miss = f"score window=w:14 site={site_id} cas_miss attempt=1"
+        cas_miss_lines = [m for m in messages if m == expected_cas_miss]
+        assert len(cas_miss_lines) == 1, f"got: {messages}"
+
+    asyncio.run(_run())
+
+
+def test_window_attempt_releases_results_before_recompute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """M24/M25: a broken window attempt that keeps an extra reference to a
+    window's computed results past the point they should be released (e.g.
+    reusing the previous attempt's payload across a CAS miss instead of
+    recomputing) is caught by a weak-reference liveness check at two
+    observation points: mid-flight, while the first attempt's batches are
+    still being applied (still alive, proving the check below is not
+    vacuous), and at the recompute that follows the miss (must be dead)."""
+    was = gc.isenabled()
+    gc.disable()
+    try:
+
+        async def _run() -> None:
+            conn = _init_tmp_db(tmp_path)
+            _freeze_now(monkeypatch, _FROZEN_NOW)
+            monkeypatch.setattr("wxverify.worker.score_batches.SCORE_BATCH_CELLS", 1)
+            site_id = _make_site(conn, "t-window-lifetime-site")
+            _seed_five_cell_window(conn, site_id)
+
+            refs: list[weakref.ReferenceType[object]] = []
+            cutoff_calls = 0
+            seen: list[bool] = []
+            real_compute = compute_cell_scores
+
+            def _spy(
+                conn_arg: sqlite3.Connection,
+                *,
+                cells: Sequence[ScoreCell],
+                cutoff: str | None,
+                min_n: int,
+            ) -> tuple[tuple[ScoreCell, MetricResult], ...]:
+                nonlocal cutoff_calls
+                result = real_compute(conn_arg, cells=cells, cutoff=cutoff, min_n=min_n)
+                if cutoff is not None:
+                    cutoff_calls += 1
+                    if cutoff_calls == 1:
+                        refs.extend(weakref.ref(r) for _, r in result)
+                    elif cutoff_calls == 2:
+                        seen.extend(alive_after_wait(refs))
+                return result
+
+            monkeypatch.setattr(
+                "wxverify.worker.score_batches.compute_cell_scores", _spy
+            )
+
+            db = get_db()
+
+            class _ForeignWriteOnThirdCall(FencedWriter):
+                def __init__(self) -> None:
+                    super().__init__(db, db.generation)
+                    self.calls = 0
+                    self.fired = False
+                    self.alive: list[bool] = []
+
+                async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
+                    self.calls += 1
+                    if self.calls == 3 and not self.fired:
+                        self.fired = True
+                        self.alive = [r() is not None for r in refs]
+                        await self._db.write(
+                            lambda c: c.execute(_FOREIGN_PAIR_BUMP_SQL, (site_id,))
+                        )
+                    return await super().write_if_current(fn, epoch=epoch)
+
+            writer = _ForeignWriteOnThirdCall()
+
+            with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
+                await run_batched_scoring(writer, site_id)
+
+            assert len(refs) == 5
+            assert writer.alive == [True] * 5
+            assert seen == [False] * 5
+            assert cutoff_calls == 2
+
+            messages = [r.getMessage() for r in caplog.records]
+            expected_cas_miss = f"score window=w:14 site={site_id} cas_miss attempt=1"
+            cas_miss_lines = [m for m in messages if m == expected_cas_miss]
+            assert len(cas_miss_lines) == 1, f"got: {messages}"
 
         asyncio.run(_run())
     finally:

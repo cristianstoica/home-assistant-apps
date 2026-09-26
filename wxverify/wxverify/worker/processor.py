@@ -522,12 +522,14 @@ async def dispatch(
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        # Each pair phase computes on a pooled read connection outside the
-        # write lock and applies in chunks under the input-epoch
-        # compare-and-set (Database.write_if_current), through
-        # run_split_pair_phases. The batched scoring orchestrator then runs
-        # discovery, each cell batch and the sweep in a write transaction of
-        # its own. So the event loop (and the Docker healthcheck) gets
+        # Each pair phase, the scoring discovery and each scoring window
+        # compute on a pooled read connection outside the write lock and
+        # apply under the input-epoch compare-and-set
+        # (Database.write_if_current): a pair phase in chunks through
+        # run_split_pair_phases, discovery as its run-stamp transaction, and
+        # a window in SCORE_BATCH_CELLS batches; the sweep is one plain write
+        # transaction. So no write transaction runs a scoring aggregate or
+        # DISTINCT, the event loop (and the Docker healthcheck) gets
         # scheduled between transactions instead of stalling for the whole
         # pipeline, and no single transaction holds the write lock for a
         # whole scoring rebuild.
@@ -558,13 +560,10 @@ async def dispatch(
         #       behind it: a future route that switches from inline scoring
         #       to enqueueing would break convergence silently. The dashboard
         #       enqueue_score_rescore routes do not write observations and
-        #       are safe. An inline route rescore that commits while a pair
-        #       phase of this job computes moves the input epoch, so that
-        #       phase's apply misses and recomputes instead of relying on the
-        #       ordering alone. Batch scoring computes each cell batch inside
-        #       its own write transaction, so it reads committed inputs; the
-        #       run-stamp rule below covers a rescore that lands between its
-        #       transactions.
+        #       are safe. An inline route rescore that commits while this job
+        #       computes moves the input epoch, so the apply that follows that
+        #       compute misses and recomputes instead of relying on the
+        #       ordering alone.
         # One writer lane sits outside (a)/(b): Database.replace_from
         # (POST /api/import/db) holds both locks and can swap the ENTIRE
         # database file between any two transactions here. Every write in
@@ -579,20 +578,23 @@ async def dispatch(
         # an abandoned mid-split job leaves nothing for it to converge with.
         #
         # Batch scoring runs LAST; its inputs are written by the earlier phases
-        # of the SAME job. Run-stamp/sweep rule: discovery captures ONE
-        # fixed-width run_stamp INSIDE the batched run's first write transaction.
-        # Acquiring the write lock guarantees an in-flight inline route rescore
-        # has committed first, so its cells are discovered and re-upserted
-        # rather than swept; an inline rescore that starts after discovery
-        # writes a LATER stamp and survives the strict computed_at < run_stamp
-        # sweep. Named accepted relaxations: (1) a same-UTC-day re-run can
-        # briefly serve a 'fresh' snapshot mixing two intra-day generations
-        # (both computed from the same day's observation set); it self-heals
-        # when the run completes and does not affect the midnight staleness
-        # contract. (2) Between two chunks of one multimodel apply, a reader
-        # can see some mean keys refreshed and others not; each visible row is
-        # a complete mean for its key, and the next complete apply of that
-        # phase ends the mix.
+        # of the SAME job. Run-stamp/sweep rule: discovery reads the cell
+        # universe at an input epoch, and ONE fixed-width run_stamp is taken
+        # in its own compare-and-set transaction at that epoch. An inline
+        # route rescore is one write transaction, so at the stamp it has
+        # either committed or not started. If it committed before the
+        # discovery read, discovery saw its cells; if after, it moved the
+        # epoch, so the stamp misses and discovery re-reads and sees them.
+        # Either way its cells are re-upserted rather than swept. One that
+        # starts after the stamp writes a LATER stamp and survives the strict
+        # computed_at < run_stamp sweep. Named accepted relaxations: (1) a
+        # same-UTC-day re-run can briefly serve a 'fresh' snapshot mixing two
+        # intra-day generations (both computed from the same day's
+        # observation set); it self-heals when the run completes and does not
+        # affect the midnight staleness contract. (2) Between two chunks of
+        # one multimodel apply, a reader can see some mean keys refreshed and
+        # others not; each visible row is a complete mean for its key, and
+        # the next complete apply of that phase ends the mix.
         try:
             await run_split_pair_phases(writer, site_id, require_enabled=True)
             await run_batched_scoring(writer, site_id)
