@@ -64,3 +64,17 @@ def read_snapshot(
             "db snapshot %s held=%.1fms", label, (time.perf_counter() - started) * 1000
         )
         conn.rollback()
+
+
+@contextmanager
+def read_only_snapshot(
+    conn: sqlite3.Connection, *, label: str
+) -> Generator[sqlite3.Connection]:
+    """``read_snapshot`` with ``query_only`` on for the block, off after it."""
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        with read_snapshot(conn, label=label):
+            yield conn
+    finally:
+        # _settle_reader never resets pragmas; a reader must go back ON-less.
+        conn.execute("PRAGMA query_only=OFF")

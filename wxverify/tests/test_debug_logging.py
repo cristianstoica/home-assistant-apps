@@ -159,7 +159,9 @@ class _FakeDb:
     async def read(self, fn):  # type: ignore[no-untyped-def]
         return fn(None)
 
-    async def write_fenced(self, fn, *, generation):  # type: ignore[no-untyped-def]
+    async def write_fenced(  # type: ignore[no-untyped-def]
+        self, fn, *, generation, epoch_exempt=False
+    ):
         return fn(None)
 
 
@@ -208,70 +210,6 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
 def _make_url(param: str, value: str = "SECRET123") -> str:
     """Build a synthetic API URL with the given query key set to value."""
     return f"https://api.example.com/v1/forecast?{param}={value}"
-
-
-# ---------------------------------------------------------------------------
-# Logging-state isolation fixture
-#
-# basicConfig(force=True) mutates global logging state. We snapshot the root
-# logger's level + handlers, and httpx/httpcore loggers' levels + filters,
-# then restore them after every test that touches _configure_logging.
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture()
-def restore_logging_state() -> Any:
-    """Snapshot and restore root + httpx/httpcore logger state.
-
-    `_configure_logging()`'s `basicConfig(force=True)` installs a fresh
-    `StreamHandler` bound to *this test's* `sys.stdout` -- a per-test
-    capture proxy (`_pytest.capture.EncodedFile`) that pytest tears down
-    with the test. Blindly re-adding whatever handlers were on the root
-    logger before the test ran, and blindly leaving whatever
-    `_configure_logging` installed during the test still attached
-    afterward, both leak a handler bound to an already-expired capture
-    stream into later tests: the next unrelated `logging.warning(...)`
-    that reaches the root logger then tries to write to a closed file and
-    prints "--- Logging error ---" to the terminal instead of failing the
-    test that actually caused it.
-
-    So on teardown: (1) any handler installed during the test -- i.e. not
-    part of the original snapshot -- is explicitly closed, not merely
-    detached, so it can't be resurrected by identity elsewhere; (2) a
-    snapshotted handler is only reattached if its stream is still
-    writable -- one whose stream already closed during the test (e.g. via
-    `force=True` swapping streams out from under it) is dropped rather
-    than reattached in a broken state.
-    """
-    root = logging.getLogger()
-    saved_root_level = root.level
-    saved_root_handlers = list(root.handlers)
-
-    wire_saved: dict[str, tuple[int, list[logging.Filter]]] = {}
-    for name in ("httpx", "httpcore"):
-        lg = logging.getLogger(name)
-        wire_saved[name] = (lg.level, list(lg.filters))
-
-    yield
-
-    # Restore root: close/discard anything the test installed, and only
-    # reattach original handlers whose stream is still writable.
-    root.setLevel(saved_root_level)
-    for h in list(root.handlers):
-        root.removeHandler(h)
-        if h not in saved_root_handlers:
-            h.close()
-    for h in saved_root_handlers:
-        stream = getattr(h, "stream", None)
-        if stream is not None and getattr(stream, "closed", False):
-            continue
-        root.addHandler(h)
-
-    # Restore wire loggers
-    for name, (lvl, filters) in wire_saved.items():
-        lg = logging.getLogger(name)
-        lg.setLevel(lvl)
-        lg.filters = list(filters)
 
 
 # ---------------------------------------------------------------------------
@@ -1679,11 +1617,16 @@ def test_batched_scoring_orchestrator_info_lines_actually_emitted(
     )
     assert "elapsed=" in discovery[0], f"got: {discovery[0]!r}"
     assert f"site={site_id}" in discovery[0], f"got: {discovery[0]!r}"
+    assert "attempts=1" in discovery[0], f"got: {discovery[0]!r}"
 
     windows = [m for m in info_msgs if m.startswith("score window=")]
-    # discover_score_work builds exactly 2 windows (rolling + all-time).
+    # stamp_score_work builds exactly 2 windows (rolling + all-time).
     assert len(windows) == 2, f"expected 2 'score window=' INFO lines; got: {info_msgs}"
     assert all("elapsed=" in m for m in windows), f"got: {windows}"
+    assert all("compute=" in m for m in windows), f"got: {windows}"
+    assert all("apply=" in m for m in windows), f"got: {windows}"
+    assert all("apply_max=" in m for m in windows), f"got: {windows}"
+    assert all("attempts=1" in m for m in windows), f"got: {windows}"
 
     sweep = [m for m in info_msgs if m.startswith("score sweep")]
     assert len(sweep) == 1, (
@@ -1692,6 +1635,10 @@ def test_batched_scoring_orchestrator_info_lines_actually_emitted(
     assert "elapsed=" in sweep[0], f"got: {sweep[0]!r}"
     assert f"site={site_id}" in sweep[0], f"got: {sweep[0]!r}"
 
+    assert not [m for m in info_msgs if "cas_miss" in m], (
+        f"a single-writer run must never CAS-miss; got: {info_msgs}"
+    )
+
 
 def test_score_batch_line_is_debug_only_never_info(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1699,7 +1646,7 @@ def test_score_batch_line_is_debug_only_never_info(
     """L3 (score batch): the per-batch 'score batch' line is DEBUG-only.
 
     Positive: with caplog at DEBUG, 'score batch' fires from
-    wxverify.scoring.engine.score_cell_batch (called once per batch by
+    wxverify.scoring.engine.apply_cell_batch (called once per batch by
     run_batched_scoring). Paired negative, from the SAME capture (not an
     ambient absence): none of those records carry levelno INFO — this is the
     regression a silent logger.debug -> logger.info promotion would trip.
@@ -1719,7 +1666,7 @@ def test_score_batch_line_is_debug_only_never_info(
 
     debug_batch = [r for r in batch_records if r.levelno == logging.DEBUG]
     assert len(debug_batch) > 0, (
-        "positive: 'score batch' must fire at DEBUG from score_cell_batch; "
+        "positive: 'score batch' must fire at DEBUG from apply_cell_batch; "
         f"engine records: {[r.getMessage() for r in engine_records]}"
     )
 

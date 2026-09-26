@@ -8,6 +8,11 @@ materializer; this oracle asserts full end-state equivalence of
 ``forecast_pairs`` and ``score_cache`` between the frozen reference pipeline
 and the live ``pair_and_score`` across representative mutation scenarios.
 
+The multimodel reference is frozen: ``tests/scoring_ref_0164.py`` holds
+``materialize_multimodel_mean_0164``, a byte-for-byte copy of the 0.16.4
+(``b21f342``) multimodel mean body. It must never track the
+live implementation.
+
 Because the reference rebuilds persistence from scratch on every run, it can
 never carry a stale row — so any pair the incremental path wrongly retains
 (i.e. any hole in the consensus-invalidation contract) shows up as a row
@@ -18,10 +23,16 @@ All fixture data is synthetic.
 
 from __future__ import annotations
 
+import asyncio
+import math
 import sqlite3
 from collections.abc import Callable
 from datetime import timedelta
+from pathlib import Path
 
+import pytest
+
+from tests.scoring_ref_0164 import materialize_multimodel_mean_0164
 from wxverify.core.timeutil import (
     day_ahead,
     floor_hour,
@@ -30,15 +41,19 @@ from wxverify.core.timeutil import (
     utc_now,
     window_cutoff,
 )
+from wxverify.db.connection import FencedWriter, close_db, init_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_id,
+)
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 from wxverify.scoring.metrics import strategy_for
-from wxverify.scoring.multimodel import materialize_multimodel_mean
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.settings.keys import get_number_setting
+from wxverify.worker.score_batches import run_batched_scoring, run_split_pair_phases
 
 # --------------------------------------------------------------------------
 # Reference implementations (verbatim 0.1.0 behavior — do not "improve").
@@ -271,8 +286,9 @@ def _ref_score_window(
 def _ref_pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None:
     _ref_pair_real_models(conn, site_id)
     _ref_materialize_persistence(conn, site_id)
-    # Multimodel stays delete+rebuild in 0.1.1 (load-bearing) — live import.
-    materialize_multimodel_mean(conn, site_id)
+    # Multimodel stays delete+rebuild (load-bearing): the 0.16.4 (b21f342)
+    # body, frozen at tests/scoring_ref_0164.py.
+    materialize_multimodel_mean_0164(conn, site_id)
     _ref_clear_score_cache(conn, site_id)
     rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
@@ -416,7 +432,7 @@ def _pairs_snapshot(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
     rows = conn.execute(
         f"""
         SELECT {_PAIR_COLS} FROM forecast_pairs
-        ORDER BY site_id, feed_id, variable, issued_at, valid_at
+        ORDER BY site_id, feed_id, variable, issued_at, valid_at, tz_generation_id
         """
     ).fetchall()
     return [tuple(row) for row in rows]
@@ -554,6 +570,55 @@ _SCENARIOS: tuple[tuple[str, Mutation, int | None], ...] = (
 )
 
 
+def _assert_end_state_equal(
+    actual: sqlite3.Connection, expected: sqlite3.Connection, *, label: str
+) -> None:
+    """§5.4: forecast_pairs/score_cache equivalence, against the frozen reference.
+
+    ``tz_generation_id`` is not compared directly between the two snapshots:
+    the live path and the reference seed generations in different orders, so
+    the ids themselves can legitimately differ. Instead each arm's own pair
+    rows are checked against that arm's own ``published_generation_id``.
+    """
+    for conn, which in ((actual, "actual"), (expected, "expected")):
+        for row in conn.execute(
+            "SELECT id, site_id, tz_generation_id FROM forecast_pairs"
+        ).fetchall():
+            expected_generation = published_generation_id(conn, int(row["site_id"]))
+            assert row["tz_generation_id"] == expected_generation, (
+                f"{label}: {which} pair id={row['id']} site={row['site_id']}"
+                f" tz_generation_id={row['tz_generation_id']!r},"
+                f" published_generation_id={expected_generation!r}"
+            )
+
+    expected_pairs = _pairs_snapshot(expected)
+    assert len(expected_pairs) > 0, f"empty oracle in scenario: {label}"
+    actual_pairs = _pairs_snapshot(actual)
+    assert actual_pairs == expected_pairs, (
+        f"forecast_pairs diverged after scenario: {label}"
+    )
+
+    actual_scores = _scores_snapshot(actual)
+    expected_scores = _scores_snapshot(expected)
+    assert len(actual_scores) == len(expected_scores), (
+        f"score_cache row count diverged after scenario: {label}:"
+        f" {len(actual_scores)} vs {len(expected_scores)}"
+    )
+    for a_row, e_row in zip(actual_scores, expected_scores, strict=True):
+        for a_val, e_val in zip(a_row, e_row, strict=True):
+            if isinstance(a_val, float) or isinstance(e_val, float):
+                assert isinstance(a_val, float) and isinstance(e_val, float), (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+                assert math.isclose(a_val, e_val, rel_tol=1e-12, abs_tol=1e-12), (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+            else:
+                assert a_val == e_val, (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+
+
 def test_pipeline_equivalent_to_reference_rebuild() -> None:
     ref = _make_db()
     live = _make_db()
@@ -563,13 +628,119 @@ def test_pipeline_equivalent_to_reference_rebuild() -> None:
             mutate(live)
             _ref_pair_and_score(ref, site_arg)
             pair_and_score(live, site_arg)
-            assert _pairs_snapshot(live) == _pairs_snapshot(ref), (
-                f"forecast_pairs diverged after scenario: {name}"
-            )
-            assert _scores_snapshot(live) == _scores_snapshot(ref), (
-                f"score_cache diverged after scenario: {name}"
-            )
-            assert len(_pairs_snapshot(ref)) > 0, f"empty oracle in scenario: {name}"
+            _assert_end_state_equal(live, ref, label=name)
     finally:
+        ref.close()
+        live.close()
+
+
+_PAIR_CROSS_ARM_EXCLUDE = frozenset({"id", "created_at", "tz_generation_id"})
+
+
+def _pairs_snapshot_excluding(
+    conn: sqlite3.Connection, exclude: frozenset[str]
+) -> list[dict[str, object]]:
+    cols = [
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(forecast_pairs)").fetchall()
+        if row["name"] not in exclude
+    ]
+    col_list = ", ".join(cols)
+    rows = conn.execute(
+        f"""
+        SELECT {col_list} FROM forecast_pairs
+        ORDER BY site_id, feed_id, variable, issued_at, valid_at
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def test_split_and_monolithic_equivalent_to_0164_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three arms per scenario, all against the same frozen 0.16.4 reference:
+
+    A. ``ref`` -- the frozen reference rebuild (``_ref_pair_and_score``).
+    B. ``live`` -- the monolithic live pipeline (``pair_and_score``).
+    C. ``split`` -- the same live pairing/persistence/multimodel/scoring
+       logic run through the write-lock-fix split path
+       (``run_split_pair_phases`` then ``run_batched_scoring``), on a real
+       ``Database``/``FencedWriter`` rather than a bare connection.
+
+    C vs A and B vs A are checked with the full ``_assert_end_state_equal``
+    oracle (``forecast_pairs``/``score_cache``, §5.4). C vs B additionally
+    checks every ``forecast_pairs`` column except ``id``, ``created_at`` and
+    ``tz_generation_id`` -- the split path must not just agree with the
+    frozen reference, it must reproduce the *live* incremental path's own
+    output, not some other value that happens to also satisfy the reference.
+
+    §5.3 scenario clock: ``utc_now`` is frozen to one instant per scenario
+    (``t0`` for the initial build, ``t0 + k`` seconds for scenario ``k``) so
+    all three arms see the same wall clock when they stamp
+    ``first_known_at``/``source_computed_at`` (``persistence.py``). Without
+    this, the three sequential ``_make_db()`` calls below would each read a
+    genuinely different real ``utc_now()`` while seeding
+    ``station_observations.fetched_at`` (via ``insert_station_observation`` /
+    ``materialize_consensus``), and the arms would diverge on
+    ``first_known_at`` for a reason that has nothing to do with the code
+    under test.
+    """
+    t0 = utc_now()
+    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: t0)
+
+    ref = _make_db()
+    live = _make_db()
+    seed = _make_db()
+    db_path = tmp_path / "equivalence-split.db"
+    seed.execute(f"VACUUM INTO '{db_path.as_posix()}'")
+    seed.close()
+
+    close_db()
+    split_db = init_db(str(db_path))
+    writer = FencedWriter(split_db, split_db.generation)
+    split_conn = split_db._conn  # noqa: SLF001 - test inspects the real writer conn
+
+    async def _run_split(site_arg: int | None) -> None:
+        if site_arg is not None:
+            site_ids: tuple[int, ...] = (site_arg,)
+        else:
+            site_ids = tuple(
+                int(row["id"])
+                for row in split_conn.execute(
+                    "SELECT id FROM sites ORDER BY id"
+                ).fetchall()
+            )
+        for site_id in site_ids:
+            await run_split_pair_phases(writer, site_id, require_enabled=True)
+            await run_batched_scoring(writer, site_id)
+
+    async def _run_all_scenarios() -> None:
+        for k, (name, mutate, site_arg) in enumerate(_SCENARIOS):
+            monkeypatch.setattr(
+                "wxverify.core.timeutil.utc_now",
+                lambda k=k: t0 + timedelta(seconds=k),
+            )
+
+            mutate(ref)
+            mutate(live)
+            mutate(split_conn)
+
+            _ref_pair_and_score(ref, site_arg)
+            pair_and_score(live, site_arg)
+            await _run_split(site_arg)
+
+            _assert_end_state_equal(live, ref, label=f"{name} (live vs ref)")
+            _assert_end_state_equal(split_conn, ref, label=f"{name} (split vs ref)")
+
+            live_pairs = _pairs_snapshot_excluding(live, _PAIR_CROSS_ARM_EXCLUDE)
+            split_pairs = _pairs_snapshot_excluding(split_conn, _PAIR_CROSS_ARM_EXCLUDE)
+            assert split_pairs == live_pairs, (
+                f"split forecast_pairs diverged from the live path: {name}"
+            )
+
+    try:
+        asyncio.run(_run_all_scenarios())
+    finally:
+        close_db()
         ref.close()
         live.close()

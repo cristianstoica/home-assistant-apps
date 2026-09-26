@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.16.5
+
+The nightly scoring job no longer holds the database write lock while it
+computes. The pairing phases and the mean-forecast phase each split into
+a read-only compute and a short, chunked write that applies the result;
+the scoring windows now save per batch instead of one long transaction
+per window. Before, one scoring write held the lock for tens of
+seconds at a time, and current-condition observation writes queued
+behind it. There is no SQL, index or schema change, and no migration.
+Rollback consists of reinstalling 0.16.4.
+
 ## 0.16.4
 
 The nightly verification run no longer holds the database write lock

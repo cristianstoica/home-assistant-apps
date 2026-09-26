@@ -98,8 +98,11 @@ async def run_current_obs_poller(db: Database, *, run_job: RunJob) -> None:
         # Exempt: the enqueue, the claim and the heartbeat run with no
         # job-scoped read behind them yet -- there is no generation to fence
         # against until a job is claimed, and run_job captures it first.
+        # The write is also exempt from the input epoch because it touches
+        # only the current-obs lane's tables.
         claimed = await db.write(
-            lambda conn, s=stamp: _enqueue_and_claim(conn, stamp_heartbeat=s)
+            lambda conn, s=stamp: _enqueue_and_claim(conn, stamp_heartbeat=s),
+            epoch_exempt=True,
         )
         if stamp:
             last_heartbeat = now_mono

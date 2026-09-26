@@ -24,12 +24,12 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
+from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
 from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
 from wxverify.worker.cadence import parse_fetch_interval_minutes
@@ -41,7 +41,11 @@ from wxverify.worker.domain_backoff import (
     source_domain,
 )
 from wxverify.worker.scheduler import scheduler_tick
-from wxverify.worker.score_batches import run_batched_scoring
+from wxverify.worker.score_batches import (
+    ScoringInputsBusy,
+    run_batched_scoring,
+    run_split_pair_phases,
+)
 from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 
 CATCHUP_SITE_CHUNK = 2
@@ -123,8 +127,10 @@ async def run_catchup(
             changed_sites.add(site.site_id)
     logger.debug("catchup rescoring sites=%s", len(changed_sites))
     for site_id in changed_sites:
-        # Same shape as the worker's pair_and_score dispatch: one write
-        # transaction per pair phase, then the shared batched scoring
+        # Same shape as the worker's pair_and_score dispatch: the pair phases
+        # compute outside the write lock and apply under the input-epoch
+        # compare-and-set (run_split_pair_phases, with no enabled check, as
+        # catchup's pair phases always ran), then the shared batched scoring
         # orchestrator. Both rescore lanes run as jobs on the main worker
         # lane, the only executor of jobs that write station_observations or
         # any scoring input, so the convergence invariant documented at the
@@ -134,12 +140,31 @@ async def run_catchup(
         # semantic change — today's rescore lane had none), so a site
         # vanished or disabled mid-catchup raises JobCancelled mid-rescore;
         # the continue ensures one vanished site does not abort rescoring
-        # the others.
+        # the others. A site whose inputs changed on every CAS attempt
+        # (ScoringInputsBusy) is handed to the main lane as an ordinary
+        # pair_and_score job, because catchup cannot defer itself for one
+        # site; an IntegrityError is logged at WARNING, not dropped.
         try:
-            for phase in PAIR_PHASES:
-                await writer.write(lambda conn, sid=site_id, run=phase: run(conn, sid))
+            await run_split_pair_phases(writer, site_id, require_enabled=False)
             await run_batched_scoring(writer, site_id)
-        except (JobCancelled, sqlite3.IntegrityError):
+        except ScoringInputsBusy as exc:
+            logger.warning(
+                "catchup rescore busy site=%s step=%s; enqueued pair_and_score",
+                site_id,
+                exc.step,
+            )
+            await writer.write(
+                lambda conn, sid=site_id: enqueue_if_absent(
+                    conn, "pair_and_score", sid, "score", {"site_id": sid}
+                )
+            )
+            continue
+        except JobCancelled:
+            continue
+        except sqlite3.IntegrityError as exc:
+            logger.warning(
+                "catchup rescore failed site=%s: %s", site_id, sanitized_exception(exc)
+            )
             continue
     if has_more and sites:
         return JobContinuation(

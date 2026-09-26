@@ -3,16 +3,37 @@
 from __future__ import annotations
 
 import sqlite3
+from typing import Final
 
 from wxverify.core.timeutil import day_ahead
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_clause,
-)
+from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.pair_flags import precip_flags
+from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
+
+_PAIR_INSERT_SQL: Final = """
+            INSERT OR IGNORE INTO forecast_pairs
+                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+                 day_ahead, forecast, observed, error, abs_error, sq_error,
+                 cat_hit, cat_false, cat_miss, cat_correct_neg,
+                 rain_threshold_mm, first_known_at, tz_generation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
 
 
 def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> int:
+    """Insert the missing real-model pairs; return the number inserted."""
+    return apply_delta(conn, compute_real_model_pairs(conn, site_id))
+
+
+def compute_real_model_pairs(
+    conn: sqlite3.Connection, site_id: int | None = None
+) -> PairDelta:
+    """Read-only: the real-model pairs ``pair_real_models`` would insert.
+
+    Every candidate sample (a matching observation, a lead in range, no
+    published pair yet) that passes the day-ahead bucket filter becomes one
+    ``InsertOp``; the seed sites are those rows' sites, in first-row order.
+    """
     params: tuple[object, ...]
     where_site = ""
     if site_id is None:
@@ -46,9 +67,9 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
           {where_site}
         """,
         params,
-    ).fetchall()
-    written = 0
-    generation_ids: dict[int, int] = {}
+    )
+    seeds: dict[int, None] = {}
+    ops: list[InsertOp] = []
     for row in rows:
         bucket = day_ahead(
             str(row["issued_at"]), str(row["valid_at"]), str(row["timezone"])
@@ -65,44 +86,34 @@ def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> in
             variable, forecast, observed, rain_threshold
         )
         row_site_id = int(row["site_id"])
-        generation_id = generation_ids.get(row_site_id)
-        if generation_id is None:
-            generation_id = ensure_published_generation(conn, row_site_id)
-            generation_ids[row_site_id] = generation_id
+        seeds.setdefault(row_site_id)
         # Availability (outcome knowability): the source sample's ingestion
         # time. NULL fetched_at stays NULL — never invented; downstream as-of
         # reads exclude NULL-availability pairs with a recorded reason.
         first_known_at = None if row["fetched_at"] is None else str(row["fetched_at"])
-        cur = conn.execute(
-            """
-            INSERT OR IGNORE INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg,
-                 rain_threshold_mm, first_known_at, tz_generation_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+        ops.append(
+            InsertOp(
                 row_site_id,
-                int(row["feed_id"]),
-                variable,
-                str(row["issued_at"]),
-                str(row["valid_at"]),
-                int(row["lead_hours"]),
-                bucket,
-                forecast,
-                observed,
-                forecast - observed,
-                abs(forecast - observed),
-                (forecast - observed) ** 2,
-                hit,
-                false,
-                miss,
-                correct_neg,
-                rain_threshold,
-                first_known_at,
-                generation_id,
-            ),
+                (
+                    row_site_id,
+                    int(row["feed_id"]),
+                    variable,
+                    str(row["issued_at"]),
+                    str(row["valid_at"]),
+                    int(row["lead_hours"]),
+                    bucket,
+                    forecast,
+                    observed,
+                    forecast - observed,
+                    abs(forecast - observed),
+                    (forecast - observed) ** 2,
+                    hit,
+                    false,
+                    miss,
+                    correct_neg,
+                    rain_threshold,
+                    first_known_at,
+                ),
+            )
         )
-        written += cur.rowcount
-    return written
+    return PairDelta(tuple(seeds), tuple(ops), _PAIR_INSERT_SQL, count=None)

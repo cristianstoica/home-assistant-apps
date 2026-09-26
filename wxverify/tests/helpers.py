@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import sqlite3
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 
@@ -543,3 +544,14 @@ def asof_insert_observation(
         """,
         (site_id, valid_at, value, computed_at),
     )
+
+
+def alive_after_wait(
+    refs: Sequence[Callable[[], object]], timeout: float = 2.0
+) -> list[bool]:
+    """Which weak referents are still alive, after waiting up to ``timeout``
+    seconds for all of them to die."""
+    deadline = time.monotonic() + timeout
+    while any(r() is not None for r in refs) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return [r() is not None for r in refs]

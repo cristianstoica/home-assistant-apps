@@ -23,7 +23,7 @@ def isoformat_utc_micro(value: datetime | None = None) -> str:
     ``isoformat_utc`` omits the fractional-seconds field when
     ``microsecond == 0``, and since ``'.' < 'Z'`` a later same-second stamp
     with microseconds compares lexically SMALLER than a whole-second one.
-    The scoring run stamp (``discover_score_work``) relies on SQL string
+    The scoring run stamp (``stamp_score_work``) relies on SQL string
     comparison as a time ordering, so it must use this fixed-width form.
     Do not switch other call sites: ``floor_hour``-derived ``…:00Z`` values
     are stored DB-wide and would cross-format-compare against new values.

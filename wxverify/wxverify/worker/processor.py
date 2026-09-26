@@ -7,7 +7,6 @@ import errno
 import logging
 import sqlite3
 import time
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
@@ -50,7 +49,6 @@ from wxverify.obs.pws_adapter import (
     is_hourly_history_no_content,
 )
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
     compute_forecast_record_readonly,
@@ -83,7 +81,12 @@ from wxverify.worker.feed_fetch import (
     mark_feed_unavailable,
 )
 from wxverify.worker.scheduler import scheduler_tick
-from wxverify.worker.score_batches import run_batched_scoring
+from wxverify.worker.score_batches import (
+    SCORING_CAS_ATTEMPTS,
+    ScoringInputsBusy,
+    run_batched_scoring,
+    run_split_pair_phases,
+)
 from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 from wxverify.worker.tz_correction import (
     advance_correction,
@@ -98,6 +101,10 @@ from wxverify.worker.verification_run import (
 POLL_INTERVAL = 1.0
 FAILED_JOB_RETENTION_HOURS = 168
 JOB_HOUSEKEEPING_INTERVAL_SECONDS = 3600
+# How long a pair_and_score job whose scoring inputs kept changing
+# (ScoringInputsBusy) waits before it is claimed again; a deferral does not
+# count as a failed attempt.
+_SCORING_BUSY_DEFER: Final = timedelta(seconds=60)
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +335,9 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     # job: every write below goes through `writer`, fenced to this
     # generation, so one that lands after a swap is rejected instead
     # of silently landing against whatever now owns this job's rows.
-    writer = FencedWriter(db, db.generation)
+    # A current-obs job's writes are also exempt from the input epoch:
+    # they touch only the current-obs lane's tables.
+    writer = FencedWriter(db, db.generation, epoch_exempt=(lane == "current_obs"))
     job_id = job.id
     claimed_at = time.monotonic()
     logger.info(
@@ -513,8 +522,14 @@ async def dispatch(
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        # One write transaction per pair phase, then the batched scoring
-        # orchestrator, so the event loop (and the Docker healthcheck) gets
+        # Each pair phase, the scoring discovery and each scoring window
+        # compute on a pooled read connection outside the write lock and
+        # apply under the input-epoch compare-and-set
+        # (Database.write_if_current): a pair phase in chunks through
+        # run_split_pair_phases, discovery as its run-stamp transaction, and
+        # a window in SCORE_BATCH_CELLS batches; the sweep is one plain write
+        # transaction. So no write transaction runs a scoring aggregate or
+        # DISTINCT, the event loop (and the Docker healthcheck) gets
         # scheduled between transactions instead of stalling for the whole
         # pipeline, and no single transaction holds the write lock for a
         # whole scoring rebuild.
@@ -529,6 +544,9 @@ async def dispatch(
         #       set is {station_current_obs, station_poll_state, api_budget,
         #       domain_backoffs, jobs} plus the runtime_state heartbeat,
         #       disjoint from every table the split pair_and_score reads.
+        #       The current-obs lane's writer is epoch-exempt for exactly
+        #       that disjoint write set; T-E4a/T-E4b
+        #       (tests/test_current_obs_poller.py) pin it.
         #       Catchup's rescore lane shares the same orchestrator
         #       (worker/score_batches.run_batched_scoring) and runs as a
         #       main-lane job too, so leg (a) serializes the two rescore lanes
@@ -542,7 +560,10 @@ async def dispatch(
         #       behind it: a future route that switches from inline scoring
         #       to enqueueing would break convergence silently. The dashboard
         #       enqueue_score_rescore routes do not write observations and
-        #       are safe.
+        #       are safe. An inline route rescore that commits while this job
+        #       computes moves the input epoch, so the apply that follows that
+        #       compute misses and recomputes instead of relying on the
+        #       ordering alone.
         # One writer lane sits outside (a)/(b): Database.replace_from
         # (POST /api/import/db) holds both locks and can swap the ENTIRE
         # database file between any two transactions here. Every write in
@@ -556,30 +577,36 @@ async def dispatch(
         # _rebuild_derived background task rebuilds scoring from scratch, so
         # an abandoned mid-split job leaves nothing for it to converge with.
         #
-        # The batching subdivides only the LAST phase (scoring), whose inputs
-        # are written by the earlier phases of the SAME job. Run-stamp/sweep
-        # rule: discovery captures ONE fixed-width run_stamp INSIDE the
-        # batched run's first write transaction — acquiring the write lock
-        # guarantees an in-flight inline route rescore has committed first,
-        # so its cells are discovered and re-upserted rather than swept; an
-        # inline rescore that starts after discovery writes a LATER stamp
-        # and survives the strict computed_at < run_stamp sweep. Named
-        # accepted relaxation: a same-UTC-day re-run can briefly serve a
-        # 'fresh' snapshot mixing two intra-day generations (both computed
-        # from the same day's observation set); it self-heals when the run
-        # completes and does not affect the midnight staleness contract.
-        for phase in PAIR_PHASES:
-            phase_started = time.monotonic()
-            await writer.write(
-                lambda conn, run=phase: _run_score_phase_if_enabled(conn, site_id, run)
-            )
-            logger.info(
-                "score phase=%s site=%s elapsed=%.1fs",
-                phase.__name__,
+        # Batch scoring runs LAST; its inputs are written by the earlier phases
+        # of the SAME job. Run-stamp/sweep rule: discovery reads the cell
+        # universe at an input epoch, and ONE fixed-width run_stamp is taken
+        # in its own compare-and-set transaction at that epoch. An inline
+        # route rescore is one write transaction, so at the stamp it has
+        # either committed or not started. If it committed before the
+        # discovery read, discovery saw its cells; if after, it moved the
+        # epoch, so the stamp misses and discovery re-reads and sees them.
+        # Either way its cells are re-upserted rather than swept. One that
+        # starts after the stamp writes a LATER stamp and survives the strict
+        # computed_at < run_stamp sweep. Named accepted relaxations: (1) a
+        # same-UTC-day re-run can briefly serve a 'fresh' snapshot mixing two
+        # intra-day generations (both computed from the same day's
+        # observation set); it self-heals when the run completes and does not
+        # affect the midnight staleness contract. (2) Between two chunks of
+        # one multimodel apply, a reader can see some mean keys refreshed and
+        # others not; each visible row is a complete mean for its key, and
+        # the next complete apply of that phase ends the mix.
+        try:
+            await run_split_pair_phases(writer, site_id, require_enabled=True)
+            await run_batched_scoring(writer, site_id)
+        except ScoringInputsBusy as exc:
+            logger.warning(
+                "pair_and_score deferred site=%s step=%s: inputs changed on "
+                "every one of %d attempts",
                 site_id,
-                time.monotonic() - phase_started,
+                exc.step,
+                SCORING_CAS_ATTEMPTS,
             )
-        await run_batched_scoring(writer, site_id)
+            raise JobDeferred(isoformat_utc(utc_now() + _SCORING_BUSY_DEFER)) from exc
         return None
     if job.type == "fetch_obs":
         site_id = job.site_id
@@ -658,17 +685,6 @@ async def dispatch(
         # run their heavy work outside any write transaction.
         return await run_verification_chunk(db, writer, site_id, job.payload)
     raise RuntimeError(f"unknown job type {job.type}")
-
-
-def _run_score_phase_if_enabled(
-    conn: sqlite3.Connection,
-    site_id: int,
-    phase: Callable[[sqlite3.Connection, int | None], object],
-) -> None:
-    row = conn.execute("SELECT enabled FROM sites WHERE id=?", (site_id,)).fetchone()
-    if row is None or not bool(row["enabled"]):
-        raise JobCancelled()
-    phase(conn, site_id)
 
 
 async def _run_forecast_record(
