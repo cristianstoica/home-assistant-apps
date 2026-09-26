@@ -12,9 +12,16 @@ from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import strategy_for
-from wxverify.scoring.multimodel import materialize_multimodel_mean
-from wxverify.scoring.pairing import pair_real_models
-from wxverify.scoring.persistence import materialize_persistence
+from wxverify.scoring.multimodel import (
+    compute_multimodel_mean,
+    materialize_multimodel_mean,
+)
+from wxverify.scoring.pairing import compute_real_model_pairs, pair_real_models
+from wxverify.scoring.persistence import (
+    compute_persistence_pairs,
+    materialize_persistence,
+)
+from wxverify.scoring.split import PairDelta
 from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
@@ -262,3 +269,22 @@ PAIR_PHASES: Final[tuple[Callable[[sqlite3.Connection, int | None], object], ...
 PAIR_AND_SCORE_PHASES: Final[
     tuple[Callable[[sqlite3.Connection, int | None], object], ...]
 ] = (*PAIR_PHASES, _score_all_windows)
+
+
+@dataclass(frozen=True, slots=True)
+class SplitPhase:
+    """One pair phase as its read-only compute (``scoring.split``)."""
+
+    name: str
+    compute: Callable[[sqlite3.Connection, int | None], PairDelta]
+
+
+# The pair phases as read-only computes, in PAIR_PHASES order. Each compute's
+# delta is written by ``scoring.split``'s apply side; each name is the
+# matching PAIR_PHASES function's ``__name__``, so phase-keyed log labels and
+# step names stay the same strings on either path.
+SPLIT_PAIR_PHASES: Final[tuple[SplitPhase, ...]] = (
+    SplitPhase("pair_real_models", compute_real_model_pairs),
+    SplitPhase("materialize_persistence", compute_persistence_pairs),
+    SplitPhase("materialize_multimodel_mean", compute_multimodel_mean),
+)

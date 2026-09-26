@@ -1318,8 +1318,9 @@ def test_import_round_trip_rebuilds_derived_tables(
         # Orphaned forecast_pairs row on a CONCRETE, non-virtual feed: no
         # station_observations/observations row backs this (site, variable,
         # valid_at) cell. Must be non-virtual: materialize_multimodel_mean
-        # unconditionally clears ALL virtual-feed forecast_pairs, which would
-        # mask a regressed rebuild-step-1 DELETE if the orphan were virtual.
+        # deletes every published mean row the rebuild cannot derive, which
+        # would mask a regressed rebuild-step-1 DELETE if the orphan were
+        # virtual.
         conn_b.execute(
             """
             INSERT INTO forecast_pairs

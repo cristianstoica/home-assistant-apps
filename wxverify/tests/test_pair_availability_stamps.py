@@ -267,7 +267,7 @@ def test_persistence_fallback_path_stamps_source_computed_at_too() -> None:
     # Canonical source at 05:00Z; the target's stored string is the same
     # whole-hour instant in a NON-canonical spelling ('+00:00' offset instead
     # of 'Z'), which fails the isoformat_utc round-trip identity and forces
-    # _materialize_target_fallback -- the separate per-lead lookup path.
+    # _fallback_ops -- the separate per-lead lookup path.
     _insert_observation(
         conn,
         site_id=site_id,
@@ -347,3 +347,35 @@ def test_multimodel_mean_binds_published_generation_and_leaves_null_stamp() -> N
     # NULL by design: a derived mean has no single source ingestion time.
     assert row["first_known_at"] is None
     assert row["state"] == "published"
+
+
+def test_multimodel_mean_return_counts_distinct_keys_not_inserts() -> None:  # SC-7
+    conn = _conn()
+    site_id = _make_site(conn, "Multimodel Site")
+    feed_a = _make_real_feed(conn, "member-a")
+    feed_b = _make_real_feed(conn, "member-b")
+    for feed_id, fetched_at in ((feed_a, _SAMPLE_FETCHED_AT), (feed_b, None)):
+        _insert_sample(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            issued_at="2035-01-01T00:00:00Z",
+            valid_at="2035-01-01T06:00:00Z",
+            lead_hours=6,
+            fetched_at=fetched_at,
+        )
+    _insert_observation(
+        conn,
+        site_id=site_id,
+        valid_at="2035-01-01T06:00:00Z",
+        value=4.0,
+        computed_at=_TARGET_COMPUTED_AT,
+    )
+    assert pair_real_models(conn, site_id) == 2
+
+    # First call: one distinct mean key, one row inserted.
+    assert materialize_multimodel_mean(conn, site_id) == 1
+    # Second call, unchanged inputs: still one distinct mean key, but the row
+    # is unchanged (no insert, no replace) -- the return value counts D keys,
+    # not the number of rows the call itself wrote (decision 36).
+    assert materialize_multimodel_mean(conn, site_id) == 1

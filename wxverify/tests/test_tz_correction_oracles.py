@@ -308,8 +308,8 @@ class TestMidBuildDeleteScoping:
         assert _counts(old_gen) == (0, 0)
 
     def test_multimodel_refresh_spares_building_mean_rows(self) -> None:
-        """Kills: published-clause drop on the multimodel site-scoped
-        delete-and-recreate (multimodel.py:33)."""
+        """Kills: published-clause drop on the multimodel X-read
+        (``existing_mean_rows_sql``)."""
         conn = asof_conn()
         site_id, _ = _seed_history(conn, second_feed=True)
         mean_feed = conn.execute(
@@ -345,11 +345,11 @@ class TestMidBuildDeleteScoping:
         published_before = _mean_rows(old_gen)
         assert published_before, "published multimodel mean rows must exist"
 
-        # Live refresh mid-build (the site-scoped delete-and-recreate lane).
+        # Live refresh mid-build (the site-scoped refresh).
         materialize_multimodel_mean(conn, site_id)
 
         assert _mean_rows(generation_id) == building_before
-        # Paired positive: the published lane really was recreated (rows
+        # Paired positive: the published lane really was refreshed (rows
         # still present under the published generation, same identities).
         assert _mean_rows(old_gen) == published_before
 

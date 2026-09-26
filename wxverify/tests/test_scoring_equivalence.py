@@ -8,6 +8,11 @@ materializer; this oracle asserts full end-state equivalence of
 ``forecast_pairs`` and ``score_cache`` between the frozen reference pipeline
 and the live ``pair_and_score`` across representative mutation scenarios.
 
+The multimodel reference is frozen: ``tests/scoring_ref_0164.py`` holds
+``materialize_multimodel_mean_0164``, a byte-for-byte copy of the 0.16.4
+(``b21f342``) multimodel mean body. It must never track the
+live implementation.
+
 Because the reference rebuilds persistence from scratch on every run, it can
 never carry a stale row — so any pair the incremental path wrongly retains
 (i.e. any hole in the consensus-invalidation contract) shows up as a row
@@ -18,10 +23,12 @@ All fixture data is synthetic.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections.abc import Callable
 from datetime import timedelta
 
+from tests.scoring_ref_0164 import materialize_multimodel_mean_0164
 from wxverify.core.timeutil import (
     day_ahead,
     floor_hour,
@@ -31,12 +38,14 @@ from wxverify.core.timeutil import (
     window_cutoff,
 )
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.tz_generations import (
+    ensure_published_generation,
+    published_generation_id,
+)
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 from wxverify.scoring.metrics import strategy_for
-from wxverify.scoring.multimodel import materialize_multimodel_mean
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.settings.keys import get_number_setting
 
@@ -271,8 +280,9 @@ def _ref_score_window(
 def _ref_pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None:
     _ref_pair_real_models(conn, site_id)
     _ref_materialize_persistence(conn, site_id)
-    # Multimodel stays delete+rebuild in 0.1.1 (load-bearing) — live import.
-    materialize_multimodel_mean(conn, site_id)
+    # Multimodel stays delete+rebuild (load-bearing): the 0.16.4 (b21f342)
+    # body, frozen at tests/scoring_ref_0164.py.
+    materialize_multimodel_mean_0164(conn, site_id)
     _ref_clear_score_cache(conn, site_id)
     rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     min_n = get_number_setting(conn, "min_n", 30, minimum=0)
@@ -416,7 +426,7 @@ def _pairs_snapshot(conn: sqlite3.Connection) -> list[tuple[object, ...]]:
     rows = conn.execute(
         f"""
         SELECT {_PAIR_COLS} FROM forecast_pairs
-        ORDER BY site_id, feed_id, variable, issued_at, valid_at
+        ORDER BY site_id, feed_id, variable, issued_at, valid_at, tz_generation_id
         """
     ).fetchall()
     return [tuple(row) for row in rows]
@@ -554,6 +564,55 @@ _SCENARIOS: tuple[tuple[str, Mutation, int | None], ...] = (
 )
 
 
+def _assert_end_state_equal(
+    actual: sqlite3.Connection, expected: sqlite3.Connection, *, label: str
+) -> None:
+    """§5.4: forecast_pairs/score_cache equivalence, against the frozen reference.
+
+    ``tz_generation_id`` is not compared directly between the two snapshots:
+    the live path and the reference seed generations in different orders, so
+    the ids themselves can legitimately differ. Instead each arm's own pair
+    rows are checked against that arm's own ``published_generation_id``.
+    """
+    for conn, which in ((actual, "actual"), (expected, "expected")):
+        for row in conn.execute(
+            "SELECT id, site_id, tz_generation_id FROM forecast_pairs"
+        ).fetchall():
+            expected_generation = published_generation_id(conn, int(row["site_id"]))
+            assert row["tz_generation_id"] == expected_generation, (
+                f"{label}: {which} pair id={row['id']} site={row['site_id']}"
+                f" tz_generation_id={row['tz_generation_id']!r},"
+                f" published_generation_id={expected_generation!r}"
+            )
+
+    expected_pairs = _pairs_snapshot(expected)
+    assert len(expected_pairs) > 0, f"empty oracle in scenario: {label}"
+    actual_pairs = _pairs_snapshot(actual)
+    assert actual_pairs == expected_pairs, (
+        f"forecast_pairs diverged after scenario: {label}"
+    )
+
+    actual_scores = _scores_snapshot(actual)
+    expected_scores = _scores_snapshot(expected)
+    assert len(actual_scores) == len(expected_scores), (
+        f"score_cache row count diverged after scenario: {label}:"
+        f" {len(actual_scores)} vs {len(expected_scores)}"
+    )
+    for a_row, e_row in zip(actual_scores, expected_scores, strict=True):
+        for a_val, e_val in zip(a_row, e_row, strict=True):
+            if isinstance(a_val, float) or isinstance(e_val, float):
+                assert isinstance(a_val, float) and isinstance(e_val, float), (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+                assert math.isclose(a_val, e_val, rel_tol=1e-12, abs_tol=1e-12), (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+            else:
+                assert a_val == e_val, (
+                    f"score_cache diverged after scenario: {label}: {a_row} vs {e_row}"
+                )
+
+
 def test_pipeline_equivalent_to_reference_rebuild() -> None:
     ref = _make_db()
     live = _make_db()
@@ -563,13 +622,7 @@ def test_pipeline_equivalent_to_reference_rebuild() -> None:
             mutate(live)
             _ref_pair_and_score(ref, site_arg)
             pair_and_score(live, site_arg)
-            assert _pairs_snapshot(live) == _pairs_snapshot(ref), (
-                f"forecast_pairs diverged after scenario: {name}"
-            )
-            assert _scores_snapshot(live) == _scores_snapshot(ref), (
-                f"score_cache diverged after scenario: {name}"
-            )
-            assert len(_pairs_snapshot(ref)) > 0, f"empty oracle in scenario: {name}"
+            _assert_end_state_equal(live, ref, label=name)
     finally:
         ref.close()
         live.close()

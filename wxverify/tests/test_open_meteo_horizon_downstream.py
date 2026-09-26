@@ -166,8 +166,8 @@ def _insert_sample_and_observation(
 
 
 def test_pair_real_models_window_boundary_at_raised_and_unraised_horizons() -> None:
-    """The bucket ``pair_real_models`` admits is ``0 <= day_ahead <= 7``,
-    measured from ISSUANCE (``pairing.py:53-56``). Any lead of ~192h or
+    """The bucket ``compute_real_model_pairs`` admits is ``0 <= day_ahead <= 7``,
+    measured from ISSUANCE (its ``day_ahead`` bucket filter). Any lead of ~192h or
     more lands outside that bucket on every date this suite exercises
     (ordinary and DST, see the companion test below), regardless of
     ``max_lead_hours`` -- so it cannot discriminate the horizon change and
@@ -338,7 +338,7 @@ def test_display_day_and_pairing_bucket_diverge_for_a_stale_issuance() -> None:
     measurements genuinely diverge here.
 
     Excluded from BOTH paths that share the ``_MAX_DAY_AHEAD``/bucket-7
-    rule: the live path (``pair_real_models``, ``pairing.py:56``) and the
+    rule: the live path (``compute_real_model_pairs``' bucket filter) and the
     timezone-rebuild path (``tz_rebuild.rebuild_generation_day`` ->
     ``_rebuild_real_pairs``, ``_MAX_DAY_AHEAD`` at ``tz_rebuild.py:31``,
     applied at ``:218``). A paired admitted sample (lead 180h, bucket 7,
