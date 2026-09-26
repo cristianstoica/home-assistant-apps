@@ -52,7 +52,11 @@ from wxverify.obs.pws_adapter import (
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.scoring.engine import PAIR_PHASES
 from wxverify.settings.keys import get_number_setting
-from wxverify.verification.record import build_forecast_record, run_record_gap_scan
+from wxverify.verification.record import (
+    compute_forecast_record_readonly,
+    persist_forecast_record,
+    run_record_gap_scan,
+)
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -626,9 +630,9 @@ async def dispatch(
         snapshot_local_date = job.payload.get("snapshot_local_date")
         if not isinstance(snapshot_local_date, str):
             raise JobCancelled()
-        await writer.write(
-            lambda conn: build_forecast_record(conn, site_id, snapshot_local_date)
-        )
+        # The build reads and ranks on a read snapshot, never under the write
+        # lock; only its insert of at most 24 rows takes the lock.
+        await _run_forecast_record(db, writer, site_id, snapshot_local_date)
         return None
     if job.type == "record_gap_scan":
         site_id = job.site_id
@@ -650,8 +654,8 @@ async def dispatch(
         if site_id is None:
             raise JobCancelled()
         # One chunk per claim, chain state in runtime_state (same shape as
-        # timezone_correction); the bootstrap phase runs its CPU work in a
-        # thread, never inside a write transaction.
+        # timezone_correction); the simulate/baseline days and the bootstrap
+        # run their heavy work outside any write transaction.
         return await run_verification_chunk(db, writer, site_id, job.payload)
     raise RuntimeError(f"unknown job type {job.type}")
 
@@ -665,6 +669,20 @@ def _run_score_phase_if_enabled(
     if row is None or not bool(row["enabled"]):
         raise JobCancelled()
     phase(conn, site_id)
+
+
+async def _run_forecast_record(
+    db: Database, writer: FencedWriter, site_id: int, snapshot_local_date: str
+) -> None:
+    """Build the day's record on a read snapshot; lock only for the insert."""
+    build = await db.read(
+        lambda conn: compute_forecast_record_readonly(
+            conn, site_id, snapshot_local_date
+        )
+    )
+    if build is None:
+        return
+    await writer.write(lambda conn: persist_forecast_record(conn, build))
 
 
 async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:

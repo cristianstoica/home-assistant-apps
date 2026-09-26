@@ -63,6 +63,24 @@ from wxverify.verification.methodology import (
 from wxverify.verification.record import resolve_snapshot_utc
 from wxverify.verification.runs import RunConfig
 
+type SqlValue = str | int | float | bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class DayEvidence:
+    """One snapshot day's rows, computed on a read snapshot, persisted later.
+
+    ``evidence_rows`` are ``verification_evidence`` parameter tuples in the
+    exact emission order of the former per-row inserts; the insert is
+    ``ON CONFLICT … DO NOTHING``, so that order decides which duplicate
+    wins. ``day_context`` is the ``verification_day_context`` tuple, or
+    ``None`` for a baseline day.
+    """
+
+    evidence_rows: tuple[tuple[SqlValue, ...], ...]
+    day_context: tuple[SqlValue, ...] | None
+
+
 #: The simulated horizon matches the record horizon: target day 0..7.
 SIM_DAY_COUNT = 8
 SIM_VARIABLES: tuple[str, ...] = DEPTH_VARIABLES
@@ -360,8 +378,29 @@ def _truth_rows(
     return {str(row["quantity"]): row for row in rows}
 
 
-def _insert_evidence(
-    conn: sqlite3.Connection,
+_EVIDENCE_INSERT_SQL = """
+        INSERT INTO verification_evidence
+            (run_id, snapshot_local_date, target_local_date, lead, variable,
+             quantity, entity_type, entity_key, predicted, forecast_eligible,
+             forecast_exclusion_reason, covered_hours, realized_contributors,
+             truth_value, truth_eligible, truth_exclusion_reason,
+             truth_covered_hours, truth_wet_hours, truth_dry_hours,
+             abs_error, occurrence_outcome)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(run_id, snapshot_local_date, lead, variable, quantity,
+                    entity_type, entity_key) DO NOTHING
+        """
+
+_DAY_CONTEXT_INSERT_SQL = """
+        INSERT INTO verification_day_context
+            (run_id, snapshot_local_date, snapshot_utc,
+             knowability_exclusions, null_availability_samples)
+        VALUES (?,?,?,?,?)
+        ON CONFLICT(run_id, snapshot_local_date) DO NOTHING
+        """
+
+
+def _evidence_row(
     cfg: RunConfig,
     *,
     snapshot_local_date: str,
@@ -371,7 +410,7 @@ def _insert_evidence(
     quantity: str,
     entity: _Entity,
     truth: sqlite3.Row | None,
-) -> None:
+) -> tuple[SqlValue, ...]:
     if truth is None:
         truth_value = None
         truth_eligible = False
@@ -401,42 +440,28 @@ def _insert_evidence(
             occurrence_outcome = classify_occurrence_outcome(
                 entity.predicted, truth_value
             )
-    conn.execute(
-        """
-        INSERT INTO verification_evidence
-            (run_id, snapshot_local_date, target_local_date, lead, variable,
-             quantity, entity_type, entity_key, predicted, forecast_eligible,
-             forecast_exclusion_reason, covered_hours, realized_contributors,
-             truth_value, truth_eligible, truth_exclusion_reason,
-             truth_covered_hours, truth_wet_hours, truth_dry_hours,
-             abs_error, occurrence_outcome)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(run_id, snapshot_local_date, lead, variable, quantity,
-                    entity_type, entity_key) DO NOTHING
-        """,
-        (
-            cfg.run_id,
-            snapshot_local_date,
-            target_local_date,
-            lead,
-            variable,
-            quantity,
-            entity.entity_type,
-            entity.entity_key,
-            entity.predicted,
-            1 if entity.forecast_eligible else 0,
-            entity.forecast_exclusion_reason,
-            entity.covered_hours,
-            entity.realized_contributors,
-            truth_value,
-            1 if truth_eligible else 0,
-            truth_reason,
-            truth_hours,
-            truth_wet,
-            truth_dry,
-            abs_error,
-            occurrence_outcome,
-        ),
+    return (
+        cfg.run_id,
+        snapshot_local_date,
+        target_local_date,
+        lead,
+        variable,
+        quantity,
+        entity.entity_type,
+        entity.entity_key,
+        entity.predicted,
+        1 if entity.forecast_eligible else 0,
+        entity.forecast_exclusion_reason,
+        entity.covered_hours,
+        entity.realized_contributors,
+        truth_value,
+        1 if truth_eligible else 0,
+        truth_reason,
+        truth_hours,
+        truth_wet,
+        truth_dry,
+        abs_error,
+        occurrence_outcome,
     )
 
 
@@ -494,8 +519,7 @@ def _pass1_truth_source(
     ).fetchone()
 
 
-def _insert_baseline_evidence(
-    conn: sqlite3.Connection,
+def _baseline_evidence_row(
     cfg: RunConfig,
     *,
     snapshot_local_date: str,
@@ -505,8 +529,8 @@ def _insert_baseline_evidence(
     quantity: str,
     entity: _Entity,
     source: sqlite3.Row,
-) -> None:
-    """Write one pass-2 baseline row, copying its truth from ``source``.
+) -> tuple[SqlValue, ...]:
+    """Build one pass-2 baseline row, copying its truth from ``source``.
 
     Six truth columns are copied verbatim; ``abs_error`` and
     ``occurrence_outcome`` are entity-specific and re-derived from the
@@ -529,66 +553,48 @@ def _insert_baseline_evidence(
             occurrence_outcome = classify_occurrence_outcome(
                 entity.predicted, truth_value
             )
-    conn.execute(
-        """
-        INSERT INTO verification_evidence
-            (run_id, snapshot_local_date, target_local_date, lead, variable,
-             quantity, entity_type, entity_key, predicted, forecast_eligible,
-             forecast_exclusion_reason, covered_hours, realized_contributors,
-             truth_value, truth_eligible, truth_exclusion_reason,
-             truth_covered_hours, truth_wet_hours, truth_dry_hours,
-             abs_error, occurrence_outcome)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(run_id, snapshot_local_date, lead, variable, quantity,
-                    entity_type, entity_key) DO NOTHING
-        """,
-        (
-            cfg.run_id,
-            snapshot_local_date,
-            target_local_date,
-            lead,
-            variable,
-            quantity,
-            entity.entity_type,
-            entity.entity_key,
-            entity.predicted,
-            1 if entity.forecast_eligible else 0,
-            entity.forecast_exclusion_reason,
-            entity.covered_hours,
-            entity.realized_contributors,
-            source["truth_value"],
-            source["truth_eligible"],
-            source["truth_exclusion_reason"],
-            source["truth_covered_hours"],
-            source["truth_wet_hours"],
-            source["truth_dry_hours"],
-            abs_error,
-            occurrence_outcome,
-        ),
+    return (
+        cfg.run_id,
+        snapshot_local_date,
+        target_local_date,
+        lead,
+        variable,
+        quantity,
+        entity.entity_type,
+        entity.entity_key,
+        entity.predicted,
+        1 if entity.forecast_eligible else 0,
+        entity.forecast_exclusion_reason,
+        entity.covered_hours,
+        entity.realized_contributors,
+        source["truth_value"],
+        source["truth_eligible"],
+        source["truth_exclusion_reason"],
+        source["truth_covered_hours"],
+        source["truth_wet_hours"],
+        source["truth_dry_hours"],
+        abs_error,
+        occurrence_outcome,
     )
 
 
-def simulate_baseline_day(
+def compute_baseline_day(
     conn: sqlite3.Connection,
     cfg: RunConfig,
     snapshot_local_date: str,
     rosters: dict[tuple[str, int, str], list[int]],
-) -> None:
-    """Pass 2 (§7 step 4): the all-feed-mean baseline for one snapshot day.
+) -> DayEvidence:
+    """Compute :func:`simulate_baseline_day`'s rows without writing them.
 
-    ``rosters`` is the resolved headline roster per ``(variable, lead,
-    quantity)`` cell; a cell absent from it resolved to no floor-clearing
-    feed and gets NO baseline row. The product path is re-run per cell (it
-    is not a post-hoc average of pass-1 per-feed rows) and only the row for
-    the cell's own quantity is persisted, because
-    ``_entities_for_selection`` emits every quantity of the variable from
-    one call and the insert discards duplicates rather than overwriting.
+    Reads only; the rows come back in emission order for
+    :func:`persist_day_evidence`. A baseline day has no day-context row.
     """
     local_date = date.fromisoformat(snapshot_local_date)
     snapshot_utc = resolve_snapshot_utc(cfg.timezone, local_date, cfg.wall_clock)
     as_of = isoformat_utc(snapshot_utc)
     samples = _snapshot_samples(conn, cfg, local_date, as_of)
     grouped = _group_samples(samples, timezone=cfg.timezone, now=snapshot_utc)
+    rows: list[tuple[SqlValue, ...]] = []
     for lead in range(SIM_DAY_COUNT):
         target_iso = (local_date + timedelta(days=lead)).isoformat()
         for variable in SIM_VARIABLES:
@@ -618,23 +624,51 @@ def simulate_baseline_day(
                 )
                 if source is None:
                     continue
-                _insert_baseline_evidence(
-                    conn,
-                    cfg,
-                    snapshot_local_date=snapshot_local_date,
-                    target_local_date=target_iso,
-                    lead=lead,
-                    variable=variable,
-                    quantity=quantity,
-                    entity=built[quantity],
-                    source=source,
+                rows.append(
+                    _baseline_evidence_row(
+                        cfg,
+                        snapshot_local_date=snapshot_local_date,
+                        target_local_date=target_iso,
+                        lead=lead,
+                        variable=variable,
+                        quantity=quantity,
+                        entity=built[quantity],
+                        source=source,
+                    )
                 )
+    return DayEvidence(tuple(rows), None)
 
 
-def simulate_snapshot_day(
-    conn: sqlite3.Connection, cfg: RunConfig, snapshot_local_date: str
+def simulate_baseline_day(
+    conn: sqlite3.Connection,
+    cfg: RunConfig,
+    snapshot_local_date: str,
+    rosters: dict[tuple[str, int, str], list[int]],
 ) -> None:
-    """Emit one snapshot day's full evidence set inside the caller's txn."""
+    """Pass 2 (§7 step 4): the all-feed-mean baseline for one snapshot day.
+
+    ``rosters`` is the resolved headline roster per ``(variable, lead,
+    quantity)`` cell; a cell absent from it resolved to no floor-clearing
+    feed and gets NO baseline row. The product path is re-run per cell (it
+    is not a post-hoc average of pass-1 per-feed rows) and only the row for
+    the cell's own quantity is persisted, because
+    ``_entities_for_selection`` emits every quantity of the variable from
+    one call and the insert discards duplicates rather than overwriting.
+    """
+    persist_day_evidence(
+        conn, compute_baseline_day(conn, cfg, snapshot_local_date, rosters)
+    )
+
+
+def compute_snapshot_day(
+    conn: sqlite3.Connection, cfg: RunConfig, snapshot_local_date: str
+) -> DayEvidence:
+    """Compute one snapshot day's full evidence set without writing it.
+
+    Reads only; the evidence rows come back in emission order, plus the
+    day-context row, for :func:`persist_day_evidence`. No read here sees
+    the day's own rows, so collecting them until the end is safe.
+    """
     local_date = date.fromisoformat(snapshot_local_date)
     snapshot_utc = resolve_snapshot_utc(cfg.timezone, local_date, cfg.wall_clock)
     as_of = isoformat_utc(snapshot_utc)
@@ -653,6 +687,7 @@ def simulate_snapshot_day(
     exclusions: dict[str, dict[str, int]] = {}
     daily_rank_cache: dict[str, list[int]] = {}
     truth_cache: dict[str, dict[str, sqlite3.Row]] = {}
+    rows: list[tuple[SqlValue, ...]] = []
 
     for lead in range(SIM_DAY_COUNT):
         target_date = local_date + timedelta(days=lead)
@@ -828,34 +863,41 @@ def simulate_snapshot_day(
 
             for per_quantity in entities:
                 for quantity, entity in per_quantity.items():
-                    _insert_evidence(
-                        conn,
-                        cfg,
-                        snapshot_local_date=snapshot_local_date,
-                        target_local_date=target_iso,
-                        lead=lead,
-                        variable=variable,
-                        quantity=quantity,
-                        entity=entity,
-                        truth=truth_by_quantity.get(quantity),
+                    rows.append(
+                        _evidence_row(
+                            cfg,
+                            snapshot_local_date=snapshot_local_date,
+                            target_local_date=target_iso,
+                            lead=lead,
+                            variable=variable,
+                            quantity=quantity,
+                            entity=entity,
+                            truth=truth_by_quantity.get(quantity),
+                        )
                     )
 
-    conn.execute(
-        """
-        INSERT INTO verification_day_context
-            (run_id, snapshot_local_date, snapshot_utc,
-             knowability_exclusions, null_availability_samples)
-        VALUES (?,?,?,?,?)
-        ON CONFLICT(run_id, snapshot_local_date) DO NOTHING
-        """,
-        (
-            cfg.run_id,
-            snapshot_local_date,
-            as_of,
-            json.dumps(exclusions, separators=(",", ":"), sort_keys=True),
-            null_availability,
-        ),
+    context: tuple[SqlValue, ...] = (
+        cfg.run_id,
+        snapshot_local_date,
+        as_of,
+        json.dumps(exclusions, separators=(",", ":"), sort_keys=True),
+        null_availability,
     )
+    return DayEvidence(tuple(rows), context)
+
+
+def persist_day_evidence(conn: sqlite3.Connection, evidence: DayEvidence) -> None:
+    """Write one computed day inside the caller's write transaction."""
+    conn.executemany(_EVIDENCE_INSERT_SQL, evidence.evidence_rows)
+    if evidence.day_context is not None:
+        conn.execute(_DAY_CONTEXT_INSERT_SQL, evidence.day_context)
+
+
+def simulate_snapshot_day(
+    conn: sqlite3.Connection, cfg: RunConfig, snapshot_local_date: str
+) -> None:
+    """Emit one snapshot day's full evidence set inside the caller's txn."""
+    persist_day_evidence(conn, compute_snapshot_day(conn, cfg, snapshot_local_date))
 
 
 __all__ = [
@@ -866,8 +908,12 @@ __all__ = [
     "SIM_DAY_COUNT",
     "SIM_DEPTHS",
     "SIM_VARIABLES",
+    "DayEvidence",
     "classify_occurrence_outcome",
+    "compute_baseline_day",
+    "compute_snapshot_day",
     "latest_knowable_target",
+    "persist_day_evidence",
     "simulate_baseline_day",
     "simulate_snapshot_day",
 ]

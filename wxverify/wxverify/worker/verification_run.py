@@ -1,12 +1,15 @@
 """Resumable ``verification_run`` job chain (§14).
 
 Mirrors the ``timezone_correction`` chain shape: one claimed job executes
-exactly ONE chunk — a single short write transaction — then returns a
-:class:`JobContinuation`, so other job types interleave between chunks.
+exactly ONE chunk, then returns a :class:`JobContinuation`, so other job
+types interleave between chunks. A sync phase's chunk is one short write
+transaction; a ``simulate``/``baseline`` chunk is a sequence of days, each
+computed on a read snapshot and persisted in its own short write.
 Chain state lives in one ``runtime_state`` JSON blob
 (``verification_state:<site_id>``), rewritten INSIDE the same transaction
-as the chunk's work; a progress heartbeat
-(``verification_heartbeat:<site_id>``) is refreshed each chunk.
+that persists the chunk's (or, in the day phases, the day's) work; a
+progress heartbeat (``verification_heartbeat:<site_id>``) is refreshed each
+chunk (each day in the day phases).
 
 Phases: ``discover`` (chunked discovery and materialization of settled local
 days missing from ``daily_truth`` — the only path that CREATES a truth row
@@ -16,12 +19,13 @@ fingerprint vs the last published run; the durable trigger-decision row lands
 here, before any run row exists) →
 ``start`` (one transaction: prior incomplete attempts wiped, the new run
 row pins config + roster + generation + period + seed) → ``simulate``
-(chunked walk-forward evidence; each chunk first re-checks the pinned
-inputs against the live tables) → ``resolve`` (§7 pass-1 availability-only
-resolution, one chunk) → ``baseline`` (§7 pass 2: the all-feed-mean
-baseline over the resolved headline roster, chunked like ``simulate``) →
-``aggregate`` (cell resolution +
-results, one transaction) → ``bootstrap`` (the ONLY async phase: series
+(chunked walk-forward evidence; each day first re-checks the pinned
+inputs inside its own read snapshot) → ``resolve`` (§7 pass-1
+availability-only resolution, one chunk) → ``baseline`` (§7 pass 2: the
+all-feed-mean baseline over the resolved headline roster, chunked like
+``simulate``) → ``aggregate`` (cell resolution +
+results, one transaction) → ``bootstrap`` (async, as ``simulate`` and
+``baseline`` are — see :func:`_run_day_chunk`: series
 prepared on a read connection, the CPU-bound bootstrap runs in
 ``asyncio.to_thread`` — never inside ``db.write`` — then one write
 persists the verdicts) → ``pairwise`` (§9: below-floor rows gain their
@@ -36,6 +40,8 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import cast
 
@@ -48,6 +54,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
     set_runtime_state_now,
 )
+from wxverify.db.snapshot import read_snapshot
 from wxverify.verification.decision import VariableInputs, Verdict, decide_variable
 from wxverify.verification.engine import (
     aggregate_run,
@@ -63,6 +70,7 @@ from wxverify.verification.manifest import write_run_manifest
 from wxverify.verification.read_cache import warm_read_cache
 from wxverify.verification.runs import (
     RunConfig,
+    assert_inputs_unchanged_readonly,
     assert_inputs_unpinned_unchanged,
     capture_config_snapshot,
     failed_attempts_for_fingerprint,
@@ -74,7 +82,14 @@ from wxverify.verification.runs import (
     settled_through,
     start_run,
 )
-from wxverify.verification.simulate import simulate_baseline_day, simulate_snapshot_day
+from wxverify.verification.simulate import (
+    DayEvidence,
+    compute_baseline_day,
+    compute_snapshot_day,
+    persist_day_evidence,
+    simulate_baseline_day,
+    simulate_snapshot_day,
+)
 from wxverify.verification.truth import (
     materialize_missing_truth_days,
     regenerate_marked_truth_chunk,
@@ -92,7 +107,7 @@ TRUTH_DISCOVERY_DAYS_PER_CHUNK = 20
 # Stale (local day, generation) truth groups regenerated per chunk
 # (payload-overridable, like tz_correction's days_per_chunk).
 REGEN_CHUNK_GROUPS = 20
-# Snapshot days simulated per chunk transaction (payload-overridable).
+# Snapshot days per claimed chunk (payload-overridable); each day commits on its own.
 SNAPSHOT_DAYS_PER_CHUNK = 7
 # Failed attempts on ONE fingerprint before the trigger stops retrying (§14:
 # a third start without completion marks the effort failed, not re-pended).
@@ -113,6 +128,12 @@ FORCED_START_REASON = "started after 2 fingerprint re-derivations"
 
 _STATE_KEY_PREFIX = "verification_state:"
 _HEARTBEAT_KEY_PREFIX = "verification_heartbeat:"
+
+#: Phases whose days are computed on a read snapshot and persisted one day
+#: per short write. Read at call time so a test can route them back through
+#: the sync reference path.
+_DAY_PHASES: frozenset[str] = frozenset({"simulate", "baseline"})
+_NEXT_PHASE: dict[str, str] = {"simulate": "resolve", "baseline": "aggregate"}
 
 
 def verification_state_key(site_id: int) -> str:
@@ -188,6 +209,8 @@ async def run_verification_chunk(
         verdicts.extend(preskipped_verdicts(cfg))
         await writer.write(lambda conn: _persist_verdicts(conn, site_id, cfg, verdicts))
         return _continuation(site_id, payload)
+    if blob is not None and phase in _DAY_PHASES:
+        return await _run_day_chunk(db, writer, site_id, payload, phase)
     more = await writer.write(lambda conn: advance_verification(conn, site_id, payload))
     if more:
         return _continuation(site_id, payload)
@@ -223,6 +246,122 @@ def _persist_verdicts(
     blob["phase"] = "pairwise"
     _save_state(conn, site_id, blob)
     _heartbeat(conn, site_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _DayWork:
+    raw_blob: str
+    next_blob: dict[str, object]
+    evidence: DayEvidence | None
+    day: str | None
+
+
+def _day_step(
+    blob: dict[str, object], cfg: RunConfig, phase: str
+) -> tuple[str | None, dict[str, object]]:
+    """Advance the cursor by at most one day; mirrors the sync chunk loop."""
+    following = dict(blob)
+    cursor = date.fromisoformat(str(blob["cursor"]))
+    end = date.fromisoformat(cfg.period_end)
+    day: str | None = None
+    if cursor <= end:
+        day = cursor.isoformat()
+        cursor += timedelta(days=1)
+    if cursor > end:
+        following["phase"] = _NEXT_PHASE[phase]
+        following.pop("cursor", None)
+    else:
+        following["cursor"] = cursor.isoformat()
+    return day, following
+
+
+def _compute_day(conn: sqlite3.Connection, site_id: int, phase: str) -> _DayWork:
+    """Compute ONE day on a pooled reader: one snapshot, no writes (enforced)."""
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        with read_snapshot(conn, label=f"verification_{phase}_day"):
+            raw = get_runtime_state(conn, verification_state_key(site_id))
+            blob = _parse_state(raw)
+            if raw is None or blob is None or str(blob.get("phase", "")) != phase:
+                raise JobCancelled()
+            cfg = _blob_config(conn, blob)
+            assert_inputs_unchanged_readonly(conn, cfg)
+            day, next_blob = _day_step(blob, cfg, phase)
+            evidence: DayEvidence | None = None
+            if day is not None:
+                if phase == "simulate":
+                    evidence = compute_snapshot_day(conn, cfg, day)
+                else:
+                    evidence = compute_baseline_day(
+                        conn, cfg, day, pass1_baseline_feeds(conn, cfg.run_id)
+                    )
+            return _DayWork(raw, next_blob, evidence, day)
+    finally:
+        # _settle_reader never resets pragmas; a reader must go back ON-less.
+        conn.execute("PRAGMA query_only=OFF")
+
+
+def _persist_day(conn: sqlite3.Connection, site_id: int, work: _DayWork) -> None:
+    """One short write: the day's rows, the advanced blob, the heartbeat."""
+    current = get_runtime_state(conn, verification_state_key(site_id))
+    if current != work.raw_blob:
+        logger.warning(
+            "verification day discarded site=%s day=%s:"
+            " chain state changed during compute",
+            site_id,
+            work.day,
+        )
+        raise JobCancelled()
+    if work.evidence is not None:
+        persist_day_evidence(conn, work.evidence)
+    _save_state(conn, site_id, work.next_blob)
+    _heartbeat(conn, site_id)
+
+
+async def _run_day_chunk(
+    db: Database,
+    writer: FencedWriter,
+    site_id: int,
+    payload: dict[str, object],
+    phase: str,
+) -> JobContinuation:
+    """Run one claim's ``simulate``/``baseline`` days, one day at a time.
+
+    Each day computes on a pooled reader inside its own read snapshot (never
+    under the write lock), then one fenced write commits its rows, the
+    advanced chain state and the heartbeat together. Day S reads snapshots up
+    to S-2, which earlier days of this claim have already committed.
+    """
+    days = _chunk_size(payload, "snapshot_days_per_chunk", SNAPSHOT_DAYS_PER_CHUNK)
+    done = 0
+    last_day: str | None = None
+    compute_max = compute_total = persist_max = 0.0
+    for _ in range(days):
+        started = time.monotonic()
+        work = await db.read(lambda conn: _compute_day(conn, site_id, phase))
+        computed = time.monotonic()
+        await writer.write(lambda conn, w=work: _persist_day(conn, site_id, w))
+        persisted = time.monotonic()
+        compute_max = max(compute_max, computed - started)
+        compute_total += computed - started
+        persist_max = max(persist_max, persisted - computed)
+        if work.day is not None:
+            done += 1
+            last_day = work.day
+        if work.next_blob.get("phase") != phase:
+            break
+    logger.info(
+        "verification chunk site=%s phase=%s days=%d last_day=%s"
+        " compute_max_s=%.1f compute_total_s=%.1f persist_max_s=%.2f",
+        site_id,
+        phase,
+        done,
+        last_day,
+        compute_max,
+        compute_total,
+        persist_max,
+    )
+    return _continuation(site_id, payload)
 
 
 def advance_verification(
@@ -277,6 +416,7 @@ def advance_verification(
         return _decide_phase(conn, site_id, payload, blob)
     if phase == "start":
         return _start_phase(conn, site_id, payload, blob)
+    # simulate/baseline below are the sync reference; production uses _run_day_chunk.
     if phase == "simulate":
         return _simulate_chunk(conn, site_id, payload, blob)
     if phase == "resolve":
@@ -501,6 +641,7 @@ def _simulate_chunk(
     payload: dict[str, object],
     blob: dict[str, object],
 ) -> bool:
+    """Test-reference path: production routes this phase to :func:`_run_day_chunk`."""
     cfg = _blob_config(conn, blob)
     # Obligation: §8 snapshot semantics — every chunk re-checks the pinned
     # roster/config against the live tables and fails the run on divergence.
@@ -544,7 +685,10 @@ def _baseline_chunk(
     payload: dict[str, object],
     blob: dict[str, object],
 ) -> bool:
-    """§7 step 4: pass 2, chunked over snapshot days exactly as pass 1 is."""
+    """Test-reference path: production routes this phase to :func:`_run_day_chunk`.
+
+    §7 step 4: pass 2, chunked over snapshot days exactly as pass 1 is.
+    """
     cfg = _blob_config(conn, blob)
     assert_inputs_unpinned_unchanged(conn, cfg)
     rosters = pass1_baseline_feeds(conn, cfg.run_id)
@@ -583,7 +727,10 @@ def _continuation(site_id: int, payload: dict[str, object]) -> JobContinuation:
 
 
 def _load_state(conn: sqlite3.Connection, site_id: int) -> dict[str, object] | None:
-    raw = get_runtime_state(conn, verification_state_key(site_id))
+    return _parse_state(get_runtime_state(conn, verification_state_key(site_id)))
+
+
+def _parse_state(raw: str | None) -> dict[str, object] | None:
     if raw is None:
         return None
     try:

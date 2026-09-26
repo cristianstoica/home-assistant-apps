@@ -19,7 +19,7 @@ import json
 import logging
 import sqlite3
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import cast
@@ -35,6 +35,7 @@ from wxverify.db.runtime_state import (
     get_runtime_state,
     set_runtime_state,
 )
+from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     blend_mean,
@@ -247,6 +248,22 @@ def _current_generation(
     )
 
     pointer = ensure_published_generation(conn, site_id)
+    resolved = resolve_generation_for_instant(conn, site_id, instant_utc)
+    return pointer if resolved is None else resolved
+
+
+def current_generation_readonly(
+    conn: sqlite3.Connection, site_id: int, instant_utc: str
+) -> int | None:
+    """READ PATH twin of ``_current_generation``: never seeds a generation."""
+    from wxverify.db.tz_generations import (
+        published_generation_id,
+        resolve_generation_for_instant,
+    )
+
+    pointer = published_generation_id(conn, site_id)
+    if pointer is None:
+        return None
     resolved = resolve_generation_for_instant(conn, site_id, instant_utc)
     return pointer if resolved is None else resolved
 
@@ -466,9 +483,10 @@ def _leaderboard_status_cell(
     at build time (status + window key + the cell's oldest snapshot stamp) —
     diagnostics only, never an input to the as-of ranking.
 
-    Calls the in-transaction variant: this runs inside the writer's
-    ``BEGIN IMMEDIATE``, which is already one snapshot, and
-    ``leaderboard_with_status``'s own snapshot would refuse to nest.
+    Calls the in-transaction variant: this runs inside a caller-held
+    snapshot (the job path's ``read_snapshot``, or the synchronous path's
+    write transaction), and ``leaderboard_with_status``'s own snapshot
+    would refuse to nest.
     """
     result = leaderboard_with_status_in_transaction(
         conn, site_id=site_id, variable=variable, day_ahead=day_ahead, window="rolling"
@@ -488,6 +506,32 @@ def _leaderboard_status_cell(
     }
 
 
+_RECORD_INSERT_SQL = """
+                INSERT INTO forecast_of_record
+                    (site_id, tz_generation_id, timezone,
+                     tz_rebuild_in_progress, snapshot_local_date,
+                     snapshot_local_time, snapshot_utc, target_local_date,
+                     variable, display_lead, status, missed_reason,
+                     write_path, write_latency_seconds, policy,
+                     methodology_version, app_version, candidates,
+                     selected_feed_ids, feed_weights, effective_cells,
+                     source_runs, hourly_values, daily_quantities,
+                     leaderboard_status)
+                VALUES (?,?,?,?,?,?,?,?,?,?, 'recorded', NULL,
+                        ?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(site_id, tz_generation_id, snapshot_local_date,
+                            variable, target_local_date) DO NOTHING
+                """
+
+
+@dataclass(frozen=True, slots=True)
+class RecordBuild:
+    """One day's forecast-of-record rows, built on a read snapshot, persisted later."""
+
+    site_id: int
+    rows: tuple[tuple[str | int, ...], ...]
+
+
 def build_forecast_record(
     conn: sqlite3.Connection,
     site_id: int,
@@ -500,13 +544,68 @@ def build_forecast_record(
     Idempotent per identity: each (variable x target day) row inserts with
     ``DO NOTHING`` on its identity, so a run against a partially written day
     fills only what is absent and a retry can only confirm, never replace.
-    Runs entirely inside the caller's write transaction. Raises
-    :class:`JobDeferred` before T and :class:`JobCancelled` beyond the
-    late-write window (the gap scan owns ``missed``).
+    The synchronous path (the gap scan and tests): runs inside the caller's
+    write transaction and may seed the site's timezone generation. The
+    ``forecast_record`` job instead builds off the lock through
+    :func:`compute_forecast_record_readonly`. Raises :class:`JobDeferred`
+    before T and :class:`JobCancelled` beyond the late-write window (the gap
+    scan owns ``missed``).
 
     A cell for which nothing was knowable at T writes NO row: the day stays
     reconstructible instead of being sealed as a successful empty grid.
     ``write_path`` is derived here from ``at`` against T, never passed in.
+    """
+    build = compute_forecast_record(
+        conn,
+        site_id,
+        snapshot_local_date,
+        now=now,
+        resolve_generation=_current_generation,
+    )
+    if build is not None:
+        persist_forecast_record(conn, build)
+
+
+def compute_forecast_record_readonly(
+    conn: sqlite3.Connection,
+    site_id: int,
+    snapshot_local_date: str,
+    *,
+    now: datetime | None = None,
+) -> RecordBuild | None:
+    """Build one day's rows on a pooled reader: one snapshot, no writes (enforced)."""
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        with read_snapshot(conn, label="forecast_record"):
+            return compute_forecast_record(
+                conn,
+                site_id,
+                snapshot_local_date,
+                now=now,
+                resolve_generation=current_generation_readonly,
+            )
+    finally:
+        # _settle_reader never resets pragmas; a reader must go back ON-less.
+        conn.execute("PRAGMA query_only=OFF")
+
+
+def compute_forecast_record(
+    conn: sqlite3.Connection,
+    site_id: int,
+    snapshot_local_date: str,
+    *,
+    now: datetime | None = None,
+    resolve_generation: Callable[[sqlite3.Connection, int, str], int | None],
+) -> RecordBuild | None:
+    """Compute one local day's forecast-of-record rows without writing them.
+
+    The body of :func:`build_forecast_record`: the same reads in the same
+    order and the same :class:`JobDeferred` / :class:`JobCancelled`
+    branches, with each row collected into the returned :class:`RecordBuild`
+    for :func:`persist_forecast_record`. Returns ``None`` when the day is
+    already complete. ``resolve_generation`` is required: the synchronous
+    path passes the seeding resolver, the job path
+    :func:`current_generation_readonly`; a ``None`` from it cancels.
     """
     at = now or utc_now()
     site = _site_row(conn, site_id)
@@ -528,9 +627,17 @@ def build_forecast_record(
         # scan is the single writer of 'missed'.
         raise JobCancelled()
     as_of = isoformat_utc(snapshot_utc)
-    generation_id = _current_generation(conn, site_id, as_of)
+    generation_id = resolve_generation(conn, site_id, as_of)
+    if generation_id is None:
+        logger.warning(
+            "forecast record cancelled site=%s date=%s:"
+            " no published timezone generation",
+            site_id,
+            snapshot_local_date,
+        )
+        raise JobCancelled()
     if record_day_complete(conn, site_id, generation_id, snapshot_local_date):
-        return
+        return None
     write_path = (
         "on_time"
         if at <= snapshot_utc + RECORD_ON_TIME_GRACE
@@ -573,6 +680,7 @@ def build_forecast_record(
 
     rank_cache: dict[tuple[str, int], dict[int, LeaderboardRow]] = {}
     status_cache: dict[tuple[str, int], dict[str, object]] = {}
+    rows: list[tuple[str | int, ...]] = []
     for day in range(RECORD_DAY_COUNT):
         target_date = local_date + timedelta(days=day)
         for variable in RECORD_VARIABLES:
@@ -726,23 +834,7 @@ def build_forecast_record(
                 ]
                 for fid in selected_ids
             }
-            conn.execute(
-                """
-                INSERT INTO forecast_of_record
-                    (site_id, tz_generation_id, timezone,
-                     tz_rebuild_in_progress, snapshot_local_date,
-                     snapshot_local_time, snapshot_utc, target_local_date,
-                     variable, display_lead, status, missed_reason,
-                     write_path, write_latency_seconds, policy,
-                     methodology_version, app_version, candidates,
-                     selected_feed_ids, feed_weights, effective_cells,
-                     source_runs, hourly_values, daily_quantities,
-                     leaderboard_status)
-                VALUES (?,?,?,?,?,?,?,?,?,?, 'recorded', NULL,
-                        ?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(site_id, tz_generation_id, snapshot_local_date,
-                            variable, target_local_date) DO NOTHING
-                """,
+            rows.append(
                 (
                     site_id,
                     generation_id,
@@ -779,8 +871,15 @@ def build_forecast_record(
                         }
                     ),
                     _dumps(statuses),
-                ),
+                )
             )
+    return RecordBuild(site_id, tuple(rows))
+
+
+def persist_forecast_record(conn: sqlite3.Connection, build: RecordBuild) -> None:
+    """Write one built day inside the caller's write transaction."""
+    _site_row(conn, build.site_id)  # disabled or deleted mid-build -> JobCancelled
+    conn.executemany(_RECORD_INSERT_SQL, build.rows)
 
 
 def _write_missed_rows(
