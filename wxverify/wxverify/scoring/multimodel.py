@@ -33,6 +33,7 @@ class _ExistingMean:
     """One published mean row read before the diff, keyed by its unique key."""
 
     row_id: int
+    key: tuple[int, str, str, str]  # X's dict key; a replace reuses its strings
     values: PairValues  # the stored row in ``_MEAN_INSERT_SQL`` order
     first_known_at: str | None
 
@@ -101,6 +102,7 @@ def compute_multimodel_mean(
             raise RuntimeError(f"duplicate published mean key {key!r}")
         existing[key] = _ExistingMean(
             row_id=int(row["id"]),
+            key=key,
             values=(
                 row["site_id"],
                 feed_id,
@@ -204,7 +206,13 @@ def compute_multimodel_mean(
         count += 1
         if current.values == values and current.first_known_at is None:
             continue
-        writes.append(ReplaceOp(current.row_id, row_site_id, values))
+        writes.append(
+            ReplaceOp(
+                current.row_id,
+                row_site_id,
+                (row_site_id, feed_id, *current.key[1:], *values[5:]),
+            )
+        )
     deletes = [
         DeleteOp(row_id)
         for row_id in sorted(

@@ -8,8 +8,11 @@ the T-rollback section below). All fixture data is synthetic.
 
 from __future__ import annotations
 
+import gc
 import sqlite3
+import tracemalloc
 from collections.abc import Callable
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -753,6 +756,81 @@ def test_mm9_mean_insert_no_longer_ignores_conflicts() -> None:  # MX-mean-ignor
     )
     with pytest.raises(sqlite3.IntegrityError):
         apply_delta(conn, duplicate_delta)
+
+
+def test_multimodel_replace_shares_existing_key_strings() -> (
+    None
+):  # T-MM10, MX-dup-strings
+    """A ReplaceOp built from X's key strings holds no second copy of them.
+
+    N = 4,000 keys, two feeds. A correct replace reuses ``current.key``'s
+    strings (variable, issued_at, valid_at) instead of allocating fresh ones
+    from the recomputed ``values``, so the per-row memory a replace adds
+    beyond an insert (which already shares its strings with D's own dict
+    key) is small. The mutant, ``ReplaceOp(current.row_id, row_site_id,
+    values)``, holds a second copy of all three key strings per row.
+    """
+    conn = asof_conn()
+    site = asof_make_site(conn, "T-MM10 site")
+    feed_a = asof_make_real_feed(conn, "t-mm10-model-a")
+    feed_b = asof_make_real_feed(conn, "t-mm10-model-b")
+    n = 4_000
+    base_valid_at = datetime.fromisoformat(_MM_VALID_AT.replace("Z", "+00:00"))
+    for k in range(n):
+        valid_at = (base_valid_at + timedelta(hours=k)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for feed_id, forecast in ((feed_a, 3.0), (feed_b, 5.0)):
+            asof_insert_pair(
+                conn,
+                site_id=site,
+                feed_id=feed_id,
+                valid_at=valid_at,
+                issued_at=_MM_ISSUED_AT,
+                forecast=forecast,
+                observed=4.0,
+                first_known_at=_MM_FIRST_KNOWN_AT,
+            )
+    conn.commit()
+    apply_delta(conn, compute_multimodel_mean(conn, site))
+    conn.commit()
+
+    mean_feed = _mean_feed_id(conn)
+
+    started_tracing = not tracemalloc.is_tracing()
+    if started_tracing:
+        tracemalloc.start()
+    gc_was_enabled = gc.isenabled()
+    try:
+        conn.execute(
+            "UPDATE forecast_pairs SET sq_error = sq_error + 1.0 WHERE feed_id = ?",
+            (mean_feed,),
+        )
+        conn.commit()
+        gc.collect()
+        base = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
+        delta = compute_multimodel_mean(conn, site)
+        replace_rise = tracemalloc.get_traced_memory()[1] - base
+        assert len(delta.ops) == n
+        assert all(isinstance(op, ReplaceOp) for op in delta.ops)
+        del delta
+
+        conn.execute("DELETE FROM forecast_pairs WHERE feed_id = ?", (mean_feed,))
+        conn.commit()
+        gc.collect()
+        base = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
+        delta = compute_multimodel_mean(conn, site)
+        insert_rise = tracemalloc.get_traced_memory()[1] - base
+        assert len(delta.ops) == n
+        assert all(isinstance(op, InsertOp) for op in delta.ops)
+        del delta
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+        assert gc.isenabled() == gc_was_enabled
+
+    per_row = (replace_rise - insert_rise) / n
+    assert per_row < 100
 
 
 # --------------------------------------------------------------------------
