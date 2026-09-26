@@ -21,7 +21,7 @@ type SqlValue = str | int | float | bytes | None
 # The 18 insert values of one pair, tz_generation_id excluded.
 type PairValues = tuple[SqlValue, ...]
 
-SCORING_APPLY_CHUNK_ROWS: Final = 1000  # provisional; Step 0b sets it (§3.2)
+SCORING_APPLY_CHUNK_ROWS: Final = 500  # Step 0b's chosen cap (§3.2)
 _DELETE_PAIR_BY_ID_SQL: Final = "DELETE FROM forecast_pairs WHERE id = ?"
 
 
