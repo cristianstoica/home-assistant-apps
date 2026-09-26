@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.4
+
+The nightly verification run no longer holds the database write lock
+while it computes. Each simulated day and each baseline day is now
+computed with reads outside the write transaction and then saved in one
+short write; before, a multi-day chunk ran inside one write transaction
+for the whole computation, and current-condition observation writes
+waited behind it. The daily forecast-of-record job gets the same
+treatment: compute outside the lock, then one short save. There is no
+SQL, index or schema change, and no migration; a verification run in
+progress on 0.16.3 resumes on 0.16.4. Rollback consists of reinstalling
+0.16.3.
+
 ## 0.16.3
 
 Current-condition polls now run in their own scheduling lane. This
