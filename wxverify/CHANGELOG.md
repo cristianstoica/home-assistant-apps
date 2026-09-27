@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.6
+
+The Forecast page now judges each feed's stale badge by the last fetch
+that returned a usable forward sample (lead of at least 1 hour), rather
+than the newest sample's issue time, and a fetch that stores no new
+samples because everything it returned was already on file still counts
+and refreshes the badge. The page header shows this same stamp as "Last
+fetched", falling back to "fetch time unknown" when a contributing feed
+has none yet; meteoblue members are judged by their package feed's
+stamp. The hover text on these tiles was reworded twice after the first
+pass read as covering the whole page, including the day-detail chart,
+when it only covers the feeds behind the forecast tiles. The forecast
+page, its auto-poll and the hourly view now all read from one database
+snapshot, so a write landing mid-request can no longer pair an old tile
+value with a new refresh token and stall the page's own refreshing.
+Separately, the database import validator now refuses a file whose
+schema catalogue has a malformed entry, or whose app tables hold text
+that is not valid UTF-8, with a 422 naming the table and column, before
+anything is staged or swapped.
+
+This release adds schema v8: a new `site_feed_state.last_usable_fetch_at`
+column, seeded from each feed's last run that stored a valid forward
+sample. The migration is one-way: 0.16.5 cannot open a database upgraded
+by 0.16.6, because its migration runner refuses to start against a
+database whose stored schema version is newer than its own target
+version and raises an error instead. Rollback is therefore not a plain
+reinstall of 0.16.5 — restore the add-on backup taken before the update.
+
 ## 0.16.5
 
 The nightly scoring job no longer holds the database write lock while it
