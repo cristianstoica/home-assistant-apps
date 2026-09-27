@@ -248,12 +248,15 @@ class Database:
             self._run_immediate(sanitize_wedge_prone_timestamps)
         except Exception:
             logger.exception("sanitize_wedge_prone_timestamps failed; continuing open")
-            # _run_immediate's commit() is outside its own try, so a
-            # commit-time failure leaves this connection inside an open
-            # IMMEDIATE transaction. Swallowing that without clearing it
-            # would hold the write lock for the process lifetime and make
-            # every later _run_immediate fail with "cannot start a
-            # transaction within a transaction".
+            # Clears a transaction left open on this connection during
+            # initialization. _run_immediate rolls back on every failure, a
+            # failed COMMIT included, before it logs anything; what it cannot
+            # clear is a rollback that itself raises (logged there; the
+            # original error is what reaches here). This is the only caller
+            # that swallows the error and keeps using the connection, so it
+            # rolls back here; if that raises, _open fails instead of booting
+            # a writer that holds the write lock and cannot start another
+            # transaction.
             if self._conn.in_transaction:
                 self._conn.rollback()
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
@@ -310,11 +313,25 @@ class Database:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             result = fn(self._conn)
+            # Inside the try: a COMMIT that fails and leaves the transaction
+            # open (e.g. a deferred foreign-key violation) must roll back like
+            # any other failure, or the writer stays wedged inside it.
+            self._conn.commit()
         except BaseException:
-            logger.debug("db txn rollback")
-            self._conn.rollback()
+            # Roll back before logging anything. Callers branch on the
+            # ORIGINAL error's type (the epoch signal, IntegrityError), so
+            # neither a failed rollback nor a raising log call may replace it.
+            try:
+                self._conn.rollback()
+            except Exception:
+                with contextlib.suppress(Exception):
+                    logger.exception(
+                        "db txn rollback failed; re-raising the original error"
+                    )
+            else:
+                with contextlib.suppress(Exception):
+                    logger.debug("db txn rollback")
             raise
-        self._conn.commit()
         logger.debug("db txn commit")
         return result
 
