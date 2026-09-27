@@ -1478,9 +1478,10 @@ _AB_STALE_ISSUED = "2026-07-20T02:00:00Z"
 # are given, so "fresh"/"stale" above are fetch ages (the stale badge's basis)
 # as well as run ages.
 _STALE_BADGE = (
-    '<span class="badge warn" title="A contributing feed hasn\'t been '
-    "successfully refreshed within its allowance (twice its fetch interval)."
-    '">stale</span>'
+    '<span class="badge warn" title="At least one feed used for this day has '
+    "gone more than twice its scheduled fetch interval without a usable "
+    "download, or its fetch interval is unknown. The age of the forecast "
+    "itself doesn't count.\">stale</span>"
 )
 
 

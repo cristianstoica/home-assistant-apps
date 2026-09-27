@@ -1376,13 +1376,16 @@ _AB_STALE_ISSUED = "2026-07-20T02:00:00Z"  # 21h before _AB_NOW -- stale.
 # are given, so "fresh"/"stale" above are fetch ages (the stale badge's basis)
 # as well as run ages.
 _STALE_BADGE = (
-    '<span class="badge warn" title="A contributing feed hasn\'t been '
-    "successfully refreshed within its allowance (twice its fetch interval)."
-    '">stale</span>'
+    '<span class="badge warn" title="At least one feed used for this day has '
+    "gone more than twice its scheduled fetch interval without a usable "
+    "download, or its fetch interval is unknown. The age of the forecast "
+    "itself doesn't count.\">stale</span>"
 )
 _UNKNOWN_BADGE = (
-    '<span class="badge muted" title="No successful fetch has been recorded '
-    'yet for a contributing feed.">fetch time unknown</span>'
+    '<span class="badge muted" title="The app has no recorded time yet for '
+    "a usable download from at least one feed used for this day. Each "
+    "feed's time is recorded after its next usable download.\">fetch time "
+    "unknown</span>"
 )
 
 

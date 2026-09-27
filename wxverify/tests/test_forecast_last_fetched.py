@@ -231,7 +231,11 @@ def test_fetch_age_label_and_title() -> None:
 
     html = _render_tiles(site_id=1, view=view)
     assert "Last fetched: 40 min ago" in html
-    assert 'title="When the app last downloaded forecasts."' in html
+    assert (
+        'title="The most recent usable download from any feed used on this '
+        "page; other feeds may have been fetched earlier. It isn't when you "
+        'loaded the page or how old the forecast is."'
+    ) in html
 
 
 # ===========================================================================

@@ -593,9 +593,10 @@ def test_v8_seed_sql_fs_subquery_matches_a_reference_recent_samples_query() -> N
     """The migration's own module-level constant, executed verbatim (never a
     copy), must read ``forecast_samples fs`` the same way a reference query
     with the same filter shape does -- a relationship, since the exact
-    ``SEARCH ...`` phrasing is a contract with the shipping SQLite build
-    (enforced separately, see the ``WXV_EQP_SHIPPING``-gated tests below),
-    not something this venv's build should be asked to reproduce exactly.
+    ``SEARCH ...`` phrasing is a contract with the shipping SQLite build.
+    This test requires the ``SEARCH fs USING INDEX idx_samples_recent``
+    prefix; it runs locally and in the shipping-SQLite CI job, and is not
+    gated by ``WXV_EQP_SHIPPING``.
 
     Mutant (plan §14.6): the ``OR`` form of §10.2 (``fs.feed_id = sfs.feed_id
     OR fs.feed_id IN (SELECT m.id ...)`` in place of the ``UNION ALL``-fed

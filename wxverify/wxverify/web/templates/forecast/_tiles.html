@@ -6,7 +6,7 @@
   {% if view.empty %}
     <p class="empty">Still collecting forecasts — check back shortly.</p>
   {% else %}
-    <p class="muted forecast-updated" {% if view.updated_at %}data-updated-at="{{ view.updated_at }}" {% endif %}title="When the app last downloaded forecasts.">Last fetched: {{ view.updated_ago or "unknown" }}</p>
+    <p class="muted forecast-updated" {% if view.updated_at %}data-updated-at="{{ view.updated_at }}" {% endif %}title="The most recent usable download from any feed used on this page; other feeds may have been fetched earlier. It isn't when you loaded the page or how old the forecast is.">Last fetched: {{ view.updated_ago or "unknown" }}</p>
     <div class="tile-grid">
       {% for tile in view.tiles %}
         <article class="tile state-{{ tile.state }}">
@@ -55,8 +55,8 @@
               <div class="tile-badges">
                 {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
                 {% if tile.confidence_state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
-                {% if tile.stale %}<span class="badge warn" title="A contributing feed hasn't been successfully refreshed within its allowance (twice its fetch interval).">stale</span>{% endif %}
-                {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="No successful fetch has been recorded yet for a contributing feed.">fetch time unknown</span>{% endif %}
+                {% if tile.stale %}<span class="badge warn" title="At least one feed used for this day has gone more than twice its scheduled fetch interval without a usable download, or its fetch interval is unknown. The age of the forecast itself doesn't count.">stale</span>{% endif %}
+                {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="The app has no recorded time yet for a usable download from at least one feed used for this day. Each feed's time is recorded after its next usable download.">fetch time unknown</span>{% endif %}
                 {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
               </div>
             {% endif %}

@@ -130,14 +130,14 @@ async def forecast_tiles(
     the site or one of its last-usable-fetch stamps moves to another whole
     second. A stamp move within the same second leaves it unchanged, and stamp
     moves in opposite directions can cancel out. A write that commits while
-    this request runs is not seen by it. The next poll sees that write only
-    if it moved the fingerprint; any other change shows on the next page
-    load. An unchanged fingerprint is answered without paying for a build
-    whose result would be discarded. On a 204 htmx leaves the DOM untouched --
-    including the hx-get that carries the old fingerprint, which
-    retains the token for subsequent comparisons. When a changed fingerprint
-    causes a rebuild, the outerHTML swap replaces only #forecast-tiles, so an
-    open day detail (a sibling element) is left intact across a tile poll.
+    this request runs is not seen by it. The next poll sees that write only if
+    it moved the fingerprint; any other change shows on the next page load. An
+    unchanged fingerprint is answered without paying for a build whose result
+    would be discarded. On a 204 htmx leaves the DOM untouched -- including
+    the hx-get that carries the old fingerprint, which retains the token for
+    subsequent comparisons. When a changed fingerprint causes a rebuild, the
+    outerHTML swap replaces only #forecast-tiles, so an open day detail (a
+    sibling element) is left intact across a tile poll.
     """
 
     def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
