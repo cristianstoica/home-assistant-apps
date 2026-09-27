@@ -260,7 +260,8 @@ def build_forecast(
 def _last_fetched_at(
     tiles: list[DayTile], freshness: dict[int, FeedFreshness]
 ) -> str | None:
-    """The "Last fetched" instant: the newest usable-fetch stamp on the page.
+    """The "Last fetched" instant: the newest usable-fetch stamp across the
+    forecast tiles.
 
     Takes the union of ``contributor_ids`` over every populated cell of every
     tile and maps each feed to its evidence feed's ``last_usable_fetch_at``
