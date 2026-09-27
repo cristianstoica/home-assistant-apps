@@ -222,6 +222,20 @@ def _as_number(value: object) -> float | None:
     return float(value)
 
 
+def _as_threshold(value: object) -> float | None:
+    """The pinned rain threshold, parsed the way the run itself parsed it.
+
+    ``run_config_from_row`` in ``verification/runs.py`` reads it as
+    ``float(str(value))``. Doing the same here means an int or a numeric
+    string in an imported snapshot prints as the same float text the site
+    card prints (``1`` as ``1.0``); a value the run could not parse is None.
+    """
+    try:
+        return float(str(value))
+    except ValueError:
+        return None
+
+
 def _as_ci(value: object) -> list[float] | None:
     items = [_as_number(v) for v in _as_list(value)]
     if len(items) != 2 or items[0] is None or items[1] is None:
@@ -321,7 +335,7 @@ def _snapshot_view(raw: object) -> dict[str, object] | None:
             )
     return {
         "timezone": snapshot.get("timezone"),
-        "rain_threshold_mm": snapshot.get("rain_threshold_mm"),
+        "rain_threshold_mm": _as_threshold(snapshot.get("rain_threshold_mm")),
         "wall_clock": snapshot.get("wall_clock"),
         "blend_depth": snapshot.get("blend_depth"),
         "blend_depths": [

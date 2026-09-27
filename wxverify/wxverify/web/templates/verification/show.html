@@ -87,7 +87,7 @@
         <dl class="facts">
           <div><dt>Timezone</dt><dd>{{ snapshot.timezone or '—' }}</dd></div>
           <div><dt>Snapshot wall clock</dt><dd>{{ snapshot.wall_clock or '—' }}</dd></div>
-          <div><dt>Rain threshold</dt><dd>{{ num(snapshot.rain_threshold_mm, '%.1f') }} mm</dd></div>
+          <div><dt>Rain threshold</dt><dd>{{ snapshot.rain_threshold_mm if snapshot.rain_threshold_mm is not none else '—' }} mm</dd></div>
           <div><dt>Global blend depth</dt><dd>{{ snapshot.blend_depth if snapshot.blend_depth is not none else '—' }}</dd></div>
           <div><dt>Minimum pairs</dt><dd>{{ snapshot.min_n if snapshot.min_n is not none else '—' }}</dd></div>
           <div><dt>Rolling window</dt><dd>{{ snapshot.window_days if snapshot.window_days is not none else '—' }} days</dd></div>
@@ -616,7 +616,7 @@
         <h3>Pinned configuration snapshot</h3>
         <p class="muted">
           Timezone {{ snapshot.timezone }} &middot; wall clock {{ snapshot.wall_clock }} &middot;
-          rain threshold {{ num(snapshot.rain_threshold_mm, '%.1f') }} mm &middot;
+          rain threshold {{ snapshot.rain_threshold_mm if snapshot.rain_threshold_mm is not none else '—' }} mm &middot;
           global depth {{ snapshot.blend_depth }} &middot; min pairs {{ snapshot.min_n }} &middot;
           window {{ snapshot.window_days }} days &middot; roster {{ snapshot.roster_size }} feeds
         </p>
