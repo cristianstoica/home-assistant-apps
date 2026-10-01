@@ -6,6 +6,9 @@
       <div>
         <strong>{{ row.source }}</strong>
         <span>{{ row.calls }} / {{ row.daily_call_limit }} calls{% if row.daily_credit_limit %} - {{ row.credits }} / {{ row.daily_credit_limit }} credits{% endif %}</span>
+        {% if row.configured_call_limit != row.daily_call_limit %}
+          <span class="panel-hint">configured {{ row.configured_call_limit }}; capped at the provisional provider allowance {{ row.daily_call_limit }}</span>
+        {% endif %}
       </div>
       <meter min="0" max="{{ row.daily_call_limit }}" value="{{ row.calls }}"></meter>
     </div>

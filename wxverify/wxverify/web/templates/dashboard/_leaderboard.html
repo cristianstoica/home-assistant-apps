@@ -1,8 +1,14 @@
 <section class="panel">
   <h2>Leaderboard</h2>
   <p class="panel-hint">Which feed is most accurate for this selection. Ranked feeds have enough data to compare; withheld ones don't yet.</p>
+  {% set wind_informational = variable == "wind" and wind_weights is not none %}
+  {% if wind_informational %}
+    <p class="panel-hint" id="leaderboard-wind-hint">Wind uses every feed, weighted by past accuracy. This table is for information.</p>
+  {% endif %}
   {% if leaderboard %}
-    {% if verdict.state == "ok" and verdict.winner is not none %}
+    {% if wind_informational %}
+      {% set top_ids = [] %}
+    {% elif verdict.state == "ok" and verdict.winner is not none %}
       {% set top_ids = [verdict.winner.feed_id] %}
     {% elif verdict.state == "tie" and verdict.winner is not none and verdict.runner_up is not none %}
       {% set top_ids = [verdict.winner.feed_id, verdict.runner_up.feed_id] %}

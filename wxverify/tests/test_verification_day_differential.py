@@ -130,19 +130,26 @@ def _full_dump_by_rowid(
     rowid order (not sorted-by-all-columns order) is required here so that
     positionally-paired rows across two independent runs correspond to the
     SAME insert, even when a wall-clock column is among the columns diffed.
+    A ``WITHOUT ROWID`` table has no rowid; it is ordered by its primary key,
+    which is its storage order and identifies the row.
     """
     tables = [
-        row[0]
+        (str(row[0]), str(row[1] or ""))
         for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            "SELECT name, sql FROM sqlite_master WHERE type = 'table'"
             " AND name NOT LIKE 'sqlite_%' ORDER BY name"
         )
     ]
     out: dict[str, tuple[list[str], list[tuple[object, ...]]]] = {}
-    for table in tables:
-        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
+    for table, ddl in tables:
+        info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        cols = [row[1] for row in info]
+        order = "rowid"
+        if "WITHOUT ROWID" in ddl.upper():
+            pk = sorted((int(row[5]), str(row[1])) for row in info if int(row[5]))
+            order = ", ".join(name for _, name in pk)
         rows = conn.execute(
-            f"SELECT {', '.join(cols)} FROM {table} ORDER BY rowid"  # noqa: S608
+            f"SELECT {', '.join(cols)} FROM {table} ORDER BY {order}"  # noqa: S608
         ).fetchall()
         out[table] = (cols, [tuple(row) for row in rows])
     return out

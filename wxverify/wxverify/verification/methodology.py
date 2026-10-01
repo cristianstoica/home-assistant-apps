@@ -27,7 +27,8 @@ DECLARATIVE_ONLY: frozenset[str] = frozenset()
 # comparison is computed on, for instance — because a run scored under the
 # new rule is not comparable with one scored under the old, whatever the
 # constants say; runs persist the version they were scored under.
-METHODOLOGY_VERSION = 2
+# 3: the served wind became the accuracy-weighted daily high (0.16.6).
+METHODOLOGY_VERSION = 3
 
 # Canonical snapshot time (default): the daily decision instant T, expressed
 # as site-local wall-clock time.

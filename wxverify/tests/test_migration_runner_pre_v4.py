@@ -992,7 +992,7 @@ def test_o2_pre_v4_inputs_converge_to_one_schema() -> None:
 
     assert versions == [TARGET_USER_VERSION] * 3
     assert masters[0] == masters[1] == masters[2]
-    assert len(masters[0]) == 44
+    assert len(masters[0]) == 46
 
 
 @pytest.mark.parametrize(
@@ -1101,7 +1101,7 @@ def test_o1_split_is_a_partition_of_the_composite() -> None:
     table_rows = conn.execute(
         "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    assert len(table_rows) == 27
+    assert len(table_rows) == 29
     assert all(row["type"] == "table" for row in table_rows)
 
     create_indexes(conn)
@@ -1347,4 +1347,4 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     }
 
     assert fresh_names == composite_names | _TRIGGERS
-    assert len(fresh_names) == 44
+    assert len(fresh_names) == 46

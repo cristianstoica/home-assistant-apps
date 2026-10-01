@@ -7,6 +7,10 @@ run ids repeat across tests. Resetting in an autouse fixture, rather than
 opting in per test, is what keeps that state from leaking between unrelated
 test modules as an intermittent failure nobody can attribute.
 
+The wind weights cache (``wxverify.forecast.wind_blend``) is process-global
+for the same reason and is reset the same way, so that its counters start at
+zero in every test and no entry outlives the test that stored it.
+
 The export sweeper's death latch
 (``wxverify.api.routes.db_transfer._sweeper_death``) is process-global for the
 same reason and needs the same treatment: ``test_graceful_shutdown.py`` crashes
@@ -53,6 +57,7 @@ import pytest
 
 from tests.network_guard import deny_network_scope
 from wxverify.api.routes.db_transfer import reset_export_sweeper_death
+from wxverify.forecast.wind_blend import reset_wind_weights_cache
 from wxverify.verification.read_cache import reset_read_cache
 
 pytest_plugins = ["pytester"]
@@ -62,6 +67,12 @@ pytest_plugins = ["pytester"]
 def _reset_verification_read_cache() -> None:
     """Empty the verification read cache before each test."""
     reset_read_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_wind_weights_cache() -> None:
+    """Empty the wind weights cache and zero its counters before each test."""
+    reset_wind_weights_cache()
 
 
 @pytest.fixture(autouse=True)

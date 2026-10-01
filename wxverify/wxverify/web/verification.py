@@ -21,6 +21,7 @@ import sqlite3
 from typing import cast
 
 from wxverify.core.timeutil import utc_now
+from wxverify.db.wind_basis import wind_basis_state
 from wxverify.settings.depth import effective_blend_depths
 from wxverify.verification import methodology
 from wxverify.verification.contract import (
@@ -1000,6 +1001,9 @@ def load_verification(
         "result_basis": RUN_INPUTS_NO_RUN.as_payload(),
         "depths": live_depths,
         "depth_mismatch": False,
+        # Plan §12.3: True once the site serves weighted wind, so the wind
+        # depth verdict is diagnostic only. Base context for the no-site path.
+        "wind_pair_max": False,
         "verification_schema": VERIFICATION_SCHEMA,
         "contract": CONTRACT,
         "methodology": {
@@ -1015,6 +1019,7 @@ def load_verification(
     }
     if site is None:
         return context
+    context["wind_pair_max"] = wind_basis_state(conn, site.id) == "pair_max"
     # §12/§3.1: same derivation the status API serves, so the page and the
     # payload cannot report different trigger states for one site.
     context["trigger"] = trigger_status(conn, site.id, utc_now())

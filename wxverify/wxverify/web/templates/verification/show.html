@@ -168,6 +168,9 @@
           <p class="verdict-conclusion" data-v16="16.2.decision_statement">{{ decision_statements.get(v.outcome, 'No candidate depth was recommended. (' ~ v.outcome ~ ')') }}</p>
         {% endif %}
         {% if v.caveat %}<p class="verdict-caveat" data-v16="16.2.caveat">{{ v.caveat }}</p>{% endif %}
+        {% if v.variable == 'wind' and wind_pair_max %}
+          <p class="notice" id="verification-wind-diagnostic">This wind verdict is diagnostic only. It does not change the served wind, which is the mean of every feed's daily high, weighted by past accuracy.</p>
+        {% endif %}
         {% if v.unmeasured_endpoints %}
           {# The closing clause is unconditional. No outcome token may
              license the reassuring "rests only on the parts that were

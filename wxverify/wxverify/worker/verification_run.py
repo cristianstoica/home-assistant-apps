@@ -55,6 +55,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.snapshot import read_snapshot
+from wxverify.db.wind_basis import wind_basis_state
 from wxverify.verification.decision import VariableInputs, Verdict, decide_variable
 from wxverify.verification.engine import (
     aggregate_run,
@@ -457,7 +458,14 @@ def advance_verification(
 def _blocking_gate(
     conn: sqlite3.Connection, site_id: int, fingerprint: str
 ) -> tuple[str, str] | None:
-    """The (decision, reason) of the first blocking pre-start gate, or None."""
+    """The (decision, reason) of the first blocking pre-start gate, or None.
+
+    First: no run starts while the site's wind history switch runs (§8.12).
+    The check names the two closed states, so ``staging`` and ``pair_max``
+    are never skipped by it.
+    """
+    if wind_basis_state(conn, site_id) in ("switching", "rescoring"):
+        return ("skipped", "wind history switch in progress")
     if published_fingerprint(conn, site_id) == fingerprint:
         return ("no_change_skip", "input fingerprint matches the published run")
     if (

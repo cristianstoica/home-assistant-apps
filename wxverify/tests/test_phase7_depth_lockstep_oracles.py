@@ -100,6 +100,7 @@ def _make_run_config(
         period_end="2026-05-30",
         bootstrap_seed=1,
         bootstrap_resamples=40,
+        wind_basis="pair_max",
     )
 
 

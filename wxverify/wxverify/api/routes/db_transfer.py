@@ -92,6 +92,7 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "valid_at"),
     ("station_observations", "valid_at"),
     ("observations", "valid_at"),
+    ("station_wind_records", "obs_at"),
 )
 # Anchored: only this producer's own output shapes are ever a sweep
 # candidate. The token group is optional on purpose -- it spans BOTH

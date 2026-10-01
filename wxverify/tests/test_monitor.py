@@ -828,14 +828,19 @@ def test_liveness_recent_completed_job_does_not_trip(
             )
             # Completed jobs for all three types at fixed_now → within every
             # liveness cutoff window (FETCH_OBS_LIVE=8h, FETCH_FEED=12h, PAIR=12h).
+            # fetch_obs liveness reads only the live "obs" lane (job_key="obs").
             recent = "2026-07-09T12:00:00Z"
-            for job_type in ("fetch_obs", "fetch_feed", "pair_and_score"):
+            for job_type, job_key in (
+                ("fetch_obs", "obs"),
+                ("fetch_feed", None),
+                ("pair_and_score", None),
+            ):
                 conn.execute(
                     """
-                    INSERT INTO jobs (type, site_id, status, updated_at)
-                    VALUES (?, ?, 'completed', ?)
+                    INSERT INTO jobs (type, site_id, job_key, status, updated_at)
+                    VALUES (?, ?, ?, 'completed', ?)
                     """,
-                    (job_type, site_id, recent),
+                    (job_type, site_id, job_key, recent),
                 )
 
         db.write_sync(_seed)
@@ -3321,15 +3326,19 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
     _wl_seed_s(conn, _wl_stamp(-16))
     conn.commit()
 
+    injected: list[sqlite3.OperationalError] = []
+
     def _fail_heartbeat(_conn: sqlite3.Connection, key: str) -> None:
-        raise sqlite3.OperationalError("synthetic heartbeat failure")
+        error = sqlite3.OperationalError("synthetic heartbeat failure")
+        injected.append(error)
+        raise error
 
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", _fail_heartbeat
     )
 
     class FakeDb:
-        async def write(self, fn):  # type: ignore[no-untyped-def]
+        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
             return fn(conn)
 
     result = asyncio.run(
@@ -3345,6 +3354,16 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
     assert any(
         r.levelno == logging.ERROR
         and r.getMessage() == "runtime heartbeat write failed key=worker_last_loop_at"
+        for r in caplog.records
+    )
+    # The logged exception is the injected one: a fake whose write() rejected
+    # the heartbeat's epoch_exempt keyword would log the same message from a
+    # TypeError, and the assertion above alone would still pass.
+    assert len(injected) == 1
+    assert any(
+        r.levelno == logging.ERROR
+        and r.exc_info is not None
+        and r.exc_info[1] is injected[0]
         for r in caplog.records
     )
     row = conn.execute(

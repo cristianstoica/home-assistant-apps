@@ -537,6 +537,7 @@ def test_swap_closes_every_old_connection_across_repeated_cycles(
                 old_conns = list(db._read_conns)  # noqa: SLF001
                 old_sync_conn = db._read_sync_conn  # noqa: SLF001
                 old_write_conn = db._conn  # noqa: SLF001
+                old_probe = db._probe  # noqa: SLF001
 
                 new_path = _build_replacement_db(
                     tmp_path, f"new-{cycle}.db", f"Generation {cycle + 1}"
@@ -553,6 +554,9 @@ def test_swap_closes_every_old_connection_across_repeated_cycles(
                     old_sync_conn.execute("SELECT 1")
                 with pytest.raises(sqlite3.ProgrammingError):
                     old_write_conn.execute("SELECT 1")
+                with pytest.raises(sqlite3.ProgrammingError):
+                    old_probe.execute("SELECT 1")
+                assert db._probe is not old_probe  # noqa: SLF001
 
                 assert await _read_site_names(db) == [f"Generation {cycle + 1}"]
 

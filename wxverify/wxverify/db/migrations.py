@@ -12,6 +12,7 @@ from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.wind_basis import init_wind_basis
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,34 @@ def create_tables(conn: sqlite3.Connection) -> None:
             source_raw TEXT,
             fetched_at TEXT,
             UNIQUE(station_id, variable, valid_at)
+        );
+
+        CREATE TABLE IF NOT EXISTS station_wind_records (
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
+            speed_kmh REAL NOT NULL CHECK (speed_kmh >= 0),
+            PRIMARY KEY (station_id, obs_at)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS station_wind_days (
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,        -- YYYY-MM-DD in the site time zone
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN
+                    ('pending','partial','fetched','unavailable','failed')),
+            record_count INTEGER NOT NULL DEFAULT 0,   -- records inside the day
+            pair_hours INTEGER NOT NULL DEFAULT 0,     -- hours with a pair
+            -- old wind rows on the day; NULL until counted
+            legacy_hours INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            -- always via core/error_sanitize.sanitized_exception
+            last_error TEXT,
+            last_ok_at TEXT,                 -- last successful persist, a 204 included
+            refetch_at TEXT,                 -- reconcile refetch due time
+            refetched INTEGER NOT NULL DEFAULT 0 CHECK (refetched IN (0, 1)),
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (station_id, local_date)
         );
 
         CREATE TABLE IF NOT EXISTS observations (
@@ -994,6 +1023,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)
+    init_wind_basis(conn)
     logger.debug("migrations seeded sources+feeds+settings")
     bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")

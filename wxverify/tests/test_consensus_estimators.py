@@ -19,6 +19,7 @@ import pytest
 
 from wxverify import config
 from wxverify.db.connection import close_db, init_db
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.scoring.consensus import (
     StationReading,
     _low_trim,
@@ -324,6 +325,9 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
             """
         ).lastrowid
     )
+    # A fresh site opens in pair_max, where the insert guard drops old-style
+    # wind rows; staging keeps the legacy hourly wind path under test.
+    set_wind_basis_state(conn, site_id, "staging")
     valid_at = "2026-01-01T00:00:00Z"
     values = [3.0, 3.0, 3.0, 3.0, 20.0]
     for index, value in enumerate(values):

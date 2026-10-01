@@ -1,0 +1,82 @@
+<section class="panel wide" id="wind-history-panel">
+  <h2>Wind History</h2>
+  <p class="panel-hint">The background rebuild of stored station wind, and the lane that keeps today's wind current. Headroom and calls are for the shared weather.com key.</p>
+  <div class="status-stack">
+    <span class="badge {{ 'ok' if wind_history.headroom is not none and wind_history.headroom > 0 else 'warn' }}" id="wind-history-headroom">
+      Headroom today: {{ wind_history.headroom if wind_history.headroom is not none else 'unknown' }}
+    </span>
+    <span class="badge muted" id="wind-history-backfill-calls">
+      Rebuild calls today: {{ wind_history.backfill_calls_today if wind_history.backfill_calls_today is not none else '—' }}
+    </span>
+    <span class="badge muted" id="wind-history-live-calls">
+      Live wind calls today: {{ wind_history.live_calls_today if wind_history.live_calls_today is not none else '—' }}
+    </span>
+  </div>
+
+  {% for hold in wind_history.holds %}
+    <div class="subsection" id="wind-auth-hold-{{ hold.endpoint }}">
+      <p>
+        <strong>{{ hold.title }}</strong>
+        <span class="badge warn" data-field="hold-status">{{ 'Check queued' if hold.status == 'probing' else 'Held' }}</span>
+      </p>
+      <div class="button-row">
+        <button type="button"
+                data-wind-auth-hold-url="{{ url('/api/wind-history/auth-hold') }}"
+                data-endpoint="{{ hold.endpoint }}">Try again</button>
+        {% if hold.error %}<span class="muted" data-field="hold-error">{{ hold.error }}</span>{% endif %}
+      </div>
+    </div>
+  {% endfor %}
+  <p class="empty" id="wind-auth-hold-result" hidden></p>
+
+  {% for site in wind_history.sites %}
+    <div class="subsection" data-site-id="{{ site.site_id }}">
+      <h3>{{ site.site_name }}</h3>
+      <p>
+        <span class="badge {{ 'ok' if site.state == 'pair_max' else 'muted' }}">{{ site.state }}</span>
+        {% if site.progress_ago %}
+          <span class="muted">last progress {{ site.progress_ago }}</span>
+        {% else %}
+          <span class="muted">no progress recorded yet</span>
+        {% endif %}
+      </p>
+      {% if site.note %}<p class="panel-hint">{{ site.note }}</p>{% endif %}
+      <p class="muted">
+        {% for status, n in site.status_counts %}{{ status }} {{ n }}{{ '' if loop.last else ' · ' }}{% endfor %}
+      </p>
+      {% if site.blocked_reason %}
+        <p class="notice">
+          <strong>Switch blocked: {{ site.blocked_reason }}.</strong>
+          {% if site.remedy %}To unblock it, {{ site.remedy }}.{% endif %}
+          {% if site.blocked_since %}<span class="muted">Since {{ site.blocked_since }}.</span>{% endif %}
+        </p>
+      {% endif %}
+      {% if site.report %}
+        <dl class="facts">
+          {% for label, value in site.report %}
+            <div><dt>{{ label }}</dt><dd>{{ value }}</dd></div>
+          {% endfor %}
+        </dl>
+      {% endif %}
+      {% if site.recent_errors %}
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Station</th><th>Date</th><th>Status</th><th>Last error</th></tr></thead>
+            <tbody>
+              {% for row in site.recent_errors %}
+                <tr>
+                  <td>{{ row.station }}</td>
+                  <td>{{ row.local_date }}</td>
+                  <td>{{ row.status }}</td>
+                  <td>{{ row.error }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="empty">No enabled sites.</p>
+  {% endfor %}
+</section>

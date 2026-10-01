@@ -10,6 +10,7 @@ from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
 from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.wind_basis import wind_open_clause
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import MetricResult, strategy_for
 from wxverify.scoring.multimodel import (
@@ -320,12 +321,20 @@ def _distinct_cells(
     else:
         where = "AND site_id = ?"
         params = (site_id,)
+    # MATERIALIZED is SQLite's optimization fence (sqlite.org/lang_with.html
+    # §3.4): the wind clause is not pushed down into the pair scan, so it runs
+    # once per distinct cell, not once per pair row.
     rows = conn.execute(
         f"""
-        SELECT DISTINCT site_id, feed_id, variable, day_ahead
-        FROM forecast_pairs
-        WHERE {published_generation_clause("forecast_pairs")}
-        {where}
+        WITH cells AS MATERIALIZED (
+            SELECT DISTINCT site_id, feed_id, variable, day_ahead
+            FROM forecast_pairs
+            WHERE {published_generation_clause("forecast_pairs")}
+            {where}
+        )
+        SELECT site_id, feed_id, variable, day_ahead
+        FROM cells
+        WHERE {wind_open_clause("cells.variable", "cells.site_id")}
         """,
         params,
     ).fetchall()
