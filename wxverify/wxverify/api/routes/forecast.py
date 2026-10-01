@@ -6,8 +6,7 @@ import sqlite3
 
 from fastapi import APIRouter, HTTPException, Query
 
-from wxverify.db.connection import get_db
-from wxverify.db.snapshot import read_snapshot
+from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.forecast.service import build_hourly
 from wxverify.web.context import load_site
 
@@ -31,7 +30,7 @@ async def forecast_hourly(
     day_clamped = max(0, min(7, day))
 
     def _read(conn: sqlite3.Connection) -> dict[str, object] | None:
-        with read_snapshot(conn, label="forecast_hourly"):
+        with pinned_read_snapshot(conn, label="forecast_hourly"):
             site_view = load_site(conn, site)
             if site_view is None:
                 return None

@@ -35,7 +35,7 @@ from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc, utc_now
-from wxverify.db.connection import Database, current_db
+from wxverify.db.connection import Database, InputCounts, current_db
 from wxverify.db.snapshot import read_only_snapshot, read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
@@ -396,13 +396,14 @@ _MAX_ENTRIES: Final = 16
 
 WindCacheOutcome = Literal["hit", "miss", "bypass", "error"]
 WindCacheBypass = Literal[
-    "in_transaction", "no_database", "foreign_connection", "probe_error"
+    "in_transaction", "no_database", "foreign_connection", "probe_error", "counts_moved"
 ]
 _BYPASS_REASONS: Final[tuple[WindCacheBypass, ...]] = (
     "in_transaction",
     "no_database",
     "foreign_connection",
     "probe_error",
+    "counts_moved",
 )
 _CALL_BUCKETS: Final = ("lt_1s", "1_3s", "3_10s", "ge_10s")
 
@@ -436,9 +437,12 @@ class _Stats:
 # Held across the whole compute on purpose (single-flight), unlike
 # read_cache's lock: a second request for the same key waits, then hits. The
 # compute uses only the caller's own pooled reader and the probe, never a
-# second pooled reader, so the holder never waits on the pool. Read as a
-# module global at every call, so a test can replace it. Lock order: _LOCK,
-# then Database._probe_lock or _STATS_LOCK, never the reverse.
+# second pooled reader, so the holder never waits on the pool. A pinned
+# caller waits here with its snapshot open. The pool bounds the waiters (at
+# most 3), but not the wait to one compute: requests pinned at different
+# counts can each miss and compute in turn. Read as a module global at every
+# call, so a test can replace it. Lock order: _LOCK, then
+# Database._probe_lock or _STATS_LOCK, never the reverse.
 _LOCK = threading.Lock()
 # Guards _stats only; never held across I/O or while acquiring another lock,
 # so wind_weights_cache_stats() never waits on a compute.
@@ -525,11 +529,15 @@ def live_wind_weights(
     """The live (``as_of is None``) weights, through the cache.
 
     Always equal to ``compute_wind_weights(load_wind_training(...,
-    as_of=None))`` on the same connection. A connection the cache cannot
-    place against the counts (inside a transaction, not a pooled reader of
-    the process database, or no process database), and a failed probe read,
-    compute uncached and are counted as a bypass by reason. Every call is
-    timed from entry, so the wait on ``_LOCK`` is included.
+    as_of=None))`` on the same connection, as far as the training inputs the
+    counts track: matching counts mean every count-moving write is the same,
+    and a write exempt from the epoch is by design invisible to the counts.
+    Inside a ``pinned_read_snapshot`` the cache keys on the snapshot's pin.
+    Any other transaction, a connection that is not a pooled reader of the
+    process database (or no process database), a failed probe read and
+    counts that moved across the snapshot's start compute uncached and are
+    counted as a bypass by reason. Every call is timed from entry, so the
+    wait on ``_LOCK`` is included.
     """
     entered = time.perf_counter()
     outcome: WindCacheOutcome = "error"
@@ -559,60 +567,134 @@ def _load(
         )
 
 
+def _lookup(
+    db: Database, counts: InputCounts, site_id: int, timezone: str, today: date
+) -> WindWeights | None:
+    # Called with _LOCK held. A copy, so a caller cannot change the entry.
+    entry = _ENTRIES.get(site_id)
+    if (
+        entry is not None
+        and entry.db is db
+        and entry.epoch == counts.epoch
+        and entry.ext == counts.ext
+        and entry.timezone == timezone
+        and entry.today == today
+    ):
+        return dict(entry.weights)
+    return None
+
+
+def _store(
+    db: Database,
+    counts: InputCounts,
+    site_id: int,
+    timezone: str,
+    today: date,
+    weights: WindWeights,
+) -> None:
+    # Called with _LOCK held. A pin older than a held entry stores nothing,
+    # so it never evicts the newer one: both counts only grow, and the
+    # caller's own weights stay correct for its snapshot.
+    for held in _ENTRIES.values():
+        if (
+            held.db is db
+            and held.epoch >= counts.epoch
+            and held.ext >= counts.ext
+            and (held.epoch, held.ext) != (counts.epoch, counts.ext)
+        ):
+            return
+    stale = [
+        key
+        for key, held in _ENTRIES.items()
+        if held.db is not db or held.epoch != counts.epoch or held.ext != counts.ext
+    ]
+    for key in stale:
+        del _ENTRIES[key]
+    if site_id in _ENTRIES or len(_ENTRIES) < _MAX_ENTRIES:
+        _ENTRIES[site_id] = _Entry(
+            db, counts.epoch, counts.ext, timezone, today, dict(weights)
+        )
+
+
+def _pinned_weights(
+    db: Database,
+    conn: sqlite3.Connection,
+    pin: InputCounts,
+    site_id: int,
+    timezone: str,
+    today: date,
+) -> tuple[WindWeights, WindCacheOutcome]:
+    # Keyed on the pin, never on counts re-read here: the pin is what the
+    # caller's snapshot is exactly described by.
+    with _LOCK:
+        hit = _lookup(db, pin, site_id, timezone, today)
+        if hit is not None:
+            _count_hit()
+            return hit, "hit"
+        started = time.perf_counter()
+        # Inside the caller's pinned snapshot: no BEGIN, no query_only, no
+        # _load (it would raise SnapshotNestingError).
+        training = load_wind_training(
+            conn, site_id=site_id, timezone=timezone, today=today, as_of=None
+        )
+        weights = compute_wind_weights(training)
+        _record_miss((time.perf_counter() - started) * 1000.0)
+        _store(db, pin, site_id, timezone, today, weights)
+        return weights, "miss"
+
+
 def _cached_weights(
     conn: sqlite3.Connection, site_id: int, timezone: str, today: date
 ) -> tuple[WindWeights, WindCacheOutcome]:
+    db = current_db()
     if conn.in_transaction:
-        # The caller's own transaction already pins one snapshot, which may
-        # predate the counts: compute inside it, store nothing.
-        _count_bypass("in_transaction")
+        # A pinned snapshot keys on its pin. Any other transaction pins one
+        # snapshot that may predate the counts: compute inside it, store
+        # nothing.
+        pin = db.snapshot_pin(conn) if db is not None else None
+        if db is not None and isinstance(pin, InputCounts):
+            return _pinned_weights(db, conn, pin, site_id, timezone, today)
+        reason: WindCacheBypass = pin if isinstance(pin, str) else "in_transaction"
+        _count_bypass(reason)
         training = load_wind_training(
             conn, site_id=site_id, timezone=timezone, today=today, as_of=None
         )
         return compute_wind_weights(training), "bypass"
-    db = current_db()
     if db is None or not db.owns_pooled_reader(conn):
         _count_bypass("no_database" if db is None else "foreign_connection")
         training = _load(conn, site_id, timezone, today, pooled=False)
         return compute_wind_weights(training), "bypass"
     with _LOCK:
-        # Both counts BEFORE any statement on conn, the count first: the
-        # writer bumps the epoch and then absorbs, so a lookup that reads the
-        # count after the absorb also sees the bump. A commit the snapshot
-        # misses lands after these reads and moves one past the stored entry.
-        ext = db.external_commit_seq()
-        epoch = db.input_epoch
-        if ext is None:
+        # The counts before the snapshot, and again after its priming read;
+        # store only if equal. Each reading takes the count first: the writer
+        # bumps the epoch and then absorbs, so a reading whose count follows
+        # the absorb also sees the bump.
+        before = db.input_counts()
+        if before is None:
             # Whether another connection committed can't be told: neither hit
             # nor store.
             _count_bypass("probe_error")
             training = _load(conn, site_id, timezone, today, pooled=True)
             return compute_wind_weights(training), "bypass"
-        entry = _ENTRIES.get(site_id)
-        if (
-            entry is not None
-            and entry.db is db
-            and entry.epoch == epoch
-            and entry.ext == ext
-            and entry.timezone == timezone
-            and entry.today == today
-        ):
+        hit = _lookup(db, before, site_id, timezone, today)
+        if hit is not None:
             _count_hit()
-            return dict(entry.weights), "hit"
+            return hit, "hit"
         started = time.perf_counter()
-        training = _load(conn, site_id, timezone, today, pooled=True)
-        # Pure, and outside the snapshot, which ended with _load.
+        with read_only_snapshot(conn, label="wind_weights"):
+            # First in the body, so after the priming read. Reads the probe,
+            # not conn.
+            after = db.input_counts()
+            training = load_wind_training(
+                conn, site_id=site_id, timezone=timezone, today=today, as_of=None
+            )
+        # Pure, and outside the snapshot.
         weights = compute_wind_weights(training)
+        if after != before:
+            _count_bypass("probe_error" if after is None else "counts_moved")
+            return weights, "bypass"
         _record_miss((time.perf_counter() - started) * 1000.0)
-        stale = [
-            key
-            for key, held in _ENTRIES.items()
-            if held.db is not db or held.epoch != epoch or held.ext != ext
-        ]
-        for key in stale:
-            del _ENTRIES[key]
-        if site_id in _ENTRIES or len(_ENTRIES) < _MAX_ENTRIES:
-            _ENTRIES[site_id] = _Entry(db, epoch, ext, timezone, today, dict(weights))
+        _store(db, before, site_id, timezone, today, weights)
         return weights, "miss"
 
 

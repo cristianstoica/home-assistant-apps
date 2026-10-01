@@ -15,6 +15,11 @@ when it only covers the feeds behind the forecast tiles. The forecast
 page, its auto-poll and the hourly view now all read from one database
 snapshot, so a write landing mid-request can no longer pair an old tile
 value with a new refresh token and stall the page's own refreshing.
+The forecast page, its auto-poll and the hourly view keep reusing the
+stored wind feed weights, as in 0.16.6, now inside that one snapshot.
+A request whose snapshot opens while the database is being changed
+works the weights out fresh and does not store them, so a page never
+pairs wind weights with data from a different moment.
 Separately, the database import validator now refuses a file whose
 schema catalogue has a malformed entry, or whose app tables hold text
 that is not valid UTF-8, with a 422 naming the table and column, before

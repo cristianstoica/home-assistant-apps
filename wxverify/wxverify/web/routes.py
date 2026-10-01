@@ -7,8 +7,7 @@ import sqlite3
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
-from wxverify.db.connection import get_db
-from wxverify.db.snapshot import read_snapshot
+from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.forecast.data import forecast_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
@@ -97,7 +96,7 @@ def _read_forecast_context(
     and rankings) then describe one database state, so the fingerprint in the
     page's poll URL is the one its tiles were built from.
     """
-    with read_snapshot(conn, label=label):
+    with pinned_read_snapshot(conn, label=label):
         return _load_forecast_context(conn, site_id)
 
 
@@ -141,7 +140,7 @@ async def forecast_tiles(
     """
 
     def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
-        with read_snapshot(conn, label="forecast_tiles"):
+        with pinned_read_snapshot(conn, label="forecast_tiles"):
             site_view = _resolve_site(conn, site)
             if site_view is None:
                 return None
