@@ -41,6 +41,7 @@ from wxverify.collection.forecast_fetcher import persist_fetch_result
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import forecast_fingerprint, samples_fingerprint
 from wxverify.forecast.service import build_forecast
@@ -69,6 +70,9 @@ def _make_db() -> sqlite3.Connection:
         VALUES (1, 'Test Site', 40.0, -105.0, 900.0, 'UTC')
         """
     )
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     return conn
 
 
@@ -704,6 +708,9 @@ def test_route_duplicates_only_serves_moved_label_and_drops_unknown_badge(
     see the note at the final assertions."""
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, site_id, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     batch = _future_wind_batch()  # real wall clock: no fixed `now` here
 
@@ -842,7 +849,7 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         label="Today",
         date_iso="2026-01-01",
         temp=TempCell(meta=available_meta, high_c=10.0, low_c=2.0),
-        wind=WindCell(meta=unavailable_meta_with_contributors, max_kmh=None),
+        wind=WindCell(meta=unavailable_meta_with_contributors, max_kmh=None, note=None),
         precip=PrecipCell(
             meta=empty_meta, total_mm=None, wet_hours=None, show_rain_glyph=False
         ),

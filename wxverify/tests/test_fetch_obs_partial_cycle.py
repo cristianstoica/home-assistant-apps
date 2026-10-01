@@ -36,6 +36,7 @@ from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import create_schema, run_migrations
 from wxverify.db.queue import Job
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.monitor import build_verdict
 from wxverify.obs.pws_adapter import (
     HOURLY_HISTORY_PATH,
@@ -2080,6 +2081,9 @@ def test_deferred_day_is_admitted_once_coverage_completes_and_settles(
         _seed_site_and_stations(conn, ["ISTATION01"])
     )
     source_raw = '{"synthetic": true}'
+    # Step (3) writes old-style hourly wind rows; a fresh site opens in
+    # pair_max, where the insert guard drops them, so hold the site in staging.
+    set_wind_basis_state(conn, site_id, "staging")
 
     # Only the pre-outage half of temperature, written directly through the
     # real per-hour consensus path -- this is construction, not seeding:

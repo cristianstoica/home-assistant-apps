@@ -34,6 +34,7 @@ from wxverify.db.queue import (
     reclaim_all_stale,
 )
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.feeds.meteoblue import MeteoblueAdapter
 from wxverify.feeds.open_meteo import (
     OpenMeteoAdapter,
@@ -404,11 +405,15 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
         pass
 
     class FakeDb:
-        async def write(self, fn):  # type: ignore[no-untyped-def]
+        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
             return fn(None)
 
+    injected: dict[str, sqlite3.OperationalError] = {}
+
     def fail_heartbeat(conn: object, key: str) -> None:
-        raise sqlite3.OperationalError(f"heartbeat failed {key}")
+        error = sqlite3.OperationalError(f"heartbeat failed {key}")
+        injected[key] = error
+        raise error
 
     def stop_at_claim(conn: object) -> None:
         raise ReachedClaim()
@@ -428,6 +433,18 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
 
     assert "runtime heartbeat write failed key=worker_last_loop_at" in caplog.text
     assert "runtime heartbeat write failed key=scheduler_last_tick_at" in caplog.text
+    # Each logged exception is the injected one: a fake whose write() rejected
+    # the heartbeat's epoch_exempt keyword would log the same messages from a
+    # TypeError, and the two assertions above alone would still pass.
+    for key in ("worker_last_loop_at", "scheduler_last_tick_at"):
+        records = [
+            r
+            for r in caplog.records
+            if r.getMessage() == f"runtime heartbeat write failed key={key}"
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is injected[key]
 
 
 def test_worker_permission_error_is_process_fatal(
@@ -448,7 +465,7 @@ def test_worker_permission_error_is_process_fatal(
     class FakeDb:
         generation = 0
 
-        async def write(self, fn):  # type: ignore[no-untyped-def]
+        async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
             return fn(None)
 
         async def write_fenced(  # type: ignore[no-untyped-def]
@@ -1570,6 +1587,9 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
                 (f"Catchup {index}", 40.0 + index),
             ).lastrowid
         )
+        # The hourly wind row below is an old-style row; a fresh site opens in
+        # pair_max, where the insert guard drops it, so hold it in staging.
+        set_wind_basis_state(conn, site_id, "staging")
         station_id = int(
             conn.execute(
                 """
@@ -1741,6 +1761,9 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
             """
         ).lastrowid
     )
+    # The wind write below must reach the source_raw check; a fresh site opens
+    # in pair_max, where the insert guard skips wind writes before that check.
+    set_wind_basis_state(conn, site_id, "staging")
     station_id = int(
         conn.execute(
             """

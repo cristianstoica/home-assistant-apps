@@ -9,9 +9,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
-from wxverify.db.queue import enqueue_if_absent_with_cooldown
+from wxverify.db.queue import LATEST_JOB_SQL, enqueue_if_absent_with_cooldown
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.worker.cadence import parse_fetch_interval_minutes
+from wxverify.worker.wind_days import (
+    WIND_DAYS_JOB_KEY,
+    WIND_DAYS_SPACING,
+    wind_lane_due,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,7 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
     _enqueue_due_feeds(conn)
     _enqueue_due_obs(conn)
+    _enqueue_due_wind_days(conn)
     _enqueue_due_forecast_records(conn)
     _enqueue_due_verification_runs(conn)
 
@@ -354,6 +360,64 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
                 {},
                 cooldown=_DUE_JOB_FAILURE_COOLDOWN,
             )
+
+
+def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
+    """Enqueue the wind-history lane for each site with work (plan §8.13).
+
+    One ``fetch_obs`` job with the ``wind-days`` key per enabled site with an
+    enabled station, spaced by ``WIND_DAYS_SPACING`` after a success. An
+    unreadable success stamp fails open here: the wrapper's success cooldown
+    fails closed on it, which would stop the lane for good.
+    """
+    now = utc_now()
+    rows = conn.execute(
+        """
+        SELECT s.id, s.timezone
+        FROM sites s
+        WHERE s.enabled=1
+          AND EXISTS (
+              SELECT 1 FROM stations st
+              WHERE st.site_id=s.id AND st.enabled=1
+          )
+        """
+    ).fetchall()
+    for row in rows:
+        site_id = int(row["id"])
+        try:
+            tz = ZoneInfo(str(row["timezone"]))
+        except (ZoneInfoNotFoundError, ValueError):
+            logger.warning(
+                "scheduler: unusable time zone site=%s; skipping the wind lane",
+                site_id,
+            )
+            continue
+        if not wind_lane_due(conn, site_id, tz, now=now):
+            continue
+        success_cooldown: timedelta | None = WIND_DAYS_SPACING
+        latest = conn.execute(
+            LATEST_JOB_SQL, ("fetch_obs", WIND_DAYS_JOB_KEY, site_id)
+        ).fetchone()
+        if latest is not None and str(latest["status"]) == "completed":
+            try:
+                parse_utc(str(latest["updated_at"]))
+            except ValueError:
+                logger.warning(
+                    "scheduler: unreadable updated_at on the latest wind lane job"
+                    " site=%s; enqueuing without the success spacing",
+                    site_id,
+                )
+                success_cooldown = None
+        logger.debug("scheduler due wind lane site=%s", site_id)
+        enqueue_if_absent_with_cooldown(
+            conn,
+            "fetch_obs",
+            site_id,
+            WIND_DAYS_JOB_KEY,
+            {},
+            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            success_cooldown=success_cooldown,
+        )
 
 
 def enqueue_due_current_obs(conn: sqlite3.Connection) -> None:

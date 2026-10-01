@@ -179,6 +179,7 @@ def test_assert_inputs_unpinned_unchanged_flags_max_lead_hours_only_roster_chang
             period_end="2026-06-01",
             bootstrap_seed=1,
             bootstrap_resamples=100,
+            wind_basis=str(snapshot["wind_basis"]),
         )
 
     # Paired positive: unchanged (max_lead_hours included) raises nothing.

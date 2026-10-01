@@ -92,6 +92,7 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "valid_at"),
     ("station_observations", "valid_at"),
     ("observations", "valid_at"),
+    ("station_wind_records", "obs_at"),
 )
 # What `_flag_invalid_utf8` returns in place of text that is not valid UTF-8.
 # A bare object equals no value a row can hold, so a row test finds only it.

@@ -40,6 +40,7 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
+from wxverify.db.wind_basis import wind_basis_state
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import (
@@ -97,6 +98,7 @@ from wxverify.worker.verification_run import (
     mark_verification_failed,
     run_verification_chunk,
 )
+from wxverify.worker.wind_days import WIND_DAYS_JOB_KEY, run_wind_days
 
 POLL_INTERVAL = 1.0
 FAILED_JOB_RETENTION_HOURS = 168
@@ -105,6 +107,9 @@ JOB_HOUSEKEEPING_INTERVAL_SECONDS = 3600
 # (ScoringInputsBusy) waits before it is claimed again; a deferral does not
 # count as a failed attempt.
 _SCORING_BUSY_DEFER: Final = timedelta(seconds=60)
+# How long a timezone_correction job waits while its site's wind history
+# switch is in progress (switching or rescoring).
+_WIND_SWITCH_CORRECTION_DEFER: Final = timedelta(minutes=10)
 
 logger = logging.getLogger(__name__)
 
@@ -504,10 +509,21 @@ async def _maybe_stamp_runtime_heartbeat(
     if last_stamp_at > 0 and now - last_stamp_at < RUNTIME_HEARTBEAT_INTERVAL_SECONDS:
         return last_stamp_at
     try:
-        # Exempt: a single global runtime_state heartbeat stamp, called from
-        # the loop between jobs -- no job-scoped read behind it.
+        # Exempt from generation fencing: a single global runtime_state
+        # heartbeat stamp, called from the loop between jobs -- no job-scoped
+        # read behind it.
+        #
+        # Exempt from the input epoch too (`epoch_exempt=True`): the only two
+        # callers pass the literal keys `worker_last_loop_at` and
+        # `scheduler_last_tick_at`, read only by the monitor and
+        # `runtime_status` -- neither a scoring nor a wind-training input. Of
+        # the epoch's two consumers, `score_batches` runs inside a claimed
+        # job, never alongside this stamp, and the wind weights cache does not
+        # read these keys. Moving the epoch every minute here would invalidate
+        # that cache every minute.
         await db.write(
-            lambda conn, state_key=key: set_runtime_state_now(conn, state_key)
+            lambda conn, state_key=key: set_runtime_state_now(conn, state_key),
+            epoch_exempt=True,
         )
     except Exception:
         logger.exception("runtime heartbeat write failed key=%s", key)
@@ -612,6 +628,9 @@ async def dispatch(
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
+        if job.job_key == WIND_DAYS_JOB_KEY:
+            await run_wind_days(db, writer, site_id)
+            return None
         await _fetch_obs(db, writer, site_id)
         return None
     if job.type == "fetch_current_obs":
@@ -647,7 +666,9 @@ async def dispatch(
         # it); the continuation re-enqueues the chain, and claim_next_job's
         # priority tier lets other job types interleave between chunks.
         more = await writer.write(
-            lambda conn: advance_correction(conn, site_id, job.payload)
+            lambda conn: _advance_correction_outside_wind_switch(
+                conn, site_id, job.payload
+            )
         )
         return build_continuation(site_id, job.payload) if more else None
     if job.type == "forecast_record":
@@ -1023,6 +1044,19 @@ async def _fetch_feed(
         raise JobCancelled()
 
 
+def _advance_correction_outside_wind_switch(
+    conn: sqlite3.Connection, site_id: int, payload: dict[str, object]
+) -> bool:
+    """``advance_correction``, deferred while the site's wind switch runs.
+
+    The state is read in the correction's own transaction, so a switch that
+    starts between claim and chunk still defers it (plan §8.12).
+    """
+    if wind_basis_state(conn, site_id) in ("switching", "rescoring"):
+        raise JobDeferred(isoformat_utc(utc_now() + _WIND_SWITCH_CORRECTION_DEFER))
+    return advance_correction(conn, site_id, payload)
+
+
 def _enabled_stations(
     conn: sqlite3.Connection, site_id: int
 ) -> list[StationFetchTarget]:
@@ -1033,7 +1067,8 @@ def _enabled_stations(
                st.history_next_attempt_at,
                (SELECT MAX(o.valid_at)
                   FROM station_observations o
-                 WHERE o.station_id = st.id) AS obs_watermark_at
+                 WHERE o.station_id = st.id
+                   AND o.variable != 'wind') AS obs_watermark_at
         FROM stations st
         JOIN sites s ON s.id = st.site_id
         WHERE s.id = ?

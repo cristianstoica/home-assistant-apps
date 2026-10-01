@@ -5,9 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
+import time
+import weakref
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -16,6 +21,7 @@ import httpx
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.core.units import kmh_to_ms
 from wxverify.obs.config import RECENT_REFRESH_HOURS
+from wxverify.obs.wind_pairs import WindRecord
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,9 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 
 HOURLY_HISTORY_URL: Final = "https://api.weather.com/v2/pws/observations/hourly/7day"
 HOURLY_HISTORY_PATH: Final = "/v2/pws/observations/hourly/7day"
+HISTORY_ALL_PATH: Final = "/v2/pws/history/all"
+ALL_1DAY_PATH: Final = "/v2/pws/observations/all/1day"
+_WEATHERCOM_BASE: Final = "https://api.weather.com"
 
 
 @dataclass(frozen=True)
@@ -147,6 +156,20 @@ def is_hourly_history_no_content(exc: BaseException) -> bool:
         isinstance(exc, UpstreamPayloadError)
         and exc.diagnostics.kind == "no_content"
         and exc.diagnostics.endpoint == HOURLY_HISTORY_PATH
+    )
+
+
+def is_wind_history_no_content(exc: BaseException) -> bool:
+    """True only for a 204 from one of the two wind-history endpoints.
+
+    The same allowlist shape as ``is_hourly_history_no_content``: the type,
+    the ``no_content`` kind and an endpoint in ``{HISTORY_ALL_PATH,
+    ALL_1DAY_PATH}`` must all match.
+    """
+    return (
+        isinstance(exc, UpstreamPayloadError)
+        and exc.diagnostics.kind == "no_content"
+        and exc.diagnostics.endpoint in {HISTORY_ALL_PATH, ALL_1DAY_PATH}
     )
 
 
@@ -253,12 +276,97 @@ class ProviderDeadlineExceeded(TimeoutError):
     """A weather.com call ran past its total deadline (read timeout + margin)."""
 
 
+PROVIDER_CALLS_PER_MINUTE: Final = 30  # UNVERIFIED provider rate
+BACKFILL_CALLS_PER_MINUTE: Final = 20
+_RATE_WINDOW_SECONDS: Final = 60.0
+
+
+class WeathercomRateLimiter:
+    """A sliding 60-second window over weather.com requests.
+
+    At most ``PROVIDER_CALLS_PER_MINUTE`` requests in the window, of which at
+    most ``BACKFILL_CALLS_PER_MINUTE`` may be backfill. The clock is
+    injectable so the window can be driven without sleeping.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._requests: deque[tuple[float, bool]] = deque()
+
+    def _prune(self, now: float) -> None:
+        while self._requests and now - self._requests[0][0] >= _RATE_WINDOW_SECONDS:
+            self._requests.popleft()
+
+    def _wait_seconds(self, now: float, *, backfill: bool) -> float:
+        self._prune(now)
+        wait = 0.0
+        if len(self._requests) >= PROVIDER_CALLS_PER_MINUTE:
+            oldest = self._requests[len(self._requests) - PROVIDER_CALLS_PER_MINUTE]
+            wait = max(wait, oldest[0] + _RATE_WINDOW_SECONDS - now)
+        if backfill:
+            backfill_times = [at for at, tagged in self._requests if tagged]
+            if len(backfill_times) >= BACKFILL_CALLS_PER_MINUTE:
+                oldest_at = backfill_times[
+                    len(backfill_times) - BACKFILL_CALLS_PER_MINUTE
+                ]
+                wait = max(wait, oldest_at + _RATE_WINDOW_SECONDS - now)
+        return wait
+
+    def try_acquire(self, *, backfill: bool) -> float:
+        """Record the request and return 0.0 when it fits; otherwise return the
+        seconds until it would fit, without recording it."""
+        now = self._clock()
+        wait = self._wait_seconds(now, backfill=backfill)
+        if wait > 0:
+            return wait
+        self._requests.append((now, backfill))
+        return 0.0
+
+    def wait_seconds(self, *, backfill: bool) -> float:
+        """The seconds until a request would fit, recording nothing."""
+        return self._wait_seconds(self._clock(), backfill=backfill)
+
+    async def acquire(self, *, backfill: bool) -> None:
+        """Wait until the request fits, then record it."""
+        while (wait := self.try_acquire(backfill=backfill)) > 0:
+            await asyncio.sleep(wait)
+
+
+# One limiter per running event loop, held through a weak reference, as
+# ``weathercom_call_lock`` does: a new loop that reuses a dead loop's id gets a
+# fresh limiter.
+_rate_limiter: WeathercomRateLimiter | None = None
+_rate_limiter_loop: weakref.ref[asyncio.AbstractEventLoop] | None = None
+
+
+def weathercom_rate_limiter() -> WeathercomRateLimiter:
+    """The one weather.com rate limiter for the running event loop."""
+    global _rate_limiter, _rate_limiter_loop
+    loop = asyncio.get_running_loop()
+    if (
+        _rate_limiter is None
+        or _rate_limiter_loop is None
+        or _rate_limiter_loop() is not loop
+    ):
+        _rate_limiter = WeathercomRateLimiter()
+        _rate_limiter_loop = weakref.ref(loop)
+    return _rate_limiter
+
+
+async def wait_for_backfill_slot() -> None:
+    """Wait until a backfill request would fit, without recording one."""
+    limiter = weathercom_rate_limiter()
+    while (wait := limiter.wait_seconds(backfill=True)) > 0:
+        await asyncio.sleep(wait)
+
+
 async def _get_with_deadline(
     client: httpx.AsyncClient,
     url: str,
     *,
     params: dict[str, str],
     read_seconds: float,
+    backfill: bool,
 ) -> httpx.Response:
     """One weather.com GET, bounded by a total deadline of read timeout + margin.
 
@@ -267,7 +375,11 @@ async def _get_with_deadline(
     deadline's own expiry is converted to ``ProviderDeadlineExceeded``; a
     transport ``TimeoutError`` re-raises unchanged and an external cancel stays
     ``CancelledError``. The message carries no URL, key or station id.
+
+    Every weather.com request passes the process rate limiter first, tagged
+    ``backfill`` or not; the limiter wait is outside the deadline.
     """
+    await weathercom_rate_limiter().acquire(backfill=backfill)
     deadline = read_seconds + PROVIDER_DEADLINE_MARGIN_SECONDS
     cm = asyncio.timeout(deadline)
     try:
@@ -302,6 +414,7 @@ async def validate_station(
                 "apiKey": api_key,
             },
             read_seconds=10.0,
+            backfill=False,
         )
         response.raise_for_status()
         data = decode_observations_payload(response, station_id=station_id)
@@ -352,6 +465,7 @@ async def fetch_hourly_history(
             "apiKey": api_key,
         },
         read_seconds=10.0,
+        backfill=False,
     )
     response.raise_for_status()
     cutoff = utc_now() - timedelta(hours=hours)
@@ -414,6 +528,7 @@ async def fetch_hourly_history_range(
             "apiKey": api_key,
         },
         read_seconds=20.0,
+        backfill=False,
     )
     response.raise_for_status()
     observations = observations_from_payload(
@@ -429,6 +544,150 @@ async def fetch_hourly_history_range(
         "pws history_range response station=%s samples=%s", station_id, len(filtered)
     )
     return filtered
+
+
+async def fetch_history_all(
+    station_id: str,
+    api_key: str,
+    *,
+    local_date: date,
+    client: httpx.AsyncClient,
+    backfill: bool,
+) -> list[WindRecord]:
+    """One past local day's raw records from ``/v2/pws/history/all``.
+
+    Raises ``httpx.HTTPStatusError`` on a non-2xx and ``UpstreamPayloadError``
+    on a 2xx without ``observations`` (a 204 included).
+    """
+    logger.debug("pws history_all request station=%s date=%s", station_id, local_date)
+    response = await _get_with_deadline(
+        client,
+        f"{_WEATHERCOM_BASE}{HISTORY_ALL_PATH}",
+        params={
+            "stationId": station_id,
+            "format": "json",
+            "units": "m",
+            "date": local_date.strftime("%Y%m%d"),
+            "numericPrecision": "decimal",
+            "apiKey": api_key,
+        },
+        read_seconds=20.0,
+        backfill=backfill,
+    )
+    response.raise_for_status()
+    records = wind_records_from_payload(
+        decode_observations_payload(response, station_id=station_id)
+    )
+    logger.debug(
+        "pws history_all response station=%s records=%s", station_id, len(records)
+    )
+    return records
+
+
+async def fetch_all_1day(
+    station_id: str,
+    api_key: str,
+    *,
+    client: httpx.AsyncClient,
+    backfill: bool,
+) -> list[WindRecord]:
+    """The last 24 hours of raw records from ``/v2/pws/observations/all/1day``.
+
+    Raises as ``fetch_history_all`` does.
+    """
+    logger.debug("pws all_1day request station=%s", station_id)
+    response = await _get_with_deadline(
+        client,
+        f"{_WEATHERCOM_BASE}{ALL_1DAY_PATH}",
+        params={
+            "stationId": station_id,
+            "format": "json",
+            "units": "m",
+            "numericPrecision": "decimal",
+            "apiKey": api_key,
+        },
+        read_seconds=20.0,
+        backfill=backfill,
+    )
+    response.raise_for_status()
+    records = wind_records_from_payload(
+        decode_observations_payload(response, station_id=station_id)
+    )
+    logger.debug(
+        "pws all_1day response station=%s records=%s", station_id, len(records)
+    )
+    return records
+
+
+def _wind_record_instant(row: dict[str, object]) -> datetime | None:
+    raw_epoch = row.get("valid_time_gmt")
+    if raw_epoch is None:
+        raw_epoch = row.get("epoch")
+    if isinstance(raw_epoch, bool):
+        return None
+    try:
+        parsed = _obs_datetime(row)
+    except (ValueError, OverflowError, OSError):
+        return None
+    if parsed is None:
+        return None
+    return parsed.replace(microsecond=0)
+
+
+def _wind_record_speed(row: dict[str, object]) -> float | None:
+    metric_obj = row.get("metric")
+    if not isinstance(metric_obj, dict):
+        return None
+    value = cast(dict[str, object], metric_obj).get("windspeedAvg")
+    speed: float
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        speed = float(value)
+    elif isinstance(value, str):
+        try:
+            speed = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(speed) or speed < 0:
+        return None
+    return speed
+
+
+def wind_records_from_payload(payload: dict[str, object]) -> list[WindRecord]:
+    """The raw wind records of a decoded all-records payload, an allowlist.
+
+    Each item must be an object with a parseable instant (``valid_time_gmt``,
+    then ``epoch``, then the ``obsTimeUtc`` normalization; a bool epoch drops
+    the record) and a finite, non-negative ``metric.windspeedAvg`` (a number
+    or a numeric string). Anything else drops the record. The result is
+    sorted by ``obs_at``, whole seconds, keeping the first of each duplicate
+    instant.
+    """
+    observations_obj = payload.get("observations")
+    if not isinstance(observations_obj, list):
+        return []
+    parsed: list[WindRecord] = []
+    for item in cast(list[object], observations_obj):
+        if not isinstance(item, dict):
+            continue
+        row = cast(dict[str, object], item)
+        obs_at = _wind_record_instant(row)
+        if obs_at is None:
+            continue
+        speed = _wind_record_speed(row)
+        if speed is None:
+            continue
+        parsed.append(WindRecord(obs_at=obs_at, speed_kmh=speed))
+    parsed.sort(key=lambda record: record.obs_at)
+    records: list[WindRecord] = []
+    for record in parsed:
+        if records and records[-1].obs_at == record.obs_at:
+            continue
+        records.append(record)
+    return records
 
 
 def observations_from_payload(
@@ -648,6 +907,7 @@ async def fetch_current_observation(
             "apiKey": api_key,
         },
         read_seconds=timeout_seconds,
+        backfill=False,
     )
 
 

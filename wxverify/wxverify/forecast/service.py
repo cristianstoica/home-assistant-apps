@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -25,6 +26,7 @@ from wxverify.core.timeutil import (
     utc_now,
 )
 from wxverify.core.units import ms_to_kmh
+from wxverify.forecast import wind_blend
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     EXTREMA_COVERAGE_INSUFFICIENT,
@@ -99,7 +101,8 @@ class CellMeta:
     reports (the clearing subset plus, for temperature and precipitation, the
     extrema feeds), in selection order without repeats. ``stale`` is True if
     any of them is stale; ``fetch_unknown`` is True if any of them has no
-    usable fetch on record.
+    usable fetch on record. A weighted wind cell (``pair_max``) has no
+    clearing subset, so its contributors are all of its chosen feeds.
     """
 
     state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
@@ -131,6 +134,9 @@ class TempCell:
 class WindCell:
     meta: CellMeta
     max_kmh: float | None
+    #: Why the value is "—": the switch's progress note, or too few feeds with
+    #: a wind track record (§11.6). None when served, and in legacy mode.
+    note: str | None
 
 
 @dataclass(frozen=True)
@@ -169,6 +175,8 @@ class ForecastView:
 # variable -> display day -> feed_id -> samples
 _Grouped = dict[str, dict[int, dict[int, list[FutureSampleRow]]]]
 _RankCache = dict[tuple[str, int], ForecastRanking]
+# One cell: its meta, the selection behind it and the per-feed daily values.
+_Cell = tuple[CellMeta, CellSelection, dict[int, list[float]]]
 
 
 def build_forecast(
@@ -187,6 +195,12 @@ def build_forecast(
     consequence, a site with only elapsed-today samples renders tiles (with
     stale badges) instead of the empty state until local midnight — intended
     forecast-of-record behavior.
+
+    Wind follows the stored wind state (§11.4): the legacy blend in
+    ``staging``, the weighted blend in ``pair_max``, and "—" with the
+    progress note otherwise. The state is read before the cells are built and
+    again after; when the two reads differ, wind is served closed for this
+    request, because a switch transaction may have landed in between.
     """
     at = now or utc_now()
     samples = load_future_samples(
@@ -214,11 +228,40 @@ def build_forecast(
 
     tz = ZoneInfo(timezone)
     today = at.astimezone(tz).date()
-    tiles: list[DayTile] = []
+    serving = wind_blend.load_wind_serving(
+        conn, site_id=site_id, timezone=timezone, today=today, as_of=None
+    )
+    # Per day: the cells, then the wind weights and note for _build_tile.
+    day_cells: list[tuple[dict[str, _Cell], dict[int, float] | None, str | None]] = []
     for day in range(DAY_COUNT):
-        cells: dict[str, tuple[CellMeta, CellSelection, dict[int, list[float]]]] = {}
+        cells: dict[str, _Cell] = {}
+        wind_weights: dict[int, float] | None = None
+        wind_note: str | None = None
         for variable in VARIABLES:
             feeds_samples = grouped.get(variable, {}).get(day, {})
+            if variable == "wind" and serving.mode == "weighted":
+                choice = _select_wind(
+                    conn,
+                    site_id=site_id,
+                    timezone=timezone,
+                    local_date=today + timedelta(days=day),
+                    feeds_samples=feeds_samples,
+                    rank_cache=rank_cache,
+                    weights=serving.weights or {},
+                )
+                meta, values = _wind_meta_and_values(
+                    choice.selection,
+                    feeds_samples=feeds_samples,
+                    stale_ids=stale_ids,
+                    unknown_ids=unknown_ids,
+                )
+                cells[variable] = (meta, choice.selection, values)
+                wind_weights, wind_note = choice.weights, choice.note
+                continue
+            if variable == "wind" and serving.mode == "closed":
+                cells[variable] = _closed_wind_cell()
+                wind_weights, wind_note = {}, serving.note
+                continue
             selection, rebuilding_by_feed = _select(
                 conn,
                 site_id=site_id,
@@ -238,15 +281,25 @@ def build_forecast(
                 rebuilding_by_feed=rebuilding_by_feed,
             )
             cells[variable] = (meta, selection, values)
-        tiles.append(
-            _build_tile(
-                day,
-                date_iso=(today + timedelta(days=day)).isoformat(),
-                label=_day_label(day, today + timedelta(days=day)),
-                cells=cells,
-                rain_threshold_mm=rain_threshold_mm,
-            )
+        day_cells.append((cells, wind_weights, wind_note))
+    if wind_blend.read_wind_state(conn, site_id) != serving.state:
+        closed_note = wind_blend.closed_wind_note(conn, site_id)
+        day_cells = [
+            ({**cells, "wind": _closed_wind_cell()}, {}, closed_note)
+            for cells, _, _ in day_cells
+        ]
+    tiles = [
+        _build_tile(
+            day,
+            date_iso=(today + timedelta(days=day)).isoformat(),
+            label=_day_label(day, today + timedelta(days=day)),
+            cells=cells,
+            rain_threshold_mm=rain_threshold_mm,
+            wind_weights=wind_weights,
+            wind_note=wind_note,
         )
+        for day, (cells, wind_weights, wind_note) in enumerate(day_cells)
+    ]
     updated_at = _last_fetched_at(tiles, freshness)
     return ForecastView(
         empty=False,
@@ -319,6 +372,14 @@ def build_hourly(
     covered it. A site with only elapsed-today samples thus yields hourly
     data (with stale badges) instead of an empty payload until local
     midnight — intended forecast-of-record behavior.
+
+    Wind follows the stored wind state with the same double read as
+    :func:`build_forecast`. In ``staging`` the payload is exactly the legacy
+    one. In ``pair_max`` the wind line is the per-hour weighted mean of the
+    eligible feeds (which join the hour axis and ``feeds``), ``states["wind"]``
+    ignores the ranking rebuild, and the payload gains ``weights`` and
+    ``notes``. Otherwise (``closed``) the wind line is all None and
+    ``notes["wind"]`` carries the progress note.
     """
     at = now or utc_now()
     samples = load_future_samples(
@@ -331,11 +392,34 @@ def build_hourly(
     rank_cache: _RankCache = {}
     tz = ZoneInfo(timezone)
     today = at.astimezone(tz).date()
+    serving = wind_blend.load_wind_serving(
+        conn, site_id=site_id, timezone=timezone, today=today, as_of=None
+    )
+    wind_mode = serving.mode
+    wind_note = serving.note
+    wind_weights: dict[int, float] = {}
 
     selections: dict[str, CellSelection] = {}
     rebuilding: dict[str, dict[int, bool]] = {}
     for variable in VARIABLES:
         feeds_samples = grouped.get(variable, {}).get(day, {})
+        if variable == "wind" and wind_mode == "weighted":
+            choice = _select_wind(
+                conn,
+                site_id=site_id,
+                timezone=timezone,
+                local_date=today + timedelta(days=day),
+                feeds_samples=feeds_samples,
+                rank_cache=rank_cache,
+                weights=serving.weights or {},
+            )
+            selections[variable], rebuilding[variable] = choice.selection, {}
+            wind_weights, wind_note = choice.weights, choice.note
+            continue
+        if variable == "wind" and wind_mode == "closed":
+            selections[variable] = wind_blend.empty_wind_selection()
+            rebuilding[variable] = {}
+            continue
         selections[variable], rebuilding[variable] = _select(
             conn,
             site_id=site_id,
@@ -346,6 +430,12 @@ def build_hourly(
             blend_depth=depths[variable].depth,
             rank_cache=rank_cache,
         )
+    if wind_blend.read_wind_state(conn, site_id) != serving.state:
+        wind_mode = "closed"
+        wind_note = wind_blend.closed_wind_note(conn, site_id)
+        wind_weights = {}
+        selections["wind"] = wind_blend.empty_wind_selection()
+        rebuilding["wind"] = {}
 
     # Hour axis: union of covered hours across every selected feed/variable,
     # plus the hours of precipitation's aggregate contributors
@@ -395,24 +485,43 @@ def build_hourly(
                     (candidate.feed_id, feed_label(candidate.source, candidate.model))
                 )
 
+    def wind_line() -> list[float | None]:
+        if wind_mode == "legacy":
+            return blend_series("wind")
+        wind_samples = grouped.get("wind", {}).get(day, {})
+        weighted = wind_blend.weighted_hourly(
+            {
+                c.feed_id: {
+                    s.valid_at: ms_to_kmh(s.value)
+                    for s in wind_samples.get(c.feed_id, [])
+                }
+                for c in selections["wind"].feeds
+            },
+            wind_weights,
+        )
+        return [weighted.get(hour) for hour in hours]
+
     states = {
         variable: _state_of(
             available=selections[variable].available,
             low_confidence=selections[variable].low_confidence,
-            ranking_rebuilding=_any_rebuilding(
-                selections[variable].feeds, rebuilding[variable]
+            # The leaderboard ranking does not drive weighted wind (§11.4).
+            ranking_rebuilding=(
+                False
+                if variable == "wind" and wind_mode != "legacy"
+                else _any_rebuilding(selections[variable].feeds, rebuilding[variable])
             ),
         )
         for variable in VARIABLES
     }
-    return {
+    payload: dict[str, object] = {
         "site_id": site_id,
         "day": day,
         "label": _day_label(day, today + timedelta(days=day)),
         "hours": hours,
         "blend": {
             "temp_c": blend_series("temperature"),
-            "wind_kmh": blend_series("wind"),
+            "wind_kmh": wind_line(),
             "precip_mm": fixed_membership_series(
                 hours,
                 [
@@ -437,6 +546,12 @@ def build_hourly(
         ],
         "states": states,
     }
+    if wind_mode != "legacy":
+        payload["weights"] = {
+            "wind": {str(feed_id): weight for feed_id, weight in wind_weights.items()}
+        }
+        payload["notes"] = {"wind": wind_note}
+    return payload
 
 
 def _state_of(
@@ -508,9 +623,43 @@ def _select(
     :func:`covers_local_day` otherwise. Temperature and precipitation ask for
     the extrema set, leaving wind alone on the clearing-subset path.
     """
+    candidates, rebuilding_by_feed, _ = _candidates(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        timezone=timezone,
+        local_date=local_date,
+        feeds_samples=feeds_samples,
+        rank_cache=rank_cache,
+    )
+    selection = select_cell_feeds(
+        candidates,
+        blend_depth=blend_depth,
+        extrema_coverage_required=variable in ("temperature", "precip"),
+    )
+    return selection, rebuilding_by_feed
+
+
+def _candidates(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    timezone: str,
+    local_date: date,
+    feeds_samples: dict[int, list[FutureSampleRow]],
+    rank_cache: _RankCache,
+) -> tuple[list[CellCandidate], dict[int, bool], dict[int, int]]:
+    """One cell's candidates, their ranking-rebuild flags and representative k.
+
+    Returns ``(candidates, rebuilding_by_feed, rep_k)``; ``rep_k`` maps each
+    feed to the representative day-ahead of its samples, the lead its ranking
+    row (and, for weighted wind, its weight) is looked up at.
+    """
     covers = covers_local_day_exactly if variable == "precip" else covers_local_day
     candidates: list[CellCandidate] = []
     rebuilding_by_feed: dict[int, bool] = {}
+    rep_k: dict[int, int] = {}
     for feed_id, feed_samples in feeds_samples.items():
         rep = representative_day_ahead(
             [
@@ -518,6 +667,7 @@ def _select(
                 for sample in feed_samples
             ]
         )
+        rep_k[feed_id] = rep
         key = (variable, rep)
         if key not in rank_cache:
             rank_cache[key] = forecast_ranking_with_status(
@@ -543,12 +693,98 @@ def _select(
                 ),
             )
         )
-    selection = select_cell_feeds(
-        candidates,
-        blend_depth=blend_depth,
-        extrema_coverage_required=variable in ("temperature", "precip"),
+    return candidates, rebuilding_by_feed, rep_k
+
+
+def _select_wind(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    timezone: str,
+    local_date: date,
+    feeds_samples: dict[int, list[FutureSampleRow]],
+    rank_cache: _RankCache,
+    weights: wind_blend.WindWeights,
+) -> wind_blend.WindChoice:
+    """The weighted-mode wind choice for one cell (``pair_max`` only)."""
+    candidates, _, rep_k = _candidates(
+        conn,
+        site_id=site_id,
+        variable="wind",
+        timezone=timezone,
+        local_date=local_date,
+        feeds_samples=feeds_samples,
+        rank_cache=rank_cache,
     )
-    return selection, rebuilding_by_feed
+    return wind_blend.choose_wind_feeds(candidates, rep_k, weights)
+
+
+def _wind_meta_and_values(
+    selection: CellSelection,
+    *,
+    feeds_samples: dict[int, list[FutureSampleRow]],
+    stale_ids: set[int],
+    unknown_ids: set[int],
+) -> tuple[CellMeta, dict[int, list[float]]]:
+    """Weighted-mode wind cell: every chosen feed contributes, none is dropped.
+
+    Replaces the clearing-subset path for wind in ``pair_max``: the values
+    come from all of ``selection.feeds`` (each already has at least
+    ``MIN_RUN_HOURS`` hours), so ``partial`` is never set, and the ranking
+    rebuild does not move the state because the leaderboard does not choose
+    these feeds.
+    """
+    if not selection.available:
+        return (
+            CellMeta(
+                state="not_available",
+                feeds=[],
+                partial=False,
+                stale=False,
+                extrema_unavailable=False,
+                extrema_state="not_available",
+                contributor_ids=(),
+                fetch_unknown=False,
+            ),
+            {},
+        )
+    values = {
+        candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
+        for candidate in selection.feeds
+    }
+    contributor_ids = tuple(
+        dict.fromkeys(candidate.feed_id for candidate in selection.feeds)
+    )
+    meta = CellMeta(
+        state=_state_of(
+            available=selection.available,
+            low_confidence=False,
+            ranking_rebuilding=False,
+        ),
+        feeds=[
+            FeedRef(
+                feed_id=candidate.feed_id,
+                label=feed_label(candidate.source, candidate.model),
+            )
+            for candidate in selection.feeds
+        ],
+        partial=False,
+        stale=any(candidate.feed_id in stale_ids for candidate in selection.feeds),
+        extrema_unavailable=False,
+        extrema_state="not_available",
+        contributor_ids=contributor_ids,
+        fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
+    )
+    return meta, values
+
+
+def _closed_wind_cell() -> _Cell:
+    """The wind cell served while the switch runs: not available, no values."""
+    selection = wind_blend.empty_wind_selection()
+    meta, values = _wind_meta_and_values(
+        selection, feeds_samples={}, stale_ids=set(), unknown_ids=set()
+    )
+    return meta, selection, values
 
 
 def _cell_meta_and_values(
@@ -658,9 +894,13 @@ def _build_tile(
     *,
     date_iso: str,
     label: str,
-    cells: dict[str, tuple[CellMeta, CellSelection, dict[int, list[float]]]],
+    cells: dict[str, _Cell],
     rain_threshold_mm: float,
+    wind_weights: Mapping[int, float] | None,
+    wind_note: str | None,
 ) -> DayTile:
+    """One day's tile. ``wind_weights`` None is the legacy wind path; a
+    mapping (empty when wind is closed) gives the weighted daily high."""
     temp_meta, _, temp_values = cells["temperature"]
     wind_meta, _, wind_values = cells["wind"]
     precip_meta, _, precip_values = cells["precip"]
@@ -673,13 +913,17 @@ def _build_tile(
         high_c=temp_daily["high_c"],
         low_c=temp_daily["low_c"],
     )
-    wind_daily = displayed_daily(
-        "wind", list(wind_values.values()), rain_threshold_mm=rain_threshold_mm
-    )
-    wind_max_ms = wind_daily["max_ms"]
+    if wind_weights is None:
+        wind_daily = displayed_daily(
+            "wind", list(wind_values.values()), rain_threshold_mm=rain_threshold_mm
+        )
+        wind_max_ms = wind_daily["max_ms"]
+    else:
+        wind_max_ms = wind_blend.weighted_daily_high(wind_values, wind_weights)
     wind = WindCell(
         meta=wind_meta,
         max_kmh=None if wind_max_ms is None else ms_to_kmh(wind_max_ms),
+        note=wind_note,
     )
     precip_daily = displayed_daily(
         "precip", list(precip_values.values()), rain_threshold_mm=rain_threshold_mm

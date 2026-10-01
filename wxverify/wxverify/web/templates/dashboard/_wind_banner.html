@@ -1,0 +1,11 @@
+{# Plan §10: shown while wind is rebuilt or recomputed, and whenever the
+   weather.com key is refused for the wind lane. #}
+{% if wind_banner %}
+  <p class="notice" id="wind-banner">
+    {% if wind_banner.note %}{{ wind_banner.note }}{% endif %}
+    {% for title in wind_banner.holds %}
+      <strong>{{ title }}.</strong>
+    {% endfor %}
+    {% if wind_banner.holds %}Use "Try again" in the Wind History panel on Ops to check the key again.{% endif %}
+  </p>
+{% endif %}

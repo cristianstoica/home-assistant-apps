@@ -3,8 +3,8 @@
 Oracle map
 ----------
 Test 1 (test_configured_cap_lands_settings_land_budget_defers_at_cap)
-    Oracle 1: boot with weathercom_daily_call_limit=4200 and distinct
-    min_interval / max_backoff → sources.daily_call_limit == 4200 (overrides seeded
+    Oracle 1: boot with weathercom_daily_call_limit=1200 and distinct
+    min_interval / max_backoff → sources.daily_call_limit == 1200 (overrides seeded
     1000), the two settings rows land, and reserve_budget defers at cap.
 
 Test 2 (test_absent_key_rescues_to_3000)
@@ -102,10 +102,12 @@ _NOW = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
 _NOW_ISO = "2026-07-10T12:00:00Z"
 
 # Distinct non-default, non-seed values for the boot-path tests.
-# The seeded cap is 1000 (config.py:59); the field default is 3000.
-# 4200 is distinct from both → any confusion between seed/default/configured
-# produces a different number and the assertion fails.
-_TEST_DAILY_CAP = 4200
+# The seeded cap is 1000 (config.py:59); the field default is 3000; the
+# provisional weather.com allowance is 1500 (collection/budget.py). 1200 is
+# distinct from all three and below the allowance, so it is the cap in force →
+# any confusion between seed/default/allowance/configured produces a different
+# number and the assertion fails.
+_TEST_DAILY_CAP = 1200
 
 # Distinct non-default interval values for the cadence test (oracles 6).
 # Module constants: MIN_INTERVAL_SECONDS=300, MAX_BACKOFF_SECONDS=86400.
@@ -312,23 +314,24 @@ def _write_options_json(path: Path, data: dict[str, object]) -> None:
 def test_configured_cap_lands_settings_land_budget_defers_at_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Boot with weathercom_daily_call_limit=4200, distinct min/max intervals.
+    """Boot with weathercom_daily_call_limit=1200, distinct min/max intervals.
 
     Preconditions (injected):
-    - options.json sets weathercom_daily_call_limit=4200, min_interval_seconds=120,
+    - options.json sets weathercom_daily_call_limit=1200, min_interval_seconds=120,
       max_backoff_seconds=7200.
     - DB seeded with weathercom cap=1000 (from seed_default_sources).
 
     Assertions:
-    1. sources.daily_call_limit for weathercom == 4200 (lifespan called
+    1. sources.daily_call_limit for weathercom == 1200 (lifespan called
        set_source_cap, which overrode the seeded 1000; also != 3000 default).
     2. settings row min_interval_seconds reads back as 120 via get_number_setting.
     3. settings row max_backoff_seconds reads back as 7200 via get_number_setting.
-    4. reserve_budget with 4200 prior calls defers (JobDeferred), proving the
-       configured cap is the live gate — not the seeded 1000 or the default 3000.
+    4. reserve_budget with 1200 prior calls defers (JobDeferred), proving the
+       configured cap is the live gate — not the seeded 1000, the default 3000 or
+       the provisional 1500 allowance.
 
-    The value 4200 is distinct from the seeded 1000 and the field default 3000, so
-    this assertion cannot pass vacuously.
+    The value 1200 is distinct from the seeded 1000, the provisional allowance
+    1500 and the field default 3000, so this assertion cannot pass vacuously.
     """
     close_db()
     config.db_path = str(tmp_path / "cap_configured.db")
@@ -336,7 +339,7 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
     _write_options_json(
         options_file,
         {
-            "weathercom_daily_call_limit": _TEST_DAILY_CAP,  # 4200
+            "weathercom_daily_call_limit": _TEST_DAILY_CAP,  # 1200
             "min_interval_seconds": _TEST_MIN_INTERVAL,  # 120
             "max_backoff_seconds": _TEST_MAX_BACKOFF,  # 7200
         },
@@ -359,7 +362,7 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
 
         cap, min_iv, max_bk = db.write_sync(_check)
 
-    # 1. sources.daily_call_limit overrode the seeded 1000 with 4200.
+    # 1. sources.daily_call_limit overrode the seeded 1000 with 1200.
     assert cap == _TEST_DAILY_CAP, (
         f"sources.daily_call_limit must be {_TEST_DAILY_CAP} (configured), "
         f"got {cap!r}; seeded value is 1000, field default is 3000 — "
@@ -375,7 +378,7 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
     )
 
     # 4. Budget defers when calls reaches the configured cap.
-    # Exhaust all 4200 slots, then one more reserve must raise JobDeferred.
+    # Exhaust all 1200 slots, then one more reserve must raise JobDeferred.
     close_db()
     config.db_path = str(tmp_path / "cap_configured.db")
     config.options_path = str(options_file)
@@ -395,7 +398,7 @@ def test_configured_cap_lands_settings_land_budget_defers_at_cap(
             ).fetchone()
             assert tz_row is not None, "sources row for weathercom must exist"
             billing_day = _billing_day(str(tz_row["billing_tz"]))
-            # Insert a budget row representing 4200 calls already consumed.
+            # Insert a budget row representing 1200 calls already consumed.
             conn.execute(
                 "INSERT OR REPLACE INTO api_budget"
                 " (source, billing_day, calls, credits)"

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Final
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -24,6 +25,19 @@ logger = logging.getLogger(__name__)
 # sent, so the provider plausibly counted the call; never underestimate
 # usage against a paid quota.
 _REFUNDABLE_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
+
+# A provider's own daily allowance, where it is lower than what an operator
+# may configure. Applied on read, so the configured value is kept and no
+# writer (boot option, set-cap, import) can raise the limit in force past it.
+PROVIDER_DAILY_CALL_ALLOWANCE: Final[Mapping[str, int]] = {
+    "weathercom": 1500,  # provisional, UNVERIFIED
+}
+
+
+def effective_daily_call_limit(source: str, stored: int) -> int:
+    """The daily call limit in force: the stored value, capped at the allowance."""
+    allowance = PROVIDER_DAILY_CALL_ALLOWANCE.get(source)
+    return stored if allowance is None else min(stored, allowance)
 
 
 @dataclass(frozen=True)
@@ -49,7 +63,7 @@ def current_billing_day(tz_name: str) -> str:
     return _billing_day(tz_name)
 
 
-def _next_billing_window(tz_name: str) -> str:
+def next_billing_window(tz_name: str) -> str:
     now_local = utc_now().astimezone(ZoneInfo(tz_name))
     tomorrow = now_local.date() + timedelta(days=1)
     midnight = now_local.replace(
@@ -100,14 +114,14 @@ def reserve_budget(
             source,
             day,
             calls,
-            int(source_row["daily_call_limit"]),
+            effective_daily_call_limit(source, int(source_row["daily_call_limit"])),
             credit_limit,
             credits_to_reserve,
             credit_limit,
         ),
     )
     if cur.rowcount != 1:
-        raise JobDeferred(_next_billing_window(billing_tz))
+        raise JobDeferred(next_billing_window(billing_tz))
     return Reservation(
         source=source, billing_day=day, calls=calls, credits=credits_to_reserve
     )

@@ -31,6 +31,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.verification.methodology import METHODOLOGY_VERSION
 from wxverify.verification.runs import (
     capture_config_snapshot,
     input_fingerprint,
@@ -1338,7 +1339,7 @@ def test_o_v1_strict_era_page_shows_only_the_strict_prose(
 def test_o_v2_pairwise_era_page_shows_only_the_pairwise_prose(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """O-V2: methodology_version 2 (this build's own) renders `pairwise` --
+    """O-V2: methodology_version 2 (the pairwise threshold) renders `pairwise` --
     the mirror image of O-V1, so a mutant that drops either bound of the
     `>=` threshold is caught by whichever arm it flips.
     """
@@ -1365,19 +1366,20 @@ def test_o_v2_pairwise_era_page_shows_only_the_pairwise_prose(
 def test_o_v4_a_run_newer_than_this_build_is_neither_old_nor_new(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """B4 -- the version ceiling the audit added: methodology_version 3 (>
-    this build's own 2) must NOT be described as pairwise. An earlier draft
-    of this test asserted the page still rendered v2 pairwise prose at
-    version 3; that was wrong under the design that shipped -- a run from a
-    newer build is `unknown`, not assumed compatible. Combined with O-V1/
-    O-V2 above, this pins both edges of the `strict < pairwise <= unknown`
-    range, so a mutant that drops either bound is killed.
+    """B4 -- the version ceiling the audit added: methodology_version
+    METHODOLOGY_VERSION + 1 (> this build's own) must NOT be described as
+    pairwise. An earlier draft of this test asserted the page still rendered
+    v2 pairwise prose at a newer version; that was wrong under the design that
+    shipped -- a run from a newer build is `unknown`, not assumed compatible.
+    Combined with O-V1/O-V2 above, this pins both edges of the
+    `strict < pairwise <= unknown` range, so a mutant that drops either bound
+    is killed.
     """
     page, _ = _render_headline_page(
         tmp_path,
         monkeypatch,
         [("wind", "recommend", 3, 2, _O18_FAMILY)],
-        methodology_version=3,
+        methodology_version=METHODOLOGY_VERSION + 1,
         headline_row=_O_V_HEADLINE_ROW,
     )
     # mutant -> at 16.3 panel-hint / _decision_core_era: correct = the
@@ -1395,7 +1397,7 @@ def test_o_v4_a_run_newer_than_this_build_is_neither_old_nor_new(
 
 @pytest.mark.parametrize(
     ("methodology_version", "era_id"),
-    [(1, "strict"), (3, "unknown")],
+    [(1, "strict"), (METHODOLOGY_VERSION + 1, "unknown")],
 )
 def test_o_v6_decision_sample_cell_is_dashed_by_the_era_gate_alone(
     tmp_path: Path,

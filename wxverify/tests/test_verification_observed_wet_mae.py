@@ -196,6 +196,7 @@ def _make_run(
         period_end=period[-1],
         bootstrap_seed=77,
         bootstrap_resamples=200,
+        wind_basis="pair_max",
     )
     aggregate_run(conn, cfg)
     return site_id, run_id, cfg
@@ -400,6 +401,7 @@ def _reaggregate(conn: sqlite3.Connection, run_id: int) -> RunConfig:
         period_end="2026-06-30",
         bootstrap_seed=77,
         bootstrap_resamples=200,
+        wind_basis="pair_max",
     )
 
 

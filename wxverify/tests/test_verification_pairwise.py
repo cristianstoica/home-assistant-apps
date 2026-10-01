@@ -122,6 +122,7 @@ def _make_run(conn: sqlite3.Connection) -> tuple[int, int, RunConfig]:
         period_end=_DATES[-1],
         bootstrap_seed=77,
         bootstrap_resamples=200,
+        wind_basis="pair_max",
     )
     _seed_wind_cell(conn, run_id, feed_id)
     return site_id, run_id, cfg

@@ -14,6 +14,7 @@ import ast
 import datetime
 import inspect
 import os
+import re
 import sqlite3
 import textwrap
 
@@ -36,6 +37,9 @@ from wxverify.db.queue import (
     ACTIVE_JOB_SQL,
     LATEST_JOB_SQL,
 )
+from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.wind_basis import wind_open_clause
+from wxverify.forecast.wind_blend import training_pairs_query
 from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
     bad_sample_count_sql,
@@ -43,6 +47,9 @@ from wxverify.provider_ops import (
     recent_model_run_count_sql,
     recent_sample_rollup_sql,
     sample_rollup_sql,
+)
+from wxverify.scoring.engine import (
+    _distinct_cells,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
 )
 from wxverify.scoring.multimodel import existing_mean_rows_sql
 from wxverify.scoring.winrate import winrate_sql
@@ -65,6 +72,36 @@ def _plan(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> lis
     return [
         str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
     ]
+
+
+def _plan_rows(
+    conn: sqlite3.Connection, sql: str, params: tuple[object, ...]
+) -> list[tuple[int, int, str]]:
+    return [
+        (int(row["id"]), int(row["parent"]), str(row["detail"]))
+        for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+    ]
+
+
+def _root_ancestor(rows: list[tuple[int, int, str]], row_id: int) -> int:
+    """Walk the EQP parent chain up to the top-level (parent 0) ancestor."""
+    parents = {rid: parent for rid, parent, _detail in rows}
+    current = row_id
+    while parents.get(current, 0) != 0:
+        current = parents[current]
+    return current
+
+
+def _subtree_ids(rows: list[tuple[int, int, str]], root_id: int) -> set[int]:
+    subtree = {root_id}
+    changed = True
+    while changed:
+        changed = False
+        for row_id, parent, _detail in rows:
+            if parent in subtree and row_id not in subtree:
+                subtree.add(row_id)
+                changed = True
+    return subtree
 
 
 def _seed_meteoblue_package_with_16_members(
@@ -1308,3 +1345,127 @@ def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
     # healthy assertion above is discriminating, not vacuously true.
     degraded_plan = _plan(conn, existing_mean_rows_sql(site_scoped=False), (1,))
     assert any("SCAN forecast_pairs" in line for line in degraded_plan), degraded_plan
+
+
+# ---------------------------------------------------------------------------
+# T62 -- wind-pair-max training/scoring reads
+# ---------------------------------------------------------------------------
+
+_LEADERBOARD_SEEK = re.compile(
+    r"^SEARCH fp USING (COVERING )?INDEX idx_pairs_leaderboard \("
+)
+
+
+def test_training_pairs_query_seeks_leaderboard_index_with_valid_at_range() -> None:
+    """T62(a) -- ``forecast/wind_blend.py:training_pairs_query``'s feed-side
+    training read must seek ``idx_pairs_leaderboard`` with a bound ``valid_at``
+    range, both without and with the ``as_of`` knowability predicate, and must
+    never degrade to an ``IN``-list binary search (``ANY(...)``) over the
+    index.
+    """
+    conn = _fresh_conn()
+
+    for as_of in (None, "2026-01-02T00:00:00+00:00"):
+        sql, params = training_pairs_query(
+            site_id=1, lo="2026-01-01", hi="2026-01-02", as_of=as_of
+        )
+        plan = _plan(conn, sql, params)
+        seeks = [line for line in plan if _LEADERBOARD_SEEK.match(line)]
+        assert len(seeks) == 1, plan
+        assert "valid_at>?" in seeks[0] and "valid_at<?" in seeks[0], plan
+        assert not any("ANY(" in line for line in plan), plan
+
+    sql, params = training_pairs_query(
+        site_id=1, lo="2026-01-01", hi="2026-01-02", as_of=None
+    )
+
+    # Negative control 1: swapping the index hint away from
+    # idx_pairs_leaderboard loses the valid_at-bounded seek entirely (the
+    # planner walks idx_pairs_winrate's (site_id, variable, day_ahead)
+    # columns with no range term at all) -- proving the healthy assertion
+    # above is pinned to the real index, not vacuously true.
+    swapped_sql = sql.replace(
+        "INDEXED BY idx_pairs_leaderboard", "INDEXED BY idx_pairs_winrate"
+    )
+    swapped_plan = _plan(conn, swapped_sql, params)
+    assert not any(_LEADERBOARD_SEEK.match(line) for line in swapped_plan), swapped_plan
+
+    # Negative control 2: dropping the day_ahead IN (...) term leaves the
+    # index in use, but the seek can no longer reach past
+    # (site_id, variable) to bind valid_at -- idx_pairs_leaderboard's column
+    # order requires day_ahead equality before a valid_at range is usable.
+    dropped_sql = re.sub(r"AND fp\.day_ahead IN \([^)]*\)\s*\n", "", sql)
+    dropped_plan = _plan(conn, dropped_sql, params)
+    dropped_seeks = [line for line in dropped_plan if _LEADERBOARD_SEEK.match(line)]
+    assert len(dropped_seeks) == 1, dropped_plan
+    assert "valid_at>?" not in dropped_seeks[0], dropped_plan
+
+
+def test_distinct_cells_materializes_before_the_wind_open_check() -> None:
+    """T62(b) -- ``scoring/engine.py:_distinct_cells``'s ``WITH cells AS
+    MATERIALIZED (...)`` fence must keep ``forecast_pairs`` scanned and
+    deduplicated INSIDE the materialized subtree, with the wind-open-state
+    check (``wind_open_clause``, reading ``runtime_state``) sitting entirely
+    OUTSIDE it -- in the outer loop that reads the already-deduplicated
+    cells -- so the check runs once per distinct cell, not once per raw
+    pair row.
+    """
+    conn = _fresh_conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        _distinct_cells(conn, 1)
+    finally:
+        conn.set_trace_callback(None)
+
+    traced = [sql for sql in statements if "forecast_pairs" in sql]
+    assert len(traced) == 1, statements
+    assert "AS MATERIALIZED" in traced[0], traced[0]
+
+    # set_trace_callback hands back the statement with bound parameters
+    # already substituted as literals, so EXPLAIN QUERY PLAN takes no params.
+    rows = _plan_rows(conn, traced[0], ())
+    materialize_row = next(row for row in rows if row[2] == "MATERIALIZE cells")
+    pairs_row = next(row for row in rows if "forecast_pairs" in row[2])
+    wind_rows = [
+        row for row in rows if re.match(r"^(SCAN|SEARCH) runtime_state\b", row[2])
+    ]
+    assert wind_rows, rows
+
+    # forecast_pairs is scanned (and deduplicated) INSIDE the fence...
+    assert pairs_row[1] == materialize_row[0], rows
+    # ...and the wind-open check's whole correlated-subquery node sits
+    # entirely outside that fenced subtree, at the top level alongside
+    # "SCAN cells" -- it runs in the outer loop over the deduplicated
+    # cells, never inside the loop that built them.
+    fenced_subtree = _subtree_ids(rows, materialize_row[0])
+    wind_roots = {_root_ancestor(rows, row[0]) for row in wind_rows}
+    assert not (wind_roots & fenced_subtree), rows
+
+    # Negative control: the inline form (the wind clause folded straight into
+    # the forecast_pairs WHERE, no CTE/fence) has no MATERIALIZE node at all
+    # -- both the pair scan and the wind-open check sit at the top level of
+    # the SAME unfenced query block, so the check runs once per raw pair row
+    # -- proving the fenced assertions above are discriminating, not
+    # vacuously true.
+    inline_sql = (
+        "SELECT DISTINCT site_id, feed_id, variable, day_ahead "
+        "FROM forecast_pairs "
+        f"WHERE {published_generation_clause('forecast_pairs')} "
+        "AND site_id = ? "
+        f"AND {wind_open_clause('variable', 'site_id')}"
+    )
+    inline_rows = _plan_rows(conn, inline_sql, (1,))
+    assert not any(row[2] == "MATERIALIZE cells" for row in inline_rows), inline_rows
+    inline_pairs_row = next(row for row in inline_rows if "forecast_pairs" in row[2])
+    inline_wind_rows = [
+        row
+        for row in inline_rows
+        if re.match(r"^(SCAN|SEARCH) runtime_state\b", row[2])
+    ]
+    assert inline_wind_rows, inline_rows
+    # With no MATERIALIZE node to nest under, the pair scan sits at the top
+    # level of the one and only query block -- the same block the wind
+    # check's correlated subquery belongs to, so nothing fences the check
+    # off from running once per raw pair row.
+    assert inline_pairs_row[1] == 0, inline_rows

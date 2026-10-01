@@ -1131,6 +1131,7 @@ def test_aggregate_strict_common_core_and_availability_floor() -> None:
         period_end="2026-07-04",
         bootstrap_seed=1,
         bootstrap_resamples=10,
+        wind_basis="pair_max",
     )
     aggregate_run(conn, cfg)
     conn.commit()

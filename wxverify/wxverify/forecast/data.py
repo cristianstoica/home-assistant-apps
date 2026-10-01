@@ -34,7 +34,7 @@ from wxverify.scoring.leaderboard import (
 )
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 
-_EXCLUDED_FEEDS_SQL = (
+EXCLUDED_FEEDS_SQL = (
     "f.is_virtual = 0 AND NOT (f.source = 'meteoblue' AND f.model = 'multimodel')"
 )
 
@@ -146,7 +146,7 @@ def load_future_samples(
             WHERE fs.site_id = ?
               AND fs.variable IN ({variables})
               AND fs.valid_at >= ?
-              AND {_EXCLUDED_FEEDS_SQL}
+              AND {EXCLUDED_FEEDS_SQL}
               AND NOT {invalid}
               {asof_clause}
         )
@@ -190,7 +190,7 @@ def count_null_availability_samples(
         WHERE fs.site_id = ?
           AND fs.variable IN ({variables})
           AND fs.valid_at >= ?
-          AND {_EXCLUDED_FEEDS_SQL}
+          AND {EXCLUDED_FEEDS_SQL}
           AND NOT {invalid}
           AND fs.fetched_at IS NULL
         """,
@@ -222,7 +222,7 @@ def load_feed_freshness(
         candidates AS (
             SELECT f.id AS feed_id, v.variable
             FROM feeds f, grid_variables v
-            WHERE {_EXCLUDED_FEEDS_SQL}
+            WHERE {EXCLUDED_FEEDS_SQL}
         ),
         latest AS (
             SELECT c.feed_id,

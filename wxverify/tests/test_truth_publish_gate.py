@@ -39,6 +39,7 @@ import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.verification.engine import publish_verified_run
 from wxverify.verification.runs import published_run_id, run_config_from_row
@@ -568,6 +569,9 @@ def test_o11c_adjacent_station_driven_eligibility_flip_is_caught() -> None:
     claiming the o11d identifier."""
     conn = asof_conn()
     site_id, _feeds, generation_id = _make_site(conn)
+    # Old-style wind writes below: a fresh site opens in pair_max, where the
+    # insert guard drops them. Seeded before the run so its snapshot matches.
+    set_wind_basis_state(conn, site_id, "staging")
     day = "2026-06-01"
     station_id = _make_station(conn, site_id, "gate-station-eligibility")
     run_id = _drive_until_publish_pending(conn, site_id, {"trigger_date": "2026-06-06"})
@@ -632,6 +636,9 @@ def test_o11d_byte_identical_reinsert_is_not_a_divergence_false_positive() -> No
     idempotent refetch, and must never wedge publication."""
     conn = asof_conn()
     site_id, _feeds, generation_id = _make_site(conn)
+    # Old-style wind writes below: a fresh site opens in pair_max, where the
+    # insert guard drops them. Seeded before the run so its snapshot matches.
+    set_wind_basis_state(conn, site_id, "staging")
     day = "2026-06-01"
     station_id = _make_station(conn, site_id, "gate-station-d")
     run_id = _drive_until_publish_pending(conn, site_id, {"trigger_date": "2026-06-06"})

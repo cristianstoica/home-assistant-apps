@@ -46,13 +46,13 @@ is usable only because C1 requires exact completeness; D10's pre-publish
 divergence gate is what catches a revision landing after admission.
 
 There is no poll-round argument behind one hour, and none is claimed. The
-routine writer of ``observations`` is the ``fetch_obs`` job at
-``obs_interval_minutes`` (default 180, floor 30) plus a non-negative
-``obs_jitter_minutes`` (default cap 20), so consecutive ingest rounds are
-180-200 minutes apart at defaults and one hour of silence guarantees ZERO
-complete rounds. Widening the window until it IS a round was worked and
-rejected: the nightly trigger is only 300 minutes after day end, and the
-interval is operator-settable to several times that band, which would
+routine writer of ``observations`` is the ``fetch_obs`` job, or its
+``wind-days`` lane, at ``obs_interval_minutes`` (default 180, floor 30) plus a
+non-negative ``obs_jitter_minutes`` (default cap 20), so consecutive ingest
+rounds are 180-200 minutes apart at defaults and one hour of silence
+guarantees ZERO complete rounds. Widening the window until it IS a round was
+worked and rejected: the nightly trigger is only 300 minutes after day end,
+and the interval is operator-settable to several times that band, which would
 silently convert admission into a pure deadline gate.
 
 The leg that does hold is fetch-window coverage, and it holds only inside a

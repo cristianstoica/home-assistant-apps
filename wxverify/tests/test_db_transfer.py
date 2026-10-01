@@ -48,6 +48,7 @@ from wxverify.db.migrations import (
     schema_table_names,
 )
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import wind_basis_key
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1395,6 +1396,189 @@ def test_import_round_trip_rebuilds_derived_tables(
         direct.close()
 
 
+def test_import_db_without_wind_tables_creates_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T79: an upload shaped like a pre-wind-history DB (station_wind_days and
+    station_wind_records genuinely absent, not merely empty) is accepted, and
+    the post-swap reopen's ``run_migrations`` -> ``create_tables`` recreates
+    both tables on the live DB. Neither table is in ``_REQUIRED_TABLES``, so
+    their absence from the upload does not trip the 422 guard.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Pre Import Site")
+    conn.commit()
+
+    # Hand-built (NOT via Database()/create_tables): a pre-wind-history shape
+    # that never had station_wind_days/station_wind_records, independent of
+    # whatever create_tables currently does -- this keeps the mutation probe
+    # for the production recreate-on-reopen behavior from being confounded by
+    # a mutant that also breaks the fixture's own construction.
+    b_path = tmp_path / "source-no-wind-tables.db"
+    raw = sqlite3.connect(str(b_path))
+    try:
+        raw.executescript(
+            """
+            CREATE TABLE sites (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                forecast_lat REAL NOT NULL,
+                forecast_lon REAL NOT NULL,
+                elevation_m REAL NOT NULL,
+                timezone TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                rain_threshold_mm REAL NOT NULL DEFAULT 0.2
+                    CHECK(rain_threshold_mm >= 0),
+                last_obs_at TEXT,
+                backfill_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(backfill_status IN ('pending','in_progress','complete')),
+                backfill_through TEXT,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                last_obs_cycle_at TEXT
+            );
+            CREATE TABLE stations (
+                id INTEGER PRIMARY KEY,
+                site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+                pws_station_id TEXT NOT NULL UNIQUE,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                dem_elevation_m REAL NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
+                last_run_at TEXT,
+                last_error TEXT,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                history_next_attempt_at TEXT,
+                history_last_error TEXT,
+                history_error_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE station_observations (
+                id INTEGER PRIMARY KEY,
+                station_id INTEGER NOT NULL REFERENCES stations(id)
+                    ON DELETE CASCADE,
+                variable TEXT NOT NULL,
+                valid_at TEXT NOT NULL,
+                value REAL NOT NULL,
+                qc_flag TEXT NOT NULL CHECK(qc_flag IN ('ok','range','spike')),
+                source_raw TEXT,
+                fetched_at TEXT,
+                UNIQUE(station_id, variable, valid_at)
+            );
+            PRAGMA user_version = 7;
+            """
+        )
+        site_id = _make_site(raw, "No Wind Tables Site")
+        raw.commit()
+        remaining = {
+            r[0]
+            for r in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name IN ('station_wind_days', 'station_wind_records')"
+            )
+        }
+        assert remaining == set(), "fixture must genuinely lack both tables"
+    finally:
+        raw.close()
+    assert site_id > 0
+    payload = b_path.read_bytes()
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    direct = sqlite3.connect(config.db_path)
+    try:
+        present = {
+            r[0]
+            for r in direct.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name IN ('station_wind_days', 'station_wind_records')"
+            )
+        }
+        assert present == {"station_wind_days", "station_wind_records"}, (
+            "both wind tables must be recreated by the post-swap reopen"
+        )
+    finally:
+        direct.close()
+
+
+def test_import_pair_max_db_with_old_wind_rows_reopens_in_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T79: importing a DB whose site is stamped ``pair_max`` but still
+    carries a pre-pair-max wind row (``source_raw`` not ``'pair-max '``-
+    prefixed) must have the post-swap reopen's ``init_wind_basis`` downgrade
+    that site back to ``staging`` -- the same rule T24 pins for a direct
+    ``replace_from``, exercised here through the actual HTTP import route.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _make_site(conn, "Pre Import Site")
+    conn.commit()
+
+    b_path = tmp_path / "source-pair-max-old-rows.db"
+    b_db = Database(str(b_path))
+    try:
+        site_id = _make_site(b_db._conn, "Pair Max Old Rows Site")  # noqa: SLF001
+        station_id = int(
+            b_db._conn.execute(  # noqa: SLF001
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+                VALUES (?, 'SYN-STATION-W1', 40.0, -105.0, 900.0, 1)
+                """,
+                (site_id,),
+            ).lastrowid
+        )
+        # A legacy wind row: source_raw does NOT carry the pair-max prefix.
+        b_db._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO station_observations
+                (station_id, variable, valid_at, value, qc_flag, source_raw)
+            VALUES (?, 'wind', '2035-06-01T00:00:00Z', 3.0, 'ok', '10.8 km/h')
+            """,
+            (station_id,),
+        )
+        b_db._conn.execute(  # noqa: SLF001
+            "INSERT OR REPLACE INTO runtime_state (key, value) VALUES (?, 'pair_max')",
+            (wind_basis_key(site_id),),
+        )
+        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        b_db._conn.commit()  # noqa: SLF001
+    finally:
+        b_db.close()
+    payload = b_path.read_bytes()
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    direct = sqlite3.connect(config.db_path)
+    direct.row_factory = sqlite3.Row
+    try:
+        imported_site_id = int(
+            direct.execute(
+                "SELECT id FROM sites WHERE name='Pair Max Old Rows Site'"
+            ).fetchone()["id"]
+        )
+        state_row = direct.execute(
+            "SELECT value FROM runtime_state WHERE key = ?",
+            (wind_basis_key(imported_site_id),),
+        ).fetchone()
+        assert state_row is not None
+        assert state_row["value"] == "staging", (
+            "a pair_max site imported with old (non-pair-max) wind rows must "
+            "reopen downgraded to staging, not stay pair_max"
+        )
+    finally:
+        direct.close()
+
+
 def _sqlite_bytes_with_user_version(path: Path, version: int) -> bytes:
     conn = sqlite3.connect(str(path))
     try:
@@ -1728,6 +1912,7 @@ def test_import_swap_failure_migrations_restore_rollback_no_leak(
             "wxverify.db.connection.run_migrations", _flaky_run_migrations
         )
         stale_conn = get_db()._conn  # noqa: SLF001
+        stale_probe = get_db()._probe  # noqa: SLF001
         headers = _csrf_headers(client)
         armed["on"] = True
         resp = client.post("/api/import/db", content=payload, headers=headers)
@@ -1743,6 +1928,12 @@ def test_import_swap_failure_migrations_restore_rollback_no_leak(
             fresh_conn.execute("PRAGMA user_version").fetchone()[0]
             == TARGET_USER_VERSION
         ), "restored connection must be healthy"
+        # The external-commit probe is reopened on the restore as well. No
+        # data_version equality here: the lifespan may commit after the reopen.
+        with pytest.raises(sqlite3.ProgrammingError):
+            stale_probe.execute("SELECT 1")
+        assert get_db()._probe is not stale_probe  # noqa: SLF001
+        assert isinstance(get_db().external_commit_seq(), int)
     names = {s["name"] for s in sites}
     assert names == {"Restored Site A"}, "app must serve rows A again after rollback"
     db_dir = Path(config.db_path).parent
@@ -4923,6 +5114,7 @@ _CHECKED_TODAY_TABLES: tuple[str, ...] = (
     "forecast_samples",
     "forecast_pairs",
     "score_cache",
+    "station_wind_records",
 )
 _OTHER_APP_TABLES: tuple[str, ...] = (
     "api_budget",
@@ -4937,6 +5129,7 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "sources",
     "station_current_obs",
     "station_poll_state",
+    "station_wind_days",
     "timezone_generations",
     "verification_day_context",
     "verification_evidence",
@@ -5449,7 +5642,7 @@ def test_import_accepts_canonical_observation_stamps(
 def test_import_rejects_non_table_under_app_table_name(
     kind: str, name: str, tmp_path: Path
 ) -> None:
-    """S10: every one of the other 20 schema table names, held by a view or
+    """S10: every one of the other 21 schema table names, held by a view or
     a virtual table, is refused -- the D6 loop over ``schema_table_names()``
     reaches names none of the pre-0.16.2 checks ever looked at.
     """
@@ -5508,7 +5701,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 27
+    assert len(schema_table_names()) == 29
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(

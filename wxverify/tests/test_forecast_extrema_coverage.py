@@ -49,6 +49,7 @@ from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_INSUFFICIENT,
     covers_local_day,
@@ -695,6 +696,9 @@ def test_hourly_drilldown_survives_temperature_suppression() -> None:
 
 def test_wind_untouched_while_temperature_and_precip_suppress() -> None:
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
 
@@ -964,7 +968,7 @@ def test_scored_temperature_entity_is_the_pre_f_clearing_subset_value() -> None:
     # NOT extrema-eligible via covers_local_day, which needs all 24).
     from wxverify.verification.methodology import METHODOLOGY_VERSION
 
-    assert METHODOLOGY_VERSION == 2
+    assert METHODOLOGY_VERSION == 3
 
     conn = _record_conn()
     site_id = _record_site(conn, "site-a")
@@ -1041,6 +1045,7 @@ def test_scored_temperature_entity_is_the_pre_f_clearing_subset_value() -> None:
         period_end=period_end,
         bootstrap_seed=1,
         bootstrap_resamples=40,
+        wind_basis="pair_max",
     )
 
     # Fingerprint-purity check (E-T17/C-T8's pattern): supporting evidence
@@ -2038,6 +2043,9 @@ def test_wind_warnings_unchanged_while_temperature_extrema_differs() -> None:
     # extrema-coverage rule (Item G) and is covered separately by
     # G-T23-G-T26, not re-derived here.
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     feed_a, feed_b = _seed_ab_fixture(conn, seed_b_scoring=False)
     wind_ats = _hours(_AB_VALID_DAY, 0, 20)
@@ -2083,6 +2091,9 @@ def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
     # EXCLUSIVE to it (icon_global) rather than feed_a, whose fresh fetch
     # stamp would otherwise mask a stale wind one.
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     _seed_ab_fixture(conn, seed_b_scoring=False)
     wind_feed = _feed_id(conn, "open-meteo", "icon_global")
@@ -2151,6 +2162,9 @@ def test_tile_level_rollup_across_variables() -> None:
     # (1) Only temperature's extrema contributor (B) is stale -- the same
     # per-cell signal F-T22 pins, checked here at the TILE level.
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     feed_a, _feed_b = _seed_ab_fixture(
         conn, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_STALE_ISSUED
     )
@@ -2173,6 +2187,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # feed_a would be masked by that same feed's fresh stamp -- the trap
     # this isolation avoids.
     conn = _make_db()
+    set_wind_basis_state(conn, 1, "staging")
     _feed_a, _feed_b = _seed_ab_fixture(conn)
     wind_feed = _feed_id(conn, "open-meteo", "icon_global")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
@@ -2196,6 +2211,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # a low-confidence BLEND-side cell (unlike case (4) below) moves both
     # ``state`` and ``confidence_state`` together.
     conn = _make_db()
+    set_wind_basis_state(conn, 1, "staging")
     feed_a, _feed_b = _seed_ab_fixture(conn)
     _seed_hourly(
         conn,
@@ -2222,6 +2238,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # because it never looks at ``extrema_state``, while ``confidence_state``
     # (badges) picks it up, the pairing F.6 requires kept independent.
     conn = _make_db()
+    set_wind_basis_state(conn, 1, "staging")
     feed_a, _feed_b = _seed_ab_fixture(conn, seed_b_scoring=False)
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     _seed_wind_confident(
@@ -2247,6 +2264,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # within one cell's own blend/extrema pair: the badge row shows "low
     # confidence" alone, never "ranking updating" beside it.
     conn = _make_db()
+    set_wind_basis_state(conn, 1, "staging")
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
@@ -2308,6 +2326,7 @@ def test_tile_level_rollup_across_variables() -> None:
     # positive badge assertion above -- proves the badge row isn't ambiently
     # present regardless of state.
     conn = _make_db()
+    set_wind_basis_state(conn, 1, "staging")
     feed_a, _feed_b = _seed_ab_fixture(conn)
     persistence_id = _feed_id(conn, "virtual", "_persistence")
     _seed_wind_confident(

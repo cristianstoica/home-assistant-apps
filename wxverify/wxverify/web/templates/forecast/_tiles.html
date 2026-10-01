@@ -36,6 +36,9 @@
                   <strong class="muted">&mdash;</strong>
                 {% endif %}
               </div>
+              {% if tile.wind.max_kmh is none and tile.wind.note %}
+                <p class="muted" data-field="wind-note">{{ tile.wind.note }}</p>
+              {% endif %}
               <div class="tile-row" {% if tile.precip.meta.available and not tile.precip.meta.extrema_unavailable %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Wet hours: the average number of hourly intervals forecast to meet this site's rain threshold, rounded for display. Rain need not fall throughout each interval."{% endif %}>
                 <span>Rain</span>
                 {% if tile.precip.meta.extrema_unavailable %}

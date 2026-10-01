@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 import statistics
@@ -13,8 +14,11 @@ from pydantic import BaseModel, ConfigDict
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.wind_basis import wind_state_sql, wind_station_row_clause
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
 from wxverify.verification.truth import mark_daily_truth_stale
+
+logger = logging.getLogger(__name__)
 
 LAPSE: Final[float] = 0.0065
 MAD_TO_SIGMA: Final[float] = 1.4826
@@ -168,6 +172,60 @@ def insert_station_observation(
     value: float,
     source_raw: str | None,
 ) -> bool:
+    """Write one station reading and re-materialize its consensus hour.
+
+    Wind rows are written only while the station's site is in ``staging``
+    (the old hourly figure); in every other state, and for a missing station,
+    a wind write is skipped and returns False. Other variables are unchanged.
+    """
+    if variable == "wind":
+        row = conn.execute(
+            "SELECT "
+            + wind_state_sql("s.site_id")
+            + " AS state FROM stations s WHERE s.id = ?",
+            (station_id,),
+        ).fetchone()
+        if row is None or row["state"] != "staging":
+            logger.debug(
+                "wind station row skipped station=%s state=%s",
+                station_id,
+                None if row is None else row["state"],
+            )
+            return False
+    if not write_station_observation(
+        conn,
+        station_id=station_id,
+        variable=variable,
+        valid_at=valid_at,
+        value=value,
+        source_raw=source_raw,
+    ):
+        return False
+    site_row = conn.execute(
+        "SELECT site_id FROM stations WHERE id = ?", (station_id,)
+    ).fetchone()
+    if site_row is not None:
+        materialize_consensus(
+            conn, site_id=int(site_row["site_id"]), variable=variable, valid_at=valid_at
+        )
+    return True
+
+
+def write_station_observation(
+    conn: sqlite3.Connection,
+    *,
+    station_id: int,
+    variable: str,
+    valid_at: str,
+    value: float,
+    source_raw: str | None,
+) -> bool:
+    """Upsert one ``station_observations`` row; True when it changed.
+
+    The unguarded write body: it does not consult the wind basis and does not
+    materialize. Callers are ``insert_station_observation`` and the
+    wind-history lane.
+    """
     if variable in TARGET_VARIABLES and not source_raw:
         raise ValueError("target observation writes require source_raw")
     previous = conn.execute(
@@ -212,13 +270,6 @@ def insert_station_observation(
         """,
         (station_id, variable, valid_at, value, flag, source_raw, isoformat_utc()),
     )
-    site_row = conn.execute(
-        "SELECT site_id FROM stations WHERE id = ?", (station_id,)
-    ).fetchone()
-    if site_row is not None:
-        materialize_consensus(
-            conn, site_id=int(site_row["site_id"]), variable=variable, valid_at=valid_at
-        )
     return True
 
 
@@ -252,7 +303,8 @@ def materialize_consensus(
           AND so.variable = ?
           AND so.valid_at = ?
           AND so.qc_flag = 'ok'
-        """,
+          AND """
+        + wind_station_row_clause("s.site_id"),
         (site_id, variable, valid_at),
     ).fetchall()
     readings = [

@@ -190,6 +190,7 @@ def _base_cfg(*, run_id: int, site_id: int, generation: int) -> RunConfig:
         period_end="2026-09-30",
         bootstrap_seed=1,
         bootstrap_resamples=20,
+        wind_basis="pair_max",
     )
 
 
@@ -333,7 +334,7 @@ def test_o12_contract_text_and_core_map() -> None:
 def test_o13_methodology_and_schema_versions_moved_together() -> None:
     # This change (pairwise decision cores) bumped both counters together;
     # a mutant reverting either one in isolation fails this assertion.
-    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (2, 2)
+    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (3, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +647,7 @@ def test_o6_headline_table_is_the_unchanged_strict_common_core() -> None:
         period_end=days[-1],
         bootstrap_seed=1,
         bootstrap_resamples=10,
+        wind_basis="pair_max",
     )
     aggregate_run(conn, cfg)
     conn.commit()

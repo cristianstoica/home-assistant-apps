@@ -22,18 +22,22 @@ window cutoff is computed from the REAL wall clock, not an injectable "now".
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
+
+import pytest
 
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.service import (
     RAIN_GLYPH_MIN_WET_HOURS,
     build_forecast,
     build_hourly,
     relative_ago,
 )
+from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import leaderboard_with_status, resolve_window
 from wxverify.scoring.metrics import strategy_for
@@ -530,6 +534,9 @@ def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
     # leaked into wind's value path, this would fail where the temperature
     # test above would not catch it.
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
@@ -561,6 +568,9 @@ def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
 
 def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() -> None:
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
@@ -643,6 +653,9 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     is O8's job.
     """
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
     icon_id = _feed_id(conn, "open-meteo", "icon_global")
@@ -995,6 +1008,9 @@ def test_build_forecast_empty_when_no_samples_at_all() -> None:
 
 def test_wind_tile_max_is_ms_to_kmh_converted() -> None:
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     _seed_hourly(
@@ -1243,7 +1259,10 @@ def test_build_hourly_hour_axis_reflects_selected_feed_only() -> None:
     assert loser_id not in feed_ids
 
 
-def test_build_hourly_wind_series_already_kmh_converted() -> None:
+def test_build_hourly_wind_untrained_feed_is_not_served() -> None:
+    """A fresh site serves weighted wind (``pair_max``); a feed with no wind
+    track record has no weight, so the wind line is empty and noted rather
+    than falling back to the unweighted blend."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
@@ -1257,8 +1276,86 @@ def test_build_hourly_wind_series_already_kmh_converted() -> None:
     )
     conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
-    assert payload["blend"]["wind_kmh"] == [18.0]
-    assert payload["feeds"][0]["wind_kmh"] == [18.0]
+    assert payload["hours"] == []
+    assert payload["blend"]["wind_kmh"] == []
+    assert payload["feeds"] == []
+    assert payload["weights"] == {"wind": {}}
+    assert payload["notes"] == {"wind": NOT_ENOUGH_FEEDS_NOTE}
+
+
+def _seed_wind_training(
+    conn: sqlite3.Connection, *, forecast_by_feed: dict[int, float], observed: float
+) -> None:
+    """Thirty complete training days before 2026-07-20 (UTC site 1).
+
+    Each feed's day-before 20:00Z run forecasts a constant wind for all 24
+    hours of each day at day_ahead 1, and the site observes a constant wind
+    for all 24 hours, so each feed's MAE is ``|forecast - observed|``.
+    """
+    for offset in range(1, 31):
+        target = date(2026, 7, 20) - timedelta(days=offset)
+        issued_at = f"{target - timedelta(days=1)}T20:00:00Z"
+        valid_ats = _hours(target.isoformat(), 0, 24)
+        for feed_id, forecast in forecast_by_feed.items():
+            for hour, valid_at in enumerate(valid_ats):
+                _insert_pair(
+                    conn,
+                    feed_id=feed_id,
+                    variable="wind",
+                    issued_at=issued_at,
+                    valid_at=valid_at,
+                    lead_hours=4 + hour,
+                    day_ahead=1,
+                    forecast=forecast,
+                    observed=observed,
+                )
+        for valid_at in valid_ats:
+            conn.execute(
+                """
+                INSERT INTO observations
+                    (site_id, variable, valid_at, value, n_stations, computed_at)
+                VALUES (1, 'wind', ?, ?, 1, ?)
+                """,
+                (valid_at, observed, valid_at),
+            )
+
+
+def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
+    """Two trained feeds: the wind line is their accuracy-weighted mean.
+
+    Observed 4.0 m/s every training day: feed A forecasts 5.0 (MAE 1.0,
+    weight 1.0) and feed B 6.0 (MAE 2.0, weight 0.5), normalized to 2/3 and
+    1/3. Tomorrow A says 4.0 m/s and B 7.0 m/s, so the weighted value is
+    5.0 m/s = 18.0 km/h (the unweighted mean would be 5.5 m/s = 19.8 km/h).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    conn.commit()
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert payload["hours"] == hours
+    assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert payload["weights"] == {
+        "wind": {str(feed_a): pytest.approx(2 / 3), str(feed_b): pytest.approx(1 / 3)}
+    }
+    assert payload["notes"] == {"wind": None}
+    per_feed = {feed["feed_id"]: feed["wind_kmh"] for feed in payload["feeds"]}
+    assert per_feed == {
+        feed_a: pytest.approx([ms_to_kmh(4.0)] * 24),
+        feed_b: pytest.approx([ms_to_kmh(7.0)] * 24),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1407,6 +1504,9 @@ def test_coverage_gate_wind_aggregates_precip_suppresses() -> None:
     either -- neither feed qualifies, so the daily total and wet-hour count
     are suppressed rather than aggregated from the partial range."""
     conn = _make_db()
+    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
+    # wind), so hold the site in staging.
+    set_wind_basis_state(conn, 1, "staging")
     single_id = _feed_id(conn, "open-meteo", "gfs_global")
     covered_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)

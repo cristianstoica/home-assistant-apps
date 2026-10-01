@@ -153,7 +153,7 @@ class _FakeDb:
 
     generation = 0
 
-    async def write(self, fn):  # type: ignore[no-untyped-def]
+    async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
         return fn(None)
 
     async def read(self, fn):  # type: ignore[no-untyped-def]

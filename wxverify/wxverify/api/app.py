@@ -34,7 +34,7 @@ from wxverify.api.routes import (
     timeseries,
     verification,
 )
-from wxverify.collection.budget import set_source_cap
+from wxverify.collection.budget import effective_daily_call_limit, set_source_cap
 from wxverify.core.options import load_runtime_options
 from wxverify.db.connection import Database, init_db
 from wxverify.db.queue import reclaim_all_stale
@@ -136,6 +136,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
             daily_call_limit=options.weathercom_daily_call_limit,
         )
     )
+    # The stored value stays the configured one; every reader clamps it to the
+    # provisional provider allowance (plan §8.6). Say so once when it bites.
+    weathercom_cap = effective_daily_call_limit(
+        "weathercom", options.weathercom_daily_call_limit
+    )
+    if weathercom_cap < options.weathercom_daily_call_limit:
+        logger.warning(
+            "weathercom_daily_call_limit %s is above the provisional provider"
+            " allowance %s; the effective daily cap is %s",
+            options.weathercom_daily_call_limit,
+            weathercom_cap,
+            weathercom_cap,
+        )
     # An import's derived-table rebuild normally runs as a post-response
     # background task; a process restart between the import response and
     # that task's completion leaves it stuck at "pending". Resume it here,

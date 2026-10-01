@@ -31,6 +31,7 @@ from tests.helpers import (
     asof_make_real_feed,
     asof_make_site,
 )
+from tests.test_forecast_service import _hours
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.tz_generations import (
@@ -38,7 +39,12 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.service import build_forecast, build_hourly
+from wxverify.forecast.wind_blend import (
+    FALLBACK_NOT_ENOUGH_FEEDS,
+    FALLBACK_SWITCH_IN_PROGRESS,
+)
 from wxverify.settings.keys import set_setting
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
 from wxverify.verification.record import (
@@ -708,6 +714,9 @@ def test_zero_sample_day_writes_no_rows() -> None:
     # Paired positive, so the assertion above is not vacuously satisfied by a
     # builder that writes nothing at all: the same day WITH samples is written.
     other = asof_make_site(conn, "record-partial-site")
+    # Legacy wind selects every sampled feed; a fresh site opens in pair_max,
+    # where wind serves only feeds with trained weights (none here).
+    set_wind_basis_state(conn, other, "staging")
     ensure_published_generation(conn, other)
     _seed_full_grid(conn, other, _DAY, tag="-partial")
     build_forecast_record(
@@ -780,6 +789,9 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-parity-site")
+    # The wind pins below are the legacy clearing-subset blend; a fresh site
+    # opens in pair_max, where wind is the accuracy-weighted daily high.
+    set_wind_basis_state(conn, site_id, "staging")
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
@@ -958,6 +970,373 @@ def test_record_outcomes_score_clearing_subset_hourly_follows_drill_down() -> No
     # exactly what the outcomes above must also ignore.
     assert [v for _at, v in hourly] == [0.0] * 24
     assert wet_value >= threshold  # fixture guard: B's value really is wet
+
+
+# ---------------------------------------------------------------------------
+# T61 (plan §15.1) — pair_max wind: displayed/tile parity, and legacy_hourly
+# is the clearing subset's blend, not the general ladder's full selection.
+# ---------------------------------------------------------------------------
+
+
+def _insert_wind_training_pair(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    valid_at: str,
+    issued_at: str,
+    forecast: float,
+    observed: float,
+) -> None:
+    """A wind training pair known as of its own ``valid_at`` (as-of-safe).
+
+    ``tests.helpers.asof_insert_pair`` is hardcoded to ``variable=
+    'temperature'`` (see its SQL literal), so wind training needs its own
+    insert here. ``first_known_at=valid_at`` makes every pair knowable to
+    the as-of training query the record build runs (``asof.py``'s
+    ``first_known_at IS NOT NULL AND first_known_at <= T``); the shared
+    ``tests/test_forecast_service.py`` wind helpers leave it NULL, which
+    hides every pair from this query even though the live Forecast page
+    (``as_of=None``) still renders fine off the same rows.
+    """
+    error = forecast - observed
+    generation_id = ensure_published_generation(conn, site_id)
+    conn.execute(
+        """
+        INSERT INTO forecast_pairs
+            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             first_known_at, tz_generation_id)
+        VALUES (?, ?, 'wind', ?, ?, 4, 1, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            site_id,
+            feed_id,
+            issued_at,
+            valid_at,
+            forecast,
+            observed,
+            error,
+            abs(error),
+            error**2,
+            valid_at,
+            generation_id,
+        ),
+    )
+
+
+def _seed_wind_training_asof(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    forecast_by_feed: dict[int, float],
+    observed: float,
+    upto: date,
+) -> None:
+    """30 days of trained, as-of-knowable wind pairs ending just before
+    ``upto``, plus the matching ``observations`` rows ``load_wind_training``
+    reads for the observed side."""
+    for offset in range(1, 31):
+        target = upto - timedelta(days=offset)
+        issued_at = f"{target - timedelta(days=1)}T20:00:00Z"
+        valid_ats = _hours(target.isoformat(), 0, 24)
+        for feed_id, forecast in forecast_by_feed.items():
+            for valid_at in valid_ats:
+                _insert_wind_training_pair(
+                    conn,
+                    site_id=site_id,
+                    feed_id=feed_id,
+                    valid_at=valid_at,
+                    issued_at=issued_at,
+                    forecast=forecast,
+                    observed=observed,
+                )
+        for valid_at in valid_ats:
+            conn.execute(
+                """
+                INSERT INTO observations
+                    (site_id, variable, valid_at, value, n_stations, computed_at)
+                VALUES (?, 'wind', ?, ?, 1, ?)
+                """,
+                (site_id, valid_at, observed, valid_at),
+            )
+
+
+def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() -> None:
+    """§15.1 T61: in ``pair_max`` the record's displayed ``max_ms`` equals
+    the Forecast tile's wind value (parity), and ``legacy_hourly`` is
+    ``_blend_hourly(agg_ids, ...)`` -- the clearing subset -- not the
+    general ladder's full ``selected_ids``.
+
+    Fixture: three feeds trained identically well enough to be weighted-
+    eligible (A and B cover 24h today and clear coverage; C covers only 15h
+    today, below ``MIN_COVERAGE_HOURS=18``, so it clears neither coverage
+    nor the clearing subset). ``forecast_blend_depth_wind`` is overridden to
+    3 so the general ladder's ``selected_ids`` includes all three feeds,
+    deliberately diverging from ``agg_ids`` (the clearing subset, A and B
+    only) -- the divergence T61 requires to distinguish the two.
+
+    mutant_agg_ids_to_selected_ids -> at ``assert legacy_hourly[0] ==
+    pytest.approx(5.5)``: correct = ``5.5`` (``_blend_hourly(agg_ids=[A, B],
+    ...)``: A's 4.0 and B's 7.0 m/s averaged, C excluded because it never
+    clears coverage), mutant (swapping ``agg_ids`` for ``selected_ids`` at
+    the ``outcome_hourly = _blend_hourly(agg_ids, feeds_samples)`` call) =
+    ``16 / 3 ≈ 5.33`` at this hour, since C's 5.0 m/s sample (present for
+    hours 0-14) now enters the mean too.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wind-pair-max-parity-site")
+    set_wind_basis_state(conn, site_id, "pair_max")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    feed_b = asof_make_real_feed(conn, "model-b")
+    feed_c = asof_make_real_feed(conn, "model-c")
+    set_setting(conn, "forecast_blend_depth_wind", "3")
+    conn.commit()
+
+    _seed_wind_training_asof(
+        conn,
+        site_id=site_id,
+        forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 5.5},
+        observed=4.0,
+        upto=_DAY,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 4.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_b,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 7.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_c,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(15),
+        value_fn=lambda _h: 5.0,
+    )
+    conn.commit()
+
+    t = _t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
+    view = build_forecast(
+        conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2, now=t
+    )
+    tile = view.tiles[0]
+
+    row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
+    # Fixture validity: the served weighted feeds are A and B (C is below
+    # MIN_COVERAGE_HOURS today, so it is never eligible for the weighted
+    # choice either), and the general ladder (blend_depth=3) genuinely
+    # diverges from it by including C.
+    assert json.loads(str(row["selected_feed_ids"])) == [feed_a, feed_b]
+
+    quantities = json.loads(str(row["daily_quantities"]))
+    displayed = quantities["displayed"]
+    max_ms = displayed["max_ms"]
+    assert isinstance(max_ms, float)
+    assert max_ms == pytest.approx(5.0)  # A's 4.0 * 2/3 + B's 7.0 * 1/3
+    assert tile.wind.max_kmh == pytest.approx(ms_to_kmh(max_ms))  # parity
+
+    assert displayed["legacy_max_ms"] == pytest.approx(5.5)
+    legacy_hourly = [v for _at, v in displayed["legacy_hourly"]]
+    assert legacy_hourly == pytest.approx([5.5] * 24)
+
+
+_RECORD_WIND_COLUMNS = (
+    "candidates",
+    "selected_feed_ids",
+    "feed_weights",
+    "effective_cells",
+    "source_runs",
+    "hourly_values",
+    "daily_quantities",
+    "leaderboard_status",
+)
+
+
+def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
+    """§15.1 T63: in ``pair_max`` with two served feeds, ``feed_weights`` is
+    the *normalized* weight (sum 1 +/- 1e-9), not the raw inverse-MAE
+    weight ``choose_wind_feeds`` starts from.
+
+    mutant_drop_normalization -> at ``assert sum(weights.values()) ==
+    pytest.approx(1.0, abs=1e-9)``: correct = ``1.0`` (A and B's
+    inverse-MAE weights divided by their ``total``), mutant (dropping the
+    ``/ total`` in ``choose_wind_feeds``'s
+    ``weights={candidate.feed_id: weight / total for candidate, weight in
+    eligible}`` so it returns the raw ``weight``) = the raw inverse-MAE sum,
+    which is not 1.0 (A's weight is ``1/0.1=10``, B's is
+    ``1/1.0=1``, raw sum ``11.0``) -- wildly off the 1e-9 tolerance.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wind-pair-max-weights-sum-site")
+    set_wind_basis_state(conn, site_id, "pair_max")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    feed_b = asof_make_real_feed(conn, "model-b")
+    conn.commit()
+
+    # A forecasts dead-on (MAE -> floor 0.1, weight 10); B is off by 1.0
+    # m/s every day (MAE 1.0, weight 1) -- an asymmetric fixture so a
+    # dropped normalization is visibly not 1.0, not coincidentally 1.0.
+    _seed_wind_training_asof(
+        conn,
+        site_id=site_id,
+        forecast_by_feed={feed_a: 4.0, feed_b: 5.0},
+        observed=4.0,
+        upto=_DAY,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 4.0,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_b,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 5.0,
+    )
+    conn.commit()
+
+    t = _t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
+
+    row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
+    for column in _RECORD_WIND_COLUMNS:
+        assert row[column] is not None
+        json.loads(str(row[column]))  # every wind column is well-formed JSON
+
+    weights = json.loads(str(row["feed_weights"]))
+    assert set(weights) == {str(feed_a), str(feed_b)}
+    assert sum(weights.values()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_t63_closed_mode_row_has_empty_weights_and_switch_in_progress() -> None:
+    """§15.1 T63: a closed-mode (``switching``) row is still written, with
+    empty ``feed_weights`` and ``fallback_reason ==
+    "wind_switch_in_progress"`` -- the row is never skipped just because
+    wind has nothing to serve.
+
+    mutant_served_instead_of_none -> at
+    ``assert displayed["fallback_reason"] == FALLBACK_SWITCH_IN_PROGRESS``:
+    correct = ``"wind_switch_in_progress"`` (the closed branch of
+    ``_served_wind`` returns unconditionally), mutant (swapping
+    ``FALLBACK_SWITCH_IN_PROGRESS`` for ``FALLBACK_NOT_ENOUGH_FEEDS`` in
+    that branch's ``"fallback_reason"`` entry) = ``"not_enough_feeds"``,
+    the wrong reason for a row that was never eligible to begin with (the
+    state is closed, not wind-blend-too-few-feeds).
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wind-closed-row-site")
+    set_wind_basis_state(conn, site_id, "switching")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    conn.commit()
+
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 4.0,
+    )
+    conn.commit()
+
+    t = _t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
+
+    row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
+    for column in _RECORD_WIND_COLUMNS:
+        assert row[column] is not None
+        json.loads(str(row[column]))
+
+    assert json.loads(str(row["feed_weights"])) == {}
+    assert json.loads(str(row["selected_feed_ids"])) == []
+    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
+    assert displayed["fallback_reason"] == FALLBACK_SWITCH_IN_PROGRESS
+
+
+def test_t63_pair_max_one_feed_has_not_enough_feeds() -> None:
+    """§15.1 T63: a ``pair_max`` row with only one weighted-eligible feed
+    (below ``MIN_FEEDS=2``) still writes a row, with empty ``feed_weights``
+    and ``fallback_reason == "not_enough_feeds"`` -- distinct from the
+    closed-mode reason above.
+
+    mutant_switch_in_progress_instead -> at
+    ``assert displayed["fallback_reason"] == FALLBACK_NOT_ENOUGH_FEEDS``:
+    correct = ``"not_enough_feeds"`` (``choose_wind_feeds`` returns
+    ``weights={}`` and an unavailable selection below ``MIN_FEEDS``, so
+    ``_served_wind``'s ``served`` is False), mutant (swapping
+    ``FALLBACK_NOT_ENOUGH_FEEDS`` for ``FALLBACK_SWITCH_IN_PROGRESS`` in
+    that branch's ``"fallback_reason": None if served else
+    FALLBACK_NOT_ENOUGH_FEEDS``) = ``"wind_switch_in_progress"``, the
+    closed-mode reason on a row that is actually in ``pair_max``.
+    """
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "wind-pair-max-one-feed-site")
+    set_wind_basis_state(conn, site_id, "pair_max")
+    ensure_published_generation(conn, site_id)
+    feed_a = asof_make_real_feed(conn, "model-a")
+    conn.commit()
+
+    _seed_wind_training_asof(
+        conn,
+        site_id=site_id,
+        forecast_by_feed={feed_a: 4.0},
+        observed=4.0,
+        upto=_DAY,
+    )
+    _insert_var_day(
+        conn,
+        site_id=site_id,
+        feed_id=feed_a,
+        variable="wind",
+        local_date=_DAY,
+        hours=range(24),
+        value_fn=lambda _h: 4.0,
+    )
+    conn.commit()
+
+    t = _t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    conn.commit()
+
+    row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
+    for column in _RECORD_WIND_COLUMNS:
+        assert row[column] is not None
+        json.loads(str(row[column]))
+
+    assert json.loads(str(row["feed_weights"])) == {}
+    assert json.loads(str(row["selected_feed_ids"])) == []
+    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
+    assert displayed["fallback_reason"] == FALLBACK_NOT_ENOUGH_FEEDS
 
 
 # ---------------------------------------------------------------------------

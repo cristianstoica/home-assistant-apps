@@ -47,6 +47,7 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
@@ -360,6 +361,9 @@ def _make_db() -> sqlite3.Connection:
                 (site_id, f"TESTPWS{site_id}{n:03d}", 900.0 + 5.0 * n),
             )
             station_ids[site_id].append(int(cur.lastrowid or 0))
+        # The hourly wind rows below are old-style rows; a fresh site opens in
+        # pair_max, where the insert guard drops them, so hold it in staging.
+        set_wind_basis_state(conn, site_id, "staging")
 
     for stations in station_ids.values():
         for hour in range(_OBS_HOURS):
