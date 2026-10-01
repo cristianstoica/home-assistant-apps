@@ -1581,19 +1581,19 @@ def test_t127b_counts_moved_from_foreign_commit(fx: _Fixture) -> None:
     """New T127(b): ``counts_moved`` pin when another connection commits
     between the pin's two readings.
 
-    mutant_drop_second_reading -> at
-    ``after["bypasses"]["counts_moved"] == before["bypasses"]["counts_moved"]
-    + 1``: correct = the pin sees the counts moved and refuses to describe
-    the snapshot, so the call counts a ``counts_moved`` bypass (a genuine
-    miss, never stored), mutant (a pin keyed on counts read once, before
-    ``BEGIN``, never re-checked after the priming read) = that count stays
-    flat and the call is wrongly counted a hit or a miss instead.
-    mutant_before_read_after_priming -> at ``served.weights == w_after``:
-    correct = the fresh (post-commit) weights, because the priming read
-    (and so the snapshot itself) lands after the raw commit, mutant (taking
-    the "before" reading after the priming read too, so both readings see
-    the commit and the pin is wrongly stable) = the stale ``w_before``
-    weights instead.
+    mutant_drop_second_reading -> at the in-block
+    ``assert db.snapshot_pin(conn) == "counts_moved"``: correct =
+    ``"counts_moved"``, because the pin's second (post-priming) reading
+    sees the foreign commit and disagrees with the first, mutant (a pin
+    keyed on counts read once, before ``BEGIN``, never re-checked after the
+    priming read) = the stable ``InputCounts`` from that one reading
+    instead.
+    mutant_before_read_after_priming -> at the same in-block
+    ``assert db.snapshot_pin(conn) == "counts_moved"``: correct =
+    ``"counts_moved"``, because the "before" reading lands ahead of the raw
+    commit while the priming read (and so the "after" reading) lands after
+    it, mutant (taking the "before" reading after the priming read too, so
+    both readings see the commit) = the stable ``InputCounts`` pin instead.
     """
     db = fx.db
     reset_wind_weights_cache()
@@ -3291,14 +3291,14 @@ def test_t146_dashboard_path_vs_pinned_race(fx: _Fixture) -> None:
     """New T146: a pinned reader racing the dashboard's own (unpinned, but
     still counts-consistent) no-transaction path.
 
-    mutant_dashboard_drops_second_reading -> at ``r1.weights == w_after``:
-    correct = the dashboard path re-reads counts inside its OWN
-    ``read_only_snapshot``, so it recomputes fresh and never stores (the
-    before/after mismatch counts a ``counts_moved`` bypass), mutant
-    (removing that second reading, so the dashboard path stores whatever
-    it computes keyed on the stale pre-commit counts) = ``r1.weights ==
-    w_before`` instead, and the entry it wrongly stores corrupts the next
-    pinned/ordinary lookup too.
+    mutant_dashboard_drops_second_reading -> at ``r2.weights == w_before``:
+    correct = the stale pre-commit weights, because the dashboard path's
+    own (correctly moved-counts) call never stores, so c2's later pinned
+    lookup -- pinned to the earlier, pre-commit counts -- recomputes fresh
+    instead of hitting anything, mutant (removing the dashboard path's
+    second reading, so it stores the post-commit weights keyed on the
+    stale pre-commit counts) = the corrupted entry's wrongly stored
+    ``w_after`` weights instead, because c2's pin matches that stale key.
     """
     db = fx.db
     w_before = _uncached(db, fx)
