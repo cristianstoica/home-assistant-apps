@@ -4,17 +4,42 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.collection.budget import current_billing_day
+from wxverify.collection.budget import (
+    current_billing_day,
+    effective_daily_call_limit,
+)
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+from wxverify.collection.wind_quota import (
+    WIND_BACKFILL_CALLS_KEY,
+    WIND_LIVE_CALLS_KEY,
+    backfill_headroom,
+    read_lane_counter,
+)
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
+from wxverify.core.timeutil import utc_now
+from wxverify.core.units import ms_to_kmh
 from wxverify.db.queue import ACTIVE_JOB_SQL
+from wxverify.db.runtime_state import get_runtime_state
 from wxverify.db.tz_generations import (
     correction_job_key,
     generation_status,
     published_generation_clause,
 )
+from wxverify.db.wind_basis import (
+    json_object,
+    read_auth_holds,
+    wind_basis_state,
+    wind_blocked_key,
+    wind_open_clause,
+    wind_rebuild_progress,
+    wind_report_key,
+    wind_station_row_clause,
+)
+from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
@@ -169,7 +194,10 @@ class FeedHealthRow:
 @dataclass(frozen=True)
 class BudgetGauge:
     source: str
+    #: The effective cap every reservation defers at (plan §8.6).
     daily_call_limit: int
+    #: The stored ``sources.daily_call_limit``; differs where the cap clamps it.
+    configured_call_limit: int
     daily_credit_limit: int | None
     calls: int
     credits: int
@@ -237,6 +265,121 @@ class TimezoneCorrectionRow:
     blocked_reason: str | None
 
 
+#: The ops-page and banner title of a weather.com auth hold (plan §8.8).
+WIND_HOLD_TITLES: Final[dict[str, str]] = {
+    "history_all": "Rebuild stalled: weather.com refused the key",
+    "all_1day": "Wind updates stalled: weather.com refused the key",
+}
+
+#: The remedy the ops page names for each switch-blocked reason (plan §8.9).
+_FREE_DISK_SPACE: Final = "free disk space"
+_DISABLE_FAILING_STATION: Final = "disable the station that keeps failing"
+WIND_BLOCKED_REMEDIES: Final[dict[str, str]] = {
+    "free disk space could not be read": _FREE_DISK_SPACE,
+    "not enough free disk space for the switch": _FREE_DISK_SPACE,
+    "too many station-days failed": _DISABLE_FAILING_STATION,
+    "no station returned yesterday's data": (
+        "check that at least one station is online and uploading to weather.com; "
+        "the switch checks again once the next day is fetched"
+    ),
+    "no station had 22 hours of wind readings at most 10 minutes apart yesterday": (
+        "make sure at least one station uploads its readings at least every "
+        "10 minutes all day; the switch checks again once the next day is fetched"
+    ),
+}
+
+WIND_DAY_STATUSES: Final = ("pending", "partial", "fetched", "unavailable", "failed")
+
+#: The rebuild report's figures, in display order (plan §8.9 pass step 2).
+_WIND_REPORT_LABELS: Final = (
+    ("switched_at", "Switched at"),
+    ("fetched", "Station-days fetched"),
+    ("unavailable", "Station-days weather.com had no data for"),
+    ("unavailable_with_legacy", "...of which had old wind values"),
+    ("failed_final", "Station-days that kept failing"),
+    ("pair_hours", "Hours with a new wind figure"),
+    ("legacy_hours", "Hours with an old wind figure"),
+    ("first_date", "First day"),
+    ("last_date", "Last day"),
+)
+
+
+@dataclass(frozen=True)
+class WindHoldView:
+    """One weather.com endpoint the wind lane is paused on (plan §8.8)."""
+
+    endpoint: str
+    #: "held" or "probing" (a check is queued for the next wind fetch).
+    status: str
+    title: str
+    since: str | None
+    #: The hold's last sanitized error, shown beside "Try again".
+    error: str | None
+
+
+@dataclass(frozen=True)
+class WindErrorRow:
+    station: str
+    local_date: str
+    status: str
+    error: str
+
+
+@dataclass(frozen=True)
+class WindSiteHistory:
+    """One enabled site's row in the ops Wind History panel (plan §10)."""
+
+    site_id: int
+    site_name: str
+    state: str
+    progress_at: str | None
+    #: "3 h ago"; None when there is no stamp, "unreadable" for a bad one.
+    progress_ago: str | None
+    note: str | None
+    #: Station-day counts over enabled stations, one per status.
+    status_counts: list[tuple[str, int]]
+    blocked_reason: str | None
+    blocked_since: str | None
+    remedy: str | None
+    recent_errors: list[WindErrorRow]
+    #: The rebuild report written at the switch, as (label, value) rows.
+    report: list[tuple[str, str]]
+
+
+@dataclass(frozen=True)
+class WindHistoryPanel:
+    """The ops Wind History panel: the shared budget and holds, then per site.
+
+    Headroom, the lane counters and the auth holds are global (every site
+    shares one weather.com key and budget), so they are shown once.
+    """
+
+    headroom: int | None
+    backfill_calls_today: int | None
+    live_calls_today: int | None
+    holds: list[WindHoldView]
+    sites: list[WindSiteHistory]
+
+
+@dataclass(frozen=True)
+class WindBanner:
+    """The dashboard's wind banner: the rebuild note and any auth holds."""
+
+    note: str | None
+    holds: list[str]
+
+
+@dataclass(frozen=True)
+class WindWeightRow:
+    """One feed's row in the dashboard wind weights panel (plan §12.2)."""
+
+    feed_id: int
+    label: str
+    mae_kmh: float
+    days: int
+    weight_pct: float
+
+
 def load_sites(
     conn: sqlite3.Connection, *, include_disabled: bool = True
 ) -> list[SiteView]:
@@ -289,6 +432,8 @@ def load_dashboard(
             "winrate": [],
             "composite": [],
             "composite_status": "empty",
+            "wind_banner": None,
+            "wind_weights": None,
         }
     day_ahead = _lead_to_day(lead)
     leaderboard = [
@@ -349,6 +494,10 @@ def load_dashboard(
         ),
         "composite": composite_result.rows,
         "composite_status": composite_result.status,
+        "wind_banner": load_wind_banner(conn, site.id),
+        "wind_weights": (
+            load_wind_weights(conn, site, day_ahead) if variable == "wind" else None
+        ),
     }
 
 
@@ -367,6 +516,7 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
         ],
         "observation_health": load_observation_health(conn),
         "station_trust": load_station_trust(conn),
+        "wind_history": load_wind_history(conn),
         "publish_hold": read_publish_hold(conn),
         "timezone_correction": load_timezone_correction(conn, sites),
     }
@@ -515,10 +665,12 @@ def load_budgets(conn: sqlite3.Connection) -> list[BudgetGauge]:
             """,
             (source, current_billing_day(str(row["billing_tz"]))),
         ).fetchone()
+        configured = int(row["daily_call_limit"])
         out.append(
             BudgetGauge(
                 source=source,
-                daily_call_limit=int(row["daily_call_limit"]),
+                daily_call_limit=effective_daily_call_limit(source, configured),
+                configured_call_limit=configured,
                 daily_credit_limit=None
                 if row["daily_credit_limit"] is None
                 else int(row["daily_credit_limit"]),
@@ -594,7 +746,7 @@ def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthR
 
 def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
     rows = conn.execute(
-        """
+        f"""
         SELECT sites.name AS site_name, stations.pws_station_id, so.variable,
                COUNT(*) AS n,
                AVG(so.value - observations.value) AS mean_delta
@@ -606,6 +758,8 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
          AND observations.variable = so.variable
          AND observations.valid_at = so.valid_at
         WHERE so.qc_flag = 'ok'
+          AND {wind_station_row_clause("stations.site_id")}
+          AND {wind_open_clause("so.variable", "stations.site_id")}
         GROUP BY stations.id, so.variable
         HAVING n > 0
         ORDER BY ABS(mean_delta) DESC, sites.name COLLATE NOCASE
@@ -622,6 +776,200 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
         )
         for row in rows
     ]
+
+
+def _wind_holds(conn: sqlite3.Connection) -> list[WindHoldView]:
+    return [
+        WindHoldView(
+            endpoint=endpoint,
+            status=hold.status,
+            title=WIND_HOLD_TITLES[endpoint],
+            since=hold.since,
+            error=hold.error,
+        )
+        for endpoint, hold in read_auth_holds(conn).items()
+    ]
+
+
+def _lane_calls_today(conn: sqlite3.Connection) -> tuple[int | None, int | None]:
+    """The lane's backfill and live calls on today's weather.com billing day."""
+    row = conn.execute(
+        "SELECT billing_tz FROM sources WHERE source = 'weathercom'"
+    ).fetchone()
+    if row is None:
+        return None, None
+    try:
+        today = current_billing_day(str(row["billing_tz"]))
+    except (ZoneInfoNotFoundError, ValueError):
+        return None, None
+    return (
+        read_lane_counter(conn, WIND_BACKFILL_CALLS_KEY).get(today, 0),
+        read_lane_counter(conn, WIND_LIVE_CALLS_KEY).get(today, 0),
+    )
+
+
+def _wind_report_rows(raw: str | None) -> list[tuple[str, str]]:
+    fields = json_object(raw)
+    if fields is None:
+        return []
+    rows: list[tuple[str, str]] = []
+    for key, label in _WIND_REPORT_LABELS:
+        value = fields.get(key)
+        if isinstance(value, str) or (
+            isinstance(value, int) and not isinstance(value, bool)
+        ):
+            rows.append((label, str(value)))
+    return rows
+
+
+def _wind_site_history(
+    conn: sqlite3.Connection, site_id: int, site_name: str
+) -> WindSiteHistory:
+    from wxverify.forecast.service import relative_ago
+
+    progress = wind_rebuild_progress(conn, site_id)
+    progress_ago: str | None = None
+    if progress.progress_at is not None:
+        try:
+            progress_ago = relative_ago(progress.progress_at, now=utc_now())
+        except ValueError:
+            progress_ago = "unreadable"
+    counts = {
+        str(row["status"]): int(row["n"])
+        for row in conn.execute(
+            """
+            SELECT d.status, COUNT(*) AS n
+            FROM station_wind_days d JOIN stations st ON st.id = d.station_id
+            WHERE st.site_id = ? AND st.enabled = 1
+            GROUP BY d.status
+            """,
+            (site_id,),
+        )
+    }
+    blocked = json_object(get_runtime_state(conn, wind_blocked_key(site_id)))
+    blocked_reason: str | None = None
+    blocked_since: str | None = None
+    if blocked is not None:
+        reason = blocked.get("reason")
+        since = blocked.get("since")
+        blocked_reason = reason if isinstance(reason, str) else "reason unreadable"
+        blocked_since = since if isinstance(since, str) else None
+    errors = [
+        WindErrorRow(
+            station=str(row["pws_station_id"]),
+            local_date=str(row["local_date"]),
+            status=str(row["status"]),
+            error=str(row["last_error"]),
+        )
+        for row in conn.execute(
+            """
+            SELECT st.pws_station_id, d.local_date, d.status, d.last_error
+            FROM station_wind_days d JOIN stations st ON st.id = d.station_id
+            WHERE st.site_id = ? AND d.last_error IS NOT NULL
+            ORDER BY d.updated_at DESC, st.id, d.local_date DESC
+            LIMIT 10
+            """,
+            (site_id,),
+        )
+    ]
+    return WindSiteHistory(
+        site_id=site_id,
+        site_name=site_name,
+        state=progress.state,
+        progress_at=progress.progress_at,
+        progress_ago=progress_ago,
+        note=progress.note,
+        status_counts=[(status, counts.get(status, 0)) for status in WIND_DAY_STATUSES],
+        blocked_reason=blocked_reason,
+        blocked_since=blocked_since,
+        remedy=(
+            None
+            if blocked_reason is None
+            else WIND_BLOCKED_REMEDIES.get(
+                blocked_reason,
+                f"{_DISABLE_FAILING_STATION}, or {_FREE_DISK_SPACE}",
+            )
+        ),
+        recent_errors=errors,
+        report=_wind_report_rows(get_runtime_state(conn, wind_report_key(site_id))),
+    )
+
+
+def load_wind_history(conn: sqlite3.Connection) -> WindHistoryPanel:
+    """The ops Wind History panel (plan §10). Read-only."""
+    backfill_calls, live_calls = _lane_calls_today(conn)
+    sites = [
+        _wind_site_history(conn, int(row["id"]), str(row["name"]))
+        for row in conn.execute(
+            "SELECT id, name FROM sites WHERE enabled = 1 ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+    ]
+    return WindHistoryPanel(
+        headroom=backfill_headroom(conn, now=utc_now()),
+        backfill_calls_today=backfill_calls,
+        live_calls_today=live_calls,
+        holds=_wind_holds(conn),
+        sites=sites,
+    )
+
+
+def load_wind_banner(conn: sqlite3.Connection, site_id: int) -> WindBanner | None:
+    """The dashboard wind banner, or None when there is nothing to say.
+
+    Shown while the stored state is ``staging``, ``switching`` or
+    ``rescoring`` (the progress note), and whenever an auth hold exists.
+    """
+    note = (
+        None
+        if wind_basis_state(conn, site_id) == "pair_max"
+        else wind_rebuild_progress(conn, site_id).note
+    )
+    holds = [hold.title for hold in _wind_holds(conn)]
+    if note is None and not holds:
+        return None
+    return WindBanner(note=note, holds=holds)
+
+
+def load_wind_weights(
+    conn: sqlite3.Connection, site: SiteView, day_ahead: int
+) -> list[WindWeightRow] | None:
+    """The dashboard wind weights for one lead; None unless wind is weighted.
+
+    Uses the same :func:`load_wind_serving` call as the Forecast page. The
+    weight (%) is each feed's share among the feeds with a track record at
+    this lead; a day's served blend renormalizes over the feeds covering it.
+    """
+    try:
+        today = utc_now().astimezone(ZoneInfo(site.timezone)).date()
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    serving = load_wind_serving(
+        conn, site_id=site.id, timezone=site.timezone, today=today, as_of=None
+    )
+    if serving.mode != "weighted" or serving.weights is None:
+        return None
+    at_lead = {
+        feed_id: weight
+        for (feed_id, k), weight in serving.weights.items()
+        if k == day_ahead
+    }
+    total = sum(weight.weight for weight in at_lead.values())
+    labels = {
+        int(row["id"]): feed_label(str(row["source"]), str(row["model"]))
+        for row in conn.execute("SELECT id, source, model FROM feeds")
+    }
+    rows = [
+        WindWeightRow(
+            feed_id=feed_id,
+            label=labels.get(feed_id, f"feed {feed_id}"),
+            mae_kmh=ms_to_kmh(weight.mae_ms),
+            days=weight.days,
+            weight_pct=0.0 if total <= 0 else 100.0 * weight.weight / total,
+        )
+        for feed_id, weight in at_lead.items()
+    ]
+    rows.sort(key=lambda row: (-row.weight_pct, row.feed_id))
+    return rows
 
 
 def _generation_int(row: dict[str, object], key: str) -> int:

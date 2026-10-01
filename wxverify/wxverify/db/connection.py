@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -187,6 +188,12 @@ class Database:
         # See `_run_epoch_txn`.
         self._input_epoch = 0
         self._dv_seen = 0
+        # The external-commit count (`external_commit_seq`) and the lock that
+        # guards it together with the probe's baseline `_probe_dv`. Created
+        # here, not in `_open`: the count only grows, never resets across an
+        # import swap, so no count stored before a swap can recur.
+        self._probe_lock = threading.Lock()
+        self._external_seq = 0
         self._open()
         self._stock_pool()
 
@@ -234,6 +241,16 @@ class Database:
                 self._conn.rollback()
         self._read_conns = [self._connect_reader() for _ in range(_READ_POOL_SIZE)]
         self._read_sync_conn = self._connect_reader()
+        # The external-commit probe: one more reader, in neither `_read_conns`
+        # nor the pool, so no request can draw it. It never writes, so every
+        # commit on the file moves its `data_version`. Its baseline is read
+        # here, after the migrations and the sanitizer committed, and only
+        # ever compared with its own later values.
+        self._probe = self._connect_reader()
+        with self._probe_lock:
+            self._probe_dv = int(
+                self._probe.execute("PRAGMA data_version").fetchone()[0]
+            )
         # The migrations and the sanitizer above ran through `_run_immediate`
         # directly; this bump covers both, and an import's reopen with them.
         self._dv_seen = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
@@ -299,7 +316,15 @@ class Database:
         epoch; then, when ``expected`` is given and no longer matches, the
         transaction ends before ``fn`` runs (``_EpochMovedSignal``). After
         the commit or rollback, a non-exempt ``fn`` that changed at least one
-        row (``total_changes`` moved) moves the epoch once more.
+        row (``total_changes`` moved) moves the epoch once more, and then, on
+        every exit, ``_absorb_own_commit`` acknowledges this transaction's own
+        commit on the external-commit probe.
+
+        Invariant: every commit on ``self._conn`` goes through here, except
+        ``_open``'s own, which run before the probe exists. The absorb takes
+        every commit it sees on the probe for its own, so a commit made on
+        ``_conn`` any other way would be acknowledged without moving either
+        count, and the wind weights cache could serve a result from before it.
         """
         # `_body` records the connection and its `total_changes` just before
         # `fn` runs. A list, not `nonlocal` flags: pyright does not see a
@@ -325,6 +350,83 @@ class Database:
                 used, before = ran[-1]
                 if used.total_changes != before:
                     self._input_epoch += 1
+            # Last, after the bump: a lookup that reads the count after the
+            # absorb also sees the bump. Looked up on the instance, like
+            # `_run_immediate`. Never raises (see its docstring).
+            self._absorb_own_commit()
+
+    def _absorb_own_commit(self) -> None:
+        """Acknowledge this process's own commit on the probe, uncounted.
+
+        Runs in ``_run_epoch_txn``'s ``finally`` on every exit. Within one
+        hold of ``_probe_lock``: (1) read the probe's ``data_version``; (2)
+        read ``_conn``'s, which moves only for other connections' commits and
+        was stored in ``_dv_seen`` inside this transaction's ``BEGIN
+        IMMEDIATE``; (3) if it differs, another connection committed after
+        this transaction, so count it; (4) store the probe's value as the
+        baseline. Steps 3 and 4 run only after both reads succeed, so a
+        failed read changes nothing and the next ``external_commit_seq``
+        counts the unacknowledged change (a conservative miss). The probe is
+        read before ``_conn``: the other way round, a foreign commit landing
+        between the two reads would be stored as the baseline with neither
+        count moved.
+
+        Never changes ``_dv_seen`` or ``_input_epoch``: the next write's
+        ``_body`` must still see a foreign commit and move the epoch for it.
+
+        Never raises: an exception escaping the ``finally`` would turn a
+        committed write into a failure, or replace the original exception
+        (including ``_EpochMovedSignal``). A ``sqlite3.Error`` is logged at
+        DEBUG, anything else at WARNING, both after ``_probe_lock`` is
+        released; ``BaseException`` outside ``Exception`` propagates.
+        """
+        try:
+            with self._probe_lock:
+                seen = int(self._probe.execute("PRAGMA data_version").fetchone()[0])
+                own = int(self._conn.execute("PRAGMA data_version").fetchone()[0])
+                if own != self._dv_seen:
+                    self._external_seq += 1
+                self._probe_dv = seen
+        except sqlite3.Error:
+            logger.debug(
+                "probe absorb failed; the next lookup will miss", exc_info=True
+            )
+        except Exception:
+            logger.warning(
+                "probe absorb failed; the next lookup will miss", exc_info=True
+            )
+
+    def external_commit_seq(self) -> int | None:
+        """A count that moves after every commit by another connection.
+
+        Reads the probe's ``PRAGMA data_version`` and, when it differs from
+        the stored baseline, stores it and adds 1 to the count, all within one
+        hold of ``_probe_lock``. This process's own commits are absorbed
+        uncounted by ``_absorb_own_commit``. Returns ``None`` when the probe
+        cannot be read: whether another connection committed can't be told.
+
+        ``.fetchone()`` on the one-row ``PRAGMA`` resets the statement, so
+        the probe holds no read mark between calls and never blocks a
+        checkpoint.
+        """
+        with self._probe_lock:
+            try:
+                seen = int(self._probe.execute("PRAGMA data_version").fetchone()[0])
+            except sqlite3.Error:
+                return None
+            if seen != self._probe_dv:
+                self._probe_dv = seen
+                self._external_seq += 1
+            return self._external_seq
+
+    def owns_pooled_reader(self, conn: sqlite3.Connection) -> bool:
+        """Whether ``conn`` is one of this database's current pooled readers.
+
+        An identity test against ``_read_conns``, which ``_settle_reader``
+        keeps naming the pooled objects when it replaces one. ``read_sync``'s
+        connection and the probe are not pooled readers.
+        """
+        return any(conn is pooled for pooled in self._read_conns)
 
     async def write(
         self,
@@ -698,6 +800,7 @@ class Database:
 
     def close(self) -> None:
         self._read_sync_conn.close()
+        self._probe.close()
         for conn in self._read_conns:
             conn.close()
         self._conn.close()
@@ -811,10 +914,12 @@ class Database:
             raise
         # 3. On the last close after a checkpoint, SQLite itself removes the
         # -wal/-shm sidecars. Every open connection must close, not just the
-        # writer: a live pooled or sync reader still holding the file is
-        # what keeps a sidecar (or the file itself, on some platforms) from
-        # being replaceable underneath it.
+        # writer: a live pooled or sync reader -- or the external-commit
+        # probe -- still holding the file is what keeps a sidecar (or the
+        # file itself, on some platforms) from being replaceable underneath
+        # it. The next `_open` opens a new probe with its own baseline.
         self._read_sync_conn.close()
+        self._probe.close()
         for conn in self._read_conns:
             conn.close()
         self._conn.close()
@@ -866,7 +971,7 @@ class Database:
             raise
 
     def _close_quietly(self) -> None:
-        for conn in (self._conn, self._read_sync_conn, *self._read_conns):
+        for conn in (self._conn, self._read_sync_conn, self._probe, *self._read_conns):
             with contextlib.suppress(Exception):
                 conn.close()
 
@@ -958,6 +1063,16 @@ def current_db_generation() -> int:
     observation, with no side effect.
     """
     return 0 if _db_instance is None else _db_instance.generation
+
+
+def current_db() -> Database | None:
+    """The process database, or ``None`` when none exists.
+
+    Like ``current_db_generation``, deliberately does **not** call
+    ``get_db()``, which would open a database against ``config.db_path``
+    inside a caller that only holds a bare ``sqlite3.Connection``.
+    """
+    return _db_instance
 
 
 def close_db() -> None:

@@ -73,6 +73,7 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
+from wxverify.db.wind_basis import wind_basis_state
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting
@@ -132,6 +133,9 @@ class RunConfig:
     period_end: str
     bootstrap_seed: int
     bootstrap_resamples: int
+    #: The site's wind state at run start (§8.12); None for a run begun
+    #: before 0.16.6, whose snapshot did not record it.
+    wind_basis: str | None
 
     def incumbent_depth(self, variable: str) -> int:
         """The variable's pinned effective depth (§15 lockstep)."""
@@ -220,6 +224,7 @@ def _config_snapshot(
         "min_n": get_number_setting(conn, "min_n", 30, minimum=0),
         "window_days": get_number_setting(conn, "rolling_window_days", 30, minimum=1),
         "tz_generation_id": tz_generation_id,
+        "wind_basis": wind_basis_state(conn, site_id),
         "roster": [
             {
                 "feed_id": f.feed_id,
@@ -728,6 +733,9 @@ def run_config_from_row(conn: sqlite3.Connection, run_id: int) -> RunConfig:
         period_end=str(row["period_end"]),
         bootstrap_seed=int(row["bootstrap_seed"]),
         bootstrap_resamples=int(row["bootstrap_resamples"]),
+        wind_basis=(
+            None if snapshot.get("wind_basis") is None else str(snapshot["wind_basis"])
+        ),
     )
 
 
@@ -788,6 +796,7 @@ def _input_mismatches(current: dict[str, object], cfg: RunConfig) -> list[str]:
         ("min_n", cfg.min_n),
         ("window_days", cfg.window_days),
         ("tz_generation_id", cfg.tz_generation_id),
+        ("wind_basis", cfg.wind_basis),
     ):
         if current.get(key) != pinned:
             mismatches.append(key)

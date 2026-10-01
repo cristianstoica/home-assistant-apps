@@ -28,7 +28,6 @@ from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
-from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
@@ -49,7 +48,10 @@ from wxverify.worker.score_batches import (
 from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 
 CATCHUP_SITE_CHUNK = 2
-TARGET_VARIABLE_LIST = tuple(sorted(TARGET_VARIABLES))
+# The variables whose hourly rows mark a station window complete. Wind is not
+# one: the wind-history lane writes it only for hours with a record pair, so
+# counting it would make every window look like a gap (plan §9.4).
+GAP_VARIABLES = ("precip", "temperature")
 
 logger = logging.getLogger(__name__)
 
@@ -449,7 +451,7 @@ def _station_has_gap(
     expected_hours = int((end - start).total_seconds() // 3600)
     if expected_hours <= 0:
         return False
-    placeholders = ",".join("?" for _ in TARGET_VARIABLE_LIST)
+    placeholders = ",".join("?" for _ in GAP_VARIABLES)
     row = conn.execute(
         f"""
         SELECT COUNT(*) AS n
@@ -463,10 +465,10 @@ def _station_has_gap(
             GROUP BY variable, valid_at
         )
         """,
-        (station_id, window_start, window_end, *TARGET_VARIABLE_LIST),
+        (station_id, window_start, window_end, *GAP_VARIABLES),
     ).fetchone()
     actual = 0 if row is None else int(row["n"])
-    return actual < expected_hours * len(TARGET_VARIABLE_LIST)
+    return actual < expected_hours * len(GAP_VARIABLES)
 
 
 def _reserve_station_history_call(

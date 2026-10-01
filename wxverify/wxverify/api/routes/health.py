@@ -8,13 +8,17 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 
 from wxverify.api.routes.db_transfer import export_sweeper_death
-from wxverify.collection.budget import current_billing_day
+from wxverify.collection.budget import (
+    current_billing_day,
+    effective_daily_call_limit,
+)
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.options import load_runtime_options
 from wxverify.core.secrets import key_status
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
+from wxverify.forecast.wind_blend import wind_weights_cache_stats
 from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
 from wxverify.verification.read_cache import warm_outcome
@@ -111,7 +115,9 @@ async def health_budget() -> list[dict[str, object]]:
             out.append(
                 {
                     "source": source,
-                    "daily_call_limit": int(row["daily_call_limit"]),
+                    "daily_call_limit": effective_daily_call_limit(
+                        source, int(row["daily_call_limit"])
+                    ),
                     "daily_credit_limit": row["daily_credit_limit"],
                     "calls": 0 if budget is None else int(budget["calls"]),
                     "credits": 0 if budget is None else int(budget["credits"]),
@@ -350,14 +356,21 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             "jobs": {str(row["status"]): int(row["n"]) for row in rows}
         }
         status.update(runtime_status(conn))
-        for job_type in ("fetch_feed", "fetch_obs", "pair_and_score"):
+        # fetch_obs carries the live "obs" stream and the wind-days lane; the
+        # key filter keeps last_completed_fetch_obs_at on the live stream.
+        for job_type, job_key in (
+            ("fetch_feed", None),
+            ("fetch_obs", "obs"),
+            ("pair_and_score", None),
+        ):
             row = conn.execute(
                 """
                 SELECT MAX(updated_at) AS completed_at
                 FROM jobs
                 WHERE status='completed' AND type=?
+                  AND (? IS NULL OR job_key = ?)
                 """,
-                (job_type,),
+                (job_type, job_key, job_key),
             ).fetchone()
             status[f"last_completed_{job_type}_at"] = (
                 None if row is None else row["completed_at"]
@@ -400,6 +413,10 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             "derivations_failed": warm.derivations_failed,
         }
     )
+    # Process state as well: the wind weights cache's counters. Taken under
+    # the cache's stats lock only, never its compute lock, so this never
+    # waits on a weights compute.
+    result["wind_weights_cache"] = wind_weights_cache_stats()
     return result
 
 

@@ -7,6 +7,7 @@ from typing import Final
 
 from wxverify.core.timeutil import day_ahead
 from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.wind_basis import wind_open_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
 
@@ -64,6 +65,7 @@ def compute_real_model_pairs(
                 AND fp.valid_at = fs.valid_at
                 AND {published_generation_clause("fp")}
           )
+          AND {wind_open_clause("fs.variable", "fs.site_id")}
           {where_site}
         """,
         params,

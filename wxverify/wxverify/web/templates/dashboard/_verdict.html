@@ -1,5 +1,33 @@
+{% set lead_word = (lead_options | selectattr("value", "equalto", lead) | map(attribute="word") | first) or lead %}
+{% if variable == "wind" and wind_weights is not none %}
+{# Plan §12.2: in pair_max wind is served from every feed, weighted by past
+   accuracy, so the "best feed" verdict is replaced by the weights. #}
+<section class="panel wide verdict" id="wind-weights-panel">
+  <p class="verdict-head">Wind for {{ lead_word }} at {{ site.name }} is the weighted mean of every feed's daily high.</p>
+  <p class="panel-hint">A feed's weight is 1 / its mean error in the daily high over the last 30 complete days. Feeds with fewer than 20 such days are left out.</p>
+  {% if wind_weights %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Feed</th><th>MAE (km/h)</th><th>Days</th><th>Weight (%)</th></tr></thead>
+        <tbody>
+          {% for row in wind_weights %}
+            <tr>
+              <td>{{ row.label }}</td>
+              <td>{{ '%.1f'|format(row.mae_kmh) }}</td>
+              <td>{{ row.days }}</td>
+              <td>{{ '%.0f'|format(row.weight_pct) }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+  {% if wind_weights | length < 2 %}
+    <p class="verdict-caveat">Not enough feeds with a wind track record yet</p>
+  {% endif %}
+</section>
+{% else %}
 <section class="panel wide verdict verdict-{{ verdict.state }}">
-  {% set lead_word = (lead_options | selectattr("value", "equalto", lead) | map(attribute="word") | first) or lead %}
   {% if verdict.state == "ok" %}
     <p class="verdict-head">
       Best {{ selected_variable_label }} forecast for {{ lead_word }} at {{ site.name }}:
@@ -22,3 +50,4 @@
     </p>
   {% endif %}
 </section>
+{% endif %}

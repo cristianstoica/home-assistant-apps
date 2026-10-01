@@ -549,6 +549,7 @@ def test_preskipped_verdicts_only_for_out_of_range_incumbents() -> None:
         period_end="2026-06-05",
         bootstrap_seed=1,
         bootstrap_resamples=40,
+        wind_basis=str(snapshot["wind_basis"]),
     )
     skipped = preskipped_verdicts(cfg)
     assert [v.variable for v in skipped] == ["precip"]

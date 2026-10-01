@@ -34,6 +34,7 @@ from types import SimpleNamespace
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     EXTREMA_COVERAGE_INSUFFICIENT,
@@ -867,6 +868,9 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
     import pytest
 
     conn = _make_db()
+    # The off-hour instant reaches the axis through the legacy wind blend; in
+    # pair_max an untrained wind feed contributes no hours.
+    set_wind_basis_state(conn, 1, "staging")
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     wind_feed = _feed_id(conn, "open-meteo", "icon_global")
@@ -1258,7 +1262,7 @@ def test_persisted_row_suppressed_day() -> None:
 
 
 def test_scored_precip_entities_are_the_pre_g_clearing_subset_values() -> None:
-    assert METHODOLOGY_VERSION == 2
+    assert METHODOLOGY_VERSION == 3
 
     conn = _record_conn()
     generation_id = ensure_published_generation(conn, 1)
@@ -1329,6 +1333,7 @@ def test_scored_precip_entities_are_the_pre_g_clearing_subset_values() -> None:
         period_end=period_end,
         bootstrap_seed=1,
         bootstrap_resamples=40,
+        wind_basis="pair_max",
     )
 
     before_input = input_fingerprint(conn, 1, snapshot)

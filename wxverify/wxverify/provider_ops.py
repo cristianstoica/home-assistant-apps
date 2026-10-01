@@ -8,7 +8,10 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import cast
 
-from wxverify.collection.budget import current_billing_day
+from wxverify.collection.budget import (
+    current_billing_day,
+    effective_daily_call_limit,
+)
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.collection.forecast_validation import (
     FORECAST_VARIABLES,
@@ -752,7 +755,9 @@ def _provider_group(
         budget = {
             "calls": 0 if budget_row is None else int(budget_row["calls"]),
             "credits": 0 if budget_row is None else int(budget_row["credits"]),
-            "daily_call_limit": int(source_row["daily_call_limit"]),
+            "daily_call_limit": effective_daily_call_limit(
+                source, int(source_row["daily_call_limit"])
+            ),
             "daily_credit_limit": source_row["daily_credit_limit"],
         }
         source_seeded = True

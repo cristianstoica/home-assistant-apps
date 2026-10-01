@@ -208,6 +208,7 @@ class TestOnlyDeadlineExpiryIsConverted:
                             _CURRENT_URL,
                             params={"stationId": _STATION_ID, "apiKey": _API_KEY},
                             read_seconds=10.0,
+                            backfill=False,
                         )
                     )
                     # Let the read actually start (at least one byte yielded)
@@ -237,6 +238,7 @@ class TestOnlyDeadlineExpiryIsConverted:
                             _CURRENT_URL,
                             params={"stationId": _STATION_ID, "apiKey": _API_KEY},
                             read_seconds=10.0,
+                            backfill=False,
                         )
                 assert type(exc_info.value) is TimeoutError, (
                     "a transport-raised TimeoutError must pass through "

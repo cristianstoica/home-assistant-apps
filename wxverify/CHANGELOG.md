@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.6
+
+Each station's hourly wind is now the highest mean of two consecutive
+readings taken at most 10 minutes apart; the daily figure is the highest
+of those hourly values. This replaces the old hourly average. The change
+takes effect through a background rebuild that refetches the stored wind
+history, with weather.com call counts shown, and switches over once it
+finishes. Installing 0.16.6 starts the rebuild only: the served wind,
+pairs, scores and verification stay on the old figure until the switch
+completes. During the switch, wind is unavailable, with progress notes.
+Once the switch completes, the wind forecast is weighted by each feed's
+recent accuracy on the daily high; the weights are cached and reloaded
+as new data arrives.
+
+A new health-monitor condition, `wind_history`, covers the rebuild and
+the live wind path, and a "Try again" control appears after a refused
+key. weather.com calls are held to a provisional 1,500 a day; the ops
+page shows both the configured and the effective limit. A dropped
+connection to weather.com during the rebuild is retried after 15
+minutes, and that call does not count against the daily allowance.
+Deleting a site also removes its wind-rebuild state.
+
+METHODOLOGY_VERSION is now 3. There is no schema version bump.
+
+Rollback before the switch completes is a plain reinstall of 0.16.5
+(see below for what is held until then). After the switch, reinstalling
+0.16.5 on the same database is unsupported; rollback is a restore of a
+backup taken before the upgrade, together with 0.16.5.
+
 ## 0.16.5
 
 The nightly scoring job no longer holds the database write lock while it

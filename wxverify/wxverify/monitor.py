@@ -14,14 +14,28 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.collection.budget import current_billing_day
+from wxverify.collection.budget import (
+    current_billing_day,
+    effective_daily_call_limit,
+)
 from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
+from wxverify.collection.wind_quota import backfill_headroom
 from wxverify.core.secrets import resolve_secret
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
+from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.wind_basis import (
+    json_object,
+    read_auth_holds,
+    wind_basis_state,
+    wind_blocked_key,
+    wind_progress_key,
+)
+from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
     gap_scan_degraded_sites,
     sites_with_record_gap,
@@ -40,6 +54,14 @@ MAIN_WORKER_LIVENESS_MINUTES: Final = 15
 OBS_COLLECTION_DELAY_MINUTES: Final = 15
 GRACE_MINUTES = 10
 COSTED_NOOP_MIN_ERRORS = 3
+# wind_history (plan §10): a rebuild with no progress stamp this long is stalled;
+# the today checks (e) and (h) wait this long after local midnight; failed-final
+# rows count over the last _WIND_FAILED_DAYS local days and the unavailable
+# share over the last _WIND_UNAVAILABLE_DAYS.
+WIND_STALL_HOURS: Final = 24
+WIND_TODAY_GRACE_HOURS: Final = 6
+_WIND_FAILED_DAYS: Final = 7
+_WIND_UNAVAILABLE_DAYS: Final = 30
 
 _SEVERITY_RANK = {"ok": 0, "warning": 1, "critical": 2}
 
@@ -372,16 +394,207 @@ def _main_liveness_check(
     return (stale and not current, detail)
 
 
-def _has_completed_within(conn: sqlite3.Connection, job_type: str, cutoff: str) -> bool:
+def _has_completed_within(
+    conn: sqlite3.Connection, job_type: str, cutoff: str, *, job_key: str | None
+) -> bool:
+    """A completed ``job_type`` row since ``cutoff``, of ``job_key`` when not None.
+
+    ``job_key`` is required so a reader of a type that carries two lanes
+    (``fetch_obs``: the live ``obs`` stream and the ``wind-days`` lane) must
+    name the one it reads.
+    """
+    if job_key is None:
+        row = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE status='completed' AND type=? AND updated_at >= ?
+            LIMIT 1
+            """,
+            (job_type, cutoff),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT 1 FROM jobs
+            WHERE status='completed' AND type=? AND updated_at >= ?
+              AND job_key = ?
+            LIMIT 1
+            """,
+            (job_type, cutoff, job_key),
+        ).fetchone()
+    return row is not None
+
+
+_WIND_TODAY_ROWS_SQL: Final = """
+    SELECT st.pws_station_id, d.station_id AS day_station,
+           d.record_count, d.last_ok_at
+    FROM stations st
+    LEFT JOIN station_wind_days d
+      ON d.station_id = st.id AND d.local_date = ?
+    WHERE st.site_id = ? AND st.enabled = 1
+    ORDER BY st.id
+"""
+
+
+def _wind_history_trips(
+    conn: sqlite3.Connection, now: datetime
+) -> tuple[int, str | None]:
+    """``(sites tripped, the first tripped site's first reason)`` for wind_history.
+
+    Evaluated per enabled site with at least one enabled station, in site id
+    order, over the checks (a) to (h) of plan §10, in that order. Read-only.
+    """
+    holds = read_auth_holds(conn)
+    hold_reasons = [
+        f"wind history paused: weather.com refused the key ({endpoint})"
+        for endpoint in holds
+    ]
+    interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
+    headroom_text: str | None = None
+    tripped = 0
+    first: str | None = None
+    sites = conn.execute(
+        f"SELECT s.id, s.timezone FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}"
+        " ORDER BY s.id"
+    ).fetchall()
+    for site in sites:
+        site_id = int(site["id"])
+        state = wind_basis_state(conn, site_id)
+        reasons: list[str] = []
+        # (a) the switch check is blocked.
+        blocked_raw = get_runtime_state(conn, wind_blocked_key(site_id))
+        if blocked_raw is not None:
+            blocked = json_object(blocked_raw)
+            reason = None if blocked is None else blocked.get("reason")
+            reasons.append(
+                "wind rebuild blocked: "
+                + (reason if isinstance(reason, str) else "reason unreadable")
+            )
+        # (b) not yet on the new basis, and no progress for WIND_STALL_HOURS.
+        if state != "pair_max":
+            stamp = get_runtime_state(conn, wind_progress_key(site_id))
+            stamped = _parse_or_none(stamp)
+            if stamped is None or now - stamped > timedelta(hours=WIND_STALL_HOURS):
+                if headroom_text is None:
+                    headroom = backfill_headroom(conn, now=now)
+                    headroom_text = (
+                        "; no call headroom under the daily limit"
+                        if headroom is None or headroom <= 0
+                        else ""
+                    )
+                since = "never" if stamped is None else isoformat_utc(stamped)
+                reasons.append(
+                    f"wind rebuild has made no progress since {since}"
+                    f" (state {state}){headroom_text}"
+                )
+        tz_name = str(site["timezone"])
+        try:
+            midnight = local_day_start(now, tz_name)
+            today = now.astimezone(ZoneInfo(tz_name)).date()
+        except (ZoneInfoNotFoundError, ValueError):
+            # (f) the can't-tell verdict, surfaced, never passed.
+            reasons.append("cannot evaluate")
+            reasons.extend(hold_reasons)
+        else:
+            reasons.extend(_wind_day_reasons(conn, site_id, today))
+            today_rows = conn.execute(
+                _WIND_TODAY_ROWS_SQL, (today.isoformat(), site_id)
+            ).fetchall()
+            today_checks = state not in (
+                "switching",
+                "rescoring",
+            ) and now - midnight >= timedelta(hours=WIND_TODAY_GRACE_HOURS)
+            # (e) no enabled station has a reading today.
+            if today_checks and not any(
+                row["record_count"] is not None and int(row["record_count"]) > 0
+                for row in today_rows
+            ):
+                reasons.append("no wind readings today from any station")
+            # (g) weather.com refused the key.
+            reasons.extend(hold_reasons)
+            # (h) one station's today refresh keeps failing.
+            if today_checks:
+                reasons.extend(_wind_stale_station_reasons(today_rows, now, interval))
+        if reasons:
+            tripped += 1
+            if first is None:
+                first = reasons[0]
+    return tripped, first
+
+
+def _wind_day_reasons(conn: sqlite3.Connection, site_id: int, today: date) -> list[str]:
+    """wind_history (c) and (d) over the site's enabled stations' past rows."""
+    reasons: list[str] = []
+    failed = _count(
+        conn,
+        """
+        SELECT COUNT(*) FROM station_wind_days d
+        JOIN stations st ON st.id = d.station_id
+        WHERE st.site_id = ? AND st.enabled = 1
+          AND d.status = 'failed' AND d.attempts >= 3
+          AND d.local_date >= ? AND d.local_date < ?
+        """,
+        (
+            site_id,
+            (today - timedelta(days=_WIND_FAILED_DAYS)).isoformat(),
+            today.isoformat(),
+        ),
+    )
+    # (c) a station-day that failed for good in the last _WIND_FAILED_DAYS days.
+    if failed > 0:
+        reasons.append(
+            f"wind history: {failed} station-days failed after 3 attempts"
+            f" in the last {_WIND_FAILED_DAYS} days"
+        )
     row = conn.execute(
         """
-        SELECT 1 FROM jobs
-        WHERE status='completed' AND type=? AND updated_at >= ?
-        LIMIT 1
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(d.status = 'unavailable'), 0) AS unavailable
+        FROM station_wind_days d
+        JOIN stations st ON st.id = d.station_id
+        WHERE st.site_id = ? AND st.enabled = 1
+          AND d.legacy_hours > 0
+          AND d.local_date >= ? AND d.local_date < ?
         """,
-        (job_type, cutoff),
+        (
+            site_id,
+            (today - timedelta(days=_WIND_UNAVAILABLE_DAYS)).isoformat(),
+            today.isoformat(),
+        ),
     ).fetchone()
-    return row is not None
+    total = 0 if row is None else int(row["total"])
+    unavailable = 0 if row is None else int(row["unavailable"])
+    # (d) weather.com has no history for more than 10 % of the days that held
+    # old wind (integer form of unavailable / total > 0.10).
+    if total >= 1 and unavailable * 10 > total:
+        reasons.append(
+            f"wind history: {unavailable} of {total} station-days with old wind"
+            " are unavailable from weather.com"
+            f" (last {_WIND_UNAVAILABLE_DAYS} days)"
+        )
+    return reasons
+
+
+def _wind_stale_station_reasons(
+    today_rows: list[sqlite3.Row], now: datetime, interval_minutes: int
+) -> list[str]:
+    """wind_history (h): one reason per enabled station whose today row is stale.
+
+    Stale is no today row, a NULL or unparseable ``last_ok_at``, or one older
+    than twice the obs interval.
+    """
+    reasons: list[str] = []
+    limit = timedelta(minutes=2 * interval_minutes)
+    for row in today_rows:
+        raw = None if row["day_station"] is None else row["last_ok_at"]
+        last_ok = _parse_or_none(raw)
+        if last_ok is not None and now - last_ok <= limit:
+            continue
+        since = "midnight" if raw is None else str(raw)
+        reasons.append(
+            f"wind for {row['pws_station_id']} has not updated since {since}"
+        )
+    return reasons
 
 
 def _pipeline_conditions(
@@ -435,14 +648,16 @@ def _pipeline_conditions(
         (),
     )
 
+    # fetch_obs carries two lanes; only the live "obs" stream proves liveness,
+    # so a completing wind-days lane cannot mask a dead live stream.
     fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
-        conn, "fetch_obs", fetch_obs_cutoff
+        conn, "fetch_obs", fetch_obs_cutoff, job_key="obs"
     )
     fetch_feed_live_tripped = eligible_feeds > 0 and not _has_completed_within(
-        conn, "fetch_feed", fetch_feed_cutoff
+        conn, "fetch_feed", fetch_feed_cutoff, job_key=None
     )
     pair_score_live_tripped = eligible_feeds > 0 and not _has_completed_within(
-        conn, "pair_and_score", pair_cutoff
+        conn, "pair_and_score", pair_cutoff, job_key=None
     )
 
     # problem_jobs = failed scopes + in-flight problems. The failed arm counts
@@ -557,6 +772,11 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
+    # wind_history (plan §10): per enabled site with an enabled station, a
+    # blocked, stalled or held rebuild, a failing station-day, or a station
+    # whose wind stopped updating today.
+    wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -646,6 +866,12 @@ def _pipeline_conditions(
             f" {collection_backoff_n} in backoff",
         ),
         _cond("main_worker_liveness", liveness_tripped, None, liveness_detail),
+        _cond(
+            "wind_history",
+            wind_tripped_n > 0,
+            wind_tripped_n,
+            wind_detail or "wind history needs attention",
+        ),
     ]
 
 
@@ -663,6 +889,9 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
     ).fetchall()
     calls_tripped = 0
     credits_tripped = 0
+    # Each tripped source by name; one whose effective cap sits below its
+    # configured limit names both (plan §8.6).
+    calls_tripped_names: dict[str, str] = {}
     for row in sources:
         source = str(row["source"])
         day = current_billing_day(str(row["billing_tz"]))
@@ -672,8 +901,16 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
         ).fetchone()
         calls = 0 if budget is None else int(budget["calls"])
         credits = 0 if budget is None else int(budget["credits"])
-        if calls >= int(row["daily_call_limit"]):
+        configured = int(row["daily_call_limit"])
+        cap = effective_daily_call_limit(source, configured)
+        if calls >= cap:
             calls_tripped += 1
+            calls_tripped_names[source] = (
+                source
+                if cap == configured
+                else f"{source} (provisional provider allowance {cap};"
+                f" configured {configured})"
+            )
         if row["daily_credit_limit"] is not None and credits >= int(
             row["daily_credit_limit"]
         ):
@@ -738,7 +975,15 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
         )
 
     return [
-        _c("budget_calls", "critical", calls_tripped, "daily call budget exhausted"),
+        _c(
+            "budget_calls",
+            "critical",
+            calls_tripped,
+            "daily call budget exhausted: "
+            + ", ".join(
+                calls_tripped_names[name] for name in sorted(calls_tripped_names)
+            ),
+        ),
         _c(
             "budget_credits",
             "critical",
@@ -881,6 +1126,7 @@ def build_verdict(
                 "obs_station_history_failing",
                 "obs_collection_delayed",
                 "main_worker_liveness",
+                "wind_history",
             )
         )
 

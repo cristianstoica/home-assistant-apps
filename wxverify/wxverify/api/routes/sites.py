@@ -16,6 +16,7 @@ from wxverify.api.schemas import (
     TimezoneCorrectionIn,
 )
 from wxverify.db.connection import get_db
+from wxverify.db.runtime_state import delete_runtime_state
 from wxverify.db.tz_generations import (
     CorrectionAlreadyBuilding,
     TimezoneSiteNotFound,
@@ -23,6 +24,14 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_clause,
     start_retrospective_correction,
+)
+from wxverify.db.wind_basis import (
+    wind_basis_key,
+    wind_blocked_key,
+    wind_cursor_key,
+    wind_done_at_key,
+    wind_progress_key,
+    wind_report_key,
 )
 from wxverify.scoring.engine import pair_and_score
 
@@ -169,6 +178,18 @@ async def delete_site(request: Request, site_id: int) -> dict[str, bool] | HTMLR
         cur = conn.execute("DELETE FROM sites WHERE id=?", (site_id,))
         if cur.rowcount == 0:
             raise ApiError(404, "site not found")
+        # Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT): drop
+        # the per-site wind state in the same transaction so a recreated
+        # site starts at the absent-key default, pair_max.
+        delete_runtime_state(
+            conn,
+            wind_basis_key(site_id),
+            wind_progress_key(site_id),
+            wind_cursor_key(site_id),
+            wind_blocked_key(site_id),
+            wind_report_key(site_id),
+            wind_done_at_key(site_id),
+        )
 
     await get_db().write(_write)
     if _wants_html(request):
