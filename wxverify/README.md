@@ -495,7 +495,10 @@ lack some of today's hours, and then cannot cover `Today`, when:
   backfill does not go back for (a catch-up, from the `Catch up` button on the
   Ops page or the `catchup` command, may fetch its history);
 - the provider returned an hour without a value, or an hour fell after the
-  backfill's end and before the feed's first regular fetch.
+  backfill's end and before the feed's first regular fetch;
+- the provider refused that feed's history request during setup backfill; the
+  backfill records the error, continues with the other feeds and does not go
+  back for that feed.
 
 The label appears only when none of the feeds with forecasts for that day
 covers it, so a feed added later never blanks a day another feed already

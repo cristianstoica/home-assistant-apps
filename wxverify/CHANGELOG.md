@@ -66,6 +66,14 @@ database whose stored schema version is newer than its own target
 version and raises an error instead. Rollback is therefore not a plain
 reinstall of 0.16.6 — restore the add-on backup taken before the update.
 
+A new site's history download no longer stops when Open-Meteo refuses
+one forecast feed's request (an HTTP 4xx error other than 408 or 429).
+That feed's error is recorded and shown as a feed error, and the
+download carries on with the site's other feeds; the refused feed gets
+no history for that period. If Open-Meteo refuses every feed, the
+download stops and retries as before. Rate limits, server errors and
+network errors are handled as before.
+
 ## 0.16.6
 
 Each station's hourly wind is now the highest mean of two consecutive
