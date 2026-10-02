@@ -10,8 +10,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum, auto
 from math import ceil
-from typing import Final, NoReturn
+from typing import Final, Literal, NoReturn
 
 import httpx
 
@@ -360,41 +361,49 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
             # crash between the two would otherwise drop a resumable
             # chain (the chunk completes but its continuation is
             # never enqueued).
-            await writer.write(
+            recorded = await writer.write(
                 lambda conn, j=job, cont=continuation: _record_outcome(
                     conn, j, lambda c: _complete_and_continue(c, j.id, cont)
                 )
             )
-            logger.debug(
-                "job completed id=%s type=%s site=%s",
-                job.id,
-                job.type,
-                job.site_id,
-            )
+            if recorded is _Dropped.OUTCOME:
+                outcome = "dropped"
+            else:
+                logger.debug(
+                    "job completed id=%s type=%s site=%s",
+                    job.id,
+                    job.type,
+                    job.site_id,
+                )
         except JobDeferred as exc:
             outcome = "deferred"
             next_attempt_at = exc.next_attempt_at
-            await writer.write(
+            recorded = await writer.write(
                 lambda conn, j=job, attempt=next_attempt_at: _record_outcome(
                     conn, j, lambda c: defer_job(c, j.id, attempt)
                 )
             )
-            logger.debug(
-                "job deferred id=%s type=%s site=%s until=%s",
-                job.id,
-                job.type,
-                job.site_id,
-                next_attempt_at,
-            )
+            if recorded is _Dropped.OUTCOME:
+                outcome = "dropped"
+            else:
+                logger.debug(
+                    "job deferred id=%s type=%s site=%s until=%s",
+                    job.id,
+                    job.type,
+                    job.site_id,
+                    next_attempt_at,
+                )
         except JobCancelled:
             outcome = "cancelled"
             # No success marker: a cancelled job resolved nothing
             # (the marker is written only by _complete_and_continue).
-            await writer.write(
+            recorded = await writer.write(
                 lambda conn, j=job: _record_outcome(
                     conn, j, lambda c: complete(c, j.id)
                 )
             )
+            if recorded is _Dropped.OUTCOME:
+                outcome = "dropped"
         except StaleGenerationError:
             raise
         except Exception as exc:
@@ -413,7 +422,12 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
                     conn, j, lambda c: _fail_job(c, j, err)
                 )
             )
-            if disposition is not None and disposition.terminal:
+            if disposition is _Dropped.OUTCOME or disposition is None:
+                # Nothing was recorded for this run and fail() scheduled
+                # no retry: the claimed row no longer stands
+                # (_record_outcome logs that), or fail() found no row.
+                outcome = "dropped"
+            elif disposition.terminal:
                 outcome = "failed"
                 logger.error(
                     "job failed permanently id=%s type=%s site=%s "
@@ -432,9 +446,9 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
                     job.id,
                     job.type,
                     job.site_id,
-                    disposition.retry_count if disposition else "?",
-                    disposition.max_retries if disposition else "?",
-                    disposition.next_attempt_at if disposition else "?",
+                    disposition.retry_count,
+                    disposition.max_retries,
+                    disposition.next_attempt_at,
                     message,
                 )
     except StaleGenerationError:
@@ -463,6 +477,12 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     )
 
 
+class _Dropped(Enum):
+    """``_record_outcome``'s result when the claimed row no longer stands."""
+
+    OUTCOME = auto()
+
+
 def _still_claimed(conn: sqlite3.Connection, job: Job) -> bool:
     # jobs.id is INTEGER PRIMARY KEY without AUTOINCREMENT and a site delete
     # cascades a running job, so the id alone can name a different job.
@@ -482,8 +502,11 @@ def _record_outcome[T](
     conn: sqlite3.Connection,
     job: Job,
     record: Callable[[sqlite3.Connection], T],
-) -> T | None:
-    """Run ``record`` only while ``job``'s claimed row still stands."""
+) -> T | Literal[_Dropped.OUTCOME]:
+    """Run ``record`` only while ``job``'s claimed row still stands.
+
+    Returns ``_Dropped.OUTCOME``, having written nothing, when it does not.
+    """
     if not _still_claimed(conn, job):
         logger.info(
             "job outcome dropped id=%s type=%s site=%s: row no longer claimed",
@@ -491,7 +514,7 @@ def _record_outcome[T](
             job.type,
             job.site_id,
         )
-        return None
+        return _Dropped.OUTCOME
     return record(conn)
 
 

@@ -860,7 +860,8 @@ The four levels, loudest to quietest:
   `logging configured level=… stream=stdout` line confirms the active level. From then on
   you'll see the worker start and stop, a `job claimed …` line when the worker picks up a
   job, one `cycle: …` line each time it finishes a unit of work (naming the job, its
-  outcome — completed, deferred, retry, or failed — and how long it took, `elapsed=…`),
+  outcome — completed, deferred, retry, failed, or dropped (its outcome was not recorded,
+  usually because its site was deleted while it ran) — and how long it took, `elapsed=…`),
   the scoring milestones (`score phase=…`, `score discovery …`, `score window=…`, and
   `score sweep …`, each with its own elapsed time), and one `scoring run complete …` line
   per scoring run. If these keep ticking over, the add-on is alive and doing its job.

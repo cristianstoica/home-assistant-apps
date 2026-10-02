@@ -7,6 +7,9 @@ offlock ``_claimed`` fixture, or any other fixture that patches
 unguarded code. Every outcome, continuation and generation check reads raw
 SQL after the real write path has run, never a mock's call record.
 
+The D-tests (#103) also read log records, always next to a raw-SQL check
+of the same run: the label and the persisted state must agree.
+
 Synthetic fixtures only -- fake site names and station ids.
 """
 
@@ -14,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from datetime import timedelta
 from pathlib import Path
@@ -86,6 +90,390 @@ def _make_dispatch_stub(outcome: str, site_x: int, swap):  # noqa: ANN001
         return _produce(outcome, site_x)
 
     return _dispatch
+
+
+# ---------------------------------------------------------------------------
+# D: a dropped outcome is reported as dropped (#103)
+# ---------------------------------------------------------------------------
+
+_MARKER = "SYNTHETIC-PAYLOAD-MARKER"
+
+
+def _proc_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "wxverify.worker.processor"]
+
+
+def _cycle_lines(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in _proc_records(caplog)
+        if r.levelno == logging.INFO and r.getMessage().startswith("cycle: job=")
+    ]
+
+
+def _delete_only_swap(site_x: int):  # noqa: ANN201
+    def _swap(c: sqlite3.Connection) -> None:
+        c.execute("DELETE FROM sites WHERE id = ?", (site_x,))
+
+    return _swap
+
+
+def _running_other_type_swap(
+    site_x: int,
+    site_y: int,
+    captured: dict[str, tuple[int, tuple[object, ...]]],
+):  # noqa: ANN201
+    def _swap(c: sqlite3.Connection) -> None:
+        c.execute("DELETE FROM sites WHERE id = ?", (site_x,))
+        cur = c.execute(
+            "INSERT INTO jobs (type, site_id, job_key, payload, status)"
+            " VALUES ('fetch_current_obs', ?, 'curobs:KTEST001', '{}', 'running')",
+            (site_y,),
+        )
+        rid = int(cur.lastrowid)
+        captured["before"] = (rid, tuple(c.execute(_SNAP, (rid,)).fetchone()))
+
+    return _swap
+
+
+def _marker_dispatch_stub(site_x: int, swap):  # noqa: ANN001, ANN201
+    async def _dispatch(
+        db: Database, writer: FencedWriter, j: Job
+    ) -> JobContinuation | None:
+        if swap is not None:
+            await db.write(swap)
+        raise RuntimeError(
+            f"GET https://example.invalid/v1/forecast?marker={_MARKER} failed"
+        )
+
+    return _dispatch
+
+
+def _gone(conn: sqlite3.Connection, job_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone() is None
+
+
+def _reused_unchanged(
+    conn: sqlite3.Connection, rid: int, before: tuple[object, ...]
+) -> bool:
+    return tuple(conn.execute(_SNAP, (rid,)).fetchone()) == before
+
+
+def _no_continuation(conn: sqlite3.Connection, site_x: int) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM jobs WHERE job_key = ?",
+            (f"gapscan:cont:{site_x}",),
+        ).fetchone()
+        is None
+    )
+
+
+def _assert_landed(
+    conn: sqlite3.Connection, job: Job, site_x: int, outcome: str
+) -> None:
+    """E3's per-outcome state assertions (§5, ``landed(o)``)."""
+    row = conn.execute(_SNAP, (job.id,)).fetchone()
+    assert row is not None
+    if outcome == "continue":
+        assert row["status"] == "completed"
+        assert row["result"] == "ok"
+        cont = conn.execute(
+            "SELECT status FROM jobs WHERE job_key = ?",
+            (f"gapscan:cont:{site_x}",),
+        ).fetchone()
+        assert cont is not None and cont["status"] == "pending"
+    elif outcome == "cancel":
+        assert row["status"] == "completed"
+        assert row["result"] is None
+    elif outcome == "defer":
+        assert row["status"] == "pending"
+        assert row["next_attempt_at"] == _DEFER_AT
+    elif outcome == "error":
+        assert row["status"] == "pending"
+        assert row["retry_count"] == 1
+        assert row["next_attempt_at"] is not None
+    else:
+        raise AssertionError(f"unknown outcome {outcome!r}")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param("delete-only", id="delete-only"),
+        pytest.param("running-other-type", id="running-other-type"),
+    ],
+)
+def test_dropped_failure_is_logged_as_dropped_not_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    shape: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    conn, site_y, site_x, job = _setup(tmp_path)
+    try:
+        captured: dict[str, tuple[int, tuple[object, ...]]] = {}
+        swap = (
+            _delete_only_swap(site_x)
+            if shape == "delete-only"
+            else _running_other_type_swap(site_x, site_y, captured)
+        )
+        monkeypatch.setattr(
+            "wxverify.worker.processor.dispatch",
+            _make_dispatch_stub("error", site_x, swap),
+        )
+
+        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
+
+        cycle_lines = _cycle_lines(caplog)
+        assert len(cycle_lines) == 1
+        assert (
+            f"job={job.id} type=record_gap_scan site={site_x} outcome=dropped elapsed="
+            in cycle_lines[0].getMessage()
+        )
+
+        proc_records = _proc_records(caplog)
+        assert not any(r.levelno >= logging.WARNING for r in proc_records)
+
+        dropped_guard = [
+            r
+            for r in proc_records
+            if r.levelno == logging.INFO
+            and r.getMessage()
+            == (
+                f"job outcome dropped id={job.id} type=record_gap_scan "
+                f"site={site_x}: row no longer claimed"
+            )
+        ]
+        assert len(dropped_guard) == 1
+
+        assert not any(
+            "outcome=retry" in r.getMessage() or "attempt=?" in r.getMessage()
+            for r in proc_records
+        )
+
+        if shape == "delete-only":
+            assert _gone(conn, job.id)
+        else:
+            rid, before = captured["before"]
+            assert rid == job.id, "job id was not reused; rebuild, don't weaken"
+            assert _reused_unchanged(conn, rid, before)
+    finally:
+        close_db()
+
+
+def test_failure_without_a_disposition_from_fail_is_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    conn, _site_y, site_x, job = _setup(tmp_path)
+    try:
+        monkeypatch.setattr(
+            "wxverify.worker.processor.dispatch",
+            _make_dispatch_stub("error", site_x, None),
+        )
+        monkeypatch.setattr("wxverify.worker.processor.fail", lambda *_a, **_k: None)
+
+        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
+
+        cycle_lines = _cycle_lines(caplog)
+        assert len(cycle_lines) == 1
+        assert "outcome=dropped" in cycle_lines[0].getMessage()
+
+        proc_records = _proc_records(caplog)
+        assert not any(r.levelno >= logging.WARNING for r in proc_records)
+
+        row = conn.execute(_SNAP, (job.id,)).fetchone()
+        assert row is not None
+        assert row["status"] == "running"
+        assert row["retry_count"] == 0
+    finally:
+        close_db()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [pytest.param("retry", id="retry"), pytest.param("failed", id="failed")],
+)
+def test_recorded_failure_keeps_retry_and_failed_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    shape: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    conn, _site_y, site_x, job = _setup(tmp_path)
+    try:
+        if shape == "failed":
+            conn.execute("UPDATE jobs SET max_retries = 0 WHERE id = ?", (job.id,))
+            conn.commit()
+
+        monkeypatch.setattr(
+            "wxverify.worker.processor.dispatch",
+            _make_dispatch_stub("error", site_x, None),
+        )
+
+        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
+
+        proc_records = _proc_records(caplog)
+        cycle_lines = _cycle_lines(caplog)
+        assert len(cycle_lines) == 1
+        assert not any("outcome=dropped" in r.getMessage() for r in proc_records)
+
+        if shape == "retry":
+            assert "outcome=retry" in cycle_lines[0].getMessage()
+            warnings = [r for r in proc_records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1
+            assert (
+                warnings[0]
+                .getMessage()
+                .startswith(
+                    f"job failed id={job.id} type=record_gap_scan site={site_x} "
+                    "attempt=1/5 next="
+                )
+            )
+            _assert_landed(conn, job, site_x, "error")
+        else:
+            assert "outcome=failed" in cycle_lines[0].getMessage()
+            errors = [r for r in proc_records if r.levelno == logging.ERROR]
+            assert len(errors) == 1
+            assert (
+                errors[0].getMessage().startswith(f"job failed permanently id={job.id}")
+            )
+            row = conn.execute(_SNAP, (job.id,)).fetchone()
+            assert row is not None
+            assert row["status"] == "failed"
+            assert row["retry_count"] == 1
+    finally:
+        close_db()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [pytest.param("dropped", id="dropped"), pytest.param("recorded", id="recorded")],
+)
+def test_dropped_failure_text_never_reaches_the_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    shape: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    conn, _site_y, site_x, job = _setup(tmp_path)
+    try:
+        swap = _delete_only_swap(site_x) if shape == "dropped" else None
+        monkeypatch.setattr(
+            "wxverify.worker.processor.dispatch",
+            _marker_dispatch_stub(site_x, swap),
+        )
+
+        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
+
+        if shape == "dropped":
+            assert _MARKER not in caplog.text
+            assert _gone(conn, job.id)
+        else:
+            warnings = [
+                r for r in _proc_records(caplog) if r.levelno == logging.WARNING
+            ]
+            assert len(warnings) == 1
+            assert _MARKER in warnings[0].getMessage(), (
+                "control: the marker must survive sanitizing, or it proves "
+                "nothing when it is absent on the dropped arm"
+            )
+    finally:
+        close_db()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param("continue", id="continue"),
+        pytest.param("defer", id="defer"),
+        pytest.param("cancel", id="cancel"),
+    ],
+)
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param("delete-only", id="delete-only"),
+        pytest.param("running-other-type", id="running-other-type"),
+        pytest.param("none", id="none"),
+    ],
+)
+def test_dropped_success_defer_cancel_are_logged_as_dropped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+    shape: str,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    conn, site_y, site_x, job = _setup(tmp_path)
+    try:
+        captured: dict[str, tuple[int, tuple[object, ...]]] = {}
+        if shape == "delete-only":
+            swap = _delete_only_swap(site_x)
+        elif shape == "running-other-type":
+            swap = _running_other_type_swap(site_x, site_y, captured)
+        else:
+            swap = None
+
+        monkeypatch.setattr(
+            "wxverify.worker.processor.dispatch",
+            _make_dispatch_stub(outcome, site_x, swap),
+        )
+
+        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
+
+        cycle_lines = _cycle_lines(caplog)
+        assert len(cycle_lines) == 1
+        proc_records = _proc_records(caplog)
+
+        if shape == "none":
+            expected_label = {
+                "continue": "completed",
+                "defer": "deferred",
+                "cancel": "cancelled",
+            }[outcome]
+            assert f"outcome={expected_label}" in cycle_lines[0].getMessage()
+            if outcome == "continue":
+                debug_lines = [
+                    r
+                    for r in proc_records
+                    if r.levelno == logging.DEBUG
+                    and r.getMessage()
+                    == f"job completed id={job.id} type=record_gap_scan site={site_x}"
+                ]
+                assert len(debug_lines) == 1
+            elif outcome == "defer":
+                debug_lines = [
+                    r
+                    for r in proc_records
+                    if r.levelno == logging.DEBUG
+                    and r.getMessage().startswith(f"job deferred id={job.id}")
+                ]
+                assert len(debug_lines) == 1
+            _assert_landed(conn, job, site_x, outcome)
+        else:
+            assert "outcome=dropped" in cycle_lines[0].getMessage()
+            assert not any(
+                r.getMessage().startswith("job completed id=")
+                or r.getMessage().startswith("job deferred id=")
+                for r in proc_records
+            )
+            assert _no_continuation(conn, site_x)
+            if shape == "delete-only":
+                assert _gone(conn, job.id)
+            else:
+                rid, before = captured["before"]
+                assert rid == job.id, "job id was not reused; rebuild, don't weaken"
+                assert _reused_unchanged(conn, rid, before)
+    finally:
+        close_db()
 
 
 # ---------------------------------------------------------------------------
