@@ -4,15 +4,15 @@ Covers ``wxverify.config.OPEN_METEO_MAX_LEAD_HOURS`` (the per-model request
 ceiling table that replaces the old flat 168h seed) and
 ``wxverify.db.migrations.correct_open_meteo_horizons``, the one-shot,
 marker-gated data correction that raises an existing database's seven
-Open-Meteo feed rows to those same horizons. Fixture and assertion style
-mirrors ``tests/test_google_horizon_correction.py``.
+original Open-Meteo feed rows to those same horizons. Fixture and assertion
+style mirrors ``tests/test_google_horizon_correction.py``.
 
 Every fixture is built with ``create_schema`` + hand-inserted ``feeds``
 rows (mirrors the Google-horizon suite), never through ``init_db``/a real
 file, because these oracles only need a bare schema plus a handful of
 ``feeds`` rows.
 
-Synthetic data only: the seven feed rows use the product's own public
+Synthetic data only: the seven original feed rows use the product's own public
 Open-Meteo model identifiers (not station, site, or coordinate data).
 """
 
@@ -118,7 +118,7 @@ def _assert_all_seven(conn: sqlite3.Connection, expected: dict[str, int]) -> Non
 
 def test_fresh_database_seeds_all_seven_open_meteo_feeds_at_approved_horizons() -> None:
     """A brand-new database (``run_migrations`` on an empty file) seeds all
-    seven Open-Meteo feeds at their approved horizons in one pass -- the
+    seven original Open-Meteo feeds at their approved horizons in one pass -- the
     old flat-168 seed would fail every assertion below except the two
     models that happen to still land on 168.
     """
@@ -140,7 +140,7 @@ def test_fresh_database_seeds_all_seven_open_meteo_feeds_at_approved_horizons() 
 
 
 def test_existing_database_all_at_168_corrected_to_approved_horizons() -> None:
-    """A database whose seven Open-Meteo feeds all sit at the old flat 168h
+    """A database whose seven original Open-Meteo feeds all sit at the old flat 168h
     seed is corrected by ``run_migrations`` to the approved per-model
     horizons -- including the two models with no downward correction, which
     a mutant that applies ``DISPLAY_REQUEST_HOURS`` uniformly (rather than
@@ -210,7 +210,7 @@ def test_marker_present_blocks_recorrection_of_a_reset_row() -> None:
 
 
 def test_partial_prior_correction_is_completed_on_the_next_run() -> None:
-    """Simulates a crash after SOME of the seven ``UPDATE``s ran but before
+    """Simulates a crash after SOME of the seven original ``UPDATE``s ran but before
     the marker write: two models are hand-corrected to their approved
     values while the marker is left unset. The next call must finish the
     remaining five and write the marker -- an implementation that instead
@@ -247,7 +247,7 @@ def test_partial_prior_correction_is_completed_on_the_next_run() -> None:
 def test_correction_updates_every_matching_model_not_just_the_first() -> None:
     """``feeds`` carries ``UNIQUE(source, model)`` (migrations.py ~line
     108), so a single ``(source, model)`` pair can never hold two rows --
-    "multiple matching rows" is realized across the seven per-model
+    "multiple matching rows" is realized across the seven original per-model
     ``UPDATE``s the loop issues in one call, not within a single
     statement. This kills an implementation that stops after the first
     model (an early ``break``, or a hardcoded single ``UPDATE`` for
@@ -280,7 +280,8 @@ def test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds() -> No
     """The key set of ``OPEN_METEO_MAX_LEAD_HOURS`` equals the key set of
     ``feeds.open_meteo.RUN_CADENCE_HOURS`` AND the key set of
     ``OPEN_METEO_FETCH_INTERVAL_MINUTES`` (Item E's fetch-interval table),
-    and all three equal the set of Open-Meteo models ``FEED_SEEDS`` builds.
+    and all three equal the set of Open-Meteo models ``FEED_SEEDS`` builds --
+    the seven original models plus ``icon_eu`` (Item D1), eight in all.
     Updated by Item E (E-T9) to cover the third, independently authored
     mapping rather than duplicating this test -- adding a model to one of
     the three without the other two now fails here. The expected hours are
@@ -296,7 +297,8 @@ def test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds() -> No
     .py``'s E-T18 covers that table with the property it can actually
     violate.
     """
-    assert dict(config.OPEN_METEO_MAX_LEAD_HOURS) == _EXPECTED_HOURS
+    expected_hours = {**_EXPECTED_HOURS, "icon_eu": 120}
+    assert dict(config.OPEN_METEO_MAX_LEAD_HOURS) == expected_hours
     assert (
         set(config.OPEN_METEO_MAX_LEAD_HOURS)
         == set(config.OPEN_METEO_FETCH_INTERVAL_MINUTES)
@@ -305,7 +307,7 @@ def test_open_meteo_model_set_and_hours_match_cadence_map_and_feed_seeds() -> No
     seed_models = {
         seed.model for seed in config.FEED_SEEDS if seed.source == "open-meteo"
     }
-    assert seed_models == set(_EXPECTED_HOURS)
+    assert seed_models == set(expected_hours)
 
 
 # ---------------------------------------------------------------------------

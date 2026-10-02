@@ -600,12 +600,22 @@ def test_t4c_persist_order_matches_evidence_id_order(
     asyncio.run(_run())
 
 
-# T5-generated golden (base commit 4454267, `wxverify.worker.verification_run`
-# pre-fix): sha256 over `verification_evidence` (ordered by id) and
+# sha256 over `verification_evidence` (ordered by id) and
 # `verification_day_context` (ordered by snapshot_local_date), both quoted
-# and filtered to the synthetic run's run_id. Generated 2026-09-26 via
-# `.tmp/myers/t5_golden.py` against a `git archive 4454267` checkout.
-GOLDEN_0163 = "b1d62aa76d5b8f4bd9166f0fcec4be115375ee4a53886cefc9a1c43f0b7a875e"
+# and filtered to the synthetic run's run_id (`tests/helpers.py:evidence_digest`),
+# at the first entry to the `aggregate` phase. Generated from the
+# pre-write-lock-fix reference implementation (base commit `4454267`, with
+# `tests/helpers.py` taken from `b21f342` since `4454267` has no
+# `evidence_digest`), by repeating this module's own T4d loop against that
+# reference with the three `icon_eu` config entries (Item D1) seeded into
+# `OPEN_METEO_MAX_LEAD_HOURS`, `OPEN_METEO_FETCH_INTERVAL_MINUTES` and
+# `RUN_CADENCE_HOURS`. The same reference without those seed entries gives
+# the previous value,
+# `b1d62aa76d5b8f4bd9166f0fcec4be115375ee4a53886cefc9a1c43f0b7a875e`.
+# Any future seeded Open-Meteo feed needs this same regeneration: the digest
+# covers feed ids and the roster's evidence rows, so a new default-subscribed
+# feed renumbers every feed id after it and adds its own no-samples rows.
+GOLDEN_0163 = "12a6850b0cb932c8c080fc100e74ab38b767491d3aad9a31258113c08683936d"
 
 
 def test_t4d_golden_digest_matches_0163(tmp_path: Path) -> None:

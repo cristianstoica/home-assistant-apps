@@ -1161,6 +1161,7 @@ FEED_DESCRIPTIONS: dict[tuple[str, str], str] = {
         "open-meteo",
         "ukmo_global_deterministic_10km",
     ): "UK Met Office global deterministic model.",
+    ("open-meteo", "icon_eu"): "DWD ICON-EU regional model for Europe.",
     (
         "meteoblue",
         "multimodel",

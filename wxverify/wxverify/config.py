@@ -62,9 +62,11 @@ DISPLAY_REQUEST_HOURS: Final = 217
 #: counts from the fetch hour and a stored lead from the estimated issue
 #: time, so the advertised duration alone does not justify lowering a bound
 #: that pairing also applies. Single source for both the fresh-database seed
-#: below and the one-shot correction
-#: `db.migrations.correct_open_meteo_horizons` applies to existing databases,
-#: so the two cannot drift apart.
+#: below and the 0.16.0 one-shot correction
+#: `db.migrations.correct_open_meteo_horizons`. A model added later reaches
+#: existing databases through the seed alone (`seed_default_feeds` inserts
+#: missing rows on every start); the correction never changes such a model's
+#: row.
 OPEN_METEO_MAX_LEAD_HOURS: Final[Mapping[str, int]] = {
     "ecmwf_ifs": DISPLAY_REQUEST_HOURS,
     "gfs_global": DISPLAY_REQUEST_HOURS,
@@ -73,16 +75,21 @@ OPEN_METEO_MAX_LEAD_HOURS: Final[Mapping[str, int]] = {
     "meteofrance_arpege_world": 168,
     "jma_gsm": DISPLAY_REQUEST_HOURS,
     "ukmo_global_deterministic_10km": 168,
+    "icon_eu": 120,  # longest (00/06/12/18 UTC) run
 }
 
 #: Each Open-Meteo model's fetch interval, in minutes: one poll per published
 #: run, i.e. the model's run cadence (`feeds.open_meteo.RUN_CADENCE_HOURS`)
-#: times 60. A second poll inside one run window gets the same run key: every
-#: sample already stored keeps its first value, so the poll cannot refresh it,
-#: though it can still insert hours not yet stored. Single source for both the
-#: fresh-database seed below and the one-shot correction
-#: `db.migrations.correct_open_meteo_fetch_intervals` applies to existing
-#: databases, so the two cannot drift apart.
+#: times 60. `icon_eu` is the deliberate exception: it publishes every 3 h but
+#: is polled every 6 h, so it samples roughly alternate runs, with no
+#: guarantee of which (owner decision 2026-10-02). A second poll inside one
+#: run window gets the same run key: every sample already stored keeps its
+#: first value, so the poll cannot refresh it, though it can still insert
+#: hours not yet stored. Single source for both the fresh-database seed below
+#: and the 0.16.0 one-shot correction
+#: `db.migrations.correct_open_meteo_fetch_intervals`, so the two cannot drift
+#: apart. A model added later reaches existing databases through the seed
+#: alone (`seed_default_feeds` inserts missing rows on every start).
 OPEN_METEO_FETCH_INTERVAL_MINUTES: Final[Mapping[str, int]] = {
     "ecmwf_ifs": 360,
     "gfs_global": 360,
@@ -91,6 +98,7 @@ OPEN_METEO_FETCH_INTERVAL_MINUTES: Final[Mapping[str, int]] = {
     "meteofrance_arpege_world": 360,
     "jma_gsm": 360,
     "ukmo_global_deterministic_10km": 360,
+    "icon_eu": 360,
 }
 
 SOURCE_SEEDS: Final[tuple[SourceSeed, ...]] = (

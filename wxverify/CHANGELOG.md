@@ -74,6 +74,19 @@ no history for that period. If Open-Meteo refuses every feed, the
 download stops and retries as before. Rate limits, server errors and
 network errors are handled as before.
 
+Adds the DWD ICON-EU regional model for Europe as an eighth Open-Meteo
+forecast feed. It switches on by itself for every site the first time
+the add-on starts after the update, and it is fetched every 6 hours, out
+to 5 days ahead. The model publishes every 3 hours, so this is
+six-hourly polling that samples roughly alternate ICON-EU updates. This
+adds 4 Open-Meteo calls per site per day (26 to 30 for the example
+deployment in the README). ICON-EU covers Europe only. It is on by
+default because the add-on's defaults are set for Europe. If a site is
+outside Europe, switch ICON-EU off for that site on the Sites page,
+under Feed Subscriptions. Left on, that feed shows errors and uses
+Open-Meteo calls on every fetch; the site's other feeds are not
+affected.
+
 ## 0.16.6
 
 Each station's hourly wind is now the highest mean of two consecutive

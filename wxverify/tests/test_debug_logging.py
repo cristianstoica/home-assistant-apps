@@ -998,7 +998,7 @@ def test_catchup_debug_lines_present(
 ) -> None:
     """T12-E: run_catchup at DEBUG emits sites/cursor debug lines.
 
-    The open-meteo adapter is stubbed so the seven due feeds are walked
+    The open-meteo adapter is stubbed so the due feeds are walked
     without a request; the line under test is emitted before any fetch.
     """
     conn = _init_tmp_db(tmp_path)

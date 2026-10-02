@@ -27,6 +27,7 @@ RUN_CADENCE_HOURS: Final[dict[str, int]] = {
     "meteofrance_arpege_world": 6,
     "jma_gsm": 6,
     "ukmo_global_deterministic_10km": 6,
+    "icon_eu": 3,
 }
 RUN_AVAILABILITY_LAG_MINUTES: Final[dict[str, int]] = {
     model: 90 for model in RUN_CADENCE_HOURS
