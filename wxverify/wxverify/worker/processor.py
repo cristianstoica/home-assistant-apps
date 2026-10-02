@@ -7,6 +7,7 @@ import errno
 import logging
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil
@@ -343,7 +344,6 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
     # A current-obs job's writes are also exempt from the input epoch:
     # they touch only the current-obs lane's tables.
     writer = FencedWriter(db, db.generation, epoch_exempt=(lane == "current_obs"))
-    job_id = job.id
     claimed_at = time.monotonic()
     logger.info(
         "job claimed id=%s type=%s site=%s lane=%s",
@@ -361,8 +361,8 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
             # chain (the chunk completes but its continuation is
             # never enqueued).
             await writer.write(
-                lambda conn, jid=job_id, cont=continuation: _complete_and_continue(
-                    conn, jid, cont
+                lambda conn, j=job, cont=continuation: _record_outcome(
+                    conn, j, lambda c: _complete_and_continue(c, j.id, cont)
                 )
             )
             logger.debug(
@@ -375,8 +375,8 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
             outcome = "deferred"
             next_attempt_at = exc.next_attempt_at
             await writer.write(
-                lambda conn, jid=job_id, attempt=next_attempt_at: defer_job(
-                    conn, jid, attempt
+                lambda conn, j=job, attempt=next_attempt_at: _record_outcome(
+                    conn, j, lambda c: defer_job(c, j.id, attempt)
                 )
             )
             logger.debug(
@@ -390,7 +390,11 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
             outcome = "cancelled"
             # No success marker: a cancelled job resolved nothing
             # (the marker is written only by _complete_and_continue).
-            await writer.write(lambda conn, jid=job_id: complete(conn, jid))
+            await writer.write(
+                lambda conn, j=job: _record_outcome(
+                    conn, j, lambda c: complete(c, j.id)
+                )
+            )
         except StaleGenerationError:
             raise
         except Exception as exc:
@@ -405,7 +409,9 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
                 raise
             message = sanitized_exception(exc)
             disposition = await writer.write(
-                lambda conn, j=job, err=message: _fail_job(conn, j, err)
+                lambda conn, j=job, err=message: _record_outcome(
+                    conn, j, lambda c: _fail_job(c, j, err)
+                )
             )
             if disposition is not None and disposition.terminal:
                 outcome = "failed"
@@ -455,6 +461,38 @@ async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
         time.monotonic() - claimed_at,
         lane,
     )
+
+
+def _still_claimed(conn: sqlite3.Connection, job: Job) -> bool:
+    # jobs.id is INTEGER PRIMARY KEY without AUTOINCREMENT and a site delete
+    # cascades a running job, so the id alone can name a different job.
+    # type + status pin the original: each lane runs one job at a time, the
+    # lanes claim disjoint types (wxverify.db.queue), and only a claim sets
+    # 'running' -- so a running row of this id and type is this job's own.
+    return (
+        conn.execute(
+            "SELECT 1 FROM jobs WHERE id = ? AND type = ? AND status = 'running'",
+            (job.id, job.type),
+        ).fetchone()
+        is not None
+    )
+
+
+def _record_outcome[T](
+    conn: sqlite3.Connection,
+    job: Job,
+    record: Callable[[sqlite3.Connection], T],
+) -> T | None:
+    """Run ``record`` only while ``job``'s claimed row still stands."""
+    if not _still_claimed(conn, job):
+        logger.info(
+            "job outcome dropped id=%s type=%s site=%s: row no longer claimed",
+            job.id,
+            job.type,
+            job.site_id,
+        )
+        return None
+    return record(conn)
 
 
 def _complete_and_continue(
@@ -680,18 +718,22 @@ async def dispatch(
             raise JobCancelled()
         # The build reads and ranks on a read snapshot, never under the write
         # lock; only its insert of at most 24 rows takes the lock.
-        await _run_forecast_record(db, writer, site_id, snapshot_local_date)
+        await _run_forecast_record(db, writer, job, site_id, snapshot_local_date)
         return None
     if job.type == "record_gap_scan":
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
+
         # One chunk of dates per write transaction; the continuation
         # re-enqueues the scan so record-tier chunks interleave with other
         # job types instead of holding the write lock across a long gap.
-        remainder = await writer.write(
-            lambda conn: run_record_gap_scan(conn, site_id, job.payload)
-        )
+        def _scan(conn: sqlite3.Connection) -> dict[str, object] | None:
+            if not _still_claimed(conn, job):
+                raise JobCancelled()
+            return run_record_gap_scan(conn, site_id, job.payload)
+
+        remainder = await writer.write(_scan)
         if remainder is None:
             return None
         return JobContinuation(
@@ -709,7 +751,11 @@ async def dispatch(
 
 
 async def _run_forecast_record(
-    db: Database, writer: FencedWriter, site_id: int, snapshot_local_date: str
+    db: Database,
+    writer: FencedWriter,
+    job: Job,
+    site_id: int,
+    snapshot_local_date: str,
 ) -> None:
     """Build the day's record on a read snapshot; lock only for the insert."""
     build = await db.read(
@@ -719,7 +765,13 @@ async def _run_forecast_record(
     )
     if build is None:
         return
-    await writer.write(lambda conn: persist_forecast_record(conn, build))
+
+    def _persist(conn: sqlite3.Connection) -> None:
+        if not _still_claimed(conn, job):
+            raise JobCancelled()
+        persist_forecast_record(conn, build)
+
+    await writer.write(_persist)
 
 
 async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:

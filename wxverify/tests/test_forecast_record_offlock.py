@@ -48,6 +48,15 @@ from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.current_obs import Health, PollOutcome, persist_poll_result
 
 
+@pytest.fixture(autouse=True)
+def _claimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The synthetic _job has no jobs row; the claim-identity check is
+    # pinned by tests/test_job_outcome_identity.py E5 and E6.
+    monkeypatch.setattr(
+        "wxverify.worker.processor._still_claimed", lambda _conn, _job: True
+    )
+
+
 def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
     close_db()
     tmp_path.mkdir(parents=True, exist_ok=True)

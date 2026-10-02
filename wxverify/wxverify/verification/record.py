@@ -1151,11 +1151,13 @@ def gap_scan_degraded_sites(conn: sqlite3.Connection) -> tuple[int, str | None]:
     Presence IS the freshness signal: the key is deleted the moment its
     dates clear, so no recency window is applied (the scan runs once per
     local day, and a 12-hour window would blank a standing failure for half
-    of every day).
+    of every day). Only keys of a site that still exists count: a site
+    deleted by a release before 0.16.7 left its key behind.
     """
     rows = conn.execute(
-        "SELECT key, value FROM runtime_state WHERE key LIKE ?",
-        (f"{GAP_SCAN_FAILURES_KEY_PREFIX}:%",),
+        "SELECT rs.key AS key, rs.value AS value FROM runtime_state rs"
+        " JOIN sites s ON rs.key = ? || s.id",
+        (f"{GAP_SCAN_FAILURES_KEY_PREFIX}:",),
     ).fetchall()
     sites = 0
     newest: str | None = None

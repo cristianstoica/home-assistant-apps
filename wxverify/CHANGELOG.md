@@ -25,6 +25,21 @@ schema catalogue has a malformed entry, or whose app tables hold text
 that is not valid UTF-8, with a 422 naming the table and column, before
 anything is staged or swapped.
 
+Deleting a site now also removes the rest of its saved state (its
+time zone record, verification progress, gap-scan failures and
+snapshot-time setting), so a new site that gets the same internal
+number starts fresh instead of inheriting it. The health check no
+longer reports gap-scan failures for a site that no longer exists,
+including ones left behind by earlier versions, and a new time zone
+correction no longer picks up progress left behind by a deleted
+site. If a site is deleted while one of its background jobs is
+running, that job's result is no longer recorded against a
+different job. A forecast record or gap scan started for a deleted
+site can no longer write into a new site that gets the same
+internal number. A site that was deleted and added again on an
+earlier version is not repaired automatically; delete it and add it
+again to reset it.
+
 This release adds schema v8: a new `site_feed_state.last_usable_fetch_at`
 column, seeded from each feed's last run that stored a valid forward
 sample. The migration is one-way: 0.16.6 cannot open a database upgraded

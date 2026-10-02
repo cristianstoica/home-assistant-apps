@@ -63,6 +63,7 @@ from wxverify.db.tz_generations import (
 from wxverify.scoring.pairing import pair_real_models
 from wxverify.scoring.persistence import materialize_persistence
 from wxverify.web.context import load_ops, load_sites, load_timezone_correction
+from wxverify.worker.control import JobCancelled
 from wxverify.worker.processor import _complete_and_continue, _fail_job
 from wxverify.worker.tz_correction import (
     advance_correction,
@@ -1288,3 +1289,54 @@ def test_o17_stalled_cleanup_predicate_truth_table(
         assert row.cleanup_stalled_generation_id == generation_id
     else:
         assert row.cleanup_stalled_generation_id is None
+
+
+@pytest.mark.parametrize(
+    "mode", ["initial", "prospective_change", "retrospective_correction"]
+)
+def test_correction_readers_ignore_a_blob_under_a_non_retrospective_generation(
+    mode: str,
+) -> None:
+    """§5.1's two mode gates (tz_correction.py:141, web/context.py:1082):
+    a correction-chain blob planted under a non-retrospective generation's
+    id is never read by either reader. ``retrospective_correction`` is the
+    positive control."""
+    conn = asof_conn()
+    site_id = _insert_site(conn)
+    cur = conn.execute(
+        """
+        INSERT INTO timezone_generations
+            (site_id, timezone, mode, state, published_at)
+        VALUES (?, ?, ?, 'published', ?)
+        """,
+        (site_id, _NEW_TZ, mode, "2026-06-11T01:00:00Z"),
+    )
+    assert cur.lastrowid is not None
+    generation_id = int(cur.lastrowid)
+    set_runtime_state(conn, published_pointer_key(site_id), str(generation_id))
+    _set_correction_blob(conn, generation_id)
+    conn.commit()
+    retro = mode == "retrospective_correction"
+
+    # Reader 1, the Ops panel (web/context.py:1082). No job exists, so only
+    # the mode gate stands between the blob and a reported stall.
+    row = next(
+        r
+        for r in load_timezone_correction(conn, load_sites(conn))
+        if r.site_id == site_id
+    )
+    assert row.cleanup_stalled_generation_id == (generation_id if retro else None)
+
+    # Reader 2, the worker (tz_correction.py:141). Runs second, because the
+    # control's cleanup chunk deletes the blob.
+    payload: dict[str, object] = {"generation_id": generation_id}
+    if retro:
+        assert advance_correction(conn, site_id, payload) is False
+        assert get_runtime_state(conn, correction_state_key(generation_id)) is None
+    else:
+        with pytest.raises(JobCancelled):
+            advance_correction(conn, site_id, payload)
+        assert (
+            get_runtime_state(conn, correction_state_key(generation_id))
+            == '{"phase": "cleanup"}'
+        )

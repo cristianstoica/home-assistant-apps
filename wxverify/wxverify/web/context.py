@@ -26,6 +26,7 @@ from wxverify.db.queue import ACTIVE_JOB_SQL
 from wxverify.db.runtime_state import get_runtime_state
 from wxverify.db.tz_generations import (
     correction_job_key,
+    correction_state_key,
     generation_status,
     published_generation_clause,
 )
@@ -1031,7 +1032,6 @@ def load_timezone_correction(
     active verification chain blocks; a FAILED generation does not, because
     the domain refuses only on a building row.
     """
-    from wxverify.worker.tz_correction import correction_state_key
     from wxverify.worker.verification_run import verification_chain_active
 
     by_site: dict[int, list[dict[str, object]]] = {}

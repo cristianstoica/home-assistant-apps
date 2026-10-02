@@ -205,6 +205,11 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "wxverify.worker.processor.run_current_obs_poller", _idle_poller
     )
+    # The fake db hands write callbacks conn=None; the claim-identity
+    # check needs a real jobs table.
+    monkeypatch.setattr(
+        "wxverify.worker.processor._still_claimed", lambda _conn, _job: True
+    )
 
 
 def _make_url(param: str, value: str = "SECRET123") -> str:
