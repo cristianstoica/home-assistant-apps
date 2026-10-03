@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
-from typing import Final
+import traceback
+from collections.abc import Awaitable
+from typing import Final, Literal
 
 import httpx
 from fastapi import APIRouter, Request
@@ -16,7 +20,7 @@ from wxverify.core.secrets import resolve_secret
 from wxverify.db.connection import FencedWriter, get_db
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.obs.elevation import lookup_elevation_m
-from wxverify.obs.pws_adapter import validate_station
+from wxverify.obs.pws_adapter import UpstreamPayloadError, validate_station
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 from wxverify.worker.control import JobDeferred
@@ -28,6 +32,8 @@ from wxverify.worker.domain_backoff import (
 )
 from wxverify.worker.station_pacing import acquire_within, weathercom_call_lock
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/sites/{site_id}/stations", tags=["stations"])
 
 # How long create_station waits for the weather.com call lock before giving up
@@ -35,6 +41,192 @@ router = APIRouter(prefix="/api/sites/{site_id}/stations", tags=["stations"])
 # timeouts; the ingress proxy's own timeout is not verified. Read at call time
 # from the module, never bound as a default argument, so tests can shorten it.
 ADD_STATION_CALL_WAIT_SECONDS: Final = 30.0
+
+_Provider = Literal["weathercom", "open-meteo"]
+_FailureReason = Literal[
+    "key_rejected",
+    "unknown_station",
+    "refused",
+    "unavailable",
+    "timeout",
+    "unreachable",
+    "unreadable",
+]
+
+# Never 401/403: the web page reads a 403 as an expired session.
+_ANSWER_STATUS: Final[dict[_FailureReason, int]] = {
+    "key_rejected": 502,
+    "unknown_station": 422,
+    "refused": 502,
+    "unavailable": 502,
+    "timeout": 504,
+    "unreachable": 502,
+    "unreadable": 502,
+}
+
+# Fixed texts only: no exception text, URL, key, station id or coordinate.
+# key_rejected and unknown_station are never produced for open-meteo.
+_ANSWER_TEXT: Final[dict[tuple[_Provider, _FailureReason], str]] = {
+    ("weathercom", "key_rejected"): (
+        "weather.com rejected the API key (HTTP {status}); station was not "
+        "added. Check the weather.com API key in the add-on configuration."
+    ),
+    ("weathercom", "unknown_station"): (
+        "weather.com has no station with this ID, or the station is not "
+        "reporting; station was not added. Check the station ID."
+    ),
+    ("weathercom", "refused"): (
+        "weather.com refused the request (HTTP {status}); station was not added."
+    ),
+    ("weathercom", "unavailable"): (
+        "weather.com is unavailable (HTTP {status}); station was not added. "
+        "Try again later."
+    ),
+    ("weathercom", "timeout"): (
+        "weather.com did not answer in time; station was not added. Try again shortly."
+    ),
+    ("weathercom", "unreachable"): (
+        "Could not reach weather.com; station was not added. Try again shortly."
+    ),
+    ("weathercom", "unreadable"): (
+        "weather.com sent a response that could not be read; station was not added."
+    ),
+    ("open-meteo", "refused"): (
+        "Open-Meteo refused the elevation lookup (HTTP {status}); station was "
+        "not added."
+    ),
+    ("open-meteo", "unavailable"): (
+        "Open-Meteo is unavailable (HTTP {status}); station was not added. "
+        "Try again later."
+    ),
+    ("open-meteo", "timeout"): (
+        "Open-Meteo did not answer the elevation lookup in time; station was "
+        "not added. Try again shortly."
+    ),
+    ("open-meteo", "unreachable"): (
+        "Could not reach Open-Meteo for the elevation lookup; station was not "
+        "added. Try again shortly."
+    ),
+    ("open-meteo", "unreadable"): (
+        "Open-Meteo sent an elevation response that could not be read; station "
+        "was not added."
+    ),
+}
+
+
+def _classify_provider_failure(
+    exc: Exception, provider: _Provider
+) -> tuple[_FailureReason, int | None]:
+    """Reason and upstream status for a failed station-add provider call.
+
+    Reads only the exception's type, its HTTP status and the payload
+    diagnostics' enum fields -- never its text, request or URL.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status == 429 or status >= 500:
+            return "unavailable", status
+        if provider == "weathercom" and status in (401, 403):
+            return "key_rejected", status
+        if provider == "weathercom" and status == 404:
+            return "unknown_station", status
+        return "refused", status
+    if isinstance(exc, UpstreamPayloadError):
+        diagnostics = exc.diagnostics
+        if provider == "weathercom" and (
+            diagnostics.kind == "no_content" or diagnostics.body == "empty"
+        ):
+            return "unknown_station", diagnostics.status
+        return "unreadable", diagnostics.status
+    # Timeout first: httpx.ReadTimeout is also an httpx.TransportError.
+    if isinstance(exc, httpx.TimeoutException | TimeoutError):
+        return "timeout", None
+    if isinstance(exc, httpx.TransportError):
+        return "unreachable", None
+    return "unreadable", None
+
+
+_CAUSE_NAMES_LIMIT: Final = 8
+
+
+def _cause_names(exc: BaseException) -> str:
+    """Class names of the retained chain below exc, suppressed context included.
+
+    Names only, never text. Prefers __cause__, else __context__ even when
+    __suppress_context__ is set; stops at None, a repeat or the limit.
+    ExceptionGroup members are not walked.
+    """
+    names: list[str] = []
+    seen = {id(exc)}
+    current = exc
+    while len(names) < _CAUSE_NAMES_LIMIT:
+        nxt = current.__cause__
+        if nxt is None:
+            nxt = current.__context__
+        if nxt is None or id(nxt) in seen:
+            break
+        seen.add(id(nxt))
+        names.append(type(nxt).__name__)
+        current = nxt
+    return "<-".join(names) or "-"
+
+
+def _innermost_package_frame(exc: BaseException) -> str:
+    """`<file>:<line> in <function>` of the innermost wxverify frame; no values.
+
+    Attribute reads only: no frame locals, no source line, no StackSummary.
+    """
+    where = "-"
+    for frame, lineno in traceback.walk_tb(exc.__traceback__):
+        module = frame.f_globals.get("__name__")
+        if isinstance(module, str) and module.startswith("wxverify."):
+            code = frame.f_code
+            where = f"{os.path.basename(code.co_filename)}:{lineno} in {code.co_name}"
+    return where
+
+
+async def _provider_call[T](call: Awaitable[T], *, provider: _Provider) -> T:
+    """Await one station-add provider call; answer any failure safely.
+
+    A provider error's text and traceback can carry the request URL (the
+    weather.com key and station id, or the station's coordinates). The except
+    block only records facts; the backoff write and every raise come after
+    it, so nothing raised here has the provider error as __cause__ or
+    __context__. CancelledError is a BaseException and passes through.
+    """
+    try:
+        return await call
+    except Exception as exc:
+        reason, upstream_status = _classify_provider_failure(exc, provider)
+        error_type = type(exc).__name__
+        kind = exc.diagnostics.kind if isinstance(exc, UpstreamPayloadError) else "-"
+        cause = _cause_names(exc)
+        where = _innermost_package_frame(exc) if reason == "unreadable" else "-"
+        http_response = exc.response if isinstance(exc, httpx.HTTPStatusError) else None
+    # Reached only through the except block: the try body returns.
+    if http_response is not None:
+        # Exempt: domain_backoffs is keyed by domain, not by site/station --
+        # no entity for a swap to contaminate, so this runs unfenced.
+        next_attempt_at = await get_db().write(
+            lambda conn, response=http_response: record_http_backoff(conn, response)
+        )
+        if next_attempt_at is not None:
+            raise JobDeferred(next_attempt_at)
+    logger.warning(
+        "station add failed provider=%s reason=%s status=%s error_type=%s "
+        "kind=%s cause=%s where=%s",
+        provider,
+        reason,
+        "-" if upstream_status is None else upstream_status,
+        error_type,
+        kind,
+        cause,
+        where,
+    )
+    raise ApiError(
+        _ANSWER_STATUS[reason],
+        _ANSWER_TEXT[(provider, reason)].format(status=upstream_status),
+    )
 
 
 def _station_out(row: sqlite3.Row) -> StationOut:
@@ -101,17 +293,9 @@ async def create_station(
         )
     try:
         await writer.write(_reserve)
-        try:
-            pws = await validate_station(body.pws_station_id, api_key)
-        except httpx.HTTPStatusError as exc:
-            # Exempt: domain_backoffs is keyed by domain, not by site/station --
-            # no entity for a swap to contaminate, so this runs unfenced.
-            next_attempt_at = await get_db().write(
-                lambda conn, response=exc.response: record_http_backoff(conn, response)
-            )
-            if next_attempt_at is not None:
-                raise JobDeferred(next_attempt_at) from exc
-            raise
+        pws = await _provider_call(
+            validate_station(body.pws_station_id, api_key), provider="weathercom"
+        )
     finally:
         lock.release()
 
@@ -125,17 +309,9 @@ async def create_station(
         reserve_budget(conn, "open-meteo", 1)
 
     await writer.write(_reserve_elevation)
-    try:
-        dem = await lookup_elevation_m(pws.lat, pws.lon)
-    except httpx.HTTPStatusError as exc:
-        # Exempt: domain_backoffs is keyed by domain, not by site/station --
-        # no entity for a swap to contaminate, so this runs unfenced.
-        next_attempt_at = await get_db().write(
-            lambda conn, response=exc.response: record_http_backoff(conn, response)
-        )
-        if next_attempt_at is not None:
-            raise JobDeferred(next_attempt_at) from exc
-        raise
+    dem = await _provider_call(
+        lookup_elevation_m(pws.lat, pws.lon), provider="open-meteo"
+    )
 
     def _write(conn: sqlite3.Connection) -> StationOut:
         if (

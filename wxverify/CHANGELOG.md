@@ -42,6 +42,22 @@ the same internal number. A site that was deleted and added again on an
 earlier version is not repaired automatically; delete it and add it
 again to reset it.
 
+If adding a station failed because weather.com or the elevation lookup
+rejected the request, sent back something unreadable or did not answer,
+the add-on log could record a full error report holding the weather.com
+API key and the station ID, or the station's coordinates. That report is
+no longer written. Instead, the add-on logs a one-line warning that
+names the provider and the kind of failure, without the key, the station
+ID or the coordinates. The add-station request now answers with a short
+reason, such as that weather.com rejected the API key or does not know
+the station; the add-on's web page still shows only "Request rejected".
+When the provider answers that it has had too many requests or has a
+server error, nothing changes: the add-on pauses its requests to it and
+still answers that its allowance is used up, as before. At the debug log
+level the add-on still logs the requests it sends to weather.com and the
+elevation lookup, which show the station ID or the coordinates; the API
+key stays hidden.
+
 This release adds schema v8: a new `site_feed_state.last_usable_fetch_at`
 column, seeded from each feed's last run that stored a valid forward
 sample. The migration is one-way: 0.16.6 cannot open a database upgraded
