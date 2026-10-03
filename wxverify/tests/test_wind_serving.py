@@ -11,7 +11,8 @@ same seeded feeds) since these tests exercise ``build_forecast``/
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -213,18 +214,33 @@ def _make_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
     return int(cur.lastrowid)
 
 
-def test_t60_staging_banner_shows_inventory_counts() -> None:
+def test_t60_staging_banner_shows_inventory_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """In ``staging``, the dashboard banner (``load_wind_banner``) carries
     the rebuild note with the station-day inventory counts; paired with the
     injected absence case, ``pair_max`` with no rebuild note and no auth
     hold, where the banner is None -- the positive proves the note actually
     fires on real counts, not that ``pair_max`` merely happens not to
     trigger it.
+
+    The site is pinned to a non-UTC zone (``Etc/GMT-3``, a neutral offset)
+    and the clock ``wind_rebuild_progress`` reads (``wind_basis.utc_now``)
+    is pinned to an instant chosen so the site's local date and the UTC
+    date differ -- 22:00 UTC is already past local midnight at UTC+3 --
+    so the station-day seeding below is anchored to the site's actual
+    local "today" rather than to the machine's wall-clock date, and the
+    result can't depend on the machine's time zone.
     """
     conn = _make_db()
+    conn.execute("UPDATE sites SET timezone = 'Etc/GMT-3' WHERE id = 1")
     set_wind_basis_state(conn, 1, "staging")
     station_id = _make_station(conn, 1, "KTEST001")
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    pinned_now = datetime(2026, 1, 2, 22, 0, tzinfo=UTC)
+    monkeypatch.setattr("wxverify.db.wind_basis.utc_now", lambda: pinned_now)
+    site_today = pinned_now.astimezone(ZoneInfo("Etc/GMT-3")).date()
+    assert site_today != pinned_now.date()
+    yesterday = (site_today - timedelta(days=1)).isoformat()
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, attempts, record_count, pair_hours,"
@@ -237,7 +253,7 @@ def test_t60_staging_banner_shows_inventory_counts() -> None:
         " (station_id, local_date, status, attempts, record_count, pair_hours,"
         "  refetched, updated_at)"
         " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, (date.today() - timedelta(days=2)).isoformat()),
+        (station_id, (site_today - timedelta(days=2)).isoformat()),
     )
     conn.commit()
     banner = load_wind_banner(conn, 1)

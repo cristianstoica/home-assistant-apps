@@ -43,7 +43,9 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.tz_generations import (
+    correction_heartbeat_key,
     correction_job_key,
+    correction_state_key,
     published_generation_id,
     published_pointer_key,
 )
@@ -68,19 +70,6 @@ MAX_RESCAN_PASSES = 3
 # Chain starts allowed before the run is marked failed (§14: "on the third
 # chain start without completion the run is marked failed").
 MAX_CHAIN_STARTS = 2
-
-_STATE_KEY_PREFIX = "tz_correction_state:"
-_HEARTBEAT_KEY_PREFIX = "tz_correction_heartbeat:"
-
-
-def correction_state_key(generation_id: int) -> str:
-    """``runtime_state`` key of the chain-state JSON blob."""
-    return f"{_STATE_KEY_PREFIX}{generation_id}"
-
-
-def correction_heartbeat_key(generation_id: int) -> str:
-    """``runtime_state`` key of the chain progress heartbeat."""
-    return f"{_HEARTBEAT_KEY_PREFIX}{generation_id}"
 
 
 def payload_generation_id(payload: dict[str, object]) -> int | None:

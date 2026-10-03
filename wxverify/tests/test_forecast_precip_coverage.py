@@ -1479,6 +1479,30 @@ _AB_VALID_DAY = "2026-07-20"
 _AB_NOW = datetime(2026, 7, 20, 23, 0, tzinfo=UTC)
 _AB_FRESH_ISSUED = "2026-07-20T20:00:00Z"
 _AB_STALE_ISSUED = "2026-07-20T02:00:00Z"
+# The fixtures below stamp each feed's last usable fetch at the issued_at they
+# are given, so "fresh"/"stale" above are fetch ages (the stale badge's basis)
+# as well as run ages.
+_STALE_BADGE = (
+    '<span class="badge warn" title="At least one feed used for this day has '
+    "gone more than twice its scheduled fetch interval without a usable "
+    "download, or its fetch interval is unknown. The age of the forecast "
+    "itself doesn't count.\">stale</span>"
+)
+
+
+def _stamp_usable_fetch(conn: sqlite3.Connection, *, feed_id: int, at: str) -> None:
+    """Record ``at`` as site 1's last usable forward fetch of ``feed_id``."""
+    conn.execute(
+        """
+        INSERT INTO site_feed_state
+            (site_id, feed_id, last_run_at, last_usable_fetch_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(site_id, feed_id) DO UPDATE SET
+            last_run_at=excluded.last_run_at,
+            last_usable_fetch_at=excluded.last_usable_fetch_at
+        """,
+        (feed_id, at, at),
+    )
 
 
 def _seed_ab_precip_fixture(
@@ -1516,6 +1540,8 @@ def _seed_ab_precip_fixture(
         valid_ats=b_ats,
         values=[0.05 * i for i in range(24)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=feed_a_issued_at)
+    _stamp_usable_fetch(conn, feed_id=feed_b, at=feed_b_issued_at)
 
     _seed_scoring_pairs(
         conn,
@@ -1560,7 +1586,7 @@ def test_stale_union_for_precipitation() -> None:
     assert today.precip.meta.stale is True
     assert today.stale is True
     html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">stale</span>' in html
+    assert _STALE_BADGE in html
 
     conn2 = _make_db()
     _seed_ab_precip_fixture(
@@ -1572,7 +1598,7 @@ def test_stale_union_for_precipitation() -> None:
     )
     assert view2.tiles[0].precip.meta.stale is True
     html2 = _render_tiles(site_id=1, view=view2)
-    assert '<span class="badge warn">stale</span>' in html2
+    assert _STALE_BADGE in html2
 
 
 def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
@@ -1808,6 +1834,7 @@ def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
         valid_ats=a_ats,
         values=[0.1 * i for i in range(20)],
     )
+    _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_FRESH_ISSUED)
     _seed_scoring_pairs(
         conn,
         feed_id=persistence_id,
@@ -1838,7 +1865,7 @@ def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
     html = _render_tiles(site_id=1, view=view)
     assert '<span class="badge warn">low confidence</span>' not in html
     assert '<span class="badge muted">ranking updating</span>' not in html
-    assert '<span class="badge warn">stale</span>' not in html
+    assert _STALE_BADGE not in html
 
     # Paired positive: the stale badge still shows when A itself is stale,
     # so the negative above is not a blanket "badges never fire" fixture.
@@ -1854,6 +1881,7 @@ def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
         valid_ats=a_ats,
         values=[0.1 * i for i in range(20)],
     )
+    _stamp_usable_fetch(stale_conn, feed_id=stale_feed, at=_AB_STALE_ISSUED)
     _seed_scoring_pairs(
         stale_conn,
         feed_id=stale_persistence,
@@ -1872,7 +1900,7 @@ def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
     assert stale_view.tiles[0].precip.meta.extrema_unavailable is True
     assert stale_view.tiles[0].precip.meta.stale is True
     stale_html = _render_tiles(site_id=1, view=stale_view)
-    assert '<span class="badge warn">stale</span>' in stale_html
+    assert _STALE_BADGE in stale_html
 
 
 # ===========================================================================

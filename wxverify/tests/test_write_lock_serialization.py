@@ -925,6 +925,8 @@ def test_batched_scoring_crash_mid_run_marks_job_retry_then_converges_e4(
             "wxverify.worker.processor.claim_next_job", _claim_once(job)
         )
 
+        # _claim_once skips the real claim's status flip (queue.py:298).
+        conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
         with pytest.raises(_StopLoop):
             await run_worker(db)
 
@@ -963,6 +965,8 @@ def test_batched_scoring_crash_mid_run_marks_job_retry_then_converges_e4(
         monkeypatch.setattr(
             "wxverify.worker.processor.claim_next_job", _claim_once(retry_job)
         )
+        # _claim_once skips the real claim's status flip (queue.py:298).
+        conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
         with pytest.raises(_StopLoop):
             await run_worker(db)
 

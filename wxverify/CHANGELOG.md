@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.16.7
+
+The Forecast page now judges each feed's stale badge by the last fetch
+that returned a usable forward sample (lead of at least 1 hour), rather
+than the newest sample's issue time, and a fetch that stores no new
+samples because everything it returned was already on file still counts
+and refreshes the badge. The page header shows this same stamp as "Last
+fetched", falling back to "fetch time unknown" when a contributing feed
+has none yet; meteoblue members are judged by their package feed's
+stamp. The hover text on these tiles was reworded twice after the first
+pass read as covering the whole page, including the day-detail chart,
+when it only covers the feeds behind the forecast tiles. The forecast
+page, its auto-poll and the hourly view now all read from one database
+snapshot, so a write landing mid-request can no longer pair an old tile
+value with a new refresh token and stall the page's own refreshing.
+The forecast page, its auto-poll and the hourly view keep reusing the
+stored wind feed weights, as in 0.16.6, now inside that one snapshot.
+A request whose snapshot opens while the database is being changed
+works the weights out fresh and does not store them, so a page never
+pairs wind weights with data from a different moment.
+Separately, the database import validator now refuses a file whose
+schema catalogue has a malformed entry, or whose app tables hold text
+that is not valid UTF-8, with a 422 naming the table and column, before
+anything is staged or swapped.
+
+Deleting a site now also removes the rest of its saved state (its time
+zone record, verification progress, gap-scan failures and snapshot-time
+setting), so a new site that gets the same internal number starts fresh
+instead of inheriting it. The health check no longer reports gap-scan
+failures for a site that no longer exists, including ones left behind by
+earlier versions, and a new time zone correction no longer picks up
+progress left behind by a deleted site. If a site is deleted while one
+of its background jobs is running, that job's result is no longer
+recorded against a different job. The add-on log now reports that job's
+outcome as `dropped`. Before, it reported the job as completed, deferred
+or cancelled even though its outcome was not recorded, or, if the job
+had failed, said it would be retried. A forecast record or gap scan
+started for a deleted site can no longer write into a new site that gets
+the same internal number. A site that was deleted and added again on an
+earlier version is not repaired automatically; delete it and add it
+again to reset it.
+
+This release adds schema v8: a new `site_feed_state.last_usable_fetch_at`
+column, seeded from each feed's last run that stored a valid forward
+sample. The migration is one-way: 0.16.6 cannot open a database upgraded
+by 0.16.7, because its migration runner refuses to start against a
+database whose stored schema version is newer than its own target
+version and raises an error instead. Rollback is therefore not a plain
+reinstall of 0.16.6 — restore the add-on backup taken before the update.
+
 ## 0.16.6
 
 Each station's hourly wind is now the highest mean of two consecutive

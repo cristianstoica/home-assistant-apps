@@ -94,6 +94,23 @@ def _insert_sample(
     )
 
 
+def _stamp_usable_fetch(
+    conn: sqlite3.Connection, *, site_id: int = 1, feed_id: int, at: str
+) -> None:
+    """Record ``at`` as the feed's last usable forward fetch (the v8 column)."""
+    conn.execute(
+        """
+        INSERT INTO site_feed_state
+            (site_id, feed_id, last_run_at, last_usable_fetch_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(site_id, feed_id) DO UPDATE SET
+            last_run_at=excluded.last_run_at,
+            last_usable_fetch_at=excluded.last_usable_fetch_at
+        """,
+        (site_id, feed_id, at, at),
+    )
+
+
 def _insert_pair(
     conn: sqlite3.Connection,
     *,
@@ -286,6 +303,11 @@ def test_since_valid_at_boundary_inclusive_at_exclusive_before() -> None:
 
 
 def test_stale_boundary_uses_2x_feeds_own_fetch_interval() -> None:
+    """The boundary is on ``last_usable_fetch_at``, not on ``issued_at``.
+
+    Both feeds' only run was issued two days ago, which the ``issued_at``
+    rule would call stale for both; the stamps alone decide the verdict.
+    """
     conn = _make_db()
     now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
     not_stale_feed = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # 360 min interval
@@ -295,27 +317,57 @@ def test_stale_boundary_uses_2x_feeds_own_fetch_interval() -> None:
     at_threshold = isoformat_utc(now - timedelta(minutes=720))
     # one minute past the threshold -> stale.
     past_threshold = isoformat_utc(now - timedelta(minutes=721))
+    old_run = isoformat_utc(now - timedelta(days=2))
 
-    _insert_sample(
-        conn,
-        feed_id=not_stale_feed,
-        variable="temperature",
-        issued_at=at_threshold,
-        valid_at="2026-07-11T00:00:00Z",
-        value=10.0,
-    )
-    _insert_sample(
-        conn,
-        feed_id=stale_feed,
-        variable="temperature",
-        issued_at=past_threshold,
-        valid_at="2026-07-11T00:00:00Z",
-        value=10.0,
-    )
+    for feed_id, stamp in (
+        (not_stale_feed, at_threshold),
+        (stale_feed, past_threshold),
+    ):
+        _insert_sample(
+            conn,
+            feed_id=feed_id,
+            variable="temperature",
+            issued_at=old_run,
+            valid_at="2026-07-11T00:00:00Z",
+            value=10.0,
+        )
+        _stamp_usable_fetch(conn, feed_id=feed_id, at=stamp)
 
     freshness = load_feed_freshness(conn, site_id=1, now=now)
+    assert freshness[not_stale_feed].fetch_state == "fresh"
     assert freshness[not_stale_feed].stale is False
+    assert freshness[stale_feed].fetch_state == "stale"
     assert freshness[stale_feed].stale is True
+
+
+def test_stale_boundary_one_second_past_2x_interval_flips_to_stale() -> None:
+    """Plan §14.6 "Boundary": ``now == stamp + 2 x interval`` is fresh; one
+    second later is stale -- the finer-grained sibling of
+    ``test_stale_boundary_uses_2x_feeds_own_fetch_interval`` above, which
+    pins the same ``<`` (not ``<=``) boundary at minute granularity."""
+    conn = _make_db()
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # 360 min interval
+    stamp = "2026-07-10T00:00:00Z"
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=stamp,
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=feed_id, at=stamp)
+
+    # +720 min exactly
+    exactly_at_boundary = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
+    freshness = load_feed_freshness(conn, site_id=1, now=exactly_at_boundary)
+    assert freshness[feed_id].fetch_state == "fresh"
+
+    one_second_later = datetime(2026, 7, 10, 12, 0, 1, tzinfo=UTC)
+    assert (
+        load_feed_freshness(conn, site_id=1, now=one_second_later)[feed_id].fetch_state
+        == "stale"
+    )
 
 
 def test_freshness_excludes_virtual_feed_includes_member_feed() -> None:
@@ -408,11 +460,267 @@ def test_freshness_accepts_exact_integral_real_stored_cadence() -> None:
         valid_at="2026-07-11T00:00:00Z",
         value=10.0,
     )
+    _stamp_usable_fetch(conn, feed_id=feed_id, at=at_threshold)
 
     freshness = load_feed_freshness(conn, site_id=1, now=now)
 
     assert freshness[feed_id].fetch_interval_minutes == 360
-    assert freshness[feed_id].stale is False
+    assert freshness[feed_id].fetch_state == "fresh"
+
+
+def test_freshness_unparseable_text_stamp_reads_unknown_not_raise() -> None:
+    """A syntactically-``str`` but unparseable stamp -- e.g. one arriving
+    through the admin DB import path -- must fail toward ``unknown``, not
+    raise. Distinct from ``test_freshness_blob_stamp_reads_unknown_not_stale``
+    elsewhere in this module: that one pins the ``isinstance(str)`` guard on
+    a non-str value (``stamp is None`` branch); this one pins ``parse_utc``'s own
+    ``ValueError`` branch on a value that passes the isinstance check.
+
+    Mutant (plan §14.6, MX4): removing the ``try/except ValueError`` around
+    ``parse_utc(stamp)`` would raise instead of returning ``"unknown"``.
+    """
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=feed_id, at="not-a-time")
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[feed_id].fetch_state == "unknown"
+
+
+def _insert_meteoblue_member(
+    conn: sqlite3.Connection, model: str, *, fetch_interval_minutes: int = 360
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO feeds
+            (source, model, enabled, default_subscribed, fetch_interval_minutes,
+             max_lead_hours, is_virtual)
+        VALUES ('meteoblue', ?, 1, 0, ?, 168, 0)
+        """,
+        (model, fetch_interval_minutes),
+    )
+    return _feed_id(conn, "meteoblue", model)
+
+
+def test_freshness_null_stamp_reads_unknown() -> None:
+    """A feed with no ``last_usable_fetch_at`` row at all (never fetched
+    forward) must read ``unknown``, not ``stale`` -- paired against the
+    2x-boundary test above, which pins the ``stale`` branch on the same
+    helper."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    # Deliberately no _stamp_usable_fetch call: site_feed_state has no row.
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[feed_id].fetch_state == "unknown"
+    assert freshness[feed_id].last_usable_fetch_at is None
+
+
+def test_freshness_blob_stamp_reads_unknown_not_stale() -> None:
+    """A corrupt/foreign BLOB in ``last_usable_fetch_at`` must fail toward
+    ``unknown`` (isinstance(str) guard), never toward a str-only comparison
+    blowing up or silently misreading as stale."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    conn.execute(
+        """
+        INSERT INTO site_feed_state (site_id, feed_id, last_usable_fetch_at)
+        VALUES (1, ?, ?)
+        """,
+        (feed_id, b"\x00\x01binary-garbage"),
+    )
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[feed_id].fetch_state == "unknown"
+    assert freshness[feed_id].last_usable_fetch_at is None
+
+
+def test_meteoblue_member_follows_package_cadence_and_stamp() -> None:
+    """Baseline meteoblue-package-as-evidence-feed case: package row exists
+    and carries the stamp; the member is judged against ITS cadence too, not
+    just its stamp.
+
+    The package (360 min, 2x-boundary 12h) and the member (1440 min,
+    2x-boundary 48h) are given deliberately different cadences, and the
+    stamp is aged 13h -- stale under the package's 12h boundary but still
+    fresh under the member's 48h one. A reader that read the package's
+    stamp but the member's OWN ``fetch_interval_minutes`` would report
+    fresh instead of stale.
+
+    Mutant: the reader computes staleness against ``f.fetch_interval_minutes``
+    (the member's own row) instead of ``e.fetch_interval_minutes`` (the
+    evidence/package row). Must be killed.
+    """
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    conn.execute(
+        "UPDATE feeds SET fetch_interval_minutes = 360 WHERE id = ?", (package_id,)
+    )
+    member_id = _insert_meteoblue_member(
+        conn, "nems_member", fetch_interval_minutes=1440
+    )
+    stamp = isoformat_utc(now - timedelta(hours=13))
+    _insert_sample(
+        conn,
+        feed_id=member_id,
+        variable="temperature",
+        issued_at=stamp,
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=package_id, at=stamp)
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[member_id].evidence_feed_id == package_id
+    assert freshness[member_id].fetch_interval_minutes == 360
+    assert freshness[member_id].fetch_state == "stale"
+
+
+def test_meteoblue_member_falls_back_to_own_state_when_package_absent() -> None:
+    """Case 2(a): no ``(meteoblue, multimodel)`` package row exists at all
+    (e.g. deleted -- a merely-disabled package row still exists and is
+    still chosen by the join; only a genuinely MISSING row triggers this
+    fallback). A member feed then reads its OWN site_feed_state row as
+    evidence: ``evidence_feed_id == member id``.
+    """
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    # Delete the default-seeded package before it accrues any state/sample
+    # rows so the RESTRICT FK never fires.
+    conn.execute("DELETE FROM feeds WHERE source='meteoblue' AND model='multimodel'")
+    assert (
+        conn.execute(
+            "SELECT id FROM feeds WHERE source='meteoblue' AND model='multimodel'"
+        ).fetchone()
+        is None
+    )
+
+    member_id = _insert_meteoblue_member(conn, "nems_member")
+    _insert_sample(
+        conn,
+        feed_id=member_id,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=member_id, at=isoformat_utc(now))
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[member_id].evidence_feed_id == member_id
+    assert freshness[member_id].fetch_state == "fresh"
+
+
+def test_meteoblue_member_reads_unknown_when_package_has_no_state_row() -> None:
+    """Case 2(b): the package row exists but has no site_feed_state row for
+    this site, while the member has its OWN recent stamp. The member must
+    still read ``unknown`` with ``evidence_feed_id == package id`` -- it
+    must never borrow its own stamp just because one exists."""
+    conn = _make_db()
+    now = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    member_id = _insert_meteoblue_member(conn, "nems_member")
+    _insert_sample(
+        conn,
+        feed_id=member_id,
+        variable="temperature",
+        issued_at=isoformat_utc(now),
+        valid_at="2026-07-11T00:00:00Z",
+        value=10.0,
+    )
+    # The member's OWN state row carries a fresh-looking stamp -- but it
+    # must never be consulted, since its evidence feed is the package.
+    _stamp_usable_fetch(conn, feed_id=member_id, at=isoformat_utc(now))
+    # Deliberately no site_feed_state row for the package (no
+    # _stamp_usable_fetch(feed_id=package_id, ...) call).
+    assert (
+        conn.execute(
+            "SELECT 1 FROM site_feed_state WHERE site_id=1 AND feed_id=?",
+            (package_id,),
+        ).fetchone()
+        is None
+    )
+
+    freshness = load_feed_freshness(conn, site_id=1, now=now)
+
+    assert freshness[member_id].evidence_feed_id == package_id
+    assert freshness[member_id].fetch_state == "unknown"
+    assert freshness[member_id].last_usable_fetch_at is None
+
+
+def test_polling_phase_boundary_pins_fresh_then_stale_across_days() -> None:
+    """Plan §14.6 "Polling phase" bullet, verbatim scenario: a 360-min (6h)
+    feed whose samples are issued at 06:00Z, fetched (stamped) at 12:44Z the
+    same day.
+
+    At 23:00Z it is fresh: 10h16m since the STAMP, under the 2x/12h
+    threshold. The old issued_at-based rule would call this stale (17h
+    since 06:00Z issued_at > 12h) -- this test pins the change to
+    stamp-based judgment, not issued_at-based. At 00:45Z the next day it is
+    stale: 12h01m since the stamp.
+
+    Mutant: judging staleness from ``latest_issued_at`` (06:00Z) instead of
+    the ``last_usable_fetch_at`` stamp (12:44Z) would already read stale at
+    23:00Z (17h > 12h). Must be killed.
+    """
+    conn = _make_db()
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")  # 360 min interval
+    issued_at = "2026-07-10T06:00:00Z"
+    stamp = "2026-07-10T12:44:00Z"
+    _insert_sample(
+        conn,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=issued_at,
+        valid_at="2026-07-11T06:00:00Z",
+        value=10.0,
+    )
+    _stamp_usable_fetch(conn, feed_id=feed_id, at=stamp)
+
+    still_fresh_now = datetime(2026, 7, 10, 23, 0, tzinfo=UTC)  # 10h16m since stamp
+    assert (
+        load_feed_freshness(conn, site_id=1, now=still_fresh_now)[feed_id].fetch_state
+        == "fresh"
+    )
+
+    now_stale = datetime(2026, 7, 11, 0, 45, tzinfo=UTC)  # 12h01m since stamp
+    assert (
+        load_feed_freshness(conn, site_id=1, now=now_stale)[feed_id].fetch_state
+        == "stale"
+    )
 
 
 # ---------------------------------------------------------------------------

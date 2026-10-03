@@ -536,6 +536,12 @@ A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
 feeds its daily high and low come from and the feeds its daily rain figures
 come from, which can differ from the selected feeds its hourly chart plots.
 
+A feed counts as `stale` when the app has not completed a successful forecast
+download for it within twice its fetch interval. Only a download that returned
+usable forecast values counts; a download that returned values already stored
+counts too. `fetch time unknown` means no such download has been recorded yet,
+for example right after an upgrade.
+
 The daily forecast record stores what the tile showed: when the label appears,
 the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
 `insufficient`, next to the `extrema_feed_ids` that were used (an empty list in
@@ -799,7 +805,8 @@ Ops → Database Import uploads a previously exported `.db` file and **fully
 replaces** the live database with it. Any data collected since that export is
 lost. The upload is validated first (integrity check, wxverify schema version,
 required tables, that each of the add-on's own tables present in the file is
-an ordinary table, and that every forecast and observation time is in the
+an ordinary table, that the file's schema and the add-on's own tables hold
+only valid UTF-8 text, and that every forecast and observation time is in the
 add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
 automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
 the swap. Only the newest `.bak` file is kept; older ones are swept
@@ -853,7 +860,8 @@ The four levels, loudest to quietest:
   `logging configured level=… stream=stdout` line confirms the active level. From then on
   you'll see the worker start and stop, a `job claimed …` line when the worker picks up a
   job, one `cycle: …` line each time it finishes a unit of work (naming the job, its
-  outcome — completed, deferred, retry, or failed — and how long it took, `elapsed=…`),
+  outcome — completed, deferred, retry, failed, or dropped (its outcome was not recorded,
+  usually because its site was deleted while it ran) — and how long it took, `elapsed=…`),
   the scoring milestones (`score phase=…`, `score discovery …`, `score window=…`, and
   `score sweep …`, each with its own elapsed time), and one `scoring run complete …` line
   per scoring run. If these keep ticking over, the add-on is alive and doing its job.

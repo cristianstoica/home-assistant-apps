@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass
+from typing import Final
 
 from wxverify.collection.budget import reserve_budget
+from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.feeds.seam import FetchResult, GridProvenance, NormalizedSample
 
@@ -15,6 +17,16 @@ logger = logging.getLogger(__name__)
 # Distinguishable sentinel stamped into site_feed_state.last_error when a
 # forward fetch returns HTTP 200 but yields zero usable canonical samples.
 NO_USABLE_SAMPLES_SENTINEL = "200 / 0 usable samples"
+
+# The shared read-side validator evaluated on one sample's own bound values, so
+# the writer and the readers agree on what "usable" means. The expression is 1
+# for a valid sample, 0 for an out-of-range one and NULL for a NaN value
+# (sqlite3 binds a float NaN as NULL); only 1 counts.
+_SAMPLE_IS_VALID_SQL: Final[str] = (
+    f"SELECT NOT {invalid_forecast_sample_sql('v')} "
+    "FROM (SELECT ? AS variable, ? AS value, ? AS lead_hours, "
+    "? AS issued_at, ? AS valid_at) v"
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,7 @@ def persist_fetch_result(
 ) -> PersistOutcome:
     inserted = 0
     usable = 0
+    has_valid = False
     fetched_at = fetched_at or isoformat_utc()
     for sample in result.samples:
         feed_id = _feed_id_for_sample(conn, source, fetch_feed_id, sample)
@@ -94,6 +107,8 @@ def persist_fetch_result(
             ),
         )
         inserted += cur.rowcount
+        if not has_valid:
+            has_valid = _sample_is_valid(conn, sample)
     grid = result.grid
     # No-op handling is the FORWARD-FETCH path only (advance_last_run_at=True);
     # the historical callers keep the unconditional last_error / error_count
@@ -104,6 +119,15 @@ def persist_fetch_result(
         _clear_feed_state(
             conn, site_id, fetch_feed_id, fetched_at, grid, advance_last_run_at
         )
+        # A forward fetch that returned at least one usable sample stamps the
+        # collection-freshness clock, even when every sample was already stored
+        # (inserted == 0). The row exists: _clear_feed_state UPSERTs it.
+        if advance_last_run_at and has_valid:
+            conn.execute(
+                "UPDATE site_feed_state SET last_usable_fetch_at = ? "
+                "WHERE site_id = ? AND feed_id = ?",
+                (fetched_at, site_id, fetch_feed_id),
+            )
     logger.debug(
         "persist site=%s feed=%s usable=%s inserted=%s",
         site_id,
@@ -112,6 +136,25 @@ def persist_fetch_result(
         inserted,
     )
     return PersistOutcome(usable_sample_count=usable, inserted_count=inserted)
+
+
+def _sample_is_valid(conn: sqlite3.Connection, sample: NormalizedSample) -> bool:
+    """Return True only when the shared validator reads exactly 1 for ``sample``.
+
+    ``row[0] == 1`` is the only sound reading: 0 means out of range and NULL
+    means a NaN or missing value, and both are not usable.
+    """
+    row = conn.execute(
+        _SAMPLE_IS_VALID_SQL,
+        (
+            sample.variable,
+            sample.value,
+            sample.lead_hours,
+            sample.issued_at,
+            sample.valid_at,
+        ),
+    ).fetchone()
+    return row is not None and row[0] == 1
 
 
 def _stamp_no_op(

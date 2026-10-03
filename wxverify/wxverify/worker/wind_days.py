@@ -1599,6 +1599,13 @@ def _switch_check(
     conn: sqlite3.Connection, site_id: int, tz_name: str, free: int | None
 ) -> bool:
     """Pass, waiting or blocked (plan §8.9). True only on a pass."""
+    state = wind_basis_state(conn, site_id)
+    if state != "staging":
+        # The basis moved since _start_job's transaction (site deleted ->
+        # key gone -> pair_max, or deleted and recreated at the same id).
+        # Write nothing; mirrors _staging_purge_day.
+        logger.info("wind switch check skipped: basis is %s site=%s", state, site_id)
+        return False
     today = _local_today(tz_name)
     counts = _switch_counts(conn, site_id, today)
     p1 = counts.retry_before_yesterday == 0

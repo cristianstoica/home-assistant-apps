@@ -3824,8 +3824,9 @@ def test_import_rejects_invalid_utf8_forecast_stamp(
     column: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """O3: an undecodable byte sequence in the stamp column fails closed as
-    422 'not a valid SQLite database', never a 500 -- the decode error
-    surfaces at fetch time, inside the loop's ``try``, not at ``execute``.
+    422 with the D2 text-check message, never a 500 -- the value now meets
+    the ``_refuse_invalid_text`` scan before the timestamp loop, so it gets
+    the specific text-check message rather than the loop's generic one.
     """
     target = tmp_path / f"utf8-{column}.db"
     canonical_pair = (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)
@@ -3842,7 +3843,9 @@ def test_import_rejects_invalid_utf8_forecast_stamp(
         assert resp.status_code == 422, (
             f"{column}: expected 422, got {resp.status_code}"
         )
-        assert resp.json() == {"error": "not a valid SQLite database"}
+        assert resp.json() == {
+            "error": f"invalid text in forecast_samples.{column}: expected valid UTF-8"
+        }
         sites = client.get("/api/sites").json()
     names = {s["name"] for s in sites}
     assert names == {"Guarded Site"}, f"{column}: live DB must be untouched"
@@ -4055,6 +4058,1017 @@ def test_import_resolves_forecast_samples_table_name_like_sqlite(
         db_transfer._validate_upload(view_target)  # noqa: SLF001
     assert exc_info.value.status_code == 422
     assert exc_info.value.message == "not a table: forecast_samples"
+
+
+# ---------------------------------------------------------------------------
+# U1-U8 (plan 2026-09-24-db-import-utf8-check.md): refuse a database import
+# holding text that is not valid UTF-8, in the file's schema (D1) or in any
+# of the add-on's own tables (D2), via a marking text_factory (D3).
+# ---------------------------------------------------------------------------
+
+
+def _sqlite_bytes_migrated_with(path: Path, statements: tuple[str, ...]) -> bytes:
+    """A fully migrated DB with site "site-synthetic" and each ``statements``
+    entry run afterward, mirroring ``_sqlite_bytes_with_forecast_stamps``.
+    """
+    db = Database(str(path))
+    try:
+        _insert_synthetic_site(db._conn, "site-synthetic")  # noqa: SLF001
+        for stmt in statements:
+            db._conn.execute(stmt)  # noqa: SLF001
+        db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+    finally:
+        db.close()
+    return path.read_bytes()
+
+
+def _amend_upload(path: Path, statements: tuple[str, ...]) -> None:
+    """Post-process a hand-built file: run each ``statements`` entry on a
+    plain default-settings connection. ``PRAGMA writable_schema`` pairs go
+    through unchanged, so a caller can bracket a catalogue edit.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        for stmt in statements:
+            conn.execute(stmt)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _sqlite_bytes_utf16(path: Path, name_hex: str) -> bytes:
+    """A hand-built UTF-16le database with one site whose ``name`` is the
+    raw bytes ``name_hex`` decodes to under the database's own encoding.
+    """
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA encoding = 'UTF-16le'")
+        conn.execute("CREATE TABLE sites (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("CREATE TABLE stations (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE station_observations (variable TEXT, valid_at TEXT)")
+        conn.execute(
+            f"INSERT INTO sites (id, name) VALUES (1, CAST(x'{name_hex}' AS TEXT))"
+        )
+        conn.execute("PRAGMA user_version = 7")
+        conn.commit()
+    finally:
+        conn.close()
+    return path.read_bytes()
+
+
+def _assert_integrity_ok(path: Path) -> None:
+    conn = sqlite3.connect(str(path))
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok", (
+            "precondition: integrity_check must be ok"
+        )
+    finally:
+        conn.close()
+
+
+_U1_STATION_TEMPLATE = (
+    "INSERT INTO stations (id, site_id, pws_station_id, lat, lon, dem_elevation_m)"
+    " VALUES ({n}, (SELECT id FROM sites), {value}, 0.0, 0.0, 100.0)"
+)
+
+_U1_CASES: tuple[tuple[str, tuple[str, ...], str], ...] = (
+    (
+        "pws_first",
+        (
+            _U1_STATION_TEMPLATE.format(n=1, value="CAST(x'49ff' AS TEXT)"),
+            _U1_STATION_TEMPLATE.format(n=2, value="'ISTATION02'"),
+            _U1_STATION_TEMPLATE.format(n=3, value="'ISTATION03'"),
+        ),
+        "invalid text in stations.pws_station_id: expected valid UTF-8",
+    ),
+    (
+        "pws_last",
+        (
+            _U1_STATION_TEMPLATE.format(n=1, value="'ISTATION01'"),
+            _U1_STATION_TEMPLATE.format(n=2, value="'ISTATION02'"),
+            _U1_STATION_TEMPLATE.format(n=3, value="CAST(x'49ff' AS TEXT)"),
+        ),
+        "invalid text in stations.pws_station_id: expected valid UTF-8",
+    ),
+    (
+        "poll_next",
+        (
+            _U1_STATION_TEMPLATE.format(n=1, value="'ISTATION01'"),
+            "INSERT INTO station_poll_state (station_id, next_poll_at)"
+            " VALUES (1, CAST(x'ff61' AS TEXT))",
+        ),
+        "invalid text in station_poll_state.next_poll_at: expected valid UTF-8",
+    ),
+    (
+        "job_payload",
+        (
+            "INSERT INTO jobs (type, site_id, payload)"
+            " VALUES ('fetch_current_obs', (SELECT id FROM sites),"
+            " CAST(x'7bff7d' AS TEXT))",
+        ),
+        "invalid text in jobs.payload: expected valid UTF-8",
+    ),
+)
+_U1_STATEMENTS_BY_ID = {case: statements for case, statements, _ in _U1_CASES}
+
+
+@pytest.mark.parametrize(
+    "case, statements, expected_error", _U1_CASES, ids=[c[0] for c in _U1_CASES]
+)
+def test_import_rejects_invalid_utf8_text(
+    case: str,
+    statements: tuple[str, ...],
+    expected_error: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """U1: D2's value scan, through the real HTTP route, over a genuinely
+    migrated upload -- the first row and the last row of ``stations``, and
+    two other app tables. Live DB untouched, no temp, no backup.
+    """
+    target = tmp_path / f"utf8-value-{case}.db"
+    payload = _sqlite_bytes_migrated_with(target, statements)
+
+    if case in ("pws_first", "pws_last"):
+        check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+        try:
+            cursor = check_conn.execute("SELECT * FROM stations")
+            idx = [d[0] for d in cursor.description].index("pws_station_id")
+            check_conn.text_factory = bytes
+            cursor = check_conn.execute("SELECT * FROM stations")
+            values = [row[idx] for row in cursor]
+        finally:
+            check_conn.close()
+        expected_values = (
+            [b"I\xff", b"ISTATION02", b"ISTATION03"]
+            if case == "pws_first"
+            else [b"ISTATION01", b"ISTATION02", b"I\xff"]
+        )
+        assert values == expected_values, (
+            f"{case}: precondition -- bad row must be first/last in scan order"
+        )
+
+    conn = _init_tmp_db(tmp_path)
+    _insert_synthetic_site(conn, "site-live")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 422, f"{case}: expected 422, got {resp.status_code}"
+        assert resp.json() == {"error": expected_error}
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert names == {"site-live"}, f"{case}: live DB must be untouched"
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        f"{case}: import temp must not remain"
+    )
+    assert list(db_dir.glob("*.db.bak")) == [], (
+        f"{case}: no backup must be created before validation passes"
+    )
+
+
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _u2_odd_name_case(path: Path, name: str) -> None:
+    _sqlite_bytes_hand_built(path, None, [])
+    _amend_upload(
+        path,
+        (
+            f"ALTER TABLE stations ADD COLUMN {_quote_identifier(name)} TEXT",
+            f"INSERT INTO stations (id, {_quote_identifier(name)})"
+            " VALUES (1, CAST(x'ff61' AS TEXT))",
+        ),
+    )
+    check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        cursor = check_conn.execute("SELECT * FROM stations")
+        assert cursor.description[1][0] == name, (
+            "precondition: column 2's description name must be the odd name"
+        )
+    finally:
+        check_conn.close()
+
+
+def _validate_upload_u2_case(case: str, path: Path) -> str:
+    """Build the U2 fixture for ``case``, assert its precondition, and
+    return the expected exact ApiError message.
+    """
+    if case == "jobs_extra_column":
+        _sqlite_bytes_migrated_with(
+            path,
+            (
+                "ALTER TABLE jobs ADD COLUMN extra_note TEXT",
+                "INSERT INTO jobs (type, site_id, extra_note)"
+                " VALUES ('fetch_current_obs', (SELECT id FROM sites),"
+                " CAST(x'ff61' AS TEXT))",
+            ),
+        )
+        return "invalid text in jobs.extra_note: expected valid UTF-8"
+
+    if case == "nul_then_invalid":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN pws_station_id TEXT",
+                "INSERT INTO stations (id, pws_station_id)"
+                " VALUES (1, CAST(x'4900ff' AS TEXT))",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            length = check_conn.execute(
+                "SELECT length(CAST(pws_station_id AS BLOB)) FROM stations"
+            ).fetchone()[0]
+        finally:
+            check_conn.close()
+        assert length == 3, "precondition: stored byte length must be 3"
+        return "invalid text in stations.pws_station_id: expected valid UTF-8"
+
+    if case == "generated_column":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN gen_note TEXT"
+                " GENERATED ALWAYS AS (CAST(x'ff61' AS TEXT)) VIRTUAL",
+                "INSERT INTO stations DEFAULT VALUES",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            plain = {
+                row[1] for row in check_conn.execute("PRAGMA table_info(stations)")
+            }
+            extended = {
+                row[1] for row in check_conn.execute("PRAGMA table_xinfo(stations)")
+            }
+        finally:
+            check_conn.close()
+        assert "gen_note" not in plain, "precondition: table_info must hide gen_note"
+        assert "gen_note" in extended, "precondition: table_xinfo must list gen_note"
+        return "invalid text in stations.gen_note: expected valid UTF-8"
+
+    if case == "odd_name_space":
+        _u2_odd_name_case(path, "extra note!")
+        return "invalid text in stations.<column 2>: expected valid UTF-8"
+
+    if case == "odd_name_newline":
+        _u2_odd_name_case(path, "extra_note\n")
+        return "invalid text in stations.<column 2>: expected valid UTF-8"
+
+    if case == "odd_name_65":
+        name = "a" + "b" * 64
+        assert len(name) == 65, "precondition: name must be 65 characters"
+        _u2_odd_name_case(path, name)
+        return "invalid text in stations.<column 2>: expected valid UTF-8"
+
+    if case == "name_64_echoed":
+        name = "a" + "b" * 63
+        assert len(name) == 64, "precondition: name must be 64 characters"
+        _u2_odd_name_case(path, name)
+        return f"invalid text in stations.{name}: expected valid UTF-8"
+
+    if case == "column_rename":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN extra_note TEXT",
+                "INSERT INTO stations (id, extra_note) VALUES (1, 'ok')",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET sql = replace(sql, 'extra_note',"
+                " 'extra_' || CAST(x'ff' AS TEXT)) WHERE name = 'stations'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+            marked = check_conn.execute(
+                "SELECT instr(hex(sql), 'FF') > 0 FROM sqlite_master"
+                " WHERE name = 'stations'"
+            ).fetchone()[0]
+        finally:
+            check_conn.close()
+        assert integrity == "ok", "precondition: integrity_check must be ok"
+        assert marked == 1, "precondition: stations.sql must carry the FF byte"
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            with pytest.raises(UnicodeDecodeError):
+                default_conn.execute("SELECT * FROM stations").fetchall()
+        finally:
+            default_conn.close()
+        return "invalid text in sqlite_master.sql: expected valid UTF-8"
+
+    if case == "table_name":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE placeholder (a)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET name = CAST(x'ff74' AS TEXT),"
+                " tbl_name = CAST(x'ff74' AS TEXT),"
+                " sql = 'CREATE TABLE \"' || CAST(x'ff74' AS TEXT) || '\" (a)'"
+                " WHERE name = 'placeholder'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+            count = check_conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE hex(name) = 'FF74'"
+            ).fetchone()[0]
+        finally:
+            check_conn.close()
+        assert integrity == "ok", "precondition: integrity_check must be ok"
+        assert count == 1, (
+            "precondition: exactly one row must carry the undecodable name"
+        )
+        return "invalid text in sqlite_master.name: expected valid UTF-8"
+
+    if case == "index_sql":
+        _sqlite_bytes_hand_built(
+            path,
+            "CREATE TABLE forecast_samples"
+            " (variable TEXT, issued_at TEXT, valid_at TEXT)",
+            [],
+        )
+        _amend_upload(
+            path,
+            (
+                "CREATE INDEX idx_samples_recent ON forecast_samples(valid_at)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET sql = sql || ' /*' ||"
+                " CAST(x'ff' AS TEXT) || '*/' WHERE name = 'idx_samples_recent'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        return "invalid text in sqlite_master.sql: expected valid UTF-8"
+
+    if case == "utf16_surrogate":
+        _sqlite_bytes_utf16(path, "610000D8")
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            encoding = check_conn.execute("PRAGMA encoding").fetchone()[0]
+            hex_name = check_conn.execute("SELECT hex(name) FROM sites").fetchone()[0]
+        finally:
+            check_conn.close()
+        assert encoding == "UTF-16le", "precondition: database must be UTF-16le"
+        assert hex_name == "610000D8", "precondition: stored bytes must match"
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                default_conn.execute("SELECT name FROM sites").fetchall()
+        finally:
+            default_conn.close()
+        return "invalid text in sites.name: expected valid UTF-8"
+
+    raise ValueError(case)
+
+
+_U2_CASES: tuple[str, ...] = (
+    "jobs_extra_column",
+    "nul_then_invalid",
+    "generated_column",
+    "odd_name_space",
+    "odd_name_newline",
+    "odd_name_65",
+    "name_64_echoed",
+    "column_rename",
+    "table_name",
+    "index_sql",
+    "utf16_surrogate",
+)
+
+
+@pytest.mark.parametrize("case", _U2_CASES)
+def test_validate_upload_rejects_invalid_utf8_text(case: str, tmp_path: Path) -> None:
+    """U2: direct cases pinning D1's and D2's text scans -- a column a file
+    adds, a NUL-then-invalid value, a VIRTUAL generated column, foreign
+    column names of every allowlist shape, a decodable-but-marked catalogue
+    ``sql``, an undecodable table ``name``, an undecodable index ``sql``,
+    and a UTF-16 file's lone surrogate.
+    """
+    target = tmp_path / f"utf8-direct-{case}.db"
+    expected_message = _validate_upload_u2_case(case, target)
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == expected_message
+
+
+def test_validate_upload_fails_closed_on_read_error_during_text_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U3: a factory that raises mid-iteration is caught by the enclosing
+    ``try`` and becomes the house 'not a valid SQLite database' refusal --
+    proving the error surfaces at fetch time, inside the loop, not at
+    ``execute``, and that row 1 is returned before it (D3, item 11).
+    """
+    target = tmp_path / "utf8-read-error.db"
+    _sqlite_bytes_hand_built(target, None, [])
+    _amend_upload(
+        target,
+        (
+            "ALTER TABLE stations ADD COLUMN pws_station_id TEXT",
+            "INSERT INTO stations (id, pws_station_id) VALUES (1, 'ISTATION01')",
+            "INSERT INTO stations (id, pws_station_id) VALUES (2, 'ISTATION-FAULT')",
+        ),
+    )
+    original = db_transfer._flag_invalid_utf8
+    seen: list[bytes] = []
+
+    def raiser(raw: bytes) -> object:
+        seen.append(raw)
+        if raw == b"ISTATION-FAULT":
+            raise sqlite3.OperationalError("injected")
+        return original(raw)
+
+    monkeypatch.setattr(db_transfer, "_flag_invalid_utf8", raiser)
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a valid SQLite database"
+    assert isinstance(exc_info.value.__cause__, sqlite3.OperationalError)
+    assert str(exc_info.value.__cause__) == "injected"
+    assert b"ISTATION01" in seen
+    assert b"ISTATION-FAULT" in seen
+
+
+_U4_CASES: tuple[str, ...] = (
+    "blob_in_text",
+    "foreign_table_value",
+    "valid_edge",
+    "utf16_cafe",
+)
+
+
+def _validate_upload_u4_case(case: str, path: Path) -> None:
+    if case == "blob_in_text":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN last_error TEXT",
+                "INSERT INTO stations (id, last_error) VALUES (1, x'ff61')",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            kind = check_conn.execute(
+                "SELECT typeof(last_error) FROM stations"
+            ).fetchone()[0]
+        finally:
+            check_conn.close()
+        assert kind == "blob", "precondition: last_error must be stored as BLOB"
+        return
+
+    if case == "foreign_table_value":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT)",
+                "INSERT INTO extra_notes (note) VALUES (CAST(x'ff61' AS TEXT))",
+            ),
+        )
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                default_conn.execute("SELECT note FROM extra_notes").fetchall()
+        finally:
+            default_conn.close()
+        return
+
+    if case == "valid_edge":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN pws_station_id TEXT",
+                "INSERT INTO stations (id, pws_station_id) VALUES (1, 'I€')",
+                "INSERT INTO stations (id, pws_station_id) VALUES (2, 'I￾')",
+                "INSERT INTO stations (id, pws_station_id) VALUES (3, 'I\U0010ffff')",
+            ),
+        )
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            values = [
+                row[0]
+                for row in check_conn.execute(
+                    "SELECT hex(pws_station_id) FROM stations ORDER BY id"
+                )
+            ]
+        finally:
+            check_conn.close()
+        assert values == ["49E282AC", "49EFBFBE", "49F48FBFBF"], (
+            "precondition: stored hex must match the valid-edge code points"
+        )
+        return
+
+    if case == "utf16_cafe":
+        _sqlite_bytes_utf16(path, "630061006600E900")
+        check_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            encoding = check_conn.execute("PRAGMA encoding").fetchone()[0]
+        finally:
+            check_conn.close()
+        assert encoding == "UTF-16le", "precondition: database must be UTF-16le"
+        default_conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            name = default_conn.execute("SELECT name FROM sites").fetchone()[0]
+        finally:
+            default_conn.close()
+        assert name == "café", "precondition: default factory must read café"
+        return
+
+    raise ValueError(case)
+
+
+@pytest.mark.parametrize("case", _U4_CASES)
+def test_validate_upload_admits_text_the_app_can_read(
+    case: str, tmp_path: Path
+) -> None:
+    """U4: the admission controls -- a BLOB in a text column, undecodable
+    text in a table the app does not own, valid edge code points, and a
+    valid UTF-16 file. ``_validate_upload`` must not raise.
+    """
+    target = tmp_path / f"utf8-admit-{case}.db"
+    _validate_upload_u4_case(case, target)
+    db_transfer._validate_upload(target)  # must not raise  # noqa: SLF001
+
+
+def test_import_accepts_valid_file_after_utf8_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U5: over-strict-mutant control, through the real route -- a refused
+    upload does not wedge the endpoint, and a genuinely valid, fully
+    migrated upload -- carrying a station, its poll state, and a queued
+    job, all decodable -- is admitted.
+    """
+    conn = _init_tmp_db(tmp_path)
+    _insert_synthetic_site(conn, "site-live")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+
+        reject_target = tmp_path / "u5-reject.db"
+        reject_payload = _sqlite_bytes_migrated_with(
+            reject_target, _U1_STATEMENTS_BY_ID["pws_first"]
+        )
+        reject_resp = client.post(
+            "/api/import/db", content=reject_payload, headers=headers
+        )
+        assert reject_resp.status_code == 422
+
+        accept_target = tmp_path / "u5-accept.db"
+        accept_payload = _sqlite_bytes_migrated_with(
+            accept_target,
+            (
+                "INSERT INTO stations (id, site_id, pws_station_id, lat, lon,"
+                " dem_elevation_m)"
+                " VALUES (1, (SELECT id FROM sites), 'ISTATION01', 0.0, 0.0,"
+                " 100.0)",
+                "INSERT INTO station_poll_state (station_id, next_poll_at)"
+                " VALUES (1, '2026-01-01T00:00:00Z')",
+                "INSERT INTO jobs (type, site_id, payload) VALUES"
+                " ('fetch_current_obs', (SELECT id FROM sites), '{}')",
+            ),
+        )
+        headers = _csrf_headers(client)
+        accept_resp = client.post(
+            "/api/import/db", content=accept_payload, headers=headers
+        )
+        assert accept_resp.status_code == 200
+        assert accept_resp.json()["status"] == "imported"
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert "site-synthetic" in names
+
+
+def test_validate_upload_timestamp_read_error_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """U6: restores the pin O3 used to provide -- a read error during the
+    timestamp loop, which now runs after D2, still fails closed as the
+    house generic refusal, never a 500.
+    """
+    target = tmp_path / "utf8-timestamp-read-error.db"
+    _sqlite_bytes_hand_built(
+        target,
+        "CREATE TABLE forecast_samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [("temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)],
+    )
+    calls = 0
+
+    def raiser(_value: object) -> bool:
+        nonlocal calls
+        calls += 1
+        raise sqlite3.OperationalError("injected")
+
+    monkeypatch.setattr(db_transfer, "is_canonical_utc_stamp", raiser)
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "not a valid SQLite database"
+    assert isinstance(exc_info.value.__cause__, sqlite3.OperationalError)
+    assert str(exc_info.value.__cause__) == "injected"
+    assert calls >= 1
+
+
+def test_validate_upload_blob_refusal_precedes_text_check(tmp_path: Path) -> None:
+    """U7: D2 runs after the BLOB guard, so an existing BLOB-guard refusal
+    keeps its message even when the same file also holds undecodable text
+    elsewhere (§14 judgment call 6, M26).
+    """
+    target = tmp_path / "utf8-blob-precedence.db"
+    _sqlite_bytes_hand_built(
+        target,
+        "CREATE TABLE forecast_samples (variable TEXT, issued_at TEXT, valid_at TEXT)",
+        [(b"temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)],
+    )
+    _amend_upload(
+        target,
+        (
+            "ALTER TABLE sites ADD COLUMN name TEXT",
+            "INSERT INTO sites (id, name) VALUES (1, CAST(x'ff61' AS TEXT))",
+        ),
+    )
+    check_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
+        kind = check_conn.execute(
+            "SELECT typeof(variable) FROM forecast_samples"
+        ).fetchone()[0]
+    finally:
+        check_conn.close()
+    assert integrity == "ok", "precondition: integrity_check must be ok"
+    assert kind == "blob", "precondition: variable must be stored as BLOB"
+    default_conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            default_conn.execute("SELECT name FROM sites").fetchall()
+    finally:
+        default_conn.close()
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "invalid data in forecast_samples.variable"
+
+
+def _u8_case(case: str, path: Path) -> None:
+    """Build the U8 fixture for ``case`` and assert its own precondition."""
+    if case == "type_upper":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET type = 'TABLE' WHERE name = 'extra_notes'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        try:
+            kind = conn.execute(
+                "SELECT type FROM sqlite_master WHERE name = 'extra_notes'"
+            ).fetchone()[0]
+            listed = [
+                row["type"]
+                for row in conn.execute("PRAGMA main.table_list('extra_notes')")
+            ]
+        finally:
+            conn.close()
+        assert kind == "TABLE", "precondition: type must be stored as 'TABLE'"
+        assert listed == ["table"], (
+            "precondition: table_list must still report kind table"
+        )
+        return
+
+    if case == "type_blob":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET type = CAST(type AS BLOB)"
+                " WHERE name = 'extra_notes'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        try:
+            kind = conn.execute(
+                "SELECT typeof(type) FROM sqlite_master WHERE name = 'extra_notes'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert kind == "blob", "precondition: type must be stored as BLOB"
+        return
+
+    if case == "type_null":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT UNIQUE)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET type = NULL"
+                " WHERE name = 'sqlite_autoindex_extra_notes_1'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        try:
+            row = conn.execute(
+                "SELECT typeof(type), sql IS NULL FROM sqlite_master"
+                " WHERE name = 'sqlite_autoindex_extra_notes_1'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("null", 1), (
+            "precondition: the automatic index's type must be NULL, sql NULL"
+        )
+        return
+
+    if case == "name_blob":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET name = CAST(name AS BLOB)"
+                " WHERE name = 'extra_notes'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        try:
+            kind = conn.execute(
+                "SELECT typeof(name) FROM sqlite_master WHERE tbl_name = 'extra_notes'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert kind == "blob", "precondition: name must be stored as BLOB"
+        return
+
+    if case == "tbl_name_blob":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "CREATE TABLE extra_notes (note TEXT)",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET tbl_name = CAST(tbl_name AS BLOB)"
+                " WHERE name = 'extra_notes'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        try:
+            kind = conn.execute(
+                "SELECT typeof(tbl_name) FROM sqlite_master WHERE name = 'extra_notes'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert kind == "blob", "precondition: tbl_name must be stored as BLOB"
+        return
+
+    if case == "sql_blob":
+        _sqlite_bytes_hand_built(path, None, [])
+        _amend_upload(
+            path,
+            (
+                "ALTER TABLE stations ADD COLUMN extra_note TEXT",
+                "INSERT INTO stations (id, extra_note) VALUES (1, 'ok')",
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET sql = CAST(replace(sql, 'extra_note',"
+                " 'extra_' || CAST(x'ff' AS TEXT)) AS BLOB) WHERE name = 'stations'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        try:
+            row = conn.execute(
+                "SELECT typeof(sql), instr(hex(sql), 'FF') > 0 FROM sqlite_master"
+                " WHERE name = 'stations'"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row == ("blob", 1), (
+            "precondition: stations.sql must be stored as BLOB carrying FF"
+        )
+        default_conn = sqlite3.connect(str(path))
+        try:
+            with pytest.raises(UnicodeDecodeError):
+                default_conn.execute("SELECT * FROM stations").fetchall()
+        finally:
+            default_conn.close()
+        return
+
+    if case == "type_upper_hides_blob":
+        _sqlite_bytes_hand_built(
+            path,
+            "CREATE TABLE forecast_samples"
+            " (variable TEXT, issued_at TEXT, valid_at TEXT)",
+            [(b"temperature", _STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)],
+        )
+        _amend_upload(
+            path,
+            (
+                "PRAGMA writable_schema = ON",
+                "UPDATE sqlite_master SET type = 'TABLE'"
+                " WHERE name = 'forecast_samples'",
+                "PRAGMA writable_schema = OFF",
+            ),
+        )
+        _assert_integrity_ok(path)
+        conn = sqlite3.connect(str(path))
+        conn.row_factory = sqlite3.Row
+        try:
+            kind = conn.execute(
+                "SELECT typeof(variable) FROM forecast_samples"
+            ).fetchone()[0]
+            listed = [
+                row["type"]
+                for row in conn.execute("PRAGMA main.table_list('forecast_samples')")
+            ]
+            present = db_transfer._guarded_table_present(  # noqa: SLF001
+                conn, "forecast_samples"
+            )
+        finally:
+            conn.close()
+        assert kind == "blob", "precondition: variable must be stored as BLOB"
+        assert listed == ["table"], (
+            "precondition: table_list must still report kind table"
+        )
+        assert present is False, (
+            "precondition: the existing lookup must read the table as absent"
+        )
+        return
+
+    raise ValueError(case)
+
+
+_U8_CASES: tuple[str, ...] = (
+    "type_upper",
+    "type_blob",
+    "type_null",
+    "name_blob",
+    "tbl_name_blob",
+    "sql_blob",
+    "type_upper_hides_blob",
+)
+
+
+@pytest.mark.parametrize("case", _U8_CASES)
+def test_validate_upload_rejects_malformed_catalogue_entry(
+    case: str, tmp_path: Path
+) -> None:
+    """U8: D1's shape query, an allowlist of what SQLite itself writes --
+    a `type` spelled or stored any other way, a BLOB `name` or `tbl_name`,
+    a `sql` that is neither TEXT nor NULL, and NULL `type` on an automatic
+    index's row. `type_upper_hides_blob` proves the original bypass is
+    closed: the file loads as an ordinary table under `TABLE`, the existing
+    lookup reads it as absent, and D1 refuses it before that lookup runs.
+    """
+    target = tmp_path / f"utf8-catalogue-{case}.db"
+    _u8_case(case, target)
+    with pytest.raises(ApiError) as exc_info:
+        db_transfer._validate_upload(target)  # noqa: SLF001
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.message == "invalid schema entry in sqlite_master"
+
+
+def test_import_rejects_catalogue_bypass_live_db_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review point: the original bypass this plan closes -- a catalogue
+    row spelled ``TABLE`` that hides a BLOB in an app table -- is refused
+    through the real HTTP route too, and the live database is left
+    untouched. U8's `type_upper_hides_blob` proves the bypass is closed at
+    `_validate_upload` directly; this is the same fixture through the
+    route, which U8 (direct `_validate_upload` calls only, per plan) does
+    not itself cover.
+    """
+    target = tmp_path / "utf8-catalogue-bypass-http.db"
+    _u8_case("type_upper_hides_blob", target)
+    payload = target.read_bytes()
+    conn = _init_tmp_db(tmp_path)
+    _insert_synthetic_site(conn, "site-live")
+    conn.commit()
+    app = _make_app(monkeypatch)
+    db_dir = Path(config.db_path).parent
+    with TestClient(app, raise_server_exceptions=False) as client:
+        headers = _csrf_headers(client)
+        resp = client.post("/api/import/db", content=payload, headers=headers)
+        assert resp.status_code == 422
+        assert resp.json() == {"error": "invalid schema entry in sqlite_master"}
+        sites = client.get("/api/sites").json()
+    names = {s["name"] for s in sites}
+    assert names == {"site-live"}, "live DB must be untouched"
+    assert list(db_dir.glob(".wxverify-import-*.db.tmp")) == [], (
+        "import temp must not remain"
+    )
+    assert list(db_dir.glob("*.db.bak")) == [], (
+        "no backup must be created before validation passes"
+    )
+
+
+def test_refuse_invalid_text_restores_default_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review point: `conn.text_factory` is restored to `str` after
+    `_refuse_invalid_text` returns normally, after it raises `ApiError` for
+    invalid text, and after a database error during iteration -- so no
+    later read on the same connection ever inherits the marking factory.
+    """
+    valid_target = tmp_path / "factory-valid.db"
+    _sqlite_bytes_hand_built(valid_target, None, [])
+    _amend_upload(
+        valid_target,
+        (
+            "INSERT INTO station_observations (variable, valid_at)"
+            " VALUES ('temperature', '2026-01-01T00:00:00Z')",
+        ),
+    )
+    conn = sqlite3.connect(str(valid_target))
+    try:
+        db_transfer._refuse_invalid_text(  # noqa: SLF001
+            conn, "station_observations", "SELECT * FROM station_observations"
+        )
+        assert conn.text_factory is str, (
+            "text_factory must be restored after a normal return"
+        )
+    finally:
+        conn.close()
+
+    invalid_target = tmp_path / "factory-invalid.db"
+    _sqlite_bytes_hand_built(invalid_target, None, [])
+    _amend_upload(
+        invalid_target,
+        (
+            "INSERT INTO station_observations (variable, valid_at)"
+            " VALUES (CAST(x'ff61' AS TEXT), '2026-01-01T00:00:00Z')",
+        ),
+    )
+    conn = sqlite3.connect(str(invalid_target))
+    try:
+        with pytest.raises(ApiError):
+            db_transfer._refuse_invalid_text(  # noqa: SLF001
+                conn, "station_observations", "SELECT * FROM station_observations"
+            )
+        assert conn.text_factory is str, (
+            "text_factory must be restored after an ApiError refusal"
+        )
+    finally:
+        conn.close()
+
+    error_target = tmp_path / "factory-error.db"
+    _sqlite_bytes_hand_built(error_target, None, [])
+    _amend_upload(
+        error_target,
+        (
+            "INSERT INTO station_observations (variable, valid_at)"
+            " VALUES ('temperature', '2026-01-01T00:00:00Z')",
+        ),
+    )
+    conn = sqlite3.connect(str(error_target))
+    try:
+
+        def raiser(_raw: bytes) -> object:
+            raise sqlite3.OperationalError("injected")
+
+        monkeypatch.setattr(db_transfer, "_flag_invalid_utf8", raiser)
+        with pytest.raises(ApiError):
+            db_transfer._refuse_invalid_text(  # noqa: SLF001
+                conn, "station_observations", "SELECT * FROM station_observations"
+            )
+        assert conn.text_factory is str, (
+            "text_factory must be restored after a database error mid-scan"
+        )
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

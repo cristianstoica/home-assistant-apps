@@ -32,10 +32,13 @@ from wxverify.db.connection import (
     EPOCH_MOVED,
     Database,
     FencedWriter,
+    InputCounts,
     close_db,
     init_db,
+    pinned_read_snapshot,
 )
 from wxverify.db.runtime_state import set_runtime_state, set_runtime_state_now
+from wxverify.db.snapshot import SnapshotNestingError, read_snapshot
 from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_pointer_key,
@@ -345,6 +348,30 @@ def fx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Fixture:
 
 def _spy_of(fx: _Fixture) -> _Spy:
     return fx.__dict__["spy"]  # type: ignore[no-any-return]
+
+
+async def _checkout_one(db: Database) -> sqlite3.Connection:
+    """Dequeue one pooled reader directly, for a test that must hold a
+    connection's snapshot open across other activity without risking
+    ``db.read``/``_serve`` handing the SAME connection out again meanwhile."""
+    return await db._read_pool.get()  # noqa: SLF001
+
+
+async def _checkout_two(
+    db: Database,
+) -> tuple[sqlite3.Connection, sqlite3.Connection]:
+    c1 = await db._read_pool.get()  # noqa: SLF001
+    c2 = await db._read_pool.get()  # noqa: SLF001
+    return c1, c2
+
+
+def _release_one(db: Database, conn: sqlite3.Connection) -> None:
+    db._read_pool.put_nowait(conn)  # noqa: SLF001
+
+
+def _release_two(db: Database, c1: sqlite3.Connection, c2: sqlite3.Connection) -> None:
+    db._read_pool.put_nowait(c1)  # noqa: SLF001
+    db._read_pool.put_nowait(c2)  # noqa: SLF001
 
 
 # --- T117: cached = uncached -----------------------------------------------
@@ -1424,6 +1451,512 @@ def test_t127_probe_error_bypass(fx: _Fixture, monkeypatch: pytest.MonkeyPatch) 
     assert rehit.weights == uncached_new
 
 
+def test_t127f_autocommit_second_reading_probe_error(
+    fx: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New T127(f): the autocommit bypass's SECOND counts reading fails.
+
+    ``_cached_weights``'s autocommit path (``wind_blend.py`` ~:664-696) reads
+    ``before = db.input_counts()``, then inside ``read_only_snapshot`` reads
+    ``after = db.input_counts()`` again. ``test_t127_probe_error_bypass``
+    above patches ``external_commit_seq`` to ``None`` for every call, so it
+    only ever exercises the ``before is None`` early return; this pins the
+    OTHER leg -- the priming (second) reading failing while the first
+    succeeds.
+
+    mutant_only_after_not_none (``if after is not None and after != before:``)
+    -> at ``after1["bypasses"]["probe_error"] == before1["bypasses"]
+    ["probe_error"] + 1`` and ``after1["misses"] == before1["misses"]``:
+    correct = ``probe_error`` bumps and ``misses`` stays flat (the bypass
+    path never stores), mutant (gating the whole check on ``after is not
+    None``) = neither bypass counter moves and ``misses`` bumps instead --
+    with ``after`` literally ``None`` the mutant's condition is false, so it
+    falls through to the miss path and stores the weights keyed on
+    ``before``. Confirmed by the follow-up: after ``monkeypatch.undo()``, a
+    plain ``_serve`` is a genuine miss under correct code (nothing was ever
+    stored) but would wrongly HIT under this mutant (the stored entry's key
+    still matches the restored real counts, since no training data
+    changed).
+    mutant_always_counts_moved (``_count_bypass("counts_moved")``
+    unconditionally, dropping the ``after is None`` choice) -> at the same
+    bypass assertions: correct = ``probe_error`` +1, ``counts_moved`` +0,
+    mutant = ``counts_moved`` +1, ``probe_error`` +0.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    uncached = _uncached(db, fx)
+    real_ext = db.external_commit_seq
+    calls = {"n": 0}
+
+    def _wrapper() -> int | None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return None
+        return real_ext()
+
+    monkeypatch.setattr(db, "external_commit_seq", _wrapper)
+
+    before1 = wind_blend.wind_weights_cache_stats()
+    served = _serve(db, fx)
+    after1 = wind_blend.wind_weights_cache_stats()
+
+    assert calls["n"] == 2
+    assert served.weights == uncached
+    assert (
+        after1["bypasses"]["probe_error"]  # type: ignore[index]
+        == before1["bypasses"]["probe_error"] + 1  # type: ignore[index]
+    )
+    assert (
+        after1["bypasses"]["counts_moved"]  # type: ignore[index]
+        == before1["bypasses"]["counts_moved"]  # type: ignore[index]
+    )
+    assert after1["hits"] == before1["hits"]
+    assert after1["misses"] == before1["misses"]
+
+    monkeypatch.undo()
+    before2 = wind_blend.wind_weights_cache_stats()
+    missed = _serve(db, fx)
+    after2 = wind_blend.wind_weights_cache_stats()
+    assert missed.weights == uncached
+    assert after2["misses"] == before2["misses"] + 1  # type: ignore[index]
+    assert after2["hits"] == before2["hits"]
+
+
+def test_t127a_plain_read_snapshot_is_not_a_pin(fx: _Fixture) -> None:
+    """New T127(a): a plain ``read_snapshot`` on a pooled reader is not a pin.
+
+    mutant_lazy_pin -> at ``result.weights == w_before`` and the unchanged
+    hit/miss counters: correct = the call inside the plain ``read_snapshot``
+    is counted an ``in_transaction`` bypass (``db.snapshot_pin`` returns
+    ``None`` for a connection no ``pinned_snapshot`` ever registered, even
+    though it IS in a transaction), mutant (treating any pooled reader
+    inside a transaction as pinned, keyed on counts read lazily at lookup
+    time) = the call wrongly hits/misses against those lazy counts instead
+    of bypassing.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    _serve(db, fx)
+    hit = _serve(db, fx)
+    w_before = hit.weights
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        with read_snapshot(conn, label="t127_plain"):
+            assert db.snapshot_pin(conn) is None
+            sql, params = _training_update_sql(fx)
+            raw = sqlite3.connect(db.path)
+            try:
+                raw.execute(sql, params)
+                raw.commit()
+            finally:
+                raw.close()
+            return wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+
+    before = wind_blend.wind_weights_cache_stats()
+    result = asyncio.run(db.read(_run))
+    after = wind_blend.wind_weights_cache_stats()
+    assert result.weights == w_before
+    assert (
+        after["bypasses"]["in_transaction"]  # type: ignore[index]
+        == before["bypasses"]["in_transaction"] + 1  # type: ignore[index]
+    )
+    assert after["hits"] == before["hits"]
+    assert after["misses"] == before["misses"]
+
+    uncached_now = _uncached(db, fx)
+    assert uncached_now != w_before
+    follow = _serve(db, fx)
+    assert follow.weights == uncached_now
+    stats_after_follow = wind_blend.wind_weights_cache_stats()
+    assert stats_after_follow["misses"] == after["misses"] + 1  # type: ignore[index]
+
+
+def test_t127b_counts_moved_from_foreign_commit(fx: _Fixture) -> None:
+    """New T127(b): ``counts_moved`` pin when another connection commits
+    between the pin's two readings.
+
+    mutant_drop_second_reading -> at the in-block
+    ``assert db.snapshot_pin(conn) == "counts_moved"``: correct =
+    ``"counts_moved"``, because the pin's second (post-priming) reading
+    sees the foreign commit and disagrees with the first, mutant (a pin
+    keyed on counts read once, before ``BEGIN``, never re-checked after the
+    priming read) = the stable ``InputCounts`` from that one reading
+    instead.
+    mutant_before_read_after_priming -> at the same in-block
+    ``assert db.snapshot_pin(conn) == "counts_moved"``: correct =
+    ``"counts_moved"``, because the "before" reading lands ahead of the raw
+    commit while the priming read (and so the "after" reading) lands after
+    it, mutant (taking the "before" reading after the priming read too, so
+    both readings see the commit) = the stable ``InputCounts`` pin instead.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    _serve(db, fx)
+    hit = _serve(db, fx)
+    w_before = hit.weights
+    fired = False
+
+    def _cb(stmt: str) -> None:
+        nonlocal fired
+        if not fired and stmt.strip() == "BEGIN DEFERRED":
+            fired = True
+            sql, params = _training_update_sql(fx)
+            raw = sqlite3.connect(db.path)
+            try:
+                raw.execute(sql, params)
+                raw.commit()
+            finally:
+                raw.close()
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        conn.set_trace_callback(_cb)
+        try:
+            with pinned_read_snapshot(conn, label="t127b_moved"):
+                assert db.snapshot_pin(conn) == "counts_moved"
+                result = wind_blend.load_wind_serving(
+                    conn,
+                    site_id=fx.site_id,
+                    timezone=fx.timezone,
+                    today=fx.today,
+                    as_of=None,
+                )
+        finally:
+            conn.set_trace_callback(None)
+        assert db.snapshot_pin(conn) is None
+        return result
+
+    before = wind_blend.wind_weights_cache_stats()
+    served = asyncio.run(db.read(_run))
+    assert fired
+
+    w_after = _uncached(db, fx)
+    assert w_after != w_before
+    assert served.weights == w_after
+
+    after = wind_blend.wind_weights_cache_stats()
+    assert (
+        after["bypasses"]["counts_moved"]  # type: ignore[index]
+        == before["bypasses"]["counts_moved"] + 1  # type: ignore[index]
+    )
+    assert after["hits"] == before["hits"]
+    assert after["misses"] == before["misses"]
+
+    follow = _serve(db, fx)
+    assert follow.weights == w_after
+    stats_after_follow = wind_blend.wind_weights_cache_stats()
+    assert stats_after_follow["misses"] == after["misses"] + 1  # type: ignore[index]
+
+
+def test_t127c_counts_moved_from_own_write(fx: _Fixture) -> None:
+    """New T127(c): ``counts_moved`` pin from the process's OWN write.
+
+    mutant_pin_compares_ext_only -> at ``w_after != w_before`` and
+    ``served.weights == w_after``: correct = an own write bumps
+    ``input_epoch`` directly (synchronously, before the absorb that would
+    otherwise leave ``ext`` unmoved for an own commit), so the pin's epoch
+    field alone already differs and the pin refuses as ``counts_moved``,
+    mutant (a pin that compares only ``InputCounts.ext``, ignoring
+    ``epoch``) = an own write between the two readings leaves ``ext``
+    unchanged (own commits are absorbed uncounted), so the mutant pin
+    wrongly holds stable and stores/serves the stale pre-write weights.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    _serve(db, fx)
+    hit = _serve(db, fx)
+    w_before = hit.weights
+    fired = False
+
+    def _cb(stmt: str) -> None:
+        nonlocal fired
+        if not fired and stmt.strip() == "BEGIN DEFERRED":
+            fired = True
+            sql, params = _training_update_sql(fx)
+            db.write_sync(lambda c: c.execute(sql, params))
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        conn.set_trace_callback(_cb)
+        try:
+            with pinned_read_snapshot(conn, label="t127c_moved"):
+                assert db.snapshot_pin(conn) == "counts_moved"
+                result = wind_blend.load_wind_serving(
+                    conn,
+                    site_id=fx.site_id,
+                    timezone=fx.timezone,
+                    today=fx.today,
+                    as_of=None,
+                )
+        finally:
+            conn.set_trace_callback(None)
+        return result
+
+    before = wind_blend.wind_weights_cache_stats()
+    served = asyncio.run(db.read(_run))
+    assert fired
+
+    w_after = _uncached(db, fx)
+    assert w_after != w_before
+    assert served.weights == w_after
+
+    after = wind_blend.wind_weights_cache_stats()
+    assert (
+        after["bypasses"]["counts_moved"]  # type: ignore[index]
+        == before["bypasses"]["counts_moved"] + 1  # type: ignore[index]
+    )
+    assert after["hits"] == before["hits"]
+    assert after["misses"] == before["misses"]
+
+
+@pytest.mark.parametrize("which_call", [1, 2])
+def test_t127d_probe_error_through_pin(
+    fx: _Fixture, monkeypatch: pytest.MonkeyPatch, which_call: int
+) -> None:
+    """New T127(d): ``probe_error`` pin, parametrized on which of the pin's
+    two ``external_commit_seq()`` readings fails.
+
+    mutant_only_checks_before -> (``which_call == 2``, the SECOND reading
+    returns ``None``) at ``db.snapshot_pin(conn) == "probe_error"``:
+    correct = ``"probe_error"`` (``after is None`` is still checked),
+    mutant (drops the ``or after is None`` half of the check, testing only
+    ``before is None``) = falls through to ``after != before`` with
+    ``after`` literally ``None`` and ``before`` a real ``InputCounts``,
+    which is true, so the pin is wrongly ``"counts_moved"`` instead.
+    mutant_only_checks_after -> (``which_call == 1``, the FIRST reading
+    returns ``None``) at the same assertion: correct = ``"probe_error"``
+    (``before is None`` is still checked), mutant (drops the
+    ``before is None`` half, testing only ``after is None``) = falls
+    through to ``after != before`` with ``before`` literally ``None`` and
+    ``after`` a real ``InputCounts``, again true, so the pin is wrongly
+    ``"counts_moved"`` instead of ``"probe_error"``.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    uncached = _uncached(db, fx)
+    real_ext = db.external_commit_seq
+    calls = {"n": 0}
+
+    def _wrapper() -> int | None:
+        calls["n"] += 1
+        if calls["n"] == which_call:
+            return None
+        return real_ext()
+
+    monkeypatch.setattr(db, "external_commit_seq", _wrapper)
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        with pinned_read_snapshot(conn, label="t127d_probe_error"):
+            assert db.snapshot_pin(conn) == "probe_error"
+            return wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+
+    before = wind_blend.wind_weights_cache_stats()
+    served = asyncio.run(db.read(_run))
+    after = wind_blend.wind_weights_cache_stats()
+
+    assert calls["n"] == 2
+    assert served.weights == uncached
+    assert (
+        after["bypasses"]["probe_error"]  # type: ignore[index]
+        == before["bypasses"]["probe_error"] + 1  # type: ignore[index]
+    )
+    assert (
+        after["bypasses"]["counts_moved"]  # type: ignore[index]
+        == before["bypasses"]["counts_moved"]  # type: ignore[index]
+    )
+    assert after["hits"] == before["hits"]
+    assert after["misses"] == before["misses"]
+
+
+def test_t127e_pin_cleared_on_exception_exit(fx: _Fixture) -> None:
+    """New T127(e), part 1: an exception out of a pinned block clears the pin.
+
+    mutant_pin_not_cleared_on_exception -> at ``db.snapshot_pin(conn) is
+    None`` (checked right after the raised exception exits the ``with``
+    block): correct = ``None`` (the registry pop runs in ``pinned_snapshot``'s
+    ``finally``, which an exception out of the block still reaches), mutant
+    (the registry pop sequenced so an exception out of the ``with`` block
+    skips it) = the stale pin (an ``InputCounts``) is still registered.
+    Were that assertion absent, the kill would surface one step later, at
+    ``after["bypasses"]["in_transaction"] == before["bypasses"]
+    ["in_transaction"] + 1``: ``reset_wind_weights_cache()`` ran at the top
+    of this test, so no entry exists yet for this key -- the stale pin
+    would wrongly route the next plain transaction through
+    ``_pinned_weights`` as a MISS (there is nothing to hit), leaving the
+    ``in_transaction`` bypass counter flat instead of bumping by 1, not a
+    wrongly-recorded hit. ``after["hits"] == before["hits"]`` holds either
+    way and does not discriminate this mutant on its own.
+    """
+
+    class _Boom(Exception):
+        pass
+
+    db = fx.db
+    reset_wind_weights_cache()
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        with pytest.raises(_Boom), pinned_read_snapshot(conn, label="t127e_exc"):
+            assert isinstance(db.snapshot_pin(conn), InputCounts)
+            raise _Boom("synthetic failure inside the pin")
+        assert db.snapshot_pin(conn) is None
+        assert not conn.in_transaction
+
+        before = wind_blend.wind_weights_cache_stats()
+        conn.execute("BEGIN")
+        try:
+            result = wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+        finally:
+            conn.rollback()
+        after = wind_blend.wind_weights_cache_stats()
+        return result, before, after
+
+    uncached = _uncached(db, fx)
+    served, before, after = asyncio.run(db.read(_run))
+    assert served.weights == uncached
+    assert (
+        after["bypasses"]["in_transaction"]  # type: ignore[index]
+        == before["bypasses"]["in_transaction"] + 1  # type: ignore[index]
+    )
+    assert after["hits"] == before["hits"]
+
+
+def test_t127e_nesting_refusal_preserves_outer_pin(fx: _Fixture) -> None:
+    """New T127(e), part 2: a nesting refusal leaves the outer pin intact.
+
+    mutant_nesting_refusal_pops_outer -> at
+    ``db.snapshot_pin(conn) == outer`` and ``conn.in_transaction is True``
+    (checked right after the refused inner attempt): correct = both (the
+    pre-check in ``read_snapshot`` runs before any SQL and before the inner
+    ``pinned_snapshot`` ever reaches its own registration/``finally``, so it
+    cannot touch the outer entry), mutant (the inner attempt's cleanup runs
+    regardless, e.g. a ``finally`` that unconditionally pops the registry
+    entry for ``conn``) = the outer pin is gone and the outer transaction
+    has been rolled back from under the caller.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    _serve(db, fx)  # primes an entry at today's (pre-pin) counts
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        with pinned_read_snapshot(conn, label="t127e_outer"):
+            outer = db.snapshot_pin(conn)
+            assert isinstance(outer, InputCounts)
+
+            # A write after the outer pin is fixed: the inner attempt's own
+            # (never-used) counts reading would differ from `outer`'s, so an
+            # inner cleanup that wrongly touches the registry is caught by
+            # VALUE, not just by presence.
+            sql, params = _training_update_sql(fx)
+            db.write_sync(lambda c: c.execute(sql, params))
+
+            with (
+                pytest.raises(SnapshotNestingError),
+                pinned_read_snapshot(conn, label="t127e_inner"),
+            ):
+                pass
+            assert db.snapshot_pin(conn) == outer
+            assert conn.in_transaction is True
+
+            before = wind_blend.wind_weights_cache_stats()
+            result = wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+            after = wind_blend.wind_weights_cache_stats()
+        return result, before, after
+
+    uncached = _uncached(db, fx)
+    served, before, after = asyncio.run(db.read(_run))
+    assert served.weights == uncached
+    assert after["hits"] == before["hits"] + 1  # type: ignore[operator]
+    assert after["misses"] == before["misses"]
+
+
+def test_t127g_pinned_snapshot_foreign_connection_skips_pin(
+    fx: _Fixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New T127(g): ``Database.pinned_snapshot`` on a connection it doesn't own.
+
+    ``pinned_snapshot`` (``connection.py`` ~:465-500) now starts with
+    ``if not self.owns_pooled_reader(conn): with read_snapshot(conn,
+    label=label): yield conn; return`` -- a connection that is not one of
+    this database's pooled readers gets a plain snapshot: no pin
+    registered, no counts read.
+
+    mutant_drop_foreign_guard (delete the guard, in a throwaway copy) -> at
+    ``db.snapshot_pin(raw) is None``: correct = ``None`` (the guard routes
+    straight to a plain ``read_snapshot``, which never touches
+    ``_snapshot_pins``), mutant (the guard removed) = an ``InputCounts`` or
+    a ``PinRefusal`` string, because the un-guarded code always registers a
+    pin for whatever connection it is given -- and with the guard gone,
+    ``input_counts_calls["n"] == 0``/``ext_calls["n"] == 0`` would also
+    fail, since the un-guarded path reads the counts before even checking
+    ownership.
+    """
+    db = fx.db
+
+    input_counts_calls = {"n": 0}
+    real_input_counts = db.input_counts
+
+    def _spy_input_counts() -> InputCounts | None:
+        input_counts_calls["n"] += 1
+        return real_input_counts()
+
+    monkeypatch.setattr(db, "input_counts", _spy_input_counts)
+
+    ext_calls = {"n": 0}
+    real_ext = db.external_commit_seq
+
+    def _spy_ext() -> int | None:
+        ext_calls["n"] += 1
+        return real_ext()
+
+    monkeypatch.setattr(db, "external_commit_seq", _spy_ext)
+
+    raw = sqlite3.connect(db.path)
+    try:
+        assert not db.owns_pooled_reader(raw)
+        with db.pinned_snapshot(raw, label="t127g_foreign"):
+            assert db.snapshot_pin(raw) is None
+            assert raw.in_transaction
+            assert input_counts_calls["n"] == 0
+            assert ext_calls["n"] == 0
+        assert not raw.in_transaction
+
+        # The nesting refusal still applies through the plain
+        # read_snapshot path: a second pinned_snapshot on the same raw
+        # connection while inside the first raises the same error
+        # read_snapshot raises.
+        with db.pinned_snapshot(raw, label="t127g_outer"):
+            with (
+                pytest.raises(SnapshotNestingError),
+                db.pinned_snapshot(raw, label="t127g_inner"),
+            ):
+                pass
+            assert db.snapshot_pin(raw) is None
+    finally:
+        raw.close()
+
+
 def test_t127_no_database_bypass(fx: _Fixture) -> None:
     """Plan T127, ``no_database`` (last: it closes the database).
 
@@ -1806,6 +2339,88 @@ def test_t131_foreign_connection_snapshot_order(fx: _Fixture) -> None:
         assert count == bypasses_before[reason], reason  # type: ignore[index]
 
 
+def test_t131_pinned_snapshot_order(fx: _Fixture) -> None:
+    """New T131, pinned leg: ``load_wind_serving`` inside a caller-held pin.
+
+    mutant_extra_snapshot -> at ``seen.count("BEGIN DEFERRED") == 1`` and
+    ``"PRAGMA query_only=ON" not in seen``: correct = exactly one
+    ``BEGIN DEFERRED`` and no ``query_only`` at all (``_pinned_weights``
+    runs the compute INSIDE the caller's already-open pinned snapshot,
+    issuing no snapshot of its own -- a nested one would raise
+    ``SnapshotNestingError``), mutant (the pinned path opens its own
+    ``read_snapshot``/``read_only_snapshot`` for the compute instead of
+    reusing the caller's) = a second ``BEGIN DEFERRED``, or, respectively,
+    a ``PRAGMA query_only=ON`` this path must never issue.
+    mutant_pin_keyed_on_recount -> at ``follow.weights == uncached_after``:
+    correct = the follow-up ``_serve`` MISSES and returns the fresh
+    weights (the entry this test's miss stores is keyed on the PIN -- the
+    counts read before ``BEGIN``/the priming read, i.e. before the raw
+    commit that lands mid-``_load`` -- so the follow-up's current counts,
+    which DO reflect the raw commit, no longer match), mutant (keying the
+    stored entry on counts re-read AFTER the compute instead) =
+    ``baseline.weights`` (the follow-up wrongly hits the stale pre-commit
+    entry).
+    """
+    db = fx.db
+    baseline = _serve(db, fx)
+    seen: list[str] = []
+    triggered = False
+
+    def _cb(stmt: str) -> None:
+        nonlocal triggered
+        normalized = stmt.strip()
+        if not triggered and normalized.startswith(
+            "SELECT valid_at, value FROM observations"
+        ):
+            triggered = True
+            sql, params = _training_update_sql(fx)
+            raw = sqlite3.connect(db.path)
+            try:
+                raw.execute(sql, params)
+                raw.commit()
+            finally:
+                raw.close()
+        seen.append(normalized)
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        conn.set_trace_callback(_cb)
+        try:
+            with pinned_read_snapshot(conn, label="t131_pinned"):
+                result = wind_blend.load_wind_serving(
+                    conn,
+                    site_id=fx.site_id,
+                    timezone=fx.timezone,
+                    today=fx.today,
+                    as_of=None,
+                )
+        finally:
+            conn.set_trace_callback(None)
+        return result
+
+    reset_wind_weights_cache()
+    served = asyncio.run(db.read(_run))
+
+    assert triggered
+    assert seen.count("BEGIN DEFERRED") == 1
+    assert seen.count("PRAGMA user_version") == 1
+    assert "PRAGMA query_only=ON" not in seen
+    assert served.weights == baseline.weights
+
+    uncached_after = _uncached(db, fx)
+    assert uncached_after != baseline.weights
+
+    stats_before = wind_blend.wind_weights_cache_stats()
+    assert stats_before["misses"] == 1
+    assert stats_before["hits"] == 0
+    for reason, count in stats_before["bypasses"].items():  # type: ignore[union-attr]
+        assert count == 0, reason
+
+    follow = _serve(db, fx)
+    assert follow.weights == uncached_after
+    stats_after = wind_blend.wind_weights_cache_stats()
+    assert stats_after["misses"] == stats_before["misses"] + 1  # type: ignore[index]
+
+
 # --- T132: external commit, then a read, no process write between ---------
 
 
@@ -2156,9 +2771,18 @@ def test_t136_concurrent_request_path_leg1_sequential(
     that SAME connection), mutant (a consumer that draws a second pooled
     reader to compute the weights) = one fewer again (two checked out).
     mutant_consumer_skips_cache -> at ``_spy_of(fx).calls == 1``: correct =
-    1 (every consumer -- forecast, hourly, dashboard -- shares one
-    compute), mutant (a consumer loading weights directly, or on a
+    1 (every consumer -- forecast, hourly, dashboard, tiles poll -- shares
+    one compute), mutant (a consumer loading weights directly, or on a
     connection the cache bypasses) = more than 1, or a nonzero bypass.
+    mutant_route_unpinned -> at ``for count in stats["bypasses"].values():
+    assert count == 0``: correct = every bypass reason stays 0 (the tiles
+    poll's connection carries a pin, so its hit on the already-stored entry
+    goes through ``_pinned_weights``), mutant (the tiles route left on a
+    plain ``read_snapshot`` instead of ``pinned_read_snapshot``) =
+    ``snapshot_pin`` returns ``None`` on that connection, so
+    ``_cached_weights`` falls through to the ``"in_transaction"`` bypass
+    reason instead of a hit, moving that count off 0 and leaving ``hits``
+    one short of 3.
     """
     db = fx.db
     now = datetime(2026, 8, 20, 12, 0, 0, tzinfo=UTC)
@@ -2198,13 +2822,18 @@ def test_t136_concurrent_request_path_leg1_sequential(
             r1 = await client.get(f"/forecast?site={fx.site_id}")
             r2 = await client.get(f"/api/forecast/hourly?site={fx.site_id}&day=0")
             r3 = await client.get(f"/dashboard?site={fx.site_id}&variable=wind")
+            # An empty fingerprint never matches the built view's, so the
+            # tiles poll always rebuilds (200), never answers 204 (precedent:
+            # tests/test_forecast_last_fetched.py:737).
+            r4 = await client.get(f"/forecast/tiles?site={fx.site_id}&fingerprint=")
             assert r1.status_code == 200
             assert r2.status_code == 200
             assert r3.status_code == 200
+            assert r4.status_code == 200
 
     asyncio.run(_run())
 
-    assert len(read_calls) == 3
+    assert len(read_calls) == 4
     assert len(pool_observations) == 1
     qsize, owned = pool_observations[0]
     assert owned
@@ -2212,7 +2841,7 @@ def test_t136_concurrent_request_path_leg1_sequential(
 
     stats = wind_blend.wind_weights_cache_stats()
     assert stats["misses"] == 1
-    assert stats["hits"] == 2
+    assert stats["hits"] == 3
     for count in stats["bypasses"].values():  # type: ignore[union-attr]
         assert count == 0
 
@@ -2564,3 +3193,418 @@ def test_t137_leg4_non_sqlite_error_in_absorb(
     _serve(db, fx)
     stats_after = wind_blend.wind_weights_cache_stats()
     assert stats_after["misses"] == stats_before["misses"] + 1  # type: ignore[operator]
+
+
+# --- T145/T146: two pinned readers racing a write --------------------------
+
+
+def test_t145_two_pinned_requests_race(fx: _Fixture) -> None:
+    """New T145: two pinned readers racing a write between their snapshots.
+
+    mutant_pinned_snapshot_drops_second_reading -> at
+    ``db.snapshot_pin(c1) == "counts_moved"`` (checked inside c1's own
+    ``with`` block): correct = ``"counts_moved"`` (``pinned_snapshot``'s two
+    readings disagree, since the raw commit lands between them), mutant
+    (``pinned_snapshot`` comparing only one of its two readings) = a real
+    ``InputCounts`` pin instead of the refusal string. c1 still SERVES
+    ``w_after`` either way -- its priming statement, not ``BEGIN DEFERRED``
+    itself, is what fixes the WAL snapshot, and that priming statement runs
+    after the raw commit under both arms -- so ``r1.weights == w_after``
+    does NOT discriminate this mutant on its own; the ``snapshot_pin``
+    assertion above it is the real kill point. Were that assertion absent,
+    the kill would surface one step later, by one of two routes
+    depending on which of ``pinned_snapshot``'s two readings the mutant
+    uses as the pin. If the pin is the first reading, c1's pin is the
+    pre-commit ``(ext, epoch)``; c1 misses and stores ``w_after`` under
+    that key (``wind_blend.py:642``), c2's pin is the same key, so c2
+    hits ``w_after`` and the test dies at ``r2.weights == w_before``
+    (about :3268). If the pin is the second reading, c1's key correctly
+    describes its own snapshot and c2 misses, computes ``w_before``,
+    and the older-pin guard (``wind_blend.py:598-605``) refuses to
+    store it, so r1 and r2 both pass and the test dies instead at the
+    ``counts_moved == 1`` check (about :3271).
+    """
+    db = fx.db
+    w_before = _uncached(db, fx)
+    reset_wind_weights_cache()
+    c1, c2 = asyncio.run(_checkout_two(db))
+    try:
+        with pinned_read_snapshot(c2, label="t145_c2"):
+            fired = False
+
+            def _cb(stmt: str) -> None:
+                nonlocal fired
+                if not fired and stmt.strip() == "BEGIN DEFERRED":
+                    fired = True
+                    sql, params = _training_update_sql(fx)
+                    raw = sqlite3.connect(db.path)
+                    try:
+                        raw.execute(sql, params)
+                        raw.commit()
+                    finally:
+                        raw.close()
+
+            c1.set_trace_callback(_cb)
+            try:
+                with pinned_read_snapshot(c1, label="t145_c1"):
+                    assert db.snapshot_pin(c1) == "counts_moved"
+                    r1 = wind_blend.load_wind_serving(
+                        c1,
+                        site_id=fx.site_id,
+                        timezone=fx.timezone,
+                        today=fx.today,
+                        as_of=None,
+                    )
+            finally:
+                c1.set_trace_callback(None)
+
+            r2 = wind_blend.load_wind_serving(
+                c2,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+    finally:
+        _release_two(db, c1, c2)
+
+    w_after = _uncached(db, fx)
+    assert w_after != w_before
+    assert r1.weights == w_after
+    assert r2.weights == w_before
+
+    stats = wind_blend.wind_weights_cache_stats()
+    assert stats["bypasses"]["counts_moved"] == 1  # type: ignore[index]
+    assert stats["misses"] == 1
+    assert stats["hits"] == 0
+    for reason, count in stats["bypasses"].items():  # type: ignore[union-attr]
+        if reason != "counts_moved":
+            assert count == 0, reason
+
+    follow = _serve(db, fx)
+    assert follow.weights == w_after
+    stats_follow = wind_blend.wind_weights_cache_stats()
+    assert stats_follow["misses"] == stats["misses"] + 1  # type: ignore[index]
+
+
+def test_t146_dashboard_path_vs_pinned_race(fx: _Fixture) -> None:
+    """New T146: a pinned reader racing the dashboard's own (unpinned, but
+    still counts-consistent) no-transaction path.
+
+    mutant_dashboard_drops_second_reading -> at ``r2.weights == w_before``:
+    correct = the stale pre-commit weights, because the dashboard path's
+    own (correctly moved-counts) call never stores, so c2's later pinned
+    lookup -- pinned to the earlier, pre-commit counts -- recomputes fresh
+    instead of hitting anything, mutant (removing the dashboard path's
+    second reading, so it stores the post-commit weights keyed on the
+    stale pre-commit counts) = the corrupted entry's wrongly stored
+    ``w_after`` weights instead, because c2's pin matches that stale key.
+    """
+    db = fx.db
+    w_before = _uncached(db, fx)
+    reset_wind_weights_cache()
+    c1, c2 = asyncio.run(_checkout_two(db))
+    try:
+        with pinned_read_snapshot(c2, label="t146_c2"):
+            fired = False
+
+            def _cb(stmt: str) -> None:
+                nonlocal fired
+                if not fired and stmt.strip() == "BEGIN DEFERRED":
+                    fired = True
+                    sql, params = _training_update_sql(fx)
+                    raw = sqlite3.connect(db.path)
+                    try:
+                        raw.execute(sql, params)
+                        raw.commit()
+                    finally:
+                        raw.close()
+
+            c1.set_trace_callback(_cb)
+            try:
+                assert not c1.in_transaction
+                r1 = wind_blend.load_wind_serving(
+                    c1,
+                    site_id=fx.site_id,
+                    timezone=fx.timezone,
+                    today=fx.today,
+                    as_of=None,
+                )
+            finally:
+                c1.set_trace_callback(None)
+
+            r2 = wind_blend.load_wind_serving(
+                c2,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+    finally:
+        _release_two(db, c1, c2)
+
+    w_after = _uncached(db, fx)
+    assert w_after != w_before
+    assert r1.weights == w_after
+    assert r2.weights == w_before
+
+    stats = wind_blend.wind_weights_cache_stats()
+    assert stats["bypasses"]["counts_moved"] == 1  # type: ignore[index]
+    assert stats["misses"] == 1
+    assert stats["hits"] == 0
+
+
+# --- T147: C7 guard -- an older pin never evicts a newer entry -------------
+
+
+def test_t147_older_pin_late_store_does_not_evict_newer(fx: _Fixture) -> None:
+    """New T147 (cross-check): the C7 guard -- an older pin's late store
+    must not evict a newer, already-held entry for the same site.
+
+    mutant_c7_guard_removed -> at ``rehit.weights == w_new`` and
+    ``stats_after_rehit["hits"] == stats_before_rehit["hits"] + 1``:
+    correct = both (the guard refused the older pin's store, so the newer
+    entry this test seeded survives untouched and a follow-up call HITS
+    it), mutant (the C7 guard removed, so ``_store`` always overwrites) =
+    the older pin's late store clobbers the newer entry with ``w_before``,
+    so the follow-up wrongly misses (or hits stale data) against the
+    lower counts.
+    """
+    db = fx.db
+    w_before = _uncached(db, fx)
+    reset_wind_weights_cache()
+
+    c_old = asyncio.run(_checkout_one(db))
+    try:
+        with pinned_read_snapshot(c_old, label="t147_old"):
+            pin_old = db.snapshot_pin(c_old)
+            assert isinstance(pin_old, InputCounts)
+
+            # A write moves the counts upward while the old pin stays open.
+            sql, params = _training_update_sql(fx)
+            db.write_sync(lambda c: c.execute(sql, params))
+            w_new = _uncached(db, fx)
+            assert w_new != w_before
+
+            # An ordinary call stores the NEW entry at the NEW (higher) counts.
+            newhit = _serve(db, fx)
+            assert newhit.weights == w_new
+
+            # The old pin's late call: its own snapshot still reflects the
+            # pre-write state, but its store attempt must be refused.
+            stats_before_late = wind_blend.wind_weights_cache_stats()
+            late = wind_blend.load_wind_serving(
+                c_old,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+            assert late.weights == w_before
+            stats_after_late = wind_blend.wind_weights_cache_stats()
+            assert (
+                stats_after_late["misses"]  # type: ignore[index]
+                == stats_before_late["misses"] + 1  # type: ignore[index]
+            )
+    finally:
+        _release_one(db, c_old)
+
+    stats_before_rehit = wind_blend.wind_weights_cache_stats()
+    rehit = _serve(db, fx)
+    assert rehit.weights == w_new
+    stats_after_rehit = wind_blend.wind_weights_cache_stats()
+    assert (
+        stats_after_rehit["hits"]  # type: ignore[index]
+        == stats_before_rehit["hits"] + 1  # type: ignore[index]
+    )
+
+
+# --- T148: a commit between input_counts()'s two reads ---------------------
+
+
+@pytest.mark.parametrize("kind", ["own_write", "raw_commit"])
+def test_t148_commit_between_ext_and_epoch_reads(
+    fx: _Fixture, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """New T148 (cross-check, invariant oracle): a commit landing between
+    ``input_counts()``'s two reads (``external_commit_seq()`` then the
+    ``input_epoch`` property) must never leave the cache serving or
+    storing data that disagrees with the database's real, current state --
+    whichever side of the race the resulting pin lands on.
+
+    Deliberately an invariant check, not a fixed-branch oracle: both the
+    "own write" sub-case (bumps ``input_epoch`` synchronously, absorbed
+    uncounted so ``ext`` does not move) and the "raw external commit"
+    sub-case (moves the probe's ``data_version`` but not ``epoch`` until a
+    later write observes it) are legitimate races this oracle must
+    tolerate -- it asserts the cache is never corrupted by either, not
+    which specific pin value results.
+
+    Invariant check: the cache never serves or stores weights that
+    disagree with the database after this race. No mutant is known to
+    fail here; the read-order swap is absorbed by the two-reading
+    check.
+
+    A hypothetical mutant this invariant is designed to catch -> at
+    ``follow.weights == uncached_now``: correct = always equal (any entry
+    this race stores, or any bypass it takes, must still agree with ground
+    truth once the race has settled), a mutant that built ``input_counts``
+    from a torn, inconsistent ``(ext, epoch)`` pair and trusted it as a
+    valid pin/stored key would let a follow-up ordinary call wrongly HIT an
+    entry keyed on a pair that never described any single real moment of
+    the database, surfacing as stale or otherwise-wrong served weights --
+    but this has not been empirically confirmed by mutating the
+    implementation.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+    real_ext = db.external_commit_seq
+    fired = False
+
+    def _wrapper() -> int | None:
+        nonlocal fired
+        value = real_ext()
+        if not fired:
+            fired = True
+            sql, params = _training_update_sql(fx)
+            if kind == "own_write":
+                db.write_sync(lambda c: c.execute(sql, params))
+            else:
+                raw = sqlite3.connect(db.path)
+                try:
+                    raw.execute(sql, params)
+                    raw.commit()
+                finally:
+                    raw.close()
+        return value
+
+    monkeypatch.setattr(db, "external_commit_seq", _wrapper)
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        with pinned_read_snapshot(conn, label="t148_race"):
+            return wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+
+    asyncio.run(db.read(_run))
+    assert fired
+
+    monkeypatch.undo()
+    follow = _serve(db, fx)
+    uncached_now = _uncached(db, fx)
+    assert follow.weights == uncached_now
+
+
+# --- T149: a priming-read failure inside a pin clears it cleanly -----------
+
+
+def test_t149_priming_failure_clears_pin_and_transaction(fx: _Fixture) -> None:
+    """New T149 (cross-check): a priming-read failure inside
+    ``pinned_read_snapshot`` must clear the pin and the transaction,
+    leaving the connection fully reusable.
+
+    mutant_pin_registered_before_priming_fails -> at
+    ``db.snapshot_pin(conn) is None`` and ``conn.in_transaction is False``
+    (checked right after the failure): correct = both (``pinned_snapshot``
+    only registers the pin AFTER ``read_snapshot``'s priming read
+    succeeds, and ``read_snapshot``'s own ``finally`` always rolls back on
+    a priming failure), mutant (registering the pin, or skipping the
+    rollback, before the priming statement's own exception has a chance to
+    propagate) = either a stale pin survives the failure, or the
+    connection is left mid-transaction and a later use on it raises
+    instead of running.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+
+    def _deny(action: int, arg1: str | None, *_rest: object) -> int:
+        if action == sqlite3.SQLITE_PRAGMA and arg1 == "user_version":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        conn.set_authorizer(_deny)
+        try:
+            with (
+                pytest.raises(sqlite3.DatabaseError),
+                pinned_read_snapshot(conn, label="t149_priming_fails"),
+            ):
+                pass
+        finally:
+            conn.set_authorizer(None)
+        assert db.snapshot_pin(conn) is None
+        assert conn.in_transaction is False
+
+        # The connection is fully reusable: an ordinary call now succeeds.
+        return wind_blend.load_wind_serving(
+            conn,
+            site_id=fx.site_id,
+            timezone=fx.timezone,
+            today=fx.today,
+            as_of=None,
+        )
+
+    uncached = _uncached(db, fx)
+    served = asyncio.run(db.read(_run))
+    assert served.weights == uncached
+
+
+# --- T150: a nesting refusal preserves a pre-existing plain transaction ----
+
+
+def test_t150_nesting_refusal_from_plain_transaction_preserves_it(
+    fx: _Fixture,
+) -> None:
+    """New T150 (cross-check): a nesting refusal on a connection already in
+    a PLAIN (non-pinned) caller-opened transaction preserves that
+    transaction and registers no pin.
+
+    mutant_pinned_snapshot_ignores_pre_existing_transaction -> at
+    ``db.snapshot_pin(conn) is None`` and ``conn.in_transaction is True``
+    (checked right after the refused attempt): correct = both (the
+    nesting pre-check in ``read_snapshot`` fires before any SQL, so
+    ``pinned_snapshot`` never reaches its own ``_snapshot_pins`` assignment
+    at all), mutant (``pinned_snapshot`` registering a pin for ``conn``
+    speculatively before delegating to ``read_snapshot``) = a pin wrongly
+    appears for a connection the cache never actually described a snapshot
+    for, and/or the caller's own transaction ends up disturbed.
+    """
+    db = fx.db
+    reset_wind_weights_cache()
+
+    def _run(conn: sqlite3.Connection) -> Any:
+        conn.execute("BEGIN")
+        try:
+            assert db.snapshot_pin(conn) is None
+            with (
+                pytest.raises(SnapshotNestingError),
+                pinned_read_snapshot(conn, label="t150_inner"),
+            ):
+                pass
+            assert db.snapshot_pin(conn) is None
+            assert conn.in_transaction is True
+            result = wind_blend.load_wind_serving(
+                conn,
+                site_id=fx.site_id,
+                timezone=fx.timezone,
+                today=fx.today,
+                as_of=None,
+            )
+            assert conn.in_transaction is True
+        finally:
+            conn.rollback()
+        return result
+
+    before = wind_blend.wind_weights_cache_stats()
+    uncached = _uncached(db, fx)
+    served = asyncio.run(db.read(_run))
+    assert served.weights == uncached
+    after = wind_blend.wind_weights_cache_stats()
+    assert (
+        after["bypasses"]["in_transaction"]  # type: ignore[index]
+        == before["bypasses"]["in_transaction"] + 1  # type: ignore[index]
+    )
