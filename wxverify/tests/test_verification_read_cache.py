@@ -85,7 +85,9 @@ _fp_counter = 0
 
 
 def _threaded_conn() -> sqlite3.Connection:
-    """A fully-migrated in-memory database usable from more than one thread."""
+    """A fully-migrated in-memory database usable from another thread, one
+    thread at a time, never concurrently -- one connection's statement cache
+    is not thread-safe (see O9)."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
@@ -572,16 +574,62 @@ def test_o8_generation_bump_forces_rederivation(
 # ---------------------------------------------------------------------------
 
 
-def test_o9_single_flight_two_threads_one_underlying_call() -> None:
-    conn = _threaded_conn()
-    site_id = _site(conn)
-    run_id = _full_run(conn, site_id, state="published")
-    conn.commit()
+class _StandInStripe:
+    """A stripe stand-in that records contention before blocking.
+
+    The Step-4 ``with _STRIPES[hash(key) % _LOCK_STRIPES]:`` in ``_cached``
+    reads ``rc._STRIPES`` at call time, so monkeypatching the tuple changes
+    what every caller in this test acquires. Each instance wraps a real
+    ``threading.Lock``: ``__enter__`` tries a non-blocking acquire first and
+    only sets ``contended`` (and then blocks) when that fails, so the test can
+    assert that the second thread genuinely waited on the stripe rather than
+    racing the fast-path lookup.
+    """
+
+    def __init__(self, contended: threading.Event) -> None:
+        self._lock = threading.Lock()
+        self._contended = contended
+
+    def __enter__(self) -> None:
+        if self._lock.acquire(blocking=False):
+            return
+        self._contended.set()
+        self._lock.acquire()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: object | None,
+    ) -> None:
+        self._lock.release()
+
+
+def test_o9_single_flight_two_threads_one_underlying_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Each caller gets its own connection to one shared file database,
+    # matching production's one-connection-per-reader model: a single
+    # sqlite3.Connection shared across threads races on its own cached
+    # prepared statements and is not what this oracle is testing.
+    db_path = tmp_path / "o9.db"
+    setup_conn = sqlite3.connect(str(db_path))
+    setup_conn.row_factory = sqlite3.Row
+    setup_conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(setup_conn)
+    site_id = _site(setup_conn)
+    run_id = _full_run(setup_conn, site_id, state="published")
+    setup_conn.commit()
+    setup_conn.close()
 
     entered = threading.Event()
     release = threading.Event()
+    contended = threading.Event()
     calls = {"n": 0}
     calls_lock = threading.Lock()
+
+    stand_ins = tuple(_StandInStripe(contended) for _ in range(rc._LOCK_STRIPES))  # noqa: SLF001
+    monkeypatch.setattr(rc, "_STRIPES", stand_ins)
 
     def _slow(conn: sqlite3.Connection, run_id: int) -> dict[str, object]:
         with calls_lock:
@@ -594,10 +642,13 @@ def test_o9_single_flight_two_threads_one_underlying_call() -> None:
     errors: list[BaseException] = []
 
     def _call(i: int) -> None:
+        conn = sqlite3.connect(str(db_path))
         try:
             results[i] = rc._cached(conn, run_id, rc._W7_NAME, _slow)  # noqa: SLF001
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
+        finally:
+            conn.close()
 
     t1 = threading.Thread(target=_call, args=(0,), daemon=True)
     t2 = threading.Thread(target=_call, args=(1,), daemon=True)
@@ -605,6 +656,7 @@ def test_o9_single_flight_two_threads_one_underlying_call() -> None:
     t2.start()
     try:
         assert entered.wait(timeout=5.0)
+        assert contended.wait(timeout=5.0), errors
     finally:
         release.set()
     t1.join(timeout=5.0)
