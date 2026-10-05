@@ -9,6 +9,9 @@ on:
       publish:
         required: true
         type: boolean
+      own-files-changed:
+        required: true
+        type: boolean
 
 jobs:
   prepare:
@@ -24,6 +27,9 @@ jobs:
       url: ${{ steps.normalize.outputs.url }}
       registry_prefix: ${{ steps.normalize.outputs.registry_prefix }}
       version: ${{ steps.normalize.outputs.version }}
+      decision: ${{ steps.guard.outputs.decision }}
+      reason: ${{ steps.guard.outputs.reason }}
+      push: ${{ steps.guard.outputs.push }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v6.0.2
@@ -81,6 +87,23 @@ jobs:
           image-name: ${{ steps.normalize.outputs.image_name }}
           registry-prefix: ${{ steps.normalize.outputs.registry_prefix }}
 
+      - name: Check the registry before publishing
+        id: guard
+        env:
+          GHCR_LOOKUP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_LOOKUP_USER: ${{ github.repository_owner }}
+          REGISTRY_PREFIX: ${{ steps.normalize.outputs.registry_prefix }}
+          IMAGE_NAME: ${{ steps.normalize.outputs.image_name }}
+          VERSION: ${{ steps.normalize.outputs.version }}
+          ARCHS: ${{ steps.info.outputs.architectures }}
+          OWN_FILES_CHANGED: ${{ inputs.own-files-changed }}
+          PUBLISH_MODE: ${{ inputs.publish }}
+        run: >-
+          python3 .github/scripts/publish_guard.py check
+          --registry-prefix "$REGISTRY_PREFIX" --image-name "$IMAGE_NAME"
+          --version "$VERSION" --archs "$ARCHS"
+          --own-files-changed "$OWN_FILES_CHANGED" --publish-mode "$PUBLISH_MODE"
+
   build:
     name: Build ${{ matrix.arch }} image
     needs: prepare
@@ -98,6 +121,14 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Check this architecture's tag before building
+        env:
+          GHCR_LOOKUP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_LOOKUP_USER: ${{ github.repository_owner }}
+          REF: ${{ matrix.image }}:${{ needs.prepare.outputs.version }}
+          PUSH: ${{ inputs.publish && needs.prepare.outputs.push == 'true' }}
+        run: python3 .github/scripts/publish_guard.py tag --ref "$REF" --push "$PUSH"
+
       - name: Build image
         uses: home-assistant/builder/actions/build-image@2026.03.2
         with:
@@ -107,25 +138,37 @@ jobs:
           image: ${{ matrix.image }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
-            latest
           labels: |
             io.hass.type=app
             io.hass.name=${{ needs.prepare.outputs.name }}
             io.hass.description=${{ needs.prepare.outputs.description }}
             ${{ needs.prepare.outputs.url && format('io.hass.url={0}', needs.prepare.outputs.url) || '' }}
-          push: ${{ inputs.publish }}
+          push: ${{ inputs.publish && needs.prepare.outputs.push == 'true' }}
           version: ${{ needs.prepare.outputs.version }}
 
   manifest:
     name: Publish multi-arch manifest
     needs: [prepare, build]
-    if: inputs.publish
+    if: inputs.publish && needs.prepare.outputs.push == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
       packages: write
     steps:
+      - name: Check out the repository
+        # actions/checkout v6.0.2 — pinned 2026-07-07
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Check the manifest tag before publishing
+        env:
+          GHCR_LOOKUP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_LOOKUP_USER: ${{ github.repository_owner }}
+          REF: ${{ needs.prepare.outputs.registry_prefix }}/${{ needs.prepare.outputs.image_name }}:${{ needs.prepare.outputs.version }}
+        run: python3 .github/scripts/publish_guard.py tag --ref "$REF" --push true
+
       - name: Publish multi-arch manifest
         uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.03.2
         with:
@@ -134,5 +177,4 @@ jobs:
           image-name: ${{ needs.prepare.outputs.image_name }}
           image-tags: |
             ${{ needs.prepare.outputs.version }}
-            latest
           registry-prefix: ${{ needs.prepare.outputs.registry_prefix }}
