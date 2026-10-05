@@ -91,5 +91,5 @@ jobs:
     uses: ./.github/workflows/build-app.yaml
     with:
       app: ${{ matrix.app }}
-      publish: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      publish: false
     secrets: inherit

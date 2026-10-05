@@ -81,6 +81,36 @@ jobs:
           image-name: ${{ steps.normalize.outputs.image_name }}
           registry-prefix: ${{ steps.normalize.outputs.registry_prefix }}
 
+      - name: Probe a never-published name (temporary, never merge)
+        if: inputs.app == 'py-ddns'
+        continue-on-error: true
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          PREFIX: ${{ steps.normalize.outputs.registry_prefix }}
+        run: |
+          path="${PREFIX#ghcr.io/}/publish-guard-probe-absent"
+          echo "event=${GITHUB_EVENT_NAME} path=${path}"
+          out="$(curl -s --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -u "${OWNER}:${TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${path}:pull")" \
+            || { echo "token request failed: curl exit $?"; exit 1; }
+          code="${out##*$'\n'}"
+          body="${out%$'\n'*}"
+          echo "token HTTP ${code}"
+          reg="$(jq -r 'if (.token | type) == "string" then .token else empty end' <<< "${body}" 2>/dev/null || true)"
+          if [[ "${code}" != "200" || -z "${reg}" ]]; then
+            echo "inconclusive: no registry token"
+            jq -c '[.errors[]? | {code, message}]' <<< "${body}" 2>/dev/null || echo "token body not JSON"
+            exit 1
+          fi
+          echo "::add-mask::${reg}"
+          resp="$(curl -s --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -H "Authorization: Bearer ${reg}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${path}/manifests/0.0.0")" \
+            || { echo "manifest request failed: curl exit $?"; exit 1; }
+          echo "manifest HTTP ${resp##*$'\n'}"
+          jq -c '[.errors[]? | {code, message}]' <<< "${resp%$'\n'*}" 2>/dev/null || echo "manifest body not JSON"
+
   build:
     name: Build ${{ matrix.arch }} image
     needs: prepare
