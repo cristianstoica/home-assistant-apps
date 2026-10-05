@@ -27,6 +27,7 @@ jobs:
     outputs:
       changed: ${{ steps.filter.outputs.changed }}
       changed_apps: ${{ steps.filter.outputs.changed_apps }}
+      own_changed_apps: ${{ steps.filter.outputs.own_changed_apps }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@v6.0.2
@@ -51,24 +52,29 @@ jobs:
           all_apps=()
           read -r -a all_apps <<< "${APPS}"
           changed_apps=()
+          own_changed_apps=()
 
-          # On manual dispatch, rebuild all apps.
-          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
-            changed_apps=("${all_apps[@]}")
-          # If the workflow file itself changed, rebuild all apps
-          elif [[ "${CHANGED_FILES}" =~ \.github/workflows/(builder|build-app)\.yaml ]]; then
-            changed_apps=("${all_apps[@]}")
-          else
+          # Add-ons whose own monitored files changed. A manual run changes none.
+          if [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
             for app in "${all_apps[@]}"; do
               for file in ${MONITORED_FILES}; do
                 if [[ "${CHANGED_FILES}" =~ ${app}/${file} ]]; then
-                  changed_apps+=("${app}")
+                  own_changed_apps+=("${app}")
                   break
                 fi
               done
             done
           fi
 
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            changed_apps=("${all_apps[@]}")
+          elif [[ "${CHANGED_FILES}" =~ \.github/(workflows/(builder|build-app)\.yaml|scripts/publish_guard\.py) ]]; then
+            changed_apps=("${all_apps[@]}")
+          else
+            changed_apps=("${own_changed_apps[@]}")
+          fi
+
+          echo "own_changed_apps=$(jq -nc '$ARGS.positional' --args "${own_changed_apps[@]}")" >> "$GITHUB_OUTPUT"
           if [[ ${#changed_apps[@]} -gt 0 ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "changed_apps=$(jq -nc '$ARGS.positional' --args "${changed_apps[@]}")" >> "$GITHUB_OUTPUT"
@@ -76,14 +82,49 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
+  publish-guard-tests:
+    name: Publish guard tests (pytest / pyright / ruff)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out code from GitHub
+        # actions/checkout v6.0.2 — pinned 2026-07-07
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        # actions/setup-python v6 — pinned 2026-07-07
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.12"
+
+      - name: Install tooling
+        run: pip install pytest==8.4.1 pyyaml==6.0.3 ruff==0.15.13 pyright==1.1.409
+
+      - name: ruff check
+        run: ruff check --target-version py312 .github/scripts
+      - name: ruff format --check
+        run: ruff format --check .github/scripts
+      - name: pyright
+        working-directory: .github/scripts
+        run: pyright --pythonversion 3.12 publish_guard.py
+      - name: pytest
+        run: PYTHONPATH=.github/scripts python -m pytest -p no:cacheprovider .github/scripts/tests
+
   build-app:
     name: Build ${{ matrix.app }}
-    needs: init
+    needs: [init, publish-guard-tests]
     if: needs.init.outputs.changed == 'true'
     permissions:
       contents: read
       id-token: write
       packages: write
+    concurrency:
+      group: ${{ github.event_name == 'pull_request' && format('publish-guard-pr-{0}-{1}', github.event.pull_request.number, matrix.app) || format('publish-guard-release-{0}', matrix.app) }}
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
       matrix:
@@ -92,4 +133,5 @@ jobs:
     with:
       app: ${{ matrix.app }}
       publish: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+      own-files-changed: ${{ contains(fromJSON(needs.init.outputs.own_changed_apps), matrix.app) }}
     secrets: inherit
