@@ -53,6 +53,10 @@ from wxverify.scoring.engine import (
     _distinct_cells,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
 )
 from wxverify.scoring.multimodel import existing_mean_rows_sql
+from wxverify.scoring.pairing import (
+    _CANDIDATE_PAIRS_SQL,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
+    REAL_MODEL_PAIR_PROBE_SQL,
+)
 from wxverify.scoring.winrate import winrate_sql
 
 
@@ -1464,3 +1468,173 @@ def test_distinct_cells_materializes_before_the_wind_open_check() -> None:
     # check's correlated subquery belongs to, so nothing fences the check
     # off from running once per raw pair row.
     assert inline_pairs_row[1] == 0, inline_rows
+
+
+# -- §11.6 "T-EQP" -- REAL_MODEL_PAIR_PROBE_SQL (plan #79 fetch-scoring-gate) --
+#
+# Synthetic fixtures: 'Testsite'/'Testsite B' at 12.3456/65.4321, 2035 (plan §11).
+
+
+def _seeded_probe_stats_conn() -> sqlite3.Connection:
+    """A hand-seeded ``_fresh_conn()`` giving the planner real statistics for
+    ``REAL_MODEL_PAIR_PROBE_SQL`` / ``_CANDIDATE_PAIRS_SQL``: two sites, one
+    small (200 rows) and one large (8,000 observations / 50,000 samples), no
+    ``forecast_pairs`` rows, then ``ANALYZE``. Counts and date ranges are
+    §11.6's own spec, verbatim."""
+    conn = _fresh_conn()
+    site1 = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('Testsite', 12.3456, 65.4321, 900, 'UTC')"
+        ).lastrowid
+    )
+    site2 = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('Testsite B', 12.3456, 65.4321, 900, 'UTC')"
+        ).lastrowid
+    )
+    feed_row = conn.execute(
+        "SELECT id FROM feeds WHERE is_virtual = 0 ORDER BY id LIMIT 1"
+    ).fetchone()
+    assert feed_row is not None
+    feed_id = int(feed_row["id"])
+
+    # Site 1: 200 hourly observations/samples from 2035-01-01T00:00Z, all
+    # issued at a single instant the day before.
+    site1_base = datetime.datetime(2035, 1, 1, tzinfo=datetime.UTC)
+    site1_valid_ats = [
+        (site1_base + datetime.timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for hour in range(200)
+    ]
+    conn.executemany(
+        "INSERT INTO observations (site_id, variable, valid_at, value,"
+        " n_stations) VALUES (?, 'temperature', ?, 10.0, 1)",
+        [(site1, valid_at) for valid_at in site1_valid_ats],
+    )
+    site1_issued_at = "2034-12-31T00:00:00Z"
+    conn.executemany(
+        "INSERT INTO forecast_samples (site_id, feed_id, variable, issued_at,"
+        " valid_at, lead_hours, value, source_raw, model_run_id)"
+        " VALUES (?, ?, 'temperature', ?, ?, 1, 10.0, '{}', 'run-1')",
+        [(site1, feed_id, site1_issued_at, valid_at) for valid_at in site1_valid_ats],
+    )
+
+    # Site 2: 8,000 hourly observations, and 50,000 samples over those 8,000
+    # valid times, spread across 7 issue days (2034-12-01 .. 2034-12-07).
+    # lcm(7, 8000) = 56,000 > 50,000, so round-robining both indices by i
+    # never repeats an (issued_at, valid_at) pair within the 50,000 rows --
+    # the table's UNIQUE(site_id, feed_id, variable, issued_at, valid_at)
+    # constraint is satisfied without tracking seen pairs.
+    site2_base = datetime.datetime(2035, 2, 1, tzinfo=datetime.UTC)
+    site2_valid_ats = [
+        (site2_base + datetime.timedelta(hours=hour)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for hour in range(8000)
+    ]
+    conn.executemany(
+        "INSERT INTO observations (site_id, variable, valid_at, value,"
+        " n_stations) VALUES (?, 'temperature', ?, 10.0, 1)",
+        [(site2, valid_at) for valid_at in site2_valid_ats],
+    )
+    issue_days = [
+        datetime.datetime(2034, 12, day, tzinfo=datetime.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        for day in range(1, 8)
+    ]
+    conn.executemany(
+        "INSERT INTO forecast_samples (site_id, feed_id, variable, issued_at,"
+        " valid_at, lead_hours, value, source_raw, model_run_id)"
+        " VALUES (?, ?, 'temperature', ?, ?, 1, 10.0, '{}', 'run-1')",
+        [
+            (
+                site2,
+                feed_id,
+                issue_days[i % 7],
+                site2_valid_ats[i % 8000],
+            )
+            for i in range(50_000)
+        ],
+    )
+
+    conn.execute("ANALYZE")
+    return conn
+
+
+def test_real_model_pair_probe_sql_seeks_fs_by_rowid_on_a_fresh_schema() -> None:
+    """T-EQP-rel, half 1: on an empty, freshly migrated schema the probe's
+    ``fs.id = ?`` predicate is a rowid seek, never a scan -- the planner
+    needs no statistics to see this, because ``forecast_samples.id`` is the
+    INTEGER PRIMARY KEY."""
+    conn = _fresh_conn()
+    plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
+    fs_line = _fs_row(plan)
+    assert fs_line == "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)", plan
+    assert not any(line.startswith("SCAN") for line in plan), plan
+
+
+def test_real_model_pair_probe_sql_seeks_fs_by_rowid_after_seeding_and_analyze() -> (
+    None
+):
+    """T-EQP-rel, half 2: the same relational pin holds once the planner has
+    real cardinality from ``_seeded_probe_stats_conn()`` -- the rowid seek on
+    ``fs`` does not depend on an empty, ANALYZE-free table."""
+    conn = _seeded_probe_stats_conn()
+    plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
+    fs_line = _fs_row(plan)
+    assert fs_line == "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)", plan
+    assert not any(line.startswith("SCAN") for line in plan), plan
+
+
+@pytest.mark.skipif(
+    os.environ.get("WXV_EQP_SHIPPING") != "1",
+    reason="exact-plan pin: planner phrasing is build-specific (WXV_EQP_SHIPPING=1)",
+)
+def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
+    """T-EQP-exact: the whole plan of ``REAL_MODEL_PAIR_PROBE_SQL`` on a
+    freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
+    including the ``CORRELATED SCALAR SUBQUERY`` headers, in the order the
+    planner prints them. Measured on the #79 implementation base in the
+    worktree venv, SQLite 3.53.1. The pin is fresh-schema only: after
+    ``ANALYZE`` the ``s``/``f``/``obs`` join order moves, and the relational
+    pins above cover that case."""
+    conn = _fresh_conn()
+    assert _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,)) == [
+        "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)",
+        # NOT EXISTS (forecast_pairs ...), with published_generation_clause's
+        # runtime_state pointer lookup (alias rs) nested inside it.
+        "CORRELATED SCALAR SUBQUERY 2",
+        "SEARCH fp USING COVERING INDEX sqlite_autoindex_forecast_pairs_1"
+        " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
+        "CORRELATED SCALAR SUBQUERY 1",
+        "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
+        # wind_open_clause's wind_state_sql: the unaliased runtime_state read.
+        "CORRELATED SCALAR SUBQUERY 3",
+        "SEARCH runtime_state USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
+        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
+        "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
+        " (site_id=? AND variable=? AND valid_at=?)",
+        "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
+    ]
+
+
+def test_candidate_pairs_sql_scans_on_a_fresh_schema() -> None:
+    """T-EQP-control-scan: proves the no-``SCAN``-line assertion above is not
+    vacuously true -- the unscoped candidate SQL (no ``fs.id`` or
+    ``fs.site_id`` predicate to seek on) has nothing to bind ``fs`` by, so
+    the planner must scan it."""
+    conn = _fresh_conn()
+    plan = _plan(conn, _CANDIDATE_PAIRS_SQL, ())
+    assert any(line.startswith("SCAN") for line in plan), plan
+
+
+def test_candidate_pairs_sql_site_scoped_does_not_rowid_seek() -> None:
+    """T-EQP-control-fs: proves the rowid-seek pin above is not vacuously
+    true -- scoping by ``fs.site_id`` (rather than the probe's ``fs.id``)
+    gives the planner a non-unique index to seek on instead of a rowid, so
+    the resulting ``fs`` line must differ from the rowid-seek pin. ``_fs_row``
+    itself asserts there is exactly one ``SEARCH fs``/``SCAN fs`` line."""
+    conn = _fresh_conn()
+    plan = _plan(conn, _CANDIDATE_PAIRS_SQL + " AND fs.site_id = ?", (1,))
+    fs_line = _fs_row(plan)
+    assert fs_line != "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)", plan

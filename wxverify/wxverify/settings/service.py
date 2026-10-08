@@ -6,8 +6,9 @@ import sqlite3
 
 from wxverify.core.options import RuntimeOptions, depth_option_values
 from wxverify.db.connection import get_db
+from wxverify.db.queue import enqueue_if_absent
 from wxverify.settings.depth import depth_override_key
-from wxverify.settings.keys import set_setting
+from wxverify.settings.keys import get_number_setting, set_setting
 
 
 async def set_rolling_window_days(days: int) -> None:
@@ -20,17 +21,31 @@ async def set_rolling_window_days(days: int) -> None:
 def set_rolling_window_days_sync(conn: sqlite3.Connection, days: int) -> None:
     if days < 1 or days > 3650:
         raise ValueError("rolling_window_days out of range")
+    prior = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
     set_setting(conn, "rolling_window_days", str(days))
     # Single-branch contract, run on every apply (no change detection): keep
     # `w:all` and the CURRENT `w:{days}` slice, drop obsolete `w:N` keys. An
     # unchanged boot re-apply preserves the usable rolling cache across
-    # restarts; a genuine value change invalidates the previous slice and the
-    # next rescore rebuilds the new one.
+    # restarts; a genuine value change invalidates the previous slice.
+    # A genuine change also queues a rescore for every enabled site below; an
+    # unchanged re-apply queues nothing. A site whose score job is already
+    # running gets no new row (enqueue_if_absent dedupes against running jobs).
+    # That run keeps the window it discovered, so it can rebuild the old `w:N`
+    # slice and not the new one. Only the CLI can apply a change while the
+    # worker runs; the boot apply runs before the worker. That site rebuilds on
+    # its next trigger: a rolling read (`rebuilding` queues a rescore), an
+    # observation or pairable-fetch trigger, or the 6 h backstop.
     conn.execute(
         "DELETE FROM score_cache WHERE window_key LIKE 'w:%' "
         "AND window_key NOT IN ('w:all', ?)",
         (f"w:{days}",),
     )
+    if prior != days:
+        for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
+            site_id = int(row[0])
+            enqueue_if_absent(
+                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+            )
 
 
 async def apply_plain_settings(options: RuntimeOptions) -> None:
