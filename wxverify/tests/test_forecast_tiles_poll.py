@@ -28,7 +28,7 @@ from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.forecast.data import samples_fingerprint
+from wxverify.forecast.data import forecast_fingerprint
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
 from wxverify.scoring.metrics import strategy_for
@@ -106,7 +106,7 @@ def _feed_id(conn: sqlite3.Connection, source: str, model: str) -> int:
 
 
 def _current_fingerprint(site_id: int) -> str:
-    return get_db().read_sync(lambda conn: samples_fingerprint(conn, site_id=site_id))
+    return get_db().read_sync(lambda conn: forecast_fingerprint(conn, site_id=site_id))
 
 
 def _count_load_sites_calls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
@@ -134,7 +134,7 @@ _HIGH_LOW_RE = re.compile(r"High / Low</span>\s*<strong[^>]*>(.*?)</strong>", re
 def _high_low_values(text: str) -> list[str]:
     """Rendered temperature High/Low strings, one per tile, in document
     order -- used to prove a tile body genuinely differs (not the whole
-    page, which also carries a wall-clock-derived "Updated ..." line)."""
+    page, which also carries a wall-clock-derived "Last fetched ..." line)."""
     return _HIGH_LOW_RE.findall(text)
 
 
@@ -360,7 +360,7 @@ def test_tiles_204_when_only_non_sample_state_changed(
 
         # (ii) Non-vacuity: the setting DID take effect -- the rendered
         # temperature High/Low tile value (not the whole page, which also
-        # carries a wall-clock-derived "Updated ..." line and a per-request
+        # carries a wall-clock-derived "Last fetched ..." line and a per-request
         # CSRF token) actually changed. depth=2 blends feed_a=11.0/feed_b=15.0
         # -> "13° / 13°"; depth=1 keeps only feed_a (lower
         # persistence-error rank) alone -> "11° / 11°". Both values

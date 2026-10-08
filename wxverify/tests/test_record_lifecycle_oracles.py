@@ -55,7 +55,7 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     enqueue_if_absent_with_cooldown,
 )
-from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.monitor import build_verdict
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
@@ -838,3 +838,35 @@ def test_a_control_signal_on_a_later_date_is_not_contained(
         assert len(_rows(conn, site_id, _DAY)) == _GRID
     finally:
         close_db()
+
+
+def test_gap_scan_degraded_sites_counts_only_keys_of_existing_sites() -> None:
+    """D1 (§5.4): the join to ``sites`` ignores a key whose site is gone, and
+    does not let a key with a matching numeric prefix (site 10 for site 1)
+    count by LIKE-range accident."""
+    conn = _conn()
+    site = _make_site(conn, "Testsite")
+    assert site == 1
+
+    for sid, stamp in (
+        (site, "2026-03-08T07:00:00Z"),
+        (10, "2026-03-09T07:00:00Z"),
+        (99, "2026-03-10T07:00:00Z"),
+    ):
+        set_runtime_state(
+            conn,
+            gap_scan_failures_key(sid),
+            json.dumps(
+                {
+                    "as_of": stamp,
+                    "dates": {
+                        "2026-03-08": {
+                            "error": "synthetic",
+                            "last_failed_at": stamp,
+                        }
+                    },
+                }
+            ),
+        )
+
+    assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")

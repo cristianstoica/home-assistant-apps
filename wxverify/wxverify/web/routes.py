@@ -7,8 +7,8 @@ import sqlite3
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse
 
-from wxverify.db.connection import get_db
-from wxverify.forecast.data import samples_fingerprint
+from wxverify.db.connection import get_db, pinned_read_snapshot
+from wxverify.forecast.data import forecast_fingerprint
 from wxverify.forecast.service import ForecastView, build_forecast
 from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.settings.depth import effective_blend_depths
@@ -58,7 +58,15 @@ def _resolve_site(
 def _load_forecast_context(
     conn: sqlite3.Connection, site_id: int | None
 ) -> dict[str, object]:
-    """Resolve the site (first enabled when unspecified) and build the view."""
+    """Resolve the site (first enabled when unspecified) and build the view.
+
+    Every read here, and the fingerprint the view carries, must come from one
+    database state, so the caller must already hold a read snapshot on
+    ``conn``: ``_read_forecast_context``, or the tiles poll's own snapshot.
+    Raises RuntimeError when no transaction is open.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("_load_forecast_context needs the caller's read snapshot")
     sites = load_sites(conn, include_disabled=False)
     site = _resolve_site(conn, site_id, enabled_sites=sites)
     view: ForecastView | None = None
@@ -79,15 +87,32 @@ def _load_forecast_context(
     }
 
 
+def _read_forecast_context(
+    conn: sqlite3.Connection, site_id: int | None, *, label: str
+) -> dict[str, object]:
+    """Run ``_load_forecast_context`` inside one read snapshot on ``conn``.
+
+    The page's reads (site list, site, samples, fingerprint, freshness, depths
+    and rankings) then describe one database state, so the fingerprint in the
+    page's poll URL is the one its tiles were built from.
+    """
+    with pinned_read_snapshot(conn, label=label):
+        return _load_forecast_context(conn, site_id)
+
+
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request, site: int | None = None) -> HTMLResponse:
-    context = await get_db().read(lambda conn: _load_forecast_context(conn, site))
+    context = await get_db().read(
+        lambda conn: _read_forecast_context(conn, site, label="forecast_page")
+    )
     return render(request, "forecast/show.html", **context)
 
 
 @router.get("/forecast", response_class=HTMLResponse)
 async def forecast_page(request: Request, site: int | None = None) -> HTMLResponse:
-    context = await get_db().read(lambda conn: _load_forecast_context(conn, site))
+    context = await get_db().read(
+        lambda conn: _read_forecast_context(conn, site, label="forecast_page")
+    )
     return render(request, "forecast/show.html", **context)
 
 
@@ -95,25 +120,33 @@ async def forecast_page(request: Request, site: int | None = None) -> HTMLRespon
 async def forecast_tiles(
     request: Request, site: int, fingerprint: str = ""
 ) -> Response:
-    """Auto-poll target: 204 (no swap) unless newer samples have landed.
+    """Auto-poll target: 204 (no swap) unless the site's forecast fingerprint moved.
 
-    The fingerprint is computed BEFORE the view is built. It is a single
-    MAX(id) over the site's samples and is the same value the full build would
-    have reported, so an unchanged fingerprint is answered without paying for a
-    build whose result would be discarded. On a 204 htmx leaves the DOM
-    untouched -- including the hx-get that carries the old fingerprint, which
-    stays correct precisely because nothing changed. When the data did change,
-    the outerHTML swap replaces only #forecast-tiles, so an open day detail (a
+    The fingerprint is compared BEFORE the view is built, and the comparison
+    and the build run inside one read snapshot, so the fingerprint a rebuilt
+    fragment carries is the one its tiles were built from. It is
+    :func:`forecast_fingerprint`, which moves when a new sample is stored for
+    the site or one of its last-usable-fetch stamps moves to another whole
+    second. A stamp move within the same second leaves it unchanged, and stamp
+    moves in opposite directions can cancel out. A write that commits while
+    this request runs is not seen by it. The next poll sees that write only if
+    it moved the fingerprint; any other change shows on the next page load. An
+    unchanged fingerprint is answered without paying for a build whose result
+    would be discarded. On a 204 htmx leaves the DOM untouched -- including
+    the hx-get that carries the old fingerprint, which retains the token for
+    subsequent comparisons. When a changed fingerprint causes a rebuild, the
+    outerHTML swap replaces only #forecast-tiles, so an open day detail (a
     sibling element) is left intact across a tile poll.
     """
 
     def _poll(conn: sqlite3.Connection) -> dict[str, object] | None:
-        site_view = _resolve_site(conn, site)
-        if site_view is None:
-            return None
-        if samples_fingerprint(conn, site_id=site_view.id) == fingerprint:
-            return None
-        return _load_forecast_context(conn, site)
+        with pinned_read_snapshot(conn, label="forecast_tiles"):
+            site_view = _resolve_site(conn, site)
+            if site_view is None:
+                return None
+            if forecast_fingerprint(conn, site_id=site_view.id) == fingerprint:
+                return None
+            return _load_forecast_context(conn, site)
 
     context = await get_db().read(_poll)
     view = context.get("view") if context is not None else None

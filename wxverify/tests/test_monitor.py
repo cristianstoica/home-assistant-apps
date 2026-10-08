@@ -354,6 +354,30 @@ def _set_feed_state(
     )
 
 
+def _unsubscribe_other_open_meteo_feeds(
+    conn: sqlite3.Connection, site_id: int, *, keep: str
+) -> int:
+    """Unsubscribe every seeded ``open-meteo`` feed except ``keep``, read from
+    the database rather than a fixed sibling tuple, so an added model (such as
+    ``icon_eu``) does not inflate a staleness count the test pins to 1."""
+    models = [
+        r["model"]
+        for r in conn.execute(
+            "SELECT model FROM feeds WHERE source='open-meteo' AND model != ?",
+            (keep,),
+        )
+    ]
+    for model in models:
+        _set_feed_state(
+            conn,
+            site_id,
+            _feed_id(conn, "open-meteo", model),
+            last_run_at=None,
+            enabled=0,
+        )
+    return len(models)
+
+
 def _cond(body: dict[str, object], cond_id: str) -> dict[str, object]:
     conditions = body["conditions"]
     assert isinstance(conditions, list)
@@ -381,23 +405,12 @@ def test_feed_stale_trips_on_eligible_null_last_run(
             om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
             # eligible feed, NULL last_run_at → stale
             _set_feed_state(conn, site_id, om, last_run_at=None)
-            # Unsubscribe the other six default-subscribed open-meteo models so
+            # Unsubscribe the other default-subscribed open-meteo models so
             # exactly one eligible stale row remains and count == 1 is valid.
-            for sibling in (
-                "gfs_global",
-                "icon_global",
-                "gem_global",
-                "meteofrance_arpege_world",
-                "jma_gsm",
-                "ukmo_global_deterministic_10km",
-            ):
-                _set_feed_state(
-                    conn,
-                    site_id,
-                    _feed_id(conn, "open-meteo", sibling),
-                    last_run_at=None,
-                    enabled=0,
-                )
+            unsubscribed = _unsubscribe_other_open_meteo_feeds(
+                conn, site_id, keep="ecmwf_ifs"
+            )
+            assert unsubscribed == len(config.OPEN_METEO_MAX_LEAD_HOURS) - 1
             # virtual feed subscribed but excluded by predicate
             virt = _feed_id(conn, "virtual", "_persistence")
             _set_feed_state(conn, site_id, virt, last_run_at=None, enabled=1)
@@ -680,21 +693,10 @@ def test_feed_stale_old_timestamp_trips(
                 last_run_at="2000-01-01T00:00:00Z",
             )
             # Unsubscribe siblings so count is deterministically 1.
-            for sibling in (
-                "gfs_global",
-                "icon_global",
-                "gem_global",
-                "meteofrance_arpege_world",
-                "jma_gsm",
-                "ukmo_global_deterministic_10km",
-            ):
-                _set_feed_state(
-                    conn,
-                    site_id,
-                    _feed_id(conn, "open-meteo", sibling),
-                    last_run_at=None,
-                    enabled=0,
-                )
+            unsubscribed = _unsubscribe_other_open_meteo_feeds(
+                conn, site_id, keep="ecmwf_ifs"
+            )
+            assert unsubscribed == len(config.OPEN_METEO_MAX_LEAD_HOURS) - 1
 
         db.write_sync(_seed)
         body = client.get("/api/health/monitor").json()
@@ -737,21 +739,10 @@ def test_meteoblue_member_feed_excluded_from_staleness(
                 last_run_at=None,
             )
             # Unsubscribe open-meteo siblings so they don't inflate the count.
-            for sibling in (
-                "gfs_global",
-                "icon_global",
-                "gem_global",
-                "meteofrance_arpege_world",
-                "jma_gsm",
-                "ukmo_global_deterministic_10km",
-            ):
-                _set_feed_state(
-                    conn,
-                    site_id,
-                    _feed_id(conn, "open-meteo", sibling),
-                    last_run_at=None,
-                    enabled=0,
-                )
+            unsubscribed = _unsubscribe_other_open_meteo_feeds(
+                conn, site_id, keep="ecmwf_ifs"
+            )
+            assert unsubscribed == len(config.OPEN_METEO_MAX_LEAD_HOURS) - 1
             # Insert a non-multimodel meteoblue member feed directly (not in seed
             # data) and subscribe it for this site with NULL last_run_at.  If the
             # predicate clause is working, this row must be excluded.

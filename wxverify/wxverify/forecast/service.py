@@ -40,12 +40,13 @@ from wxverify.forecast.aggregate import (
     fixed_membership_series,
 )
 from wxverify.forecast.data import (
+    FeedFreshness,
     ForecastRanking,
     FutureSampleRow,
+    forecast_fingerprint,
     forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
-    samples_fingerprint,
 )
 from wxverify.forecast.selection import (
     CellCandidate,
@@ -95,6 +96,13 @@ class CellMeta:
     "not_available" for wind, a suppressed cell and an unavailable cell. The
     tile rolls it up with the cells' states into
     ``DayTile.confidence_state``; it never moves ``state``.
+
+    ``contributor_ids`` are the feeds whose collection freshness the cell
+    reports (the clearing subset plus, for temperature and precipitation, the
+    extrema feeds), in selection order without repeats. ``stale`` is True if
+    any of them is stale; ``fetch_unknown`` is True if any of them has no
+    usable fetch on record. A weighted wind cell (``pair_max``) has no
+    clearing subset, so its contributors are all of its chosen feeds.
     """
 
     state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
@@ -103,6 +111,8 @@ class CellMeta:
     stale: bool
     extrema_unavailable: bool
     extrema_state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
+    contributor_ids: tuple[int, ...]
+    fetch_unknown: bool
 
     @property
     def available(self) -> bool:
@@ -150,6 +160,7 @@ class DayTile:
     confidence_state: str  # tile.state's rollup over cell and extrema states
     stale: bool
     partial: bool
+    fetch_unknown: bool
 
 
 @dataclass(frozen=True)
@@ -197,7 +208,7 @@ def build_forecast(
         site_id=site_id,
         since_valid_at=isoformat_utc(local_day_start(at, timezone)),
     )
-    fingerprint = samples_fingerprint(conn, site_id=site_id)
+    fingerprint = forecast_fingerprint(conn, site_id=site_id)
     if not samples:
         return ForecastView(
             empty=True,
@@ -209,6 +220,9 @@ def build_forecast(
     grouped = _group_samples(samples, timezone=timezone, now=at)
     freshness = load_feed_freshness(conn, site_id=site_id, now=at)
     stale_ids = {feed_id for feed_id, row in freshness.items() if row.stale}
+    unknown_ids = {
+        feed_id for feed_id, row in freshness.items() if row.fetch_state == "unknown"
+    }
     depths = effective_blend_depths(conn)
     rank_cache: _RankCache = {}
 
@@ -236,7 +250,10 @@ def build_forecast(
                     weights=serving.weights or {},
                 )
                 meta, values = _wind_meta_and_values(
-                    choice.selection, feeds_samples=feeds_samples, stale_ids=stale_ids
+                    choice.selection,
+                    feeds_samples=feeds_samples,
+                    stale_ids=stale_ids,
+                    unknown_ids=unknown_ids,
                 )
                 cells[variable] = (meta, choice.selection, values)
                 wind_weights, wind_note = choice.weights, choice.note
@@ -260,6 +277,7 @@ def build_forecast(
                 variable=variable,
                 feeds_samples=feeds_samples,
                 stale_ids=stale_ids,
+                unknown_ids=unknown_ids,
                 rebuilding_by_feed=rebuilding_by_feed,
             )
             cells[variable] = (meta, selection, values)
@@ -282,14 +300,53 @@ def build_forecast(
         )
         for day, (cells, wind_weights, wind_note) in enumerate(day_cells)
     ]
-    updated_at = max(sample.issued_at for sample in samples)
+    updated_at = _last_fetched_at(tiles, freshness)
     return ForecastView(
         empty=False,
         tiles=tiles,
         updated_at=updated_at,
-        updated_ago=relative_ago(updated_at, now=at),
+        updated_ago=None if updated_at is None else relative_ago(updated_at, now=at),
         fingerprint=fingerprint,
     )
+
+
+def _last_fetched_at(
+    tiles: list[DayTile], freshness: dict[int, FeedFreshness]
+) -> str | None:
+    """The "Last fetched" instant: the newest usable-fetch stamp across the
+    forecast tiles.
+
+    Takes the union of ``contributor_ids`` over every populated cell of every
+    tile and maps each feed to its evidence feed's ``last_usable_fetch_at``
+    through ``freshness``. Stamps that do not parse are skipped. Stamps are
+    compared as parsed UTC instants, never as strings, so stamps with
+    different UTC offsets are ordered chronologically, and the newest instant
+    is chosen before it is cut to the whole second. It is returned as a
+    whole-second ``isoformat_utc`` stamp, which the browser's ``Date.parse``
+    reads as-is; ``None`` when no stamp parses.
+    """
+    contributor_ids = {
+        feed_id
+        for tile in tiles
+        for meta in (tile.temp.meta, tile.wind.meta, tile.precip.meta)
+        if meta.available
+        for feed_id in meta.contributor_ids
+    }
+    newest: datetime | None = None
+    for feed_id in contributor_ids:
+        row = freshness.get(feed_id)
+        stamp = None if row is None else row.last_usable_fetch_at
+        if stamp is None:
+            continue
+        try:
+            fetched = parse_utc(stamp)
+        except ValueError:
+            continue
+        if newest is None or fetched > newest:
+            newest = fetched
+    if newest is None:
+        return None
+    return isoformat_utc(newest.replace(microsecond=0))
 
 
 def build_hourly(
@@ -522,7 +579,7 @@ def _any_rebuilding(
 
 
 def relative_ago(timestamp: str, *, now: datetime) -> str:
-    """Human 'Updated X ago' text for a UTC ISO timestamp."""
+    """Human "X ago" text for the "Last fetched" label, from a UTC ISO stamp."""
     seconds = (now - parse_utc(timestamp)).total_seconds()
     if seconds < 60:
         return "just now"
@@ -667,6 +724,7 @@ def _wind_meta_and_values(
     *,
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
+    unknown_ids: set[int],
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Weighted-mode wind cell: every chosen feed contributes, none is dropped.
 
@@ -685,6 +743,8 @@ def _wind_meta_and_values(
                 stale=False,
                 extrema_unavailable=False,
                 extrema_state="not_available",
+                contributor_ids=(),
+                fetch_unknown=False,
             ),
             {},
         )
@@ -692,6 +752,9 @@ def _wind_meta_and_values(
         candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
         for candidate in selection.feeds
     }
+    contributor_ids = tuple(
+        dict.fromkeys(candidate.feed_id for candidate in selection.feeds)
+    )
     meta = CellMeta(
         state=_state_of(
             available=selection.available,
@@ -709,6 +772,8 @@ def _wind_meta_and_values(
         stale=any(candidate.feed_id in stale_ids for candidate in selection.feeds),
         extrema_unavailable=False,
         extrema_state="not_available",
+        contributor_ids=contributor_ids,
+        fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
     )
     return meta, values
 
@@ -716,7 +781,9 @@ def _wind_meta_and_values(
 def _closed_wind_cell() -> _Cell:
     """The wind cell served while the switch runs: not available, no values."""
     selection = wind_blend.empty_wind_selection()
-    meta, values = _wind_meta_and_values(selection, feeds_samples={}, stale_ids=set())
+    meta, values = _wind_meta_and_values(
+        selection, feeds_samples={}, stale_ids=set(), unknown_ids=set()
+    )
     return meta, selection, values
 
 
@@ -726,6 +793,7 @@ def _cell_meta_and_values(
     variable: str,
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
+    unknown_ids: set[int],
     rebuilding_by_feed: dict[int, bool],
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage rules; return cell meta + per-feed value lists.
@@ -746,7 +814,8 @@ def _cell_meta_and_values(
     is NOT aggregated. Because those feeds can lie outside the clearing
     subset, for both variables ``stale`` also covers every extrema feed, and
     ``extrema_state`` is the extrema set's own verdict under
-    :func:`_state_of`'s precedence.
+    :func:`_state_of`'s precedence. ``fetch_unknown`` covers the same
+    contributor feeds as ``stale``.
     """
     if not selection.available:
         return (
@@ -757,6 +826,8 @@ def _cell_meta_and_values(
                 stale=False,
                 extrema_unavailable=False,
                 extrema_state="not_available",
+                contributor_ids=(),
+                fetch_unknown=False,
             ),
             {},
         )
@@ -792,6 +863,9 @@ def _cell_meta_and_values(
         candidate.feed_id: [s.value for s in feeds_samples[candidate.feed_id]]
         for candidate in value_feeds
     }
+    contributor_ids = tuple(
+        dict.fromkeys(candidate.feed_id for candidate in stale_feeds)
+    )
     meta = CellMeta(
         state=_state_of(
             available=selection.available,
@@ -809,6 +883,8 @@ def _cell_meta_and_values(
         stale=any(candidate.feed_id in stale_ids for candidate in stale_feeds),
         extrema_unavailable=extrema_unavailable,
         extrema_state=extrema_state,
+        contributor_ids=contributor_ids,
+        fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
     )
     return meta, values
 
@@ -880,6 +956,7 @@ def _build_tile(
         confidence_state=confidence_state,
         stale=any(meta.stale for meta in populated),
         partial=any(meta.partial for meta in populated),
+        fetch_unknown=any(meta.fetch_unknown for meta in populated),
     )
 
 

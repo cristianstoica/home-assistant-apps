@@ -29,7 +29,8 @@ from wxverify.api.routes.health import (
     FORECAST_PAIRS_COUNT_SQL,
     FORECAST_SAMPLES_COUNT_SQL,
 )
-from wxverify.db.migrations import run_migrations
+from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
+from wxverify.db.migrations import SEED_LAST_USABLE_FETCH_SQL, run_migrations
 from wxverify.db.queue import (
     _CURRENT_OBS_LANE_CLAUSE,  # noqa: PLC2701 -- the constant IS the plan input under test
     _MAIN_LANE_CLAUSE,  # noqa: PLC2701
@@ -612,6 +613,52 @@ def test_idx_samples_recent_column_order_matches_the_query_shape() -> None:
         ("variable", 0),
         ("model_run_id", 0),
     ]
+
+
+# ---------------------------------------------------------------------------
+# §14.6 "S" — Seed EQP (relationship, never a fixed-phrasing pin).
+# ---------------------------------------------------------------------------
+
+
+def _fs_row(plan: list[str]) -> str:
+    rows = [line for line in plan if line.startswith(("SEARCH fs", "SCAN fs"))]
+    assert len(rows) == 1, plan
+    return rows[0]
+
+
+def test_v8_seed_sql_fs_subquery_matches_a_reference_recent_samples_query() -> None:
+    """The migration's own module-level constant, executed verbatim (never a
+    copy), must read ``forecast_samples fs`` the same way a reference query
+    with the same filter shape does -- a relationship, since the exact
+    ``SEARCH ...`` phrasing is a contract with the shipping SQLite build.
+    This test requires the ``SEARCH fs USING INDEX idx_samples_recent``
+    prefix; it runs locally and in the shipping-SQLite CI job, and is not
+    gated by ``WXV_EQP_SHIPPING``.
+
+    Mutant (plan §14.6): the ``OR`` form of §10.2 (``fs.feed_id = sfs.feed_id
+    OR fs.feed_id IN (SELECT m.id ...)`` in place of the ``UNION ALL``-fed
+    ``IN``) drops the leading ``feed_id`` conjunct from the planner's view,
+    so its ``fs`` row reads ``(site_id=?)`` only instead of seeking on
+    ``site_id`` AND ``feed_id`` -- divergent from the reference query's row
+    at this exact assertion.
+    """
+    conn = _fresh_conn()
+
+    seed_plan = _plan(conn, SEED_LAST_USABLE_FETCH_SQL, ())
+    seed_row = _fs_row(seed_plan)
+
+    reference_sql = f"""
+        SELECT 1 FROM forecast_samples fs
+        WHERE fs.site_id = ? AND fs.feed_id = ? AND fs.issued_at >= ?
+          AND fs.fetched_at = ? AND NOT {invalid_forecast_sample_sql("fs")}
+        """
+    reference_plan = _plan(
+        conn, reference_sql, (1, 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z")
+    )
+    reference_row = _fs_row(reference_plan)
+
+    assert seed_row.startswith("SEARCH fs USING INDEX idx_samples_recent")
+    assert seed_row == reference_row
 
 
 # ---------------------------------------------------------------------------

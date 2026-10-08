@@ -205,6 +205,11 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "wxverify.worker.processor.run_current_obs_poller", _idle_poller
     )
+    # The fake db hands write callbacks conn=None; the claim-identity
+    # check needs a real jobs table.
+    monkeypatch.setattr(
+        "wxverify.worker.processor._still_claimed", lambda _conn, _job: True
+    )
 
 
 def _make_url(param: str, value: str = "SECRET123") -> str:
@@ -993,7 +998,7 @@ def test_catchup_debug_lines_present(
 ) -> None:
     """T12-E: run_catchup at DEBUG emits sites/cursor debug lines.
 
-    The open-meteo adapter is stubbed so the seven due feeds are walked
+    The open-meteo adapter is stubbed so the due feeds are walked
     without a request; the line under test is emitted before any fetch.
     """
     conn = _init_tmp_db(tmp_path)

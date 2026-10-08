@@ -256,7 +256,7 @@ def test_catchup_swallows_denied_open_meteo_requests(
             message.count(
                 "getaddrinfo(host='previous-runs-api.open-meteo.com', port=443"
             )
-            == 7
+            == 8
         )
         assert "host='api.open-meteo.com'" not in message
         assert "[Errno 1]" not in message

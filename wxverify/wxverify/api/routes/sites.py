@@ -21,8 +21,11 @@ from wxverify.db.tz_generations import (
     CorrectionAlreadyBuilding,
     TimezoneSiteNotFound,
     UnknownTimezone,
+    correction_heartbeat_key,
+    correction_state_key,
     ensure_published_generation,
     published_generation_clause,
+    published_pointer_key,
     start_retrospective_correction,
 )
 from wxverify.db.wind_basis import (
@@ -34,6 +37,12 @@ from wxverify.db.wind_basis import (
     wind_report_key,
 )
 from wxverify.scoring.engine import pair_and_score
+from wxverify.verification.record import SNAPSHOT_TIME_KEY, gap_scan_failures_key
+from wxverify.verification.runs import published_run_key
+from wxverify.worker.verification_run import (
+    verification_heartbeat_key,
+    verification_state_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,10 +98,15 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         ).fetchone()
         if row is None:
             raise RuntimeError("site insert failed")
+        site_id = int(row["id"])
+        # A reused id may still carry keys a pre-0.16.7 delete left behind;
+        # clear them BEFORE seeding, because ensure_published_generation
+        # trusts any existing pointer.
+        _clear_site_state(conn, site_id, [])
         # New sites get their initial published timezone generation and
         # published-pointer row immediately — the same seed migrate_v4
         # applies to pre-existing sites.
-        ensure_published_generation(conn, int(row["id"]))
+        ensure_published_generation(conn, site_id)
         return _site_out(row)
 
     site = await get_db().write(_write)
@@ -172,24 +186,59 @@ async def update_site(
     return site
 
 
+def _clear_site_state(
+    conn: sqlite3.Connection, site_id: int, generation_ids: list[int]
+) -> None:
+    """Drop every runtime_state/settings row keyed by ``site_id``, plus the
+    correction-chain keys of each id in ``generation_ids``.
+
+    Site and generation ids are reused (INTEGER PRIMARY KEY, no
+    AUTOINCREMENT) and neither table has a foreign key, so the sites
+    cascade never reaches these rows.
+    """
+    correction_keys = [
+        key
+        for generation_id in generation_ids
+        for key in (
+            correction_state_key(generation_id),
+            correction_heartbeat_key(generation_id),
+        )
+    ]
+    delete_runtime_state(
+        conn,
+        wind_basis_key(site_id),
+        wind_progress_key(site_id),
+        wind_cursor_key(site_id),
+        wind_blocked_key(site_id),
+        wind_report_key(site_id),
+        wind_done_at_key(site_id),
+        published_pointer_key(site_id),
+        verification_state_key(site_id),
+        verification_heartbeat_key(site_id),
+        published_run_key(site_id),
+        gap_scan_failures_key(site_id),
+        *correction_keys,
+    )
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?", (f"{SNAPSHOT_TIME_KEY}:{site_id}",)
+    )
+
+
 @router.delete("/{site_id}", response_model=None)
 async def delete_site(request: Request, site_id: int) -> dict[str, bool] | HTMLResponse:
     def _write(conn: sqlite3.Connection) -> None:
+        # Read before the DELETE: the cascade removes the generation rows
+        # whose ids key the correction-chain state.
+        generation_ids = [
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM timezone_generations WHERE site_id = ?", (site_id,)
+            )
+        ]
         cur = conn.execute("DELETE FROM sites WHERE id=?", (site_id,))
         if cur.rowcount == 0:
             raise ApiError(404, "site not found")
-        # Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT): drop
-        # the per-site wind state in the same transaction so a recreated
-        # site starts at the absent-key default, pair_max.
-        delete_runtime_state(
-            conn,
-            wind_basis_key(site_id),
-            wind_progress_key(site_id),
-            wind_cursor_key(site_id),
-            wind_blocked_key(site_id),
-            wind_report_key(site_id),
-            wind_done_at_key(site_id),
-        )
+        _clear_site_state(conn, site_id, generation_ids)
 
     await get_db().write(_write)
     if _wants_html(request):

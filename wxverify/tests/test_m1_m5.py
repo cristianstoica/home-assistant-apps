@@ -161,7 +161,7 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
         WHERE source='open-meteo' AND default_subscribed=1
         """
     ).fetchone()
-    assert open_meteo["n"] == 7
+    assert open_meteo["n"] == 8
     assert (
         conn.execute(
             """

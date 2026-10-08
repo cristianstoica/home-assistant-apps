@@ -51,7 +51,11 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.queue import Job, claim_next_job
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import (
+    delete_runtime_state,
+    get_runtime_state,
+    set_runtime_state,
+)
 from wxverify.db.wind_basis import (
     read_auth_hold,
     read_wind_cursor,
@@ -62,6 +66,7 @@ from wxverify.db.wind_basis import (
     wind_cursor_key,
     wind_done_at_key,
     wind_progress_key,
+    wind_report_key,
     write_auth_hold,
     write_wind_cursor,
 )
@@ -957,6 +962,45 @@ def test_switch_check_p7_free_disk_none_blocks_with_warning(
         " written, or reason 1 not checked first) ="
         f" {reason!r}"
     )
+
+
+def test_switch_check_writes_nothing_once_the_site_is_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
+    conn = _make_db()
+    site_id, _ = _seed_switchable_site(conn)
+    # The delete route's transaction as this lane sees it. _make_db leaves
+    # foreign keys off, so station rows survive; free=None forces the blocked
+    # branch (p7) whatever the counts are.
+    conn.execute("DELETE FROM sites WHERE id = ?", (site_id,))
+    delete_runtime_state(
+        conn,
+        wind_basis_key(site_id),
+        wind_progress_key(site_id),
+        wind_cursor_key(site_id),
+        wind_blocked_key(site_id),
+        wind_report_key(site_id),
+        wind_done_at_key(site_id),
+    )
+    conn.commit()
+
+    switched = _switch_check(conn, site_id, _TZ, None)
+
+    assert switched is False
+    assert get_runtime_state(conn, wind_blocked_key(site_id)) is None, (
+        "mutant -> at this assertion: correct = None, mutant (no basis"
+        " guard) ="
+        ' {"reason": "free disk space could not be read", ...}'
+    )
+    for key in (
+        wind_basis_key(site_id),
+        wind_progress_key(site_id),
+        wind_cursor_key(site_id),
+        wind_report_key(site_id),
+        wind_done_at_key(site_id),
+    ):
+        assert get_runtime_state(conn, key) is None, key
 
 
 def test_switch_check_blocked_vs_waiting(monkeypatch: pytest.MonkeyPatch) -> None:

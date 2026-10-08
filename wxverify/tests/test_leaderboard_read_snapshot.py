@@ -602,12 +602,15 @@ def test_o4_leaderboard_status_cell_runs_inside_writer_transaction(
 # ---------------------------------------------------------------------------
 
 
-def test_o5_leaderboard_with_status_in_transaction_has_exactly_two_callers() -> None:
+def test_o5_leaderboard_with_status_in_transaction_has_exactly_three_callers() -> None:
     """The unbracketed inner (``leaderboard_with_status_in_transaction``) is
-    called from exactly two places: its own facade wrapper
-    (``leaderboard_with_status``) and the one write-path caller
-    (``_leaderboard_status_cell`` in ``verification/record.py``). Any third
-    caller would bypass the bracket outside a caller-owned transaction.
+    called from exactly three places: its own facade wrapper
+    (``leaderboard_with_status``), the one write-path caller
+    (``_leaderboard_status_cell`` in ``verification/record.py``), and
+    ``forecast_ranking_with_status`` in ``forecast/data.py``, which calls it
+    only when ``conn.in_transaction`` (a forecast route's read snapshot is
+    open). Any fourth caller would bypass the bracket outside a caller-owned
+    transaction.
     """
     import wxverify
 
@@ -620,6 +623,7 @@ def test_o5_leaderboard_with_status_in_transaction_has_exactly_two_callers() -> 
             callers.add(path.relative_to(package_root))
 
     assert callers == {
+        Path("forecast/data.py"),
         Path("scoring/leaderboard.py"),
         Path("verification/record.py"),
     }

@@ -1051,7 +1051,7 @@ def _assert_v2_seed_state(conn: sqlite3.Connection) -> None:
         for row in conn.execute("SELECT key, value FROM settings")
     }
     assert settings["synthetic_key"] == "v"
-    assert conn.execute("SELECT COUNT(*) FROM feeds").fetchone()[0] == 16
+    assert conn.execute("SELECT COUNT(*) FROM feeds").fetchone()[0] == 17
 
     tz_rows = conn.execute(
         "SELECT site_id, timezone, mode, state FROM timezone_generations"

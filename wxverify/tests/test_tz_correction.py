@@ -23,7 +23,7 @@ from tests.helpers import (
     asof_make_site,
 )
 from wxverify.db.queue import Job, claim_next_job, enqueue_if_absent
-from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.tz_generations import (
     apply_prospective_change,
     correction_job_key,
@@ -43,6 +43,7 @@ from wxverify.verification.truth import (
 from wxverify.worker.control import JobCancelled
 from wxverify.worker.tz_correction import (
     advance_correction,
+    correction_heartbeat_key,
     correction_state_key,
     mark_correction_failed,
 )
@@ -602,3 +603,26 @@ class TestDailyTruthObligations:
             (site_id, int(old_generation["id"])),
         ).fetchone()
         assert still_stale is not None and int(still_stale["stale"]) == 1
+
+
+def test_retrospective_generation_starts_without_leftover_correction_state() -> None:
+    """D2 (§5.1): starting a new retrospective correction clears any
+    correction-chain blob left under the reused generation id."""
+    conn = asof_conn()
+    site_id = asof_make_site(conn, "Testsite")
+    ensure_published_generation(conn, site_id)
+    next_gen = int(
+        conn.execute(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM timezone_generations"
+        ).fetchone()[0]
+    )
+    set_runtime_state(
+        conn, correction_state_key(next_gen), '{"phase":"days","attempts":2}'
+    )
+    set_runtime_state(conn, correction_heartbeat_key(next_gen), "2026-03-09T07:00:00Z")
+
+    gid = start_retrospective_correction(conn, site_id, NEW_TZ)
+
+    assert gid == next_gen, "generation id was not reused; rebuild, don't weaken"
+    assert get_runtime_state(conn, correction_state_key(gid)) is None
+    assert get_runtime_state(conn, correction_heartbeat_key(gid)) is None

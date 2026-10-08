@@ -27,9 +27,15 @@ import sqlite3
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import (
+    delete_runtime_state,
+    get_runtime_state,
+    set_runtime_state,
+)
 
 _POINTER_KEY_PREFIX = "tz_generation_published:"
+_CORRECTION_STATE_KEY_PREFIX = "tz_correction_state:"
+_CORRECTION_HEARTBEAT_KEY_PREFIX = "tz_correction_heartbeat:"
 
 #: job_key prefix for timezone_correction chain jobs (``tzcorr:<generation>``).
 CORRECTION_JOB_KEY_PREFIX = "tzcorr:"
@@ -68,6 +74,16 @@ class CorrectionAlreadyBuilding(TimezoneOperationRefused):
 def correction_job_key(generation_id: int) -> str:
     """``jobs.job_key`` for the correction chain building ``generation_id``."""
     return f"{CORRECTION_JOB_KEY_PREFIX}{generation_id}"
+
+
+def correction_state_key(generation_id: int) -> str:
+    """``runtime_state`` key of the correction chain-state JSON blob."""
+    return f"{_CORRECTION_STATE_KEY_PREFIX}{generation_id}"
+
+
+def correction_heartbeat_key(generation_id: int) -> str:
+    """``runtime_state`` key of the correction chain progress heartbeat."""
+    return f"{_CORRECTION_HEARTBEAT_KEY_PREFIX}{generation_id}"
 
 
 def _validate_timezone(timezone: str) -> None:
@@ -274,6 +290,14 @@ def start_retrospective_correction(
     if cur.lastrowid is None:
         raise RuntimeError("timezone generation insert failed")
     generation_id = int(cur.lastrowid)
+    # Generation ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT) and
+    # runtime_state has no foreign key: a chain blob an older release left
+    # under this id would otherwise be resumed by advance_correction.
+    delete_runtime_state(
+        conn,
+        correction_state_key(generation_id),
+        correction_heartbeat_key(generation_id),
+    )
     enqueue_if_absent(
         conn,
         "timezone_correction",

@@ -93,10 +93,11 @@ def _isolate_open_meteo_feed(
 ) -> int:
     """Disable every open-meteo feed except ``keep_model`` for this site.
 
-    All seven open-meteo feeds default-subscribe (`config.FEED_SEEDS`), so a
-    real reservation/refund drive over a single feed needs the other six
+    All open-meteo feeds default-subscribe (`config.FEED_SEEDS`), so a real
+    reservation/refund drive over a single feed needs every other one
     switched off via ``site_feed_state.enabled=0`` -- otherwise every
-    assertion below would be about a set of seven calls, not one.
+    assertion below would be about a set of calls across all open-meteo
+    feeds, not one.
     """
     rows = conn.execute(
         "SELECT id, model FROM feeds WHERE source='open-meteo' ORDER BY id"

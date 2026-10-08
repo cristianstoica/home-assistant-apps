@@ -7,6 +7,7 @@ import logging
 import sqlite3
 import time
 from datetime import timedelta
+from typing import Final
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
@@ -16,7 +17,7 @@ from wxverify.db.wind_basis import init_wind_basis
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 7
+TARGET_USER_VERSION = 8
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -148,6 +149,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             grid_lat REAL,
             grid_lon REAL,
             grid_elevation_m REAL,
+            last_usable_fetch_at TEXT,
             PRIMARY KEY(site_id, feed_id)
         );
 
@@ -881,12 +883,12 @@ OPEN_METEO_HORIZON_CORRECTION_KEY = "open_meteo_horizon_correction_applied"
 def correct_open_meteo_horizons(conn: sqlite3.Connection) -> None:
     """Move every Open-Meteo feed to its own request horizon, once.
 
-    All seven feeds were seeded at a uniform 168 h. The four longest
-    models -- `ecmwf_ifs`, `gfs_global`, `gem_global` and `jma_gsm` --
-    rise to `config.DISPLAY_REQUEST_HOURS`, the hours the eight-day
-    product can actually consume, rather than to their advertised
-    maxima, which run far past it. `icon_global` rises to its own
-    maximum, 180 h, which already sits below that cap.
+    The seven original feeds were seeded at a uniform 168 h. The four
+    longest models -- `ecmwf_ifs`, `gfs_global`, `gem_global` and
+    `jma_gsm` -- rise to `config.DISPLAY_REQUEST_HOURS`, the hours the
+    eight-day product can actually consume, rather than to their
+    advertised maxima, which run far past it. `icon_global` rises to
+    its own maximum, 180 h, which already sits below that cap.
     `meteofrance_arpege_world` and `ukmo_global_deterministic_10km`
     keep 168. `config.OPEN_METEO_MAX_LEAD_HOURS` is the same table
     `FEED_SEEDS` seeds from, so a fresh database and an upgraded one
@@ -914,8 +916,12 @@ def correct_open_meteo_horizons(conn: sqlite3.Connection) -> None:
     operator-writable columns (`enabled`, `disabled_reason`,
     `fetch_interval_minutes`, `default_subscribed`) at every boot.
 
-    Two of the seven iterations write 168 over 168 -- a no-op by
-    arithmetic, not by a special case.
+    Two of the seven original iterations write 168 over 168 -- a no-op
+    by arithmetic, not by a special case. A model added later is seeded
+    at its config value, so this pass either matches no row of it (a
+    value other than 168) or writes the same value back: it can never
+    change that model's row, because `max_lead_hours` is not
+    operator-writable.
     """
     if get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) is not None:
         return
@@ -939,9 +945,10 @@ OPEN_METEO_INTERVAL_CORRECTION_KEY = "open_meteo_interval_correction_applied"
 def correct_open_meteo_fetch_intervals(conn: sqlite3.Connection) -> None:
     """Move every Open-Meteo feed to one poll per published run, once.
 
-    All seven feeds were seeded at a uniform 360 minutes. `gem_global`
-    updates every 12 hours, so a 6-hour poll collected each update twice;
-    it moves to 720. The other six update every 6 hours and keep 360.
+    The seven original feeds were seeded at a uniform 360 minutes.
+    `gem_global` updates every 12 hours, so a 6-hour poll collected each
+    update twice; it moves to 720. The other six update every 6 hours
+    and keep 360.
     `config.OPEN_METEO_FETCH_INTERVAL_MINUTES` is the same table
     `FEED_SEEDS` seeds from, so a fresh database and an upgraded one
     cannot drift apart.
@@ -967,8 +974,11 @@ def correct_open_meteo_fetch_intervals(conn: sqlite3.Connection) -> None:
     operator-writable columns (`enabled`, `disabled_reason`,
     `fetch_interval_minutes`, `default_subscribed`) at every boot.
 
-    Six of the seven iterations write 360 over 360 -- a no-op by
-    arithmetic, not by a special case.
+    Six of the seven original iterations write 360 over 360 -- a no-op
+    by arithmetic, not by a special case. A model added later is seeded
+    at its config value, so on its row as seeded this pass either
+    matches nothing (a value other than 360) or writes the same 360
+    back.
     """
     if get_runtime_state(conn, OPEN_METEO_INTERVAL_CORRECTION_KEY) is not None:
         return
@@ -1015,6 +1025,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 7:
         logger.debug("migrations applying v7 obs cycle clock + station history")
         migrate_v7_obs_cycle_and_station_history(conn)
+    if current < 8:
+        logger.debug("migrations applying v8 last usable fetch stamp")
+        migrate_v8_last_usable_fetch_at(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1482,6 +1495,67 @@ def migrate_v7_obs_cycle_and_station_history(conn: sqlite3.Connection) -> None:
         "UPDATE sites SET last_obs_cycle_at = last_obs_at "
         "WHERE last_obs_cycle_at IS NULL"
     )
+
+
+# Seeds ``site_feed_state.last_usable_fetch_at`` from ``last_run_at`` when a
+# stored sample proves that fetch returned something usable: a valid sample
+# whose ``fetched_at`` is exactly that stamp. Both columns are written from
+# the same ``fetched_at`` value by one ``persist_fetch_result`` call, so exact
+# string equality is sound. A meteoblue package row also accepts samples of
+# its member feeds, which is where that fetch stores them. The member branch
+# is an ``IN (... UNION ALL ...)``, not an ``OR``: the ``OR`` form degrades
+# the probe to a ``site_id``-only seek of idx_samples_recent, while this form
+# seeks ``(site_id, feed_id, issued_at)``. The ``issued_at`` floor is that
+# seek's range. Idempotent through ``IS NULL``; every case it cannot prove
+# (a no-op fetch, a duplicates-only fetch, runs older than 2 days) is left
+# NULL, which the Forecast page reads as "fetch time unknown".
+SEED_LAST_USABLE_FETCH_SQL: Final[str] = f"""
+    UPDATE site_feed_state AS sfs
+    SET last_usable_fetch_at = sfs.last_run_at
+    WHERE sfs.last_usable_fetch_at IS NULL
+      AND sfs.last_run_at IS NOT NULL
+      AND EXISTS (
+          SELECT 1 FROM forecast_samples fs
+          WHERE fs.site_id = sfs.site_id
+            AND fs.feed_id IN (
+                SELECT sfs.feed_id
+                UNION ALL
+                SELECT m.id FROM feeds m, feeds p
+                WHERE p.id = sfs.feed_id
+                  AND p.source = 'meteoblue' AND p.model = 'multimodel'
+                  AND m.source = 'meteoblue' AND m.model != 'multimodel')
+            AND fs.issued_at
+                >= strftime('%Y-%m-%dT%H:%M:%SZ', sfs.last_run_at, '-2 days')
+            AND fs.fetched_at = sfs.last_run_at
+            AND NOT {invalid_forecast_sample_sql("fs")}
+      )
+    """
+
+
+def migrate_v8_last_usable_fetch_at(conn: sqlite3.Connection) -> None:
+    """Add ``site_feed_state.last_usable_fetch_at`` and seed it.
+
+    The column records when the app last completed a forward fetch for the
+    site and feed that returned at least one usable sample; the Forecast
+    page's ``stale`` badge reads it. ``persist_fetch_result`` writes it from
+    now on; :data:`SEED_LAST_USABLE_FETCH_SQL` recovers what the stored
+    samples can prove for fetches made before the column existed.
+
+    Column-probed idempotence, following
+    :func:`migrate_v7_obs_cycle_and_station_history`: ``run_migrations``
+    writes ``PRAGMA user_version`` only after this returns, so a crash in
+    between leaves the column present at user_version 7 and the next boot
+    re-enters the ``current < 8`` gate. :func:`create_tables` already creates
+    the column on a fresh database, where the probe is a no-op -- which is
+    why the DDL appends it last in its table, so a fresh and a migrated
+    database agree on column order, not just membership. The seed runs
+    outside the probe guard and is self-idempotent through its ``IS NULL``,
+    so a crash between the ``ALTER`` and the ``UPDATE`` converges on the next
+    boot.
+    """
+    if "last_usable_fetch_at" not in _table_columns(conn, "site_feed_state"):
+        conn.execute("ALTER TABLE site_feed_state ADD COLUMN last_usable_fetch_at TEXT")
+    conn.execute(SEED_LAST_USABLE_FETCH_SQL)
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

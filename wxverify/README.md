@@ -330,18 +330,22 @@ Two limits apply here, and they are not the same number.
 `max_lead_hours`, and that value is what the fetcher asks the provider for. For
 Open-Meteo, `config.OPEN_METEO_MAX_LEAD_HOURS` maps each model to its horizon:
 `ecmwf_ifs`, `gfs_global`, `gem_global` and `jma_gsm` are requested to the
-ceiling `config.DISPLAY_REQUEST_HOURS` (`217`); `icon_global` to `180` and
-`ukmo_global_deterministic_10km` to `168`, each model's longest-run maximum;
-and `meteofrance_arpege_world` stays at `168` to preserve its existing scoring
-eligibility. The request length counts from the hour of the fetch, but a stored
-lead counts from the estimated issue time, so the model's advertised duration
-of about four days does not by itself justify lowering its `max_lead_hours`,
-which also bounds scoring. No feed's horizon is lowered in 0.16.0. Adding
-a model means adding an entry to that mapping — the fresh-database seed and
-the one-shot correction applied to existing databases both read it, so the two
-cannot drift apart. Meteoblue is unchanged: its seed stays at `168` and its
-package data is filtered to that feed's `max_lead_hours`. Open-Meteo historical
-backfill still stores previous-run day-ahead leads from day 1 through day 7.
+ceiling `config.DISPLAY_REQUEST_HOURS` (`217`); `icon_global` to `180`,
+`ukmo_global_deterministic_10km` to `168` and `icon_eu` to `120`, each model's
+longest-run maximum; and `meteofrance_arpege_world` stays at `168` to preserve
+its existing scoring eligibility. The request length counts from the hour of
+the fetch, but a stored lead counts from the estimated issue time, so the
+model's advertised duration of about four days does not by itself justify
+lowering its `max_lead_hours`, which also bounds scoring. No feed's horizon is
+lowered in 0.16.0. Adding a model means editing all three mappings
+(`feeds.open_meteo.RUN_CADENCE_HOURS`, `config.OPEN_METEO_MAX_LEAD_HOURS` and
+`config.OPEN_METEO_FETCH_INTERVAL_MINUTES`) plus the tests: the seed, which
+runs on every start, inserts the new model's row, and the 0.16.0 one-shot
+corrections leave a model added later as it was seeded. Meteoblue is
+unchanged: its seed stays at `168` and its package data is filtered to that
+feed's `max_lead_hours`. Open-Meteo historical backfill stores previous-run
+day-ahead leads from day 1 through day 7, or through the last whole day of the
+feed's `max_lead_hours` when that comes sooner: day 5 for `icon_eu`.
 
 `DISPLAY_REQUEST_HOURS` is `217`, and it is a display figure, not a scoring
 one. The product displays `forecast.service.DAY_COUNT` days; the request has to
@@ -368,6 +372,7 @@ hours: a longer request improves last-day coverage but does not guarantee a
 complete day. `icon_global`, raised to `180`, gains at most leads 169-180 for
 scoring, and its last displayed day can still be incomplete, because its
 request can end before that day ends. Both feeds kept at `168` are unchanged.
+`icon_eu`, requested to `120`, covers about the first five displayed days.
 
 Actual stored coverage can still be shorter than a feed's own request horizon,
 when the provider or a member model returns less — some regional Meteoblue
@@ -495,7 +500,10 @@ lack some of today's hours, and then cannot cover `Today`, when:
   backfill does not go back for (a catch-up, from the `Catch up` button on the
   Ops page or the `catchup` command, may fetch its history);
 - the provider returned an hour without a value, or an hour fell after the
-  backfill's end and before the feed's first regular fetch.
+  backfill's end and before the feed's first regular fetch;
+- the provider refused that feed's history request during setup backfill (for
+  example ICON-EU for a site outside Europe); the backfill records the error,
+  continues with the other feeds and does not go back for that feed.
 
 The label appears only when none of the feeds with forecasts for that day
 covers it, so a feed added later never blanks a day another feed already
@@ -535,6 +543,12 @@ all.
 A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
 feeds its daily high and low come from and the feeds its daily rain figures
 come from, which can differ from the selected feeds its hourly chart plots.
+
+A feed counts as `stale` when the app has not completed a successful forecast
+download for it within twice its fetch interval. Only a download that returned
+usable forecast values counts; a download that returned values already stored
+counts too. `fetch time unknown` means no such download has been recorded yet,
+for example right after an upgrade.
 
 The daily forecast record stores what the tile showed: when the label appears,
 the recorded `high_c` and `low_c` are empty (`null`) and `extrema_coverage` is
@@ -799,7 +813,8 @@ Ops → Database Import uploads a previously exported `.db` file and **fully
 replaces** the live database with it. Any data collected since that export is
 lost. The upload is validated first (integrity check, wxverify schema version,
 required tables, that each of the add-on's own tables present in the file is
-an ordinary table, and that every forecast and observation time is in the
+an ordinary table, that the file's schema and the add-on's own tables hold
+only valid UTF-8 text, and that every forecast and observation time is in the
 add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
 automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
 the swap. Only the newest `.bak` file is kept; older ones are swept
@@ -853,7 +868,8 @@ The four levels, loudest to quietest:
   `logging configured level=… stream=stdout` line confirms the active level. From then on
   you'll see the worker start and stop, a `job claimed …` line when the worker picks up a
   job, one `cycle: …` line each time it finishes a unit of work (naming the job, its
-  outcome — completed, deferred, retry, or failed — and how long it took, `elapsed=…`),
+  outcome — completed, deferred, retry, failed, or dropped (its outcome was not recorded,
+  usually because its site was deleted while it ran) — and how long it took, `elapsed=…`),
   the scoring milestones (`score phase=…`, `score discovery …`, `score window=…`, and
   `score sweep …`, each with its own elapsed time), and one `scoring run complete …` line
   per scoring run. If these keep ticking over, the add-on is alive and doing its job.
@@ -1042,29 +1058,39 @@ With the default cadences, each enabled site makes:
   roughly `7.2` to `8` cycles per day.
 - Open-Meteo forecasts: each enabled Open-Meteo model is polled every `360`
   minutes (`4` calls per day), except `gem_global`, polled every `720` minutes
-  (`2` calls per day). Polling follows each model's run cadence but is not
-  aligned to publication, so fetching every published run is not guaranteed.
+  (`2` calls per day). Except for `icon_eu`, polling follows each model's run
+  cadence; it is not aligned to publication, so fetching every published run is
+  not guaranteed. `icon_eu` publishes every 3 hours and is polled every `360`
+  minutes, which is six-hourly polling that samples roughly alternate ICON-EU
+  updates. Which updates it samples depends on when the add-on started and
+  shifts over time. ICON-EU covers Europe only and is on by default because the
+  add-on's defaults are set for Europe; for a site outside Europe, switch it off
+  for that site on the Sites page, under Feed Subscriptions.
 - Meteoblue: one multimodel package call every `360` minutes, or `4` calls per
   enabled site per day. The current package costs `16000` credits per call.
 
 The run a forward Open-Meteo forecast is labelled with, and the time it is
 recorded as issued, are estimated from the time of the fetch: the add-on
 subtracts a flat `90`-minute availability lag and rounds the result down to the
-model's run cadence in UTC, to `00`, `06`, `12` or `18` UTC, or to `00` or `12`
-UTC for `gem_global`. No run identifier is read from the provider, and nothing
+model's run cadence in UTC, to `00`, `06`, `12` or `18` UTC, to `00` or `12`
+UTC for `gem_global`, or to any multiple of 3 hours (`00`, `03`, … `21` UTC)
+for `icon_eu`. No run identifier is read from the provider, and nothing
 confirms which provider run a stored forecast came from. `gem_global`'s
 estimated labels are now twelve-hourly, matching the model's twelve-hour run
 schedule; forward `gem_global` forecasts stored before 0.16.0 keep their
-six-hourly estimated labels, and no stored row is relabelled.
+six-hourly estimated labels, and no stored row is relabelled. Because the lag
+is a flat `90` minutes and ICON-EU is usually published later than that, an
+`icon_eu` label can name a run newer than the one that supplied the data, so a
+stored lead can be shorter than the data's true age.
 
-For an example deployment with one enabled site, 8 enabled stations, 7 enabled
+For an example deployment with one enabled site, 8 enabled stations, 8 enabled
 Open-Meteo models, and the Meteoblue package enabled, the expected steady-state
 use is:
 
 | Provider        |          Expected steady-state use |
 | --------------- | ---------------------------------: |
 | Weather.com PWS |            about `56-64` calls/day |
-| Open-Meteo      |                     `26` calls/day |
+| Open-Meteo      |                     `30` calls/day |
 | Meteoblue       | `4` calls/day, `64000` credits/day |
 
 The default wxverify caps are:

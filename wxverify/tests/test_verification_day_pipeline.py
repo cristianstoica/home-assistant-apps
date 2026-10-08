@@ -952,16 +952,26 @@ def test_missing_published_pointer_is_flagged_readonly_only(tmp_path: Path) -> N
     asyncio.run(_run())
 
 
-# T5-generated golden (base commit 4454267, pre-write-lock-fix
-# `wxverify.worker.verification_run`): sha256 over `verification_evidence`
-# (ordered by id) and `verification_day_context` (ordered by
-# snapshot_local_date), both quoted and filtered to the synthetic run's
-# run_id -- see `tests/test_verification_day_differential.py`'s own
-# `GOLDEN_0163`, generated identically and by the same script
-# (`.tmp/myers/t5_golden.py`, 2026-09-26) against the same
-# `build_synthetic_verification_site` fixture. Duplicated here (not moved to
-# `tests/helpers.py`) because it is only used by these two modules.
-GOLDEN_0163 = "b1d62aa76d5b8f4bd9166f0fcec4be115375ee4a53886cefc9a1c43f0b7a875e"
+# sha256 over `verification_evidence` (ordered by id) and
+# `verification_day_context` (ordered by snapshot_local_date), both quoted
+# and filtered to the synthetic run's run_id (`tests/helpers.py:evidence_digest`),
+# at the first entry to the `aggregate` phase -- see
+# `tests/test_verification_day_differential.py`'s own `GOLDEN_0163`, generated
+# identically against the same `build_synthetic_verification_site` fixture.
+# Generated from the pre-write-lock-fix reference implementation (base
+# commit `4454267`, with `tests/helpers.py` taken from `b21f342` since
+# `4454267` has no `evidence_digest`), by repeating that module's T4d loop
+# against that reference with the three `icon_eu` config entries (Item D1)
+# seeded into `OPEN_METEO_MAX_LEAD_HOURS`, `OPEN_METEO_FETCH_INTERVAL_MINUTES`
+# and `RUN_CADENCE_HOURS`. The same reference without those seed entries
+# gives the previous value,
+# `b1d62aa76d5b8f4bd9166f0fcec4be115375ee4a53886cefc9a1c43f0b7a875e`. Any
+# future seeded Open-Meteo feed needs this same regeneration: the digest
+# covers feed ids and the roster's evidence rows, so a new default-subscribed
+# feed renumbers every feed id after it and adds its own no-samples rows.
+# Duplicated here (not moved to `tests/helpers.py`) because it is only used
+# by these two modules.
+GOLDEN_0163 = "12a6850b0cb932c8c080fc100e74ab38b767491d3aad9a31258113c08683936d"
 
 
 # ---------------------------------------------------------------------------

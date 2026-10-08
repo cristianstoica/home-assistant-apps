@@ -425,17 +425,26 @@ def test_e_t8_unknown_model_raises_and_names_itself() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T10 -- one poll per run, pinned as arithmetic on the mappings.
+# E-T10 -- one poll per run for every model except a named, deliberate
+# subsample, pinned as arithmetic on the mappings.
 # ---------------------------------------------------------------------------
 
+# Models deliberately polled at k times their run cadence (owner decision
+# 2026-10-02). They sample roughly every k-th run, with no guarantee of which
+# runs.
+_SUBSAMPLED_RUNS_PER_POLL: dict[str, int] = {"icon_eu": 2}
 
-def test_e_t10_fetch_interval_equals_cadence_hours_times_60() -> None:
+
+def test_e_t10_fetch_interval_matches_cadence_except_subsampled() -> None:
     from wxverify import config
 
+    assert set(_SUBSAMPLED_RUNS_PER_POLL) <= set(RUN_CADENCE_HOURS)
+    assert all(k >= 2 for k in _SUBSAMPLED_RUNS_PER_POLL.values())
     for model in RUN_CADENCE_HOURS:
+        k = _SUBSAMPLED_RUNS_PER_POLL.get(model, 1)
         assert (
             config.OPEN_METEO_FETCH_INTERVAL_MINUTES[model]
-            == RUN_CADENCE_HOURS[model] * 60
+            == RUN_CADENCE_HOURS[model] * 60 * k
         ), model
 
 
@@ -682,7 +691,7 @@ def test_e_t16_scheduling_arithmetic_at_720_minute_cadence(
     conn.commit()
     _enqueue_due_feeds(conn)
     conn.commit()
-    # asof_conn() seeds the seven default open-meteo feeds too, each
+    # asof_conn() seeds the eight default open-meteo feeds too, each
     # never-run and therefore unconditionally due -- scope to THIS feed's
     # job_key ("fetch:<feed_id>") so those siblings' jobs cannot mask the
     # assertion.

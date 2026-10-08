@@ -294,6 +294,10 @@ async def _fetch_historical_forecasts(
 ) -> int:
     feeds = await db.read(lambda conn: _historical_feed_targets(conn, target.site_id))
     written = 0
+    # Fetches that returned, with a result or with None. A refused feed is
+    # not counted, so a refusal of every feed re-raises after the loop.
+    answered = 0
+    first_rejection: httpx.HTTPStatusError | None = None
     async with httpx.AsyncClient() as client:
         for feed in feeds:
             logger.debug(
@@ -341,6 +345,21 @@ async def _fetch_historical_forecasts(
                 )
                 if next_attempt_at is not None:
                     raise JobDeferred(next_attempt_at) from exc
+                # The provider refused this feed's request: the error is
+                # recorded above, and the other feeds carry on. Tested on the
+                # status code, because a 429 or 5xx with no host also gets no
+                # backoff and must still raise.
+                status = response.status_code
+                if 400 <= status <= 499 and status not in (408, 429):
+                    logger.warning(
+                        "backfill feed skipped site=%s feed=%s status=%d",
+                        feed.site_id,
+                        feed.feed_id,
+                        status,
+                    )
+                    if first_rejection is None:
+                        first_rejection = exc
+                    continue
                 raise
             except Exception as exc:
                 error = sanitized_exception(exc)
@@ -361,6 +380,7 @@ async def _fetch_historical_forecasts(
                     error,
                 )
                 raise
+            answered += 1
             if result is None:
                 continue
             outcome = await write_after_reservation(
@@ -372,6 +392,8 @@ async def _fetch_historical_forecasts(
                 reservation,
             )
             written += outcome.inserted_count
+    if first_rejection is not None and answered == 0:
+        raise first_rejection
     return written
 
 

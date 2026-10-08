@@ -11,17 +11,17 @@ import shutil
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Final, Literal, TypeVar
 
 from wxverify import config
 from wxverify.core.aio import run_to_completion
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
-from wxverify.db.snapshot import read_only_snapshot
+from wxverify.db.snapshot import read_only_snapshot, read_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,20 @@ SLOW_WRITE_MS = 1000.0
 # worker's own job loop, the page request being served, and the handful of
 # chart JSON fetches a page kicks off) with one spare.
 _READ_POOL_SIZE = 4
+
+
+@dataclass(frozen=True, slots=True)
+class InputCounts:
+    """The weights cache's key counts, read external-commit count first, then epoch."""
+
+    ext: int
+    epoch: int
+
+
+# What `Database.pinned_snapshot` registers for its connection: the counts its
+# snapshot is exactly described by, or why there are none.
+PinRefusal = Literal["probe_error", "counts_moved"]
+SnapshotPin = InputCounts | PinRefusal
 
 
 @dataclass
@@ -194,6 +208,9 @@ class Database:
         # import swap, so no count stored before a swap can recur.
         self._probe_lock = threading.Lock()
         self._external_seq = 0
+        # Pooled readers inside `pinned_snapshot`, each with its pin. Here,
+        # not in `_open`, so it survives an import swap.
+        self._snapshot_pins: dict[sqlite3.Connection, SnapshotPin] = {}
         self._open()
         self._stock_pool()
 
@@ -427,6 +444,60 @@ class Database:
         connection and the probe are not pooled readers.
         """
         return any(conn is pooled for pooled in self._read_conns)
+
+    def input_counts(self) -> InputCounts | None:
+        """The external-commit count, then the input epoch; ``None`` when the
+        probe cannot be read.
+
+        The count first: the writer bumps the epoch and then absorbs, so a
+        reading whose count follows the absorb also sees the bump.
+        """
+        # Looked up on the instance: tests patch it there.
+        ext = self.external_commit_seq()
+        if ext is None:
+            return None
+        return InputCounts(ext=ext, epoch=self.input_epoch)
+
+    def snapshot_pin(self, conn: sqlite3.Connection) -> SnapshotPin | None:
+        """The pin ``pinned_snapshot`` holds for ``conn``, or ``None`` outside one."""
+        return self._snapshot_pins.get(conn)
+
+    @contextlib.contextmanager
+    def pinned_snapshot(
+        self, conn: sqlite3.Connection, *, label: str
+    ) -> Generator[sqlite3.Connection]:
+        """``read_snapshot`` on ``conn`` that also pins the weights cache's counts.
+
+        The counts are read before ``BEGIN DEFERRED`` and again after the
+        priming read, both times from the probe, never ``conn``. Equal, the
+        snapshot is exactly the state they describe and the pin is those
+        counts; otherwise the pin is ``"counts_moved"``, or ``"probe_error"``
+        when either reading failed. ``snapshot_pin`` returns it inside the
+        block. A ``conn`` that is not one of this database's pooled readers
+        gets a plain ``read_snapshot``: no pin is registered, no counts read.
+        """
+        if not self.owns_pooled_reader(conn):
+            with read_snapshot(conn, label=label):
+                yield conn
+            return
+        before = self.input_counts()
+        with read_snapshot(conn, label=label):
+            after = self.input_counts()
+            pin: SnapshotPin
+            if before is None or after is None:
+                pin = "probe_error"
+            elif after != before:
+                pin = "counts_moved"
+            else:
+                pin = before
+            # Registered inside the snapshot, so a nesting refusal on entry
+            # never reaches the `finally` and never pops an outer pin.
+            self._snapshot_pins[conn] = pin
+            try:
+                yield conn
+            finally:
+                # Before read_snapshot's ROLLBACK.
+                del self._snapshot_pins[conn]
 
     async def write(
         self,
@@ -1073,6 +1144,25 @@ def current_db() -> Database | None:
     inside a caller that only holds a bare ``sqlite3.Connection``.
     """
     return _db_instance
+
+
+@contextlib.contextmanager
+def pinned_read_snapshot(
+    conn: sqlite3.Connection, *, label: str
+) -> Generator[sqlite3.Connection]:
+    """read_snapshot that also pins the weights cache's counts on a pooled reader.
+
+    A connection that is not a pooled reader of the process database (or no
+    process database) gets a plain ``read_snapshot``. Uses ``current_db``,
+    never ``get_db``, so it never opens a database.
+    """
+    db = current_db()
+    if db is None or not db.owns_pooled_reader(conn):
+        with read_snapshot(conn, label=label):
+            yield conn
+        return
+    with db.pinned_snapshot(conn, label=label):
+        yield conn
 
 
 def close_db() -> None:

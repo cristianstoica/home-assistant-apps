@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.16.7
+
+The Forecast page now judges each feed's stale badge by the last fetch
+that returned a usable forward sample (lead of at least 1 hour), rather
+than the newest sample's issue time, and a fetch that stores no new
+samples because everything it returned was already on file still counts
+and refreshes the badge. The page header shows this same stamp as "Last
+fetched", falling back to "fetch time unknown" when a contributing feed
+has none yet; meteoblue members are judged by their package feed's
+stamp. The hover text on these tiles was reworded twice after the first
+pass read as covering the whole page, including the day-detail chart,
+when it only covers the feeds behind the forecast tiles. The forecast
+page, its auto-poll and the hourly view now all read from one database
+snapshot, so a write landing mid-request can no longer pair an old tile
+value with a new refresh token and stall the page's own refreshing.
+The forecast page, its auto-poll and the hourly view keep reusing the
+stored wind feed weights, as in 0.16.6, now inside that one snapshot.
+A request whose snapshot opens while the database is being changed
+works the weights out fresh and does not store them, so a page never
+pairs wind weights with data from a different moment.
+Separately, the database import validator now refuses a file whose
+schema catalogue has a malformed entry, or whose app tables hold text
+that is not valid UTF-8, with a 422 naming the table and column, before
+anything is staged or swapped.
+
+Deleting a site now also removes the rest of its saved state (its time
+zone record, verification progress, gap-scan failures and snapshot-time
+setting), so a new site that gets the same internal number starts fresh
+instead of inheriting it. The health check no longer reports gap-scan
+failures for a site that no longer exists, including ones left behind by
+earlier versions, and a new time zone correction no longer picks up
+progress left behind by a deleted site. If a site is deleted while one
+of its background jobs is running, that job's result is no longer
+recorded against a different job. The add-on log now reports that job's
+outcome as `dropped`. Before, it reported the job as completed, deferred
+or cancelled even though its outcome was not recorded, or, if the job
+had failed, said it would be retried. A forecast record or gap scan
+started for a deleted site can no longer write into a new site that gets
+the same internal number. A site that was deleted and added again on an
+earlier version is not repaired automatically; delete it and add it
+again to reset it.
+
+If adding a station failed because weather.com or the elevation lookup
+rejected the request, sent back something unreadable or did not answer,
+the add-on log could record a full error report holding the weather.com
+API key and the station ID, or the station's coordinates. That report is
+no longer written. Instead, the add-on logs a one-line warning that
+names the provider and the kind of failure, without the key, the station
+ID or the coordinates. The add-station request now answers with a short
+reason, such as that weather.com rejected the API key or does not know
+the station; the add-on's web page still shows only "Request rejected".
+When the provider answers that it has had too many requests or has a
+server error, nothing changes: the add-on pauses its requests to it and
+still answers that its allowance is used up, as before. At the debug log
+level the add-on still logs the requests it sends to weather.com and the
+elevation lookup, which show the station ID or the coordinates; the API
+key stays hidden.
+
+This release adds schema v8: a new `site_feed_state.last_usable_fetch_at`
+column, seeded from each feed's last run that stored a valid forward
+sample. The migration is one-way: 0.16.6 cannot open a database upgraded
+by 0.16.7, because its migration runner refuses to start against a
+database whose stored schema version is newer than its own target
+version and raises an error instead. Rollback is therefore not a plain
+reinstall of 0.16.6 — restore the add-on backup taken before the update.
+
+A new site's history download no longer stops when Open-Meteo refuses
+one forecast feed's request (an HTTP 4xx error other than 408 or 429).
+That feed's error is recorded and shown as a feed error, and the
+download carries on with the site's other feeds; the refused feed gets
+no history for that period. If Open-Meteo refuses every feed, the
+download stops and retries as before. Rate limits, server errors and
+network errors are handled as before.
+
+Adds the DWD ICON-EU regional model for Europe as an eighth Open-Meteo
+forecast feed. It switches on by itself for every site the first time
+the add-on starts after the update, and it is fetched every 6 hours, out
+to 5 days ahead. The model publishes every 3 hours, so this is
+six-hourly polling that samples roughly alternate ICON-EU updates. This
+adds 4 Open-Meteo calls per site per day (26 to 30 for the example
+deployment in the README). ICON-EU covers Europe only. It is on by
+default because the add-on's defaults are set for Europe. If a site is
+outside Europe, switch ICON-EU off for that site on the Sites page,
+under Feed Subscriptions. Left on, that feed shows errors and uses
+Open-Meteo calls on every fetch; the site's other feeds are not
+affected.
+
 ## 0.16.6
 
 Each station's hourly wind is now the highest mean of two consecutive
