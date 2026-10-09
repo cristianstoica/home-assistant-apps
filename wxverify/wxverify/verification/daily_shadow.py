@@ -36,6 +36,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, date, datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
+from stat import S_ISDIR, S_ISLNK, S_ISREG
 from typing import Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -205,6 +206,14 @@ ERROR_KEYS: tuple[str, ...] = (
 NOTE_FORMAT = "wxverify-daily-shadow-freeze-note/1"
 HEADER_FORMAT = "wxverify-daily-shadow-header/1"
 
+RESULT_PREFIX = "daily_shadow_result "
+"""The result line's prefix (§13.3).
+
+After a completed run (exit 0) and after an ERROR (exit 1), the last line on
+standard output is this prefix followed by a JSON object with exactly the
+keys ``exit_code`` and ``run_dir``. A refusal (exit 2) prints none.
+"""
+
 TEMPERATURE_QUANTITIES: tuple[str, ...] = ("temperature_high", "temperature_low")
 RAIN_DECISIONS: tuple[str, ...] = ("symbol", "chance", "amount")
 TEMPERATURE_CANDIDATES: tuple[str, ...] = ("IW", "TD-K", "IW-BC", "TD-K-BC")
@@ -224,6 +233,10 @@ class RefusedError(Exception):
 
 class CopyChangedError(RuntimeError):
     """The copy's sha256 after the run differs from the one before it."""
+
+
+class CodeChangedError(RuntimeError):
+    """The package's ``.py`` files after the run differ from those before it."""
 
 
 class ReadOnlyCheckError(RuntimeError):
@@ -553,89 +566,287 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def package_root() -> Path:
+    """The directory of the ``wxverify`` package actually imported (§13.3).
+
+    ``main()`` calls it once and passes that one value to :func:`check_commit`
+    and to the end-of-run code check.
+    """
+    return Path(wxverify.__file__).parent
+
+
+def _raise_walk_error(error: OSError) -> None:
+    """``os.walk``'s ``onerror``: raise the error, so no directory is skipped."""
+    raise error
+
+
+def _check_entry_kind(root: Path, relative: Path, *, directory: bool) -> None:
+    """Raise ``OSError`` unless ``root / relative`` is a directory or a regular file.
+
+    ``directory`` says which the walk listed it as. ``os.lstat`` does not
+    follow a link, so a symbolic link, to a file or to a directory, raises,
+    as does an entry of any other kind (§13.3).
+    """
+    mode = os.lstat(root / relative).st_mode
+    shown = json.dumps(relative.as_posix())
+    if S_ISLNK(mode):
+        raise OSError(f"{shown} is a symbolic link")
+    if not (S_ISDIR(mode) if directory else S_ISREG(mode)):
+        raise OSError(f"{shown} is neither a regular file nor a directory")
+
+
+def package_snapshot(root: Path) -> tuple[dict[str, object], dict[str, str]]:
+    """The package manifest of ``root`` and each file's git object id (§13.3).
+
+    The files are found with ``os.walk``, whose ``onerror`` raises, so a
+    directory that cannot be listed raises ``OSError`` instead of being
+    skipped; ``__pycache__`` directories are not entered. Every other name
+    the walk lists, whatever its suffix, is checked with ``os.lstat``: a
+    listed subdirectory must be a directory and a listed file a regular
+    file, so a symbolic link or an entry of another kind raises ``OSError``
+    rather than being read through or passed over. Every file whose name
+    ends ``.py`` is kept. Each file is read once, with one
+    ``Path.read_bytes()``, in the manifest's order (the relative paths
+    sorted as ``Path`` objects); from those bytes come both its sha256 for
+    the manifest and its git blob id. Returns the manifest (``files``: the
+    POSIX relative paths with their sha256; ``python``:
+    ``sys.version_info[:2]``) and a mapping from each POSIX relative path to
+    its object id. An unreadable file raises ``OSError`` too.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, onerror=_raise_walk_error):
+        dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+        base = Path(dirpath).relative_to(root)
+        for name in dirnames:
+            _check_entry_kind(root, base / name, directory=True)
+        for name in filenames:
+            _check_entry_kind(root, base / name, directory=False)
+        found.extend(base / name for name in filenames if name.endswith(".py"))
+    files: list[list[str]] = []
+    object_ids: dict[str, str] = {}
+    for relative in sorted(found):
+        data = (root / relative).read_bytes()
+        path = relative.as_posix()
+        files.append([path, hashlib.sha256(data).hexdigest()])
+        object_ids[path] = hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+    return {"files": files, "python": list(sys.version_info[:2])}, object_ids
+
+
 def package_manifest(root: Path) -> dict[str, object]:
     """Every ``*.py`` under ``root`` with its sha256, and the Python version.
 
-    Paths are relative to ``root``, POSIX-style, sorted; ``__pycache__`` is
-    skipped. ``python`` is ``sys.version_info[:2]``.
+    ``package_snapshot(root)[0]``, so the commit check and the end-of-run
+    code check find and read the files the same way. Paths are relative to
+    ``root``, POSIX-style, sorted; ``__pycache__`` is skipped. ``python`` is
+    ``sys.version_info[:2]``. A directory that cannot be listed or a file
+    that cannot be read raises ``OSError``.
     """
-    files: list[list[str]] = []
-    for path in sorted(root.rglob("*.py")):
-        relative = path.relative_to(root)
-        if "__pycache__" in relative.parts:
-            continue
-        files.append([relative.as_posix(), sha256_file(path)])
-    return {"files": files, "python": list(sys.version_info[:2])}
+    return package_snapshot(root)[0]
 
 
-def _run_git(package_dir: Path, *args: str) -> str:
-    """Run ``git -C package_dir *args``; its standard output, stripped, on exit 0.
+def changed_paths(first: Mapping[str, str], second: Mapping[str, str]) -> str:
+    """``changed [...]; added [...]; removed [...]`` between two path maps (§13.3).
 
-    git missing (``OSError``), a timeout, output that cannot be decoded and a
-    non-zero exit each raise :class:`RefusedError` naming the command: a check
-    that cannot be completed refuses. ``GIT_OPTIONAL_LOCKS=0`` keeps
-    ``git status`` from rewriting the index.
+    Each map goes from a relative path to a digest. ``changed``: the paths
+    both have with different digests; ``added``: those only ``second`` has;
+    ``removed``: those only ``first`` has. Each list is sorted and written
+    with ``json.dumps``.
+    """
+    changed = sorted(
+        path for path in first.keys() & second.keys() if first[path] != second[path]
+    )
+    added = sorted(second.keys() - first.keys())
+    removed = sorted(first.keys() - second.keys())
+    return (
+        f"changed {json.dumps(changed)}; added {json.dumps(added)}; "
+        f"removed {json.dumps(removed)}"
+    )
+
+
+def _manifest_digests(manifest: Mapping[str, object]) -> dict[str, str]:
+    """A package manifest's ``files`` entries as a map from path to sha256."""
+    entries = cast("Sequence[Sequence[str]]", manifest["files"])
+    return {path: digest for path, digest in entries}
+
+
+def _git_environment() -> dict[str, str]:
+    """The environment the commit check gives git (§13.3).
+
+    ``os.environ`` without any name that begins ``GIT_``, except
+    ``GIT_CEILING_DIRECTORIES``, which is passed unchanged; plus
+    ``GIT_NO_REPLACE_OBJECTS=1``, ``GIT_CONFIG_NOSYSTEM=1`` and
+    ``GIT_CONFIG_GLOBAL`` set to ``os.devnull``. Inherited ``GIT_DIR``,
+    ``GIT_WORK_TREE``, ``GIT_INDEX_FILE`` and the like would point git at
+    another repository, index or object store, and ``-C`` does not undo
+    them; the one name kept can only stop git's upward search, never move it.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("GIT_") or name == "GIT_CEILING_DIRECTORIES"
+    }
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    return env
+
+
+def _run_git(package_dir: Path, *args: str) -> bytes:
+    """Run ``git -C package_dir *args``; its standard output, as bytes, on exit 0.
+
+    Bytes mode, with no newline translation: text mode would turn a ``\\r``
+    in a path into ``\\n``. git missing (``OSError``), a timeout and a
+    non-zero exit each raise :class:`RefusedError` naming the command: a
+    check that cannot be completed refuses. Standard error is decoded, with
+    ``errors="replace"``, only for a non-zero exit's message. The environment
+    is :func:`_git_environment`'s.
     """
     name = " ".join(("git", *args))
     try:
         result = subprocess.run(
             ["git", "-C", str(package_dir), *args],
             capture_output=True,
-            text=True,
             check=False,
             timeout=30,
-            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            env=_git_environment(),
         )
-    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise RefusedError(f"commit check: {name} could not run: {exc}") from exc
     if result.returncode != 0:
-        message = result.stderr.strip().splitlines()
+        stderr = result.stderr or b""
+        message = stderr.decode("utf-8", errors="replace").strip().splitlines()
         reason = message[0][:200] if message else "no message"
         raise RefusedError(f"commit check: {name} exited {result.returncode}: {reason}")
-    return result.stdout.strip()
+    return result.stdout
 
 
-def check_commit(package_dir: Path, *, commit_sha: str) -> None:
-    """Refuse unless ``package_dir`` is a clean checkout of ``commit_sha`` (§13.3).
+_LS_TREE_KINDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("100644", "blob"),
+        ("100755", "blob"),
+        ("120000", "blob"),
+        ("160000", "commit"),
+    }
+)
+"""The (mode, type) pairs ``git ls-tree -r`` may print: two regular-file
+modes, a symbolic link and a submodule (§13.3)."""
 
-    Three git commands, in order: HEAD must resolve to ``commit_sha``;
-    ``git status`` must list nothing under the package (modified, staged,
-    deleted or untracked); and no ignored ``.py`` file may sit under it. The
-    last is needed because the add-on's ignore rules name directories such
-    as ``data/`` and ``.local/`` at any depth, and ``git status`` does not
-    list ignored files, so such a file would be in the manifest but in no
-    checkout. Every failure raises :class:`RefusedError` naming what failed.
+
+def _unparseable_record(record: bytes) -> RefusedError:
+    return RefusedError(
+        f"commit check: git ls-tree printed a record it cannot parse: {record!r}"
+    )
+
+
+def _ls_tree_object_ids(listing: bytes, *, commit_sha: str) -> dict[str, str]:
+    """The ``.py`` entries of ``git ls-tree -r -z`` output: path to object id.
+
+    The output is split at ``b"\\0"``. The last piece must be empty and is
+    the only one dropped; every other piece is one record, split at its
+    first ``b"\\t"`` only. Before the tab, decoded as ASCII: exactly three
+    fields separated by single spaces, ``<mode> <type> <object id>``, the
+    (mode, type) pair one of :data:`_LS_TREE_KINDS` and the id 40 lowercase
+    hex digits. After it, decoded with ``os.fsdecode`` as ``os.walk`` decodes
+    names: a non-empty path that no other record has. Anything else, a part
+    that cannot be decoded included, refuses with :class:`RefusedError`
+    showing the record's bytes. Every record is checked first; then a
+    symbolic link or a submodule outside ``__pycache__``, whatever its name,
+    refuses. The entries kept are those whose path ends ``.py`` and has no
+    ``__pycache__`` component, all of them regular files.
     """
-    head = _run_git(package_dir, "rev-parse", "--verify", "HEAD^{commit}")
+    pieces = listing.split(b"\0")
+    if pieces[-1]:
+        raise _unparseable_record(pieces[-1])
+    records: dict[str, tuple[str, str]] = {}
+    for record in pieces[:-1]:
+        meta_bytes, tab, path_bytes = record.partition(b"\t")
+        try:
+            meta = meta_bytes.decode("ascii")
+            path = os.fsdecode(path_bytes)
+        except UnicodeDecodeError:
+            raise _unparseable_record(record) from None
+        parts = meta.split(" ")
+        if (
+            not tab
+            or not path
+            or len(parts) != 3
+            or (parts[0], parts[1]) not in _LS_TREE_KINDS
+            or re.fullmatch(r"[0-9a-f]{40}", parts[2]) is None
+            or path in records
+        ):
+            raise _unparseable_record(record)
+        records[path] = (parts[0], parts[2])
+    kept: dict[str, str] = {}
+    for path, (mode, object_id) in records.items():
+        if "__pycache__" in path.split("/"):
+            continue
+        if mode == "120000":
+            raise RefusedError(
+                f"commit check: {commit_sha} holds {json.dumps(path)} "
+                "as a symbolic link"
+            )
+        if mode == "160000":
+            raise RefusedError(
+                f"commit check: {commit_sha} holds {json.dumps(path)} as a submodule"
+            )
+        if path.endswith(".py"):
+            kept[path] = object_id
+    return kept
+
+
+def check_commit(package_dir: Path, *, commit_sha: str) -> dict[str, object]:
+    """Refuse unless the package's ``.py`` files are ``commit_sha``'s (§13.3).
+
+    Two git commands, in order, from ``package_dir`` with
+    :func:`_git_environment`, both in bytes mode: ``rev-parse --verify
+    HEAD^{commit}``, decoded as ASCII and stripped, must equal
+    ``commit_sha``; and ``ls-tree -r -z --full-tree <sha>:wxverify/wxverify``
+    lists the commit's package files, parsed by :func:`_ls_tree_object_ids`
+    (a link or a submodule in the commit refuses). Then
+    :func:`package_snapshot` reads the files once (a link on disk refuses),
+    and the commit's and the files' (path, object id) pairs must be equal,
+    in both directions, ignored files included. No command reads the index,
+    so no index flag can hide a change. Every failure raises
+    :class:`RefusedError` with a message that begins ``commit check:``.
+    Returns the manifest of the bytes compared.
+    """
+    raw_head = _run_git(package_dir, "rev-parse", "--verify", "HEAD^{commit}")
+    try:
+        head = raw_head.decode("ascii").strip()
+    except UnicodeDecodeError as exc:
+        raise RefusedError(
+            "commit check: git rev-parse --verify HEAD^{commit} printed output "
+            f"that is not ASCII: {raw_head[:100]!r}"
+        ) from exc
     if head != commit_sha:
         raise RefusedError(
             f"commit check: the package's HEAD is {head[:64]!r}, "
             f"not --commit-sha {commit_sha}"
         )
-    status = _run_git(
-        package_dir, "status", "--porcelain=v1", "--untracked-files=all", "--", "."
+    committed = _ls_tree_object_ids(
+        _run_git(
+            package_dir,
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            f"{commit_sha}:wxverify/wxverify",
+        ),
+        commit_sha=commit_sha,
     )
-    if status:
-        changed = status.splitlines()
+    try:
+        manifest, on_disk = package_snapshot(package_dir)
+    except OSError as exc:
         raise RefusedError(
-            f"commit check: {len(changed)} path(s) under the package are "
-            f"modified, staged, deleted or untracked; the first: {changed[0][:200]!r}"
-        )
-    ignored = _run_git(
-        package_dir,
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-standard",
-        "--",
-        "*.py",
-    )
-    if ignored:
-        found = ignored.splitlines()
+            f"commit check: the package's .py files could not be read: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if on_disk != committed:
         raise RefusedError(
-            f"commit check: {len(found)} ignored .py file(s) under the package; "
-            f"the first: {found[0][:200]!r}"
+            f"commit check: the package's .py files differ from {commit_sha}: "
+            f"{changed_paths(committed, on_disk)}"
         )
+    return manifest
 
 
 def copy_facts(copy: Path, sha256: str) -> dict[str, object]:
@@ -6219,8 +6430,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _print_result_line(*, exit_code: int, run_dir: str | None) -> None:
+    """Print the result line, the last line on standard output (§13.3).
+
+    ``run_dir`` is the run directory written, relative to ``--out``, in
+    POSIX form, or ``None`` when ``error.json`` could not be written.
+    """
+    result = {"exit_code": exit_code, "run_dir": run_dir}
+    print(RESULT_PREFIX + json.dumps(result), flush=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the tool; 0 on success, 1 on ERROR (error.json), 2 on a refusal."""
+    """Run the tool; 0 on success, 1 on ERROR (error.json), 2 on a refusal.
+
+    After 0 and after 1 the last line on standard output is the result line
+    (:data:`RESULT_PREFIX`); a refusal prints none.
+    """
     parser = build_parser()
     args = parser.parse_args(argv)
     copy: Path = args.copy
@@ -6255,9 +6480,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         note = None if note_path is None else load_freeze_note(note_path)
         if note is not None and note.site_id != site_id:
             raise RefusedError("the freeze note is for another site")
-        package_dir = Path(wxverify.__file__).parent
-        manifest = package_manifest(package_dir)
-        check_commit(package_dir, commit_sha=commit_sha)
+        package_dir = package_root()
+        manifest = check_commit(package_dir, commit_sha=commit_sha)
         if mode == "heldout":
             if note is None:
                 raise RefusedError("--heldout needs a freeze note")
@@ -6340,6 +6564,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
         finally:
             conn.close()
+        stage = "code_check"
+        try:
+            after_manifest = package_manifest(package_dir)
+        except OSError as exc:
+            raise RuntimeError(
+                "the package manifest after the run could not be computed: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if after_manifest != manifest:
+            detail = changed_paths(
+                _manifest_digests(manifest), _manifest_digests(after_manifest)
+            )
+            stage = "code_changed"
+            raise CodeChangedError(
+                f"the package's .py files changed during the run: {detail}"
+            )
         stage = "copy_check"
         after = sha256_file(copy)
         if after != before:
@@ -6364,10 +6604,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             written = write_outputs_atomically(final_dir, {"error.json": _dumps(error)})
         except OSError as write_exc:
             print(f"error.json not written: {write_exc}", file=sys.stderr)
+            _print_result_line(exit_code=1, run_dir=None)
             return 1
-        print(written, file=sys.stderr)
+        _print_result_line(exit_code=1, run_dir=written.relative_to(out).as_posix())
         return 1
-    print(written)
+    _print_result_line(exit_code=0, run_dir=written.relative_to(out).as_posix())
     return 0
 
 
