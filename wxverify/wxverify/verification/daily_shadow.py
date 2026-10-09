@@ -938,11 +938,16 @@ def rename_stale_partials(out: Path) -> list[str]:
     """Rename every ``*.partial`` directory under ``out`` to ``*.failed``.
 
     Returns the renamed paths relative to ``out``, sorted. A name already
-    taken gets a ``-N`` suffix. The walk's ``onerror`` raises, so a directory
-    under ``out`` that cannot be listed raises ``OSError`` instead of being
-    passed over (§13.3).
+    taken gets a ``-N`` suffix. It begins with ``out.stat()``: only a
+    ``FileNotFoundError`` returns ``[]`` (the run's write creates ``out``);
+    any other error from it propagates. The walk's ``onerror`` raises, so an
+    ``out`` that is not a directory raises ``NotADirectoryError`` and a
+    directory under ``out`` that cannot be listed raises its ``OSError``,
+    instead of being passed over (§13.3).
     """
-    if not out.is_dir():
+    try:
+        out.stat()
+    except FileNotFoundError:
         return []
     found: list[Path] = []
     for dirpath, dirnames, _ in os.walk(out, onerror=_raise_walk_error):
@@ -964,11 +969,16 @@ def list_failed_dirs(out: Path) -> list[str]:
     """Every ``*.failed`` directory under ``out``, relative to it, sorted.
 
     A ``-N`` suffix (a name already taken, :func:`_free_name`) still counts.
-    A failed directory's own contents are not searched. The walk's
-    ``onerror`` raises, so a directory under ``out`` that cannot be listed
-    raises ``OSError`` instead of being passed over (§13.3).
+    A failed directory's own contents are not searched. It begins with
+    ``out.stat()``: only a ``FileNotFoundError`` returns ``[]``; any other
+    error from it propagates. The walk's ``onerror`` raises, so an ``out``
+    that is not a directory raises ``NotADirectoryError`` and a directory
+    under ``out`` that cannot be listed raises its ``OSError``, instead of
+    being passed over (§13.3).
     """
-    if not out.is_dir():
+    try:
+        out.stat()
+    except FileNotFoundError:
         return []
     found: list[str] = []
     for dirpath, dirnames, _ in os.walk(out, onerror=_raise_walk_error):
@@ -2858,16 +2868,25 @@ def candidate_outcome(
     missing: int,
     guards: Mapping[str, object],
     twin: Bounds | None,
+    twin_missing: int,
     checks: Mapping[str, object],
     flip: bool,
     station_set_changed: Mapping[str, Sequence[str]] | None,
     db_import_changed: bool | None,
 ) -> CandidateOutcome:
-    """INSUFFICIENT, NOT_ASSESSED, FAIL, INCONCLUSIVE or PASS, in that order.
+    """One temperature candidate's outcome and reasons (§8.5, §8.6, §13.3).
 
-    NOT_ASSESSED: some scored case has no value (a bias-corrected candidate
-    in the pooled regime, whose pooled bias the plan does not define). The
-    changed-header rule is applied last, to every outcome.
+    The first that applies decides: INSUFFICIENT for failed data checks;
+    NOT_ASSESSED, ``cases_without_value:<missing>``, when the candidate has
+    no value at some scored case; NOT_ASSESSED,
+    ``twin_values_missing:<twin_missing>``, when its twin has none at some;
+    INSUFFICIENT, ``no_point_estimate``; FAIL, ``point_delta_not_negative``
+    then ``guard_failed``; INCONCLUSIVE, ``upper_bound_not_negative``; with a
+    twin, NOT_ASSESSED, ``twin_comparison_unavailable``, when the
+    head-to-head's point or U is None, else INCONCLUSIVE,
+    ``does_not_beat_its_twin``, when its U >= 0; then PASS. A PASS with a
+    sign flip becomes INCONCLUSIVE, and the changed-header rule is applied
+    last, to every outcome.
     """
     reasons: list[str] = []
     if not checks["f1_pass"]:
@@ -2882,6 +2901,9 @@ def candidate_outcome(
     elif missing:
         outcome = "NOT_ASSESSED"
         reasons.append(f"cases_without_value:{missing}")
+    elif twin_missing:
+        outcome = "NOT_ASSESSED"
+        reasons.append(f"twin_values_missing:{twin_missing}")
     elif tile.point is None or tile.upper is None:
         outcome = "INSUFFICIENT"
         reasons.append("no_point_estimate")
@@ -2894,7 +2916,10 @@ def candidate_outcome(
     elif tile.upper >= 0:
         outcome = "INCONCLUSIVE"
         reasons.append("upper_bound_not_negative")
-    elif twin is not None and (twin.upper is None or twin.upper >= 0):
+    elif twin is not None and (twin.point is None or twin.upper is None):
+        outcome = "NOT_ASSESSED"
+        reasons.append("twin_comparison_unavailable")
+    elif twin is not None and twin.upper is not None and twin.upper >= 0:
         outcome = "INCONCLUSIVE"
         reasons.append("does_not_beat_its_twin")
     else:
@@ -6000,15 +6025,17 @@ def _temperature_heldout(
         bounds, missing = tile(lines, name, "control", index_lists)
         guards = guard_report(lines, name)
         twin_name = TWINS.get(name)
-        twin = (
-            None if twin_name is None else tile(lines, name, twin_name, index_lists)[0]
-        )
+        twin: Bounds | None = None
+        twin_missing = 0
+        if twin_name is not None:
+            twin, twin_missing = tile(lines, name, twin_name, index_lists)
         outcome = candidate_outcome(
             name,
             tile=bounds,
             missing=missing,
             guards=guards,
             twin=twin,
+            twin_missing=twin_missing,
             checks=checks,
             flip=flips[name],
             station_set_changed=facts.station_set_changed,
