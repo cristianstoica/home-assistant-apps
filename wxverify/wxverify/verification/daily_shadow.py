@@ -24,6 +24,7 @@ import json
 import math
 import os
 import random
+import re
 import sqlite3
 import statistics
 import sys
@@ -41,7 +42,10 @@ import wxverify
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.runtime_state import get_runtime_state_entry
-from wxverify.db.tz_generations import published_generation_id
+from wxverify.db.tz_generations import (
+    published_generation_clause,
+    published_generation_id,
+)
 from wxverify.forecast import daily_method
 from wxverify.forecast.aggregate import (
     covers_local_day,
@@ -51,6 +55,7 @@ from wxverify.forecast.aggregate import (
 )
 from wxverify.forecast.data import load_future_samples
 from wxverify.scoring.consensus import MAD_FLOORS, StationReading, compute_consensus
+from wxverify.scoring.effective import active_competitor_clause
 from wxverify.verification.coverage import (
     QuantityOutcome,
     evaluate_variable,
@@ -176,12 +181,15 @@ COUNTS_ONLY_HEADER_KEYS: tuple[str, ...] = (
     "excluded_h_dates_count",
     "h_training_coverage",
     "rain_event_counts",
+    "meteoblue",
+    "coverage",
 )
 """Every key a ``--counts-only`` header holds, and nothing else (§13.3).
 
 The key set is the same for both variables: the key that does not apply to
 the run's variable (``h_training_coverage`` for rain, ``rain_event_counts``
-for temperature) is present and null.
+for temperature) is present and null. ``meteoblue`` (A8) and ``coverage``
+(A10) apply to both, each for the run's variable (§11.5).
 """
 
 ERROR_KEYS: tuple[str, ...] = (
@@ -569,6 +577,37 @@ def copy_facts(copy: Path, sha256: str) -> dict[str, object]:
     }
 
 
+def error_after_open(
+    copy: Path, *, before: str, stage: str, exc: BaseException
+) -> tuple[str, str]:
+    """An ERROR's ``stage`` and ``error`` text once the copy's open was tried (§13.3).
+
+    The copy's sha256 is read again, whatever failed: a difference makes the
+    stage ``copy_changed`` and names the original failure after it; a copy
+    that cannot be read keeps the stage and says so, so "can't tell" never
+    reads as "unchanged". A :class:`CopyChangedError` is already that finding
+    and is returned as it is.
+    """
+    text = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, CopyChangedError):
+        return stage, text
+    try:
+        after = sha256_file(copy)
+    except OSError as read_exc:
+        return (
+            stage,
+            f"{text}; copy sha256 after: unreadable "
+            f"({type(read_exc).__name__}: {read_exc})",
+        )
+    if after != before:
+        return (
+            "copy_changed",
+            f"CopyChangedError: the copy's sha256 changed during the run: "
+            f"{before} -> {after}; while handling {text}",
+        )
+    return stage, text
+
+
 # --- Writes (§13.3) ------------------------------------------------------------
 
 
@@ -631,6 +670,26 @@ def rename_stale_partials(out: Path) -> list[str]:
         os.replace(path, target)
         renamed.append(target.relative_to(out).as_posix())
     return sorted(renamed)
+
+
+_FAILED_NAME = re.compile(r"\.failed(?:-\d+)?\Z")
+
+
+def list_failed_dirs(out: Path) -> list[str]:
+    """Every ``*.failed`` directory under ``out``, relative to it, sorted.
+
+    A ``-N`` suffix (a name already taken, :func:`_free_name`) still counts.
+    A failed directory's own contents are not searched.
+    """
+    if not out.is_dir():
+        return []
+    found: list[str] = []
+    for dirpath, dirnames, _ in os.walk(out):
+        failed = [name for name in dirnames if _FAILED_NAME.search(name)]
+        for name in failed:
+            found.append((Path(dirpath) / name).relative_to(out).as_posix())
+        dirnames[:] = [name for name in dirnames if name not in failed]
+    return sorted(found)
 
 
 def _jsonable(value: object) -> object:
@@ -1316,6 +1375,10 @@ class ArmARebuilder:
             self._fetched[day] = [cast("datetime", r.fetched_at) for r in known]
         self._cache: dict[tuple[date, int, float], dict[str, QuantityOutcome]] = {}
 
+    def readings(self, days: Iterable[date]) -> int:
+        """The readings read on the given days, NULL ``fetched_at`` included (G-a)."""
+        return sum(len(self._rows.get(day, ())) for day in days)
+
     def null_fetched(self, days: Iterable[date]) -> int:
         """Readings with a NULL ``fetched_at`` on the given days (G-a)."""
         return sum(
@@ -1394,6 +1457,7 @@ class GateReport:
     """G-a, G-b and the arm they select (§6.5)."""
 
     in_scope_days: int
+    ga_readings: int
     ga_null_fetched: int
     ga_pass: bool
     gb_matched: int
@@ -1417,12 +1481,15 @@ def compute_gates(
 ) -> GateReport:
     """G-a and G-b over the in-scope days, and the arm they select.
 
-    G-b's denominator is the in-scope days with a non-stale truth row for
-    every quantity; a day with no row is reported apart, and a stale day is
+    G-a passes when the in-scope days hold at least one reading and none
+    has a NULL ``fetched_at``; zero readings (0/0) fails it. G-b's
+    denominator is the in-scope days with a non-stale truth row for every
+    quantity; a day with no row is reported apart, and a stale day is
     reported next to the denominator. 0/0 fails. ``force_arm`` (a testing
     and sensitivity hook) overrides the selection and is recorded.
     """
     days = sorted(set(in_scope_days))
+    readings = rebuilder.readings(days)
     null_fetched = rebuilder.null_fetched(days)
     matched = denominator = stale = no_row = 0
     mismatched: list[date] = []
@@ -1456,13 +1523,14 @@ def compute_gates(
             matched += 1
         else:
             mismatched.append(day)
-    ga_pass = bool(days) and null_fetched == 0
+    ga_pass = readings > 0 and null_fetched == 0
     gb_pass = denominator > 0 and 100 * matched >= GB_MIN_PERCENT * denominator
     arm: Literal["A", "B"] = "A" if ga_pass and gb_pass else "B"
     if force_arm is not None:
         arm = force_arm
     return GateReport(
         in_scope_days=len(days),
+        ga_readings=readings,
         ga_null_fetched=null_fetched,
         ga_pass=ga_pass,
         gb_matched=matched,
@@ -4736,6 +4804,226 @@ def rain_settings() -> dict[str, object]:
     }
 
 
+OPEN = "open"
+"""An owner answer not given yet (§22); never filled in by default."""
+
+
+def rain_owner_answers() -> dict[str, object]:
+    """The owner's answers that rain uses, copied from §22 (§10.2).
+
+    Written as the owner gave them, not read from the settings, so the header
+    shows any difference between the two. An answer not given yet (D7's
+    chance part, D13, D14) is the string ``"open"``; no calculation reads it.
+    """
+    return {
+        "D1": {"decided": "2026-09-29", "w_amount": 1.5},
+        "D3": {"decided": "2026-09-29", "w_r": 2, "p_star": "1/3"},
+        "D5": {
+            "decided": "2026-09-29; the truth decided again for rain on 2026-10-06",
+            "truth": "the rain-nearby event (§6.6); the target stays the house",
+            "rule": (
+                "A day is rain nearby when at least two validated stations each "
+                "record at least 0.2 mm, or at least one records at least 0.5 mm. "
+                "It is dry when that rule is not met and at least one validated "
+                "station has at least 22 hourly readings that day. With no such "
+                "station it is unknown, and an unknown day is never scored."
+            ),
+            "partial_coverage": (
+                "A validated station with fewer than 22 hourly readings still "
+                "counts toward rain nearby; it never makes a day dry, and it never "
+                "enters the amount."
+            ),
+            "observed_amount": (
+                "On a rain-nearby day, the mean of the two largest totals among "
+                "the validated stations with adequate coverage and 0.2 mm or "
+                "more, or the one total when only one station contributes; when "
+                "every wet station has only partial coverage, amount_not_available. "
+                "On a dry day 0 mm; on an unknown day none."
+            ),
+            "flagged_lone_readings": (
+                "A high or lone reading that no other station confirms counts in "
+                "full, in the event, the amount and the ranking, and is flagged "
+                "large_total or lone_reading."
+            ),
+            "not_adopted": (
+                "Holding out a high reading, or a station, because its neighbours "
+                "disagree or stayed dry."
+            ),
+            "house_station": "c: a report-only comparison, for rain too (§6.4)",
+            "change_after_freeze": (
+                "b, with the interrupted run recorded INCONCLUSIVE; it applies to "
+                "temperature's verdict: rain has no freeze and no verdict"
+            ),
+        },
+        "D6": {
+            "decided": "2026-10-06; the gap question on 2026-10-07",
+            "option": "D, the selector",
+            "method": (
+                "The lead-matched window; the score, (2 · misses + false alarms) "
+                "per common day; the group, the best ⌈0.75 · J⌉ models of the "
+                "score order; the symbol, shown when at least 1/3 of the group "
+                "votes rain; the chance, the vote share at 0.2 mm, shown only if "
+                "it passes its test against R-clim; and the selected model's own "
+                "amount, hours and hourly line. The ranking uses the same 0.2 mm "
+                "trigger; the trigger grid is reported by A15 only."
+            ),
+            "window_days": 60,
+            "window_retest": "after the winter (A17, report only)",
+            "minimum": (
+                "On when at least two models that cover the target have 20 or "
+                "more counted days at the lead: a model is then eligible with at "
+                "least 20 counted days, and N = 20. Otherwise every model with a "
+                "counted day is eligible, N = min(20, the largest number of "
+                "counted days), and the ranking is flagged provisional."
+            ),
+            "switch": (
+                "The incumbent is replaced by the best-score model when incumbent "
+                "total − best-score total ≥ 3 on the same common days, and kept "
+                "when the difference is 2 or less; it is replaced at once if it has "
+                "no exact-cover forecast for the target or is no longer eligible."
+            ),
+            "todays_method": (
+                "Never served for rain; with no ranked model (J = 0) that "
+                "day-ahead has no rain forecast, recorded no_eligible."
+            ),
+            "fresh_install": "availability comes from the data, not a timer",
+            "gap": (
+                "The model selected most recently at the lead, within the 60 "
+                "previous snapshot dates, stays the incumbent across dates that "
+                "decided nothing, while it still qualifies. A date recorded with "
+                "no_eligible clears it, and so does a row written under the "
+                "rollback (current). A record row of a shape the add-on does not "
+                "recognise also ends it, and is flagged."
+            ),
+        },
+        "D7": {
+            "small_amounts": {
+                "decided": "2026-10-06",
+                "rule": (
+                    "The tile shows the selected model's daily total exactly as "
+                    "calculated, one decimal ('%.1f' mm). There is no cut-off, no "
+                    "special label for small amounts and no zeroing. The stored "
+                    "and scored value is the same unrounded total."
+                ),
+            },
+            "chance": OPEN,
+        },
+        "D13": OPEN,
+        "D14": OPEN,
+    }
+
+
+# --- A8 and A10: the meteoblue lists and the coverage counts (§10.4, §10.5) ------
+
+
+def meteoblue_lists(
+    conn: sqlite3.Connection, *, site: Site, variable: str
+) -> dict[str, object]:
+    """A8 for one variable at the site: names and counts only (§10.5, §12).
+
+    ``members``: each meteoblue member model with samples, and its sample
+    count. ``multimodel_samples``: the samples stored under the model
+    ``multimodel``. ``multimodel_mean``: the published ``_multimodel_mean``
+    rows, and the feeds its grouping averages. The grouping is
+    ``scoring/multimodel.py``'s own (the same filters, GROUP BY and
+    ``HAVING COUNT(*) >= 2``), run read-only with each group's feed ids
+    collected; ``contributors`` counts the groups each feed is in.
+    """
+    members: dict[str, int] = {}
+    multimodel_samples = 0
+    for row in conn.execute(
+        """
+        SELECT f.model AS model, COUNT(*) AS samples
+        FROM feeds f
+        JOIN forecast_samples fs ON fs.feed_id = f.id
+        WHERE f.source = 'meteoblue' AND fs.site_id = ? AND fs.variable = ?
+        GROUP BY f.id, f.model
+        """,
+        (site.site_id, variable),
+    ):
+        model, samples = str(row["model"]), int(row["samples"])
+        if model == "multimodel":
+            multimodel_samples += samples
+        else:
+            members[model] = samples
+    mean_row = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM forecast_pairs fp
+        JOIN feeds f ON f.id = fp.feed_id
+        WHERE f.source = 'virtual' AND f.model = '_multimodel_mean'
+          AND fp.site_id = ? AND fp.variable = ?
+          AND {published_generation_clause("fp")}
+        """,
+        (site.site_id, variable),
+    ).fetchone()
+    names = {
+        int(row["id"]): f"{row['source']}/{row['model']}"
+        for row in conn.execute("SELECT id, source, model FROM feeds")
+    }
+    contributors: dict[str, int] = {}
+    groups = 0
+    for row in conn.execute(
+        f"""
+        SELECT GROUP_CONCAT(fp.feed_id) AS feed_ids
+        FROM forecast_pairs fp
+        JOIN feeds f ON f.id = fp.feed_id
+        JOIN sites s ON s.id = fp.site_id
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
+        WHERE f.is_virtual = 0
+          AND {active_competitor_clause(site_expr="fp.site_id")}
+          AND {published_generation_clause("fp")}
+          AND fp.site_id = ? AND fp.variable = ?
+        GROUP BY fp.site_id, fp.variable, fp.issued_at, fp.valid_at, fp.lead_hours,
+                 fp.day_ahead, fp.observed, s.rain_threshold_mm
+        HAVING COUNT(*) >= 2
+        """,
+        (site.site_id, variable),
+    ):
+        groups += 1
+        for feed_id in str(row["feed_ids"]).split(","):
+            name = names.get(int(feed_id), f"feed {feed_id}")
+            contributors[name] = contributors.get(name, 0) + 1
+    return {
+        variable: {
+            "members": dict(sorted(members.items())),
+            "multimodel_samples": multimodel_samples,
+            "multimodel_mean": {
+                "rows": 0 if mean_row is None else int(mean_row[0]),
+                "groups": groups,
+                "contributors": dict(sorted(contributors.items())),
+            },
+        }
+    }
+
+
+def coverage_counts(
+    replays: ReplayCache, rows: Iterable[RecordRow]
+) -> list[dict[str, object]]:
+    """A10: per snapshot, the feeds whose day covers it, at every lead 0-7 (§10.4).
+
+    One entry per distinct (snapshot date, decision time) among ``rows``,
+    sorted. A feed counts when it passes the replay's own check:
+    ``covers_local_day`` for temperature, ``covers_local_day_exactly`` for
+    rain. Counts only.
+    """
+    snapshots = sorted({(row.snapshot_date, row.snapshot_utc) for row in rows})
+    out: list[dict[str, object]] = []
+    for snapshot_date, snapshot_utc in snapshots:
+        replay = replays.get(snapshot_date, snapshot_utc)
+        out.append(
+            {
+                "snapshot_date": snapshot_date,
+                "snapshot_utc": snapshot_utc,
+                "feeds_covering": [
+                    sum(1 for feed in replay.feeds(lead).values() if feed.covers)
+                    for lead in RECORD_LEADS
+                ],
+            }
+        )
+    return out
+
+
 # --- Shared run helpers (§6.5, §7.4, §8.2) ------------------------------------
 
 LOW_C_NOT_BUILT = (
@@ -5169,6 +5457,7 @@ def _run_temperature(
     excluded_h_dates: Sequence[date],
     note: FreezeNote | None,
     house_station: str | None,
+    failed_dirs: Sequence[str],
     header_base: Mapping[str, object],
 ) -> dict[str, bytes]:
     rows = load_record_rows(conn, site=site, variable="temperature")
@@ -5255,6 +5544,16 @@ def _run_temperature(
             unmatched=unmatched,
             h_training_coverage=coverage,
             rain_event_counts=None,
+            meteoblue=meteoblue_lists(conn, site=site, variable="temperature"),
+            coverage=coverage_counts(
+                replays,
+                (
+                    row
+                    for cases, _ in ranges.values()
+                    for _, row in cases
+                    if row is not None and row.status == "recorded"
+                ),
+            ),
         )
         return {"header.json": _dumps(_checked_counts_only(header))}
     header.update(
@@ -5268,6 +5567,7 @@ def _run_temperature(
             header=header,
             facts=facts,
             house_station=house_station,
+            failed_dirs=failed_dirs,
         )
     if note is None or note.house_station is None:
         raise ValueError("--heldout needs a freeze note that names the house station")
@@ -5291,6 +5591,7 @@ def _temperature_freeze_prepare(
     header: dict[str, object],
     facts: HeaderFacts,
     house_station: str | None,
+    failed_dirs: Sequence[str],
 ) -> dict[str, bytes]:
     f1 = F1Tally()
     lines = temperature_lines(ctx, training, cases, td_k=TD_K_DEFAULT, f1=f1)
@@ -5328,8 +5629,6 @@ def _temperature_freeze_prepare(
         not_built=[
             "A3 (T1)",
             "A7",
-            "A8",
-            "A10",
             "A12",
             "F2",
             "A11: the largest SQLITE_TMPDIR size",
@@ -5348,6 +5647,7 @@ def _temperature_freeze_prepare(
         "manifest": header["manifest"],
         "constants": frozen_constants(),
         "house_station": house_station,
+        "failed_dirs": list(failed_dirs),
         "td_k": k,
         "td_k_choice": choice,
         "regime_counts": regimes,
@@ -5558,6 +5858,7 @@ def _run_rain(
     t2_last: date,
     house_station: str | None,
     incumbent_from_record: bool,
+    failed_dirs: Sequence[str],
     header_base: Mapping[str, object],
 ) -> dict[str, bytes]:
     rows = load_record_rows(conn, site=site, variable="precip")
@@ -5631,6 +5932,10 @@ def _run_rain(
             unmatched=rain_counts(lines).as_json(),
             h_training_coverage=None,
             rain_event_counts=rain_event_counts(lines),
+            meteoblue=meteoblue_lists(conn, site=site, variable="precip"),
+            coverage=coverage_counts(
+                replays, (row for row in case_rows if row.status == "recorded")
+            ),
         )
         return {"header.json": _dumps(_checked_counts_only(header))}
     if mode != "freeze-prepare":
@@ -5661,7 +5966,9 @@ def _run_rain(
         site=_site_json(site),
         incumbent_from_record=incumbent_from_record,
         settings=rain_settings(),
+        owner_answers=rain_owner_answers(),
         house_station=house_station,
+        failed_dirs=list(failed_dirs),
         decisions=reports,
         discarded_resamples=discarded,
         counts={
@@ -5683,8 +5990,6 @@ def _run_rain(
             "the rain control from V_B on (stage two)",
             "A6 for rain (the offered w_amount and w_r values)",
             "A7",
-            "A8",
-            "A10",
             "A12",
             "A16",
             "A17",
@@ -5734,6 +6039,7 @@ def run(
     note: FreezeNote | None,
     house_station: str | None,
     incumbent_from_record: bool,
+    failed_dirs: Sequence[str],
     header_base: Mapping[str, object],
 ) -> dict[str, bytes]:
     """One run's output files, computed in memory (§13.3).
@@ -5742,7 +6048,10 @@ def run(
     set, or rain's S0 to the last complete day. ``h_first`` to
     ``last_complete``, less ``excluded_h_dates``, bound temperature's H.
     ``t2_last`` is T2's last day (rain). The bounds select cases only; the
-    training and truth reads follow each case's own window.
+    training and truth reads follow each case's own window. ``failed_dirs``
+    (the ``*.failed`` directories under the output root) goes into the
+    draft freeze note and rain's freeze-prepare header, never a counts-only
+    header.
     """
     if variable == "temperature":
         if h_first is None:
@@ -5758,6 +6067,7 @@ def run(
             excluded_h_dates=excluded_h_dates,
             note=note,
             house_station=house_station,
+            failed_dirs=failed_dirs,
             header_base=header_base,
         )
     if t2_last is None:
@@ -5771,6 +6081,7 @@ def run(
         t2_last=t2_last,
         house_station=house_station,
         incumbent_from_record=incumbent_from_record,
+        failed_dirs=failed_dirs,
         header_base=header_base,
     )
 
@@ -5806,7 +6117,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--expect-sha256", help="the recorded sha256 of the verdict copy"
     )
     parser.add_argument(
-        "--house-station", help="the house station's pws_station_id (--freeze-prepare)"
+        "--house-station",
+        help="the house station's pws_station_id (required with --freeze-prepare)",
     )
     parser.add_argument(
         "--incumbent-from-record",
@@ -5840,6 +6152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--freeze-note is for --variable temperature only")
     if mode == "heldout" and (note_path is None or expect is None):
         parser.error("--heldout needs --freeze-note and --expect-sha256")
+    if mode == "freeze-prepare" and house_station is None:
+        parser.error("--freeze-prepare needs --house-station")
     if house_station is not None and mode != "freeze-prepare":
         parser.error(
             "--house-station is allowed only with --freeze-prepare; "
@@ -5871,6 +6185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     for renamed in rename_stale_partials(out):
         print(f"renamed an unfinished output to {renamed}", file=sys.stderr)
+    failed_dirs = list_failed_dirs(out)
     start = datetime.now(UTC)
     copied_at = datetime.fromtimestamp(copy.stat().st_mtime, tz=UTC)
     final_dir = (
@@ -5904,6 +6219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     note=note,
                     house_station=house_station,
                     incumbent_from_record=from_record,
+                    failed_dirs=failed_dirs,
                     header_base=header_base,
                 )
             else:
@@ -5921,22 +6237,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     note=None,
                     house_station=house_station,
                     incumbent_from_record=from_record,
+                    failed_dirs=failed_dirs,
                     header_base=header_base,
                 )
         finally:
             conn.close()
-        stage = "copy_changed"
+        stage = "copy_check"
         after = sha256_file(copy)
         if after != before:
+            stage = "copy_changed"
             raise CopyChangedError(
                 f"the copy's sha256 changed during the run: {before} -> {after}"
             )
         stage = "write"
         written = write_outputs_atomically(final_dir, files)
     except Exception as exc:
+        # The try begins with the open, so every exit through here follows it.
+        stage, text = error_after_open(copy, before=before, stage=stage, exc=exc)
         error: dict[str, object] = {
             "stage": stage,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": text,
             "sqlite_errorcode": find_sqlite_errorcode(exc),
             "copy_sha256": before,
             "manifest": manifest,
