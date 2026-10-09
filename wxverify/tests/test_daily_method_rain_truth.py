@@ -9,7 +9,6 @@ module's own `date` objects, no real calendar meaning is relied on.
 
 from __future__ import annotations
 
-import math
 from datetime import datetime
 
 import pytest
@@ -35,27 +34,23 @@ def _station(sid: str, mm: float, hours: int) -> StationDay:
 
 
 def test_event_exact_sum_float_trap() -> None:
-    """Row 13: SYN-1's hourly readings sum to the IEEE-754 float one ULP
-    below 0.2 mm, whose *100 is 19.999999999999996 -- not an integer, so
-    `round()` and `int()` give different hundredths (20 vs 19). The sum
-    must pass through `station_day_total` -- the function that actually
-    calls `hundredths()` on a raw float total
-    (`StationDayTotal.hundredths=hundredths(total)`) -- not a hand-rounded
-    fixture value, or a mutant in `hundredths()` itself (M42: truncating
-    instead of rounding) goes unseen. (0.01+0.01+0.18, the plan's own
-    row-13 example, lands on an exact multiple of 0.01 once multiplied by
-    100 -- 20.0 -- so it cannot discriminate round() from int(); this
-    fixture is engineered one float ULP below that to actually do so.)
+    """ "event, exact sum": the plan's own readings, 0.05, 0.05 and
+    0.09999999999999996, sum in IEEE-754 float to two ULPs below 0.2 mm,
+    whose *100 is 19.999999999999996 -- not an integer, so `round()` and
+    `int()` give different hundredths (20 vs 19). The sum must pass through
+    `station_day_total` -- the function that actually calls `hundredths()`
+    on a raw float total (`StationDayTotal.hundredths=hundredths(total)`)
+    -- not a hand-rounded fixture value, or a mutant in `hundredths()`
+    itself (M42: truncating instead of rounding) goes unseen.
 
     `round(19.999999999999996) == 20`, so SYN-1 clears the 0.2 mm pair line
     exactly; with SYN-2 at 0.25 mm two stations are >= 0.2 mm -> rain
     nearby, trigger "two_at_0.2". `int(19.999999999999996) == 19` instead
     stays below the line, which is the "M42 gives dry" the plan names.
     """
-    one_ulp_below_02 = math.nextafter(math.nextafter(0.2, 0.0), 0.0)
-    assert one_ulp_below_02 * 100 == 19.999999999999996  # noqa: PLR2004
-    a, b = 0.05, 0.05
-    c = one_ulp_below_02 - a - b
+    a, b, c = 0.05, 0.05, 0.09999999999999996
+    two_ulps_below_02 = a + b + c
+    assert two_ulps_below_02 * 100 == 19.999999999999996  # noqa: PLR2004
     readings = [
         RainReading(
             hour=datetime(2035, 1, 1, h), value=mm, source_raw=None, fetched_at=None
@@ -63,7 +58,7 @@ def test_event_exact_sum_float_trap() -> None:
         for h, mm in enumerate([a, b, c])
     ]
     syn1_total = station_day_total(readings, expected_hours=24, gap_hours=6)
-    assert syn1_total.total == one_ulp_below_02
+    assert syn1_total.total == two_ulps_below_02
     assert syn1_total.hundredths == 20
     syn1 = StationDay(
         station_id="SYN-1",
@@ -185,7 +180,7 @@ def test_event_coverage_partial_hours_still_count_for_rain_nearby() -> None:
     amount_22 = observed_amount(
         stations_22h, outcome="rain_nearby", min_hours=22, wet_hundredths=50
     )
-    assert amount_22.amount == pytest.approx(0.5)
+    assert amount_22.amount == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_dry_needs_one_covered_station() -> None:
@@ -253,7 +248,7 @@ def test_one_covered_station_a_partial_light_reading() -> None:
     amount = observed_amount(
         stations, outcome="rain_nearby", min_hours=24, wet_hundredths=20
     )
-    assert amount.amount == pytest.approx(0.25)
+    assert amount.amount == pytest.approx(0.25)  # pyright: ignore[reportUnknownMemberType]
     assert amount.contributing == (("SYN-1", 25, 24),)
 
     dropped = [
@@ -274,7 +269,7 @@ def test_one_covered_station_a_partial_light_reading() -> None:
     amount_dry = observed_amount(
         dropped, outcome="dry", min_hours=24, wet_hundredths=25
     )
-    assert amount_dry.amount == pytest.approx(0.0)
+    assert amount_dry.amount == pytest.approx(0.0)  # pyright: ignore[reportUnknownMemberType]
     # SYN-2/SYN-3 are counted but short of min_hours -> partial, not absent.
     assert amount_dry.partial == (("SYN-2", 0, 21), ("SYN-3", 0, 21))
     # SYN-1's 0.25 mm reading is still visible in the station-day output
@@ -306,7 +301,7 @@ def test_event_partial_and_adequate_wet_stations() -> None:
     amount = observed_amount(
         stations, outcome="rain_nearby", min_hours=24, wet_hundredths=20
     )
-    assert amount.amount == pytest.approx(0.3)
+    assert amount.amount == pytest.approx(0.3)  # pyright: ignore[reportUnknownMemberType]
     assert amount.contributing == (("SYN-2", 30, 24),)
 
 
@@ -340,7 +335,7 @@ def test_lone_reading_flagged_and_kept() -> None:
     amount = observed_amount(
         stations, outcome="rain_nearby", min_hours=24, wet_hundredths=50
     )
-    assert amount.amount == pytest.approx(0.5)
+    assert amount.amount == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_station_day_correction_from_running_total() -> None:
@@ -364,7 +359,7 @@ def test_station_day_correction_from_running_total() -> None:
         for h, total in [(0, 0.25), (1, 0.50), (2, 0.50)]
     ]
     result = station_day_total(good_day, expected_hours=3, gap_hours=2)
-    assert result.total == pytest.approx(0.50)
+    assert result.total == pytest.approx(0.50)  # pyright: ignore[reportUnknownMemberType]
     assert result.correction == "from_running_total"
     assert result.invalid is False
     assert result.problems == ("unreconciled",)

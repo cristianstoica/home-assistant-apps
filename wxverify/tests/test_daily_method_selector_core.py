@@ -15,8 +15,10 @@ from fractions import Fraction
 import pytest
 
 from wxverify.forecast.daily_method import (
+    GroupVote,
     ModelWindow,
     RainWindow,
+    Selection,
     group_vote_chance,
     select_model,
     served_rain,
@@ -399,7 +401,7 @@ def test_the_margin_never_changes_the_group() -> None:
         miss_weight=2,
         threshold_mm=0.1,
     )
-    assert served.amount == pytest.approx(1.0)
+    assert served.amount == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
     assert served.chance == Fraction(0)
     assert served.symbol is False
 
@@ -454,8 +456,8 @@ def test_group_vote_tie_at_the_cut() -> None:
         "SYN-d/SYN-m": 0.5,
     }
 
-    def _group_vote(selection: object) -> object:
-        order = [(item.key, ranked_totals[item.key]) for item in selection.ranked]  # type: ignore[attr-defined]
+    def _group_vote(selection: Selection) -> GroupVote:
+        order = [(item.key, ranked_totals[item.key]) for item in selection.ranked]
         return group_vote_chance(
             order, group_fraction=Fraction(3, 4), trigger_hundredths=20
         )

@@ -119,9 +119,9 @@ def test_amount_benchmarks_odd_q() -> None:
     ranked = [("SYN-a", 0.0), ("SYN-b", 0.4), ("SYN-c", 2.0), ("SYN-d", 5.0)]
     benchmarks = group_amount_benchmarks(ranked, group_fraction=Fraction(3, 4))
     assert benchmarks.q == 3
-    assert benchmarks.median == pytest.approx(0.4)
-    assert benchmarks.mean == pytest.approx(0.8, abs=1e-9)
-    assert (benchmarks.mean - benchmarks.median) == pytest.approx(0.4, abs=1e-9)
+    assert benchmarks.median == pytest.approx(0.4)  # pyright: ignore[reportUnknownMemberType]
+    assert benchmarks.mean == pytest.approx(0.8, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
+    assert (benchmarks.mean - benchmarks.median) == pytest.approx(0.4, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_amount_benchmarks_even_q() -> None:
@@ -141,7 +141,7 @@ def test_amount_benchmarks_even_q() -> None:
     ]
     benchmarks = group_amount_benchmarks(ranked, group_fraction=Fraction(3, 4))
     assert benchmarks.q == 6
-    assert benchmarks.median == pytest.approx(0.3, abs=1e-9)
+    assert benchmarks.median == pytest.approx(0.3, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_amount_benchmarks_zeros_counted_and_amount_tradeoff() -> None:
@@ -155,8 +155,8 @@ def test_amount_benchmarks_zeros_counted_and_amount_tradeoff() -> None:
     ranked = [("SYN-a", 0.0), ("SYN-b", 0.8), ("SYN-c", 0.0), ("SYN-d", 0.0)]
     benchmarks = group_amount_benchmarks(ranked, group_fraction=Fraction(3, 4))
     assert benchmarks.q == 3
-    assert benchmarks.median == pytest.approx(0.0)
-    assert benchmarks.mean == pytest.approx(0.8 / 3, abs=1e-9)
+    assert benchmarks.median == pytest.approx(0.0)  # pyright: ignore[reportUnknownMemberType]
+    assert benchmarks.mean == pytest.approx(0.8 / 3, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
 
     assert amount_tradeoff(benchmarks.mean, outcome="dry") == "dry_shown"
     assert amount_tradeoff(benchmarks.median, outcome="dry") is None

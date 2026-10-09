@@ -119,7 +119,7 @@ def test_served_rain_symbol_off_while_selected_is_wet() -> None:
     assert served.group.k == 1
     assert served.chance == Fraction(1, 5)
     assert served.symbol is False
-    assert served.amount == pytest.approx(0.3)
+    assert served.amount == pytest.approx(0.3)  # pyright: ignore[reportUnknownMemberType]
     assert served.hours_counted == 1
     assert served.hourly == line
 
@@ -152,7 +152,7 @@ def test_served_rain_symbol_on_while_selected_is_dry() -> None:
     assert served.group.k == 3
     assert served.chance == Fraction(3, 5)
     assert served.symbol is True
-    assert served.amount == pytest.approx(0.0)
+    assert served.amount == pytest.approx(0.0)  # pyright: ignore[reportUnknownMemberType]
     assert served.hours_counted == 0
     assert served.hourly == zero_line
 
@@ -170,7 +170,7 @@ def test_hourly_line_missing_hours() -> None:
     line = selected_hourly(samples, hours=_HOURS)
     assert line[2] is None
     assert line[3] is None
-    assert all(v == pytest.approx(0.1) for i, v in enumerate(line) if i not in (2, 3))
+    assert all(v == pytest.approx(0.1) for i, v in enumerate(line) if i not in (2, 3))  # pyright: ignore[reportUnknownMemberType]
     assert counted_hours(line, threshold_mm=0.05) is None
 
     selection = _six_model_selection()
@@ -223,13 +223,14 @@ def test_hourly_line_unscaled() -> None:
     )
     assert served.group is not None
     assert served.group.q == 3
-    assert served.amount == pytest.approx(1.0)
+    assert served.amount == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
     assert served.hourly == line
+    assert isinstance(served.hourly, tuple)
     assert 0.6 in served.hourly  # not 0.006 (a /100 scaling bug)
 
     tz = ZoneInfo("America/New_York")
     spring_forward = date(2035, 3, 11)
-    local_hours = []
+    local_hours: list[datetime] = []
     for h in range(24):
         if h == 2:
             continue  # 02:00 local does not exist on the spring-forward day
@@ -264,7 +265,7 @@ def test_small_amounts_kept_as_calculated() -> None:
             miss_weight=2,
             threshold_mm=0.5,
         )
-        assert served.amount == pytest.approx(small_amount)
+        assert served.amount == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
         assert served.hourly == line
 
 
@@ -377,4 +378,5 @@ def test_served_rain_hourly_line_stays_the_selected_models_own() -> None:
     assert served.group.members == tuple(keys)
     assert served.hourly == a_line
     assert served.hourly != b_line
-    assert all(v == pytest.approx(1.0) for v in served.hourly)
+    assert served.hourly is not None
+    assert all(v == pytest.approx(1.0) for v in served.hourly)  # pyright: ignore[reportUnknownMemberType]

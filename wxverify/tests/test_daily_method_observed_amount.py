@@ -38,7 +38,7 @@ def test_amount_two_largest() -> None:
     amount = observed_amount(
         stations, outcome="rain_nearby", min_hours=1, wet_hundredths=20
     )
-    assert amount.amount == pytest.approx(11.045)
+    assert amount.amount == pytest.approx(11.045)  # pyright: ignore[reportUnknownMemberType]
     assert [c[0] for c in amount.contributing] == ["SYN-1", "SYN-2", "SYN-3"]
 
 
@@ -56,7 +56,7 @@ def test_amount_one_contributing_station() -> None:
     amount = observed_amount(
         stations, outcome="rain_nearby", min_hours=1, wet_hundredths=50
     )
-    assert amount.amount == pytest.approx(0.5)
+    assert amount.amount == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
     assert len(amount.contributing) == 1
 
 
@@ -77,7 +77,7 @@ def test_amount_dry_and_unknown() -> None:
     dry_amount = observed_amount(
         dry_stations, outcome="dry", min_hours=1, wet_hundredths=20
     )
-    assert dry_amount.amount == pytest.approx(0.0)
+    assert dry_amount.amount == pytest.approx(0.0)  # pyright: ignore[reportUnknownMemberType]
     assert dry_amount.contributing == (("SYN-1", 25, 24),)
 
     unknown_stations = [

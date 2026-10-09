@@ -14,30 +14,52 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from fractions import Fraction
+from typing import TypedDict
 
 from wxverify.forecast.daily_method import StationDayTotal, station_fault_states
 
 _BASE = date(2035, 1, 1)
 
-_FAULT_KWARGS = dict(
-    adequate_hours=22,
-    wet_line_hundredths=100,
-    dry_line_hundredths=10,
-    min_peers=3,
-    suspect_lookback_days=30,
-    suspect_min_days=5,
-    suspect_ratio_below=Fraction(1, 2),
-    quarantine_lookback_days=60,
-    quarantine_min_days=8,
-    quarantine_min_episodes=3,
-    quarantine_ratio_at_most=Fraction(1, 4),
-    quarantine_dry_share=Fraction(1, 2),
-    recovery_lookback_days=30,
-    recovery_min_days=5,
-    recovery_min_episodes=2,
-    recovery_ratio_at_least=Fraction(1, 2),
-    recovery_max_dry_days=1,
-)
+
+class _FaultKwargs(TypedDict):
+    adequate_hours: int
+    wet_line_hundredths: int
+    dry_line_hundredths: int
+    min_peers: int
+    suspect_lookback_days: int
+    suspect_min_days: int
+    suspect_ratio_below: Fraction
+    quarantine_lookback_days: int
+    quarantine_min_days: int
+    quarantine_min_episodes: int
+    quarantine_ratio_at_most: Fraction
+    quarantine_dry_share: Fraction
+    recovery_lookback_days: int
+    recovery_min_days: int
+    recovery_min_episodes: int
+    recovery_ratio_at_least: Fraction
+    recovery_max_dry_days: int
+
+
+_FAULT_KWARGS: _FaultKwargs = {
+    "adequate_hours": 22,
+    "wet_line_hundredths": 100,
+    "dry_line_hundredths": 10,
+    "min_peers": 3,
+    "suspect_lookback_days": 30,
+    "suspect_min_days": 5,
+    "suspect_ratio_below": Fraction(1, 2),
+    "quarantine_lookback_days": 60,
+    "quarantine_min_days": 8,
+    "quarantine_min_episodes": 3,
+    "quarantine_ratio_at_most": Fraction(1, 4),
+    "quarantine_dry_share": Fraction(1, 2),
+    "recovery_lookback_days": 30,
+    "recovery_min_days": 5,
+    "recovery_min_episodes": 2,
+    "recovery_ratio_at_least": Fraction(1, 2),
+    "recovery_max_dry_days": 1,
+}
 
 
 def _d(n: int) -> date:

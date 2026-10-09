@@ -35,8 +35,8 @@ def test_trimean_and_shrink() -> None:
     Shrink factor n/(n+shrink) = 20/30; bias = 20/30 * 1.0 = 0.6667.
     """
     errors = [0.0] * 10 + [2.0] * 10
-    assert trimean(errors) == pytest.approx(1.0)
-    assert shrunk_bias(errors, shrink=10, limit=3) == pytest.approx(
+    assert trimean(errors) == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
+    assert shrunk_bias(errors, shrink=10, limit=3) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
         20 / 30 * 1.0, abs=1e-4
     )
 
@@ -49,8 +49,8 @@ def test_limit_clamps_the_bias() -> None:
     """
     errors = [5.0] * 30
     raw = 30 / 40 * trimean(errors)
-    assert raw == pytest.approx(3.75)
-    assert shrunk_bias(errors, shrink=10, limit=3) == pytest.approx(3.0)
+    assert raw == pytest.approx(3.75)  # pyright: ignore[reportUnknownMemberType]
+    assert shrunk_bias(errors, shrink=10, limit=3) == pytest.approx(3.0)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_calibration_heavy_penalty_snaps_to_the_vote_share() -> None:
@@ -66,9 +66,9 @@ def test_calibration_heavy_penalty_snaps_to_the_vote_share() -> None:
         [x], [1], lam=1e9, max_iterations=50, tolerance=1e-9
     )
     assert converged
-    assert a == pytest.approx(0.0, abs=1e-6)
-    assert b == pytest.approx(1.0, abs=1e-6)
-    assert calibrated_chance(x, a=a, b=b) == pytest.approx(0.7, abs=1e-6)
+    assert a == pytest.approx(0.0, abs=1e-6)  # pyright: ignore[reportUnknownMemberType]
+    assert b == pytest.approx(1.0, abs=1e-6)  # pyright: ignore[reportUnknownMemberType]
+    assert calibrated_chance(x, a=a, b=b) == pytest.approx(0.7, abs=1e-6)  # pyright: ignore[reportUnknownMemberType]
 
 
 def _row4_days() -> tuple[list[float], list[int]]:
@@ -90,11 +90,11 @@ def test_calibration_fitted() -> None:
         xs, ys, lam=1.0, max_iterations=100, tolerance=1e-10
     )
     assert converged
-    assert a == pytest.approx(0.408366, abs=1e-5)
-    assert b == pytest.approx(1.144587, abs=1e-5)
+    assert a == pytest.approx(0.408366, abs=1e-5)  # pyright: ignore[reportUnknownMemberType]
+    assert b == pytest.approx(1.144587, abs=1e-5)  # pyright: ignore[reportUnknownMemberType]
     x_at_2_of_4 = vote_logit(2, 4)
-    assert x_at_2_of_4 == pytest.approx(0.0, abs=1e-12)
-    assert calibrated_chance(x_at_2_of_4, a=a, b=b) == pytest.approx(0.600696, abs=1e-6)
+    assert x_at_2_of_4 == pytest.approx(0.0, abs=1e-12)  # pyright: ignore[reportUnknownMemberType]
+    assert calibrated_chance(x_at_2_of_4, a=a, b=b) == pytest.approx(0.600696, abs=1e-6)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_no_convergence_with_one_iteration() -> None:
@@ -132,7 +132,7 @@ def test_exact_symbol_boundary(
 
 def test_counted_hour_sum() -> None:
     """Row 7: [0.05, 0.2, 0.0, 1.0], T=0.1 -> only 0.2 and 1.0 qualify -> 1.2."""
-    assert qualifying_sum([0.05, 0.2, 0.0, 1.0], threshold_mm=0.1) == pytest.approx(1.2)
+    assert qualifying_sum([0.05, 0.2, 0.0, 1.0], threshold_mm=0.1) == pytest.approx(1.2)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_wet_vote_refuses_a_zero_threshold() -> None:
@@ -154,12 +154,12 @@ def test_pooled_per_lead_gives_equal_weight_to_each_lead() -> None:
     a different, wrong, number if the pooling were weighted by day count).
     """
     per_lead = {0: [1.0] * 20, 1: [5.0] * 2}
-    assert pooled_statistic(per_lead, min_days=1) == pytest.approx(3.0)
+    assert pooled_statistic(per_lead, min_days=1) == pytest.approx(3.0)  # pyright: ignore[reportUnknownMemberType]
     day_weighted = sum(sum(v) for v in per_lead.values()) / sum(
         len(v) for v in per_lead.values()
     )
-    assert day_weighted == pytest.approx(30 / 22)
-    assert day_weighted != pytest.approx(3.0)
+    assert day_weighted == pytest.approx(30 / 22)  # pyright: ignore[reportUnknownMemberType]
+    assert day_weighted != pytest.approx(3.0)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_asymmetric_loss_the_amounts_weight() -> None:
@@ -168,18 +168,18 @@ def test_asymmetric_loss_the_amounts_weight() -> None:
     F=20, y=22 (under-forecast by 2): 1.5 * 2 = 3.0.
     F=22, y=20 (over-forecast by 2): 1 * 2 = 2.0.
     """
-    assert asymmetric_loss(20, 22, under_weight=1.5, over_weight=1) == pytest.approx(
+    assert asymmetric_loss(20, 22, under_weight=1.5, over_weight=1) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
         3.0
     )
-    assert asymmetric_loss(22, 20, under_weight=1.5, over_weight=1) == pytest.approx(
+    assert asymmetric_loss(22, 20, under_weight=1.5, over_weight=1) == pytest.approx(  # pyright: ignore[reportUnknownMemberType]
         2.0
     )
 
 
 def test_asymmetric_loss_the_highs_weight() -> None:
     """Row 11: under_weight=w_high=1, over_weight=1 -- symmetric, both 2.0."""
-    assert asymmetric_loss(20, 22, under_weight=1, over_weight=1) == pytest.approx(2.0)
-    assert asymmetric_loss(22, 20, under_weight=1, over_weight=1) == pytest.approx(2.0)
+    assert asymmetric_loss(20, 22, under_weight=1, over_weight=1) == pytest.approx(2.0)  # pyright: ignore[reportUnknownMemberType]
+    assert asymmetric_loss(22, 20, under_weight=1, over_weight=1) == pytest.approx(2.0)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_tie_break_on_mean_under_forecast_beats_alphabetical_order() -> None:
@@ -205,10 +205,10 @@ def test_tie_break_on_mean_under_forecast_beats_alphabetical_order() -> None:
     ranked = rank_by_loss(
         histories, under_weight=1, over_weight=1, tie_break="under_forecast"
     )
-    assert ranked[0].mean_loss == pytest.approx(1.0)
-    assert ranked[1].mean_loss == pytest.approx(1.0)
+    assert ranked[0].mean_loss == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
+    assert ranked[1].mean_loss == pytest.approx(1.0)  # pyright: ignore[reportUnknownMemberType]
     assert ranked[0].feed == feed_a
-    assert ranked[0].mean_under == pytest.approx(0.25)
+    assert ranked[0].mean_under == pytest.approx(0.25)  # pyright: ignore[reportUnknownMemberType]
 
     # Paired control: under plain (source, model) tie-break, feed_b (which
     # sorts first alphabetically) wins instead -- proving the override is
