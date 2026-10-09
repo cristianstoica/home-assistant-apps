@@ -27,6 +27,7 @@ import random
 import re
 import sqlite3
 import statistics
+import subprocess
 import sys
 import time
 from bisect import bisect_right
@@ -169,6 +170,7 @@ M_CIW_FLOOR_MM = 0.1
 COUNTS_ONLY_HEADER_KEYS: tuple[str, ...] = (
     "copy",
     "manifest",
+    "commit_sha",
     "gates",
     "arm",
     "counts",
@@ -564,6 +566,76 @@ def package_manifest(root: Path) -> dict[str, object]:
             continue
         files.append([relative.as_posix(), sha256_file(path)])
     return {"files": files, "python": list(sys.version_info[:2])}
+
+
+def _run_git(package_dir: Path, *args: str) -> str:
+    """Run ``git -C package_dir *args``; its standard output, stripped, on exit 0.
+
+    git missing (``OSError``), a timeout, output that cannot be decoded and a
+    non-zero exit each raise :class:`RefusedError` naming the command: a check
+    that cannot be completed refuses. ``GIT_OPTIONAL_LOCKS=0`` keeps
+    ``git status`` from rewriting the index.
+    """
+    name = " ".join(("git", *args))
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(package_dir), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
+        raise RefusedError(f"commit check: {name} could not run: {exc}") from exc
+    if result.returncode != 0:
+        message = result.stderr.strip().splitlines()
+        reason = message[0][:200] if message else "no message"
+        raise RefusedError(f"commit check: {name} exited {result.returncode}: {reason}")
+    return result.stdout.strip()
+
+
+def check_commit(package_dir: Path, *, commit_sha: str) -> None:
+    """Refuse unless ``package_dir`` is a clean checkout of ``commit_sha`` (§13.3).
+
+    Three git commands, in order: HEAD must resolve to ``commit_sha``;
+    ``git status`` must list nothing under the package (modified, staged,
+    deleted or untracked); and no ignored ``.py`` file may sit under it. The
+    last is needed because the add-on's ignore rules name directories such
+    as ``data/`` and ``.local/`` at any depth, and ``git status`` does not
+    list ignored files, so such a file would be in the manifest but in no
+    checkout. Every failure raises :class:`RefusedError` naming what failed.
+    """
+    head = _run_git(package_dir, "rev-parse", "--verify", "HEAD^{commit}")
+    if head != commit_sha:
+        raise RefusedError(
+            f"commit check: the package's HEAD is {head[:64]!r}, "
+            f"not --commit-sha {commit_sha}"
+        )
+    status = _run_git(
+        package_dir, "status", "--porcelain=v1", "--untracked-files=all", "--", "."
+    )
+    if status:
+        changed = status.splitlines()
+        raise RefusedError(
+            f"commit check: {len(changed)} path(s) under the package are "
+            f"modified, staged, deleted or untracked; the first: {changed[0][:200]!r}"
+        )
+    ignored = _run_git(
+        package_dir,
+        "ls-files",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--",
+        "*.py",
+    )
+    if ignored:
+        found = ignored.splitlines()
+        raise RefusedError(
+            f"commit check: {len(found)} ignored .py file(s) under the package; "
+            f"the first: {found[0][:200]!r}"
+        )
 
 
 def copy_facts(copy: Path, sha256: str) -> dict[str, object]:
@@ -5520,6 +5592,7 @@ def _run_temperature(
     header: dict[str, object] = {
         "copy": header_base["copy"],
         "manifest": header_base["manifest"],
+        "commit_sha": header_base["commit_sha"],
         "gates": gates,
         "arm": gates.arm,
         "stale_truth_rows": stale,
@@ -5657,7 +5730,7 @@ def _temperature_freeze_prepare(
             "D2": "A",
             "D4": {"m": G4_MARGIN_PP},
         },
-        "commit_sha": None,
+        "commit_sha": header["commit_sha"],
         "statement": None,
         "f2": "not_built",
     }
@@ -5912,6 +5985,7 @@ def _run_rain(
     header: dict[str, object] = {
         "copy": header_base["copy"],
         "manifest": header_base["manifest"],
+        "commit_sha": header_base["commit_sha"],
         "gates": gates,
         "arm": gates.arm,
         "stale_truth_rows": stale,
@@ -5985,12 +6059,10 @@ def _run_rain(
         own_days=own_days_summary(lines),
         replay_time=replay_time_stats(replays.seconds()),
         python=list(sys.version_info[:3]),
-        commit_sha=None,
         not_built=[
             "the rain control from V_B on (stage two)",
             "A6 for rain (the offered w_amount and w_r values)",
             "A7",
-            "A12",
             "A16",
             "A17",
             "F2",
@@ -6086,6 +6158,19 @@ def run(
     )
 
 
+def _commit_sha(value: str) -> str:
+    """``--commit-sha``: the full 40-character lowercase hex sha, unchanged.
+
+    Any other form, an uppercase sha included, is an argparse error.
+    """
+    if re.fullmatch(r"[0-9a-f]{40}", value):
+        return value
+    raise argparse.ArgumentTypeError(
+        f"must be the full 40-character lowercase hex sha of the add-on commit, "
+        f"not {value!r}"
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The command line of §13.3."""
     parser = argparse.ArgumentParser(
@@ -6102,6 +6187,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--out", type=Path, required=True, help="the output root")
     parser.add_argument("--variable", choices=("temperature", "precip"), required=True)
+    parser.add_argument(
+        "--commit-sha",
+        type=_commit_sha,
+        required=True,
+        help="the 40-character sha of the add-on commit the run uses",
+    )
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument(
         "--counts-only", dest="mode", action="store_const", const="counts-only"
@@ -6136,6 +6227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     site_id: int = args.site_id
     out: Path = args.out
     variable: Variable = args.variable
+    commit_sha: str = args.commit_sha
     mode: Mode = args.mode
     note_path: Path | None = args.freeze_note
     expect: str | None = args.expect_sha256
@@ -6163,7 +6255,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         note = None if note_path is None else load_freeze_note(note_path)
         if note is not None and note.site_id != site_id:
             raise RefusedError("the freeze note is for another site")
-        manifest = package_manifest(Path(wxverify.__file__).parent)
+        package_dir = Path(wxverify.__file__).parent
+        manifest = package_manifest(package_dir)
+        check_commit(package_dir, commit_sha=commit_sha)
         if mode == "heldout":
             if note is None:
                 raise RefusedError("--heldout needs a freeze note")
@@ -6174,8 +6268,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         tmpdir = os.environ.get("SQLITE_TMPDIR")
         if tmpdir is None or os.path.realpath(tmpdir) != os.path.realpath(copy.parent):
             raise RefusedError(
-                "SQLITE_TMPDIR must name the copy's directory when the tool starts; "
-                "SQLite reads it once, when the sqlite3 module loads"
+                "SQLITE_TMPDIR must name the copy's directory in the environment "
+                "the tool is started with"
             )
         before = sha256_file(copy)
         if expect is not None and before != expect.strip().lower():
@@ -6201,7 +6295,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             site = load_site(conn, site_id=site_id)
             last_complete = latest_knowable_target(site.timezone, copied_at)
-            header_base = {"copy": copy_facts(copy, before), "manifest": manifest}
+            header_base = {
+                "copy": copy_facts(copy, before),
+                "manifest": manifest,
+                "commit_sha": commit_sha,
+            }
             if variable == "temperature":
                 files = run(
                     conn,
