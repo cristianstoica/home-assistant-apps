@@ -938,12 +938,14 @@ def rename_stale_partials(out: Path) -> list[str]:
     """Rename every ``*.partial`` directory under ``out`` to ``*.failed``.
 
     Returns the renamed paths relative to ``out``, sorted. A name already
-    taken gets a ``-N`` suffix.
+    taken gets a ``-N`` suffix. The walk's ``onerror`` raises, so a directory
+    under ``out`` that cannot be listed raises ``OSError`` instead of being
+    passed over (§13.3).
     """
     if not out.is_dir():
         return []
     found: list[Path] = []
-    for dirpath, dirnames, _ in os.walk(out):
+    for dirpath, dirnames, _ in os.walk(out, onerror=_raise_walk_error):
         for name in dirnames:
             if name.endswith(".partial"):
                 found.append(Path(dirpath) / name)
@@ -962,12 +964,14 @@ def list_failed_dirs(out: Path) -> list[str]:
     """Every ``*.failed`` directory under ``out``, relative to it, sorted.
 
     A ``-N`` suffix (a name already taken, :func:`_free_name`) still counts.
-    A failed directory's own contents are not searched.
+    A failed directory's own contents are not searched. The walk's
+    ``onerror`` raises, so a directory under ``out`` that cannot be listed
+    raises ``OSError`` instead of being passed over (§13.3).
     """
     if not out.is_dir():
         return []
     found: list[str] = []
-    for dirpath, dirnames, _ in os.walk(out):
+    for dirpath, dirnames, _ in os.walk(out, onerror=_raise_walk_error):
         failed = [name for name in dirnames if _FAILED_NAME.search(name)]
         for name in failed:
             found.append((Path(dirpath) / name).relative_to(out).as_posix())
@@ -6498,14 +6502,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         before = sha256_file(copy)
         if expect is not None and before != expect.strip().lower():
             raise RefusedError("the copy's sha256 differs from --expect-sha256")
+        for renamed in rename_stale_partials(out):
+            print(f"renamed an unfinished output to {renamed}", file=sys.stderr)
+        failed_dirs = list_failed_dirs(out)
+        start = datetime.now(UTC)
+        copied_at = datetime.fromtimestamp(copy.stat().st_mtime, tz=UTC)
     except RefusedError as exc:
         print(f"refused: {exc}", file=sys.stderr)
         return 2
-    for renamed in rename_stale_partials(out):
-        print(f"renamed an unfinished output to {renamed}", file=sys.stderr)
-    failed_dirs = list_failed_dirs(out)
-    start = datetime.now(UTC)
-    copied_at = datetime.fromtimestamp(copy.stat().st_mtime, tz=UTC)
+    except OSError as exc:
+        print(
+            f"refused: the run could not be prepared: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
     final_dir = (
         out
         / copied_at.date().isoformat()

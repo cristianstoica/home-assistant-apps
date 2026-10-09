@@ -99,6 +99,28 @@ def shrunk_bias(errors: Sequence[float], *, shrink: float, limit: float) -> floa
     return max(-limit, min(limit, raw))
 
 
+def pooled_bias(
+    per_lead: Mapping[int, Sequence[float]], *, shrink: float, limit: float
+) -> float:
+    """The pooled regime's bias (§8.2): per-lead shrunk trimeans, averaged.
+
+    ``per_lead`` maps each lead to that lead's errors. Each lead with at least
+    one error gives n / (n + shrink) * trimean(errors), shrunk by its own count
+    and not limited on its own. The bias is the mean of those values, each
+    lead counting once however many days it has, limited to +-limit. A lead
+    with no errors is left out, not counted as 0. With no errors at any lead
+    the bias is 0.0, as in ``shrunk_bias``.
+    """
+    lead_biases = [
+        len(errors) / (len(errors) + shrink) * trimean(errors)
+        for errors in per_lead.values()
+        if errors
+    ]
+    if not lead_biases:
+        return 0.0
+    return max(-limit, min(limit, statistics.fmean(lead_biases)))
+
+
 def _lead_mean(per_lead: Mapping[int, Sequence[float]]) -> float | None:
     """The mean of the per-lead means, each lead with at least one day."""
     means = [statistics.fmean(values) for values in per_lead.values() if values]
@@ -334,22 +356,6 @@ def _no_eligible(name: str, control: float) -> CandidateValue:
     )
 
 
-def _bias_not_defined(
-    name: str, regime: Regime, eligible: Sequence[FeedCase]
-) -> CandidateValue:
-    return CandidateValue(
-        name=name,
-        value=None,
-        regime=regime,
-        eligible=tuple(f.feed.key for f in eligible),
-        weights={},
-        biases={},
-        ranks=(),
-        flags=("pooled_bias_not_defined",),
-        fallback_reason="pooled_bias_not_defined",
-    )
-
-
 def compose_iw(
     feeds: Sequence[FeedCase],
     *,
@@ -436,14 +442,32 @@ def compose_td_k(
 
 
 def _feed_biases(
-    eligible: Sequence[FeedCase], *, lead: int, shrink: float, limit: float
+    eligible: Sequence[FeedCase],
+    *,
+    regime: Regime,
+    lead: int,
+    pooled_leads: Sequence[int],
+    shrink: float,
+    limit: float,
 ) -> dict[ModelRef, float]:
-    return {
-        f.feed: shrunk_bias(
-            [fc - y for fc, y in f.training.get(lead, ())], shrink=shrink, limit=limit
-        )
-        for f in eligible
-    }
+    """Each eligible feed's one b (§8.2).
+
+    Per lead: ``shrunk_bias`` on its errors at the case's lead. Pooled:
+    ``pooled_bias`` on its errors at each of ``pooled_leads``.
+    """
+    biases: dict[ModelRef, float] = {}
+    for f in eligible:
+        errors = {
+            ld: [fc - y for fc, y in pairs]
+            for ld, pairs in _regime_training(
+                f, regime=regime, lead=lead, pooled_leads=pooled_leads
+            ).items()
+        }
+        if regime == "pooled":
+            biases[f.feed] = pooled_bias(errors, shrink=shrink, limit=limit)
+        else:
+            biases[f.feed] = shrunk_bias(errors[lead], shrink=shrink, limit=limit)
+    return biases
 
 
 def compose_iw_bc(
@@ -459,20 +483,31 @@ def compose_iw_bc(
 ) -> CandidateValue:
     """IW-BC: IW on bias-corrected values, weights from mean |e - b| (§8.2).
 
-    The pooled regime has no defined bias (the plan does not say how a
-    trimean is pooled with equal weight per lead), so that case carries no
-    value and the flag ``pooled_bias_not_defined``.
+    Each feed has one b: ``shrunk_bias`` at the case's lead in the per-lead
+    regime, ``pooled_bias`` over ``pooled_leads`` in the pooled one. P' = P - b
+    at every lead, and the mean |e - b| has equal weight per lead, as IW's
+    MAE does.
     """
     regime, eligible = training_regime(
         feeds, lead=lead, min_days=min_days, pooled_leads=pooled_leads
     )
     if regime == "no_eligible":
         return _no_eligible("IW-BC", control)
-    if regime == "pooled":
-        return _bias_not_defined("IW-BC", regime, eligible)
-    biases = _feed_biases(eligible, lead=lead, shrink=shrink, limit=limit)
+    biases = _feed_biases(
+        eligible,
+        regime=regime,
+        lead=lead,
+        pooled_leads=pooled_leads,
+        shrink=shrink,
+        limit=limit,
+    )
     histories = {
-        f.feed: {lead: [fc - y - biases[f.feed] for fc, y in f.training.get(lead, ())]}
+        f.feed: {
+            ld: [fc - y - biases[f.feed] for fc, y in pairs]
+            for ld, pairs in _regime_training(
+                f, regime=regime, lead=lead, pooled_leads=pooled_leads
+            ).items()
+        }
         for f in eligible
     }
     weights = inverse_mae_weights(histories, floor=floor)
@@ -506,21 +541,29 @@ def compose_td_k_bc(
 ) -> CandidateValue:
     """TD-K-BC: TD-K ranked by the loss of P' = P - b, averaging P' (§8.2).
 
-    As for IW-BC, the pooled regime carries no value
-    (``pooled_bias_not_defined``).
+    Its b is IW-BC's in both regimes; in the pooled one the loss of P' is
+    taken at every lead of ``pooled_leads``, with equal weight per lead.
     """
     regime, eligible = training_regime(
         feeds, lead=lead, min_days=min_days, pooled_leads=pooled_leads
     )
     if regime == "no_eligible":
         return _no_eligible("TD-K-BC", control)
-    if regime == "pooled":
-        return _bias_not_defined("TD-K-BC", regime, eligible)
-    biases = _feed_biases(eligible, lead=lead, shrink=shrink, limit=limit)
+    biases = _feed_biases(
+        eligible,
+        regime=regime,
+        lead=lead,
+        pooled_leads=pooled_leads,
+        shrink=shrink,
+        limit=limit,
+    )
     ranked = rank_by_loss(
         {
             f.feed: {
-                lead: [(fc - biases[f.feed], y) for fc, y in f.training.get(lead, ())]
+                ld: [(fc - biases[f.feed], y) for fc, y in pairs]
+                for ld, pairs in _regime_training(
+                    f, regime=regime, lead=lead, pooled_leads=pooled_leads
+                ).items()
             }
             for f in eligible
         },
