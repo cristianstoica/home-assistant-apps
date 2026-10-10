@@ -5,8 +5,8 @@ Covers only the version-map change: :data:`RainRule`, :data:`V_B`,
 :class:`RainRuleRead`, :data:`RAIN_RULE_READS`, :data:`RAIN_RULES`,
 :class:`VersionUnmappedError`, the new :func:`control_value` signature,
 :func:`rain_rules_record` and the :func:`rain_settings` additions. Does NOT
-cover the span check or mutants M141-M144 -- that check does not exist yet
-and is a separate later step.
+cover the span check or mutants M141-M144 -- those are covered by
+``tests/test_daily_shadow_span_check.py`` instead.
 
 Every rain fixture row sets the literal ``app_version`` ``'0.16.7'`` unless
 the test names another version -- never ``wxverify.__version__``, and never
@@ -295,6 +295,13 @@ def test_f3_rain_rule_reads_commits_are_full_hex_shas_and_map_starts_at_0_16_2()
 def test_t2_version_unmapped_raises_versionunmappederror(app_version: str) -> None:
     """A version after the map's last read (0.16.7) raises VersionUnmappedError.
 
+    Per plan :1300, :1302 and :1306 (F5), this unit-level stop test passes
+    its own minimal map, ``{(0, 16, 7): "legacy"}``, rather than the tool's
+    own ``RAIN_RULES`` -- so this pin survives stage two unchanged when the
+    tool's own map grows to hold 0.16.8/0.16.10. Each of the three versions
+    tested here (0.16.8, 0.16.9, 0.16.10) is absent from this map in both
+    stages.
+
     Kills M8 (control always uses the legacy rule, without reading the map):
     at this call, the correct code raises VersionUnmappedError and never
     returns a value, while M8 (which skips the ``rain_rules.get`` lookup
@@ -306,6 +313,9 @@ def test_t2_version_unmapped_raises_versionunmappederror(app_version: str) -> No
     substring, so a mutant that injects it diverges from the real text at
     these two ``not in`` assertions.
     """
+    minimal_map: Mapping[tuple[int, ...], daily_shadow.RainRule] = MappingProxyType(
+        {(0, 16, 7): "legacy"}
+    )
     row = _row(
         app_version=app_version,
         daily_quantities=_precip_daily_quantities(
@@ -313,10 +323,11 @@ def test_t2_version_unmapped_raises_versionunmappederror(app_version: str) -> No
         ),
     )
     with pytest.raises(VersionUnmappedError, match=re.escape(app_version)) as excinfo:
-        control_value(row, variable="precip", rain_rules=RAIN_RULES)
+        control_value(row, variable="precip", rain_rules=minimal_map)
     message = str(excinfo.value)
     assert "Style B" not in message
     assert "V_B" not in message
+    assert "no verified control rule maps" in message
 
 
 def test_t2_temperature_row_never_raises_for_the_same_unmapped_version() -> None:
@@ -1024,3 +1035,10 @@ def test_t5b_a_real_shaped_0_15_0_row_with_absent_wet_hours_is_pre_wet_hours() -
     )
     result = control_value(row, variable="precip", rain_rules=RAIN_RULES)
     assert result == Unmatched("pre_wet_hours")
+
+
+@pytest.mark.skip(
+    reason="deferred to stage two (plan §13.1, §15.3): 0.16.10/0.16.11 style_b "
+    "rows and the 0.16.9 stop"
+)
+def test_control_rule_by_version_style_b_deferred_to_stage_two() -> None: ...

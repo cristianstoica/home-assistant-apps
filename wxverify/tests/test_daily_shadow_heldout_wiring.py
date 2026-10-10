@@ -6,11 +6,17 @@ production-written fixture, to prove by construction that ``twin_missing``
 is literally the twin's own ``missing`` count, not merely documented as
 such, and that a corrected candidate whose own composer gives no value is
 caught by its own count rather than by its twin's.
+
+Also covers §15.4's M22 ("warm-spell threshold frozen on the first
+window"): a two-case, DB-backed fixture with disjoint training windows,
+needed because the bug this mutant posits is only visible across more
+than one case sharing a run.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -149,6 +155,77 @@ def _make_fixture() -> tuple[sqlite3.Connection, daily_shadow.Site]:
     return conn, site
 
 
+_DAY_B = _DAY + timedelta(days=180)
+
+
+def _make_two_window_fixture() -> tuple[sqlite3.Connection, daily_shadow.Site]:
+    """Two lead-0 cases 180 days apart, each with its own disjoint 35-day
+    seed window of ``temperature_high`` truth, built for §15.4's M22
+    ("warm-spell threshold frozen on the first window").
+
+    Day A's window (``_DAY`` and the 34 days before it) is seeded at a
+    uniform 5.0C; day B's window (``_DAY_B`` and the 34 days before it,
+    which never overlaps day A's) is seeded at a uniform 30.0C. Both
+    days' own target truth is 20.0C. A correct per-case
+    ``warm_spell_threshold`` computation gives day A's threshold near
+    5.0C (so 20.0 is a warm spell) and day B's threshold near 30.0C (so
+    20.0 is not) -- if the threshold were frozen on the first window
+    computed, day B would wrongly inherit day A's ~5.0C threshold and
+    also come out warm.
+
+    The 35-day seed (one more than ``TEMP_WINDOW_DAYS`` = 30) is a
+    deliberate margin over the training window's own day count, to
+    absorb any lag ``latest_knowable_target`` may apply when mapping a
+    snapshot to its training K day -- the test checks the *computed*
+    threshold value, not the window's exact boundary dates.
+    """
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    run_migrations(conn)
+    site_id = asof_make_site(conn, "heldout-wiring-two-window-site")
+    ensure_published_generation(conn, site_id)
+    set_setting(conn, "forecast_blend_depth", "1")
+    feed_a = asof_make_real_feed(conn, "model-a")
+    site = daily_shadow.load_site(conn, site_id=site_id)
+
+    for target_day, seed_value in ((_DAY, 5.0), (_DAY_B, 30.0)):
+        day_before = target_day - timedelta(days=1)
+        issued = f"{day_before.isoformat()}T06:00:00Z"
+        fetched = f"{day_before.isoformat()}T06:05:00Z"
+        _insert_day_samples(
+            conn,
+            site_id=site_id,
+            feed_id=feed_a,
+            local_date=target_day,
+            issued_at=issued,
+            fetched_at=fetched,
+            value=10.0,
+        )
+        now = resolve_snapshot_utc("UTC", target_day, "07:00")
+        build_forecast_record(conn, site_id, target_day.isoformat(), now=now)
+        for offset in range(35):
+            seed_day = target_day - timedelta(days=offset)
+            _insert_daily_truth(
+                conn,
+                site_id=site_id,
+                tz_generation_id=site.generation_id,
+                local_date=seed_day,
+                quantity="temperature_high",
+                value=seed_value if seed_day != target_day else 20.0,
+            )
+        _insert_daily_truth(
+            conn,
+            site_id=site_id,
+            tz_generation_id=site.generation_id,
+            local_date=target_day,
+            quantity="temperature_low",
+            value=10.0,
+        )
+    conn.commit()
+    return conn, site
+
+
 def _note(site: daily_shadow.Site) -> daily_shadow.FreezeNote:
     return daily_shadow.FreezeNote(
         site_id=site.site_id,
@@ -267,3 +344,53 @@ def test_a_corrected_candidates_own_composer_is_caught_by_its_own_count(
     assert by_name["IW"]["missing"] == 0
     assert by_name["IW-BC"]["missing"] > 0
     assert by_name["IW-BC"]["twin_missing"] > 0
+
+
+def _warm_spell_by_target(files: dict[str, bytes]) -> dict[date, bool | None]:
+    lines = [json.loads(line) for line in files["lines.jsonl"].decode().splitlines()]
+    return {
+        date.fromisoformat(entry["target"]): entry["warm_spell"]
+        for entry in lines
+        if entry["quantity"] == "temperature_high" and entry["lead"] == 0
+    }
+
+
+def test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window() -> None:
+    """M22: warm-spell threshold frozen on the first window -> at each
+    day's own ``warm_spell`` flag in ``lines.jsonl``: correct = day A
+    True, day B False (each case's own ~5C/~30C window gives its own
+    threshold), mutant = day A True, day B ALSO True (day B wrongly
+    inherits day A's ~5C threshold from "the first window").
+    """
+    conn, site = _make_two_window_fixture()
+    note = daily_shadow.FreezeNote(
+        site_id=site.site_id,
+        first_h_date=_DAY,
+        excluded_h_dates=(),
+        station_set=(),
+        db_import=None,
+        manifest={},
+        constants={},
+        house_station="SYN-HOUSE",
+        td_k=daily_shadow.TD_K_DEFAULT,
+    )
+    files = daily_shadow.run(
+        conn,
+        site=site,
+        variable="temperature",
+        mode="heldout",
+        first=_DAY,
+        last=_DAY_B,
+        h_first=_DAY,
+        last_complete=_DAY_B,
+        excluded_h_dates=(),
+        t2_last=None,
+        note=note,
+        house_station=note.house_station,
+        incumbent_from_record=False,
+        failed_dirs=(),
+        header_base={"copy": {}, "manifest": {}, "commit_sha": "a" * 40},
+    )
+    by_target = _warm_spell_by_target(files)
+    assert by_target[_DAY] is True
+    assert by_target[_DAY_B] is False

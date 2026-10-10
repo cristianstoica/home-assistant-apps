@@ -290,6 +290,16 @@ ERROR_KEYS: tuple[str, ...] = (
     "manifest",
 )
 
+SQLITE_CORRUPT = 11
+SQLITE_NOTADB = 26
+DAMAGED_PRIMARY_CODES: frozenset[int] = frozenset({SQLITE_CORRUPT, SQLITE_NOTADB})
+"""The primary SQLite result codes that mark the copy damaged (§11.3).
+
+:func:`copy_damaged` compares an ERROR's code's low byte (``code & 0xFF``)
+with these. The classification is shown on the ERROR's standard-error line
+only, never as a key of ``error.json``.
+"""
+
 NOTE_FORMAT = "wxverify-daily-shadow-freeze-note/1"
 HEADER_FORMAT = "wxverify-daily-shadow-header/1"
 
@@ -653,7 +663,9 @@ def find_sqlite_errorcode(exc: BaseException) -> int | None:
     """The ``sqlite_errorcode`` of the first :class:`sqlite3.Error` in the chain.
 
     Walks from ``exc`` along ``__cause__``, else ``__context__``, visiting
-    each exception once; None when no ``sqlite3.Error`` carries a code.
+    each exception once, and stops at the first ``sqlite3.Error`` it finds
+    (§11.3). Returns that error's code; None if that error carries none or
+    none is found, so a codeless error hides any code further along.
     """
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -668,6 +680,21 @@ def find_sqlite_errorcode(exc: BaseException) -> int | None:
             current.__cause__ if current.__cause__ is not None else current.__context__
         )
     return None
+
+
+def copy_damaged(code: int | None) -> bool | None:
+    """Whether an ERROR's ``sqlite_errorcode`` marks the copy damaged (§11.3).
+
+    None when ``code`` is None: unclassified. Otherwise whether its low byte
+    (``code & 0xFF``, the primary result code) is ``SQLITE_CORRUPT`` (11) or
+    ``SQLITE_NOTADB`` (26), so 267 (``SQLITE_CORRUPT_VTAB``) is True and 522
+    (low byte 10) is False. False says only that the code is neither of those
+    two; it is never a check that the copy is sound. Pure: on no result does
+    the tool delete, rename, replace or write the copy.
+    """
+    if code is None:
+        return None
+    return (code & 0xFF) in DAMAGED_PRIMARY_CODES
 
 
 def sha256_file(path: Path) -> str:
@@ -6788,14 +6815,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         # The try begins with the open, so every exit through here follows it.
         stage, text = error_after_open(copy, before=before, stage=stage, exc=exc)
+        sqlite_errorcode = find_sqlite_errorcode(exc)
         error: dict[str, object] = {
             "stage": stage,
             "error": text,
-            "sqlite_errorcode": find_sqlite_errorcode(exc),
+            "sqlite_errorcode": sqlite_errorcode,
             "copy_sha256": before,
             "manifest": manifest,
         }
-        print(f"ERROR at stage {stage}: {error['error']}", file=sys.stderr)
+        # §13.3: the classification goes on standard error only, never into
+        # error.json, and the copy is left as it is whatever the result.
+        damaged = copy_damaged(sqlite_errorcode)
+        if damaged is None:
+            classification = "; no SQLite code; copy damage not classified"
+        elif damaged:
+            classification = f"; copy damaged (SQLite code {sqlite_errorcode})"
+        else:
+            classification = (
+                f"; SQLite code {sqlite_errorcode} does not mark the copy damaged;"
+                " that is not a check of the copy"
+            )
+        print(
+            f"ERROR at stage {stage}: {error['error']}{classification}",
+            file=sys.stderr,
+        )
         try:
             written = write_outputs_atomically(final_dir, {"error.json": _dumps(error)})
         except OSError as write_exc:
