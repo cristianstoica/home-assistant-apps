@@ -11,9 +11,12 @@ The pure rules live in :mod:`wxverify.forecast.daily_method`; this module
 reads the copy, replays production's loader as of each decision time, builds
 the cases and the truth, and writes the reports.
 
-Stage one: the rain control for record rows written by V_B or later is not
-built. :func:`control_value` raises :class:`ControlNotBuiltError` for such a
-row, and the run ends in ERROR.
+The rain control reads a map from ``app_version`` to rule
+(:data:`RAIN_RULES`, §13.1), which holds only versions whose released code
+was read. A rain record row from 0.16.0 on whose version the map does not
+hold makes :func:`control_value` raise :class:`VersionUnmappedError`, and the
+run ends in ERROR. Stage one's map holds the legacy rule only, so every row
+from Style B's release (V_B) on stops this way until stage two.
 """
 
 from __future__ import annotations
@@ -37,7 +40,8 @@ from datetime import UTC, date, datetime, timedelta
 from fractions import Fraction
 from pathlib import Path
 from stat import S_ISDIR, S_ISLNK, S_ISREG
-from typing import Literal, cast
+from types import MappingProxyType
+from typing import Literal, assert_never, cast
 from zoneinfo import ZoneInfo
 
 import wxverify
@@ -68,14 +72,93 @@ from wxverify.verification.stats import moving_block_indices, percentile_ci
 
 Variable = Literal["temperature", "precip"]
 Mode = Literal["counts-only", "freeze-prepare", "heldout"]
+RainRule = Literal["legacy"]
 
 # --- Constants (every one is recorded in the freeze note or the rain header) --
 
-V_B: tuple[int, ...] = (0, 16, 9)
-"""Style B's release number: the rain control changes at this app_version."""
+V_B: tuple[int, ...] | None = None
+"""Style B's release number, null until stage two sets it (§13.1).
+
+Stage two sets it from the checks on Style B's release. No code compares a
+row's version with V_B.
+"""
 
 LEGACY_GLYPH_MIN_WET_HOURS = 6
-"""The page's symbol rule before V_B: ``round(wet_hours) >= 6``."""
+"""The page's symbol under the legacy rule: ``round(wet_hours) >= 6``."""
+
+WET_HOURS_FIRST: tuple[int, ...] = (0, 16, 0)
+"""The first ``app_version`` whose record rows store ``wet_hours`` (§7.2).
+
+Rain rows before it are unmatched (``pre_wet_hours``).
+"""
+
+
+@dataclass(frozen=True)
+class RainRuleRead:
+    """One version in the rain control's map, with the read that mapped it (§13.1)."""
+
+    version: tuple[int, ...]
+    rule: RainRule
+    release_commit: str
+    read_to: str
+    other_heads: tuple[str, ...]
+
+
+RAIN_RULE_READS: tuple[RainRuleRead, ...] = (
+    RainRuleRead(
+        version=(0, 16, 2),
+        rule="legacy",
+        release_commit="cde769b2db5ae54cd4cbb05d75c652014a995ef3",
+        read_to="deb19f3216278cc58e7029bdb90b076373ade775",
+        other_heads=(),
+    ),
+    RainRuleRead(
+        version=(0, 16, 3),
+        rule="legacy",
+        release_commit="deb19f3216278cc58e7029bdb90b076373ade775",
+        read_to="b21f342c0b6c3f6127749c462839fa07adbf1079",
+        other_heads=(),
+    ),
+    RainRuleRead(
+        version=(0, 16, 4),
+        rule="legacy",
+        release_commit="b21f342c0b6c3f6127749c462839fa07adbf1079",
+        read_to="12a14bd7496deb83bcf5a8f45e624aac0b18c328",
+        other_heads=(),
+    ),
+    RainRuleRead(
+        version=(0, 16, 5),
+        rule="legacy",
+        release_commit="12a14bd7496deb83bcf5a8f45e624aac0b18c328",
+        read_to="1d191d9c401579cc7379eb87270647369d0f66d0",
+        other_heads=(),
+    ),
+    RainRuleRead(
+        version=(0, 16, 6),
+        rule="legacy",
+        release_commit="1d191d9c401579cc7379eb87270647369d0f66d0",
+        read_to="8cffc73cbf9bf6126c79f2da1b4ed228c0f8e6da",
+        other_heads=(),
+    ),
+    RainRuleRead(
+        version=(0, 16, 7),
+        rule="legacy",
+        release_commit="8cffc73cbf9bf6126c79f2da1b4ed228c0f8e6da",
+        read_to="8cffc73cbf9bf6126c79f2da1b4ed228c0f8e6da",
+        other_heads=(),
+    ),
+)
+"""The rain control's map, one entry per version read, in version order (§13.1).
+
+It holds only versions whose released code was read, each from its release
+commit to ``read_to``; it is not a freeze-note constant, and no temperature
+path reads it.
+"""
+
+RAIN_RULES: Mapping[tuple[int, ...], RainRule] = MappingProxyType(
+    {read.version: read.rule for read in RAIN_RULE_READS}
+)
+"""The rain control's map from ``app_version`` to rule (§13.1)."""
 
 CHOOSING_FIRST = date(2026, 7, 25)
 CHOOSING_LAST = date(2026, 9, 7)
@@ -223,8 +306,12 @@ TWINS: Mapping[str, str] = {"IW-BC": "IW", "TD-K-BC": "TD-K"}
 # --- Exceptions ---------------------------------------------------------------
 
 
-class ControlNotBuiltError(RuntimeError):
-    """Stage one: the rain control for rows from V_B on is not built yet."""
+class VersionUnmappedError(RuntimeError):
+    """A rain record row from 0.16.0 on whose app_version the map does not hold.
+
+    Raised by :func:`control_value` and never caught, so the run ends in ERROR
+    (§13.1).
+    """
 
 
 class RefusedError(Exception):
@@ -435,28 +522,38 @@ def _version_text(version: Sequence[int]) -> str:
 
 
 def control_value(
-    row: RecordRow, *, variable: str, v_b: tuple[int, ...]
+    row: RecordRow,
+    *,
+    variable: Variable,
+    rain_rules: Mapping[tuple[int, ...], RainRule],
 ) -> ControlValue | Unmatched:
     """The control for one record row, or why the row is unmatched (§7.2).
 
     Order: a ``missed`` row is unmatched (``missed``); then ``app_version`` is
-    parsed (``version_unparseable``); then, for rain from ``v_b`` on, stage
-    one stops with :class:`ControlNotBuiltError` (never caught, never counted
-    as unmatched); then the JSON columns are narrowed and a null value is
-    ``control_null``. Temperature reads ``high_c`` and ``low_c``. Rain before
-    ``v_b``: symbol = ``round(wet_hours) >= LEGACY_GLYPH_MIN_WET_HOURS``,
-    amount = ``total_mm``.
+    parsed (``version_unparseable``); then, for rain only, a version below
+    :data:`WET_HOURS_FIRST` is unmatched (``pre_wet_hours``), and a version
+    ``rain_rules`` does not hold raises :class:`VersionUnmappedError` (never
+    caught, never counted as unmatched, §13.1); then the JSON columns are
+    narrowed and a null value is ``control_null``. Temperature never reads
+    ``rain_rules`` and reads ``high_c`` and ``low_c``. Rain under the legacy
+    rule: symbol = ``round(wet_hours) >= LEGACY_GLYPH_MIN_WET_HOURS``, amount =
+    ``total_mm``.
     """
     if row.status != "recorded":
         return Unmatched("missed")
     version = parse_version(row.app_version)
     if version is None:
         return Unmatched("version_unparseable")
-    if variable == "precip" and version >= v_b:
-        raise ControlNotBuiltError(
-            f"rain record row with app_version {row.app_version!r}: the control "
-            f"from V_B ({_version_text(v_b)}) on is not built yet"
-        )
+    rule: RainRule | None = None
+    if variable == "precip":
+        if version < WET_HOURS_FIRST:
+            return Unmatched("pre_wet_hours")
+        rule = rain_rules.get(version)
+        if rule is None:
+            raise VersionUnmappedError(
+                f"rain record row with app_version {row.app_version!r}: no verified "
+                "control rule maps this version, so its release mapping is unresolved"
+            )
     policy = narrow_policy(row.policy)
     if isinstance(policy, Unmatched):
         return policy
@@ -480,11 +577,17 @@ def control_value(
     wet_hours = shown.values["wet_hours"]
     total = shown.values["total_mm"]
     assert wet_hours is not None and total is not None
+    assert rule is not None
+    match rule:
+        case "legacy":
+            symbol = round(wet_hours) >= LEGACY_GLYPH_MIN_WET_HOURS
+        case _:
+            assert_never(rule)
     return ControlValue(
         variable=variable,
         high=None,
         low=None,
-        symbol=round(wet_hours) >= LEGACY_GLYPH_MIN_WET_HOURS,
+        symbol=symbol,
         amount=total,
         wet_hours=wet_hours,
         version=version,
@@ -1110,7 +1213,7 @@ def frozen_constants() -> dict[str, object]:
         "dict[str, object]",
         _jsonable(
             {
-                "V_B": list(V_B),
+                "V_B": None if V_B is None else list(V_B),
                 "LEGACY_GLYPH_MIN_WET_HOURS": LEGACY_GLYPH_MIN_WET_HOURS,
                 "CHOOSING_FIRST": CHOOSING_FIRST,
                 "CHOOSING_LAST": CHOOSING_LAST,
@@ -2473,7 +2576,7 @@ def temperature_lines(
         if row is None:
             out.extend(TempLine(key, q, None, "no_row") for q in TEMPERATURE_QUANTITIES)
             continue
-        control = control_value(row, variable="temperature", v_b=V_B)
+        control = control_value(row, variable="temperature", rain_rules=RAIN_RULES)
         if isinstance(control, Unmatched):
             out.extend(
                 TempLine(key, q, row, control.reason) for q in TEMPERATURE_QUANTITIES
@@ -3481,14 +3584,15 @@ def rain_controls(
 ) -> dict[tuple[date, int], ControlValue | Unmatched]:
     """Every rain row's control, in snapshot and lead order, before any other work.
 
-    This is where stage one stops (§13.1): a row from V_B on raises
-    :class:`ControlNotBuiltError`, which nothing catches, so the run ends in
-    ERROR before any event, selection or score is computed.
+    This is where a rain row of a version the map does not hold stops the run
+    (§13.1): :func:`control_value` raises :class:`VersionUnmappedError`, which
+    nothing catches, so the run ends in ERROR before any event, selection or
+    score is computed. In stage one, this covers every row from V_B on.
     """
     out: dict[tuple[date, int], ControlValue | Unmatched] = {}
     for row in sorted(rows, key=lambda r: (r.snapshot_date, r.lead)):
         out[(row.snapshot_date, row.lead)] = control_value(
-            row, variable="precip", v_b=V_B
+            row, variable="precip", rain_rules=RAIN_RULES
         )
     return out
 
@@ -5060,6 +5164,24 @@ def house_rain_report(
 # --- Rain's settings, as recorded in its test header (§10.2) ----------------------
 
 
+def rain_rules_record(reads: Sequence[RainRuleRead]) -> list[dict[str, object]]:
+    """The version map as rain's header records it (§10.2).
+
+    Version order, and exactly the keys ``version`` (dotted), ``rule``,
+    ``release_commit``, ``read_to`` and ``other_heads`` (sorted).
+    """
+    return [
+        {
+            "version": _version_text(read.version),
+            "rule": read.rule,
+            "release_commit": read.release_commit,
+            "read_to": read.read_to,
+            "other_heads": sorted(read.other_heads),
+        }
+        for read in sorted(reads, key=lambda r: r.version)
+    ]
+
+
 def rain_settings() -> dict[str, object]:
     """The rain settings the pre-deployment test runs with."""
     return {
@@ -5107,7 +5229,9 @@ def rain_settings() -> dict[str, object]:
         "group_fraction": GROUP_FRACTION,
         "w_amount": W_AMOUNT,
         "clim_min_days": CLIM_MIN_DAYS,
-        "v_b": _version_text(V_B),
+        "v_b": None if V_B is None else _version_text(V_B),
+        "wet_hours_first": _version_text(WET_HOURS_FIRST),
+        "rain_rules": rain_rules_record(RAIN_RULE_READS),
         "levels": {
             "chance": LEVEL_CHANCE,
             "symbol": LEVEL_SYMBOL,
@@ -5952,7 +6076,7 @@ def _temperature_freeze_prepare(
         "format": NOTE_FORMAT,
         "draft": True,
         "site": header["site"],
-        "v_b": _version_text(V_B),
+        "v_b": None if V_B is None else _version_text(V_B),
         "first_h_date": DEFAULT_H_FIRST,
         "excluded_h_dates": [],
         "station_set": facts.station_set,
@@ -6180,8 +6304,9 @@ def _run_rain(
     by_key = {(row.snapshot_date, row.lead): row for row in rows}
     cases, _ = select_cases(by_key, first=first, last=last, excluded_h_dates=[])
     case_rows = [row for _, row in cases if row is not None]
-    # Stage one's stop (§13.1): every case row's control first, before any
-    # event, selection or score; a row from V_B on raises here.
+    # The version-map stop (§13.1): every case row's control first, before any
+    # event, selection or score; a row of a version the map does not hold
+    # raises here.
     controls = rain_controls(case_rows)
     store = StationDayStore(
         load_station_rain(
