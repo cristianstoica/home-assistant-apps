@@ -1,5 +1,5 @@
 """§15.4 Batch 1: killer tests for mutants M9, M10, M11, M12, M15, M20,
-M21 and M23.
+M21, M23 and M25.
 
 These are direct tests that ADD to the named §15.3 tests; they do not
 replace them (§15.4:1403, "Each must be killed by the named test"). Each
@@ -24,7 +24,22 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   re-derivation of the leak test's broader byte-identical guarantee.
   still owed: M9 -> "the leak test" itself (§15.3:1313; also kills M28,
   M32 and M34 per the mutant table at §15.4:1435, :1439 and :1441).
-- still owed: M11 -> "Discarded resamples" (§15.3:1322).
+- implemented; reviewed: pending; mutation-verified: pending: M11 -> "Discarded
+  resamples" (§15.3:1322). Covered by
+  ``test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds`` and
+  its paired positive
+  ``test_m11_draw_resamples_paired_positive_every_lead_on_every_date``, both
+  through production ``draw_resamples(30)``, ``TILE_WEIGHTS`` and
+  ``LEAD_WEIGHTS``, in addition to the existing direct-``Bounds``
+  ``test_m11_discard_over_1_percent_fails`` tests above. The header's
+  ``discarded_resamples`` entry (built inside ``_temperature_heldout``) is
+  separately pinned, with the count reported, by
+  ``test_m11_header_reports_discarded_resamples_per_candidate`` in
+  ``tests/test_daily_shadow_heldout_wiring.py``: ``_make_fixture`` scores
+  only lead 0 on a single day, so every other scored lead has no case for
+  any candidate and every resample is discarded (kept 0, discarded
+  10,000) -- a fixture shaped for the header line, not a re-derivation of
+  the one-lead-missing-on-29-of-30-dates population above.
 - implemented, reviewed; mutation-verified: pending: M16 -> plan row
   :1423 "manifest check skipped". Covered in
   ``tests/test_daily_shadow_batch2_mutants.py`` by
@@ -51,8 +66,23 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   M68).
 - still owed: M23 -> "The copy changed during the run" (§15.3:1347),
   cases (a) and (b).
-- still owed: M10 -> the "Levels" pins (§15.3:1323): 974.025 at 0.95,
-  949.05 at 0.90, and PASS with U = -5.975.
+- implemented, reviewed; mutation-verified: pending: M10 (the constant form,
+  :183) -> the two existing killers, reviewed in round 1:
+  ``test_m10_second_killer_levels_unshifted_upper_at_0_975`` and
+  ``test_m10_levels_shifted_tile_is_inconclusive_not_pass`` above, each
+  reading the module's own ``LEVEL_TILE``.
+- implemented; reviewed: pending; mutation-verified: pending: the explicit-level
+  pins added here -- ``test_m10_levels_unshifted_upper_at_0_95``,
+  ``test_m10_levels_unshifted_upper_at_0_90`` and
+  ``test_m10_levels_shifted_at_0_95_is_pass`` -- pin the percentile
+  arithmetic (974.025 at 0.95, 949.05 at 0.90, and PASS with U = -5.975,
+  §15.3:1323) at an explicit level, not ``LEVEL_TILE``; they kill no form
+  of M10 by themselves.
+- implemented; reviewed: pending; mutation-verified: pending: M10 (the
+  call-site form, :6182, ``level=LEVEL_TILE`` inside the heldout tile's
+  ``daily_bounds(...)`` call) -> the ``tile.level == 0.975`` assertion in
+  ``test_m11_header_reports_discarded_resamples_per_candidate`` in
+  ``tests/test_daily_shadow_heldout_wiring.py``.
 - implemented, reviewed; mutation-verified: n/a (no mutant row): "What
   stage one lacks is named" (§15.3:1355). Covered by
   ``test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers``
@@ -67,8 +97,14 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   ``test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window``,
   in both directions (cold-then-warm, and the plan's autumn-to-winter
   case).
-- still owed: M25 -> plan row :1432 "the ``on_time``-only F1 rule
-  removed", killed by "F1 (38 of 40)" (§15.3:1311).
+- implemented; reviewed: pending; mutation-verified: pending: M25 -> plan row
+  :1432 "the ``on_time``-only F1 rule removed", killed by "F1 (38 of 40)"
+  (§15.3:1311). Covered by
+  ``test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1``, its
+  paired positive
+  ``test_m25_paired_positive_38_of_40_with_on_time_at_95_percent_passes``, and
+  ``test_m25_f1_below_95_insufficient_through_data_checks`` at the
+  ``data_checks``/``candidate_outcome`` level.
 - still owed (newly identified coverage, not a §15.3 named test):
   ``main()`` handing ``--heldout``'s arguments to ``run()`` --
   ``mode``, ``h_first`` (``DEFAULT_H_FIRST`` without a note, the note's
@@ -138,17 +174,10 @@ def test_m9_second_killer_arm_a_window_start_is_k_minus_29() -> None:
 
 
 def _levels_bounds(*, shift: float) -> daily_shadow.Bounds:
-    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(1000)]
-    index_lists = [[i] for i in range(1000)]
-    deltas = {("q", dates[i], 0): float(i) - shift for i in range(1000)}
-    return daily_shadow.daily_bounds(
-        deltas,
-        index_lists,
-        dates=dates,
-        quantity_weights={"q": 1.0},
-        lead_weights={0: 1.0},
-        level=daily_shadow.LEVEL_TILE,
-    )
+    """Reads ``daily_shadow.LEVEL_TILE`` at call time (not a module-level
+    default baked in here), so a mutant on the constant still reaches the
+    callers of this helper, via ``_levels_bounds_at``."""
+    return _levels_bounds_at(shift=shift, level=daily_shadow.LEVEL_TILE)
 
 
 def test_m10_second_killer_levels_unshifted_upper_at_0_975() -> None:
@@ -186,6 +215,70 @@ def test_m10_levels_shifted_tile_is_inconclusive_not_pass() -> None:
     )
     assert result.outcome == "INCONCLUSIVE"
     assert result.reasons == ("upper_bound_not_negative",)
+
+
+def _levels_bounds_at(*, shift: float, level: float) -> daily_shadow.Bounds:
+    dates = [date(2020, 1, 1) + timedelta(days=i) for i in range(1000)]
+    index_lists = [[i] for i in range(1000)]
+    deltas = {("q", dates[i], 0): float(i) - shift for i in range(1000)}
+    return daily_shadow.daily_bounds(
+        deltas,
+        index_lists,
+        dates=dates,
+        quantity_weights={"q": 1.0},
+        lead_weights={0: 1.0},
+        level=level,
+    )
+
+
+def test_m10_levels_unshifted_upper_at_0_95() -> None:
+    """Level pin, not an M10 killer by itself (this reads an explicit
+    level, 0.95, not ``LEVEL_TILE``): the same unshifted population's
+    ``upper`` at level 0.95 is 974.025 (±1e-9), from ``percentile_ci``'s
+    linear interpolation (§15.3:1323, ``verification/stats.py:119-129``).
+    """
+    bounds = _levels_bounds_at(shift=0.0, level=0.95)
+    assert bounds.kept == 1000
+    assert bounds.discarded == 0
+    assert bounds.upper is not None
+    assert math.isclose(bounds.upper, 974.025, rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_m10_levels_unshifted_upper_at_0_90() -> None:
+    """Level pin, not an M10 killer by itself (this reads an explicit
+    level, 0.90, not ``LEVEL_TILE``): the same unshifted population's
+    ``upper`` at level 0.90 is 949.05 (±1e-9) (§15.3:1323).
+    """
+    bounds = _levels_bounds_at(shift=0.0, level=0.90)
+    assert bounds.kept == 1000
+    assert bounds.discarded == 0
+    assert bounds.upper is not None
+    assert math.isclose(bounds.upper, 949.05, rel_tol=0.0, abs_tol=1e-9)
+
+
+def test_m10_levels_shifted_at_0_95_is_pass() -> None:
+    """Level pin, not an M10 killer by itself (this reads an explicit
+    level, 0.95, not ``LEVEL_TILE``): shifted by -980.0, the tile's
+    ``upper`` at level 0.95 is -5.975 (±1e-9), which the plan calls out
+    as "at 0.95 it would be PASS" (§15.3:1323) -- ``candidate_outcome``
+    confirms the outcome.
+    """
+    bounds = _levels_bounds_at(shift=980.0, level=0.95)
+    assert bounds.upper is not None
+    assert math.isclose(bounds.upper, -5.975, rel_tol=0.0, abs_tol=1e-9)
+    result = daily_shadow.candidate_outcome(
+        "X",
+        tile=bounds,
+        missing=0,
+        guards=_BASE_GUARDS,
+        twin=None,
+        twin_missing=0,
+        checks=_BASE_CHECKS,
+        flip=False,
+        station_set_changed=None,
+        db_import_changed=False,
+    )
+    assert result.outcome == "PASS"
 
 
 # --- M11: discard rule disabled -----------------------------------------------
@@ -235,6 +328,115 @@ def test_m11_discard_over_1_percent_fails_the_candidate_outcome() -> None:
     assert result.reasons == ("discarded_over_1_percent",)
 
 
+def _one_lead_missing_deltas(
+    *, dates: list[date], present_date: date, missing_lead: int
+) -> dict[tuple[str, date, int], float]:
+    deltas: dict[tuple[str, date, int], float] = {}
+    for quantity in daily_shadow.TEMPERATURE_QUANTITIES:
+        for lead in daily_shadow.SCORED_LEADS:
+            if lead == missing_lead:
+                deltas[(quantity, present_date, lead)] = -1.0
+            else:
+                for day in dates:
+                    deltas[(quantity, day, lead)] = -1.0
+    return deltas
+
+
+def test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds() -> None:
+    """M11, through production ``draw_resamples(30)`` and the production
+    tile weights (``TILE_WEIGHTS``, ``LEAD_WEIGHTS``), as the heldout tile
+    builds it (§15.3:1322, "Discarded resamples") -- one lead present on
+    only one of 30 H dates discards every resample whose drawn indices
+    never land on that one date. The deltas are uniformly -1.0 (not 1.0),
+    so the kept resamples' point estimate is negative and clears
+    ``point_delta_not_negative``: with ``discard_ok`` disabled, the
+    mutant would let ``candidate_outcome`` reach PASS, not FAIL, instead
+    of the correct INSUFFICIENT. ``bounds.discarded``: correct = the
+    independently-computed count of index lists missing that date's
+    index.
+    """
+    dates = [date(2030, 1, 1) + timedelta(days=i) for i in range(30)]
+    j = 5
+    deltas = _one_lead_missing_deltas(
+        dates=dates, present_date=dates[j], missing_lead=3
+    )
+    index_lists = daily_shadow.draw_resamples(30)
+    expected_discarded = sum(1 for indices in index_lists if j not in indices)
+
+    bounds = daily_shadow.daily_bounds(
+        deltas,
+        index_lists,
+        dates=dates,
+        quantity_weights=daily_shadow.TILE_WEIGHTS,
+        lead_weights=daily_shadow.LEAD_WEIGHTS,
+        level=daily_shadow.LEVEL_TILE,
+    )
+
+    assert bounds.discarded == expected_discarded
+    assert bounds.kept + bounds.discarded == len(index_lists)
+    assert 100 * bounds.discarded > 1 * (bounds.kept + bounds.discarded)
+    assert daily_shadow.discard_ok(bounds) is False
+
+    result = daily_shadow.candidate_outcome(
+        "X",
+        tile=bounds,
+        missing=0,
+        guards=_BASE_GUARDS,
+        twin=None,
+        twin_missing=0,
+        checks=_BASE_CHECKS,
+        flip=False,
+        station_set_changed=None,
+        db_import_changed=False,
+    )
+    assert result.outcome == "INSUFFICIENT"
+    assert result.reasons == ("discarded_over_1_percent",)
+
+
+def test_m11_draw_resamples_paired_positive_every_lead_on_every_date() -> None:
+    """Paired positive: every lead present on all 30 dates -> no resample
+    can be discarded, so ``discard_ok`` passes and the outcome reaches
+    PASS cleanly, with no reasons at all -- the same -1.0 deltas as the
+    main test above, so the two share a direction and only the discard
+    behavior differs.
+    """
+    dates = [date(2030, 1, 1) + timedelta(days=i) for i in range(30)]
+    deltas = {
+        (quantity, day, lead): -1.0
+        for quantity in daily_shadow.TEMPERATURE_QUANTITIES
+        for lead in daily_shadow.SCORED_LEADS
+        for day in dates
+    }
+    index_lists = daily_shadow.draw_resamples(30)
+
+    bounds = daily_shadow.daily_bounds(
+        deltas,
+        index_lists,
+        dates=dates,
+        quantity_weights=daily_shadow.TILE_WEIGHTS,
+        lead_weights=daily_shadow.LEAD_WEIGHTS,
+        level=daily_shadow.LEVEL_TILE,
+    )
+
+    assert bounds.discarded == 0
+    assert daily_shadow.discard_ok(bounds) is True
+
+    result = daily_shadow.candidate_outcome(
+        "X",
+        tile=bounds,
+        missing=0,
+        guards=_BASE_GUARDS,
+        twin=None,
+        twin_missing=0,
+        checks=_BASE_CHECKS,
+        flip=False,
+        station_set_changed=None,
+        db_import_changed=False,
+    )
+    assert result.outcome == "PASS"
+    assert result.reasons == ()
+
+
 # --- M12: F1 threshold 0.90 instead of 0.95 (direct F1Tally, not via the
 #          freeze note -- M12 also feeds a constant comparison inside
 #          ``check_note_matches_package`` that is part of "Freeze
@@ -261,6 +463,109 @@ def test_m12_f1_at_90_percent_fails_the_95_percent_rule() -> None:
 def test_m12_paired_positive_f1_at_95_percent_passes() -> None:
     """Paired positive: 19/20 matched (95.0%, the boundary) passes."""
     assert _tally_at(matched=19, rows=20).passes() is True
+
+
+# --- M25: the on_time-only F1 rule removed ------------------------------------
+
+
+def _record_row(*, write_path: str) -> daily_shadow.RecordRow:
+    return daily_shadow.RecordRow(
+        snapshot_date=date(2035, 6, 10),
+        target_date=date(2035, 6, 10),
+        lead=0,
+        snapshot_utc="2035-06-10T07:00:00Z",
+        status="recorded",
+        write_path=write_path,
+        app_version="0.16.7",
+        methodology_version=1,
+        tz_generation_id=1,
+        policy=None,
+        candidates=None,
+        daily_quantities=None,
+    )
+
+
+def test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1() -> None:
+    """M25: the ``on_time``-only F1 rule removed, killed by "F1 (38 of
+    40)" (§15.3:1311) -- 20 ``on_time`` rows with 18 matching plus 20
+    ``late_reconstruction`` rows all matching, built through production
+    ``F1Tally.add``: 38 of 40 overall (95%), but the ``on_time`` rows
+    alone are at 90%. At ``F1Tally.passes()``: correct = False (the
+    on_time-only rule applies), mutant (the rule removed) = True (95%
+    overall clears the single rule).
+    """
+    tally = daily_shadow.F1Tally()
+    for i in range(20):
+        tally.add(_record_row(write_path="on_time"), ok=i < 18)
+    for _ in range(20):
+        tally.add(_record_row(write_path="late_reconstruction"), ok=True)
+
+    assert tally.rows == 40
+    assert tally.matched == 38
+    assert tally.on_time_rows == 20
+    assert tally.on_time_matched == 18
+
+    assert tally.passes() is False
+
+
+def test_m25_paired_positive_38_of_40_with_on_time_at_95_percent_passes() -> None:
+    """Paired positive, same 38-of-40 overall population (§15.3:1311): 20
+    ``on_time`` rows with 19 matching plus 20 ``late_reconstruction`` rows
+    with 19 matching -- 38 of 40 overall (95%) and the on_time rows alone
+    also at 95% -> ``passes()`` is True.
+    """
+    tally = daily_shadow.F1Tally()
+    for i in range(20):
+        tally.add(_record_row(write_path="on_time"), ok=i < 19)
+    for i in range(20):
+        tally.add(_record_row(write_path="late_reconstruction"), ok=i < 19)
+
+    assert tally.rows == 40
+    assert tally.matched == 38
+    assert tally.on_time_rows == 20
+    assert tally.on_time_matched == 19
+
+    assert tally.passes() is True
+
+
+def test_m25_f1_below_95_insufficient_through_data_checks() -> None:
+    """M25 at the outcome level, through production ``data_checks``. No
+    scored ``TempLine`` rows are fabricated: ``data_checks`` reads only
+    ``f1.as_json()`` and ``f1.passes()`` off the tally for the ``"f1"``
+    and ``"f1_pass"`` entries, so ``[]`` isolates the F1 rule (not a
+    production-reachable combination) -- the empty ``lines`` also drives
+    ``minimums_met`` to False, which this test pins exactly rather than
+    ignoring. At ``candidate_outcome``'s result: correct = ``"INSUFFICIENT"``
+    with both ``"f1_below_95"`` (the on_time rows at 90%, below
+    ``F1_MIN_PERCENT``) and ``"minimums_not_met"`` among the reasons,
+    mutant (the ``on_time``-only check removed) = this tally's overall
+    rate (95%) would not raise ``"f1_below_95"`` at all.
+    """
+    tally = daily_shadow.F1Tally()
+    for i in range(20):
+        tally.add(_record_row(write_path="on_time"), ok=i < 18)
+    for _ in range(20):
+        tally.add(_record_row(write_path="late_reconstruction"), ok=True)
+    assert tally.passes() is False
+
+    checks = daily_shadow.data_checks([], f1=tally)
+    assert checks["f1_pass"] is False
+    assert checks["minimums_met"] is False
+
+    result = daily_shadow.candidate_outcome(
+        "X",
+        tile=_bounds(kept=100, discarded=0),
+        missing=0,
+        guards=_BASE_GUARDS,
+        twin=None,
+        twin_missing=0,
+        checks=checks,
+        flip=False,
+        station_set_changed=None,
+        db_import_changed=False,
+    )
+    assert result.outcome == "INSUFFICIENT"
+    assert result.reasons == ("f1_below_95", "minimums_not_met")
 
 
 # --- M15: files written straight into the final run directory ---------------

@@ -363,6 +363,67 @@ def test_a_corrected_candidates_own_composer_is_caught_by_its_own_count(
     assert by_name["IW-BC"]["twin_missing"] > 0
 
 
+def test_m11_header_reports_discarded_resamples_per_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M11's header line: the ``discarded_resamples`` entry built inside
+    ``_temperature_heldout`` (daily_shadow.py:6270-6290) from each
+    candidate's own ``o.tile`` -- not a full-run read of the final
+    ``outcome``, which only needs a fixture where the discarded count is
+    above zero. ``_make_fixture`` scores only lead 0 on a single day, so
+    every other scored lead (1-5) has no case for any candidate; every
+    (quantity, lead) group the tile weights iterate over therefore has at
+    least one empty lead-group, and every one of the 10,000 resamples is
+    discarded for every candidate (``kept`` 0, ``discarded`` 10,000,
+    ``discard_ok`` False).
+
+    This also complements, not replaces,
+    ``test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds``
+    in ``test_daily_shadow_batch1_mutants.py``: that test pins one lead
+    missing on 1 of 30 H dates (a partial-discard population) directly
+    against ``draw_resamples``/``daily_bounds``; this one drives the real
+    pipeline end to end and checks the header line that the other test's
+    direct call never reaches.
+
+    F-B: ``call["tile"].level`` pins the call-site ``level=LEVEL_TILE``
+    argument (daily_shadow.py:6182) as the literal ``0.975``, not the
+    module constant -- a mutant that changed the call site's level
+    argument, rather than the ``LEVEL_TILE`` constant itself, would flip
+    this literal. The twin-bearing candidates (IW-BC, TD-K-BC, per
+    ``daily_shadow.TWINS``) get the same pin on their own recorded twin
+    bounds, which are never ``None`` in this fixture because their twin
+    name is always looked up and tiled.
+    """
+    conn, site = _make_fixture()
+    calls = _record_outcome_calls(monkeypatch)
+    files = _run_heldout(conn, site)
+    reported = json.loads(files["header.json"])["discarded_resamples"]
+    by_name = {call["name"]: call for call in calls}
+
+    # Non-vacuity: the recorder actually captured a call per candidate, and
+    # the header actually reports one, so neither side can pass empty.
+    assert by_name
+    assert set(reported) == set(by_name) == set(daily_shadow.TEMPERATURE_CANDIDATES)
+
+    for name, call in by_name.items():
+        tile = call["tile"]
+        assert tile.level == 0.975
+        assert tile.kept == 0
+        assert tile.discarded == 10_000  # literal, not RESAMPLES
+        assert tile.kept + tile.discarded == 10_000
+        assert reported[name] == {
+            "kept": tile.kept,
+            "discarded": tile.discarded,
+            "discard_ok": False,
+        }
+        twin = call["twin"]
+        if name in daily_shadow.TWINS:
+            assert twin is not None
+            assert twin.level == 0.975
+        else:
+            assert twin is None
+
+
 def _warm_spell_by_target(files: dict[str, bytes]) -> dict[date, bool | None]:
     lines = [json.loads(line) for line in files["lines.jsonl"].decode().splitlines()]
     return {
