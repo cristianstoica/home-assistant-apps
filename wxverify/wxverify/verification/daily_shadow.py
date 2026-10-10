@@ -17,6 +17,10 @@ was read. A rain record row from 0.16.0 on whose version the map does not
 hold makes :func:`control_value` raise :class:`VersionUnmappedError`, and the
 run ends in ERROR. Stage one's map holds the legacy rule only, so every row
 from Style B's release (V_B) on stops this way until stage two.
+
+A rain run's first step is the span check (§13.3): a copy that holds any
+``station_precip_spans`` row raises :class:`SpanRowsPresentError` before any
+other read of the copy, and the run ends in ERROR.
 """
 
 from __future__ import annotations
@@ -311,6 +315,15 @@ class VersionUnmappedError(RuntimeError):
 
     Raised by :func:`control_value` and never caught, so the run ends in ERROR
     (§13.1).
+    """
+
+
+class SpanRowsPresentError(RuntimeError):
+    """A rain run's copy holds ``station_precip_spans`` rows.
+
+    Raised by :func:`main`'s span check. It propagates to the run-level
+    error handler in :func:`main`, so the run ends in ERROR at stage
+    ``span_check`` (§13.3).
     """
 
 
@@ -6679,6 +6692,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         conn = open_copy_readonly(copy)
         stage = "run"
         try:
+            if variable == "precip":
+                # The span check (§13.3): rain's first step, before any other
+                # read of the copy. The whole table is counted, with no site,
+                # station, date or fetched_at filter: the rule is about the copy.
+                stage = "span_check"
+                named = conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE lower(name) = 'station_precip_spans'"
+                ).fetchone()
+                if int(named[0]) > 0:
+                    spans = int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM station_precip_spans"
+                        ).fetchone()[0]
+                    )
+                    if spans > 0:
+                        raise SpanRowsPresentError(
+                            f"the copy holds {spans} station_precip_spans rows; "
+                            "rain reads no copy that holds span rows"
+                        )
+                stage = "run"
             site = load_site(conn, site_id=site_id)
             last_complete = latest_knowable_target(site.timezone, copied_at)
             header_base = {
