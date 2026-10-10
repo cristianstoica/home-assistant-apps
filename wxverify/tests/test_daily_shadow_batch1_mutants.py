@@ -14,34 +14,36 @@ needs multiple distinct cases (M22, in
 
 Named §15.3 test coverage and remaining work:
 
-- implemented: M9's lighter direct kill test. This file pins the same
-  change ("Arm A training window ends at K + 1") directly against
-  ``temperature_window``, the one function the mutant changes -- a
-  lighter kill at the same site, not a re-derivation of the leak test's
-  broader byte-identical guarantee. still owed: M9 -> "the leak test"
-  itself (§15.3:1313; also kills M28, M32 and M34 per the mutant table
-  at §15.4:1435, :1439 and :1441).
+Each entry gives three separate statuses: implemented, reviewed, and
+mutation-verified (checked at checkpoint C, §15.4:1403).
+
+- implemented, reviewed; mutation-verified: pending: M9's lighter direct
+  kill test. This file pins the same change ("Arm A training window ends
+  at K + 1") directly against ``temperature_window``, the one function
+  the mutant changes -- a lighter kill at the same site, not a
+  re-derivation of the leak test's broader byte-identical guarantee.
+  still owed: M9 -> "the leak test" itself (§15.3:1313; also kills M28,
+  M32 and M34 per the mutant table at §15.4:1435, :1439 and :1441).
 - still owed: M11 -> "Discarded resamples" (§15.3:1322).
-- implemented: M16 -> plan row :1423 "manifest check skipped". Covered
-  in ``tests/test_daily_shadow_batch2_mutants.py`` by
+- implemented, reviewed; mutation-verified: pending: M16 -> plan row
+  :1423 "manifest check skipped". Covered in
+  ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_m16a_check_note_matches_package_python_version_differs``,
   ``test_m16a_check_note_matches_package_files_differ``, their paired
-  positive, and the ``test_m16b_*`` tests. Kill verification at
-  checkpoint C is still pending.
-- implemented: the §15.3:1336 argparse case (``--heldout`` without
-  ``--freeze-note`` or without ``--expect-sha256`` exits with an
-  argparse error) is covered in
-  ``tests/test_daily_shadow_batch2_mutants.py`` by
+  positive, and the ``test_m16b_*`` tests.
+- implemented, reviewed; mutation-verified: n/a (no mutant row): the
+  §15.3:1336 argparse case (``--heldout`` without ``--freeze-note`` or
+  without ``--expect-sha256`` exits with an argparse error) is covered
+  in ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_freeze_enforcement_heldout_without_freeze_note_is_an_argparse_error``
   and
   ``test_freeze_enforcement_heldout_without_expect_sha256_is_an_argparse_error``.
-  No mutant row targets this check, so no kill claim is made for it.
-- implemented: M24 -> plan row :1431 "``--expect-sha256`` comparison
-  skipped" (not M16, whose row is "manifest check skipped"), the
-  hex-digit sentence. Covered in
+- implemented, reviewed; mutation-verified: pending: M24 -> plan row
+  :1431 "``--expect-sha256`` comparison skipped" (not M16, whose row is
+  "manifest check skipped"), the hex-digit sentence. Covered in
   ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_m24_expect_sha256_off_by_one_hex_digit_is_refused`` and its
-  paired positive. Kill verification at checkpoint C is still pending.
+  paired positive.
 - still owed: atomic outputs (§15.3:1335), last sentence: "A
   counts-only run and then a ``--freeze-prepare`` run on one copy leave
   two separate run directories."
@@ -51,6 +53,27 @@ Named §15.3 test coverage and remaining work:
   cases (a) and (b).
 - still owed: M10 -> the "Levels" pins (§15.3:1323): 974.025 at 0.95,
   949.05 at 0.90, and PASS with U = -5.975.
+- implemented, reviewed; mutation-verified: n/a (no mutant row): "What
+  stage one lacks is named" (§15.3:1355). Covered by
+  ``test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers``
+  and ``test_rain_freeze_prepare_not_built_names_the_missing_a_numbers``
+  in ``tests/test_daily_shadow_not_built.py``, and
+  ``test_heldout_not_built_names_a11_and_d2_option_c`` in
+  ``tests/test_daily_shadow_heldout_wiring.py``.
+- implemented, reviewed; mutation-verified: pending: M22 -> plan row
+  :1429 "warm-spell threshold frozen on the first window" ("Rolling
+  warm-spell threshold", §15.3:1353). Covered in
+  ``tests/test_daily_shadow_heldout_wiring.py`` by
+  ``test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window``,
+  in both directions (cold-then-warm, and the plan's autumn-to-winter
+  case).
+- still owed: M25 -> plan row :1432 "the ``on_time``-only F1 rule
+  removed", killed by "F1 (38 of 40)" (§15.3:1311).
+- still owed (newly identified coverage, not a §15.3 named test):
+  ``main()`` handing ``--heldout``'s arguments to ``run()`` --
+  ``mode``, ``h_first`` (``DEFAULT_H_FIRST`` without a note, the note's
+  ``first_h_date`` with one), the note's ``excluded_h_dates`` and
+  ``last_complete``.
 """
 
 from __future__ import annotations

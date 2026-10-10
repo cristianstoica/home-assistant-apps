@@ -1,11 +1,17 @@
-"""§15.3 "What stage one lacks is named" (plan :1351; F2).
+"""§15.3 "What stage one lacks is named" (plan :1355).
 
 Stage one only: temperature's ``--freeze-prepare`` header names, in
-``not_built``, at least A3, A7, A12, F2 and A11's temporary-file size; rain's
-``--freeze-prepare`` header names at least A6 at the offered values of
-w_amount and w_r, A7, A16, A17, F2 and A11's temporary-file size, each by its
-A-number or ``F2``. Stage two replaces this test with one that runs the same
-modes and finds no ``not_built`` key at all.
+``not_built``, at least A3, A7, A12, F2, A11's temporary-file size and D2
+option C, and holds a ``not_built`` naming D2 option C in
+``tradeoffs.tables["low=C"]``; rain's ``--freeze-prepare`` header names at
+least A6 at the offered values of w_amount and w_r, A7, A16, A17, F2 and
+A11's temporary-file size, each by its A-number or ``F2``. Temperature's
+``--heldout`` half -- its header's A11/D2-option-C ``not_built`` entries and
+the ``not_built`` in ``sensitivities["low=C"]`` -- is pinned separately, in
+``test_daily_shadow_heldout_wiring.py``'s
+``test_heldout_not_built_names_a11_and_d2_option_c``. Stage two replaces
+this test with one that runs the same modes and finds no ``not_built`` key
+at all.
 """
 
 from __future__ import annotations
@@ -176,11 +182,13 @@ def _header_from_run(
 def test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Temperature's ``not_built`` names A3, A7, A12, F2 and A11's file size.
+    """Temperature's ``not_built`` names A3, A7, A12, F2, A11's file size and
+    D2 option C, and names D2 option C again in ``tradeoffs.tables["low=C"]``.
 
     Each assertion fails if that entry is dropped from ``not_built`` --
-    there is no way for this test to pass with any one of A3, A7, A12, F2 or
-    A11's temporary-file-size entry missing from the list.
+    there is no way for this test to pass with any one of A3, A7, A12, F2,
+    A11's temporary-file-size entry or D2 option C missing from the
+    top-level list, or with D2 option C missing from the tradeoffs table.
     """
     copy = _make_copy(tmp_path, name="temperature")
     out = tmp_path / "out"
@@ -195,9 +203,21 @@ def test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers(
     assert "A7" in joined
     assert "A12" in joined
     assert "F2" in joined
+    assert "D2 option C" in joined
     a11_entries = [entry for entry in not_built if "A11" in str(entry)]
     assert a11_entries, not_built
     assert "SQLITE_TMPDIR" in str(a11_entries[0])
+
+    tradeoffs_raw = header["tradeoffs"]
+    assert isinstance(tradeoffs_raw, dict)
+    tradeoffs = cast("dict[str, object]", tradeoffs_raw)
+    tables_raw = tradeoffs["tables"]
+    assert isinstance(tables_raw, dict)
+    tables = cast("dict[str, object]", tables_raw)
+    low_c_raw = tables["low=C"]
+    assert isinstance(low_c_raw, dict)
+    low_c = cast("dict[str, object]", low_c_raw)
+    assert "D2 option C" in str(low_c["not_built"])
 
 
 def test_rain_freeze_prepare_not_built_names_the_missing_a_numbers(

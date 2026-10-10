@@ -11,6 +11,10 @@ Also covers §15.4's M22 ("warm-spell threshold frozen on the first
 window"): a two-case, DB-backed fixture with disjoint training windows,
 needed because the bug this mutant posits is only visible across more
 than one case sharing a run.
+
+Also covers the ``--heldout`` half of §15.3's "What stage one lacks is
+named" (plan :1355) -- the ``--freeze-prepare`` half lives in
+``test_daily_shadow_not_built.py``.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import dataclasses
 import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -157,21 +161,34 @@ def _make_fixture() -> tuple[sqlite3.Connection, daily_shadow.Site]:
 
 _DAY_B = _DAY + timedelta(days=180)
 
+# Plan :1353's own case: a September target day, then a December target day
+# in the same autumn-to-winter run. 2035-09-15 to 2035-12-15 is 91 days
+# apart (15 remaining days of September + 31 of October + 30 of November +
+# 15 of December = 91), far more than the 35-day seed margin each side
+# needs: September's seed window (its 34 days of lookback) spans 2035-08-12
+# to 2035-09-15; December's spans 2035-11-11 to 2035-12-15. The gap between
+# those two spans is 2035-12-15 minus 34 days (2035-11-11) minus 2035-09-15
+# = 57 days, so the two seed windows -- and therefore the real 30-day
+# training windows nested inside them -- cannot overlap.
+_DAY_SEPTEMBER = date(2035, 9, 15)
+_DAY_DECEMBER = date(2035, 12, 15)
 
-def _make_two_window_fixture() -> tuple[sqlite3.Connection, daily_shadow.Site]:
-    """Two lead-0 cases 180 days apart, each with its own disjoint 35-day
-    seed window of ``temperature_high`` truth, built for §15.4's M22
-    ("warm-spell threshold frozen on the first window").
 
-    Day A's window (``_DAY`` and the 34 days before it) is seeded at a
-    uniform 5.0C; day B's window (``_DAY_B`` and the 34 days before it,
-    which never overlaps day A's) is seeded at a uniform 30.0C. Both
-    days' own target truth is 20.0C. A correct per-case
+def _make_two_window_fixture(
+    *, day_a: date, day_b: date, seed_a: float, seed_b: float
+) -> tuple[sqlite3.Connection, daily_shadow.Site]:
+    """Two lead-0 cases, each with its own disjoint 35-day seed window of
+    ``temperature_high`` truth, built for §15.4's M22 ("warm-spell
+    threshold frozen on the first window").
+
+    Day A's window (``day_a`` and the 34 days before it) is seeded at a
+    uniform ``seed_a``; day B's window (``day_b`` and the 34 days before
+    it, which must never overlap day A's) is seeded at a uniform
+    ``seed_b``. Both days' own target truth is 20.0C. A correct per-case
     ``warm_spell_threshold`` computation gives day A's threshold near
-    5.0C (so 20.0 is a warm spell) and day B's threshold near 30.0C (so
-    20.0 is not) -- if the threshold were frozen on the first window
-    computed, day B would wrongly inherit day A's ~5.0C threshold and
-    also come out warm.
+    ``seed_a`` and day B's threshold near ``seed_b`` -- if the threshold
+    were frozen on the first window computed, day B would wrongly
+    inherit day A's threshold instead of its own.
 
     The 35-day seed (one more than ``TEMP_WINDOW_DAYS`` = 30) is a
     deliberate margin over the training window's own day count, to
@@ -189,7 +206,7 @@ def _make_two_window_fixture() -> tuple[sqlite3.Connection, daily_shadow.Site]:
     feed_a = asof_make_real_feed(conn, "model-a")
     site = daily_shadow.load_site(conn, site_id=site_id)
 
-    for target_day, seed_value in ((_DAY, 5.0), (_DAY_B, 30.0)):
+    for target_day, seed_value in ((day_a, seed_a), (day_b, seed_b)):
         day_before = target_day - timedelta(days=1)
         issued = f"{day_before.isoformat()}T06:00:00Z"
         fetched = f"{day_before.isoformat()}T06:05:00Z"
@@ -355,25 +372,22 @@ def _warm_spell_by_target(files: dict[str, bytes]) -> dict[date, bool | None]:
     }
 
 
-def test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window() -> None:
-    """M22: warm-spell threshold frozen on the first window -> at each
-    day's own ``warm_spell`` flag in ``lines.jsonl``: correct = day A
-    True, day B False (each case's own ~5C/~30C window gives its own
-    threshold), mutant = day A True, day B ALSO True (day B wrongly
-    inherits day A's ~5C threshold from "the first window").
+def test_heldout_not_built_names_a11_and_d2_option_c() -> None:
+    """§15.3 "What stage one lacks is named" (plan :1355), the
+    ``--heldout`` half -- the ``--freeze-prepare`` half is pinned in
+    ``test_daily_shadow_not_built.py``.
+
+    Stage one only: temperature's ``--heldout`` header names A11's
+    temporary-file size and D2 option C in its top-level ``not_built``,
+    and names D2 option C again in ``sensitivities["low=C"]``. Each
+    assertion fails if that entry is dropped -- there is no way for this
+    test to pass with A11's temporary-file-size entry or D2 option C
+    missing from either place.
     """
-    conn, site = _make_two_window_fixture()
-    note = daily_shadow.FreezeNote(
-        site_id=site.site_id,
-        first_h_date=_DAY,
-        excluded_h_dates=(),
-        station_set=(),
-        db_import=None,
-        manifest={},
-        constants={},
-        house_station="SYN-HOUSE",
-        td_k=daily_shadow.TD_K_DEFAULT,
+    conn, site = _make_two_window_fixture(
+        day_a=_DAY, day_b=_DAY_B, seed_a=5.0, seed_b=30.0
     )
+    note = _note(site)
     files = daily_shadow.run(
         conn,
         site=site,
@@ -391,6 +405,95 @@ def test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window() -> None:
         failed_dirs=(),
         header_base={"copy": {}, "manifest": {}, "commit_sha": "a" * 40},
     )
+    header_raw = json.loads(files["header.json"])
+    assert isinstance(header_raw, dict)
+    header = cast("dict[str, object]", header_raw)
+
+    not_built_raw = header["not_built"]
+    assert isinstance(not_built_raw, list)
+    not_built = cast("list[object]", not_built_raw)
+    joined = "|".join(str(entry) for entry in not_built)
+    a11_entries = [entry for entry in not_built if "A11" in str(entry)]
+    assert a11_entries, not_built
+    assert "SQLITE_TMPDIR" in str(a11_entries[0])
+    assert "D2 option C" in joined
+
+    sensitivities_raw = header["sensitivities"]
+    assert isinstance(sensitivities_raw, dict)
+    sensitivities = cast("dict[str, object]", sensitivities_raw)
+    low_c_raw = sensitivities["low=C"]
+    assert isinstance(low_c_raw, dict)
+    low_c = cast("dict[str, object]", low_c_raw)
+    assert "D2 option C" in str(low_c["not_built"])
+
+
+@pytest.mark.parametrize(
+    ("day_a", "day_b", "seed_a", "seed_b", "warm_a", "warm_b"),
+    [
+        pytest.param(_DAY, _DAY_B, 5.0, 30.0, True, False, id="cold-then-warm"),
+        pytest.param(
+            _DAY_SEPTEMBER,
+            _DAY_DECEMBER,
+            30.0,
+            5.0,
+            False,
+            True,
+            id="plan-1353-autumn-to-winter",
+        ),
+    ],
+)
+def test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window(
+    day_a: date, day_b: date, seed_a: float, seed_b: float, warm_a: bool, warm_b: bool
+) -> None:
+    """M22: warm-spell threshold frozen on the first window -> at each
+    day's own ``warm_spell`` flag in ``lines.jsonl``: correct = day A
+    ``warm_a``, day B ``warm_b`` (each case's own window gives its own
+    threshold); mutant = day B wrongly inherits day A's threshold instead
+    of computing its own, from "the first window".
+
+    The ``cold-then-warm`` case is the original direction (cold ``_DAY``,
+    then warm ``_DAY_B``), unchanged in meaning. The
+    ``plan-1353-autumn-to-winter`` case is plan :1353's own case: an
+    autumn-to-winter run. Here day A (September) has a warm
+    reference window and day B (December) a cold one, and
+    both targets are 20.0C. The rolling threshold classifies
+    September's target as not warm (False) and December's as
+    warm (True). With September's threshold reused in
+    December, the December target is wrongly classified as not
+    warm. This pins the plan's case; mutant-kill verification
+    happens later, at checkpoint C.
+    """
+    conn, site = _make_two_window_fixture(
+        day_a=day_a, day_b=day_b, seed_a=seed_a, seed_b=seed_b
+    )
+    note = daily_shadow.FreezeNote(
+        site_id=site.site_id,
+        first_h_date=day_a,
+        excluded_h_dates=(),
+        station_set=(),
+        db_import=None,
+        manifest={},
+        constants={},
+        house_station="SYN-HOUSE",
+        td_k=daily_shadow.TD_K_DEFAULT,
+    )
+    files = daily_shadow.run(
+        conn,
+        site=site,
+        variable="temperature",
+        mode="heldout",
+        first=day_a,
+        last=day_b,
+        h_first=day_a,
+        last_complete=day_b,
+        excluded_h_dates=(),
+        t2_last=None,
+        note=note,
+        house_station=note.house_station,
+        incumbent_from_record=False,
+        failed_dirs=(),
+        header_base={"copy": {}, "manifest": {}, "commit_sha": "a" * 40},
+    )
     by_target = _warm_spell_by_target(files)
-    assert by_target[_DAY] is True
-    assert by_target[_DAY_B] is False
+    assert by_target[day_a] is warm_a
+    assert by_target[day_b] is warm_b
