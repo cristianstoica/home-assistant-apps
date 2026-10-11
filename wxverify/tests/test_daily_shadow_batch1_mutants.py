@@ -233,11 +233,16 @@ mutation-verified (checked at checkpoint C, §15.4:1448).
     ``test_published_comparison_decides_nothing``; M161 (Run 3c), shown
     by ``test_run3c_stale_and_mismatched_gives_threshold_mismatch_first``
     -- all in ``tests/test_daily_shadow_published_comparison.py``.
-- still owed (newly identified coverage, not a §15.3 named test):
-  ``main()`` handing ``--heldout``'s arguments to ``run()`` --
-  ``mode``, ``h_first`` (``DEFAULT_H_FIRST`` without a note, the note's
-  ``first_h_date`` with one), the note's ``excluded_h_dates`` and
-  ``last_complete``.
+- implemented, reviewed; mutation-verified: n/a (no mutant row):
+  ``main()`` handing the note's fields to ``run()`` under ``--heldout``
+  -- ``mode``, ``h_first`` (the note's ``first_h_date``), the note's
+  ``excluded_h_dates``, the note itself and ``last_complete`` -- and,
+  as the paired control, ``--freeze-prepare`` with no note
+  (``DEFAULT_H_FIRST``, no excluded dates, ``note`` None) (plan :805,
+  :1076, :1079; not a §15.3 named test).
+  Covered by ``test_heldout_note_overrides_h_first_and_excluded_dates``
+  and ``test_freeze_prepare_with_no_note_uses_defaults`` in
+  ``tests/test_daily_shadow_heldout_handoff.py``.
 """
 
 from __future__ import annotations

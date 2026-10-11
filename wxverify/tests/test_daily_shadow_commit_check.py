@@ -226,8 +226,15 @@ Covered here (plan line numbers in brackets):
   ``test_daily_shadow_span_check.py``, ``test_daily_shadow_prepare_open.py``,
   ``test_daily_shadow_batch2_mutants.py``, ``test_daily_shadow_rain_rules.py``,
   ``test_daily_shadow_published_comparison.py``,
-  ``test_daily_shadow_output_folder.py`` and
-  ``test_daily_shadow_amount_known_days.py``.
+  ``test_daily_shadow_output_folder.py``,
+  ``test_daily_shadow_amount_known_days.py``,
+  ``test_daily_shadow_date_bounds.py``,
+  ``test_daily_shadow_incumbent_from_record.py``,
+  ``test_daily_shadow_one_rain_trigger.py``,
+  ``test_daily_shadow_outage_recovery.py`` and
+  ``test_daily_shadow_heldout_handoff.py``.
+  ``test_daily_shadow_house_station.py``'s identical stub is nested
+  inside its ``_run_main`` helper rather than defined at module level.
   ``test_daily_shadow_batch1_mutants.py`` drives ``main()`` only through
   ``test_daily_shadow_output_folder._run_main``, so it is covered by
   that helper's stub. No non-conforming case found.
