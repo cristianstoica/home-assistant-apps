@@ -222,6 +222,7 @@ Covered here (plan line numbers in brackets):
   up on the ``daily_shadow`` module at call time. Confirmed conforming,
   one module-level helper each: ``test_daily_shadow_leak_rain.py``,
   ``test_daily_shadow_not_built.py``, ``test_daily_shadow_copy_changed.py``,
+  ``test_daily_shadow_code_changed.py``,
   ``test_daily_shadow_span_check.py``, ``test_daily_shadow_prepare_open.py``,
   ``test_daily_shadow_batch2_mutants.py``, ``test_daily_shadow_rain_rules.py``,
   ``test_daily_shadow_published_comparison.py``,
@@ -1225,7 +1226,8 @@ def test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out(
     once, exits 2, prints a single ``refused:`` line on standard error
     carrying the recorder's own message, never calls
     ``open_copy_readonly``, and leaves nothing under ``--out`` -- the
-    raise happens before ``out`` is ever touched.
+    raise happens before ``out`` is ever touched. It also prints no
+    result line [plan :1393].
     """
     copy, site_id = _make_valid_copy(tmp_path)
     out = tmp_path / "out"
@@ -1248,7 +1250,7 @@ def test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out(
 
     monkeypatch.setattr(daily_shadow, "check_commit", raising_check_commit)
     monkeypatch.setattr(daily_shadow, "open_copy_readonly", open_recorder)
-    exit_code, _out_text, err_text = _run_main_counts_only(
+    exit_code, out_text, err_text = _run_main_counts_only(
         copy=copy,
         out=out,
         commit_sha=_WIRING_COMMIT_SHA,
@@ -1264,6 +1266,9 @@ def test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out(
     assert check_commit_calls == 1
     assert open_calls == 0
     assert not out.exists()
+    assert not any(
+        line.startswith(daily_shadow.RESULT_PREFIX) for line in out_text.splitlines()
+    )
 
 
 def test_wiring_check_commit_returns_manifest_called_once_before_open(
