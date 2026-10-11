@@ -4,10 +4,14 @@ M21, M23 and M25.
 Most tests here are direct tests that add to the named §15.3 tests
 elsewhere. The M10 Levels, M11 Discarded-resamples and M25 F1 tests in
 this file are the named §15.3 tests themselves (see the ledger below).
+M21 and M21b are two distinct mutants at two code sites (see the ledger's
+M21/M68 and M21b bullets); this file covers M21b's
+``daily_shadow._observed`` site directly, via
+``test_m21_an_unknown_days_amount_is_not_scored`` below.
 Each mutant's own pure function or filesystem-level site is called directly,
 rather than driven through the full pipeline: for M12, directly against
 ``F1Tally.passes()`` at the 90%/95% boundary §15.3's own "F1." test
-(:1311) describes, and likewise for the others below. The site under
+(:1345) describes, and likewise for the others below. The site under
 test is exercised with real inputs and no mock of the code under test,
 but without the DB-backed case machinery that mutants whose divergence
 needs multiple distinct cases (M22, in
@@ -16,35 +20,38 @@ needs multiple distinct cases (M22, in
 Named §15.3 test coverage and remaining work:
 
 Each entry gives three separate statuses: implemented, reviewed, and
-mutation-verified (checked at checkpoint C, §15.4:1403).
+mutation-verified (checked at checkpoint C, §15.4:1448).
 
 - implemented, reviewed; mutation-verified: pending: M9's lighter direct
   kill test. This file pins the same change ("Arm A training window ends
   at K + 1") directly against ``temperature_window``, the one function
   the mutant changes -- a lighter kill at the same site, not a
   re-derivation of the leak test's broader byte-identical guarantee.
-  implemented; reviewed: pending; mutation-verified: pending: M9 -> "the
-  leak test" itself (§15.3:1313), killed by change (i) under Arm A in
+  implemented, reviewed; mutation-verified: pending: M9 -> "the
+  leak test" itself (§15.3:1347), killed by change (i) under Arm A in
   ``test_daily_shadow_leak.py``.
-- implemented; reviewed: pending; mutation-verified: pending: M28 (Arm B
+- implemented, reviewed; mutation-verified: pending: M28 (Arm B
   training window not shifted one day earlier, still ends at K), killed
   by change (i) under Arm B in ``test_daily_shadow_leak.py``.
-- implemented; reviewed: pending; mutation-verified: pending: M32 (Arm A
+- implemented, reviewed; mutation-verified: pending: M32 (Arm A
   rebuild's ``known_by`` cutoff removed from ``ArmARebuilder.rebuild``, so
   a station reading fetched after ``T(s)`` is no longer excluded), killed
   by change (iii) under Arm A in ``test_daily_shadow_leak.py``.
-- implemented; reviewed: pending; mutation-verified: pending: M34
+- implemented, reviewed; mutation-verified: pending: M34
   (persistence reads the published ``daily_truth`` row of day K whatever
   the arm), killed by change (i) under Arm B and by change (iii) under
   Arm A in ``test_daily_shadow_leak.py``.
-- implemented; reviewed: pending; mutation-verified: pending: M150
+- implemented, reviewed; mutation-verified: pending: M150
   (``load_future_samples``'s ``as_of`` cutoff drops only the
   ``fetched_at`` half of its check, leaving ``issued_at`` alone -- a
   sample issued before T(s) but fetched after it is no longer excluded),
   killed by change (ii) in ``test_daily_shadow_leak.py`` (temperature,
-  both arms; rain pending -- see that file's module docstring).
+  both arms).
+- implemented, reviewed; mutation-verified: pending: M150 (rain), the
+  same ``as_of``-cutoff change, killed by change (ii) in
+  ``tests/test_daily_shadow_leak_rain.py`` (both arms).
 - implemented, reviewed; mutation-verified: pending: M11 -> "Discarded
-  resamples" (§15.3:1322). Covered by
+  resamples" (§15.3:1357). Covered by
   ``test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds`` and
   its paired positive
   ``test_m11_draw_resamples_paired_positive_every_lead_on_every_date``, both
@@ -60,33 +67,71 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   10,000) -- a fixture shaped for the header line, not a re-derivation of
   the one-lead-missing-on-29-of-30-dates population above.
 - implemented, reviewed; mutation-verified: pending: M16 -> plan row
-  :1423 "manifest check skipped". Covered in
+  :1468 "manifest check skipped". Covered in
   ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_m16a_check_note_matches_package_python_version_differs``,
   ``test_m16a_check_note_matches_package_files_differ``, their paired
   positive, and the ``test_m16b_*`` tests.
 - implemented, reviewed; mutation-verified: n/a (no mutant row): the
-  §15.3:1336 argparse case (``--heldout`` without ``--freeze-note`` or
+  §15.3:1371 argparse case (``--heldout`` without ``--freeze-note`` or
   without ``--expect-sha256`` exits with an argparse error) is covered
   in ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_freeze_enforcement_heldout_without_freeze_note_is_an_argparse_error``
   and
   ``test_freeze_enforcement_heldout_without_expect_sha256_is_an_argparse_error``.
 - implemented, reviewed; mutation-verified: pending: M24 -> plan row
-  :1431 "``--expect-sha256`` comparison skipped" (not M16, whose row is
+  :1477 "``--expect-sha256`` comparison skipped" (not M16, whose row is
   "manifest check skipped"), the hex-digit sentence. Covered in
   ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_m24_expect_sha256_off_by_one_hex_digit_is_refused`` and its
   paired positive.
-- still owed: atomic outputs (§15.3:1335), last sentence: "A
+- still owed: atomic outputs (§15.3:1370), last sentence: "A
   counts-only run and then a ``--freeze-prepare`` run on one copy leave
   two separate run directories."
-- still owed: M21 -> "Amount on known days" (§15.3:1376; also kills
-  M68).
-- still owed: M23 -> "The copy changed during the run" (§15.3:1347),
-  cases (a) and (b).
+- implemented; reviewed: pending; mutation-verified: pending: M21 (plan
+  :1473, an unknown day's amount scored as 0,
+  ``daily_method.observed_amount``'s unknown branch) and M68 (plan :1521,
+  a rain-nearby day with no contributing station given 0.0 instead of
+  ``amount_not_available``) -> "Amount on known days" (§15.3:1411). Both
+  are killed by ``test_amount_scored_on_known_days_only`` and its
+  fixture-liveness check
+  ``test_fixture_station_events_match_the_derived_values`` in
+  ``tests/test_daily_shadow_amount_known_days.py``.
+- implemented; reviewed: pending; mutation-verified: pending: M21b (plan
+  :1474, ``daily_shadow._observed`` returning 0.0 instead of ``None`` for
+  an unknown line, which gives that line a served amount loss) ->
+  "Amount on known days" (§15.3:1411). Killed by
+  ``test_amount_scored_on_known_days_only``'s
+  ``d3_line["served_amount_loss"] is None`` assertion in
+  ``tests/test_daily_shadow_amount_known_days.py``; also covered
+  directly, against ``daily_shadow._observed`` itself, by
+  ``test_m21_an_unknown_days_amount_is_not_scored`` in this file.
+- implemented; reviewed: pending; mutation-verified: pending: M23 ->
+  "The copy changed during the run" (§15.3:1382). The main case
+  (``test_the_copy_changes_mid_run_with_no_other_failure``) kills M23's
+  whole-block and comparison-only forms alike at its own
+  ``assert exit_code == 1``. Case (a)
+  (``test_case_a_the_copy_changes_and_the_hook_itself_raises``) never
+  reaches the end-of-run check at all -- its hook raises while ``stage``
+  is still ``"run"``, and ``error_after_open`` (``daily_shadow.py:1022-
+  1035``) re-hashes the copy itself, detects the change and reports stage
+  ``copy_changed`` -- so it does not kill M23;
+  cases (a) and (b) together pin ``error_after_open``'s §15.3:1382
+  behaviour (the "while handling" chain and the unreadable-second-hash
+  wording) rather than killing the mutant. Case (b)
+  (``test_case_b_the_second_sha256_cannot_be_computed``) additionally
+  kills M23's whole-block form at its own ``assert len(calls) >= 2``, but
+  does not kill the comparison-only form (equivalent under case (b)'s
+  oracle -- see the module docstring in
+  ``tests/test_daily_shadow_copy_changed.py``). Their paired positive is
+  ``test_paired_positive_an_unmutated_copy_runs_clean``, all in
+  ``tests/test_daily_shadow_copy_changed.py``. The main case is also
+  covered here by the earlier batch1 test
+  ``test_m23_a_copy_mutated_during_the_run_errors_with_copy_changed``
+  (hooks ``load_site``, before any record is read) and its paired
+  positive ``test_m23_paired_positive_an_unmutated_copy_runs_clean``.
 - implemented, reviewed; mutation-verified: pending: M10 (the constant form,
-  :183) -> the two existing killers, reviewed in round 1:
+  :183) -> the two existing killers:
   ``test_m10_second_killer_levels_unshifted_upper_at_0_975`` and
   ``test_m10_levels_shifted_tile_is_inconclusive_not_pass`` below, each
   reading the module's own ``LEVEL_TILE``.
@@ -95,35 +140,96 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   ``test_m10_levels_unshifted_upper_at_0_90`` and
   ``test_m10_levels_shifted_at_0_95_is_pass`` -- pin the percentile
   arithmetic (974.025 at 0.95, 949.05 at 0.90, and PASS with U = -5.975,
-  §15.3:1323) at an explicit level, not ``LEVEL_TILE``; they kill no form
+  §15.3:1358) at an explicit level, not ``LEVEL_TILE``; they kill no form
   of M10 by themselves.
 - implemented, reviewed; mutation-verified: pending: M10 (the
-  call-site form, :6182, ``level=LEVEL_TILE`` inside the heldout tile's
-  ``daily_bounds(...)`` call) -> the ``tile.level == 0.975`` assertion in
-  ``test_m11_header_reports_discarded_resamples_per_candidate`` in
-  ``tests/test_daily_shadow_heldout_wiring.py``.
+  call-site form, daily_shadow.py:6484, ``level=LEVEL_TILE`` inside the
+  heldout tile's ``daily_bounds(...)`` call) -> the ``tile.level == 0.975``
+  assertion in ``test_m11_header_reports_discarded_resamples_per_candidate``
+  in ``tests/test_daily_shadow_heldout_wiring.py``.
 - implemented, reviewed; mutation-verified: n/a (no mutant row): "What
-  stage one lacks is named" (§15.3:1355). Covered by
+  stage one lacks is named" (§15.3:1390). Covered by
   ``test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers``
   and ``test_rain_freeze_prepare_not_built_names_the_missing_a_numbers``
   in ``tests/test_daily_shadow_not_built.py``, and
   ``test_heldout_not_built_names_a11_and_d2_option_c`` in
   ``tests/test_daily_shadow_heldout_wiring.py``.
 - implemented, reviewed; mutation-verified: pending: M22 -> plan row
-  :1429 "warm-spell threshold frozen on the first window" ("Rolling
-  warm-spell threshold", §15.3:1353). Covered in
+  :1475 "warm-spell threshold frozen on the first window" ("Rolling
+  warm-spell threshold", §15.3:1388). Covered in
   ``tests/test_daily_shadow_heldout_wiring.py`` by
   ``test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window``,
   in both directions (cold-then-warm, and the plan's autumn-to-winter
   case).
 - implemented, reviewed; mutation-verified: pending: M25 -> plan row
-  :1432 "the ``on_time``-only F1 rule removed", killed by "F1 (38 of 40)"
-  (§15.3:1311). Covered by
+  :1478 "the ``on_time``-only F1 rule removed", killed by "F1 (38 of 40)"
+  (§15.3:1345). Covered by
   ``test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1``, its
   paired positive
   ``test_m25_paired_positive_38_of_40_with_on_time_at_95_percent_passes``, and
   ``test_m25_f1_below_95_insufficient_through_data_checks`` at the
   ``data_checks``/``candidate_outcome`` level.
+- Round-3 rain mutants (plan :1599-1616):
+  - implemented, reviewed; mutation-verified: pending: M146 (rain window
+    ends at K+1), shown by ``test_leak_change_i_arm_a_window_end`` in
+    ``tests/test_daily_shadow_leak_rain.py``.
+  - implemented, reviewed; mutation-verified: pending: M147 (rain's
+    as-of station-day total counts every known reading of the day,
+    ``count = len(fetched)`` in place of
+    ``count = bisect_right(fetched, known_by)`` -- the whole-day form),
+    shown by ``test_leak_change_iii_new_station_full_vs_asof`` in
+    ``tests/test_daily_shadow_leak_rain.py`` and by
+    ``test_fault_states_as_of_t_syn4_is_suspect_not_quarantined`` and
+    ``test_fault_states_as_of_t_partial_day_twelve_is_not_reliable`` in
+    ``tests/test_daily_shadow_fault_states_as_of.py``.
+  - implemented, reviewed; mutation-verified: pending: M148 (rain's
+    symbol persistence reads ``RainEvents.full``, not the events as of
+    T(s)), shown by ``test_leak_change_iii_new_station_full_vs_asof`` in
+    ``tests/test_daily_shadow_leak_rain.py``.
+  - implemented, reviewed; mutation-verified: pending: M149 (rain's
+    amount persistence reads the amounts in full, not as of T(s)), shown
+    by ``test_leak_change_iii_new_station_full_vs_asof`` in
+    ``tests/test_daily_shadow_leak_rain.py``.
+  - implemented, reviewed; mutation-verified: pending: M151
+    (``RainEvents.states_at`` builds the fault states from every reading
+    up to K, ``known_by=None``), shown by
+    ``test_fault_states_as_of_t_syn4_is_suspect_not_quarantined`` and
+    ``test_fault_states_as_of_t_partial_day_twelve_is_not_reliable`` in
+    ``tests/test_daily_shadow_fault_states_as_of.py`` (in both, day 12's
+    readings that are fetched after T would be counted under the
+    mutation, making day 12 a reliable qualifying day and quarantining
+    SYN-4, so their ``== "suspect"`` assertions would fail; the positive
+    control, ``test_fault_states_as_of_t_positive_control_syn4_is_quarantined``,
+    already expects quarantined with day 12 known by T either way and
+    does not tell M151 apart).
+  - implemented, reviewed; mutation-verified: pending: M162 (the
+    comparison looks published rows up at the line's snapshot date, not
+    its target date), shown by
+    ``test_leak_change_i_arm_b_published_rows_inert`` in
+    ``tests/test_daily_shadow_leak_rain.py``.
+  - implemented, reviewed; mutation-verified: pending: M163 (expected
+    divergence from M147: rain's as-of station-day total takes the whole
+    day once one reading is known, keeping ``count == 0`` but dropping
+    the ``[:count]`` slice -- the slice-only form, distinct from M147's
+    whole-day form), shown by
+    ``test_fault_states_as_of_t_partial_day_twelve_is_not_reliable`` in
+    ``tests/test_daily_shadow_fault_states_as_of.py``.
+  - implemented, reviewed; mutation-verified: pending: M152 (expected
+    divergence: Run 3, 4 usable cases) and M158 (Run 3, ``unmatched`` differs),
+    both shown by ``test_run3_threshold_mismatch_on_d3``; M153 (Run 3d,
+    ``threshold_mismatch`` on every case), shown by
+    ``test_run3d_site_threshold_change_does_not_affect_reasons``; M154
+    (Run 4, D2 usable), M155 (Run 4, ``truth_not_eligible`` 0) and M157
+    (Run 4, an amount with 1 case on D4), all shown by
+    ``test_run4_missing_stale_and_ineligible_published_rows``; M156
+    (Run 5, 4 symbol cases), shown by
+    ``test_run5_non_binary_occurrence_value_is_not_eligible``; M159
+    (Run 2, ``share_agreeing`` 0.25), shown by
+    ``test_run2_disagrees_on_every_case_day``; M160 (``decisions.symbol``
+    differs between Run 1 and Run 2), shown by
+    ``test_published_comparison_decides_nothing``; M161 (Run 3c), shown
+    by ``test_run3c_stale_and_mismatched_gives_threshold_mismatch_first``
+    -- all in ``tests/test_daily_shadow_published_comparison.py``.
 - still owed (newly identified coverage, not a §15.3 named test):
   ``main()`` handing ``--heldout``'s arguments to ``run()`` --
   ``mode``, ``h_first`` (``DEFAULT_H_FIRST`` without a note, the note's
@@ -254,7 +360,7 @@ def test_m10_levels_unshifted_upper_at_0_95() -> None:
     """Level pin, not an M10 killer by itself (this reads an explicit
     level, 0.95, not ``LEVEL_TILE``): the same unshifted population's
     ``upper`` at level 0.95 is 974.025 (±1e-9), from ``percentile_ci``'s
-    linear interpolation (§15.3:1323, ``verification/stats.py:119-129``).
+    linear interpolation (§15.3:1358, ``verification/stats.py:119-129``).
     """
     bounds = _levels_bounds_at(shift=0.0, level=0.95)
     assert bounds.kept == 1000
@@ -266,7 +372,7 @@ def test_m10_levels_unshifted_upper_at_0_95() -> None:
 def test_m10_levels_unshifted_upper_at_0_90() -> None:
     """Level pin, not an M10 killer by itself (this reads an explicit
     level, 0.90, not ``LEVEL_TILE``): the same unshifted population's
-    ``upper`` at level 0.90 is 949.05 (±1e-9) (§15.3:1323).
+    ``upper`` at level 0.90 is 949.05 (±1e-9) (§15.3:1358).
     """
     bounds = _levels_bounds_at(shift=0.0, level=0.90)
     assert bounds.kept == 1000
@@ -279,7 +385,7 @@ def test_m10_levels_shifted_at_0_95_is_pass() -> None:
     """Level pin, not an M10 killer by itself (this reads an explicit
     level, 0.95, not ``LEVEL_TILE``): shifted by -980.0, the tile's
     ``upper`` at level 0.95 is -5.975 (±1e-9), which the plan calls out
-    as "at 0.95 it would be PASS" (§15.3:1323) -- ``candidate_outcome``
+    as "at 0.95 it would be PASS" (§15.3:1358) -- ``candidate_outcome``
     confirms the outcome.
     """
     bounds = _levels_bounds_at(shift=980.0, level=0.95)
@@ -324,8 +430,8 @@ def test_m11_paired_positive_discard_at_1_percent_passes() -> None:
 def test_m11_discard_over_1_percent_fails_the_candidate_outcome() -> None:
     """M11, at the outcome level: ``discard_ok`` disabled lets
     ``candidate_outcome`` pass a tile whose resamples are over the 1%
-    discard limit (daily_shadow.py:3039-3040, via ``discard_ok`` at
-    :2233) -> at the result: correct = ``("INSUFFICIENT",
+    discard limit (daily_shadow.py:3041-3042, via ``discard_ok`` at
+    :2235) -> at the result: correct = ``("INSUFFICIENT",
     ("discarded_over_1_percent",))``, mutant (``discard_ok`` always
     ``True``) = ``("PASS", ())``.
     """
@@ -364,7 +470,7 @@ def _one_lead_missing_deltas(
 def test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds() -> None:
     """M11, through production ``draw_resamples(30)`` and the production
     tile weights (``TILE_WEIGHTS``, ``LEAD_WEIGHTS``), as the heldout tile
-    builds it (§15.3:1322, "Discarded resamples") -- one lead present on
+    builds it (§15.3:1357, "Discarded resamples") -- one lead present on
     only one of 30 H dates discards every resample whose drawn indices
     never land on that one date. The deltas are uniformly -1.0 (not 1.0),
     so the kept resamples' point estimate is negative and clears
@@ -459,7 +565,7 @@ def test_m11_draw_resamples_paired_positive_every_lead_on_every_date() -> None:
 # --- M12: F1 threshold 0.90 instead of 0.95 (direct F1Tally, not via the
 #          freeze note -- M12 also feeds a constant comparison inside
 #          ``check_note_matches_package`` that is part of "Freeze
-#          enforcement" (§15.3:1336), exercised in the batch-2 file) -------
+#          enforcement" (§15.3:1371), exercised in the batch-2 file) -------
 
 
 def _tally_at(matched: int, rows: int) -> daily_shadow.F1Tally:
@@ -506,7 +612,7 @@ def _record_row(*, write_path: str) -> daily_shadow.RecordRow:
 
 def test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1() -> None:
     """M25: the ``on_time``-only F1 rule removed, killed by "F1 (38 of
-    40)" (§15.3:1311) -- 20 ``on_time`` rows with 18 matching plus 20
+    40)" (§15.3:1345) -- 20 ``on_time`` rows with 18 matching plus 20
     ``late_reconstruction`` rows all matching, built through production
     ``F1Tally.add``: 38 of 40 overall (95%), but the ``on_time`` rows
     alone are at 90%. At ``F1Tally.passes()``: correct = False (the
@@ -528,7 +634,7 @@ def test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1() -> None:
 
 
 def test_m25_paired_positive_38_of_40_with_on_time_at_95_percent_passes() -> None:
-    """Paired positive, same 38-of-40 overall population (§15.3:1311): 20
+    """Paired positive, same 38-of-40 overall population (§15.3:1345): 20
     ``on_time`` rows with 19 matching plus 20 ``late_reconstruction`` rows
     with 19 matching -- 38 of 40 overall (95%) and the on_time rows alone
     also at 95% -> ``passes()`` is True.
@@ -597,7 +703,7 @@ def _listed(root: Path) -> list[str]:
 def test_m15_atomic_outputs_a_a_clean_write_lands_under_partial_first(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§15.3 "Atomic outputs" (:1335), case (a). ``_write_file`` is replaced
+    """§15.3 "Atomic outputs" (:1370), case (a). ``_write_file`` is replaced
     by a recorder that, before anything else, records the path it is given
     and whether ``final_dir`` exists, then calls the original
     ``daily_shadow._write_file`` (saved before the monkeypatch).
@@ -607,8 +713,8 @@ def test_m15_atomic_outputs_a_a_clean_write_lands_under_partial_first(
     recorder's first call: correct = ``(tmp_path/"out"/"run.partial"/
     "a.json", False)`` (``final_dir`` absent, write under ``.partial/``),
     mutant = ``(tmp_path/"out"/"run"/"a.json", True)`` (``final_dir``
-    already exists, because ``partial.mkdir(parents=True)`` (:1057)
-    creates it before the write loop starts (:1059). The end states
+    already exists, because ``partial.mkdir(parents=True)`` (:1059)
+    creates it before the write loop starts (:1061). The end states
     alone (``run``, ``run/a.json`` = ``first``, ``run/b.json`` =
     ``second``) are identical under the mutant and do not themselves
     catch it.
@@ -640,7 +746,7 @@ def test_m15_atomic_outputs_a_a_clean_write_lands_under_partial_first(
 def test_m15_atomic_outputs_b_a_failed_second_write_leaves_only_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§15.3 "Atomic outputs" (:1335), case (b). The recorder calls the
+    """§15.3 "Atomic outputs" (:1370), case (b). The recorder calls the
     original ``_write_file`` on its first call and raises
     ``OSError("forced write")`` on its second without calling the
     original, so ``b.json`` is never created.
@@ -682,7 +788,7 @@ def test_m15_atomic_outputs_b_a_failed_second_write_leaves_only_failed(
 def test_rename_stale_partials_renames_a_stale_partial_directory(
     tmp_path: Path,
 ) -> None:
-    """§15.3:1335, the sentence on stale ``.partial/`` directories, as a
+    """§15.3:1370, the sentence on stale ``.partial/`` directories, as a
     direct call: "A stale ``.partial/`` directory from an earlier run is
     renamed ``.failed/`` before the run starts."
     ``tests/test_daily_shadow_prepare_open.py`` (c) (:131-147) and (f)
@@ -706,14 +812,14 @@ def test_rename_stale_partials_renames_a_stale_partial_directory(
 
 # --- M16: manifest check skipped ----------------------------------------------
 #
-# Tests for M16 (plan row :1423, "manifest check skipped") are in
+# Tests for M16 (plan row :1468, "manifest check skipped") are in
 # tests/test_daily_shadow_batch2_mutants.py: the manifest-differs case is
 # test_m16a_check_note_matches_package_python_version_differs,
 # test_m16a_check_note_matches_package_files_differ, their paired
 # positive, and the test_m16b_* tests of main(). Kill verification at
 # checkpoint C is still pending. No replacement test is added here.
 #
-# The §15.3:1336 argparse case ("--heldout" without "--freeze-note" or
+# The §15.3:1371 argparse case ("--heldout" without "--freeze-note" or
 # without "--expect-sha256" exits with an argparse error) is covered
 # there too, by
 # test_freeze_enforcement_heldout_without_freeze_note_is_an_argparse_error
@@ -722,7 +828,7 @@ def test_rename_stale_partials_renames_a_stale_partial_directory(
 # No mutant row targets this check, so no kill claim is made for it.
 #
 # The hex-digit sentence of "Freeze enforcement" belongs to M24 (plan row
-# :1431: "--expect-sha256 comparison skipped"), not M16 (whose row is
+# :1477: "--expect-sha256 comparison skipped"), not M16 (whose row is
 # "manifest check skipped"), and is covered there by
 # test_m24_expect_sha256_off_by_one_hex_digit_is_refused and its paired
 # positive. Kill verification at checkpoint C is still pending.
@@ -941,7 +1047,7 @@ def test_m20_paired_positive_g4_on_the_low_passes_within_the_margin() -> None:
     boundary) -- G4 for the low passes. Because the control sits at
     exactly the 2.0 band line in every case, this fixture also exercises
     a ``>`` -> ``>=`` change on the control side of G4_BAND_C
-    (daily_shadow.py:2829): under ``>=`` ``control_too_warm`` becomes 100
+    (daily_shadow.py:2831): under ``>=`` ``control_too_warm`` becomes 100
     instead of 0, but the low's ``pass`` stays True
     (100 * 5 <= 100 * 100 + 5 * 100). What catches that change is the
     exact G4 dict assertion below (``control_too_warm`` 0 vs 100), not a
@@ -966,7 +1072,7 @@ def test_m20_paired_positive_g4_on_the_low_passes_within_the_margin() -> None:
     assert daily_shadow.guards_pass(guards) is True
 
 
-# --- M21: an unknown day's amount scored as 0 --------------------------------
+# --- M21b: an unknown day's amount scored as 0 -------------------------------
 
 
 def _rain_day(
@@ -1016,10 +1122,11 @@ def _rain_line(day: daily_shadow.RainDay) -> daily_shadow.RainLine:
 
 
 def test_m21_an_unknown_days_amount_is_not_scored() -> None:
-    """M21: an unknown day's amount scored as 0 -> at ``_observed`` for an
-    unknown day (injected via ``outcome="unknown"``, with the day's own
-    ``ObservedAmount.amount`` left at ``None`` as production code would
-    leave it): correct = None, mutant = 0.0.
+    """M21b (plan :1474): ``daily_shadow._observed`` returns 0.0 for an
+    unknown line -> at ``_observed`` for an unknown day (injected via
+    ``outcome="unknown"``, with the day's own ``ObservedAmount.amount``
+    left at ``None`` as production code would leave it): correct = None,
+    mutant = 0.0.
     """
     unknown_line = _rain_line(_rain_day(outcome="unknown", amount_value=None))
     assert daily_shadow._observed(unknown_line) is None  # pyright: ignore[reportPrivateUsage]
@@ -1043,8 +1150,8 @@ def test_m23_a_copy_mutated_during_the_run_errors_with_copy_changed(
     """M23: end-of-run sha256 check removed -> at ``main()``'s exit code,
     with the copy mutated mid-run (via a wrapper around ``load_site``, the
     first function the run calls after opening the read-only copy --
-    this fixture's site holds no records, so ``control_value``, §15.3:
-    1347's own hook, is never called here):
+    this fixture's site holds no records, so ``control_value``,
+    §15.3:1382's own hook, is never called here):
     correct = 1 (``CopyChangedError``, caught and written as ``error.json``),
     mutant = 0 (the run completes as if the copy never moved).
     """
@@ -1085,11 +1192,11 @@ def test_m23_a_copy_mutated_during_the_run_errors_with_copy_changed(
     assert "ERROR at stage copy_changed" in err_text
     assert "CopyChangedError" in err_text
     # ``CopyChangedError`` comes from main()'s own post-run check
-    # (daily_shadow.py:6806-6812), not from error_after_open: that
+    # (daily_shadow.py:7113-7119), not from error_after_open: that
     # function returns a CopyChangedError unchanged (daily_shadow.py:
-    # 1018-1019). Only a *different* exception raised after the copy's
+    # 1020-1021). Only a *different* exception raised after the copy's
     # hash changed takes error_after_open's chained branch
-    # (daily_shadow.py:1028-1033), which adds "while handling" to the
+    # (daily_shadow.py:1030-1035), which adds "while handling" to the
     # message. So its absence here is a genuine, non-vacuous check of
     # which code path produced the error.
     assert "while handling" not in err_text
