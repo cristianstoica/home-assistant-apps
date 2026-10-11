@@ -1,8 +1,12 @@
 """§13.3's commit check (``daily_shadow.check_commit``): the fixture
 repository, the clean case, a control for the ``subprocess.run`` stub
-itself, mutant M113, and the refusal and still-returns cases of plan
+itself, mutant M113, the refusal and still-returns cases of plan
 :1375-:1376 listed under "Covered here" below, mutants M104, M108,
-M111, M112 and M116-M119 among them.
+M111, M112 and M116-M119 among them, the ``subprocess.run``,
+``package_snapshot`` and ``os.scandir`` failure stubs, a control for the
+``os.scandir`` stub itself, the real unreadable-folder case, the
+``ls-tree`` cannot-parse cases, and mutants M107, M107b, M107c, M110,
+M114 and M115.
 
 The fixture builds a real git repository at ``tmp_path / <repo_name>``
 (default ``"repo"``) holding a package directory at ``<package_path>``
@@ -122,15 +126,57 @@ Covered here (plan line numbers in brackets):
   directory's list of subdirectories with ``os.lstat``, so a link to a
   directory is passed over. Killed by the symbolic link ``ext`` to a
   directory holding ``x.py`` [plan :1375].
-- still owed (a later round): the ``subprocess.run`` stubs that raise
-  ``FileNotFoundError``, raise ``subprocess.TimeoutExpired``, or return a
-  ``CompletedProcess`` with return code 128; the ``package_snapshot``
-  stub raising ``OSError("forced")``; the ``os.scandir`` stub raising
-  ``PermissionError("forced")`` for ``package_dir / "sub"``; every
-  changed-``ls-tree``-output ("cannot parse") case; the ``io.open`` /
-  ``builtins.open`` recorder case [plan :1376]; plan :1377-:1380
-  (redirected environment, recorder, wiring); and mutants M105, M106,
-  M107, M109, M110, M114 and M115.
+- implemented; reviewed: pending; mutation-verified: pending: M107
+  [plan :1560, :1375] -- the final-piece check removed (``if
+  pieces[-1]:`` and its raise deleted), so a non-empty final piece is
+  dropped. Killed by the final-NUL-removed case [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M107b
+  [plan :1560, :1375] -- the ASCII decode's refusal skipped (replaced by
+  ``continue``), so a record whose metadata is not ASCII is passed over.
+  Killed by the non-ASCII-metadata record [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M107c
+  [plan :1560, :1375] -- the combined record check's refusal skipped
+  (replaced by ``continue``). Killed by the other eight cases [plan
+  :1375]: the no-tab record, the two-metadata-fields record, the
+  39-zero id, the ``100664 blob`` mode, the ``040000 tree`` type, the
+  ``100644 commit`` type mismatch, a second NUL inserted after the
+  first record, and the ``a.py`` record added a second time.
+- implemented; reviewed: pending; mutation-verified: pending: M110
+  [plan :1563] -- ``package_snapshot`` finds the files with
+  ``Path.rglob``, which skips a directory it cannot list. Two cases with
+  distinct purposes: the ``os.scandir`` stub case that raises
+  ``PermissionError("forced")`` for ``package_dir / "sub"`` detects the
+  mutant (on CPython 3.13 the stub is bypassed, ``sub/b.py`` is listed,
+  and ``check_commit`` returns instead of refusing) [plan :1375]; the
+  real unreadable-folder case exercises the skip itself (the mutant
+  passes over the ``PermissionError`` and refuses with ``differ`` instead
+  of the permission message) [plan :1375] -- if that case is skipped on a
+  machine, its coverage there is unavailable.
+- implemented; reviewed: pending; mutation-verified: pending: M114
+  [plan :1567] -- the mode and type of an ``ls-tree`` record not checked:
+  any three fields with a 40-digit id are accepted. Killed by the
+  changed-output cases with ``100664 blob``, ``040000 tree`` and
+  ``100644 commit`` [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M115
+  [plan :1568] -- the mode and the type each checked against its own
+  list, not as one of the four pairs. Killed by the changed-output case
+  with ``100644 commit`` [plan :1375].
+- implemented; reviewed: pending; mutation-verified: n/a this round
+  (none of M107, M107b, M107c, M110, M114 and M115 cites them):
+  ``subprocess.run`` and failure-stub cases [plan :1375] -- a stub that
+  raises ``FileNotFoundError`` on every call; a stub that raises
+  ``subprocess.TimeoutExpired`` on every call; a stub that returns a
+  ``CompletedProcess`` with return code 128 on every call; and a
+  ``package_snapshot`` stub that raises ``OSError("forced")``.
+- implemented; reviewed: pending; mutation-verified: n/a (no mutant row):
+  a paired control for the ``os.scandir`` stub used by M110's stub case above
+  -- the same stub, aimed at a path the snapshot never scans
+  (``tmp_path / "unused"``), records exactly ``package_dir`` and
+  ``package_dir / "sub"`` and leaves the clean manifest returned, showing
+  the stub mechanism alone causes no refusal.
+- still owed (a later round): the ``io.open`` / ``builtins.open``
+  recorder case [plan :1376]; plan :1377-:1380 (redirected environment,
+  recorder, wiring); and mutants M105, M106 and M109.
 """
 
 from __future__ import annotations
@@ -138,7 +184,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
 
@@ -893,3 +941,344 @@ def test_m112_committed_cr_name_manifest_lists_it_unchanged(
     assert manifest == daily_shadow.package_manifest(package_dir)
     files = cast("list[list[str]]", manifest["files"])
     assert any(path == cr_name for path, _digest in files)
+
+
+def test_commit_check_refuses_when_subprocess_run_cannot_find_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1375]: ``subprocess.run`` replaced by a stub that raises
+    ``FileNotFoundError`` on every call refuses. The stub fires on every
+    git call, so it hits the first one, ``git rev-parse --verify
+    HEAD^{commit}``.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+
+    def raising_stub(
+        args: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("no such file: git")
+
+    monkeypatch.setattr(daily_shadow.subprocess, "run", raising_stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith(
+        "commit check: git rev-parse --verify HEAD^{commit} could not run: "
+    )
+
+
+def test_commit_check_refuses_when_subprocess_run_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1375]: ``subprocess.run`` replaced by a stub that raises
+    ``subprocess.TimeoutExpired`` on every call refuses. The stub fires on
+    every git call, so it hits the first one, ``git rev-parse --verify
+    HEAD^{commit}``.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+
+    def raising_stub(
+        args: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(daily_shadow.subprocess, "run", raising_stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith(
+        "commit check: git rev-parse --verify HEAD^{commit} could not run: "
+    )
+
+
+def test_commit_check_refuses_when_subprocess_run_returns_exit_128(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1375]: ``subprocess.run`` replaced by a stub that returns a
+    ``CompletedProcess`` with return code 128 on every call refuses. The
+    stub fires on every git call, so it hits the first one, ``git
+    rev-parse --verify HEAD^{commit}``; empty stderr makes the reason
+    ``"no message"``.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+
+    def returning_stub(
+        args: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(args, 128, b"", b"")
+
+    monkeypatch.setattr(daily_shadow.subprocess, "run", returning_stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message == (
+        "commit check: git rev-parse --verify HEAD^{commit} exited 128: no message"
+    )
+
+
+def test_commit_check_refuses_when_package_snapshot_raises_os_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1375]: ``package_snapshot`` replaced by a stub that raises
+    ``OSError("forced")`` refuses with a message naming the forced error.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+
+    def raising_stub(root: Path) -> tuple[dict[str, object], dict[str, str]]:
+        raise OSError("forced")
+
+    monkeypatch.setattr(daily_shadow, "package_snapshot", raising_stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert "forced" in message
+
+
+def _scandir_raising_for(
+    target: Path,
+) -> tuple[Callable[[str], Iterator[os.DirEntry[str]]], list[Path]]:
+    """An ``os.scandir`` stub that raises ``PermissionError("forced")`` for
+    ``target`` and calls the real function for every other path; returns
+    the stub and the paths it was called with.
+    """
+    real_scandir = os.scandir
+    seen: list[Path] = []
+
+    def stub(path: str) -> Iterator[os.DirEntry[str]]:
+        seen.append(Path(path))
+        if Path(path) == target:
+            raise PermissionError("forced")
+        return real_scandir(path)
+
+    return stub, seen
+
+
+def test_commit_check_refuses_when_os_scandir_raises_for_sub_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M110 [plan :1563, :1375]: ``os.scandir`` replaced by a stub that
+    raises ``PermissionError("forced")`` for ``package_dir / "sub"`` only
+    (the real function runs for every other path) refuses with a message
+    naming the forced error, not a byte difference -- a directory that
+    cannot be listed refuses rather than dropping ``sub/b.py`` from a
+    snapshot that is then compared. Under M110 (``Path.rglob``) this case
+    fails too, but on Python 3.13 not through the skip M110 names:
+    ``rglob`` lists directories through ``glob._StringGlobber.scandir``,
+    bound to the real ``os.scandir`` when ``glob`` is imported, so the
+    stub never fires, ``sub/b.py`` is found and the check returns the
+    manifest.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    stub, seen = _scandir_raising_for(package_dir / "sub")
+    monkeypatch.setattr(os, "scandir", stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert "forced" in message
+    assert "differ" not in message
+    assert package_dir / "sub" in seen
+
+
+def test_commit_check_os_scandir_stub_aimed_elsewhere_still_returns_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Paired control for the ``os.scandir`` stub above: the identical
+    stub, aimed at a path the snapshot never scans
+    (``tmp_path / "unused"``), is called for exactly ``package_dir`` and
+    ``package_dir / "sub"`` and leaves the clean manifest returned -- the
+    stub sits in the walk's path, and the refusal above is caused by the
+    stub firing on the targeted directory, not by stubbing ``os.scandir``
+    itself.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    stub, seen = _scandir_raising_for(tmp_path / "unused")
+    monkeypatch.setattr(os, "scandir", stub)
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert set(seen) == {package_dir, package_dir / "sub"}
+    assert manifest == daily_shadow.package_manifest(package_dir)
+
+
+def test_commit_check_refuses_when_sub_directory_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M110 [plan :1563, :1375]: ``package_dir / "sub"`` made a directory
+    that really cannot be listed, by removing every permission from it,
+    refuses with a message equal to ``"commit check: the package's .py
+    files could not be read: PermissionError: " + str(probe)``, where
+    ``probe`` is the ``PermissionError`` the test's own full listing of
+    ``sub`` raised first; that equality is the whole assertion. The case
+    exercises the skip itself: under ``Path.rglob`` (the mutant) the
+    ``PermissionError`` the real operating system raises is passed over,
+    ``sub/b.py`` goes missing from the snapshot, and the check refuses
+    with ``differ`` and ``changed []; added []; removed ["sub/b.py"]``
+    instead of naming the permission error. A ``finally`` restores the
+    saved mode. Skipped where the directory can still be listed despite
+    the removed permission (a root user, or a file system that does not
+    enforce the mode).
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    sub = package_dir / "sub"
+    saved_mode = stat.S_IMODE(os.stat(sub).st_mode)
+    os.chmod(sub, 0)
+    try:
+        probe: PermissionError | None = None
+        try:
+            with os.scandir(str(sub)) as entries:
+                list(entries)
+        except PermissionError as error:
+            probe = error
+        if probe is None:
+            pytest.skip(
+                "sub/ can still be listed with every permission removed "
+                "(root user, or a file system that does not enforce the mode)"
+            )
+        with pytest.raises(daily_shadow.RefusedError) as excinfo:
+            daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+        assert str(excinfo.value) == (
+            "commit check: the package's .py files could not be read: "
+            f"PermissionError: {probe}"
+        )
+    finally:
+        os.chmod(sub, saved_mode)
+
+
+def _append_record(record: bytes) -> Callable[[bytes], bytes]:
+    """A corruption that appends ``record`` (with its own NUL) at the end."""
+
+    def corrupt(original: bytes) -> bytes:
+        return original + record + b"\0"
+
+    return corrupt
+
+
+def _insert_second_nul(original: bytes) -> bytes:
+    """A corruption that inserts a second NUL right after the first record's."""
+    first_nul = original.index(b"\0")
+    return original[: first_nul + 1] + b"\0" + original[first_nul + 1 :]
+
+
+def _remove_final_nul(original: bytes) -> bytes:
+    """A corruption that removes the trailing NUL, so the last piece is non-empty."""
+    assert original.endswith(b"\0")
+    return original[:-1]
+
+
+def _duplicate_a_py_record(original: bytes) -> bytes:
+    """A corruption that appends the ``a.py`` record (with its own NUL) again."""
+    records = original.split(b"\0")
+    assert records[-1] == b""
+    matches = [record for record in records[:-1] if record.endswith(b"\ta.py")]
+    assert len(matches) == 1
+    return original + matches[0] + b"\0"
+
+
+def _ls_tree_corrupting_stub(
+    corrupt: Callable[[bytes], bytes],
+) -> tuple[Callable[..., subprocess.CompletedProcess[bytes]], list[bool]]:
+    """Build a passthrough ``subprocess.run`` stub that corrupts only the
+    ``ls-tree`` call's stdout, via ``corrupt``; returns the stub and a list
+    that gains one ``True`` per ``ls-tree`` call it corrupted, so a test
+    can confirm the stub actually altered an ``ls-tree`` call.
+    """
+    real_run = subprocess.run
+    corrupted_calls: list[bool] = []
+
+    def stub(
+        args: list[str],
+        *,
+        capture_output: bool,
+        check: bool,
+        timeout: float,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        result = real_run(
+            args, capture_output=capture_output, check=check, timeout=timeout, env=env
+        )
+        if "ls-tree" in args:
+            corrupted_stdout = corrupt(result.stdout)
+            corrupted_calls.append(True)
+            result = subprocess.CompletedProcess(
+                result.args, result.returncode, corrupted_stdout, result.stderr
+            )
+        return result
+
+    return stub, corrupted_calls
+
+
+_LS_TREE_CANNOT_PARSE_CASES: list[tuple[str, Callable[[bytes], bytes]]] = [
+    ("no-tab", _append_record(b"100644 blob " + b"0" * 40)),
+    ("two-metadata-fields", _append_record(b"blob " + b"0" * 40 + b"\tz.txt")),
+    ("39-zero-id", _append_record(b"100644 blob " + b"0" * 39 + b"\tz.txt")),
+    (
+        "non-ascii-metadata",
+        _append_record(b"10064\xff blob " + b"0" * 40 + b"\tz.txt"),
+    ),
+    ("bad-mode", _append_record(b"100664 blob " + b"0" * 40 + b"\tz.txt")),
+    ("tree-type", _append_record(b"040000 tree " + b"0" * 40 + b"\tz")),
+    (
+        "commit-type-mismatch",
+        _append_record(b"100644 commit " + b"0" * 40 + b"\tz.txt"),
+    ),
+    ("second-nul-inserted", _insert_second_nul),
+    ("final-nul-removed", _remove_final_nul),
+    ("a-py-record-duplicated", _duplicate_a_py_record),
+]
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [corrupt for _case_id, corrupt in _LS_TREE_CANNOT_PARSE_CASES],
+    ids=[case_id for case_id, _corrupt in _LS_TREE_CANNOT_PARSE_CASES],
+)
+def test_commit_check_refuses_ls_tree_output_it_cannot_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corrupt: Callable[[bytes], bytes]
+) -> None:
+    """M107, M107b, M107c, M114 and M115 [plan :1560, :1567, :1568, :1375]:
+    ``subprocess.run`` replaced by a stub that passes each call through
+    unchanged except ``ls-tree``'s, whose ``stdout`` it corrupts one way
+    per case -- a malformed, mistyped or duplicated record refuses with a
+    message naming the parse failure, not a byte difference, and the
+    recorder confirms the stub actually altered an ``ls-tree`` call (so no
+    case passes because the stub never fired). M107 (the final-piece check
+    removed) is killed by the final-NUL-removed case; M107b (the ASCII
+    decode's refusal skipped) is killed by the non-ASCII-metadata case;
+    M107c (the combined record check's refusal skipped) is killed by the
+    other eight cases. M114 (mode and type not checked) is killed by the
+    bad-mode, tree-type and commit-type-mismatch cases; M115 (mode and
+    type checked against separate lists) by the commit-type-mismatch case.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    stub, corrupted_calls = _ls_tree_corrupting_stub(corrupt)
+    monkeypatch.setattr(daily_shadow.subprocess, "run", stub)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert "cannot parse" in message
+    assert "differ" not in message
+    assert corrupted_calls == [True]
