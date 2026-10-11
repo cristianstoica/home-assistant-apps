@@ -5,8 +5,12 @@ itself, mutant M113, the refusal and still-returns cases of plan
 M111, M112 and M116-M119 among them, the ``subprocess.run``,
 ``package_snapshot`` and ``os.scandir`` failure stubs, a control for the
 ``os.scandir`` stub itself, the real unreadable-folder case, the
-``ls-tree`` cannot-parse cases, and mutants M107, M107b, M107c, M110,
-M114 and M115.
+``ls-tree`` cannot-parse cases, mutants M107, M107b, M107c, M110,
+M114 and M115, the ``io.open``/``builtins.open`` recorder case [plan
+:1376] and mutant M109 [plan :1562], the redirected-environment case
+[plan :1377] and mutant M105 [plan :1558], the exact-call subprocess
+recorder [plan :1378], and ``main()``'s wiring to ``check_commit``
+[plan :1379] and mutant M106 [plan :1559].
 
 The fixture builds a real git repository at ``tmp_path / <repo_name>``
 (default ``"repo"``) holding a package directory at ``<package_path>``
@@ -32,11 +36,16 @@ external default ignore and attributes files cannot make ``git add``
 leave out a fixture file or change the bytes it commits.
 Removing the inherited ``GIT_*`` names prevents a calling process,
 including a hook, from supplying repository, index, object-store or
-configuration overrides through those variables. Each test's own
-environment is given ``GIT_CEILING_DIRECTORIES``
+configuration overrides through those variables. Each test that runs
+git is given ``GIT_CEILING_DIRECTORIES``
 set to ``tmp_path`` (plan :1373; the repository sits below it, never at
 it: git does not look in the ceiling directory itself when it searches
-upward). In every case here but one git finds
+upward). The three wiring tests
+(``test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out``,
+``test_wiring_check_commit_returns_manifest_called_once_before_open``,
+``test_m106_wiring_check_commit_extra_file_drives_code_changed``)
+replace ``check_commit`` and run no git, so they need not set it and do
+not. In every case here but one git finds
 ``tmp_path / <repo_name> / ".git"`` before reaching the ceiling; in the
 case whose package directory, ``tmp_path / "loose"``, is in no
 repository, the ceiling stops git's upward search, which would
@@ -85,6 +94,35 @@ Covered here (plan line numbers in brackets):
   present; an untracked ``notes.txt`` in the package; ``pyproject.toml``
   changed outside the package; and an unchanged untracked copy of the
   package at ``elsewhere/pkg/``.
+- implemented; reviewed: pending; mutation-verified: pending: M109
+  [plan :1562] -- ``package_snapshot`` reads each file twice, once for
+  its sha256 and once for its object id. Killed by the ``io.open`` /
+  ``builtins.open`` recorder case [plan :1376], which shows each of the
+  package's three ``.py`` files opened exactly once.
+- implemented; reviewed: pending; mutation-verified: pending: M105
+  [plan :1558] -- ``check_commit`` gives git the inherited environment
+  unchanged, ``GIT_*`` variables included. Killed by the redirected-
+  environment case [plan :1377]: ``GIT_DIR``/``GIT_WORK_TREE``/
+  ``GIT_INDEX_FILE`` pointed at a second repository still let the check
+  return the first repository's manifest, since ``_git_environment``
+  strips them.
+- implemented; reviewed: pending; mutation-verified: n/a (no mutant row
+  cites it): the exact-call subprocess recorder [plan :1378] -- the
+  same redirected environment, plus ``GIT_CONFIG_COUNT``/
+  ``GIT_CONFIG_KEY_0``/``GIT_CONFIG_VALUE_0``/``GIT_CONFIG_GLOBAL``/
+  ``WXVERIFY_TEST_KEEP``, pins the exact two git calls' argument lists,
+  keyword arguments and filtered environment.
+- implemented; reviewed: pending; mutation-verified: pending: M106
+  [plan :1559] -- ``main()`` records and compares at the end a manifest
+  it computes itself before the open, not the one ``check_commit``
+  returns. Killed by the wiring case 3 [plan :1379] whose recorder adds
+  ``x.py`` to the manifest it returns.
+- implemented; reviewed: pending; mutation-verified: n/a (no mutant row
+  cites them): wiring cases 1 and 2 [plan :1379]
+  (``test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out``
+  and
+  ``test_wiring_check_commit_returns_manifest_called_once_before_open``)
+  confirm the refusal and the call-order/argument behavior directly.
 - implemented; reviewed: pending; mutation-verified: pending: M104
   [plan :1557] -- the byte comparison removed from ``check_commit``: it
   returns the manifest without comparing the files with the commit's.
@@ -174,16 +212,35 @@ Covered here (plan line numbers in brackets):
   (``tmp_path / "unused"``), records exactly ``package_dir`` and
   ``package_dir / "sub"`` and leaves the clean manifest returned, showing
   the stub mechanism alone causes no refusal.
-- still owed (a later round): the ``io.open`` / ``builtins.open``
-  recorder case [plan :1376]; plan :1377-:1380 (redirected environment,
-  recorder, wiring); and mutants M105, M106 and M109.
+- implemented; reviewed: pending; mutation-verified: n/a (no mutant row
+  cites it): audit (plan :1380, no test -- a check of the other test files):
+  every other test in ``tests/`` that drives ``daily_shadow.main`` past
+  argument parsing replaces ``check_commit`` with a stub shaped
+  ``def _stub_check_commit(package_dir: Path, *, commit_sha: str) ->
+  dict[str, object]: return daily_shadow.package_manifest(package_dir)``
+  -- the ``package_dir`` it is given, with ``package_manifest`` looked
+  up on the ``daily_shadow`` module at call time. Confirmed conforming,
+  one module-level helper each: ``test_daily_shadow_leak_rain.py``,
+  ``test_daily_shadow_not_built.py``, ``test_daily_shadow_copy_changed.py``,
+  ``test_daily_shadow_span_check.py``, ``test_daily_shadow_prepare_open.py``,
+  ``test_daily_shadow_batch2_mutants.py``, ``test_daily_shadow_rain_rules.py``,
+  ``test_daily_shadow_published_comparison.py``,
+  ``test_daily_shadow_output_folder.py`` and
+  ``test_daily_shadow_amount_known_days.py``.
+  ``test_daily_shadow_batch1_mutants.py`` drives ``main()`` only through
+  ``test_daily_shadow_output_folder._run_main``, so it is covered by
+  that helper's stub. No non-conforming case found.
 """
 
 from __future__ import annotations
 
+import builtins
+import contextlib
+import io
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 from collections.abc import Callable, Iterator
@@ -192,7 +249,13 @@ from typing import cast
 
 import pytest
 
+import wxverify
+from tests.helpers import asof_make_site
+from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.verification import daily_shadow
+
+_WIRING_COMMIT_SHA = "f" * 40
 
 _INIT_BYTES = b"# package init\n"
 _A_BYTES = b"VALUE_A = 1\n"
@@ -941,6 +1004,393 @@ def test_m112_committed_cr_name_manifest_lists_it_unchanged(
     assert manifest == daily_shadow.package_manifest(package_dir)
     files = cast("list[list[str]]", manifest["files"])
     assert any(path == cr_name for path, _digest in files)
+
+
+def test_m109_open_recorder_sees_each_py_file_opened_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 27, M109 [plan :1562, :1376]: ``io.open`` and ``builtins.open``
+    both replaced by one recorder that calls the real ``open`` -- the
+    check still returns the clean manifest, and the recorder shows each
+    of the package's three ``.py`` files (``__init__.py``, ``a.py``,
+    ``sub/b.py``) opened exactly once, and no other file under the
+    package directory opened. ``pathlib/_local.py``'s ``Path.open``
+    (CPython 3.13) calls ``io.open(self, mode, buffering, encoding,
+    errors, newline)`` directly, never ``builtins.open``, so
+    ``package_snapshot``'s one ``Path.read_bytes()`` per file reaches the
+    recorder through ``io.open`` alone; ``builtins.open`` is replaced too,
+    per the plan, but the recorder is never expected to see a call there.
+    M109 (``package_snapshot`` reads each file twice, once for its
+    sha256 and once for its object id) would make the recorder see each
+    of the three files opened twice.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    expected_manifest = daily_shadow.package_manifest(package_dir)
+    real_open = cast("Callable[..., object]", io.open)
+    opened: list[Path] = []
+
+    def recorder(*args: object, **kwargs: object) -> object:
+        if args:
+            first = args[0]
+            if isinstance(first, (str, os.PathLike)):
+                opened.append(Path(cast("str | os.PathLike[str]", first)))
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(io, "open", recorder)
+    monkeypatch.setattr(builtins, "open", recorder)
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == expected_manifest
+    under_package = [path for path in opened if package_dir in path.parents]
+    counts: dict[Path, int] = {}
+    for path in under_package:
+        counts[path] = counts.get(path, 0) + 1
+    expected = {
+        package_dir / "__init__.py": 1,
+        package_dir / "a.py": 1,
+        package_dir / "sub" / "b.py": 1,
+    }
+    assert counts == expected
+
+
+def test_m105_redirected_git_env_vars_do_not_divert_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1377], M105 [plan :1558]: a second repository is built the
+    same way at ``tmp_path / "other"``, with other bytes in ``a.py``.
+    After both are built, ``GIT_DIR``, ``GIT_WORK_TREE`` and
+    ``GIT_INDEX_FILE`` are set naming the second repository's ``.git``
+    directory, its top and its index. The check on the first
+    repository's package, with the first repository's HEAD sha, still
+    returns the first package's manifest: ``_git_environment`` strips
+    every inherited ``GIT_*`` name except ``GIT_CEILING_DIRECTORIES``, so
+    these three names never reach git. M105 (the inherited environment
+    passed unchanged) would instead let ``GIT_DIR``/``GIT_WORK_TREE``
+    point git at the second repository, so ``git rev-parse --verify
+    HEAD^{commit}`` would resolve the second repository's HEAD and
+    compare it with the first repository's sha, refusing.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    _make_repo(tmp_path, repo_name="other", a_bytes=b"VALUE_A = 777\n")
+    other_git_dir = tmp_path / "other" / ".git"
+    monkeypatch.setenv("GIT_DIR", str(other_git_dir))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "other"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other_git_dir / "index"))
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+
+
+def test_subprocess_recorder_sees_exact_two_calls_with_filtered_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """[plan :1378]: the same redirected environment as above, with
+    ``GIT_CONFIG_COUNT=1``, ``GIT_CONFIG_KEY_0=user.name``,
+    ``GIT_CONFIG_VALUE_0=t``, ``GIT_CONFIG_GLOBAL`` naming a file in
+    ``tmp_path`` and ``WXVERIFY_TEST_KEEP=1`` also set. A recorder that
+    wraps the real ``subprocess.run``, installed after the fixture is
+    built, shows exactly two calls: the exact argument lists for
+    ``rev-parse --verify HEAD^{commit}`` and ``ls-tree -r -z --full-tree
+    <sha>:wxverify/wxverify``, no ``shell=True``, ``timeout=30``, none
+    of ``text``/``encoding``/``errors``/``universal_newlines``, and an
+    environment whose ``GIT_``-prefixed names are exactly the four
+    ``_git_environment`` sets, keeping ``WXVERIFY_TEST_KEEP`` and
+    ``PATH`` as the test's environment has them. Plan :1378 requires
+    only the call shape and the absence of ``shell=True``; the
+    ``capture_output is True`` and ``check is False`` assertions below
+    go beyond it. No mutant in this round's ledger is cited against this
+    test; it pins the exact call shape ``check_commit`` makes; the M105
+    case above relies on the environment filtering it pins.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    _make_repo(tmp_path, repo_name="other", a_bytes=b"VALUE_A = 777\n")
+    other_git_dir = tmp_path / "other" / ".git"
+    monkeypatch.setenv("GIT_DIR", str(other_git_dir))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "other"))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other_git_dir / "index"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "t")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "hostile-gitconfig"))
+    monkeypatch.setenv("WXVERIFY_TEST_KEEP", "1")
+    expected_path = os.environ["PATH"]
+
+    real_run = cast("Callable[..., subprocess.CompletedProcess[bytes]]", subprocess.run)
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def recorder(
+        args: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((list(args), dict(kwargs)))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(daily_shadow.subprocess, "run", recorder)
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+    assert len(calls) == 2
+    expected_args = [
+        ["git", "-C", str(package_dir), "rev-parse", "--verify", "HEAD^{commit}"],
+        [
+            "git",
+            "-C",
+            str(package_dir),
+            "ls-tree",
+            "-r",
+            "-z",
+            "--full-tree",
+            f"{second_sha}:wxverify/wxverify",
+        ],
+    ]
+    assert [args for args, _kwargs in calls] == expected_args
+    for _args, kwargs in calls:
+        assert not kwargs.get("shell", False)
+        assert kwargs["capture_output"] is True
+        assert kwargs["check"] is False
+        assert kwargs["timeout"] == 30
+        for forbidden in ("text", "encoding", "errors", "universal_newlines"):
+            assert forbidden not in kwargs
+        env = cast("dict[str, str]", kwargs["env"])
+        git_names = {
+            name: value for name, value in env.items() if name.startswith("GIT_")
+        }
+        assert git_names == {
+            "GIT_CEILING_DIRECTORIES": str(tmp_path),
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        }
+        assert env.get("WXVERIFY_TEST_KEEP") == "1"
+        assert env.get("PATH") == expected_path
+
+
+def _make_valid_copy(tmp_path: Path) -> tuple[Path, int]:
+    """A real, fully-migrated copy holding one site, no feeds or stations.
+
+    Enough for a ``--counts-only`` run to complete past the commit check
+    and ``open_copy_readonly`` (plan :1379's wiring cases). Returns
+    (copy, site_id).
+    """
+    copy = tmp_path / "copy.db"
+    conn = sqlite3.connect(copy)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        run_migrations(conn)
+        site_id = asof_make_site(conn, "commit-check-wiring-site")
+        ensure_published_generation(conn, site_id)
+        conn.commit()
+    finally:
+        conn.close()
+    return copy, site_id
+
+
+def _run_main_counts_only(
+    *,
+    copy: Path,
+    out: Path,
+    commit_sha: str,
+    site_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[int, str, str]:
+    """Run ``main()`` once with a ``--counts-only --variable temperature``
+    argv; return (exit_code, stdout, stderr). ``check_commit`` is left for
+    the caller to monkeypatch.
+    """
+    monkeypatch.setenv("SQLITE_TMPDIR", str(copy.parent))
+    argv = [
+        "--copy",
+        str(copy),
+        "--site-id",
+        str(site_id),
+        "--out",
+        str(out),
+        "--variable",
+        "temperature",
+        "--commit-sha",
+        commit_sha,
+        "--counts-only",
+    ]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        exit_code = daily_shadow.main(argv)
+    return exit_code, stdout.getvalue(), stderr.getvalue()
+
+
+def test_wiring_check_commit_raises_exits_2_before_open_nothing_under_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring case 1 [plan :1379]: ``main()`` with ``check_commit``
+    replaced by a recorder that raises ``RefusedError`` is called exactly
+    once, exits 2, prints a single ``refused:`` line on standard error
+    carrying the recorder's own message, never calls
+    ``open_copy_readonly``, and leaves nothing under ``--out`` -- the
+    raise happens before ``out`` is ever touched.
+    """
+    copy, site_id = _make_valid_copy(tmp_path)
+    out = tmp_path / "out"
+    open_calls = 0
+    check_commit_calls = 0
+    real_open_copy_readonly = daily_shadow.open_copy_readonly
+
+    def open_recorder(path: Path) -> object:
+        nonlocal open_calls
+        open_calls += 1
+        return real_open_copy_readonly(path)
+
+    def raising_check_commit(
+        package_dir: Path, *, commit_sha: str
+    ) -> dict[str, object]:
+        del package_dir, commit_sha
+        nonlocal check_commit_calls
+        check_commit_calls += 1
+        raise daily_shadow.RefusedError("refused for test")
+
+    monkeypatch.setattr(daily_shadow, "check_commit", raising_check_commit)
+    monkeypatch.setattr(daily_shadow, "open_copy_readonly", open_recorder)
+    exit_code, _out_text, err_text = _run_main_counts_only(
+        copy=copy,
+        out=out,
+        commit_sha=_WIRING_COMMIT_SHA,
+        site_id=site_id,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 2
+    refused_lines = [
+        line for line in err_text.splitlines() if line.startswith("refused:")
+    ]
+    assert len(refused_lines) == 1
+    assert "refused for test" in refused_lines[0]
+    assert check_commit_calls == 1
+    assert open_calls == 0
+    assert not out.exists()
+
+
+def test_wiring_check_commit_returns_manifest_called_once_before_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring case 2 [plan :1379]: ``main()`` with ``check_commit``
+    replaced by a recorder that returns
+    ``daily_shadow.package_manifest(package_dir)`` is called once,
+    before ``open_copy_readonly``, with the value ``package_root()``
+    returns (``Path(wxverify.__file__).parent``) and the given sha; the
+    counts-only header's ``commit_sha`` is that sha and its ``manifest``
+    is what the recorder returned.
+    """
+    copy, site_id = _make_valid_copy(tmp_path)
+    out = tmp_path / "out"
+    events: list[tuple[str, ...]] = []
+    check_commit_dirs: list[Path] = []
+    returned_manifests: list[dict[str, object]] = []
+
+    def recording_check_commit(
+        package_dir: Path, *, commit_sha: str
+    ) -> dict[str, object]:
+        events.append(("check_commit", str(package_dir), commit_sha))
+        check_commit_dirs.append(package_dir)
+        manifest = daily_shadow.package_manifest(package_dir)
+        returned_manifests.append(manifest)
+        return manifest
+
+    real_open_copy_readonly = daily_shadow.open_copy_readonly
+
+    def open_recorder(path: Path) -> object:
+        events.append(("open_copy_readonly",))
+        return real_open_copy_readonly(path)
+
+    monkeypatch.setattr(daily_shadow, "check_commit", recording_check_commit)
+    monkeypatch.setattr(daily_shadow, "open_copy_readonly", open_recorder)
+    exit_code, out_text, err_text = _run_main_counts_only(
+        copy=copy,
+        out=out,
+        commit_sha=_WIRING_COMMIT_SHA,
+        site_id=site_id,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 0, err_text
+    assert daily_shadow.package_root() == Path(wxverify.__file__).parent
+    assert [event for event in events if event[0] == "check_commit"] == [
+        ("check_commit", str(daily_shadow.package_root()), _WIRING_COMMIT_SHA)
+    ]
+    assert check_commit_dirs == [daily_shadow.package_root()]
+    assert len(returned_manifests) == 1
+    check_index = next(
+        i for i, event in enumerate(events) if event[0] == "check_commit"
+    )
+    open_events = [
+        i for i, event in enumerate(events) if event[0] == "open_copy_readonly"
+    ]
+    assert len(open_events) == 1
+    open_index = open_events[0]
+    assert check_index < open_index
+    result_lines = [
+        line
+        for line in out_text.splitlines()
+        if line.startswith(daily_shadow.RESULT_PREFIX)
+    ]
+    assert len(result_lines) == 1
+    payload = json.loads(result_lines[0][len(daily_shadow.RESULT_PREFIX) :])
+    run_dir = out / payload["run_dir"]
+    header = json.loads((run_dir / "header.json").read_bytes())
+    assert header["commit_sha"] == _WIRING_COMMIT_SHA
+    assert header["manifest"] == returned_manifests[0]
+
+
+def test_m106_wiring_check_commit_extra_file_drives_code_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring case 3, M106 [plan :1559, :1379]: ``main()`` with
+    ``check_commit`` replaced by a recorder that returns the clean
+    manifest plus one more ``files`` entry, ``["x.py", "0" * 64]`` -- a
+    path the package does not hold -- exits 1; the run directory holds
+    only ``error.json``, whose ``stage`` is ``code_changed``, whose
+    ``manifest`` equals what the recorder returned (``x.py`` included),
+    and whose ``error`` ends ``changed []; added []; removed ["x.py"]``,
+    so the manifest ``main()`` records and compares at the end is the
+    one ``check_commit`` returned. M106 (``main()`` records and compares
+    at the end a manifest it computes itself before the open, not the
+    one ``check_commit`` returns) would instead compare a manifest it
+    computed itself -- also without ``x.py`` -- against the real
+    post-run manifest, which match, so no ``CodeChangedError`` would be
+    raised and the run would exit 0 with no ``error.json`` at all.
+    """
+    copy, site_id = _make_valid_copy(tmp_path)
+    out = tmp_path / "out"
+    returned_manifests: list[dict[str, object]] = []
+
+    def extra_file_check_commit(
+        package_dir: Path, *, commit_sha: str
+    ) -> dict[str, object]:
+        del commit_sha
+        manifest = daily_shadow.package_manifest(package_dir)
+        files = cast("list[list[str]]", manifest["files"])
+        extra_manifest = {**manifest, "files": [*files, ["x.py", "0" * 64]]}
+        returned_manifests.append(extra_manifest)
+        return extra_manifest
+
+    monkeypatch.setattr(daily_shadow, "check_commit", extra_file_check_commit)
+    exit_code, out_text, _err_text = _run_main_counts_only(
+        copy=copy,
+        out=out,
+        commit_sha=_WIRING_COMMIT_SHA,
+        site_id=site_id,
+        monkeypatch=monkeypatch,
+    )
+    assert exit_code == 1
+    result_lines = [
+        line
+        for line in out_text.splitlines()
+        if line.startswith(daily_shadow.RESULT_PREFIX)
+    ]
+    assert len(result_lines) == 1
+    payload = json.loads(result_lines[0][len(daily_shadow.RESULT_PREFIX) :])
+    run_dir = out / payload["run_dir"]
+    assert sorted(path.name for path in run_dir.iterdir()) == ["error.json"]
+    error = json.loads((run_dir / "error.json").read_bytes())
+    assert len(returned_manifests) == 1
+    assert error["stage"] == "code_changed"
+    assert error["manifest"] == returned_manifests[0]
+    assert error["error"].endswith('changed []; added []; removed ["x.py"]')
 
 
 def test_commit_check_refuses_when_subprocess_run_cannot_find_git(
