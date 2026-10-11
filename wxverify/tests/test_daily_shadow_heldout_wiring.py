@@ -15,6 +15,9 @@ than one case sharing a run.
 Also covers the ``--heldout`` half of §15.3's "What stage one lacks is
 named" (plan :1355) -- the ``--freeze-prepare`` half lives in
 ``test_daily_shadow_not_built.py``.
+
+Also covers the header's per-candidate discarded_resamples (M11) and the
+tile and twin level at the call site (M10, call-site form).
 """
 
 from __future__ import annotations
@@ -370,12 +373,11 @@ def test_m11_header_reports_discarded_resamples_per_candidate(
     ``_temperature_heldout`` (daily_shadow.py:6270-6290) from each
     candidate's own ``o.tile`` -- not a full-run read of the final
     ``outcome``, which only needs a fixture where the discarded count is
-    above zero. ``_make_fixture`` scores only lead 0 on a single day, so
-    every other scored lead (1-5) has no case for any candidate; every
-    (quantity, lead) group the tile weights iterate over therefore has at
-    least one empty lead-group, and every one of the 10,000 resamples is
-    discarded for every candidate (``kept`` 0, ``discarded`` 10,000,
-    ``discard_ok`` False).
+    above zero. The fixture has one scored lead-0 case on one day, so ten
+    of the twelve (quantity, lead) groups (leads 1-5, both quantities)
+    have no scored case. No resample is complete, so all 10,000 are
+    discarded. The test reads the header written by the real heldout run
+    and compares it with each candidate's recorded tile.
 
     This also complements, not replaces,
     ``test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds``
@@ -385,7 +387,8 @@ def test_m11_header_reports_discarded_resamples_per_candidate(
     pipeline end to end and checks the header line that the other test's
     direct call never reaches.
 
-    F-B: ``call["tile"].level`` pins the call-site ``level=LEVEL_TILE``
+    M10, call-site form (daily_shadow.py `level=LEVEL_TILE` in `tile()`):
+    ``call["tile"].level`` pins the call-site ``level=LEVEL_TILE``
     argument (daily_shadow.py:6182) as the literal ``0.975``, not the
     module constant -- a mutant that changed the call site's level
     argument, rather than the ``LEVEL_TILE`` constant itself, would flip

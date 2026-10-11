@@ -313,6 +313,8 @@ keys ``exit_code`` and ``run_dir``. A refusal (exit 2) prints none.
 
 TEMPERATURE_QUANTITIES: tuple[str, ...] = ("temperature_high", "temperature_low")
 RAIN_DECISIONS: tuple[str, ...] = ("symbol", "chance", "amount")
+RAIN_PUBLISHED_QUANTITIES: tuple[str, ...] = ("precip_occurrence", "precip_total")
+"""The published rain rows each rain line carries, by quantity (§6.1)."""
 TEMPERATURE_CANDIDATES: tuple[str, ...] = ("IW", "TD-K", "IW-BC", "TD-K-BC")
 TWINS: Mapping[str, str] = {"IW-BC": "IW", "TD-K-BC": "TD-K"}
 
@@ -3662,7 +3664,12 @@ def _extrema_ids(row: RecordRow, control: ControlValue | None) -> tuple[int, ...
 
 @dataclass(frozen=True)
 class RainContext:
-    """Everything one rain run reads, loaded once."""
+    """Everything one rain run reads, loaded once.
+
+    ``published`` is the site's published rain rows, whatever their
+    ``eligible`` and ``stale``; only :func:`rain_case` reads it, to put each
+    line's target-date rows on the line (§6.1).
+    """
 
     site: Site
     rows: Mapping[tuple[date, int], RecordRow]
@@ -3672,11 +3679,18 @@ class RainContext:
     replays: ReplayCache
     store: StationDayStore
     events: RainEvents
+    published: Mapping[tuple[str, date], PublishedTruth]
 
 
 @dataclass(frozen=True)
 class RainLine:
-    """One rain (s, L): the control, the event and the served rain (§13.3)."""
+    """One rain (s, L): the control, the event and the served rain (§13.3).
+
+    ``published`` maps ``precip_occurrence`` and ``precip_total`` to the
+    target's published row, or to None when there is none. It is read only
+    by the comparison against the published rain rows (§6.1), which decides
+    nothing.
+    """
 
     key: CaseKey
     row: RecordRow | None
@@ -3698,6 +3712,7 @@ class RainLine:
     amounts: Mapping[str, daily_method.BenchmarkValue]
     grid: tuple[daily_method.GridRanking, ...]
     own_days: daily_method.OwnDaysComparison | None
+    published: Mapping[str, PublishedTruth | None]
 
     @property
     def outcome(self) -> daily_method.EventOutcome:
@@ -3731,6 +3746,7 @@ def _unmatched_line(
     unmatched: str | None,
     control: ControlValue | None,
     day: RainDay,
+    published: Mapping[str, PublishedTruth | None],
 ) -> RainLine:
     return RainLine(
         key=key,
@@ -3753,6 +3769,7 @@ def _unmatched_line(
         amounts={},
         grid=(),
         own_days=None,
+        published=published,
     )
 
 
@@ -3770,15 +3787,20 @@ def rain_case(
     control; a missing or ``missed`` row has no decision time and no
     selection, and is a gap in the incumbent chain. A row whose replay fails
     F1 is unmatched (``f1_mismatch``) and its control is not scored (§7.3).
+    Every line carries the published rain rows of its target date, never of
+    its snapshot date (§6.1); nothing here decides on them.
     """
     day = ctx.events.full(key.target)
+    published = {
+        q: ctx.published.get((q, key.target)) for q in RAIN_PUBLISHED_QUANTITIES
+    }
     if row is None:
-        return _unmatched_line(key, None, "no_row", None, day)
+        return _unmatched_line(key, None, "no_row", None, day, published)
     found = ctx.controls[(key.snapshot_date, key.lead)]
     control = found if isinstance(found, ControlValue) else None
     unmatched = found.reason if isinstance(found, Unmatched) else None
     if row.status != "recorded":
-        return _unmatched_line(key, row, unmatched, control, day)
+        return _unmatched_line(key, row, unmatched, control, day, published)
     tz = ctx.site.timezone
     lead = key.lead
     at = parse_utc(row.snapshot_utc)
@@ -4006,6 +4028,7 @@ def rain_case(
         amounts=amounts,
         grid=grid,
         own_days=own,
+        published=published,
     )
 
 
@@ -4512,6 +4535,278 @@ def amount_report(
     }
 
 
+# --- Rain: the comparison against the published rain rows (§6.1, §7.3) ---------
+
+PUBLISHED_REASONS: tuple[str, ...] = (
+    "truth_absent",
+    "threshold_mismatch",
+    "truth_stale",
+    "truth_not_eligible",
+)
+"""Why a scored line's published row is not usable, in the order tried (§6.1).
+
+They belong to the comparison alone: counted in ``counts.published_comparison``,
+never in the primary ``unmatched``, and no score, selection or event reads them.
+"""
+
+
+def _published_reason(
+    row: PublishedTruth | None, *, quantity: str, threshold_mm: float
+) -> str | None:
+    if row is None:
+        return "truth_absent"
+    if row.rain_threshold_mm is None or row.rain_threshold_mm != threshold_mm:
+        return "threshold_mismatch"
+    if row.stale:
+        return "truth_stale"
+    if not row.eligible or row.value is None:
+        return "truth_not_eligible"
+    if quantity == "precip_occurrence" and row.value not in (0.0, 1.0):
+        return "truth_not_eligible"
+    return None
+
+
+def published_reasons(line: RainLine) -> dict[str, str | None] | None:
+    """Per quantity, why a scored line's published row is not usable (§6.1).
+
+    For each of ``precip_occurrence`` and ``precip_total``, the first that
+    applies: ``truth_absent`` (no row); ``threshold_mismatch`` (the row's
+    ``rain_threshold_mm`` is NULL, or not equal, by ``==``, to the matched
+    control's policy threshold; ``sites.rain_threshold_mm`` is never read),
+    tried before the stale check; ``truth_stale``; ``truth_not_eligible``
+    (``eligible = 0``, a NULL value or, for the occurrence, a value other
+    than exactly 0.0 or 1.0, the only two ``evaluate_precip`` gives an
+    eligible occurrence). None when the row is usable. A line that is not
+    scored is outside the comparison and gets None in place of the mapping.
+    """
+    if not line.scored:
+        return None
+    control = line.control
+    assert control is not None
+    threshold = control.policy.rain_threshold_mm
+    return {
+        q: _published_reason(line.published[q], quantity=q, threshold_mm=threshold)
+        for q in RAIN_PUBLISHED_QUANTITIES
+    }
+
+
+def published_reason_counts(
+    lines: Iterable[RainLine],
+) -> dict[str, dict[str, dict[str, int]]]:
+    """Per lead and quantity, the scored lines by comparison reason (§13.3).
+
+    Every lead ``"0"``-``"7"`` and quantity holds ``usable`` and each of
+    :data:`PUBLISHED_REASONS`, 0 when none, so the five sum to the lead's
+    scored lines. A line that is not scored is not counted.
+    """
+    out = {
+        str(lead): {
+            q: dict.fromkeys(("usable", *PUBLISHED_REASONS), 0)
+            for q in RAIN_PUBLISHED_QUANTITIES
+        }
+        for lead in RECORD_LEADS
+    }
+    for line in lines:
+        reasons = published_reasons(line)
+        if reasons is None:
+            continue
+        for q, reason in reasons.items():
+            out[str(line.key.lead)][q]["usable" if reason is None else reason] += 1
+    return out
+
+
+def published_comparison(lines: Sequence[RainLine]) -> dict[str, object]:
+    """The comparison against the published rain rows (§6.1); it decides nothing.
+
+    Its cases are the scored lines whose ``precip_occurrence`` row is usable
+    (:func:`published_reasons`): wet when its value is 1.0 and dry when 0.0,
+    in place of the event. The symbol is scored on the primary symbol cases,
+    the chance on the primary chance cases, and the amount on the primary
+    amount cases whose ``precip_total`` row is also usable, its value in place
+    of the event's amount. The formulas, fields and per-lead denominators are
+    those of the primary reports' ``sources`` and ``brier_per_lead``, with no
+    interval, no resample and no lead-weighted point. ``agreement`` (A14) sets
+    the published occurrence against the event built in full, never against
+    the control's symbol.
+    """
+    cases: list[tuple[RainLine, bool, float | None]] = []
+    for line in lines:
+        reasons = published_reasons(line)
+        if reasons is None or reasons["precip_occurrence"] is not None:
+            continue
+        occurrence = line.published["precip_occurrence"]
+        assert occurrence is not None and occurrence.value is not None
+        total = line.published["precip_total"]
+        y = (
+            total.value
+            if reasons["precip_total"] is None and total is not None
+            else None
+        )
+        cases.append((line, occurrence.value == 1.0, y))
+    symbol = [(line, wet) for line, wet, _ in cases if _symbol_common(line)]
+    chance = [
+        (line, wet)
+        for line, wet, _ in cases
+        if (values := chance_values(line))["CH-Q"] is not None
+        and values["R-clim"] is not None
+    ]
+    amount = [
+        (line, y)
+        for line, _, y in cases
+        if y is not None
+        and _observed(line) is not None
+        and amount_values(line)["control"] is not None
+        and amount_values(line)["served"] is not None
+    ]
+    return {
+        "agreement": _published_agreement(cases),
+        "symbol": {
+            "cases": _cases_per_lead(line for line, _ in symbol),
+            "sources": _published_symbol_sources(symbol),
+        },
+        "chance": {
+            "cases": _cases_per_lead(line for line, _ in chance),
+            "brier_per_lead": _published_briers(chance),
+        },
+        "amount": {
+            "cases": _cases_per_lead(line for line, _ in amount),
+            "sources": _published_amount_sources(amount),
+        },
+    }
+
+
+def _cases_per_lead(lines: Iterable[RainLine]) -> dict[str, int]:
+    out = {str(lead): 0 for lead in RECORD_LEADS}
+    for line in lines:
+        out[str(line.key.lead)] += 1
+    return out
+
+
+def _published_agreement(
+    cases: Sequence[tuple[RainLine, bool, float | None]],
+) -> dict[str, dict[str, object]]:
+    """A14: per lead, the event built in full against the published occurrence."""
+    out: dict[str, dict[str, object]] = {}
+    for lead in RECORD_LEADS:
+        at_lead = [(line, wet) for line, wet, _ in cases if line.key.lead == lead]
+        both_wet = event_only = published_only = both_dry = 0
+        for line, wet in at_lead:
+            event = line.outcome == "rain_nearby"
+            both_wet += event and wet
+            event_only += event and not wet
+            published_only += wet and not event
+            both_dry += not event and not wet
+        out[str(lead)] = {
+            "cases": len(at_lead),
+            "both_wet": both_wet,
+            "event_only_wet": event_only,
+            "published_only_wet": published_only,
+            "both_dry": both_dry,
+            "share_agreeing": (
+                None if not at_lead else (both_wet + both_dry) / len(at_lead)
+            ),
+        }
+    return out
+
+
+def _published_symbol_sources(
+    cases: Sequence[tuple[RainLine, bool]],
+) -> dict[str, dict[str, dict[str, object]]]:
+    """Per source and lead, as :func:`symbol_report` computes its ``sources``.
+
+    The published occurrence (``wet``) stands in for the event; the cost is
+    at w_r = :data:`RAIN_MISS_WEIGHT`.
+    """
+    sources: dict[str, dict[str, dict[str, object]]] = {}
+    names = sorted({name for line, _ in cases for name in symbol_values(line)})
+    for name in names:
+        per_lead: dict[str, dict[str, object]] = {}
+        for lead in RECORD_LEADS:
+            at_lead = [(line, wet) for line, wet in cases if line.key.lead == lead]
+            misses = false_alarms = missing = shown = 0
+            dry = 0
+            costs: list[float] = []
+            for line, wet in at_lead:
+                value = symbol_values(line)[name]
+                if value is None:
+                    missing += 1
+                    continue
+                misses += wet and not value
+                false_alarms += value and not wet
+                shown += value
+                dry += not wet
+                costs.append(symbol_cost(value, wet, miss_weight=RAIN_MISS_WEIGHT))
+            per_lead[str(lead)] = {
+                "cases": len(at_lead),
+                "missing": missing,
+                "misses": misses,
+                "false_alarms": false_alarms,
+                "dry_shown_share": None if dry == 0 else false_alarms / dry,
+                "shown": shown,
+                "cost_per_case": _mean(costs),
+            }
+        sources[name] = per_lead
+    return sources
+
+
+def _published_briers(
+    cases: Sequence[tuple[RainLine, bool]],
+) -> dict[str, dict[str, float | None]]:
+    """Per source and lead, the mean Brier score, as :func:`chance_report` has it.
+
+    The published occurrence (``wet``) stands in for the event; null where
+    the source has no value on any case at that lead.
+    """
+    briers: dict[str, dict[str, float | None]] = {}
+    for name in ("CH-Q", "R-clim", "control", "R0", "MB-R0", "R1"):
+        per_lead: dict[str, float | None] = {}
+        for lead in RECORD_LEADS:
+            scores = [
+                _brier(value, wet)
+                for line, wet in cases
+                if line.key.lead == lead
+                and (value := chance_values(line)[name]) is not None
+            ]
+            per_lead[str(lead)] = _mean(scores)
+        briers[name] = per_lead
+    return briers
+
+
+def _published_amount_sources(
+    cases: Sequence[tuple[RainLine, float]],
+) -> dict[str, dict[str, object]]:
+    """Per source and lead, as :func:`amount_report` computes its ``sources``.
+
+    The published ``precip_total`` (``y``) is the observed amount; ``{}``
+    when there is no case at any lead.
+    """
+    sources: dict[str, dict[str, object]] = {}
+    names = sorted({name for line, _ in cases for name in amount_values(line)})
+    for name in names:
+        per_lead: dict[str, object] = {}
+        for lead in RECORD_LEADS:
+            pairs = [
+                (value, y)
+                for line, y in cases
+                if line.key.lead == lead
+                and (value := amount_values(line)[name]) is not None
+            ]
+            per_lead[str(lead)] = {
+                "cases": len(pairs),
+                "loss": _mean(
+                    [amount_loss(f, y, under_weight=W_AMOUNT) for f, y in pairs]
+                ),
+                "loss_by_weight": {
+                    str(w): _mean([amount_loss(f, y, under_weight=w) for f, y in pairs])
+                    for w in (1.0, 2.0, 3.0)
+                },
+                "mae": _mean([abs(f - y) for f, y in pairs]),
+                "bias": _mean([f - y for f, y in pairs]),
+            }
+        sources[name] = per_lead
+    return sources
+
+
 def rain_case_counts(lines: Sequence[RainLine]) -> dict[str, dict[str, object]]:
     """Per lead: the selector's and the event's case counts (§9.1, §9.2, §7.3)."""
     out: dict[str, dict[str, object]] = {}
@@ -4640,7 +4935,12 @@ def replay_time_stats(seconds: Sequence[float]) -> dict[str, object]:
 
 
 def rain_line_json(line: RainLine) -> dict[str, object]:
-    """One output line (§13.3) for a rain (s, L)."""
+    """One output line (§13.3) for a rain (s, L).
+
+    ``published_truth`` is on every line, scored or not: per quantity, null
+    or the target's published row. ``published_reason`` is null on a line
+    that is not scored, else :func:`published_reasons`'s mapping.
+    """
     y = _observed(line)
     wet = line.outcome == "rain_nearby"
     control_cost: float | None = None
@@ -4703,6 +5003,8 @@ def rain_line_json(line: RainLine) -> dict[str, object]:
             and line.control is not None
             and line.control.symbol is not None
         ),
+        "published_truth": line.published,
+        "published_reason": published_reasons(line),
     }
 
 
@@ -6356,6 +6658,9 @@ def _run_rain(
     )
     events = RainEvents(store, timezone=site.timezone)
     replays = ReplayCache(conn, site=site, variable="precip")
+    quantities = ("precip_total", "precip_occurrence")
+    assert set(quantities) == set(RAIN_PUBLISHED_QUANTITIES)
+    published = load_published_truth(conn, site=site, quantities=quantities)
     ctx = RainContext(
         site=site,
         rows=by_key,
@@ -6365,9 +6670,8 @@ def _run_rain(
         replays=replays,
         store=store,
         events=events,
+        published=published,
     )
-    quantities = ("precip_total", "precip_occurrence")
-    published = load_published_truth(conn, site=site, quantities=quantities)
     stations = load_station_rows(conn, site=site, variable="precip")
     rebuilder = ArmARebuilder(stations, site=site, variable="precip")
     in_scope = rain_in_scope_days(case_rows, timezone=site.timezone)
@@ -6409,6 +6713,7 @@ def _run_rain(
                     "false": sum(1 for line in lines if line.f1 is False),
                     "none": sum(1 for line in lines if line.f1 is None),
                 },
+                "published_comparison": published_reason_counts(lines),
             },
             unmatched=rain_counts(lines).as_json(),
             h_training_coverage=None,
@@ -6451,10 +6756,12 @@ def _run_rain(
         house_station=house_station,
         failed_dirs=list(failed_dirs),
         decisions=reports,
+        published_comparison=published_comparison(lines),
         discarded_resamples=discarded,
         counts={
             "record_rows": _rain_record_rows(cases),
             "cases": rain_case_counts(lines),
+            "published_comparison": published_reason_counts(lines),
         },
         unmatched=rain_counts(lines).as_json(),
         rain_event_counts=rain_event_counts(lines),

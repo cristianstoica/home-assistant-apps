@@ -1,9 +1,10 @@
 """§15.4 Batch 1: killer tests for mutants M9, M10, M11, M12, M15, M20,
 M21, M23 and M25.
 
-These are direct tests that ADD to the named §15.3 tests; they do not
-replace them (§15.4:1403, "Each must be killed by the named test"). Each
-mutant's own pure function or filesystem-level site is called directly,
+Most tests here are direct tests that add to the named §15.3 tests
+elsewhere. The M10 Levels, M11 Discarded-resamples and M25 F1 tests in
+this file are the named §15.3 tests themselves (see the ledger below).
+Each mutant's own pure function or filesystem-level site is called directly,
 rather than driven through the full pipeline: for M12, directly against
 ``F1Tally.passes()`` at the 90%/95% boundary §15.3's own "F1." test
 (:1311) describes, and likewise for the others below. The site under
@@ -22,16 +23,34 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   at K + 1") directly against ``temperature_window``, the one function
   the mutant changes -- a lighter kill at the same site, not a
   re-derivation of the leak test's broader byte-identical guarantee.
-  still owed: M9 -> "the leak test" itself (§15.3:1313; also kills M28,
-  M32 and M34 per the mutant table at §15.4:1435, :1439 and :1441).
-- implemented; reviewed: pending; mutation-verified: pending: M11 -> "Discarded
+  implemented; reviewed: pending; mutation-verified: pending: M9 -> "the
+  leak test" itself (§15.3:1313), killed by change (i) under Arm A in
+  ``test_daily_shadow_leak.py``.
+- implemented; reviewed: pending; mutation-verified: pending: M28 (Arm B
+  training window not shifted one day earlier, still ends at K), killed
+  by change (i) under Arm B in ``test_daily_shadow_leak.py``.
+- implemented; reviewed: pending; mutation-verified: pending: M32 (Arm A
+  rebuild's ``known_by`` cutoff removed from ``ArmARebuilder.rebuild``, so
+  a station reading fetched after ``T(s)`` is no longer excluded), killed
+  by change (iii) under Arm A in ``test_daily_shadow_leak.py``.
+- implemented; reviewed: pending; mutation-verified: pending: M34
+  (persistence reads the published ``daily_truth`` row of day K whatever
+  the arm), killed by change (i) under Arm B and by change (iii) under
+  Arm A in ``test_daily_shadow_leak.py``.
+- implemented; reviewed: pending; mutation-verified: pending: M150
+  (``load_future_samples``'s ``as_of`` cutoff drops only the
+  ``fetched_at`` half of its check, leaving ``issued_at`` alone -- a
+  sample issued before T(s) but fetched after it is no longer excluded),
+  killed by change (ii) in ``test_daily_shadow_leak.py`` (temperature,
+  both arms; rain pending -- see that file's module docstring).
+- implemented, reviewed; mutation-verified: pending: M11 -> "Discarded
   resamples" (§15.3:1322). Covered by
   ``test_m11_draw_resamples_discard_over_1_percent_through_daily_bounds`` and
   its paired positive
   ``test_m11_draw_resamples_paired_positive_every_lead_on_every_date``, both
   through production ``draw_resamples(30)``, ``TILE_WEIGHTS`` and
   ``LEAD_WEIGHTS``, in addition to the existing direct-``Bounds``
-  ``test_m11_discard_over_1_percent_fails`` tests above. The header's
+  ``test_m11_discard_over_1_percent_fails`` tests below. The header's
   ``discarded_resamples`` entry (built inside ``_temperature_heldout``) is
   separately pinned, with the count reported, by
   ``test_m11_header_reports_discarded_resamples_per_candidate`` in
@@ -69,16 +88,16 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
 - implemented, reviewed; mutation-verified: pending: M10 (the constant form,
   :183) -> the two existing killers, reviewed in round 1:
   ``test_m10_second_killer_levels_unshifted_upper_at_0_975`` and
-  ``test_m10_levels_shifted_tile_is_inconclusive_not_pass`` above, each
+  ``test_m10_levels_shifted_tile_is_inconclusive_not_pass`` below, each
   reading the module's own ``LEVEL_TILE``.
-- implemented; reviewed: pending; mutation-verified: pending: the explicit-level
+- implemented, reviewed; mutation-verified: pending: the explicit-level
   pins added here -- ``test_m10_levels_unshifted_upper_at_0_95``,
   ``test_m10_levels_unshifted_upper_at_0_90`` and
   ``test_m10_levels_shifted_at_0_95_is_pass`` -- pin the percentile
   arithmetic (974.025 at 0.95, 949.05 at 0.90, and PASS with U = -5.975,
   §15.3:1323) at an explicit level, not ``LEVEL_TILE``; they kill no form
   of M10 by themselves.
-- implemented; reviewed: pending; mutation-verified: pending: M10 (the
+- implemented, reviewed; mutation-verified: pending: M10 (the
   call-site form, :6182, ``level=LEVEL_TILE`` inside the heldout tile's
   ``daily_bounds(...)`` call) -> the ``tile.level == 0.975`` assertion in
   ``test_m11_header_reports_discarded_resamples_per_candidate`` in
@@ -97,7 +116,7 @@ mutation-verified (checked at checkpoint C, §15.4:1403).
   ``test_m22_warm_spell_threshold_is_not_frozen_on_the_first_window``,
   in both directions (cold-then-warm, and the plan's autumn-to-winter
   case).
-- implemented; reviewed: pending; mutation-verified: pending: M25 -> plan row
+- implemented, reviewed; mutation-verified: pending: M25 -> plan row
   :1432 "the ``on_time``-only F1 rule removed", killed by "F1 (38 of 40)"
   (§15.3:1311). Covered by
   ``test_m25_on_time_only_f1_rule_removed_38_of_40_fails_f1``, its
@@ -992,6 +1011,7 @@ def _rain_line(day: daily_shadow.RainDay) -> daily_shadow.RainLine:
         amounts={},
         grid=(),
         own_days=None,
+        published={"precip_occurrence": None, "precip_total": None},
     )
 
 
