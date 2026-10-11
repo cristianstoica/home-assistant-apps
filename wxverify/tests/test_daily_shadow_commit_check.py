@@ -1,21 +1,26 @@
 """§13.3's commit check (``daily_shadow.check_commit``): the fixture
 repository, the clean case, a control for the ``subprocess.run`` stub
-itself, and mutant M113.
+itself, mutant M113, and the refusal and still-returns cases of plan
+:1375-:1376 listed under "Covered here" below, mutants M104, M108,
+M111, M112 and M116-M119 among them.
 
-The fixture builds a real git repository at ``tmp_path / "repo"`` holding
-a package directory ``wxverify/wxverify/`` (``__init__.py``, ``a.py``,
+The fixture builds a real git repository at ``tmp_path / <repo_name>``
+(default ``"repo"``) holding a package directory at ``<package_path>``
+inside it (default ``wxverify/wxverify/``: ``__init__.py``, ``a.py``,
 ``sub/b.py``), a top-level ``.gitignore`` naming ``__pycache__/`` and
-``data/``, and a tracked ``wxverify/pyproject.toml`` outside the package.
-It is committed twice -- first everything, then a change to
-``pyproject.toml`` alone -- so both commits hold the same package files.
-Every fixture git command runs with an environment built from
-``os.environ`` without any name starting ``GIT_``, plus
-``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1`` and
-``GIT_ATTR_NOSYSTEM=1``, and with ``XDG_CONFIG_HOME`` set to an empty
-directory the fixture creates outside the repository. Git then reads no
-global or system configuration file and no system-wide attributes file,
-and it looks for the per-user ignore and attributes files it reads when
-no setting names ``core.excludesFile`` or ``core.attributesFile``,
+``data/``, and a tracked ``pyproject.toml`` in the package path's parent
+(``wxverify/pyproject.toml`` by default). It is committed twice -- first
+everything, then a change to ``pyproject.toml`` alone -- so both commits
+hold the same package files. ``tmp_path / "xdg"`` is a shared,
+fixture-owned empty directory: ``_make_repo`` creates it (if missing)
+once per test and every repository a test builds shares it, since every
+fixture git command's environment points ``XDG_CONFIG_HOME`` at it.
+That environment is built from ``os.environ`` without any name starting
+``GIT_``, plus ``GIT_CONFIG_GLOBAL=/dev/null``, ``GIT_CONFIG_NOSYSTEM=1``
+and ``GIT_ATTR_NOSYSTEM=1``. Git then reads no global or system
+configuration file and no system-wide attributes file, and it looks for
+the per-user ignore and attributes files it reads when no setting names
+``core.excludesFile`` or ``core.attributesFile``,
 ``$XDG_CONFIG_HOME/git/ignore`` and ``$XDG_CONFIG_HOME/git/attributes``
 (under ``$HOME/.config/git/`` when ``XDG_CONFIG_HOME`` is unset or
 empty), under that empty directory, which holds neither, so those
@@ -27,11 +32,16 @@ configuration overrides through those variables. Each test's own
 environment is given ``GIT_CEILING_DIRECTORIES``
 set to ``tmp_path`` (plan :1373; the repository sits below it, never at
 it: git does not look in the ceiling directory itself when it searches
-upward). In the cases here git finds ``tmp_path / "repo" / ".git"``
-before reaching the ceiling; the ceiling matters for a case whose
-package directory is in no repository, where git's upward search would
+upward). In every case here but one git finds
+``tmp_path / <repo_name> / ".git"`` before reaching the ceiling; in the
+case whose package directory, ``tmp_path / "loose"``, is in no
+repository, the ceiling stops git's upward search, which would
 otherwise continue past ``tmp_path`` (into this worktree's repository
 when pytest's base temporary directory sits inside it).
+``_commit`` stages every change in a repository with ``git add -A`` and
+commits it with the fixture's ``-c user.name=t -c
+user.email=t@example.invalid``, returning the new commit's sha, for
+tests that need a third commit.
 
 Covered here (plan line numbers in brackets):
 
@@ -52,16 +62,85 @@ Covered here (plan line numbers in brackets):
   undecodable byte into the replacement character U+FFFD and let a
   committed file whose name holds an undecodable byte wrongly match a
   working file whose name holds U+FFFD in its place.
-- still owed (a later round): every other commit-check case of plan
-  :1375-:1380, and mutants M104-M112 and M114-M119.
+- implemented; reviewed: pending; mutation-verified: n/a this round
+  (none of M104, M108, M111, M112 and M116-M119 cites them):
+  refusal cases [plan :1375] -- a sha with one hex digit changed; the
+  first commit's sha, with a message naming HEAD's own (second-commit)
+  sha; ``a.py`` rewritten, and the same rewrite staged with ``git add``;
+  an untracked ``c.py``; ``sub/b.py`` deleted; a third commit that adds
+  ``l.py`` as a symbolic link to ``a.py``, checked with that commit's
+  sha; a copy of the package at ``elsewhere/pkg/`` with ``a.py``
+  rewritten in the copy; a repository whose commits hold the package at
+  ``other/wxverify/`` and nothing at ``wxverify/wxverify/``, checked on
+  ``other/wxverify/`` (``git ls-tree`` exits non-zero); the check run on
+  ``wxverify/wxverify/sub/``; and a package directory in no repository
+  (``git rev-parse`` exits non-zero).
+- implemented; reviewed: pending; mutation-verified: n/a this round
+  (none of M104, M108, M111, M112 and M116-M119 cites them):
+  cases that still return [plan :1376] -- a ``__pycache__/x.pyc`` file
+  present; an untracked ``notes.txt`` in the package; ``pyproject.toml``
+  changed outside the package; and an unchanged untracked copy of the
+  package at ``elsewhere/pkg/``.
+- implemented; reviewed: pending; mutation-verified: pending: M104
+  [plan :1557] -- the byte comparison removed from ``check_commit``: it
+  returns the manifest without comparing the files with the commit's.
+  Killed by the ignored ``data/x.py`` case and the ``--assume-unchanged``
+  and ``--skip-worktree`` cases [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M108
+  [plan :1561] -- an ``ls-tree`` record split at every tab, or at its
+  last tab, not at its first. Killed by the third commit that adds a
+  name holding a tab, whose manifest lists ``"t\\tab.py"`` [plan :1376].
+- implemented; reviewed: pending; mutation-verified: pending: M111
+  [plan :1564] -- ``check_commit`` compares the sorted object ids alone,
+  not each path with its id. Killed by ``a.py`` renamed to ``c.py`` with
+  its bytes unchanged [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M112
+  [plan :1565] -- ``ls-tree``'s output captured in text mode
+  (``text=True``), so a carriage return in a path becomes a newline.
+  Killed by the third commit that adds ``"a\\rb.py"``, renamed to
+  ``"a\\nb.py"`` with its bytes unchanged [plan :1375], and by the third
+  commit that adds ``"a\\rb.py"``, whose manifest lists it unchanged
+  [plan :1376].
+- implemented; reviewed: pending; mutation-verified: pending: M116
+  [plan :1569] -- a symbolic link or submodule record treated as a
+  regular file: kept when its path ends ``.py``, filtered out otherwise.
+  Killed by the package's ``l.py`` replaced by a regular file holding
+  the four bytes ``a.py``, the link's target (the same object id as the
+  committed link's, so only the commit's mode can refuse it), and by the
+  submodule entry ``m`` [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M117
+  [plan :1570] -- the commit's symbolic links and submodules refused
+  only when the path ends ``.py``. Killed by the submodule entry ``m``,
+  whose path does not end ``.py`` [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M118
+  [plan :1571] -- ``package_snapshot`` does not check the names in a
+  directory's list of files with ``os.lstat``, so ``read_bytes`` reads
+  through a link. Killed by ``a.py`` replaced by a symbolic link to
+  ``outside.py`` holding the same bytes [plan :1375].
+- implemented; reviewed: pending; mutation-verified: pending: M119
+  [plan :1572] -- ``package_snapshot`` does not check the names in a
+  directory's list of subdirectories with ``os.lstat``, so a link to a
+  directory is passed over. Killed by the symbolic link ``ext`` to a
+  directory holding ``x.py`` [plan :1375].
+- still owed (a later round): the ``subprocess.run`` stubs that raise
+  ``FileNotFoundError``, raise ``subprocess.TimeoutExpired``, or return a
+  ``CompletedProcess`` with return code 128; the ``package_snapshot``
+  stub raising ``OSError("forced")``; the ``os.scandir`` stub raising
+  ``PermissionError("forced")`` for ``package_dir / "sub"``; every
+  changed-``ls-tree``-output ("cannot parse") case; the ``io.open`` /
+  ``builtins.open`` recorder case [plan :1376]; plan :1377-:1380
+  (redirected environment, recorder, wiring); and mutants M105, M106,
+  M107, M109, M110, M114 and M115.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -112,20 +191,52 @@ def _git(repo: Path, xdg_config_home: Path, *args: str) -> bytes:
     return result.stdout
 
 
-def _make_repo(tmp_path: Path) -> tuple[Path, str]:
-    """Build the fixture repository; return (package_dir, second commit sha)."""
+def _commit(repo: Path, xdg_config_home: Path, message: str) -> str:
+    """Stage every change with ``git add -A`` and commit it; return the new sha."""
+    _git(repo, xdg_config_home, "add", "-A")
+    _git(
+        repo,
+        xdg_config_home,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "-m",
+        message,
+    )
+    return _git(repo, xdg_config_home, "rev-parse", "HEAD").decode("ascii").strip()
+
+
+def _make_repo(
+    tmp_path: Path,
+    *,
+    repo_name: str = "repo",
+    package_path: str = "wxverify/wxverify",
+    a_bytes: bytes = _A_BYTES,
+) -> tuple[Path, str]:
+    """Build the fixture repository; return (package_dir, second commit sha).
+
+    ``repo_name`` names the repository's folder directly under
+    ``tmp_path`` (default ``"repo"``); ``package_path`` is the package
+    directory's path inside that repository (default
+    ``"wxverify/wxverify"``), with ``pyproject.toml`` committed in its
+    parent; ``a_bytes`` is ``a.py``'s content. ``tmp_path / "xdg"`` is
+    created, if it does not already exist, as the shared
+    ``XDG_CONFIG_HOME`` every repository a test builds uses.
+    """
     xdg_config_home = tmp_path / "xdg"
-    xdg_config_home.mkdir()
-    repo = tmp_path / "repo"
+    xdg_config_home.mkdir(exist_ok=True)
+    repo = tmp_path / repo_name
     repo.mkdir()
     (repo / ".gitignore").write_bytes(b"__pycache__/\ndata/\n")
-    package_dir = repo / "wxverify" / "wxverify"
+    package_dir = repo / package_path
     package_dir.mkdir(parents=True)
     (package_dir / "__init__.py").write_bytes(_INIT_BYTES)
-    (package_dir / "a.py").write_bytes(_A_BYTES)
+    (package_dir / "a.py").write_bytes(a_bytes)
     (package_dir / "sub").mkdir()
     (package_dir / "sub" / "b.py").write_bytes(_B_BYTES)
-    pyproject = repo / "wxverify" / "pyproject.toml"
+    pyproject = package_dir.parent / "pyproject.toml"
     pyproject.write_bytes(_PYPROJECT_BYTES_1)
 
     _git(repo, xdg_config_home, "init", "--initial-branch=main")
@@ -258,3 +369,527 @@ def test_m113_committed_path_with_undecodable_byte_never_matches_replacement_cha
     )
     assert message.endswith(expected_tail)
     assert replaced == [True]
+
+
+def test_commit_check_refuses_sha_with_one_hex_digit_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 1 [plan :1375]: a sha with one hex digit changed refuses,
+    naming the wrong sha it was asked to match.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    flipped_digit = "1" if second_sha[0] == "0" else "0"
+    wrong_sha = flipped_digit + second_sha[1:]
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=wrong_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith(f"not --commit-sha {wrong_sha}")
+
+
+def test_commit_check_refuses_first_commit_sha_naming_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 2 [plan :1375]: the first commit's sha, whose package files
+    equal the second's, so only the HEAD check can refuse it, with a
+    message naming HEAD's (the second commit's) own sha.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    first_sha = (
+        _git(repo, xdg_config_home, "rev-parse", "HEAD~1").decode("ascii").strip()
+    )
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=first_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert repr(second_sha[:64]) in message
+    assert message.endswith(f"not --commit-sha {first_sha}")
+
+
+def test_commit_check_refuses_a_py_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 3 [plan :1375]: ``a.py`` rewritten on disk."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "a.py").write_bytes(b"VALUE_A = 999\n")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed ["a.py"]; added []; removed []')
+
+
+def test_commit_check_refuses_a_py_rewritten_and_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 4 [plan :1375]: the same rewrite, staged with ``git add``,
+    refuses the same way -- no command reads the index.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    (package_dir / "a.py").write_bytes(b"VALUE_A = 999\n")
+    _git(repo, xdg_config_home, "add", "wxverify/wxverify/a.py")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed ["a.py"]; added []; removed []')
+
+
+def test_commit_check_refuses_untracked_c_py(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 5 [plan :1375]: an untracked ``c.py`` in the package."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "c.py").write_bytes(b"VALUE_C = 1\n")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed []; added ["c.py"]; removed []')
+
+
+def test_commit_check_refuses_sub_b_py_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 6 [plan :1375]: ``sub/b.py`` deleted from disk."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "sub" / "b.py").unlink()
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed []; added []; removed ["sub/b.py"]')
+
+
+def test_m104_ignored_data_py_under_package_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 7, M104 [plan :1557, :1375]: an ignored ``data/x.py`` under
+    the package still refuses -- the byte comparison is not skipped just
+    because ``.gitignore`` hides the file from git.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "data").mkdir()
+    (package_dir / "data" / "x.py").write_bytes(b"VALUE_X = 1\n")
+    # check-ignore exits 1 (and _git raises) unless .gitignore ignores it.
+    _git(
+        tmp_path / "repo",
+        tmp_path / "xdg",
+        "check-ignore",
+        "--quiet",
+        "wxverify/wxverify/data/x.py",
+    )
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed []; added ["data/x.py"]; removed []')
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--assume-unchanged", "--skip-worktree"],
+    ids=["assume-unchanged", "skip-worktree"],
+)
+def test_m104_a_py_rewritten_after_index_flag_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """Cases 8/9, M104 [plan :1557, :1375]: ``a.py`` rewritten after
+    ``git update-index --assume-unchanged`` or ``--skip-worktree`` still
+    refuses, after first confirming the fixture's own ``git status
+    --porcelain`` prints nothing -- a change ``git status`` cannot see.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    _git(repo, xdg_config_home, "update-index", flag, "wxverify/wxverify/a.py")
+    (package_dir / "a.py").write_bytes(b"VALUE_A = 999\n")
+    status = _git(repo, xdg_config_home, "status", "--porcelain")
+    assert status == b""
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed ["a.py"]; added []; removed []')
+
+
+def test_m111_a_py_renamed_to_c_py_bytes_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 10, M111 [plan :1564, :1375]: ``a.py`` renamed to ``c.py``
+    with its bytes unchanged -- comparing sorted object ids alone (the
+    mutant) would not catch this, since the id set is the same; comparing
+    each path with its id (the real code) refuses.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "a.py").rename(package_dir / "c.py")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed []; added ["c.py"]; removed ["a.py"]')
+
+
+def test_m112_committed_cr_name_renamed_to_lf_name_bytes_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 11, M112 [plan :1565, :1375]: a third commit adds
+    ``"a\\rb.py"`` (a carriage return in the name); that file is then
+    renamed to ``"a\\nb.py"`` (a newline) with its bytes unchanged. Text
+    mode (the mutant) would turn the committed record's ``\\r`` into
+    ``\\n`` on read, making the two names equal; bytes mode (the real
+    code) keeps them distinct and refuses.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    cr_name = "a\rb.py"
+    (package_dir / cr_name).write_bytes(b"VALUE_CR = 1\n")
+    third_sha = _commit(repo, xdg_config_home, "add cr name")
+    (package_dir / cr_name).rename(package_dir / "a\nb.py")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    expected_tail = (
+        "changed []; added "
+        + json.dumps(["a\nb.py"])
+        + "; removed "
+        + json.dumps(["a\rb.py"])
+    )
+    assert message.endswith(expected_tail)
+
+
+def test_commit_check_refuses_committed_symlink_l_py(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 12 [plan :1375]: a third commit adds ``l.py`` as a symbolic
+    link to ``a.py``; checked with that commit's sha, it refuses by the
+    commit's mode.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    os.symlink("a.py", package_dir / "l.py")
+    third_sha = _commit(repo, xdg_config_home, "add symlink l.py")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    assert str(excinfo.value) == (
+        f"commit check: {third_sha} holds {json.dumps('l.py')} as a symbolic link"
+    )
+
+
+def test_m116_committed_symlink_refuses_even_when_disk_object_id_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 13, M116 [plan :1569, :1375]: the same third commit, then the
+    package's ``l.py`` replaced by a regular file holding the four bytes
+    ``a.py`` -- the committed link's own object id -- so only the
+    commit's mode can refuse it. A symbolic link or submodule record
+    treated as a regular file (the mutant) would match it and return.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    os.symlink("a.py", package_dir / "l.py")
+    third_sha = _commit(repo, xdg_config_home, "add symlink l.py")
+    (package_dir / "l.py").unlink()
+    (package_dir / "l.py").write_bytes(b"a.py")
+    assert not (package_dir / "l.py").is_symlink()
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    assert str(excinfo.value) == (
+        f"commit check: {third_sha} holds {json.dumps('l.py')} as a symbolic link"
+    )
+
+
+def test_m117_committed_submodule_entry_refuses_despite_no_py_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 14, M116/M117 [plan :1569, :1570, :1375]: a third commit adds
+    a submodule entry ``m`` (via ``git update-index --add
+    --cacheinfo``), though the package directory holds nothing named
+    ``m``. It refuses by the commit's mode alone, even though ``m`` does
+    not end ``.py`` -- a mutant that refuses a symbolic link or submodule
+    only when its path ends ``.py`` would not catch this.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    first_sha = (
+        _git(repo, xdg_config_home, "rev-parse", "HEAD~1").decode("ascii").strip()
+    )
+    _git(
+        repo,
+        xdg_config_home,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{first_sha},wxverify/wxverify/m",
+    )
+    _git(
+        repo,
+        xdg_config_home,
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "commit",
+        "-m",
+        "add submodule m",
+    )
+    third_sha = _git(repo, xdg_config_home, "rev-parse", "HEAD").decode("ascii").strip()
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    message = str(excinfo.value)
+    expected_message = (
+        f"commit check: {third_sha} holds {json.dumps('m')} as a submodule"
+    )
+    assert message == expected_message
+
+
+def test_m118_a_py_replaced_by_symlink_to_outside_file_refuses_as_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 15, M118 [plan :1571, :1375]: ``a.py`` replaced by a symbolic
+    link to ``outside.py``, which holds ``a.py``'s own bytes. It refuses
+    because the link is detected (``os.lstat``), not because the bytes
+    differ -- a mutant that reads through the link would see matching
+    bytes and return normally.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(_A_BYTES)
+    (package_dir / "a.py").unlink()
+    os.symlink(outside, package_dir / "a.py")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert '"a.py" is a symbolic link' in message
+    assert "differ" not in message
+
+
+def test_m119_symlinked_directory_in_package_refuses_as_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 16, M119 [plan :1572, :1375]: a symbolic link ``ext`` in the
+    package to a directory ``outside_dir`` that holds ``x.py``. It
+    refuses because the link is detected (``os.lstat``) on the
+    subdirectory listing, not because the bytes differ -- a mutant that
+    skips that check would pass the link's target directory over.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "x.py").write_bytes(b"VALUE_X = 1\n")
+    os.symlink(outside_dir, package_dir / "ext")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert '"ext" is a symbolic link' in message
+    assert "differ" not in message
+
+
+def test_commit_check_refuses_rewritten_copy_elsewhere_in_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 17 [plan :1375]: an untracked copy of the package at
+    ``elsewhere/pkg/`` in the same repository, with ``a.py`` rewritten in
+    the copy, checked on the copy -- it refuses because its bytes differ,
+    not because of where it sits.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    elsewhere = repo / "elsewhere" / "pkg"
+    shutil.copytree(package_dir, elsewhere)
+    (elsewhere / "a.py").write_bytes(b"VALUE_A = 999\n")
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(elsewhere, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith('changed ["a.py"]; added []; removed []')
+
+
+def test_commit_check_refuses_when_commit_has_no_wxverify_wxverify_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 18 [plan :1375]: a repository whose commits hold the package
+    files at ``other/wxverify/`` and nothing at ``wxverify/wxverify/``,
+    checked on ``other/wxverify/`` -- ``ls-tree``'s tree path is the fixed
+    string ``wxverify/wxverify``, so it exits non-zero regardless of the
+    package directory the check was given.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(
+        tmp_path, repo_name="other_repo", package_path="other/wxverify"
+    )
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith(
+        f"commit check: git ls-tree -r -z --full-tree {second_sha}:wxverify/wxverify"
+        " exited "
+    )
+
+
+def test_commit_check_refuses_when_run_on_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 19 [plan :1375]: the check run on ``wxverify/wxverify/sub/``
+    instead of the package directory -- ``ls-tree``'s tree path stays
+    ``wxverify/wxverify``, so the commit's full file list is compared
+    against the subdirectory's single file.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(package_dir / "sub", commit_sha=second_sha)
+    message = str(excinfo.value)
+    assert message.startswith("commit check:")
+    assert message.endswith(
+        'changed []; added ["b.py"]; removed ["__init__.py", "a.py", "sub/b.py"]'
+    )
+
+
+def test_commit_check_refuses_package_dir_in_no_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 20 [plan :1375]: a package directory in no repository --
+    ``git rev-parse`` exits non-zero. ``GIT_CEILING_DIRECTORIES`` is set
+    to ``tmp_path`` so git's upward search stops there instead of
+    reaching this worktree's own repository.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    loose = tmp_path / "loose"
+    loose.mkdir()
+    with pytest.raises(daily_shadow.RefusedError) as excinfo:
+        daily_shadow.check_commit(loose, commit_sha="0" * 40)
+    message = str(excinfo.value)
+    assert message.startswith(
+        "commit check: git rev-parse --verify HEAD^{commit} exited "
+    )
+
+
+def test_commit_check_returns_manifest_with_pycache_pyc_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 21 [plan :1376]: a ``__pycache__/x.pyc`` file present is
+    ignored, so the check still returns.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    pycache = package_dir / "__pycache__"
+    pycache.mkdir()
+    (pycache / "x.pyc").write_bytes(b"not python bytecode, just bytes")
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+
+
+def test_commit_check_returns_manifest_with_untracked_notes_txt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 22 [plan :1376]: an untracked ``notes.txt`` in the package is
+    outside the ``.py`` scope, so the check still returns.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    (package_dir / "notes.txt").write_bytes(b"not a python file\n")
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+
+
+def test_commit_check_returns_manifest_with_pyproject_toml_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 23 [plan :1376]: ``pyproject.toml``, outside the package
+    directory, changed -- the check still returns; refusals above are not
+    caused by the fixture.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    pyproject = package_dir.parent / "pyproject.toml"
+    pyproject.write_bytes(b'[project]\nname = "wxverify"\nversion = "9.9.9"\n')
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+
+
+def test_commit_check_returns_manifest_for_unchanged_copy_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 24 [plan :1376]: an unchanged untracked copy of the package
+    at ``elsewhere/pkg/`` in the same repository -- where the package
+    sits does not matter when its bytes have not changed.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, second_sha = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    elsewhere = repo / "elsewhere" / "pkg"
+    shutil.copytree(package_dir, elsewhere)
+    manifest = daily_shadow.check_commit(elsewhere, commit_sha=second_sha)
+    assert manifest == daily_shadow.package_manifest(elsewhere)
+
+
+def test_m108_committed_tab_name_is_split_at_first_tab(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 25, M108 [plan :1561, :1376]: a third commit adds
+    ``"t\\tab.py"`` (a tab in the name); the check still returns, and its
+    manifest lists the name split at its first tab only. A mutant that
+    splits at every tab, or at the last tab, would produce a different
+    path.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    tab_name = "t\tab.py"
+    (package_dir / tab_name).write_bytes(b"VALUE_TAB = 1\n")
+    third_sha = _commit(repo, xdg_config_home, "add tab name")
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+    files = cast("list[list[str]]", manifest["files"])
+    assert any(path == tab_name for path, _digest in files)
+
+
+def test_m112_committed_cr_name_manifest_lists_it_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case 26, M112 [plan :1565, :1376]: a third commit adds
+    ``"a\\rb.py"`` (a carriage return in the name); the check still
+    returns, and its manifest lists the name with the carriage return
+    kept. Text-mode capture of ``ls-tree``'s output (the mutant) would
+    turn it into a newline instead.
+    """
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    package_dir, _ = _make_repo(tmp_path)
+    repo = tmp_path / "repo"
+    xdg_config_home = tmp_path / "xdg"
+    cr_name = "a\rb.py"
+    (package_dir / cr_name).write_bytes(b"VALUE_CR = 1\n")
+    third_sha = _commit(repo, xdg_config_home, "add cr name")
+    manifest = daily_shadow.check_commit(package_dir, commit_sha=third_sha)
+    assert manifest == daily_shadow.package_manifest(package_dir)
+    files = cast("list[list[str]]", manifest["files"])
+    assert any(path == cr_name for path, _digest in files)
