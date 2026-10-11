@@ -8,7 +8,11 @@ raising ``PermissionError``/another non-``FileNotFoundError`` ``OSError``.
 Case (b)'s ``NotADirectoryError`` kills a mutant that *narrows* ``main()``'s
 own ``OSError`` handler below ``NotADirectoryError`` -- not one that widens
 it, since ``NotADirectoryError`` is itself an ``OSError`` and a widened
-``except Exception`` would catch it identically.
+``except Exception`` would catch it identically. Also covers the last
+sentence of plan :1370 (the **Atomic outputs** item) with
+``test_output_folder_d_counts_only_then_freeze_prepare_leave_two_run_dirs``:
+a ``--counts-only`` run and then a ``--freeze-prepare`` run on one copy
+leave two separate run directories.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from typing import Literal, assert_never
 
 import pytest
 
@@ -39,9 +44,11 @@ def _stub_check_commit(package_dir: Path, *, commit_sha: str) -> dict[str, objec
 def _make_copy(tmp_path: Path) -> Path:
     """A real, fully-migrated copy holding one site, no feeds or stations.
 
-    Only ``test_output_folder_a_missing_out_is_created`` needs the run to
-    actually complete (exit 0); the refusal cases below never reach the
-    open, so a migrated-but-empty copy is fine for them too.
+    ``test_output_folder_a_missing_out_is_created`` and
+    ``test_output_folder_d_counts_only_then_freeze_prepare_leave_two_run_dirs``
+    need the run to actually complete (exit 0); the refusal cases below
+    never reach the open, so a migrated-but-empty copy is fine for them
+    too.
     """
     copy = tmp_path / "copy.db"
     conn = sqlite3.connect(copy)
@@ -58,8 +65,21 @@ def _make_copy(tmp_path: Path) -> Path:
 
 
 def _run_main(
-    *, copy: Path, out: Path, monkeypatch: pytest.MonkeyPatch
+    *,
+    copy: Path,
+    out: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: Literal["counts-only", "freeze-prepare"] = "freeze-prepare",
 ) -> tuple[int, str, str, int]:
+    """Run ``main()`` once; ``mode`` picks the argv built below.
+
+    ``mode="freeze-prepare"`` (the default, unchanged for every existing
+    caller) builds the exact byte-identical argv this function always
+    built. ``mode="counts-only"`` builds the ``--counts-only`` argv for
+    the two-run test in this file. There is no other mode: an
+    unrecognized value fails at runtime instead of silently falling into
+    the freeze-prepare argv.
+    """
     monkeypatch.setattr(daily_shadow, "check_commit", _stub_check_commit)
     monkeypatch.setenv("SQLITE_TMPDIR", str(copy.parent))
     real_open = daily_shadow.open_copy_readonly
@@ -71,21 +91,39 @@ def _run_main(
         return real_open(path)
 
     monkeypatch.setattr(daily_shadow, "open_copy_readonly", open_recorder)
-    argv = [
-        "--copy",
-        str(copy),
-        "--site-id",
-        "1",
-        "--out",
-        str(out),
-        "--variable",
-        "temperature",
-        "--commit-sha",
-        COMMIT_SHA,
-        "--freeze-prepare",
-        "--house-station",
-        "SYN-HOUSE",
-    ]
+    match mode:
+        case "counts-only":
+            argv = [
+                "--copy",
+                str(copy),
+                "--site-id",
+                "1",
+                "--out",
+                str(out),
+                "--variable",
+                "temperature",
+                "--commit-sha",
+                COMMIT_SHA,
+                "--counts-only",
+            ]
+        case "freeze-prepare":
+            argv = [
+                "--copy",
+                str(copy),
+                "--site-id",
+                "1",
+                "--out",
+                str(out),
+                "--variable",
+                "temperature",
+                "--commit-sha",
+                COMMIT_SHA,
+                "--freeze-prepare",
+                "--house-station",
+                "SYN-HOUSE",
+            ]
+        case _:
+            assert_never(mode)
     stdout, stderr = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         exit_code = daily_shadow.main(argv)
@@ -201,3 +239,73 @@ def test_output_folder_c2_other_oserror(
         error=OSError(errno.EIO, "forced"),
         message="OSError: [Errno 5] forced",
     )
+
+
+def _result_run_dir(out_text: str) -> str:
+    result_line = [
+        line
+        for line in out_text.splitlines()
+        if line.startswith(daily_shadow.RESULT_PREFIX)
+    ]
+    assert len(result_line) == 1
+    payload = json.loads(result_line[0][len(daily_shadow.RESULT_PREFIX) :])
+    run_dir = payload["run_dir"]
+    assert isinstance(run_dir, str)
+    return run_dir
+
+
+def test_output_folder_d_counts_only_then_freeze_prepare_leave_two_run_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan :1370 (**Atomic outputs**), last sentence: a ``--counts-only``
+    run and then a ``--freeze-prepare`` run on one copy leave two separate
+    run directories.
+    """
+    copy = _make_copy(tmp_path)
+    out = tmp_path / "out"
+    exit_code1, out_text1, err_text1, _open_calls1 = _run_main(
+        copy=copy, out=out, monkeypatch=monkeypatch, mode="counts-only"
+    )
+    assert exit_code1 == 0
+    assert not any(line.startswith("renamed") for line in err_text1.splitlines())
+    run_dir1_name = _result_run_dir(out_text1)
+    run_dir1 = out / run_dir1_name
+    assert run_dir1.exists()
+    assert run_dir1.name.startswith("counts-only-")
+
+    before_bytes = {
+        p.relative_to(run_dir1): p.read_bytes()
+        for p in run_dir1.rglob("*")
+        if p.is_file()
+    }
+    assert set(before_bytes) == {Path("header.json")}
+
+    exit_code2, out_text2, err_text2, _open_calls2 = _run_main(
+        copy=copy, out=out, monkeypatch=monkeypatch, mode="freeze-prepare"
+    )
+    assert exit_code2 == 0
+    run_dir2_name = _result_run_dir(out_text2)
+    run_dir2 = out / run_dir2_name
+    assert run_dir2.exists()
+    assert run_dir2.name.startswith("freeze-prepare-")
+    assert sorted(p.name for p in run_dir2.iterdir()) == [
+        "freeze_note.draft.json",
+        "header.json",
+        "lines.jsonl",
+    ]
+
+    assert run_dir1_name != run_dir2_name
+    assert run_dir1.parent == run_dir2.parent
+    assert sorted(p.name for p in run_dir1.parent.iterdir()) == sorted(
+        [run_dir1.name, run_dir2.name]
+    )
+
+    after_bytes = {
+        p.relative_to(run_dir1): p.read_bytes()
+        for p in run_dir1.rglob("*")
+        if p.is_file()
+    }
+    assert after_bytes == before_bytes
+
+    assert not any(line.startswith("renamed") for line in err_text2.splitlines())
+    assert not any(p.name.endswith((".partial", ".failed")) for p in out.rglob("*"))

@@ -85,9 +85,12 @@ mutation-verified (checked at checkpoint C, §15.4:1448).
   ``tests/test_daily_shadow_batch2_mutants.py`` by
   ``test_m24_expect_sha256_off_by_one_hex_digit_is_refused`` and its
   paired positive.
-- still owed: atomic outputs (§15.3:1370), last sentence: "A
-  counts-only run and then a ``--freeze-prepare`` run on one copy leave
-  two separate run directories."
+- implemented; reviewed: pending; mutation-verified: n/a (no mutant row):
+  atomic outputs (§15.3:1370), last sentence: "A counts-only run and then
+  a ``--freeze-prepare`` run on one copy leave two separate run
+  directories." Covered by
+  ``test_output_folder_d_counts_only_then_freeze_prepare_leave_two_run_dirs``
+  in ``tests/test_daily_shadow_output_folder.py``.
 - implemented; reviewed: pending; mutation-verified: pending: M21 (plan
   :1473, an unknown day's amount scored as 0,
   ``daily_method.observed_amount``'s unknown branch) and M68 (plan :1521,
