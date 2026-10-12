@@ -1,11 +1,14 @@
-"""§15.3 the run-level wiring: ``twin_missing`` and the compose_iw_bc-only wrapper.
+"""§15.3 the run-level wiring: ``twin_missing``, its wrapper run and the flip.
 
-Drives the real pipeline (``run`` -> ``_run_temperature`` ->
-``_temperature_heldout`` -> ``candidate_outcome``) end to end over a tiny,
-production-written fixture, to prove by construction that ``twin_missing``
-is literally the twin's own ``missing`` count, not merely documented as
-such, and that a corrected candidate whose own composer gives no value is
-caught by its own count rather than by its twin's.
+Drives the real pipeline (``main`` with ``--heldout`` -> ``run`` ->
+``_run_temperature`` -> ``_temperature_heldout`` -> ``candidate_outcome``)
+end to end over a tiny, production-written fixture written to disk as the
+copy, to prove by construction that ``twin_missing`` is literally the
+twin's own ``missing`` count, not merely documented as such, that a
+corrected candidate whose own composer gives no value is caught by its
+own count rather than by its twin's, and that the split rule's flip
+reaches its own candidate's ``candidate_outcome`` call and no other.
+Each of these runs exits 0 (plan :1418).
 
 Also covers §15.4's M22 ("warm-spell threshold frozen on the first
 window"): a two-case, DB-backed fixture with disjoint training windows,
@@ -22,10 +25,15 @@ tile and twin level at the call site (M10, call-site form).
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import io
 import json
+import os
 import sqlite3
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -38,6 +46,7 @@ from wxverify.forecast import daily_method
 from wxverify.settings.keys import set_setting
 from wxverify.verification import daily_shadow
 from wxverify.verification.record import build_forecast_record, resolve_snapshot_utc
+from wxverify.verification.simulate import latest_knowable_target
 
 _DAY = date(2035, 6, 15)
 
@@ -305,7 +314,95 @@ def _force_none_at_lead_zero(monkeypatch: pytest.MonkeyPatch, attr: str) -> None
     monkeypatch.setattr(daily_method, attr, forced)
 
 
+_COMMIT_SHA = "b" * 40
+
+
+def _stub_check_commit(package_dir: Path, *, commit_sha: str) -> dict[str, object]:
+    """Skip the real commit check -- the fixture is never an actual
+    git-tracked checkout -- and report the package manifest as-is."""
+    del commit_sha
+    return daily_shadow.package_manifest(package_dir)
+
+
+def _write_copy(
+    conn: sqlite3.Connection, site: daily_shadow.Site, tmp_path: Path
+) -> Path:
+    """Write the in-memory fixture to disk as main()'s ``--copy``, with an
+    mtime whose last complete target is ``_DAY``, so main()'s held-out
+    range is ``_DAY`` alone."""
+    copy = tmp_path / "copy.db"
+    disk = sqlite3.connect(copy)
+    try:
+        conn.backup(disk)
+    finally:
+        disk.close()
+    conn.close()
+    stamp = datetime(_DAY.year, _DAY.month, _DAY.day, 12, tzinfo=UTC) + timedelta(
+        days=1
+    )
+    os.utime(copy, (stamp.timestamp(), stamp.timestamp()))
+    assert latest_knowable_target(site.timezone, stamp) == _DAY
+    return copy
+
+
+def _write_note(site: daily_shadow.Site, tmp_path: Path) -> Path:
+    """Write a freeze note that matches this package, with the first
+    held-out date ``_DAY``."""
+    path = tmp_path / "note.json"
+    note: dict[str, object] = {
+        "format": daily_shadow.NOTE_FORMAT,
+        "site": {"id": site.site_id},
+        "first_h_date": _DAY.isoformat(),
+        "excluded_h_dates": [],
+        "station_set": [],
+        "db_import": None,
+        "manifest": daily_shadow.package_manifest(daily_shadow.package_root()),
+        "constants": daily_shadow.frozen_constants(),
+        "house_station": "SYN-HOUSE",
+        "td_k": daily_shadow.TD_K_DEFAULT,
+    }
+    path.write_text(json.dumps(note), encoding="utf-8")
+    return path
+
+
+def _run_main_heldout(
+    conn: sqlite3.Connection,
+    site: daily_shadow.Site,
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[int, str]:
+    """Run ``main()`` with ``--heldout`` on the fixture; return the exit
+    code and stderr."""
+    copy = _write_copy(conn, site, tmp_path)
+    note_path = _write_note(site, tmp_path)
+    monkeypatch.setattr(daily_shadow, "check_commit", _stub_check_commit)
+    monkeypatch.setenv("SQLITE_TMPDIR", str(copy.parent))
+    argv = [
+        "--copy",
+        str(copy),
+        "--site-id",
+        str(site.site_id),
+        "--out",
+        str(tmp_path / "out"),
+        "--variable",
+        "temperature",
+        "--commit-sha",
+        _COMMIT_SHA,
+        "--heldout",
+        "--freeze-note",
+        str(note_path),
+        "--expect-sha256",
+        daily_shadow.sha256_file(copy),
+    ]
+    stdout, stderr = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+        exit_code = daily_shadow.main(argv)
+    return exit_code, stderr.getvalue()
+
+
 def test_twin_missing_equals_the_twins_own_missing_count(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forcing IW's (and TD-K's) composer to None at lead 0 raises IW's own
@@ -318,7 +415,12 @@ def test_twin_missing_equals_the_twins_own_missing_count(
     _force_none_at_lead_zero(monkeypatch, "compose_iw")
     _force_none_at_lead_zero(monkeypatch, "compose_td_k")
 
-    _run_heldout(conn, site)
+    exit_code, err_text = _run_main_heldout(
+        conn, site, tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+
+    assert exit_code == 0, err_text
+    assert len(calls) == 4
 
     by_name = {call["name"]: call for call in calls}
     assert set(by_name) == {"IW", "TD-K", "IW-BC", "TD-K-BC"}
@@ -331,22 +433,27 @@ def test_twin_missing_equals_the_twins_own_missing_count(
     assert by_name["IW-BC"]["twin_missing"] == by_name["IW"]["missing"]
 
     assert by_name["TD-K"]["missing"] > 0
+    assert by_name["TD-K"]["twin"] is None
     assert by_name["TD-K"]["twin_missing"] == 0
 
     assert by_name["TD-K-BC"]["missing"] == 0
     assert by_name["TD-K-BC"]["twin_missing"] == by_name["TD-K"]["missing"]
 
+    assert all(call["flip"] is False for call in calls)
+
 
 def test_a_corrected_candidates_own_composer_is_caught_by_its_own_count(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Forcing IW-BC's OWN composer to None at lead 0 raises IW-BC's own
-    ``missing`` (against control) -- unlike the previous test, where only
-    IW-BC's ``twin_missing`` moved while its own ``missing`` stayed 0, here
+    ``missing`` (against control). In the twin-missing test above, IW's own
+    ``missing`` and IW-BC's ``twin_missing`` rise while IW-BC's own
+    ``missing`` stays 0; here IW-BC's own ``missing`` and ``twin_missing``
     BOTH move (``twin_missing`` is ``case_deltas(lines, "IW-BC", "IW")``,
     which also reads IW-BC's own value, so it is not twin-only sensitive).
-    IW itself, whose composer was never touched, stays unaffected either
-    way: IW's own ``missing`` is 0 in both tests. (Whether the pipeline's
+    IW, whose composer is not touched here, keeps its own ``missing`` at
+    0, so the count comes from IW-BC's composer alone. (Whether the pipeline's
     own precedence rule then reports the own-count reason over the twin
     one, when both are nonzero, is pinned directly against
     ``candidate_outcome`` by Twin rule (iv) in
@@ -358,7 +465,12 @@ def test_a_corrected_candidates_own_composer_is_caught_by_its_own_count(
     calls = _record_outcome_calls(monkeypatch)
     _force_none_at_lead_zero(monkeypatch, "compose_iw_bc")
 
-    _run_heldout(conn, site)
+    exit_code, err_text = _run_main_heldout(
+        conn, site, tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+
+    assert exit_code == 0, err_text
+    assert len(calls) == 4
 
     by_name = {call["name"]: call for call in calls}
     assert by_name["IW"]["missing"] == 0
@@ -366,11 +478,44 @@ def test_a_corrected_candidates_own_composer_is_caught_by_its_own_count(
     assert by_name["IW-BC"]["twin_missing"] > 0
 
 
+def test_the_split_rules_flip_reaches_its_own_candidate_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``segment_report``'s flip for IW is forced on -- the IW call to
+    ``candidate_outcome`` receives ``flip=True`` and the other three
+    receive ``False``, so each candidate gets its own flip."""
+    conn, site = _make_fixture()
+    calls = _record_outcome_calls(monkeypatch)
+    real_report = daily_shadow.segment_report
+
+    def flipped(
+        segments: Sequence[Sequence[daily_shadow.TempLine]], names: Sequence[str]
+    ) -> tuple[list[dict[str, object]], dict[str, bool]]:
+        report, flips = real_report(segments, names)
+        return report, {**flips, "IW": True}
+
+    monkeypatch.setattr(daily_shadow, "segment_report", flipped)
+
+    exit_code, err_text = _run_main_heldout(
+        conn, site, tmp_path=tmp_path, monkeypatch=monkeypatch
+    )
+
+    assert exit_code == 0, err_text
+    assert len(calls) == 4
+    by_name = {call["name"]: call for call in calls}
+    assert {name: call["flip"] for name, call in by_name.items()} == {
+        "IW": True,
+        "TD-K": False,
+        "IW-BC": False,
+        "TD-K-BC": False,
+    }
+
+
 def test_m11_header_reports_discarded_resamples_per_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """M11's header line: the ``discarded_resamples`` entry built inside
-    ``_temperature_heldout`` (daily_shadow.py:6270-6290) from each
+    ``_temperature_heldout`` (daily_shadow.py:6572-6579) from each
     candidate's own ``o.tile`` -- not a full-run read of the final
     ``outcome``, which only needs a fixture where the discarded count is
     above zero. The fixture has one scored lead-0 case on one day, so ten
@@ -389,7 +534,7 @@ def test_m11_header_reports_discarded_resamples_per_candidate(
 
     M10, call-site form (daily_shadow.py `level=LEVEL_TILE` in `tile()`):
     ``call["tile"].level`` pins the call-site ``level=LEVEL_TILE``
-    argument (daily_shadow.py:6182) as the literal ``0.975``, not the
+    argument (daily_shadow.py:6484) as the literal ``0.975``, not the
     module constant -- a mutant that changed the call site's level
     argument, rather than the ``LEVEL_TILE`` constant itself, would flip
     this literal. The twin-bearing candidates (IW-BC, TD-K-BC, per

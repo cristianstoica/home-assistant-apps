@@ -1,6 +1,6 @@
 """§6.6 / §10.1 / §15.3 — the rain leak test.
 
-Rain's leak test (§10.1, oracle file ``.tmp/rain-leak-oracle.md``) runs the
+Rain's leak test (§10.1, whose text is the oracle) runs the
 real pipeline twice with the arm forced — Arm A as built, Arm B by giving
 one in-scope ``precip`` reading a NULL ``fetched_at`` so G-a fails — and
 asserts that none of changes (i)-(iii) move the (s, 2) line except the one
@@ -33,7 +33,7 @@ question):
   it), so every row's replay reproduces its own ``displayed`` values
   exactly (F1 passes) and the window's training days carry real,
   counted feed data — with one model, any non-empty day set makes the
-  selector eligible (§10.1, F3-1);
+  selector eligible (§10.1);
 * the case, (s, 2): one of the above rows (snapshot s, lead 2, target
   s+2, status ``recorded``), so the control is well-formed.
 """
@@ -80,8 +80,7 @@ _K = _S - timedelta(days=1)
 _K_MINUS_1 = _K - timedelta(days=1)
 _TARGET = _S + timedelta(days=2)
 # A superset of rain's 60-day training window and of the oracle's "s-37
-# to s" / "s-67 to s" record-row readings (§10.1; the date-range decision
-# that resolved the ambiguity between them).
+# to s" / "s-67 to s" record-row readings (§10.1), so both are covered.
 _WINDOW_FIRST = _S - timedelta(days=67)
 _RECORD_LEADS = range(6)
 
@@ -385,8 +384,7 @@ def _build_record_matrix(
     days, lead 5's own snapshot), so every row's replay reproduces its own
     ``displayed`` values exactly (F1 passes) whatever its lead. This gives
     the rain window's training days real, counted feed data: with one
-    model, any non-empty day set makes the selector eligible (§10.1,
-    F3-1).
+    model, any non-empty day set makes the selector eligible (§10.1).
     """
     displayed_by_target: dict[date, dict[str, float | None]] = {}
     for snapshot in _date_range(first_snapshot, last_snapshot):
@@ -623,6 +621,13 @@ def _canonical(obj: dict[str, object], *, excluding: str | None = None) -> str:
     return json.dumps(trimmed, sort_keys=True)
 
 
+def _field_bytes(line: dict[str, object], key: str) -> bytes:
+    """One field re-serialised from the parsed line, keeping its loaded key
+    order (the writer sorts keys), so a value or JSON-type change shows as
+    a byte difference."""
+    return json.dumps(line[key]).encode()
+
+
 def _rain_events(copy: Path, *, site_id: int) -> daily_shadow.RainEvents:
     """The run's own ``RainEvents`` reader, direct from the copy — used
     only to confirm a change landed in the station data, never to derive
@@ -738,6 +743,8 @@ def test_leak_change_i_arm_a_window_end(
     assert _canonical(before_line) == _canonical(after_line)
     assert before_line["training_asof_differs"] == 0
     assert after_line["training_asof_differs"] == 0
+    for field in ("published_truth", "published_reason"):
+        assert _field_bytes(before_line, field) == _field_bytes(after_line, field)
 
     before_grid = _read_jsonl(before_dir / "trigger_grid.jsonl")
     after_grid = _read_jsonl(after_dir / "trigger_grid.jsonl")
@@ -780,8 +787,8 @@ def test_leak_change_i_arm_b_published_rows_inert(
     after_s2 = _find_line(after_lines, snapshot=_S, lead=2)
     assert _canonical(before_s2) == _canonical(after_s2)
     assert before_s2["training_asof_differs"] == 0
-    assert before_s2["published_truth"] == after_s2["published_truth"]
-    assert before_s2["published_reason"] == after_s2["published_reason"]
+    for field in ("published_truth", "published_reason"):
+        assert _field_bytes(before_s2, field) == _field_bytes(after_s2, field)
 
     before_grid = _read_jsonl(before_dir / "trigger_grid.jsonl")
     after_grid = _read_jsonl(after_dir / "trigger_grid.jsonl")
@@ -809,6 +816,11 @@ def test_leak_change_i_arm_b_published_rows_inert(
         "stale": False,
         "rain_threshold_mm": _RAIN_THRESHOLD_MM,
     }, published
+    assert _field_bytes(after_s0, "published_truth") == (
+        b'{"precip_occurrence": {"eligible": true, "rain_threshold_mm": 0.2,'
+        b' "stale": false, "value": 1.0}, "precip_total": {"eligible": true,'
+        b' "rain_threshold_mm": 0.2, "stale": false, "value": 5.0}}'
+    )
 
 
 @pytest.mark.parametrize("arm", ["A", "B"])
@@ -865,6 +877,8 @@ def test_leak_change_ii_forecast_cutoff(
     assert _canonical(before_line) == _canonical(after_line)
     assert before_line["training_asof_differs"] == 0
     assert after_line["training_asof_differs"] == 0
+    for field in ("published_truth", "published_reason"):
+        assert _field_bytes(before_line, field) == _field_bytes(after_line, field)
 
     before_grid = _read_jsonl(before_dir / "trigger_grid.jsonl")
     after_grid = _read_jsonl(after_dir / "trigger_grid.jsonl")
@@ -920,6 +934,8 @@ def test_leak_change_iii_new_station_full_vs_asof(
     after_differs = after_line["training_asof_differs"]
     assert before_differs == 0, before_differs
     assert after_differs == 1, after_differs
+    for field in ("published_truth", "published_reason"):
+        assert _field_bytes(before_line, field) == _field_bytes(after_line, field)
 
     before_grid = _read_jsonl(before_dir / "trigger_grid.jsonl")
     after_grid = _read_jsonl(after_dir / "trigger_grid.jsonl")
@@ -927,7 +943,7 @@ def test_leak_change_iii_new_station_full_vs_asof(
     after_cell = _find_line(after_grid, snapshot=_S, lead=2)
     assert _canonical(before_cell) == _canonical(after_cell)
 
-    # Landed check, moved below the line/grid assertions (it calls the
+    # Landed check, placed after the line/grid assertions (it calls the
     # same production ``StationDayStore.as_of`` that M147 changes, so a
     # setup check placed before the kill assertions would stop the test
     # there under that mutant instead of at the plan's kill point): day K
