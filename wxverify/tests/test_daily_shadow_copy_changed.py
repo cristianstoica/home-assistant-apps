@@ -23,7 +23,7 @@ mutation happens from inside the scoring stage (``stage == "run"``, the
 ``control_value`` call site), so a removed end-of-run check would also
 hide the breakage this test injects.
 
-Production refs: ``daily_shadow.py:7113-7119`` (the post-run
+Production refs: ``daily_shadow.py:7116-7122`` (the post-run
 ``stage = "copy_check"`` -> ``sha256_file(copy)`` -> ``CopyChangedError``
 check) and ``daily_shadow.py:1008-1036`` (``error_after_open``, which
 passes a ``CopyChangedError`` through unchanged at :1020-1021, chains
@@ -52,17 +52,17 @@ no ``error.json``); the ``run_dir`` listing assertion after it is never
 reached.
 
 M23 has two possible forms. The whole-block form
-(``daily_shadow.py`` :7113-7119 deleted, including the second
+(``daily_shadow.py`` :7116-7122 deleted, including the second
 ``sha256_file(copy)`` call) -> at case (b)'s ``assert len(calls) >= 2``
 (``test_case_b_the_second_sha256_cannot_be_computed``): correct = 3
-(``sha256_file`` is called once before the run at :7001, once at the
-end-of-run check at :7114 -- the call this form deletes -- and once more
-inside ``error_after_open`` at :1023, after the :7114 call has raised),
+(``sha256_file`` is called once before the run at :7004, once at the
+end-of-run check at :7117 -- the call this form deletes -- and once more
+inside ``error_after_open`` at :1023, after the :7117 call has raised),
 mutant = 1 -- with the second call gone, case (b)'s wrapper (which raises
 from its second call onward) is never triggered, the run completes
 normally, and this call-count assertion is case (b)'s first failing one,
 before its ``exit_code`` check.
-A comparison-only form of M23 (the ``sha256_file(copy)`` call at :7114
+A comparison-only form of M23 (the ``sha256_file(copy)`` call at :7117
 kept, only the ``if after != before: raise CopyChangedError`` comparison
 dropped) is NOT killed by case (b): that call still happens as the second
 ``sha256_file`` call, the test's wrapper still forces an ``OSError`` on it
@@ -79,13 +79,11 @@ there lets that run complete instead of raising ``CopyChangedError``.
 Production names used -- all public, none underscore-prefixed:
 ``daily_shadow.main``, ``daily_shadow.control_value``,
 ``daily_shadow.sha256_file``, ``daily_shadow.RecordRow``,
-``daily_shadow.Site``, ``daily_shadow.Variable``, ``daily_shadow.RainRule``,
+``daily_shadow.Variable``, ``daily_shadow.RainRule``,
 ``daily_shadow.ControlValue``, ``daily_shadow.Unmatched``,
-``daily_shadow.RAIN_RULES``, ``daily_shadow.RESULT_PREFIX``,
-``daily_shadow.package_manifest``, ``daily_shadow.load_site``,
-``timeutil.isoformat_utc``, ``record.resolve_snapshot_utc``,
-``simulate.latest_knowable_target``, ``migrations.run_migrations``,
-``tz_generations.ensure_published_generation``.
+``daily_shadow.RESULT_PREFIX``, ``daily_shadow.package_manifest``.
+The fixture (``shadow_build_precip_copy``, ``shadow_set_copy_mtime``)
+comes from ``tests.helpers``.
 """
 
 from __future__ import annotations
@@ -93,110 +91,21 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
-import sqlite3
 from collections.abc import Mapping
-from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
-from tests.helpers import asof_make_real_feed, asof_make_site
-from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from tests.helpers import shadow_build_precip_copy, shadow_set_copy_mtime
 from wxverify.verification import daily_shadow
-from wxverify.verification.daily_shadow import Site
-from wxverify.verification.record import resolve_snapshot_utc
-from wxverify.verification.simulate import latest_knowable_target
 
 COMMIT_SHA = "c" * 40
-_APP_VERSION = "0.16.7"
-_DAY = date(2037, 4, 1)
-
-
-def _make_copy(tmp_path: Path, *, name: str) -> tuple[Path, Site]:
-    copy = tmp_path / name
-    conn = sqlite3.connect(copy)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        run_migrations(conn)
-        site_id = asof_make_site(conn, "copy-changed-site")
-        ensure_published_generation(conn, site_id)
-        conn.commit()
-    finally:
-        conn.close()
-    conn = sqlite3.connect(copy)
-    try:
-        conn.row_factory = sqlite3.Row
-        site = daily_shadow.load_site(conn, site_id=site_id)
-    finally:
-        conn.close()
-    return copy, site
-
-
-def _build_fixture(tmp_path: Path, *, name: str) -> tuple[Path, Site]:
-    """One feed, one precip ``forecast_of_record`` row for ``_DAY``.
-
-    No station readings at all -- ``_DAY``'s own event/amount are
-    irrelevant here; only that ``control_value`` is invoked for the row.
-    """
-    copy, site = _make_copy(tmp_path, name=name)
-    conn = sqlite3.connect(copy)
-    try:
-        feed_id = asof_make_real_feed(conn, "model-a")
-        snapshot_utc = isoformat_utc(resolve_snapshot_utc("UTC", _DAY, "07:00"))
-        daily_quantities = json.dumps(
-            {
-                "displayed": {
-                    "total_mm": 1.0,
-                    "wet_hours": 4.0,
-                    "extrema_feed_ids": [feed_id],
-                }
-            }
-        )
-        conn.execute(
-            """
-            INSERT INTO forecast_of_record
-                (site_id, tz_generation_id, timezone, snapshot_local_date,
-                 snapshot_local_time, snapshot_utc, target_local_date, variable,
-                 display_lead, status, write_path, policy, methodology_version,
-                 app_version, candidates, daily_quantities)
-            VALUES (?, ?, 'UTC', ?, '07:00:00', ?, ?, 'precip', 0, 'recorded',
-                    'on_time', '{"rain_threshold_mm": 0.2}', 1, ?, NULL, ?)
-            """,
-            (
-                site.site_id,
-                site.generation_id,
-                _DAY.isoformat(),
-                snapshot_utc,
-                _DAY.isoformat(),
-                _APP_VERSION,
-                daily_quantities,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    return copy, site
 
 
 def _stub_check_commit(package_dir: Path, *, commit_sha: str) -> dict[str, object]:
     del commit_sha
     return daily_shadow.package_manifest(package_dir)
-
-
-def _set_deterministic_now(copy: Path) -> date:
-    """Fix the copy's mtime so main()'s last-complete target is ``_DAY``."""
-    stamp = datetime(_DAY.year, _DAY.month, _DAY.day, 12, tzinfo=UTC) + timedelta(
-        days=2
-    )
-    os.utime(copy, (stamp.timestamp(), stamp.timestamp()))
-    last_complete = latest_knowable_target("UTC", stamp)
-    assert last_complete >= _DAY, last_complete
-    return last_complete
 
 
 def _run_main(
@@ -268,8 +177,8 @@ def _make_control_value_recorder(
 def test_the_copy_changes_mid_run_with_no_other_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    copy, site = _build_fixture(tmp_path, name="copy.db")
-    _set_deterministic_now(copy)
+    copy, site = shadow_build_precip_copy(tmp_path, name="copy.db")
+    shadow_set_copy_mtime(copy)
     before_bytes = copy.read_bytes()
 
     calls, wrapper = _make_control_value_recorder(copy, raise_after_mutate=False)
@@ -301,8 +210,8 @@ def test_the_copy_changes_mid_run_with_no_other_failure(
 def test_case_a_the_copy_changes_and_the_hook_itself_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    copy, site = _build_fixture(tmp_path, name="copy.db")
-    _set_deterministic_now(copy)
+    copy, site = shadow_build_precip_copy(tmp_path, name="copy.db")
+    shadow_set_copy_mtime(copy)
     before_bytes = copy.read_bytes()
 
     calls, wrapper = _make_control_value_recorder(copy, raise_after_mutate=True)
@@ -333,8 +242,8 @@ def test_case_a_the_copy_changes_and_the_hook_itself_raises(
 def test_case_b_the_second_sha256_cannot_be_computed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    copy, site = _build_fixture(tmp_path, name="copy.db")
-    _set_deterministic_now(copy)
+    copy, site = shadow_build_precip_copy(tmp_path, name="copy.db")
+    shadow_set_copy_mtime(copy)
     before_bytes = copy.read_bytes()
 
     original = daily_shadow.sha256_file
@@ -382,8 +291,8 @@ def test_paired_positive_an_unmutated_copy_runs_clean(
     errors above come from the injected mutation/failure, not from the
     fixture itself.
     """
-    copy, site = _build_fixture(tmp_path, name="copy.db")
-    _set_deterministic_now(copy)
+    copy, site = shadow_build_precip_copy(tmp_path, name="copy.db")
+    shadow_set_copy_mtime(copy)
 
     out_dir = tmp_path / "out"
     exit_code, out_text, err_text = _run_main(

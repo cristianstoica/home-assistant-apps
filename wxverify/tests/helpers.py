@@ -7,20 +7,28 @@ modules belong here. Anything used by a single file stays local to it.
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
+from pathlib import Path
 
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.verification import daily_shadow
+from wxverify.verification.daily_shadow import Site
 from wxverify.verification.decision import ContinuousLead, OccurrenceLead
 from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
     OCCURRENCE_BASELINES,
 )
+from wxverify.verification.record import resolve_snapshot_utc
+from wxverify.verification.simulate import latest_knowable_target
 
 
 def occurrence_baseline_set(
@@ -555,3 +563,91 @@ def alive_after_wait(
     while any(r() is not None for r in refs) and time.monotonic() < deadline:
         time.sleep(0.01)
     return [r() is not None for r in refs]
+
+
+# ---------------------------------------------------------------------------
+# Daily-shadow copy fixture (plan §15.3, "The copy changed during the run").
+# Shared by test_daily_shadow_copy_changed.py, test_daily_shadow_prepare_open.py
+# and test_daily_shadow_readonly_open.py. All values are synthetic.
+# ---------------------------------------------------------------------------
+
+SHADOW_APP_VERSION = "0.16.7"
+SHADOW_DAY = date(2037, 4, 1)
+
+
+def shadow_make_copy(tmp_path: Path, *, name: str) -> tuple[Path, Site]:
+    copy = tmp_path / name
+    conn = sqlite3.connect(copy)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        run_migrations(conn)
+        site_id = asof_make_site(conn, "copy-changed-site")
+        ensure_published_generation(conn, site_id)
+        conn.commit()
+    finally:
+        conn.close()
+    conn = sqlite3.connect(copy)
+    try:
+        conn.row_factory = sqlite3.Row
+        site = daily_shadow.load_site(conn, site_id=site_id)
+    finally:
+        conn.close()
+    return copy, site
+
+
+def shadow_build_precip_copy(tmp_path: Path, *, name: str) -> tuple[Path, Site]:
+    """One feed, one precip ``forecast_of_record`` row for ``SHADOW_DAY``.
+
+    No station readings at all -- ``SHADOW_DAY``'s own event/amount are
+    irrelevant here; only that ``control_value`` is invoked for the row.
+    """
+    copy, site = shadow_make_copy(tmp_path, name=name)
+    conn = sqlite3.connect(copy)
+    try:
+        feed_id = asof_make_real_feed(conn, "model-a")
+        snapshot_utc = isoformat_utc(resolve_snapshot_utc("UTC", SHADOW_DAY, "07:00"))
+        daily_quantities = json.dumps(
+            {
+                "displayed": {
+                    "total_mm": 1.0,
+                    "wet_hours": 4.0,
+                    "extrema_feed_ids": [feed_id],
+                }
+            }
+        )
+        conn.execute(
+            """
+            INSERT INTO forecast_of_record
+                (site_id, tz_generation_id, timezone, snapshot_local_date,
+                 snapshot_local_time, snapshot_utc, target_local_date, variable,
+                 display_lead, status, write_path, policy, methodology_version,
+                 app_version, candidates, daily_quantities)
+            VALUES (?, ?, 'UTC', ?, '07:00:00', ?, ?, 'precip', 0, 'recorded',
+                    'on_time', '{"rain_threshold_mm": 0.2}', 1, ?, NULL, ?)
+            """,
+            (
+                site.site_id,
+                site.generation_id,
+                SHADOW_DAY.isoformat(),
+                snapshot_utc,
+                SHADOW_DAY.isoformat(),
+                SHADOW_APP_VERSION,
+                daily_quantities,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return copy, site
+
+
+def shadow_set_copy_mtime(copy: Path) -> date:
+    """Fix the copy's mtime so main()'s last-complete target is ``SHADOW_DAY``."""
+    stamp = datetime(
+        SHADOW_DAY.year, SHADOW_DAY.month, SHADOW_DAY.day, 12, tzinfo=UTC
+    ) + timedelta(days=2)
+    os.utime(copy, (stamp.timestamp(), stamp.timestamp()))
+    last_complete = latest_knowable_target("UTC", stamp)
+    assert last_complete >= SHADOW_DAY, last_complete
+    return last_complete
