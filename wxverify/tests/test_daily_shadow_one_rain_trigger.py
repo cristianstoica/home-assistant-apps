@@ -220,7 +220,7 @@ def _insert_station_day(
                 station_id,
                 isoformat_utc(valid_at),
                 increment,
-                f"{cumulative:.2f} mm precipTotal",
+                f"{round(cumulative, 10)} mm precipTotal",
                 isoformat_utc(fetched_at),
             ),
         )

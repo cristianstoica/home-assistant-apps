@@ -3,7 +3,8 @@
 Every function here is pure: no database, no clock, no file or network I/O.
 Every tunable is a required keyword argument, so a caller cannot fall back to
 a silent default. Millimetre lines are compared in hundredths, as integers
-(``round(total * 100)``), and every ratio is a :class:`fractions.Fraction`.
+(``round(total * 100)``), and every ratio is a :class:`fractions.Fraction`;
+a station's running-total text is read as its exact decimal, rounded half-even.
 
 A model is named by one key, the string ``"<source>/<model>"``. The key is
 only compared for equality, never split; every tie order sorts on the
@@ -17,6 +18,7 @@ import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_EVEN, Decimal
 from fractions import Fraction
 from typing import Literal, cast
 
@@ -641,7 +643,8 @@ def compose_persistence(
 # The rain truth (§6.6, §6.7)
 # --------------------------------------------------------------------------
 
-_PRECIP_TOTAL_SUFFIX = " mm precipTotal"
+_PRECIP_TOTAL_UNIT = "mm precipTotal"
+_RUNNING_TOTAL_CAP_MM = 500.0
 
 
 @dataclass(frozen=True)
@@ -678,14 +681,18 @@ class StationDayTotal:
 
 
 def _parse_running_total(source_raw: str | None) -> float | None:
-    if source_raw is None or not source_raw.endswith(_PRECIP_TOTAL_SUFFIX):
+    if source_raw is None:
         return None
-    head = source_raw[: -len(_PRECIP_TOTAL_SUFFIX)].strip()
+    number, _, unit = source_raw.partition(" ")
+    if unit != _PRECIP_TOTAL_UNIT:
+        return None
     try:
-        value = float(head)
+        value = float(number)
     except ValueError:
         return None
-    if not math.isfinite(value):
+    if not math.isfinite(value) or value < 0 or str(value) != number:
+        return None
+    if value > _RUNNING_TOTAL_CAP_MM:
         return None
     return value
 
@@ -696,14 +703,19 @@ def station_day_total(
     """One station's total for one local day, with its problems (§6.7).
 
     Readings are taken in hour order. Problems: ``counter_reset`` (the
-    running total drops by more than 0.01 mm), ``unparsed_total``,
+    running total drops by more than 0.01 mm), ``unparsed_total`` (a
+    running total whose text is not exactly ``"<number> mm precipTotal"``,
+    with ``<number>`` a finite float >= 0 in its own ``str()`` form, or
+    whose text's value is above 500 mm before any rounding to hundredths),
     ``unreconciled`` (the increments miss the last running total by more
     than 0.01 mm) and ``future_timestamp`` (an hour after its fetch). An
     ``unreconciled`` day whose running totals all parse and never go down
-    takes the last running total (``from_running_total``) and stays valid;
-    every other problem day is invalid. ``after_gap`` counts the readings
-    that follow the previous reading by ``gap_hours`` or more. No reading is
-    changed.
+    takes the last running total (``from_running_total``), in hundredths of
+    its text's exact decimal, rounded half-even, and stays valid; every
+    other problem day is invalid. Running totals are compared in hundredths
+    of their text's exact decimal, rounded half-even; the increment sum by
+    ``hundredths()``. ``after_gap`` counts the readings that follow the
+    previous reading by ``gap_hours`` or more. No reading is changed.
     """
     ordered = sorted(readings, key=lambda r: r.hour)
     hours = len({r.hour.replace(minute=0, second=0, microsecond=0) for r in ordered})
@@ -713,7 +725,10 @@ def station_day_total(
     parsed = [v for v in running if v is not None]
     if len(parsed) != len(running):
         problems.append("unparsed_total")
-    running_h = [hundredths(v) for v in parsed]
+    running_h = [
+        int((Decimal(str(v)) * 100).to_integral_value(rounding=ROUND_HALF_EVEN))
+        for v in parsed
+    ]
     never_down = all(b >= a for a, b in zip(running_h, running_h[1:], strict=False))
     if any(a - b > 1 for a, b in zip(running_h, running_h[1:], strict=False)):
         problems.append("counter_reset")
@@ -736,7 +751,7 @@ def station_day_total(
     )
     return StationDayTotal(
         total=total,
-        hundredths=hundredths(total),
+        hundredths=running_h[-1] if correction is not None else hundredths(total),
         hours=hours,
         expected_hours=expected_hours,
         problems=tuple(problems),

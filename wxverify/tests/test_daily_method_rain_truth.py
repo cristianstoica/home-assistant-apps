@@ -377,3 +377,200 @@ def test_station_day_correction_from_running_total() -> None:
     assert "counter_reset" in reset_result.problems
     assert reset_result.correction is None
     assert reset_result.invalid is True
+
+
+@pytest.mark.parametrize(
+    ("source_raw", "value", "expected_hundredths"),
+    [
+        pytest.param("0.0 mm precipTotal", 0.0, 0, id="accepted-0.0"),
+        pytest.param("-0.0 mm precipTotal", -0.0, 0, id="accepted-neg-0.0"),
+        pytest.param("1e-05 mm precipTotal", 1e-05, 0, id="accepted-1e-05"),
+        pytest.param(
+            "0.30000000000000004 mm precipTotal",
+            0.30000000000000004,
+            30,
+            id="accepted-0.3-float-trap",
+        ),
+        pytest.param("16.41 mm precipTotal", 16.41, 1641, id="accepted-16.41"),
+        pytest.param("500.0 mm precipTotal", 500.0, 50000, id="accepted-500-cap"),
+        pytest.param("1e+16 mm precipTotal", 1e16, None, id="refused-1e16-cap"),
+        pytest.param("-1.0 mm precipTotal", 0.0, None, id="refused-negative-total"),
+        pytest.param("nan mm precipTotal", 0.0, None, id="refused-nan"),
+        pytest.param("inf mm precipTotal", 0.0, None, id="refused-inf"),
+        pytest.param(
+            "1.0   mm precipTotal",
+            0.0,
+            None,
+            id="refused-two-trailing-spaces",
+        ),
+        pytest.param(" 1.0 mm precipTotal", 0.0, None, id="refused-leading-space"),
+        pytest.param("1.0  mm precipTotal", 0.0, None, id="refused-one-trailing-space"),
+        pytest.param("1_000 mm precipTotal", 0.0, None, id="refused-underscore"),
+        pytest.param("+1.0 mm precipTotal", 0.0, None, id="refused-plus-sign"),
+        pytest.param("1e-5 mm precipTotal", 0.0, None, id="refused-short-exponent"),
+        pytest.param("01.0 mm precipTotal", 0.0, None, id="refused-leading-zero"),
+        pytest.param("", 0.0, None, id="refused-empty-string-as-whole"),
+        pytest.param("1.0 mm", 0.0, None, id="refused-1.0-mm-as-whole"),
+        pytest.param(" mm precipTotal", 0.0, None, id="refused-empty-formatted"),
+        pytest.param("1.0 mm mm precipTotal", 0.0, None, id="refused-1.0mm-formatted"),
+    ],
+)
+def test_station_day_total_running_total_text_rule(
+    source_raw: str, value: float, expected_hundredths: int | None
+) -> None:
+    """Row 21 / #115 §19.4: the running-total text rule, one reading alone.
+
+    The contract (forecast-method plan line 385, time-alignment plan
+    §10.4.3 step 1): a reading's ``source_raw`` must parse as exactly
+    ``"<number> mm precipTotal"``, with the number's own ``str()`` text
+    matching the number text exactly, finite and >= 0, or the day carries
+    ``unparsed_total``; the same problem covers a parsed total above the
+    500 mm cap. The accepted hundredths are #115 §19.4's own T1 values for
+    the same strings: 0, 0, 0, 30, 1641, 50000.
+
+    With only one reading, no second running total exists to drop
+    (``counter_reset``) or disagree with the increment sum
+    (``unreconciled``), and ``fetched_at`` is ``None`` so
+    ``future_timestamp`` cannot fire -- ``unparsed_total`` is the only
+    problem either rule can add.
+    """
+    reading = RainReading(
+        hour=datetime(2035, 1, 1, 0),
+        value=value,
+        source_raw=source_raw,
+        fetched_at=None,
+    )
+    result = station_day_total([reading], expected_hours=1, gap_hours=2)
+    if expected_hundredths is None:
+        assert result.problems == ("unparsed_total",)
+        assert result.invalid is True
+    else:
+        assert result.hundredths == expected_hundredths
+        assert result.problems == ()
+        assert result.correction is None
+        assert result.invalid is False
+
+
+@pytest.mark.parametrize(
+    ("source_raw", "expected_hundredths"),
+    [
+        pytest.param("1.015 mm precipTotal", 102, id="corrected-half-even-1.015"),
+        pytest.param("0.575 mm precipTotal", 58, id="corrected-half-even-0.575"),
+        pytest.param("0.015 mm precipTotal", 2, id="corrected-half-even-0.015"),
+        pytest.param("0.025 mm precipTotal", 2, id="corrected-half-even-0.025"),
+        pytest.param("16.41 mm precipTotal", 1641, id="corrected-half-even-16.41"),
+        pytest.param("500.0 mm precipTotal", 50000, id="corrected-half-even-500.0"),
+    ],
+)
+def test_station_day_total_correction_reads_decimal_half_even(
+    source_raw: str, expected_hundredths: int
+) -> None:
+    """A corrected day takes the running total's own half-even hundredths.
+
+    One reading, value 0.0, whose running-total text disagrees with the
+    (zero) increment sum by more than the running total itself -- the only
+    problem is ``unreconciled``, the running total never goes down (one
+    value, trivially), so the day is corrected to ``from_running_total``
+    and its total is exactly the running-total text read as a float. The
+    hundredths pinned here are the text's own half-even decimal reading,
+    not a float ``round(total * 100)`` of that same number -- the two
+    disagree for "1.015" (102 vs 101) and "0.575" (58 vs 57).
+    """
+    number_text = source_raw.split(" ", 1)[0]
+    reading = RainReading(
+        hour=datetime(2035, 1, 1, 0),
+        value=0.0,
+        source_raw=source_raw,
+        fetched_at=None,
+    )
+    result = station_day_total([reading], expected_hours=1, gap_hours=2)
+    assert result.problems == ("unreconciled",)
+    assert result.correction == "from_running_total"
+    assert result.invalid is False
+    assert result.total == float(number_text)
+    assert result.hundredths == expected_hundredths
+
+
+def test_station_day_total_counter_reset_uses_decimal_rounding() -> None:
+    """A counter reset is caught by the half-even reading, not float rounding.
+
+    The running totals "1.015" then "1.0" read as half-even hundredths 102
+    then 100, a drop of 2 -- above the 1-hundredth tolerance, so
+    ``counter_reset`` fires. A float ``round(total * 100)`` of the same two
+    numbers gives 101 then 100, a drop of only 1, which would not fire.
+    """
+    readings = [
+        RainReading(
+            hour=datetime(2035, 1, 1, 0),
+            value=1.0,
+            source_raw="1.015 mm precipTotal",
+            fetched_at=None,
+        ),
+        RainReading(
+            hour=datetime(2035, 1, 1, 1),
+            value=0.0,
+            source_raw="1.0 mm precipTotal",
+            fetched_at=None,
+        ),
+    ]
+    result = station_day_total(readings, expected_hours=2, gap_hours=2)
+    assert result.problems == ("counter_reset",)
+    assert result.correction is None
+    assert result.invalid is True
+
+
+def test_station_day_total_small_increment_mismatch_is_unreconciled() -> None:
+    """A 0.015 mm gap between the increment sum and the running total corrects.
+
+    The single reading's increment (1.0 mm) misses its own running total
+    ("1.015 mm precipTotal") by 0.015 mm -- more than the 0.01 mm
+    tolerance, so the day is ``unreconciled`` and corrected to the running
+    total, whose half-even hundredths is 102.
+    """
+    reading = RainReading(
+        hour=datetime(2035, 1, 1, 0),
+        value=1.0,
+        source_raw="1.015 mm precipTotal",
+        fetched_at=None,
+    )
+    result = station_day_total([reading], expected_hours=1, gap_hours=2)
+    assert result.problems == ("unreconciled",)
+    assert result.correction == "from_running_total"
+    assert result.total == 1.015
+    assert result.hundredths == 102
+    assert result.invalid is False
+
+
+@pytest.mark.parametrize(
+    ("source_raw", "value"),
+    [
+        pytest.param("500.01 mm precipTotal", 500.01, id="refused-above-cap-500.01"),
+        pytest.param(
+            "500.004 mm precipTotal",
+            500.004,
+            id="refused-above-cap-before-rounding",
+        ),
+        pytest.param("500 mm precipTotal", 500.0, id="refused-500-str-mismatch"),
+        pytest.param(None, 0.0, id="refused-no-source-raw"),
+    ],
+)
+def test_station_day_total_cap_and_odd_texts_are_unparsed(
+    source_raw: str | None, value: float
+) -> None:
+    """The 500 mm cap and malformed running-total texts are ``unparsed_total``.
+
+    "500.01" is refused by the plain 500 mm cap; "500.004" is above 500 mm
+    before any rounding (its half-even hundredths, 50000, would otherwise
+    look acceptable, so the cap must be checked on the float, not the
+    rounded hundredths); "500" is refused because ``str(500.0)`` is
+    "500.0", not "500"; and a ``None`` running total is refused outright.
+    """
+    reading = RainReading(
+        hour=datetime(2035, 1, 1, 0),
+        value=value,
+        source_raw=source_raw,
+        fetched_at=None,
+    )
+    result = station_day_total([reading], expected_hours=1, gap_hours=2)
+    assert result.problems == ("unparsed_total",)
+    assert result.invalid is True
