@@ -151,7 +151,7 @@ mutation-verified (checked at checkpoint C, §15.4:1448).
   assertion in ``test_m11_header_reports_discarded_resamples_per_candidate``
   in ``tests/test_daily_shadow_heldout_wiring.py``.
 - implemented, reviewed; mutation-verified: n/a (no mutant row): "What
-  stage one lacks is named" (§15.3:1390). Covered by
+  stage one lacks is named" (§15.3:1399). Covered by
   ``test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers``
   and ``test_rain_freeze_prepare_not_built_names_the_missing_a_numbers``
   in ``tests/test_daily_shadow_not_built.py``, and

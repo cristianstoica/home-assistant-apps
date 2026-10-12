@@ -39,6 +39,8 @@ import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from tests.helpers import asof_make_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
@@ -444,3 +446,13 @@ def test_fault_states_as_of_t_partial_day_twelve_is_not_reliable(
     assert syn1_full is not None
     assert syn1_full.hours == 24, syn1_full
     assert syn1_full.hundredths == 200, syn1_full
+
+
+@pytest.mark.skip(
+    reason="deferred to stage two (plan §6.7, §15.3): a --rain-holdout "
+    "intervals run against SYN-1's two held-out intervals, reporting "
+    "exclusion_table, holdout_partial_days and holdout_comparison; plus "
+    "the no-table (absent) and index-only (ERROR at exclusion_read) copies"
+)
+def test_interval_holdout_deferred_to_stage_two() -> None:
+    raise NotImplementedError("Stage-two acceptance test not implemented")

@@ -1,17 +1,20 @@
-"""§15.3 "What stage one lacks is named" (plan :1355).
+"""§15.3 "What stage one lacks is named" (plan :1399).
 
 Stage one only: temperature's ``--freeze-prepare`` header names, in
 ``not_built``, at least A3, A7, A12, F2, A11's temporary-file size and D2
 option C, and holds a ``not_built`` naming D2 option C in
 ``tradeoffs.tables["low=C"]``; rain's ``--freeze-prepare`` header names at
 least A6 at the offered values of w_amount and w_r, A7, A16, A17, F2 and
-A11's temporary-file size, each by its A-number or ``F2``. Temperature's
-``--heldout`` half -- its header's A11/D2-option-C ``not_built`` entries and
-the ``not_built`` in ``sensitivities["low=C"]`` -- is pinned separately, in
+A11's temporary-file size, each by its A-number or ``F2``. Rain's header
+also names the interval hold-out by ``rain_holdout``, standing for it,
+``exclusion_table``, ``holdout_comparison`` and ``holdout_partial_days``.
+Temperature's ``--heldout`` half -- its header's A11/D2-option-C
+``not_built`` entries and the ``not_built`` in ``sensitivities["low=C"]``
+-- is pinned separately, in
 ``test_daily_shadow_heldout_wiring.py``'s
 ``test_heldout_not_built_names_a11_and_d2_option_c``. Stage two replaces
-this test with one that runs the same modes and finds no ``not_built`` key
-at all.
+this test with one that runs the same modes, finds no ``not_built`` key at
+any depth, and finds rain's four hold-out keys present.
 """
 
 from __future__ import annotations
@@ -223,12 +226,15 @@ def test_temperature_freeze_prepare_not_built_names_the_missing_a_numbers(
 def test_rain_freeze_prepare_not_built_names_the_missing_a_numbers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Rain's ``not_built`` names A6 (w_amount/w_r), A7, A16, A17, F2, A11.
+    """Rain's ``not_built`` names A6/A7/A16/A17/F2/A11 and rain_holdout.
 
     Each assertion fails if that entry is dropped from ``not_built`` -- in
     particular a mutant that drops A17 alone, or A6's w_amount/w_r wording
     alone, fails this test where a looser "some entries present" check would
-    not.
+    not. The same holds for the ``rain_holdout`` entry, which stands for
+    ``exclusion_table``, ``holdout_comparison`` and
+    ``holdout_partial_days`` (plan :1399) and also names ``--rain-holdout``
+    and ``interval_holdout`` (plan :952).
     """
     copy = _make_copy(tmp_path, name="precip")
     _add_one_matched_rain_row(copy)
@@ -251,3 +257,35 @@ def test_rain_freeze_prepare_not_built_names_the_missing_a_numbers(
     a11_entries = [entry for entry in not_built if "A11" in str(entry)]
     assert a11_entries, not_built
     assert "SQLITE_TMPDIR" in str(a11_entries[0])
+    holdout_entries = [entry for entry in not_built if "rain_holdout" in str(entry)]
+    assert holdout_entries, not_built
+    assert "exclusion_table" in str(holdout_entries[0])
+    assert "holdout_comparison" in str(holdout_entries[0])
+    assert "holdout_partial_days" in str(holdout_entries[0])
+    assert "--rain-holdout" in str(holdout_entries[0])
+    assert "interval_holdout" in str(holdout_entries[0])
+
+
+@pytest.mark.skip(
+    reason="deferred to stage two (plan §15.3): replaces the stage-one "
+    "not_built tests (here and test_heldout_not_built_names_a11_and_d2_"
+    "option_c); runs temperature's --freeze-prepare and --heldout and "
+    "rain's --freeze-prepare, walks every header's nested objects and "
+    "lists, finds no not_built key at any depth, and finds each named "
+    "report present (D2 option C's table and sensitivity included) with "
+    "rain's four hold-out keys (rain_holdout, exclusion_table, "
+    "holdout_comparison, holdout_partial_days)"
+)
+def test_no_not_built_key_at_any_depth_deferred_to_stage_two() -> None:
+    raise NotImplementedError("Stage-two acceptance test not implemented")
+
+
+@pytest.mark.skip(
+    reason="deferred to stage two (plan §13.3, §15.3): tests "
+    "sqlite_tmp_peak.py's run function against small child processes "
+    "(measured/not_measured verdicts, lsof field parsing, exit codes); "
+    "A11's temporary-file size, which that tool yields, stays named in "
+    "not_built until then"
+)
+def test_sqlite_tmp_peak_measurement_deferred_to_stage_two() -> None:
+    raise NotImplementedError("Stage-two acceptance test not implemented")

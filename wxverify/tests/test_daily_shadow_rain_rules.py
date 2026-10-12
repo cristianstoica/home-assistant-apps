@@ -1041,4 +1041,5 @@ def test_t5b_a_real_shaped_0_15_0_row_with_absent_wet_hours_is_pre_wet_hours() -
     reason="deferred to stage two (plan §13.1, §15.3): 0.16.10/0.16.11 style_b "
     "rows and the 0.16.9 stop"
 )
-def test_control_rule_by_version_style_b_deferred_to_stage_two() -> None: ...
+def test_control_rule_by_version_style_b_deferred_to_stage_two() -> None:
+    raise NotImplementedError("Stage-two acceptance test not implemented")

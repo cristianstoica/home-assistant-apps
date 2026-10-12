@@ -6781,6 +6781,9 @@ def _run_rain(
             "A17",
             "F2",
             "A11: the largest SQLITE_TMPDIR size",
+            "rain_holdout: the interval hold-out (--rain-holdout, interval_holdout),"
+            " with exclusion_table, holdout_comparison and holdout_partial_days"
+            " (stage two)",
         ],
     )
     files = {

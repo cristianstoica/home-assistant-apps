@@ -13,7 +13,7 @@ needed because the bug this mutant posits is only visible across more
 than one case sharing a run.
 
 Also covers the ``--heldout`` half of §15.3's "What stage one lacks is
-named" (plan :1355) -- the ``--freeze-prepare`` half lives in
+named" (plan :1399) -- the ``--freeze-prepare`` half lives in
 ``test_daily_shadow_not_built.py``.
 
 Also covers the header's per-candidate discarded_resamples (M11) and the
@@ -437,7 +437,7 @@ def _warm_spell_by_target(files: dict[str, bytes]) -> dict[date, bool | None]:
 
 
 def test_heldout_not_built_names_a11_and_d2_option_c() -> None:
-    """§15.3 "What stage one lacks is named" (plan :1355), the
+    """§15.3 "What stage one lacks is named" (plan :1399), the
     ``--heldout`` half -- the ``--freeze-prepare`` half is pinned in
     ``test_daily_shadow_not_built.py``.
 
