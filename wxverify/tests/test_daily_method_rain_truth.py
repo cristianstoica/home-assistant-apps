@@ -9,18 +9,20 @@ module's own `date` objects, no real calendar meaning is relied on.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pytest
 
 from wxverify.forecast.daily_method import (
     RainReading,
     StationDay,
+    StationDayTotal,
     high_reading_flags,
     observed_amount,
     rain_nearby_event,
     station_day_total,
 )
+from wxverify.verification import daily_shadow
 
 
 def _station(sid: str, mm: float, hours: int) -> StationDay:
@@ -30,6 +32,19 @@ def _station(sid: str, mm: float, hours: int) -> StationDay:
         hours=hours,
         invalid=False,
         quarantined=False,
+    )
+
+
+def _day_total(mm: float) -> StationDayTotal:
+    return StationDayTotal(
+        total=mm,
+        hundredths=round(mm * 100),
+        hours=24,
+        expected_hours=24,
+        problems=(),
+        correction=None,
+        invalid=False,
+        after_gap=0,
     )
 
 
@@ -336,6 +351,32 @@ def test_lone_reading_flagged_and_kept() -> None:
         stations, outcome="rain_nearby", min_hours=24, wet_hundredths=50
     )
     assert amount.amount == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
+
+
+def test_lone_reading_flagged_and_kept_through_build_rain_day() -> None:
+    """Row 20 through the run's own day builder, `daily_shadow.build_rain_day`.
+
+    It reads the event, the amount and the flags with the run's constants
+    (0.2mm as the wet line for the amount and the flags). SYN-1 0.5mm,
+    SYN-2/SYN-3 0.0mm, all 24h: SYN-1 is the only counted station at or
+    above 0.2mm -> lone_reading, and it still makes the event (one_at_0.5)
+    and the whole amount (0.5mm, SYN-1 alone).
+    """
+    rain_day = daily_shadow.build_rain_day(
+        date(2035, 1, 1),
+        {
+            "SYN-1": _day_total(0.5),
+            "SYN-2": _day_total(0.0),
+            "SYN-3": _day_total(0.0),
+        },
+        {},
+    )
+    assert rain_day.flags.lone_reading == "SYN-1"
+    assert rain_day.flags.large_total is None
+    assert rain_day.event.outcome == "rain_nearby"
+    assert rain_day.event.trigger == "one_at_0.5"
+    assert rain_day.amount.amount == pytest.approx(0.5)  # pyright: ignore[reportUnknownMemberType]
+    assert rain_day.amount.contributing == (("SYN-1", 50, 24),)
 
 
 def test_station_day_correction_from_running_total() -> None:

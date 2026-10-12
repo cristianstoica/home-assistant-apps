@@ -10,6 +10,7 @@ plan's rows assume for SYN-a.. SYN-f / SYN-a..SYN-d.
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from fractions import Fraction
 from zoneinfo import ZoneInfo
@@ -20,11 +21,14 @@ from wxverify.forecast.daily_method import (
     ModelWindow,
     RainWindow,
     Selection,
+    ServedRain,
+    StationDayTotal,
     counted_hours,
     select_model,
     selected_hourly,
     served_rain,
 )
+from wxverify.verification import daily_shadow
 
 _DAY = date(2035, 1, 1)
 _HOURS = tuple(datetime(2035, 1, 1, h) for h in range(24))
@@ -242,12 +246,61 @@ def test_hourly_line_unscaled() -> None:
     assert spring_forward.isoformat() == "2035-03-11"
 
 
+def _dry_rain_line(served: ServedRain) -> daily_shadow.RainLine:
+    """A §13.3 line for _DAY: one SYN station read 0.0mm for all 24 hours."""
+    day = daily_shadow.build_rain_day(
+        _DAY,
+        {
+            "SYN-1": StationDayTotal(
+                total=0.0,
+                hundredths=0,
+                hours=24,
+                expected_hours=24,
+                problems=(),
+                correction=None,
+                invalid=False,
+                after_gap=0,
+            )
+        },
+        {},
+    )
+    return daily_shadow.RainLine(
+        key=daily_shadow.CaseKey(snapshot_date=_DAY, lead=0, target=_DAY),
+        row=None,
+        unmatched=None,
+        control=None,
+        day=day,
+        f1=None,
+        threshold_mm=None,
+        decision_time=None,
+        window=None,
+        training_days=0,
+        asof_differs=0,
+        incumbent=None,
+        selection=None,
+        served=served,
+        clim=None,
+        issued={},
+        symbols={},
+        amounts={},
+        grid=(),
+        own_days=None,
+        published={"precip_occurrence": None, "precip_total": None},
+    )
+
+
 def test_small_amounts_kept_as_calculated() -> None:
     """Row 55: SYN-a's 14:00 value 0.04mm, then 0.15mm -- unrounded amounts.
 
     Reusing row 51's six-model dry-selected setup: the served amount is the
     selected model's own ranked total, carried through with no rounding to
     a 0.01mm line.
+
+    Then that case's §13.3 JSON line, on a dry day (one SYN station read
+    0.0mm for 24h, built by `daily_shadow.build_rain_day`): the line carries
+    the same unrounded amount, and its amount loss is the amount itself
+    (y = 0, over-forecast weight 1). Both hold for the line as built and as
+    written by the run's ``lines.jsonl`` writer, `daily_shadow._dumps_lines`.
     """
     selection = _six_model_selection()
     for small_amount in (0.04, 0.15):
@@ -267,6 +320,18 @@ def test_small_amounts_kept_as_calculated() -> None:
         )
         assert served.amount == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
         assert served.hourly == line
+
+        rain_line = _dry_rain_line(served)
+        assert rain_line.outcome == "dry"
+        assert rain_line.day.amount.amount == 0.0
+        json_line = daily_shadow.rain_line_json(rain_line)
+        json_served = json_line["served"]
+        assert isinstance(json_served, ServedRain)
+        assert json_served.amount == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
+        assert json_line["served_amount_loss"] == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
+        written = json.loads(daily_shadow._dumps_lines([json_line]))
+        assert written["served"]["amount"] == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
+        assert written["served_amount_loss"] == pytest.approx(small_amount)  # pyright: ignore[reportUnknownMemberType]
 
 
 def test_served_rain_group_cut_ignores_the_incumbent() -> None:

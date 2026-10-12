@@ -9,9 +9,9 @@ built for ``--heldout`` names a house station by a ``SYN-`` id.
 
 Departures from §15.1 and §15.3: databases are ``:memory:`` because these
 tests call ``run()`` with a connection, so the file-opening path
-(``main()``) is the owed item at batch1:236-240. The lower bound filler
-covers leads 0-5 only, the leads it asserts on. Its Arm B case has no
-stations at all.
+(``main()``) is tested in tests/test_daily_shadow_heldout_handoff.py. The
+lower bound filler covers leads 0-5 only, the leads it asserts on. Its Arm
+B case has no stations at all.
 
 Mutant ledger (§15.4):
 
@@ -21,9 +21,10 @@ pending (checkpoint C, §15.4:1448).
 
 M29 (``excluded_h_dates`` ignored by ``select_cases``) -- implemented: yes;
 reviewed: pending; mutation-verified: pending (checkpoint C, §15.4:1448).
-Killed at ``select_cases`` only. The ``main()`` route
-(daily_shadow.py:7067-7069) is the owed item in
-tests/test_daily_shadow_batch1_mutants.py:236-240.
+Killed at ``select_cases``. The ``main()`` route that hands the note's
+``excluded_h_dates`` to ``run()`` (daily_shadow.py:7070-7072) is tested by
+``test_heldout_note_overrides_h_first_and_excluded_dates`` in
+tests/test_daily_shadow_heldout_handoff.py.
 
 M30 (the station-set comparison against the note is skipped) --
 implemented: yes; reviewed: pending; mutation-verified: pending (checkpoint

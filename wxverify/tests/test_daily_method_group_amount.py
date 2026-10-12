@@ -5,15 +5,20 @@ Expected values come straight from the plan's §15.2 table arithmetic.
 
 from __future__ import annotations
 
+from datetime import date
 from fractions import Fraction
 
 import pytest
 
 from wxverify.forecast.daily_method import (
+    ModelWindow,
+    RainWindow,
     amount_tradeoff,
+    compose_s_pick,
     glyph_from_votes,
     group_amount_benchmarks,
     group_vote_chance,
+    select_model,
     top_two_rain,
 )
 
@@ -122,6 +127,55 @@ def test_amount_benchmarks_odd_q() -> None:
     assert benchmarks.median == pytest.approx(0.4)  # pyright: ignore[reportUnknownMemberType]
     assert benchmarks.mean == pytest.approx(0.8, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
     assert (benchmarks.mean - benchmarks.median) == pytest.approx(0.4, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
+
+
+def test_amount_benchmarks_odd_q_s_pick_shows_no_symbol() -> None:
+    """Row 48's S-PICK part: the same a..d ranking, through S-PICK's composer.
+
+    One dry common day on which every model forecasts 0.0mm ties all four
+    at penalty 0, so the (source, model) tie-break ranks a..d in that order
+    and selects SYN-a at the 0.2mm trigger. S-PICK reads SYN-a's own target
+    total, 0.0mm, below the trigger -> no symbol, though the group's median
+    (0.4) and mean (0.8) are both above it. With SYN-a's own total at 0.2mm,
+    the trigger itself, S-PICK shows the symbol.
+    """
+    day = date(2035, 1, 1)
+    keys = [f"SYN-{c}/SYN-m" for c in "abcd"]
+    window = RainWindow(
+        events={day: False},
+        models={
+            key: ModelWindow(
+                source=key.split("/")[0],
+                model="SYN-m",
+                totals={day: 0.0},
+                covers_target=True,
+            )
+            for key in keys
+        },
+    )
+    selection = select_model(
+        window,
+        min_days=1,
+        miss_weight=2.0,
+        triggers_hundredths=(20,),
+        incumbent=None,
+        switch_margin=0,
+    )
+    assert [item.key for item in selection.ranked] == keys
+    assert selection.selected == "SYN-a/SYN-m"
+    assert selection.entry("SYN-a/SYN-m").trigger_hundredths == 20
+    totals = dict(zip(keys, (0.0, 0.4, 2.0, 5.0), strict=True))
+    benchmarks = group_amount_benchmarks(
+        [(item.key, totals[item.key]) for item in selection.ranked],
+        group_fraction=Fraction(3, 4),
+    )
+    assert benchmarks.median == pytest.approx(0.4)  # pyright: ignore[reportUnknownMemberType]
+    assert benchmarks.mean == pytest.approx(0.8, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
+    pick = compose_s_pick(selection, totals)
+    assert pick.symbol is False
+    assert pick.members == ("SYN-a/SYN-m",)
+    at_trigger = compose_s_pick(selection, {**totals, "SYN-a/SYN-m": 0.2})
+    assert at_trigger.symbol is True
 
 
 def test_amount_benchmarks_even_q() -> None:

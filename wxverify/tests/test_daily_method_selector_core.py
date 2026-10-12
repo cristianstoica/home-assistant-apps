@@ -19,10 +19,12 @@ from wxverify.forecast.daily_method import (
     ModelWindow,
     RainWindow,
     Selection,
+    ServedRain,
     group_vote_chance,
     select_model,
     served_rain,
 )
+from wxverify.verification import daily_shadow
 
 _BASE = date(2035, 1, 1)
 
@@ -208,9 +210,10 @@ def test_the_minimum_switches_on() -> None:
 
 
 def test_switching_margin() -> None:
-    """Row 29: switch_margin=3, 20 common days, incumbent a (penalty 5),
-    b (penalty 3): best is b in both cases; 5-3=2 < 3 keeps a. With b's
-    false alarms reduced to 2 (penalty 2): 5-2=3 >= 3 replaces a with b.
+    """Row 29: the run's own margin, daily_shadow.RAIN_SWITCH_MARGIN (3),
+    20 common days, incumbent a (penalty 5), b (penalty 3): best is b in
+    both cases; 5-3=2 < 3 keeps a. With b's false alarms reduced to 2
+    (penalty 2): 5-2=3 >= 3 replaces a with b.
     """
     events = {_d(1): True, **{_d(n): False for n in range(2, 21)}}
     a_totals = {_d(n): 0.0 for n in range(1, 21)}
@@ -234,7 +237,7 @@ def test_switching_margin() -> None:
         miss_weight=2.0,
         triggers_hundredths=(20,),
         incumbent="SYN-a/SYN-m",
-        switch_margin=3,
+        switch_margin=daily_shadow.RAIN_SWITCH_MARGIN,
     )
     assert sel_first.entry("SYN-a/SYN-m").penalty == 5
     assert sel_first.entry("SYN-b/SYN-m").penalty == 3
@@ -257,7 +260,7 @@ def test_switching_margin() -> None:
         miss_weight=2.0,
         triggers_hundredths=(20,),
         incumbent="SYN-a/SYN-m",
-        switch_margin=3,
+        switch_margin=daily_shadow.RAIN_SWITCH_MARGIN,
     )
     assert sel_second.entry("SYN-b/SYN-m").penalty == 2
     assert sel_second.incumbent_outcome == "replaced_margin"
@@ -422,6 +425,9 @@ def test_group_vote_tie_at_the_cut() -> None:
     Reverting d and setting the incumbent to c changes nothing about the
     group (built from the ranked SCORE order, not from who is selected):
     group is [a, b, d] again, chance 1/3.
+
+    Each case is also read through `served_rain`, whose group must be the
+    same vote: cut from the score order, misses included.
     """
     events = {_d(1): True, **{_d(n): False for n in range(2, 21)}}
 
@@ -462,6 +468,18 @@ def test_group_vote_tie_at_the_cut() -> None:
             order, group_fraction=Fraction(3, 4), trigger_hundredths=20
         )
 
+    def _served(selection: Selection) -> ServedRain:
+        return served_rain(
+            selection,
+            ranked_totals,
+            {},
+            hours=(),
+            group_fraction=Fraction(3, 4),
+            trigger_hundredths=20,
+            miss_weight=2.0,
+            threshold_mm=0.1,
+        )
+
     selection1 = select_model(
         _window(d_totals_scenario1),
         min_days=20,
@@ -481,6 +499,9 @@ def test_group_vote_tie_at_the_cut() -> None:
     assert vote1.members == ("SYN-a/SYN-m", "SYN-b/SYN-m", "SYN-d/SYN-m")
     assert vote1.k == 1
     assert vote1.chance == Fraction(1, 3)
+    served1 = _served(selection1)
+    assert served1.group == vote1
+    assert served1.chance == Fraction(1, 3)
 
     d_totals_scenario2 = _totals(wet_day1=False, fa_days=(2,))  # 1 miss, 1 FA
     selection2 = select_model(
@@ -502,6 +523,9 @@ def test_group_vote_tie_at_the_cut() -> None:
     assert vote2.members == ("SYN-a/SYN-m", "SYN-b/SYN-m", "SYN-c/SYN-m")
     assert vote2.k == 0
     assert vote2.chance == Fraction(0)
+    served2 = _served(selection2)
+    assert served2.group == vote2
+    assert served2.chance == Fraction(0)
 
     selection3 = select_model(
         _window(d_totals_scenario1),
@@ -522,6 +546,9 @@ def test_group_vote_tie_at_the_cut() -> None:
     assert vote3.members == ("SYN-a/SYN-m", "SYN-b/SYN-m", "SYN-d/SYN-m")
     assert vote3.k == 1
     assert vote3.chance == Fraction(1, 3)
+    served3 = _served(selection3)
+    assert served3.group == vote3
+    assert served3.chance == Fraction(1, 3)
 
 
 def test_trigger_grid_tie_picks_the_lower_of_the_two() -> None:
