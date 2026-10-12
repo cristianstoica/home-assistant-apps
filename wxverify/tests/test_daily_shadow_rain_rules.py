@@ -103,10 +103,10 @@ def _temperature_daily_quantities(*, high_c: float, low_c: float) -> str:
 # --- T1: control rule by version -----------------------------------------------
 
 
-# F2: each case runs once against the tool's own map (RAIN_RULES) and once
-# against a minimal map holding only the one version the row uses -- proof
-# that control_value reads the *passed* rain_rules argument, not any
-# particular map's other contents.
+# Each case runs once against the tool's own map (RAIN_RULES) and once
+# against a minimal map holding only 0.16.7 -- proof that control_value
+# reads the *passed* rain_rules argument, not any particular map's other
+# contents.
 _T1_LEGACY_MAPS: dict[str, Mapping[tuple[int, ...], daily_shadow.RainRule]] = {
     "tool_map": RAIN_RULES,
     "minimal_map": MappingProxyType({(0, 16, 7): "legacy"}),
@@ -205,7 +205,38 @@ def test_t1_pre_wet_hours_versions_are_unmatched(app_version: str) -> None:
     assert result == Unmatched("pre_wet_hours")
 
 
-# --- F1 (blocker): the "0.16.0" boundary ----------------------------------------
+@pytest.mark.parametrize("app_version", ["0.15.0", "0.11.0", "0.9.9"])
+@pytest.mark.parametrize("map_name", sorted(_T1_LEGACY_MAPS))
+def test_t1_pre_wet_hours_versions_are_unmatched_with_numeric_wet_hours(
+    app_version: str, map_name: str
+) -> None:
+    """A version below 0.16.0 is unmatched ``pre_wet_hours`` even with a valid policy.
+
+    A version below WET_HOURS_FIRST (0.16.0) is unmatched ``pre_wet_hours``
+    even when the row holds a valid policy and a numeric ``wet_hours``,
+    under the tool's own map, a minimal map holding only 0.16.7, and a map
+    that holds the row's own version -- so the version check runs before
+    the map lookup, not only after the lookup misses.
+    """
+    row = _row(
+        app_version=app_version,
+        daily_quantities=_precip_daily_quantities(
+            total_mm=1.0, wet_hours=6.0, extrema_feed_ids=[1]
+        ),
+    )
+    result = control_value(row, variable="precip", rain_rules=_T1_LEGACY_MAPS[map_name])
+    assert result == Unmatched("pre_wet_hours")
+
+    own_version = parse_version(app_version)
+    assert own_version is not None
+    own_map: Mapping[tuple[int, ...], daily_shadow.RainRule] = MappingProxyType(
+        {own_version: "legacy"}
+    )
+    own_result = control_value(row, variable="precip", rain_rules=own_map)
+    assert own_result == Unmatched("pre_wet_hours")
+
+
+# --- The "0.16.0" boundary ------------------------------------------------------
 #
 # WET_HOURS_FIRST == (0, 16, 0), but RAIN_RULES' minimum key is (0, 16, 2) --
 # so a version of exactly 0.16.0 is NOT below WET_HOURS_FIRST (fails the
@@ -291,11 +322,17 @@ def test_f3_rain_rule_reads_commits_are_full_hex_shas_and_map_starts_at_0_16_2()
             assert _COMMIT_SHA_RE.fullmatch(other_head), read
 
 
+def test_stage_one_maps_every_version_to_the_legacy_rule() -> None:
+    """In stage one the map holds only the legacy rule, for every version."""
+    assert all(read.rule == "legacy" for read in RAIN_RULE_READS)
+    assert set(RAIN_RULES.values()) == {"legacy"}
+
+
 @pytest.mark.parametrize("app_version", ["0.16.8", "0.16.9", "0.16.10"])
 def test_t2_version_unmapped_raises_versionunmappederror(app_version: str) -> None:
     """A version after the map's last read (0.16.7) raises VersionUnmappedError.
 
-    Per plan :1300, :1302 and :1306 (F5), this unit-level stop test passes
+    Per the plan's control-rule-by-version row, this unit-level stop test passes
     its own minimal map, ``{(0, 16, 7): "legacy"}``, rather than the tool's
     own ``RAIN_RULES`` -- so this pin survives stage two unchanged when the
     tool's own map grows to hold 0.16.8/0.16.10. Each of the three versions
@@ -660,10 +697,11 @@ def _run_main(
 ) -> tuple[int, str, str]:
     """Run main() in ``--freeze-prepare`` mode (per the plan's own T3-T5 text).
 
-    The rain-rules stop fires in ``rain_controls()`` before the mode branch
-    (:6310 vs :6362+), so T3's stop is identical under either mode; T4/T5
-    and F5 need ``freeze-prepare`` specifically, since only that mode's
-    header calls ``rain_settings()`` (:6409). ``--house-station`` is
+    The rain-rules stop fires in ``rain_controls()``, which ``_run_rain``
+    calls before its ``counts-only``/``freeze-prepare`` branch, so T3's stop
+    is identical under either mode; T4/T5 and the ``rain_rules`` settings
+    test need ``freeze-prepare`` specifically, since only that mode's
+    header calls ``rain_settings()``. ``--house-station`` is
     required by the CLI in this mode but the fixture has no matching
     ``stations`` row, so ``load_house_station`` returns its "not in the
     station set" default and never errors.
@@ -717,28 +755,16 @@ def test_t3_a_version_the_map_does_not_hold_stops_the_full_run(
 ) -> None:
     """A full --freeze-prepare run over a single unmapped row ends in ERROR.
 
-    0.16.8 is after the map's last read; 0.16.0 is the F1 boundary -- equal
+    0.16.8 is after the map's last read; 0.16.0 is the boundary itself -- equal
     to WET_HOURS_FIRST, so not caught by pre_wet_hours, and still absent
-    from RAIN_RULES. The stop fires in rain_controls(), before any
-    station/event/replay machinery runs, so this fixture needs no station
-    or sample data at all -- only the one record row (which also satisfies
-    rain_s0's S0 lookup). The run folder holds exactly ``error.json``.
+    from RAIN_RULES. This is the same fixture as T4 (one feed, its samples,
+    one record row) with only ``app_version`` changed: the stop fires in
+    rain_controls() before any station/event/replay work, so the run
+    folder holds exactly ``error.json``.
     """
-    copy, site = _make_copy(tmp_path)
-    conn = sqlite3.connect(copy)
-    try:
-        _insert_precip_row(
-            conn,
-            site=site,
-            snapshot_date=_DAY,
-            app_version=app_version,
-            daily_quantities=_precip_daily_quantities(
-                total_mm=1.0, wet_hours=6.0, extrema_feed_ids=[1]
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    copy, site, _feed_id = _build_matched_run(
+        tmp_path, app_version=app_version, wet_count=6
+    )
     _set_deterministic_now(copy, mtime=datetime(2035, 6, 20, 12, tzinfo=UTC))
 
     out = tmp_path / "out"
@@ -823,8 +849,9 @@ def test_t4_a_mapped_version_run_finishes_with_matched_count(
 ) -> None:
     """A single mapped-version (0.16.7) row finishes the run; unmatched.matched == 1.
 
-    No error.json, and no ``*.failed`` sibling of the run directory under
-    ``out``: the run completed, it did not stop.
+    No error.json, and no ``*.partial`` or ``*.failed`` folder anywhere
+    under ``out``: the run completed, it did not stop. The run folder holds
+    the rain run's six outputs.
     """
     copy, site, _feed_id = _build_matched_run(
         tmp_path, app_version="0.16.7", wet_count=6
@@ -842,7 +869,15 @@ def test_t4_a_mapped_version_run_finishes_with_matched_count(
     header = json.loads((run_dir / "header.json").read_text())
     assert header["unmatched"]["rain"]["matched"]["0"] == 1
     assert not (run_dir / "error.json").exists()
-    assert daily_shadow.list_failed_dirs(out) == []
+    assert not any(p.name.endswith((".partial", ".failed")) for p in out.rglob("*"))
+    assert {entry.name for entry in run_dir.iterdir()} == {
+        "header.json",
+        "lines.jsonl",
+        "trigger_grid.jsonl",
+        "station_days.jsonl",
+        "fault_states.json",
+        "house_station.json",
+    }
 
 
 def test_f5_freeze_prepare_header_settings_rain_rules_matches_the_record(
@@ -851,10 +886,10 @@ def test_f5_freeze_prepare_header_settings_rain_rules_matches_the_record(
     """Two separate --freeze-prepare runs produce equal rain_rules settings.
 
     Each run's ``header["settings"]["rain_rules"]`` is compared against
-    ``rain_rules_record(RAIN_RULE_READS)`` as decoded JSON, and the two runs'
-    values are compared to each other via ``json.dumps(..., sort_keys=True)``
-    -- a key-order-independent equality check, not a byte-for-byte file
-    comparison.
+    ``rain_rules_record(RAIN_RULE_READS)`` as decoded JSON, and the two
+    runs' values are serialized in the key order read from each file
+    (``json.loads`` keeps the file's order) and compared to each other --
+    so the check holds the same bytes on two runs, including key order.
 
     Kills the mutant ``settings={}`` at the freeze-prepare header line: the
     correct header's ``settings.rain_rules`` equals
@@ -880,9 +915,7 @@ def test_f5_freeze_prepare_header_settings_rain_rules_matches_the_record(
         header = json.loads((run_dir / "header.json").read_text())
         settings = cast("dict[str, object]", header["settings"])
         assert settings["rain_rules"] == expected_record
-        serialized_runs.append(
-            json.dumps(settings["rain_rules"], sort_keys=True).encode()
-        )
+        serialized_runs.append(json.dumps(settings["rain_rules"]).encode())
     assert serialized_runs[0] == serialized_runs[1]
 
 
@@ -981,12 +1014,18 @@ def test_t5_a_mixed_run_finishes_with_matched_and_pre_wet_hours(
     assert exit_code == 0, err_text
     payload = _result_payload(out_text)
     run_dir = out / cast(str, payload["run_dir"])
+    assert not (run_dir / "error.json").exists()
     header = json.loads((run_dir / "header.json").read_text())
     assert header["unmatched"]["rain"]["matched"]["0"] == 1
     assert header["unmatched"]["rain"]["pre_wet_hours"]["0"] == 1
 
     mixed_lines = _read_lines_jsonl(run_dir)
     mixed_control = _control_for_snapshot(mixed_lines, snapshot_date=matched_date)
+    assert isinstance(mixed_control, dict)
+    mixed_fields = cast("dict[str, object]", mixed_control)
+    assert mixed_fields["symbol"] is True
+    assert mixed_fields["amount"] == 3.0
+    assert mixed_fields["version"] == [0, 16, 7]
 
     single_root = tmp_path / "single"
     single_root.mkdir()
@@ -1015,7 +1054,7 @@ def test_t5b_a_real_shaped_0_15_0_row_with_absent_wet_hours_is_pre_wet_hours() -
 
     Covers the shape an actual pre-0.16.0 row has on disk -- ``wet_hours``
     was not yet a stored field, so ``daily_quantities.displayed`` omits it
-    (rather than storing an explicit 0.0 as in T5). The pre_wet_hours check
+    (where T5's 0.15.0 row stores a numeric 6.0). The pre_wet_hours check
     must still fire before daily_quantities is ever narrowed, so the
     missing key is never read.
     """

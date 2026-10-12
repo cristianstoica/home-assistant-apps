@@ -1192,7 +1192,11 @@ def test_m23_a_copy_mutated_during_the_run_errors_with_copy_changed(
     monkeypatch.setattr(daily_shadow, "load_site", mutate_then_load)
     out = tmp_path / "out"
     exit_code, out_text, err_text, open_calls = _run_main(
-        copy=copy, out=out, monkeypatch=monkeypatch
+        copy=copy,
+        out=out,
+        monkeypatch=monkeypatch,
+        variable="temperature",
+        site_id=1,
     )
     assert open_calls == 1
     assert copy.read_bytes() == before_bytes + b"\x00"
@@ -1242,7 +1246,11 @@ def test_m23_paired_positive_an_unmutated_copy_runs_clean(
         conn.close()
     out = tmp_path / "out"
     exit_code, out_text, err_text, open_calls = _run_main(
-        copy=copy, out=out, monkeypatch=monkeypatch
+        copy=copy,
+        out=out,
+        monkeypatch=monkeypatch,
+        variable="temperature",
+        site_id=1,
     )
     assert open_calls == 1
     assert exit_code == 0

@@ -199,7 +199,11 @@ def test_main_error_wiring_classifies_and_records_each_forced_failure(
 
     monkeypatch.setattr(daily_shadow, "load_site", forced_load_site)
     exit_code, out_text, err_text, open_calls = _run_main(
-        copy=copy, out=out, monkeypatch=monkeypatch
+        copy=copy,
+        out=out,
+        monkeypatch=monkeypatch,
+        variable="temperature",
+        site_id=1,
     )
 
     assert exit_code == 1
