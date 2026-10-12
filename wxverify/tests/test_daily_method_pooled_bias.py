@@ -164,6 +164,8 @@ def test_pooled_bias_in_the_composers_two_feeds() -> None:
         shrink=shrink,
         limit=limit,
     )
+    assert iw_bc.regime == "pooled"
+    assert td_k_bc.regime == "pooled"
     assert iw_bc.biases[syn_a.feed.key] == pytest.approx(0.5, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
     assert iw_bc.biases[syn_b.feed.key] == pytest.approx(1.375, abs=1e-9)  # pyright: ignore[reportUnknownMemberType]
     # IW-BC = (1.0 * 19.5 + 0.6667 * 20.625) / 1.6667 = 19.95.

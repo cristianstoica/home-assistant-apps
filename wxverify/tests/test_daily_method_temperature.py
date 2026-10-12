@@ -12,9 +12,13 @@ import math
 import pytest
 
 from wxverify.forecast.daily_method import (
+    FeedDay,
     ModelRef,
+    VoteDay,
     asymmetric_loss,
     calibrated_chance,
+    compose_r0,
+    compose_r1,
     fit_calibration,
     glyph_from_votes,
     pooled_statistic,
@@ -100,15 +104,85 @@ def test_calibration_fitted() -> None:
 def test_no_convergence_with_one_iteration() -> None:
     """Row 5: the same six days, max_iterations=1 -> converged is False.
 
-    (The composer-level fallback to R0 with ``fallback_reason`` set belongs
-    to a compose_* wrapper not exercised by this pure-function row; see the
-    "not written" notes in the handback.)
+    The composer half, R1 falling back to R0 with ``fallback_reason``
+    set, is pinned below by
+    ``test_compose_r1_falls_back_to_r0_when_the_fit_does_not_converge``.
     """
     xs, ys = _row4_days()
     _a, _b, converged = fit_calibration(
         xs, ys, lam=1.0, max_iterations=1, tolerance=1e-10
     )
     assert converged is False
+
+
+def _syn_vote_feeds() -> list[FeedDay]:
+    # SYN-a and SYN-b stay dry; SYN-c and SYN-d reach the 0.1 mm threshold,
+    # so k = 2 of n = 4 vote wet and R0 = 2 / 4 = 0.5.
+    return [
+        FeedDay(feed_id=1, ref=ModelRef("SYN", "a"), values=(0.0,)),
+        FeedDay(feed_id=2, ref=ModelRef("SYN", "b"), values=(0.0,)),
+        FeedDay(feed_id=3, ref=ModelRef("SYN", "c"), values=(0.3,)),
+        FeedDay(feed_id=4, ref=ModelRef("SYN", "d"), values=(0.3,)),
+    ]
+
+
+def _row4_vote_days() -> list[VoteDay]:
+    # Row 4's six (k, n, y) days as R1's training window: four
+    # rain-nearby, two dry.
+    days = [
+        (0, 4, False),
+        (1, 4, False),
+        (1, 4, True),
+        (2, 4, True),
+        (3, 4, True),
+        (4, 4, True),
+    ]
+    return [VoteDay(k=k, n=n, rain_nearby=y) for k, n, y in days]
+
+
+def test_compose_r1_falls_back_to_r0_when_the_fit_does_not_converge() -> None:
+    """Row 5, composer half: R1 falls back to R0 with ``not_converged``.
+
+    The window has six known days, four rain-nearby and two dry, so with
+    min_days 6 and min_each 2 none of the earlier fallbacks applies; only
+    the one-iteration fit fails. R1's chance is then R0's vote share,
+    2 / 4 = 0.5, and the unconverged fit is still reported.
+    """
+    r1 = compose_r1(
+        _syn_vote_feeds(),
+        _row4_vote_days(),
+        threshold_mm=0.1,
+        lam=1.0,
+        max_iterations=1,
+        tolerance=1e-10,
+        min_days=6,
+        min_each=2,
+    )
+    assert r1.fallback_reason == "not_converged"
+    assert r1.chance == 0.5
+    assert r1.chance == compose_r0(_syn_vote_feeds(), threshold_mm=0.1).chance
+    assert (r1.k, r1.n) == (2, 4)
+    assert r1.fit is not None
+
+
+def test_compose_r1_uses_the_fit_when_it_converges() -> None:
+    """Paired control for row 5: the same inputs with max_iterations=100.
+
+    The fit converges, so no fallback applies and R1 is row 4's calibrated
+    chance at k = 2, n = 4 (x = 0): 0.600696.
+    """
+    r1 = compose_r1(
+        _syn_vote_feeds(),
+        _row4_vote_days(),
+        threshold_mm=0.1,
+        lam=1.0,
+        max_iterations=100,
+        tolerance=1e-10,
+        min_days=6,
+        min_each=2,
+    )
+    assert r1.fallback_reason is None
+    assert r1.chance == pytest.approx(0.600696, abs=1e-6)  # pyright: ignore[reportUnknownMemberType]
 
 
 @pytest.mark.parametrize(
