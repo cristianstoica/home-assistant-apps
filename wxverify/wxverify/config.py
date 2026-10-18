@@ -85,8 +85,10 @@ OPEN_METEO_MAX_LEAD_HOURS: Final[Mapping[str, int]] = {
 #: guarantee of which (owner decision 2026-10-02). A second poll inside one
 #: run window gets the same run key: every sample already stored keeps its
 #: first value, so the poll cannot refresh it, though it can still insert
-#: hours not yet stored. Single source for both the fresh-database seed below
-#: and the 0.16.0 one-shot correction
+#: hours not yet stored. `worker.cadence.effective_due_minutes` makes a feed
+#: with an interval of 691-720 minutes due at 690, so `gem_global` gets such a
+#: second poll about once every 23 runs. Single source for both the
+#: fresh-database seed below and the 0.16.0 one-shot correction
 #: `db.migrations.correct_open_meteo_fetch_intervals`, so the two cannot drift
 #: apart. A model added later reaches existing databases through the seed
 #: alone (`seed_default_feeds` inserts missing rows on every start).

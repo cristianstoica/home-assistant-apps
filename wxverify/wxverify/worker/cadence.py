@@ -1,4 +1,4 @@
-"""Shared validation for feed fetch-cadence values.
+"""Feed fetch-cadence validation, and the due rule both due checks use.
 
 ``feeds.fetch_interval_minutes`` is trusted input on every read path here:
 the API bounds it at creation (``ge=1``), but an imported, restored, or
@@ -12,6 +12,7 @@ overflow a downstream ``timedelta``.
 from __future__ import annotations
 
 import logging
+from typing import Final
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,12 @@ logger = logging.getLogger(__name__)
 # epoch stamp pasted into a minutes field) feeds timedelta(seconds=...)
 # downstream and would raise OverflowError there if left unbounded.
 MAX_FETCH_INTERVAL_MINUTES = 30 * 24 * 60
+
+#: monitor.FEED_STALE_HOURS * 60. Not imported: cadence must not depend on the
+#: monitor. A test pins the two together.
+FEED_STALE_LIMIT_MINUTES: Final = 720
+#: How long before that limit a feed whose interval reaches it is fetched.
+FEED_STALE_LEAD_MINUTES: Final = 30
 
 
 def parse_fetch_interval_minutes(value: object, *, context: str) -> int | None:
@@ -52,3 +59,16 @@ def parse_fetch_interval_minutes(value: object, *, context: str) -> int | None:
         )
         return None
     return minutes
+
+
+def effective_due_minutes(interval_minutes: int) -> int:
+    """Minutes after the last run at which a feed is due.
+
+    An interval within the lead of the stale limit is pulled back to
+    limit - lead, so the fetch starts before the feed reads as stale.
+    Every other interval is returned unchanged.
+    """
+    floor = FEED_STALE_LIMIT_MINUTES - FEED_STALE_LEAD_MINUTES
+    if floor < interval_minutes <= FEED_STALE_LIMIT_MINUTES:
+        return floor
+    return interval_minutes

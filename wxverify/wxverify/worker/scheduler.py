@@ -11,7 +11,7 @@ from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.queue import LATEST_JOB_SQL, enqueue_if_absent_with_cooldown
 from wxverify.settings.keys import get_number_setting, get_setting
-from wxverify.worker.cadence import parse_fetch_interval_minutes
+from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
 from wxverify.worker.wind_days import (
     WIND_DAYS_JOB_KEY,
     WIND_DAYS_SPACING,
@@ -297,7 +297,7 @@ def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
                 due = True
             else:
                 minutes = (now - last_run_dt).total_seconds() / 60
-                due = minutes >= interval
+                due = minutes >= effective_due_minutes(interval)
         if due:
             logger.debug(
                 "scheduler due feed site=%s feed=%s",

@@ -31,7 +31,7 @@ from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
 from wxverify.scoring.consensus import insert_station_observation
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
-from wxverify.worker.cadence import parse_fetch_interval_minutes
+from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -610,7 +610,7 @@ def _due_open_meteo_targets(
                 )
                 continue
             elapsed = (window_end - last_run_dt).total_seconds() / 60
-            due = elapsed >= interval
+            due = elapsed >= effective_due_minutes(interval)
         if not due:
             continue
         targets.append(
