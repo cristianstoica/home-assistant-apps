@@ -1057,8 +1057,10 @@ With the default cadences, each enabled site makes:
   default `obs_interval_minutes=180` and up to `obs_jitter_minutes=20`, that is
   roughly `7.2` to `8` cycles per day.
 - Open-Meteo forecasts: each enabled Open-Meteo model is polled every `360`
-  minutes (`4` calls per day), except `gem_global`, polled every `720` minutes
-  (`2` calls per day). Except for `icon_eu`, polling follows each model's run
+  minutes (`4` calls per day), except `gem_global`, whose interval is `720`
+  minutes. The add-on reports a feed as stale after `12` hours, so `gem_global`
+  is polled `30` minutes early, about every `690` minutes (just over `2` calls
+  per day). Except for `icon_eu`, polling follows each model's run
   cadence; it is not aligned to publication, so fetching every published run is
   not guaranteed. `icon_eu` publishes every 3 hours and is polled every `360`
   minutes, which is six-hourly polling that samples roughly alternate ICON-EU

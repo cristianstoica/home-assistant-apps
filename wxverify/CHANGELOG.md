@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.16.8
+
+Long verification work no longer holds up the daily forecast record
+and feed fetches in the morning.
+
+A verification run now works through its days in steps, and a step
+stops starting new days when another day would likely take it past 5
+minutes. Before, one step could run for 20 minutes or more while
+everything else waited. Each day still runs whole, so a day that alone
+takes longer than 5 minutes still gets a step of its own. The step's
+log line now also gives its running time and why it stopped:
+`elapsed_s=` and `stop=`, which is `cap` (the step's 7-day limit),
+`budget` (the 5 minutes) or `phase_end`.
+
+A verification or time zone correction step that has waited 5 minutes
+now takes its turn with other waiting work, oldest first. Before, it
+always went after every other waiting job, so a busy queue could keep
+it waiting longer than the health check allows. A step put back in the
+queue at a restart or after a database import waits its 5 minutes
+again, counted from that moment. The daily forecast record and gap
+scan still go first.
+
+A feed whose fetch interval is 691 to 720 minutes is now fetched at
+690 minutes, 30 minutes before the 12-hour limit after which it reads
+as stale. Before, the 12-hour `gem_global` feed fell due exactly at
+that limit, so any wait in the queue made it read as stale. Every other
+interval is unchanged.
+
 ## 0.16.7
 
 The Forecast page now judges each feed's stale badge by the last fetch

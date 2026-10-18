@@ -660,11 +660,16 @@ def test_e_t15_lead_hours_end_to_end_against_the_12_hour_label() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T16 -- scheduling arithmetic at the corrected 720-minute cadence.
+# E-T16 (plan C3-T18) -- scheduling arithmetic at the 690-minute lead
+# boundary for a 720-minute-cadence feed. A 720-minute interval is pulled
+# back to 690 (worker.cadence.effective_due_minutes) so the fetch starts
+# before the feed reads as stale -- 719/721 is no longer the boundary this
+# feed is due at; 689/690 is. Catches the helper being wired into catchup
+# only and never reaching the scheduler.
 # ---------------------------------------------------------------------------
 
 
-def test_e_t16_scheduling_arithmetic_at_720_minute_cadence(
+def test_e_t16_scheduling_arithmetic_at_the_690_minute_lead_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     conn = asof_conn()
@@ -686,7 +691,7 @@ def test_e_t16_scheduling_arithmetic_at_720_minute_cadence(
 
     conn.execute(
         "INSERT INTO site_feed_state (site_id, feed_id, last_run_at) VALUES (?, ?, ?)",
-        (site_id, feed_id, isoformat_utc(fixed_now - timedelta(minutes=719))),
+        (site_id, feed_id, isoformat_utc(fixed_now - timedelta(minutes=689))),
     )
     conn.commit()
     _enqueue_due_feeds(conn)
@@ -695,25 +700,25 @@ def test_e_t16_scheduling_arithmetic_at_720_minute_cadence(
     # never-run and therefore unconditionally due -- scope to THIS feed's
     # job_key ("fetch:<feed_id>") so those siblings' jobs cannot mask the
     # assertion.
-    jobs_719 = conn.execute(
+    jobs_689 = conn.execute(
         "SELECT * FROM jobs WHERE type = 'fetch_feed' AND job_key = ?",
         (f"fetch:{feed_id}",),
     ).fetchall()
-    assert jobs_719 == []
+    assert jobs_689 == []
 
     conn.execute(
         "UPDATE site_feed_state SET last_run_at = ? WHERE site_id = ? AND feed_id = ?",
-        (isoformat_utc(fixed_now - timedelta(minutes=721)), site_id, feed_id),
+        (isoformat_utc(fixed_now - timedelta(minutes=690)), site_id, feed_id),
     )
     conn.commit()
     _enqueue_due_feeds(conn)
     conn.commit()
-    jobs_721 = conn.execute(
+    jobs_690 = conn.execute(
         "SELECT * FROM jobs WHERE type = 'fetch_feed' AND job_key = ?",
         (f"fetch:{feed_id}",),
     ).fetchall()
-    assert len(jobs_721) == 1
-    payload = json.loads(str(jobs_721[0]["payload"]))
+    assert len(jobs_690) == 1
+    payload = json.loads(str(jobs_690[0]["payload"]))
     assert payload["feed_id"] == feed_id
 
 

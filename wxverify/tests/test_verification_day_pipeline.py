@@ -9,11 +9,12 @@ path -- never a stand-in for it.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import date
 from pathlib import Path
 
@@ -42,13 +43,15 @@ from wxverify.verification.record import SNAPSHOT_TIME_KEY
 from wxverify.verification.runs import (
     assert_inputs_unchanged_readonly,
     assert_inputs_unpinned_unchanged,
+    published_run_id,
     run_config_from_row,
 )
 from wxverify.verification.simulate import DayEvidence
 from wxverify.worker import verification_run as verification_run_module
-from wxverify.worker.control import JobCancelled
+from wxverify.worker.control import JobCancelled, JobContinuation
 from wxverify.worker.processor import run_claimed_job
 from wxverify.worker.verification_run import (
+    _DayWork,  # noqa: SLF001
     _load_state,  # noqa: SLF001
     advance_verification,
     run_verification_chunk,
@@ -1496,5 +1499,362 @@ def test_per_claim_info_line_absent_on_raise(
             r.getMessage().startswith("verification chunk site=")
             for r in caplog.records
         )
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# T1-T7 -- the time budget for one simulate/baseline claim.
+#
+# Each test fakes the module clock with a counter and wraps `_compute_day`
+# so it calls the real function and then advances the counter by that
+# day's scripted cost -- `_clock()` reads the counter exactly as the real
+# claim-elapsed-time arithmetic in `_run_day_chunk` expects.
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_clock(
+    monkeypatch: pytest.MonkeyPatch, day_costs: Iterable[float]
+) -> dict[str, int]:
+    """Fake clock + costed `_compute_day`; returns a live call counter."""
+    counter = {"value": 0.0}
+    calls = {"n": 0}
+    costs = iter(day_costs)
+    real_compute_day = verification_run_module._compute_day  # noqa: SLF001
+
+    def _fake_clock() -> float:
+        return counter["value"]
+
+    def _costed_compute_day(c: sqlite3.Connection, sid: int, phase: str) -> _DayWork:
+        calls["n"] += 1
+        work = real_compute_day(c, sid, phase)
+        counter["value"] += next(costs)
+        return work
+
+    monkeypatch.setattr(verification_run_module, "_clock", _fake_clock)
+    monkeypatch.setattr(verification_run_module, "_compute_day", _costed_compute_day)
+    return calls
+
+
+def test_day_chunk_budget_stops_before_a_day_would_overrun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T1: 120s/day, cap 7 -> 2 days, stop=budget, `_compute_day` called twice.
+
+    Catches: stopping only once elapsed itself reaches the budget (a third
+    day would run and only then get discarded, 3 calls) instead of stopping
+    before a day that would not fit.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        calls = _install_fake_clock(monkeypatch, [120.0] * 7)
+
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+        result = await run_verification_chunk(db, writer, site_id, payload)
+        assert result is not None
+
+        assert calls["n"] == 2
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        [message] = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+        ]
+        assert "days=2" in message
+        assert "stop=budget" in message
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_budget_predicts_from_the_slowest_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T2: 150, 10, 150, ... s/day, cap 7 -> 2 days, stop=budget.
+
+    Catches: predicting the next day's cost from the LAST day (10s) instead
+    of the slowest day so far (150s) -- that would let a third day start
+    (160 + 10 <= 300) and run to 3 days total.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        calls = _install_fake_clock(
+            monkeypatch, [150.0, 10.0, 150.0, 10.0, 150.0, 10.0, 150.0]
+        )
+
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+        result = await run_verification_chunk(db, writer, site_id, payload)
+        assert result is not None
+
+        assert calls["n"] == 2
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        [message] = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+        ]
+        assert "days=2" in message
+        assert "stop=budget" in message
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_budget_boundary_is_inclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T3: 100s/day, cap 7 -> 3 days (elapsed+day_max == budget exactly).
+
+    Catches: `<` instead of `<=` in the budget check, which would stop one
+    day early (2 days) at the same elapsed+day_max == 300 boundary.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        calls = _install_fake_clock(monkeypatch, [100.0] * 7)
+
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+        result = await run_verification_chunk(db, writer, site_id, payload)
+        assert result is not None
+
+        assert calls["n"] == 3
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        [message] = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+        ]
+        assert "days=3" in message
+        assert "stop=budget" in message
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_budget_always_runs_the_first_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T4: 400s/day (over budget alone), cap 7, 3 claims -> 1 day/claim, and
+    `last_day` advances on every claim.
+
+    Catches: checking the budget before the FIRST day of a claim too, which
+    would stop every claim at 0 days and the chain would never progress.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        calls = _install_fake_clock(monkeypatch, [400.0, 400.0, 400.0])
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        expected_last_days = ["2026-01-01", "2026-01-02", "2026-01-03"]
+        for expected_last_day in expected_last_days:
+            caplog.clear()
+            fresh_writer = FencedWriter(db, db.generation)
+            result = await run_verification_chunk(db, fresh_writer, site_id, payload)
+            assert result is not None
+            [message] = [
+                r.getMessage()
+                for r in caplog.records
+                if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+            ]
+            assert "days=1" in message
+            assert f"last_day={expected_last_day}" in message
+
+        assert calls["n"] == 3
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_cap_still_applies_under_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T5: 10s/day (well under budget), cap 2 -> 2 days, stop=cap.
+
+    Catches: the budget replacing the payload cap, which would keep running
+    days past the cap (up to 7, the chunk-size default) since 10s/day never
+    approaches the 300s budget.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=2)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        calls = _install_fake_clock(monkeypatch, itertools.repeat(10.0))
+
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+        result = await run_verification_chunk(db, writer, site_id, payload)
+        assert result is not None
+
+        assert calls["n"] == 2
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        [message] = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+        ]
+        assert "days=2" in message
+        assert "stop=cap" in message
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_phase_end_stop_label_and_log_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """T6: 10s/day, phase ends on the claim's 3rd day -> 3 days,
+    stop=phase_end, and every old INFO field is still present, in order.
+
+    Catches: the phase-end break leaving `stop` labelled `cap` instead of
+    `phase_end`, and a renamed or reordered field in the INFO line.
+    """
+
+    async def _run() -> None:
+        conn = _init_tmp_db(tmp_path)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+
+        # Three real (uninstrumented) 7-day claims consume 2026-01-01..21,
+        # leaving exactly 3 days (01-22..24) before `simulate` ends.
+        for _ in range(3):
+            fresh_writer = FencedWriter(db, db.generation)
+            result = await run_verification_chunk(db, fresh_writer, site_id, payload)
+            assert result is not None
+
+        calls = _install_fake_clock(monkeypatch, [10.0, 10.0, 10.0])
+
+        caplog.clear()
+        caplog.set_level(logging.INFO, logger="wxverify.worker.verification_run")
+        fresh_writer = FencedWriter(db, db.generation)
+        result = await run_verification_chunk(db, fresh_writer, site_id, payload)
+        assert result is not None
+
+        assert calls["n"] == 3
+        prefix = f"verification chunk site={site_id} phase=simulate"
+        [message] = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.INFO and r.getMessage().startswith(prefix)
+        ]
+        assert "days=3" in message
+        assert "last_day=2026-01-24" in message
+        assert "compute_max_s=" in message
+        assert "compute_total_s=" in message
+        assert "persist_max_s=" in message
+        assert "stop=phase_end" in message
+
+        assert (
+            message.index(f"site={site_id}")
+            < message.index("phase=simulate")
+            < message.index("days=3")
+            < message.index("last_day=2026-01-24")
+            < message.index("compute_max_s=")
+            < message.index("compute_total_s=")
+            < message.index("persist_max_s=")
+            < message.index("stop=phase_end")
+        )
+
+        assert message == (
+            f"verification chunk site={site_id} phase=simulate days=3"
+            " last_day=2026-01-24 compute_max_s=10.0 compute_total_s=30.0"
+            " persist_max_s=0.00 elapsed_s=30.0 stop=phase_end"
+        )
+
+    asyncio.run(_run())
+
+
+def test_day_chunk_budget_split_does_not_change_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T7: a 400s/day claim split (1 day/claim) against a 1s/day claim split
+    (7 days/claim, cap-bound) on the same fixture -- identical evidence and
+    published verdicts, and every continuation payload equals the original.
+
+    Catches: any result that depends on where a claim happens to end, and
+    budget state (elapsed, day_max, ...) leaking into the continuation
+    payload instead of staying internal to `_run_day_chunk`.
+    """
+
+    async def _drive_to_publish(
+        db_dir: Path, day_cost: float
+    ) -> tuple[str, frozenset[tuple[str, str]]]:
+        db_dir.mkdir()
+        conn = _init_tmp_db(db_dir)
+        site_id, _feeds, _station = build_synthetic_verification_site(conn)
+        db = get_db()
+        writer = FencedWriter(db, db.generation)
+        payload = _payload(days_per_chunk=7)
+        await _drive_to_simulate(db, writer, site_id, payload)
+        # After setup: the sync decide phase adds decision_fingerprint in place.
+        original = dict(payload)
+
+        _install_fake_clock(monkeypatch, itertools.repeat(day_cost))
+
+        fresh_writer = FencedWriter(db, db.generation)
+        result: JobContinuation | None = None
+        for _ in range(400):
+            result = await run_verification_chunk(db, fresh_writer, site_id, payload)
+            assert payload == original
+            assert result is None or result.payload == original
+            if result is None:
+                break
+        else:
+            raise AssertionError("chain never terminated")
+
+        run_id = published_run_id(conn, site_id)
+        assert run_id is not None
+        digest = await db.read(lambda c, r=run_id: evidence_digest(c, r))
+        verdicts = await db.read(
+            lambda c, r=run_id: frozenset(
+                (str(row["variable"]), str(row["outcome"]))
+                for row in c.execute(
+                    "SELECT variable, outcome FROM verification_verdicts"
+                    " WHERE run_id = ?",
+                    (r,),
+                ).fetchall()
+            )
+        )
+        return digest, verdicts
+
+    async def _run() -> None:
+        slow_digest, slow_verdicts = await _drive_to_publish(tmp_path / "slow", 400.0)
+        fast_digest, fast_verdicts = await _drive_to_publish(tmp_path / "fast", 1.0)
+
+        assert slow_digest == fast_digest
+        assert slow_verdicts == fast_verdicts
 
     asyncio.run(_run())

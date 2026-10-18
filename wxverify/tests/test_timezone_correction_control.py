@@ -164,13 +164,13 @@ def _drain_foreign_jobs(conn: sqlite3.Connection) -> None:
     The flip chunk (``worker/tz_correction.py: _flip``) enqueues a
     ``pair_and_score`` job in the SAME transaction as the flip -- a real,
     expected side effect, not a fixture leak. ``claim_next_job`` claims
-    globally by type-priority tier (db/queue.py:276-280), and
-    ``pair_and_score`` outranks ``timezone_correction`` (the LAST tier), so
-    it would otherwise be claimed ahead of the chain's own next job on every
-    drive step following a flip. We don't care about its effects for these
-    oracles -- only that it stops shadowing the correction chain's own
-    claims -- so it is drained by direct completion rather than by running
-    real scoring logic.
+    globally by type-priority tier (db/queue.py's ``_CLAIM_ORDER_BY``), and
+    ``pair_and_score`` outranks ``timezone_correction`` (the LAST tier) for
+    its first 5 minutes, so it would otherwise be claimed ahead of the
+    chain's own next job on every drive step following a flip. We don't
+    care about its effects for these oracles -- only that it stops
+    shadowing the correction chain's own claims -- so it is drained by
+    direct completion rather than by running real scoring logic.
 
     Deliberately an allowlist of ``pair_and_score`` (the one job type this
     drain exists to clear), not a denylist of ``timezone_correction``: with
@@ -194,11 +194,12 @@ def _claim_and_step(conn: sqlite3.Connection, site_id: int, generation_id: int) 
     _drain_foreign_jobs(conn)
     job = claim_next_job(conn)
     assert job is not None, "expected a claimable timezone_correction job"
-    # Trap #2: timezone_correction is the LAST claim-priority tier
-    # (db/queue.py:276-280); assert identity so a stray pending row from a
-    # DIFFERENT fixture could never be silently claimed instead. Foreign
-    # job types (e.g. the flip's own pair_and_score side effect) are
-    # drained above, so this now catches only a genuine identity mismatch.
+    # Trap #2: timezone_correction is the LAST claim-priority tier for
+    # its first 5 minutes (db/queue.py's ``_CLAIM_ORDER_BY``); assert
+    # identity so a stray pending row from a DIFFERENT fixture could
+    # never be silently claimed instead. Foreign job types (e.g. the
+    # flip's own pair_and_score side effect) are drained above, so this
+    # now catches only a genuine identity mismatch.
     assert job.job_key == correction_job_key(generation_id), (
         f"claimed {job.job_key!r}, expected {correction_job_key(generation_id)!r}"
     )
@@ -1120,8 +1121,9 @@ def test_o16_cleanup_stall_is_reported_distinctly_from_failure(
         def _force_terminal_failure(conn: sqlite3.Connection) -> None:
             # The flip enqueued its own pair_and_score side-effect job in the
             # same transaction; drain it first so claim_next_job's global
-            # priority-tier ordering (db/queue.py:276-280) doesn't hand back
-            # that instead of the cleanup continuation under test.
+            # priority-tier ordering (db/queue.py's ``_CLAIM_ORDER_BY``)
+            # doesn't hand back that instead of the cleanup continuation
+            # under test.
             _drain_foreign_jobs(conn)
             job = claim_next_job(conn)
             assert job is not None

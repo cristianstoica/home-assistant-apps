@@ -32,7 +32,8 @@ from wxverify.api.routes.health import (
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.db.migrations import SEED_LAST_USABLE_FETCH_SQL, run_migrations
 from wxverify.db.queue import (
-    _CURRENT_OBS_LANE_CLAUSE,  # noqa: PLC2701 -- the constant IS the plan input under test
+    _CLAIM_ORDER_BY,  # noqa: PLC2701 -- the constant IS the plan input under test
+    _CURRENT_OBS_LANE_CLAUSE,  # noqa: PLC2701
     _MAIN_LANE_CLAUSE,  # noqa: PLC2701
     ACTIVE_JOB_SQL,
     LATEST_JOB_SQL,
@@ -1268,10 +1269,10 @@ def _claim_subselect_plan(conn: sqlite3.Connection, type_clause: str) -> list[st
     """The claim's inner pending-row subselect, isolated from the outer
     UPDATE ... RETURNING (§6.3.4, ``db/queue.py``'s ``_claim``). The outer
     UPDATE always resolves by rowid regardless of ``type_clause``, so only
-    this subselect's plan can move -- reproduced here (not imported: it is
-    not a module-level constant) with the same ``type_clause`` splice point
-    ``_claim`` uses, so this test drives the SAME clause CONSTANTS production
-    claims with, not a hand-copied literal.
+    this subselect's plan can move -- imports ``_CLAIM_ORDER_BY`` and uses
+    the same ``type_clause`` splice point ``_claim`` uses, so this test
+    drives the SAME clause CONSTANTS production claims with, not a
+    hand-copied literal.
     """
     return _plan(
         conn,
@@ -1280,16 +1281,10 @@ def _claim_subselect_plan(conn: sqlite3.Connection, type_clause: str) -> list[st
         WHERE status = 'pending'
           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
           {type_clause}
-        ORDER BY
-            CASE
-                WHEN type IN ('forecast_record','record_gap_scan') THEN 0
-                WHEN type IN ('verification_run','timezone_correction') THEN 2
-                ELSE 1
-            END,
-            created_at, id
+        {_CLAIM_ORDER_BY}
         LIMIT 1
         """,
-        ("2026-07-07T12:00:00Z",),
+        ("2026-07-07T12:00:00Z", "2026-07-07T11:55:00Z"),
     )
 
 

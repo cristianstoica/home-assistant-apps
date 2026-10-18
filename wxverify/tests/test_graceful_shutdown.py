@@ -180,8 +180,8 @@ def test_cancellation_reclaims_claimed_job(
         after = _job_row(conn, job_id)
         assert after["status"] == "pending"
         assert after["next_attempt_at"] == before["next_attempt_at"], (
-            "reclaim must not touch next_attempt_at (bare pending, not "
-            "defer_job's fresh next_attempt_at=now)"
+            "reclaim must not touch next_attempt_at for non-chain types "
+            "(bare pending, not defer_job's fresh next_attempt_at=now)"
         )
 
     asyncio.run(_run())

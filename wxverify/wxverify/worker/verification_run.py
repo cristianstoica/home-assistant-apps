@@ -110,6 +110,10 @@ TRUTH_DISCOVERY_DAYS_PER_CHUNK = 20
 REGEN_CHUNK_GROUPS = 20
 # Snapshot days per claimed chunk (payload-overridable); each day commits on its own.
 SNAPSHOT_DAYS_PER_CHUNK = 7
+# Longest one simulate/baseline claim may run before it hands the lane back.
+DAY_CHUNK_BUDGET_SECONDS = 300.0
+# Read at call time, so a test can substitute a fake clock.
+_clock = time.monotonic
 # Failed attempts on ONE fingerprint before the trigger stops retrying (§14:
 # a third start without completion marks the effort failed, not re-pended).
 MAX_FAILED_ATTEMPTS = 2
@@ -319,6 +323,13 @@ def _persist_day(conn: sqlite3.Connection, site_id: int, work: _DayWork) -> None
     _heartbeat(conn, site_id)
 
 
+def _budget_allows_next_day(
+    elapsed_s: float, day_max_s: float, budget_s: float
+) -> bool:
+    """Start another day only if the slowest day so far would still fit."""
+    return elapsed_s + day_max_s <= budget_s
+
+
 async def _run_day_chunk(
     db: Database,
     writer: FencedWriter,
@@ -336,24 +347,36 @@ async def _run_day_chunk(
     days = _chunk_size(payload, "snapshot_days_per_chunk", SNAPSHOT_DAYS_PER_CHUNK)
     done = 0
     last_day: str | None = None
-    compute_max = compute_total = persist_max = 0.0
-    for _ in range(days):
-        started = time.monotonic()
+    compute_max = compute_total = persist_max = day_max = 0.0
+    stop = "cap"
+    claim_started = _clock()
+    for index in range(days):
+        # The first day always runs, so the chain advances even when one day
+        # alone is longer than the budget.
+        if index > 0 and not _budget_allows_next_day(
+            _clock() - claim_started, day_max, DAY_CHUNK_BUDGET_SECONDS
+        ):
+            stop = "budget"
+            break
+        started = _clock()
         work = await db.read(lambda conn: _compute_day(conn, site_id, phase))
-        computed = time.monotonic()
+        computed = _clock()
         await writer.write(lambda conn, w=work: _persist_day(conn, site_id, w))
-        persisted = time.monotonic()
+        persisted = _clock()
         compute_max = max(compute_max, computed - started)
         compute_total += computed - started
         persist_max = max(persist_max, persisted - computed)
+        day_max = max(day_max, persisted - started)
         if work.day is not None:
             done += 1
             last_day = work.day
         if work.next_blob.get("phase") != phase:
+            stop = "phase_end"
             break
     logger.info(
         "verification chunk site=%s phase=%s days=%d last_day=%s"
-        " compute_max_s=%.1f compute_total_s=%.1f persist_max_s=%.2f",
+        " compute_max_s=%.1f compute_total_s=%.1f persist_max_s=%.2f"
+        " elapsed_s=%.1f stop=%s",
         site_id,
         phase,
         done,
@@ -361,6 +384,8 @@ async def _run_day_chunk(
         compute_max,
         compute_total,
         persist_max,
+        _clock() - claim_started,
+        stop,
     )
     return _continuation(site_id, payload)
 

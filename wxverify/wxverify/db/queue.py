@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Final, cast
 
+from wxverify.core import timeutil
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 
 logger = logging.getLogger(__name__)
@@ -256,6 +257,23 @@ MAIN_LANE_TYPE_SQL: Final = "type IS NOT 'fetch_current_obs'"
 _MAIN_LANE_CLAUSE: Final = "AND " + MAIN_LANE_TYPE_SQL
 _CURRENT_OBS_LANE_CLAUSE: Final = "AND +type = 'fetch_current_obs'"
 
+#: A pending chain chunk older than this claims in tier 1, FIFO by created_at.
+CHAIN_PROMOTION_AGE: Final = timedelta(minutes=5)
+
+#: The resumable chain types: the claim's tier-2 rule and the reclaim stamp.
+_CHAIN_TYPES_SQL: Final = "('verification_run','timezone_correction')"
+
+_CLAIM_ORDER_BY: Final = f"""
+    ORDER BY
+        CASE
+            WHEN type IN ('forecast_record','record_gap_scan') THEN 0
+            WHEN type IN {_CHAIN_TYPES_SQL}
+                 AND COALESCE(next_attempt_at, updated_at) > ? THEN 2
+            ELSE 1
+        END,
+        created_at, id
+"""
+
 
 def claim_next_job(conn: sqlite3.Connection) -> Job | None:
     """Claim one pending main-lane job: any type but ``fetch_current_obs``.
@@ -283,15 +301,22 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
     a single failed job -- so the disposition happens here, not in the
     dispatcher.
 
-    Ordering is a type-priority tier, then FIFO within the tier (§14):
-    ``forecast_record`` / ``record_gap_scan`` claim ahead of everything,
-    and the resumable chain chunks (``verification_run`` /
-    ``timezone_correction``) claim LAST -- each chunk re-enqueues its own
-    continuation, so under plain FIFO a long chain would monopolize the
-    single main worker lane and starve record derivation; the tier lets
-    other work interleave between chunks by construction.
+    Ordering is a type-priority tier, then FIFO by ``created_at, id`` within
+    the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). ``forecast_record`` /
+    ``record_gap_scan`` (tier 0) still claim ahead of everything. A resumable
+    chain chunk (``verification_run`` / ``timezone_correction``) claims after
+    all other work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in
+    tier 1, FIFO by ``created_at`` with the rest. Its age runs from
+    ``COALESCE(next_attempt_at, updated_at)``: a new continuation's insert
+    time, a retried or deferred chunk's due time, or the reclaim time
+    (``reclaim_all_stale``). Each chunk re-enqueues its continuation as a
+    fresh row, so every chunk starts its wait in tier 2 again: other work
+    still interleaves between chunks, and a chunk no longer waits for as
+    long as any tier-1 job is pending.
     """
-    now = isoformat_utc()
+    claim_at = timeutil.utc_now()  # module attribute, the clock isoformat_utc() reads
+    now = isoformat_utc(claim_at)
+    promote_after = isoformat_utc(claim_at - CHAIN_PROMOTION_AGE)
     row = conn.execute(
         f"""
         UPDATE jobs
@@ -301,18 +326,12 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
             WHERE status = 'pending'
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
               {type_clause}
-            ORDER BY
-                CASE
-                    WHEN type IN ('forecast_record','record_gap_scan') THEN 0
-                    WHEN type IN ('verification_run','timezone_correction') THEN 2
-                    ELSE 1
-                END,
-                created_at, id
+            {_CLAIM_ORDER_BY}
             LIMIT 1
         )
         RETURNING *
         """,
-        (now, now),
+        (now, now, promote_after),
     ).fetchone()
     if row is None:
         return None
@@ -452,12 +471,22 @@ def purge_failed_jobs_older_than(conn: sqlite3.Connection, hours: int) -> int:
 
 
 def reclaim_all_stale(conn: sqlite3.Connection) -> int:
+    """Re-pend every running row.
+
+    A chain row's next_attempt_at becomes now, so it waits in tier 2 like a
+    new continuation (see _claim). Besides status and updated_at, nothing
+    else changes: created_at, retry_count and every other type's
+    next_attempt_at stay as they were.
+    """
+    now = isoformat_utc()
     cur = conn.execute(
-        """
+        f"""
         UPDATE jobs
-        SET status='pending', updated_at=?
-        WHERE status='running'
+        SET status = 'pending', updated_at = ?,
+            next_attempt_at = CASE WHEN type IN {_CHAIN_TYPES_SQL}
+                                   THEN ? ELSE next_attempt_at END
+        WHERE status = 'running'
         """,
-        (isoformat_utc(),),
+        (now, now),
     )
     return cur.rowcount

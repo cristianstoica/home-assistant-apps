@@ -460,8 +460,8 @@ class TestRetrospectiveChain:
 class TestClaimPriority:
     def test_records_claim_before_chain_chunks(self) -> None:
         """§14: forecast_record / record_gap_scan claim ahead of everything;
-        chain chunks claim last, so FIFO cannot let a self-re-enqueueing
-        chain starve record derivation.
+        chain chunks claim last for their first 5 minutes, so FIFO cannot
+        let a self-re-enqueueing chain starve record derivation.
         """
         conn = asof_conn()
         site_id = asof_make_site(conn, "prio-site")
