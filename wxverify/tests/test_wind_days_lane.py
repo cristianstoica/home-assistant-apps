@@ -3430,23 +3430,21 @@ def test_wind_lane_due_true_for_staging_with_pair_max_rows_present() -> None:
 def test_wind_days_lane_quiescence_leaves_a_claim_window_for_verification_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Plan rationale ('Why not JobContinuation'): a wind-days lane with a
-    job always pending would starve the tier-2 ``verification_run`` lane,
-    because ``claim_next_job``'s CASE orders ``verification_run``/
-    ``timezone_correction`` strictly after every other pending type
-    (wind_days.py's ``WIND_DAYS_SPACING`` is what keeps a wind-days job
-    from always being pending -- see the spacing test above). This pins
-    both halves of that rationale in one place, DRIVING the real scheduler
-    (``_enqueue_due_wind_days``) rather than hand-inserting the wind job,
-    so the lane's own ``WIND_DAYS_SPACING`` cooldown is what keeps it
-    quiescent, not just an absent row by construction: with the lane
-    quiescent (a completed job 1 minute inside its 5-minute cooldown, so no
-    pending wind-days job), a pending ``verification_run`` job IS the next
-    claim; the paired positive re-stamps the completed job 6 minutes ago
-    (outside the cooldown), drives the scheduler again, and shows the
-    resulting pending wind-days job claims FIRST over a re-pended
-    ``verification_run``, which is exactly the tier ordering that would
-    starve it if a wind-days job were always pending.
+    """Plan rationale ('Why not JobContinuation'): a wind-days lane with a job always
+    pending would hold every ``verification_run`` chunk back, because
+    ``claim_next_job``'s CASE orders ``verification_run``/``timezone_correction`` after
+    every other pending type for their first 5 minutes (wind_days.py's
+    ``WIND_DAYS_SPACING`` is what keeps a wind-days job from always being pending -- see
+    the spacing test above). This pins both halves of that rationale in one place,
+    DRIVING the real scheduler (``_enqueue_due_wind_days``) rather than hand-inserting
+    the wind job, so the lane's own ``WIND_DAYS_SPACING`` cooldown is what keeps it
+    quiescent, not just an absent row by construction: with the lane quiescent (a
+    completed job 1 minute inside its 5-minute cooldown, so no pending wind-days job), a
+    pending ``verification_run`` job IS the next claim; the paired positive re-stamps
+    the completed job 6 minutes ago (outside the cooldown), drives the scheduler again,
+    and shows the resulting pending wind-days job claims FIRST over a re-pended
+    ``verification_run``, which is exactly the tier ordering that would hold it in tier
+    2 for its first 5 minutes if a wind-days job were always pending.
 
     mutant -> at the step-3 pending-count assertion: correct = 0 (1 minute
     is inside WIND_DAYS_SPACING, so the scheduler does not enqueue), mutant
@@ -3521,11 +3519,13 @@ def test_wind_days_lane_quiescence_leaves_a_claim_window_for_verification_run(
     claimed_busy = claim_next_job(conn)
     assert claimed_busy is not None and claimed_busy.type == "fetch_obs", (
         "mutant -> at this assertion: correct = the fetch_obs (wind-days)"
-        " job claims first (tier 1 beats tier 2 in the claim CASE), mutant"
+        " job claims first (tier 1 beats the chain row's tier 2 -- it was"
+        " claimed seconds ago, still inside its first 5 minutes, so it is"
+        " not yet promoted), mutant"
         " (verification_run's CASE tier changed to rank ahead of or equal"
         " to the default tier) = the verification_run job claimed instead"
-        " -- exactly the ordering that would starve it if a wind-days job"
-        " were always pending"
+        " -- exactly the ordering that would hold it in tier 2 for its"
+        " first 5 minutes if a wind-days job were always pending"
     )
 
 
