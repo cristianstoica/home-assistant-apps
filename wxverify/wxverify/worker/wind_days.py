@@ -64,12 +64,15 @@ from wxverify.db.wind_basis import (
     LEGACY_WIND_SQL,
     PAIR_MAX_WIND_SQL,
     STATES,
+    WIND_FINAL_LEAD,
     AuthHold,
     AuthHoldEndpoint,
     WindCursor,
     clear_auth_hold,
+    count_missed_final,
     json_object,
     julian_to_utc,
+    read_auth_hold,
     read_auth_holds,
     read_wind_cursor,
     set_wind_basis_state,
@@ -83,7 +86,7 @@ from wxverify.db.wind_basis import (
     write_auth_hold,
     write_wind_cursor,
 )
-from wxverify.forecast.wind_blend import MIN_OBS_HOURS
+from wxverify.forecast.wind_blend import MIN_OBS_HOURS, TRAINING_DAYS
 from wxverify.obs.pws_adapter import (
     UpstreamPayloadError,
     fetch_all_1day,
@@ -125,6 +128,7 @@ _CHUNK_ROWS: Final = 24
 _DAY_TRANSACTIONS: Final = 14
 _MAX_ATTEMPTS: Final = 3
 _TRANSPORT_DEFER: Final = timedelta(minutes=15)
+_FINAL_RETRY_LEAD: Final = timedelta(minutes=20)
 _HEADROOM_RETRY: Final = timedelta(hours=1)
 _STORE_MARGIN: Final = timedelta(hours=24)
 _FUTURE_SLACK: Final = timedelta(minutes=5)
@@ -176,6 +180,23 @@ LIMIT 1
 _RETRYABLE_SQL: Final = (
     "(d.status IN ('pending','partial') OR (d.status = 'failed' AND d.attempts < 3))"
 )
+
+#: The past rows the finish step closes while ``history_all`` is held, shared
+#: by the finish step, its re-check and ``wind_lane_due``. The status clause is
+#: the unsettled-days clause of wind training; a non-canonical date never matches.
+_FINISHABLE_SQL: Final = """
+SELECT d.station_id, d.local_date, st.pws_station_id
+FROM station_wind_days d JOIN stations st ON st.id = d.station_id
+WHERE st.site_id = :site_id AND st.enabled = 1
+  AND d.local_date < :today AND d.local_date >= :floor
+  AND date(d.local_date) = d.local_date
+  AND (d.status IN ('pending','partial') OR (d.status = 'failed' AND d.attempts < 3)
+       OR (d.refetch_at IS NOT NULL AND d.refetched = 0))
+  AND (:station_id IS NULL OR d.station_id = :station_id)
+  AND (:local_date IS NULL OR d.local_date = :local_date)
+ORDER BY d.local_date, d.station_id
+LIMIT :limit
+"""
 
 _RowOutcome = Literal["skipped", "fetched", "closed"]
 _FailureOutcome = Literal["fetched", "closed", "reraise"]
@@ -377,9 +398,29 @@ def wind_lane_due(
     if state == "staging" and _has_pair_max_rows(conn, site_id):
         return True
     today = now.astimezone(tz).date()
-    opened = open_endpoints(read_auth_holds(conn), probing_open=True)
+    holds = read_auth_holds(conn)
+    opened = open_endpoints(holds, probing_open=True)
     if wind_days_due(
         conn, site_id, today=today, now=now, open_endpoints=opened, limit=1
+    ):
+        return True
+    history = holds.get("history_all")
+    if (
+        state == "pair_max"
+        and history is not None
+        and history.status == "held"
+        and conn.execute(
+            _FINISHABLE_SQL,
+            {
+                "site_id": site_id,
+                "today": today.isoformat(),
+                "floor": _finish_floor(today),
+                "station_id": None,
+                "local_date": None,
+                "limit": 1,
+            },
+        ).fetchone()
+        is not None
     ):
         return True
     return _missing_today_row(conn, site_id, today)
@@ -508,6 +549,8 @@ async def _run_fetch_chunk(
         tz_name=start.tz_name,
         today=today,
     )
+    if start.state == "pair_max":
+        await _finish_waiting_days(chunk, start)
     for endpoint in _ENDPOINTS:
         hold = start.holds.get(endpoint)
         if hold is None or hold.status != "probing":
@@ -1011,11 +1054,19 @@ def _read_records(
     return records
 
 
-def _today_next_attempt(conn: sqlite3.Connection, now: datetime, end: datetime) -> str:
-    """now + the obs interval; at or past the day's end, end + 1 h."""
+def _today_next_attempt(
+    conn: sqlite3.Connection, now: datetime, end: datetime, *, failed: bool
+) -> str:
+    """Next today call: the obs cadence capped at the final call (end - 35 min,
+    before the one-day product resets); one retry at end - 20 min after a
+    failed final call; otherwise end + 1 h."""
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
-    next_at = now + timedelta(minutes=interval)
-    if next_at >= end:
+    final = end - WIND_FINAL_LEAD
+    if now < final:
+        next_at = min(now + timedelta(minutes=interval), final)
+    elif failed and now < end - _FINAL_RETRY_LEAD:
+        next_at = end - _FINAL_RETRY_LEAD
+    else:
         next_at = end + _ONE_HOUR
     return isoformat_utc(next_at)
 
@@ -1122,7 +1173,7 @@ def _persist_day(
     next_attempt_at: str | None = None
     if local_date == today:
         status = "partial"
-        next_attempt_at = _today_next_attempt(conn, now, end)
+        next_attempt_at = _today_next_attempt(conn, now, end, failed=False)
     elif record_count > 0:
         status = "fetched"
     elif local_date == yesterday and attempts < _MAX_ATTEMPTS:
@@ -1281,6 +1332,178 @@ def _reconcile(
     )
 
 
+def _finish_floor(today: date) -> str:
+    """The oldest local date the finish step touches: the first day of the
+    wind training window (``TRAINING_DAYS``)."""
+    return (today - timedelta(days=TRAINING_DAYS)).isoformat()
+
+
+async def _finish_waiting_days(chunk: _Chunk, start: _JobStart) -> None:
+    """Finish the past rows that wait on a held ``history_all`` (plan §4).
+
+    No API call and no budget. Each row is finished in its own transaction; a
+    row whose finish raises goes through ``_row_failure``, with a WARNING, and
+    the step moves on. After a row dated yesterday is finished, a missed final
+    collection is logged (plan §7) unless ``all_1day`` has a hold.
+    """
+    history = start.holds.get("history_all")
+    if history is None or history.status != "held":
+        return
+    site_id = chunk.site_id
+    tz_name = chunk.tz_name
+    today = chunk.today
+    yesterday = today - _ONE_DAY
+    rows = await chunk.db.read(
+        lambda conn: conn.execute(
+            _FINISHABLE_SQL,
+            {
+                "site_id": site_id,
+                "today": today.isoformat(),
+                "floor": _finish_floor(today),
+                "station_id": None,
+                "local_date": None,
+                "limit": _CHUNK_ROWS,
+            },
+        ).fetchall()
+    )
+    finished_yesterday = False
+    for row in rows:
+        station_id = int(row["station_id"])
+        pws_station_id = str(row["pws_station_id"])
+        local_date = date.fromisoformat(str(row["local_date"]))
+        try:
+            finished = await chunk.writer.write(
+                lambda conn, sid=station_id, day=local_date: _finish_day(
+                    conn,
+                    site_id=site_id,
+                    station_id=sid,
+                    local_date=day,
+                    tz_name=tz_name,
+                    today=today,
+                )
+            )
+        except (StaleGenerationError, sqlite3.OperationalError, JobControl):
+            raise
+        except Exception as exc:
+            error = sanitized_exception(exc)
+            message = f"station={pws_station_id} date={local_date.isoformat()}: {error}"
+            await chunk.writer.write(
+                lambda conn, sid=station_id, day=local_date, text=message: _row_failure(
+                    conn,
+                    site_id=site_id,
+                    station_id=sid,
+                    local_date=day,
+                    tz_name=tz_name,
+                    today=today,
+                    message=text,
+                )
+            )
+            logger.warning(
+                "wind day finish failed site=%s station=%s date=%s: %s",
+                site_id,
+                pws_station_id,
+                local_date,
+                error,
+            )
+            continue
+        if finished and local_date == yesterday:
+            finished_yesterday = True
+    if finished_yesterday and "all_1day" not in start.holds:
+        missed, total = await chunk.db.read(
+            lambda conn: count_missed_final(conn, site_id, yesterday, tz_name)
+        )
+        if missed > 0:
+            logger.warning(
+                "wind final collection missed site=%s date=%s stations=%s/%s",
+                site_id,
+                yesterday,
+                missed,
+                total,
+            )
+
+
+def _finish_day(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    tz_name: str,
+    today: date,
+) -> bool:
+    """Finish one past row with the records it has (plan §4); False if gated.
+
+    The gate is an allowlist read in this transaction: the site is
+    ``pair_max``, the ``history_all`` hold is ``held``, and the row matches
+    ``_FINISHABLE_SQL``. A pending refetch on a fetched or unavailable row is
+    closed; any other row becomes fetched or unavailable and is derived as a
+    past day. ``attempts``, ``last_ok_at``, ``last_error``, the records and
+    the hold are left as they are.
+    """
+    if wind_basis_state(conn, site_id) != "pair_max":
+        return False
+    hold = read_auth_hold(conn, "history_all")
+    if hold is None or hold.status != "held":
+        return False
+    day = local_date.isoformat()
+    finishable = conn.execute(
+        _FINISHABLE_SQL,
+        {
+            "site_id": site_id,
+            "today": today.isoformat(),
+            "floor": _finish_floor(today),
+            "station_id": station_id,
+            "local_date": day,
+            "limit": 1,
+        },
+    ).fetchone()
+    if finishable is None:
+        return False
+    stamp = isoformat_utc(utc_now())
+    row = _read_day(conn, station_id, local_date)
+    if row is not None and _is_refetch(row):
+        conn.execute(
+            "UPDATE station_wind_days SET refetched = 1, updated_at = ?"
+            " WHERE station_id = ? AND local_date = ?",
+            (stamp, station_id, day),
+        )
+        return True
+    start, end, _ = local_day_slots(local_date, tz_name)
+    count_row = conn.execute(
+        "SELECT COUNT(*) AS n FROM station_wind_records"
+        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?",
+        (station_id, isoformat_utc(start), isoformat_utc(end)),
+    ).fetchone()
+    conn.execute(
+        """
+        UPDATE station_wind_days
+        SET status = CASE WHEN :n > 0 THEN 'fetched' ELSE 'unavailable' END,
+            next_attempt_at = NULL, record_count = :n,
+            refetched = CASE WHEN refetch_at IS NOT NULL THEN 1 ELSE refetched END,
+            updated_at = :now
+        WHERE station_id = :station_id AND local_date = :local_date
+          AND (status IN ('pending','partial')
+               OR (status = 'failed' AND attempts < 3))
+        """,
+        {
+            "n": int(count_row["n"]),
+            "now": stamp,
+            "station_id": station_id,
+            "local_date": day,
+        },
+    )
+    _derive_days(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=local_date,
+        tz_name=tz_name,
+        today=today,
+        write_rows=True,
+    )
+    return True
+
+
 def _row_failure(
     conn: sqlite3.Connection,
     *,
@@ -1311,7 +1534,7 @@ def _row_failure(
             "UPDATE station_wind_days SET status = 'partial', next_attempt_at = ?,"
             " last_error = ?, updated_at = ? WHERE station_id = ? AND local_date = ?",
             (
-                _today_next_attempt(conn, now, end),
+                _today_next_attempt(conn, now, end, failed=True),
                 message,
                 stamp,
                 station_id,

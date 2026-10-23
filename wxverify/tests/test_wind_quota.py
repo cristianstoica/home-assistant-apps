@@ -26,6 +26,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -730,12 +731,13 @@ def test_t95_a_slow_fake_limiter_does_not_cause_provider_deadline_exceeded(
 
 # ---------------------------------------------------------------------------
 # T96 -- a simulated pair_max day at the default interval (180 min) makes
-# 48 all_1day calls (6 stations x ceil(1440/180)=8) and 6 history_all calls
-# (one per station, closed for good on its first successful fetch).
+# 54 all_1day calls (6 stations x (ceil(1440/180)=8 interval calls + 1 final
+# call)) and 6 history_all calls (one per station, closed for good on its
+# first successful fetch).
 # ---------------------------------------------------------------------------
 
 
-def test_t96_a_simulated_day_makes_48_all_1day_and_6_history_all_calls(
+def test_t96_a_simulated_day_makes_54_all_1day_and_6_history_all_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
@@ -779,7 +781,13 @@ def test_t96_a_simulated_day_makes_48_all_1day_and_6_history_all_calls(
         _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
         now += step
 
-    assert all_1day_calls == 48, f"got {all_1day_calls} all_1day calls"
+    interval_calls = math.ceil(1440 / 180)
+    expected_all_1day = len(station_ids) * (interval_calls + 1)
+    assert all_1day_calls == expected_all_1day, (
+        f"got {all_1day_calls} all_1day calls, expected {expected_all_1day}"
+        f" ({len(station_ids)} stations x ({interval_calls} interval calls"
+        " + 1 final call))"
+    )
     assert history_all_calls == 6, f"got {history_all_calls} history_all calls"
 
 

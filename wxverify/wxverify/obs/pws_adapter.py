@@ -591,7 +591,8 @@ async def fetch_all_1day(
     client: httpx.AsyncClient,
     backfill: bool,
 ) -> list[WindRecord]:
-    """The last 24 hours of raw records from ``/v2/pws/observations/all/1day``.
+    """Today's raw records since the station's local midnight, from
+    ``/v2/pws/observations/all/1day``.
 
     Raises as ``fetch_history_all`` does.
     """

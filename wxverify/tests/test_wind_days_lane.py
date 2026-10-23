@@ -47,7 +47,7 @@ import httpx
 import pytest
 
 from wxverify import config
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.queue import Job, claim_next_job
@@ -57,6 +57,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
 )
 from wxverify.db.wind_basis import (
+    WIND_FINAL_LEAD,
     read_auth_hold,
     read_wind_cursor,
     set_wind_basis_state,
@@ -70,17 +71,26 @@ from wxverify.db.wind_basis import (
     write_auth_hold,
     write_wind_cursor,
 )
-from wxverify.forecast.wind_blend import MIN_OBS_HOURS
+from wxverify.forecast.wind_blend import MIN_OBS_HOURS, TRAINING_DAYS
+from wxverify.monitor import (  # noqa: PLC2701 -- private, exercised directly
+    _wind_history_trips,
+)
 from wxverify.obs.wind_pairs import WindRecord
+from wxverify.verification.truth import materialize_daily_truth
+from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import dispatch
 from wxverify.worker.scheduler import (
     _enqueue_due_wind_days,  # noqa: PLC2701 -- private, exercised directly (T47)
 )
 from wxverify.worker.score_batches import ScoringInputsBusy
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
+    _FINAL_RETRY_LEAD,
+    _FINISHABLE_SQL,
     WIND_DAYS_JOB_KEY,
     _derive_days,
     _end_purge,
+    _finish_day,
+    _finish_floor,
     _headroom_wake,
     _install_step,
     _persist_day,
@@ -89,6 +99,7 @@ from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised d
     _run_rescoring,
     _staging_purge_day,
     _switch_check,
+    _today_next_attempt,
     _write_blocked,
     endpoint_for,
     ensure_wind_days,
@@ -730,18 +741,18 @@ def test_persist_day_older_than_yesterday_204_is_unavailable_at_once() -> None:
 
 
 def test_today_next_attempt_near_midnight_rolls_to_tomorrow_plus_an_hour() -> None:
-    from wxverify.worker.wind_days import _today_next_attempt  # noqa: PLC2701
-
     conn = _make_db()
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
 
-    normal = _today_next_attempt(conn, end - timedelta(hours=5), end)
+    normal = _today_next_attempt(conn, end - timedelta(hours=5), end, failed=False)
     assert normal < end.isoformat().replace("+00:00", "Z"), (
         "mutant -> at this assertion: correct = now+interval (well before"
         " midnight), mutant (always rolls to end+1h) = end+1h regardless"
     )
 
-    near_midnight = _today_next_attempt(conn, end - timedelta(minutes=5), end)
+    near_midnight = _today_next_attempt(
+        conn, end - timedelta(minutes=5), end, failed=False
+    )
     assert near_midnight == "2026-03-11T01:00:00Z", (
         "mutant -> at this assertion: correct = start(d+1)+1h"
         " ('2026-03-11T01:00:00Z'), mutant (the >= end rollover check"
@@ -3700,4 +3711,1143 @@ def test_progress_stamp_does_not_move_on_a_chunk_that_only_fetched_yesterday() -
         " is excluded by `local_date < yesterday`, even though its status"
         " changed pending -> fetched), mutant (the guard loosened to"
         " `<=`, stamping on yesterday-only chunks too) = a new stamp value"
+    )
+
+
+# =============================================================================
+# 2026-10-23 wind pre-midnight fetch (plan §9) -- S1-S6, items 1-8, 10, 11.
+# D = the local day under test; start, end = local_day_slots(D, tz)[:2];
+# F = end - WIND_FINAL_LEAD; R = end - _FINAL_RETRY_LEAD. Every expected
+# value below is derived from these, never written as a bare literal.
+# =============================================================================
+
+_TZ_DENVER = "America/Denver"  # fall-back zone, see test_daily_truth_completeness.py:78
+
+
+def _wind_payload(*timestamps: datetime) -> dict[str, object]:
+    """A weather.com ``all_1day``-shaped response: one observation per
+    timestamp (field names from ``wind_records_from_payload`` in
+    ``obs/pws_adapter.py``, precedent: ``tests/test_wind_quota.py:662-671``)."""
+    return {
+        "observations": [
+            {"epoch": int(ts.timestamp()), "metric": {"windspeedAvg": 5.0}}
+            for ts in timestamps
+        ]
+    }
+
+
+def _budget_calls(conn: sqlite3.Connection) -> int:
+    """Total weathercom calls spent across every billing day (precedent:
+    ``tests/test_wind_auth_hold.py:215-217``)."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(calls), 0) AS n FROM api_budget WHERE source='weathercom'"
+    ).fetchone()
+    return int(row["n"])
+
+
+def _five_minute_marks(start: datetime, through: datetime) -> list[datetime]:
+    """5-minute observations from ``start`` through ``through`` inclusive
+    (plan §9's build-records instruction)."""
+    marks: list[datetime] = []
+    mark = start
+    while mark <= through:
+        marks.append(mark)
+        mark += timedelta(minutes=5)
+    return marks
+
+
+def test_all_1day_only_day_finishes_with_eligible_wind_truth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Plan item 1 (S1-S3). Today's final call lands at F and caps there;
+    the finish step closes D after midnight without any history/all call,
+    leaving record_count/attempts/last_ok_at/the raw-record count from the
+    F call unchanged; the resulting day publishes eligible wind_max truth
+    covering 24/24 hours."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 3, 10)
+    start, end, _ = local_day_slots(D, _TZ)
+    final = end - WIND_FINAL_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    _insert_day(
+        conn, station_id, D, status="partial", next_attempt_at=isoformat_utc(final)
+    )
+
+    payload = _wind_payload(*_five_minute_marks(start, final - timedelta(minutes=5)))
+    call_log: list[str] = []
+    responses = [200]
+    # D's one seeded response only answers D's own call. Past midnight the
+    # lane also opens tomorrow's row and fetches it as the new "today"; a
+    # 200 there would let its own neighbour-derive write D's hour 23 too,
+    # masking whether `_finish_day`'s own derive did -- so this unrelated
+    # call is answered 404 instead (precedent:
+    # test_missed_final_call_is_reported_and_the_day_still_finishes).
+    new_day_responses = [404]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        call_log.append(url)
+        if "history/all" in url:
+            return httpx.Response(500, request=request)
+        status = responses.pop(0) if responses else new_day_responses.pop(0)
+        if status == 200:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404, request=request)
+
+    _t97_freeze(monkeypatch, final)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert len(call_log) == 1, f"expected exactly one call at F, got {call_log}"
+    assert responses == [], "fixture bug: D's seeded response must be consumed"
+    row = _day_row(conn, station_id, D)
+    assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
+        "mutant -> at this assertion: correct = end + 1h (now == F is not"
+        " < final, and failed=False skips the retry branch), mutant (the"
+        " now < final cap left open, or the retry branch taken despite"
+        " failed=False) = F or R"
+    )
+    assert row["last_ok_at"] == isoformat_utc(final), (
+        "mutant -> at this assertion: correct = F (the successful call's own"
+        " clock reading), mutant (last_ok_at left stale from before this"
+        " call) = a different/earlier timestamp"
+    )
+    before_record_count = row["record_count"]
+    before_attempts = row["attempts"]
+    before_raw_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM station_wind_records WHERE station_id = ?"
+        " AND obs_at >= ? AND obs_at < ?",
+        (station_id, isoformat_utc(start), isoformat_utc(end)),
+    ).fetchone()["n"]
+
+    call_log.clear()
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
+        _t97_freeze(monkeypatch, end + timedelta(minutes=5))
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert not any("history/all" in url for url in call_log), (
+        "mutant -> at this assertion: correct = no history/all call (the"
+        " finish step reads only stored records), mutant (the finish gate"
+        " dropped, falling back to the old history/all retry path) = a"
+        f" history/all URL appears, got {call_log}"
+    )
+    assert not any(
+        "wind final collection missed" in rec.message for rec in caplog.records
+    ), (
+        "mutant -> at this assertion: correct = no missed-final WARNING"
+        " (last_ok_at == F satisfies count_missed_final's [F, end) bound,"
+        " read as >=), mutant (the `>=` bound at count_missed_final.py"
+        " loosened to `>`, excluding a last_ok_at exactly at F) = a missed"
+        f" WARNING, logged = {[rec.message for rec in caplog.records]}"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "fetched", (
+        "mutant -> at this assertion: correct = fetched (records exist in"
+        " [start, end)), mutant (the finish UPDATE's CASE WHEN n > 0"
+        " inverted) = unavailable"
+    )
+    assert row["next_attempt_at"] is None, (
+        "mutant -> at this assertion: correct = NULL (a finished row is"
+        " never due again), mutant (next_attempt_at left set) = a timestamp"
+    )
+    assert row["record_count"] == before_record_count, (
+        "finish recomputes record_count over the same [start, end) window"
+        " as the F call, so it must land on the same value"
+    )
+    assert row["attempts"] == before_attempts
+    after_raw_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM station_wind_records WHERE station_id = ?"
+        " AND obs_at >= ? AND obs_at < ?",
+        (station_id, isoformat_utc(start), isoformat_utc(end)),
+    ).fetchone()["n"]
+    assert after_raw_count == before_raw_count, (
+        "mutant -> at this assertion: correct = unchanged (the finish step"
+        " makes no API call and deletes no record), mutant (the finish"
+        " step re-fetches or purges D's own window) = a different count"
+    )
+
+    hour_23 = end - timedelta(hours=1)
+    hour_23_rows = conn.execute(
+        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?"
+        " AND variable = 'wind' AND valid_at = ?",
+        (station_id, isoformat_utc(hour_23)),
+    ).fetchone()["n"]
+    assert hour_23_rows == 1, (
+        "mutant -> at this assertion: correct = 1 (D's own neighbour is"
+        " never a 'fetched'/'partial' row at this point, so only"
+        " `_finish_day`'s own `_derive_days(..., write_rows=True)` call can"
+        " write D's hour 23), mutant (`write_rows=True` dropped to False in"
+        " `_finish_day`) = 0"
+    )
+
+    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=D.isoformat())
+    wind_max = outcomes["wind_max"]
+    assert wind_max.eligible is True, (
+        "mutant -> at this assertion: correct = eligible (24 >= expected - 1"
+        " = 23), mutant (hour 23 never derived as a past day, leaving 23"
+        " covered hours short of a 24-hour expectation... still eligible"
+        " under the -1 rule, so a stricter break would read ineligible"
+        " here) = False"
+    )
+    assert wind_max.covered_hours == wind_max.expected_slots == 24, (
+        "mutant -> at this assertion: correct = 24 == 24 (hour 23 is"
+        " written by the past-day derive inside the finish step), mutant"
+        " (the finish step's write_rows=True dropped, or _derive_hours'"
+        " `local_date != today` branch never taken) = 23 covered"
+    )
+
+
+def test_fall_back_day_final_call_covers_25_hours(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan item 2. Same as item 1, on the 25-hour fall-back day."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn, tz=_TZ_DENVER)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 11, 1)
+    start, end, _ = local_day_slots(D, _TZ_DENVER)
+    assert end - start == timedelta(hours=25), (
+        "fixture bug: 2026-11-01 must be the America/Denver fall-back day"
+    )
+    final = end - WIND_FINAL_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    _insert_day(
+        conn, station_id, D, status="partial", next_attempt_at=isoformat_utc(final)
+    )
+
+    payload = _wind_payload(*_five_minute_marks(start, final - timedelta(minutes=5)))
+    responses = [200]
+    # D's one seeded response only answers D's own call. Past midnight the
+    # lane also opens tomorrow's row and fetches it as the new "today"; a
+    # 200 there would let its own neighbour-derive write D's hour 24 too,
+    # masking whether `_finish_day`'s own derive did -- so this unrelated
+    # call is answered 404 instead (precedent:
+    # test_missed_final_call_is_reported_and_the_day_still_finishes).
+    new_day_responses = [404]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "history/all" in url:
+            return httpx.Response(500, request=request)
+        status = responses.pop(0) if responses else new_day_responses.pop(0)
+        if status == 200:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404, request=request)
+
+    _t97_freeze(monkeypatch, final)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    _t97_freeze(monkeypatch, end + timedelta(minutes=5))
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert responses == [], "fixture bug: D's seeded response must be consumed"
+
+    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=D.isoformat())
+    wind_max = outcomes["wind_max"]
+    assert wind_max.expected_slots == wind_max.covered_hours == 25, (
+        "mutant -> at this assertion: correct = 25 == 25 (the fall-back"
+        " day's extra hour is derived the same way as any other past-day"
+        " hour), mutant (a hardcoded 24 anywhere in the expected-slots or"
+        " hour-derive path) = 24"
+    )
+    assert wind_max.eligible is True
+
+
+def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
+    """Plan item 3. A unit table at the default 180-minute cadence, over
+    both ``failed`` values, at six ``now`` points spanning well-before-F,
+    just-before-F, exactly F, between F and R, exactly R, and
+    well-after-R."""
+    conn = _make_db()
+    end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
+    final = end - WIND_FINAL_LEAD
+    retry = end - _FINAL_RETRY_LEAD
+
+    now_points = [
+        end - timedelta(hours=5),
+        end - timedelta(minutes=36),
+        final,
+        end - timedelta(minutes=25),
+        retry,
+        end - timedelta(minutes=5),
+    ]
+    expected_not_failed = [
+        isoformat_utc(end - timedelta(hours=2)),
+        isoformat_utc(final),
+        isoformat_utc(end + timedelta(hours=1)),
+        isoformat_utc(end + timedelta(hours=1)),
+        isoformat_utc(end + timedelta(hours=1)),
+        isoformat_utc(end + timedelta(hours=1)),
+    ]
+    expected_failed = [
+        isoformat_utc(end - timedelta(hours=2)),
+        isoformat_utc(final),
+        isoformat_utc(retry),
+        isoformat_utc(retry),
+        isoformat_utc(end + timedelta(hours=1)),
+        isoformat_utc(end + timedelta(hours=1)),
+    ]
+
+    for now, want in zip(now_points, expected_not_failed, strict=True):
+        got = _today_next_attempt(conn, now, end, failed=False)
+        assert got == want, (
+            f"failed=False at now={now.isoformat()}:"
+            " mutant -> at this assertion: correct ="
+            f" {want}, mutant = {got}"
+        )
+    for now, want in zip(now_points, expected_failed, strict=True):
+        got = _today_next_attempt(conn, now, end, failed=True)
+        assert got == want, (
+            f"failed=True at now={now.isoformat()}:"
+            " mutant -> at this assertion: correct ="
+            f" {want}, mutant = {got}"
+        )
+
+
+def test_missed_final_call_is_reported_and_the_day_still_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Plan item 4 (S4). A 200 well before the final window, then a 404 at
+    F and a 404 at R, leave D's own last_ok_at stale from that single
+    successful call -- well outside [F, end) -- so the finish step still
+    closes D (from that call's stored records) but reports exactly one
+    missed-final-collection WARNING, and the monitor reports it too."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 3, 10)
+    start, end, _ = local_day_slots(D, _TZ)
+    final = end - WIND_FINAL_LEAD
+    retry = end - _FINAL_RETRY_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    seed_at = end - timedelta(hours=3)
+    _insert_day(
+        conn, station_id, D, status="partial", next_attempt_at=isoformat_utc(seed_at)
+    )
+    payload = _wind_payload(*_five_minute_marks(start, seed_at - timedelta(minutes=5)))
+    responses = [200, 404, 404]
+    # D's three seeded responses only answer D's own calls. Past midnight the
+    # lane also opens tomorrow's row and fetches it as the new "today", an
+    # unchanged, unrelated call this fixture must still answer.
+    new_day_responses = [404]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "history/all" in url:
+            return httpx.Response(500, request=request)
+        status = responses.pop(0) if responses else new_day_responses.pop(0)
+        if status == 200:
+            return httpx.Response(200, json=payload)
+        return httpx.Response(404, request=request)
+
+    _t97_freeze(monkeypatch, seed_at)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    row = _day_row(conn, station_id, D)
+    assert row["next_attempt_at"] == isoformat_utc(final), (
+        "mutant -> at this assertion: correct = F (a 200 well before F"
+        " caps the obs-cadence call at F), mutant (the now < final cap"
+        " dropped) = a different value"
+    )
+
+    _t97_freeze(monkeypatch, final)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    row = _day_row(conn, station_id, D)
+    assert row["next_attempt_at"] == isoformat_utc(retry), (
+        "mutant -> at this assertion: correct = R (a 404 at F falls"
+        " through to the ordinary row-failure path, retrying once at R),"
+        " mutant (a 404 mistakenly dispatched like a 4xx-auth or 5xx"
+        " branch) = a different value"
+    )
+
+    _t97_freeze(monkeypatch, retry)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    row = _day_row(conn, station_id, D)
+    assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
+        "mutant -> at this assertion: correct = end + 1h (the one retry is"
+        " exhausted), mutant (the retry-exhaustion boundary dropped,"
+        " retrying forever) = R again"
+    )
+    assert responses == [], "fixture bug: all three seeded responses must be consumed"
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
+        _t97_freeze(monkeypatch, end + timedelta(minutes=5))
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+
+    missed_text = f"wind final collection missed site={site_id} date={D} stations=1/1"
+    missed_records = [rec for rec in caplog.records if rec.message == missed_text]
+    assert len(missed_records) == 1, (
+        "mutant -> at this assertion: correct = exactly one missed-final"
+        " WARNING (last_ok_at is stale from the first 200, well outside"
+        " [F, end)), mutant (count_missed_final's window comparison"
+        " inverted, treating the stale last_ok_at as covering, or the"
+        " missed > 0 guard dropped) = zero matching records, logged ="
+        f" {[rec.message for rec in caplog.records]}"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "fetched"
+    assert row["next_attempt_at"] is None
+
+    tripped, first = _wind_history_trips(conn, end + timedelta(hours=2))
+    assert first == (
+        f"wind: last collection before midnight missed for 1 of 1 stations ({D})"
+    ), (
+        "mutant -> at this assertion: correct = the missed-final text"
+        f" naming {D}, mutant (the monitor's own count_missed_final call,"
+        " or its missed > 0 guard, or the string split after 'for ')"
+        f" = {first!r}"
+    )
+    assert tripped == 1
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_final_call_refused_keeps_hold_behaviour(
+    status: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Plan item 5 (S5). A 401/403 on the final call is unchanged
+    behaviour: it sets the all_1day hold and leaves the row's own status
+    and next_attempt_at exactly as seeded; afterwards the finish step
+    still closes D with no "missed" WARNING (the hold already explains
+    it), and the lane is no longer due."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 3, 10)
+    start, end, _ = local_day_slots(D, _TZ)
+    final = end - WIND_FINAL_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    seeded_status = "partial"
+    seeded_next_attempt = isoformat_utc(final)
+    _insert_day(
+        conn,
+        station_id,
+        D,
+        status=seeded_status,
+        next_attempt_at=seeded_next_attempt,
+    )
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        call_log.append(url)
+        if "history/all" in url:
+            return httpx.Response(500, request=request)
+        return httpx.Response(status, request=request)
+
+    before_budget = _budget_calls(conn)
+    _t97_freeze(monkeypatch, final)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert len(call_log) == 1
+    assert _budget_calls(conn) == before_budget + 1, (
+        "mutant -> at this assertion: correct = spent (a 401/403 is a"
+        " dispatched, non-refunded call), mutant (the reservation refunded"
+        " on auth refusal) = unchanged"
+    )
+    hold = read_auth_hold(conn, "all_1day")
+    assert hold is not None and hold.status == "held", (
+        "mutant -> at this assertion: correct = held (unchanged auth-hold"
+        " behaviour), mutant (the hold write dropped for a final call) ="
+        " None or a different status"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == seeded_status, (
+        "mutant -> at this assertion: correct = unchanged ("
+        f"{seeded_status!r}), mutant (_auth_refused mistakenly touches"
+        f" status) = {row['status']!r}"
+    )
+    assert row["next_attempt_at"] == seeded_next_attempt, (
+        "mutant -> at this assertion: correct = unchanged"
+        f" ({seeded_next_attempt!r}), mutant (_auth_refused mistakenly"
+        f" touches next_attempt_at) = {row['next_attempt_at']!r}"
+    )
+
+    call_log.clear()
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
+        _t97_freeze(monkeypatch, end + timedelta(minutes=5))
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert call_log == [], (
+        f"a held all_1day endpoint must not be called again, got {call_log}"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "unavailable", (
+        "mutant -> at this assertion: correct = unavailable (D's refused"
+        " final call stored no records, so the finish step still closes"
+        " the day as unavailable), mutant (the all_1day hold mistakenly"
+        " blocks the finish step too) = partial (unchanged)"
+    )
+    assert row["next_attempt_at"] is None, (
+        "mutant -> at this assertion: correct = None (the finish step"
+        " clears next_attempt_at), mutant (the all_1day hold mistakenly"
+        " blocks the finish step too) ="
+        f" {seeded_next_attempt!r} (unchanged)"
+    )
+    assert not any("missed" in rec.message for rec in caplog.records), (
+        "mutant -> at this assertion: correct = no missed-final WARNING"
+        " (the all_1day hold already explains the gap, plan's"
+        ' "all_1day" not in holds guard), mutant (the guard dropped) ='
+        f" a missed WARNING, logged = {[rec.message for rec in caplog.records]}"
+    )
+
+    from zoneinfo import ZoneInfo
+
+    assert wind_lane_due(
+        conn, site_id, ZoneInfo(_TZ), now=end + timedelta(hours=2)
+    ) is (False), (
+        "mutant -> at this assertion: correct = False (D is finished and"
+        " nothing else is due), mutant (wind_lane_due's finishable check"
+        " still matches the closed row) = True"
+    )
+
+
+def test_budget_exhausted_final_call_defers_and_the_day_still_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Plan item 6 (S6). A daily_call_limit of 0 defers the final call
+    itself with JobDeferred before any request and before the row
+    changes; after midnight the finish step still closes D (it reserves
+    no budget) and reports the missed-final WARNING, even though the
+    same run's own fetch attempt for the new today row also defers."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 3, 10)
+    start, end, _ = local_day_slots(D, _TZ)
+    final = end - WIND_FINAL_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    seeded_next_attempt = isoformat_utc(final)
+    _insert_day(
+        conn, station_id, D, status="partial", next_attempt_at=seeded_next_attempt
+    )
+    conn.execute("UPDATE sources SET daily_call_limit = 0 WHERE source = 'weathercom'")
+    conn.commit()
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _t97_freeze(monkeypatch, final)
+    with pytest.raises(JobDeferred):
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert call_log == [], (
+        "mutant -> at this assertion: correct = no call (the budget"
+        " reservation is checked before any request), mutant (the"
+        " reservation check moved after the request) = a request"
+        f" happened, got {call_log}"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "partial"
+    assert row["next_attempt_at"] == seeded_next_attempt
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
+        _t97_freeze(monkeypatch, end + timedelta(minutes=5))
+        with pytest.raises(JobDeferred):
+            _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "unavailable", (
+        "mutant -> at this assertion: correct = unavailable (D never"
+        " stored a record, since every call was deferred by the zero"
+        " budget), mutant (the finish step never ran, so status stays"
+        " partial) = partial"
+    )
+    assert row["next_attempt_at"] is None, (
+        "mutant -> at this assertion: correct = NULL (the finish step"
+        " runs -- and completes -- before any budget reservation),"
+        " mutant (the finish step moved after the fetch loop's own"
+        " reservation, so a JobDeferred there skips it) = unchanged"
+    )
+    assert any(
+        rec.message
+        == f"wind final collection missed site={site_id} date={D} stations=1/1"
+        for rec in caplog.records
+    ), (
+        "mutant -> at this assertion: correct = the missed-final WARNING"
+        " is still logged despite the same run later raising JobDeferred,"
+        " mutant (the finish step's own write ordered after the"
+        " exception-raising fetch attempt) = no such record, logged ="
+        f" {[rec.message for rec in caplog.records]}"
+    )
+
+
+def test_finish_gate_is_an_allowlist() -> None:
+    """Plan item 7. ``_finish_day`` is called directly; the gate is an
+    allowlist, so every disqualifying condition returns False and writes
+    nothing, and every qualifying one returns True and writes exactly
+    the documented change."""
+    today = date(2026, 3, 10)
+    yesterday = today - timedelta(days=1)
+    start, end, _ = local_day_slots(yesterday, _TZ)
+
+    def _setup(
+        *, state: str = "pair_max", hold_status: str | None = "held"
+    ) -> tuple[sqlite3.Connection, int, int]:
+        conn = _make_db()
+        site_id = _make_site(conn)
+        station_id = _make_station(conn, site_id, "WSTATION01")
+        set_wind_basis_state(conn, site_id, state)
+        if hold_status is not None:
+            write_auth_hold(
+                conn,
+                "history_all",
+                status=hold_status,  # type: ignore[arg-type]
+                since=isoformat_utc(start),
+                error=None,
+            )
+        return conn, site_id, station_id
+
+    def _unchanged(
+        got: bool, conn: sqlite3.Connection, station_id: int, before: dict
+    ) -> None:
+        assert got is False, (
+            "mutant -> at this assertion: correct = False (a disqualifying"
+            " gate condition), mutant (the allowlist check for this"
+            " condition dropped) = True"
+        )
+        after = dict(
+            _day_row(conn, station_id, date.fromisoformat(before["local_date"]))
+        )
+        assert after == before, (
+            "mutant -> at this assertion: correct = unchanged (a gated-out"
+            " row is written to), mutant (a write happens before the gate"
+            " re-check) = a changed row"
+        )
+
+    # -- False: no hold ---------------------------------------------------
+    conn, site_id, station_id = _setup(hold_status=None)
+    _insert_day(conn, station_id, yesterday, status="pending")
+    before = dict(_day_row(conn, station_id, yesterday))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    _unchanged(got, conn, station_id, before)
+
+    # -- False: probing ----------------------------------------------------
+    conn, site_id, station_id = _setup(hold_status="probing")
+    _insert_day(conn, station_id, yesterday, status="pending")
+    before = dict(_day_row(conn, station_id, yesterday))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    _unchanged(got, conn, station_id, before)
+
+    # -- False: state staging ----------------------------------------------
+    conn, site_id, station_id = _setup(state="staging")
+    _insert_day(conn, station_id, yesterday, status="pending")
+    before = dict(_day_row(conn, station_id, yesterday))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    _unchanged(got, conn, station_id, before)
+
+    # -- False: today's row --------------------------------------------
+    conn, site_id, station_id = _setup()
+    _insert_day(conn, station_id, today, status="pending")
+    before = dict(_day_row(conn, station_id, today))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=today,
+        tz_name=_TZ,
+        today=today,
+    )
+    _unchanged(got, conn, station_id, before)
+
+    # -- False: failed with attempts == 3 ----------------------------------
+    conn, site_id, station_id = _setup()
+    _insert_day(conn, station_id, yesterday, status="failed", attempts=3)
+    before = dict(_day_row(conn, station_id, yesterday))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    _unchanged(got, conn, station_id, before)
+
+    # -- True: partial with records -> fetched -----------------------------
+    conn, site_id, station_id = _setup()
+    _insert_day(conn, station_id, yesterday, status="partial")
+    conn.execute(
+        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
+        " VALUES (?, ?, 5.0)",
+        (station_id, isoformat_utc(start + timedelta(hours=1))),
+    )
+    conn.commit()
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert got is True
+    row = _day_row(conn, station_id, yesterday)
+    assert row["status"] == "fetched", (
+        "mutant -> at this assertion: correct = fetched (n > 0 records"
+        " found), mutant (the CASE WHEN n > 0 inverted) = unavailable"
+    )
+    assert row["record_count"] == 1
+    assert row["next_attempt_at"] is None
+
+    # -- True: pending without records -> unavailable -----------------
+    conn, site_id, station_id = _setup()
+    _insert_day(conn, station_id, yesterday, status="pending")
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert got is True
+    row = _day_row(conn, station_id, yesterday)
+    assert row["status"] == "unavailable", (
+        "mutant -> at this assertion: correct = unavailable (n == 0),"
+        " mutant (the CASE WHEN n > 0 inverted) = fetched"
+    )
+
+    # -- True: fetched with a pending refetch -> refetched=1, status kept --
+    conn, site_id, station_id = _setup()
+    _insert_day(
+        conn,
+        station_id,
+        yesterday,
+        status="fetched",
+        record_count=5,
+        refetch_at=isoformat_utc(start),
+        refetched=0,
+    )
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert got is True
+    row = _day_row(conn, station_id, yesterday)
+    assert row["refetched"] == 1, (
+        "mutant -> at this assertion: correct = 1 (a pending refetch is"
+        " closed), mutant (the refetch-row branch dropped) = 0"
+    )
+    assert row["status"] == "fetched", (
+        "mutant -> at this assertion: correct = fetched (status kept,"
+        " not recomputed), mutant (the refetch row falls through to the"
+        " ordinary recompute path) = a possibly-different status"
+    )
+
+    # -- Floor boundary: K is in, K-1 is out -------------------------------
+    conn, site_id, station_id = _setup()
+    floor_date = today - timedelta(days=TRAINING_DAYS)
+    _insert_day(conn, station_id, floor_date, status="pending")
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=floor_date,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert got is True, (
+        "mutant -> at this assertion: correct = True (today - TRAINING_DAYS"
+        " is the first day kept, >= floor), mutant (the floor boundary off"
+        " by one, excluding this exact date) = False"
+    )
+    row = _day_row(conn, station_id, floor_date)
+    assert row["status"] == "unavailable"
+
+    conn, site_id, station_id = _setup()
+    before_floor_date = floor_date - timedelta(days=1)
+    _insert_day(conn, station_id, before_floor_date, status="pending")
+    before = dict(_day_row(conn, station_id, before_floor_date))
+    got = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=before_floor_date,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert got is False, (
+        "mutant -> at this assertion: correct = False (one day older than"
+        " the floor is excluded), mutant (the floor boundary off by one,"
+        " including this date too) = True"
+    )
+    after = dict(_day_row(conn, station_id, before_floor_date))
+    assert after == before
+
+
+def test_wind_lane_due_while_a_finishable_row_waits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan item 8. ``wind_lane_due`` must see a waiting finishable row
+    only while ``history_all`` is held, and must stop seeing it once
+    ``_finish_day`` closes it; a row whose date cannot be parsed never
+    counts as due either way, and the lane's own per-start housekeeping
+    (``ensure_wind_days``) deletes it rather than leaving it "unchanged"
+    (mandatory correction over the plan's literal wording)."""
+    from zoneinfo import ZoneInfo
+
+    today = date(2026, 3, 15)
+    yesterday = today - timedelta(days=1)
+    start, _end, _ = local_day_slots(yesterday, _TZ)
+    future_next_attempt = isoformat_utc(
+        datetime.combine(today, datetime.min.time(), tzinfo=UTC) + timedelta(hours=1)
+    )
+
+    # -- no hold: a waiting row is not due --------------------------------
+    conn = _make_db()
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    set_wind_basis_state(conn, site_id, "pair_max")
+    _insert_day(
+        conn, station_id, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(
+        conn,
+        station_id,
+        yesterday,
+        status="partial",
+        next_attempt_at=future_next_attempt,
+    )
+    assert (
+        wind_lane_due(
+            conn,
+            site_id,
+            ZoneInfo(_TZ),
+            now=datetime.combine(today, datetime.min.time(), tzinfo=UTC),
+        )
+        is False
+    ), (
+        "mutant -> at this assertion: correct = False (no hold, so the"
+        " finishable-row due check must not fire), mutant (the due check"
+        " dropped the held-hold guard) = True"
+    )
+
+    # -- held: the same waiting row is now due ----------------------------
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    now = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is True, (
+        "mutant -> at this assertion: correct = True (the same row, now"
+        " finishable), mutant (the finishable-row due check never added)"
+        " = False"
+    )
+
+    # -- after _finish_day closes it: not due again ------------------------
+    _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is False, (
+        "mutant -> at this assertion: correct = False (the row is"
+        " finished, so no finishable row remains), mutant (the due check"
+        " re-reads a stale row set, or ignores status) = True"
+    )
+
+    # -- a row with an unparseable date never counts as due, either way --
+    bad_date = f"{today:%Y-%m}-0x"
+    conn2 = _t97_init_tmp_db(tmp_path)
+    site_id2 = _make_site(conn2)
+    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
+    set_wind_basis_state(conn2, site_id2, "pair_max")
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    _insert_day(
+        conn2, station_id2, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(conn2, station_id2, bad_date, status="partial")
+    assert wind_lane_due(conn2, site_id2, ZoneInfo(_TZ), now=now) is False, (
+        "mutant -> at this assertion: correct = False (the canonical-date"
+        " guard excludes an unparseable row from the finishable-row due"
+        " check), mutant (the guard dropped from wind_lane_due's own"
+        " query) = True"
+    )
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _t97_freeze(monkeypatch, now)
+    _t97_run_wind_days(site_id2, handler, monkeypatch=monkeypatch)  # must not raise
+    assert call_log == [], (
+        f"neither row is due or finishable by a real call, got {call_log}"
+    )
+    remaining = conn2.execute(
+        "SELECT local_date FROM station_wind_days WHERE station_id = ?"
+        " AND local_date = ?",
+        (station_id2, bad_date),
+    ).fetchall()
+    assert remaining == [], (
+        "mutant -> at this assertion: correct = gone (ensure_wind_days'"
+        " per-start housekeeping deletes any row whose local_date is not"
+        " a real date, so this row is deleted rather than left"
+        ' "unchanged" as a bare reading of the plan text would claim),'
+        " mutant (the housekeeping delete skipped) = still present"
+    )
+
+
+def test_final_call_429_leaves_row_due_until_the_backoff_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan item 10. A 429 on the final call raises JobDeferred carrying
+    the domain backoff's own F + 60s (the default initial delay, no
+    Retry-After header), while the row's own next_attempt_at stays at F
+    -- the two times must be asserted separately. Once the backoff
+    clears, the next run makes the call and finishes the obs-cadence
+    schedule normally."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    D = date(2026, 3, 10)
+    start, end, _ = local_day_slots(D, _TZ)
+    final = end - WIND_FINAL_LEAD
+    set_wind_basis_state(conn, site_id, "pair_max")
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    seeded_next_attempt = isoformat_utc(final)
+    _insert_day(
+        conn, station_id, D, status="partial", next_attempt_at=seeded_next_attempt
+    )
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        call_log.append(url)
+        if "history/all" in url:
+            return httpx.Response(500, request=request)
+        if len(call_log) == 1:
+            return httpx.Response(429, request=request)
+        return httpx.Response(200, json={"observations": []})
+
+    before_budget = _budget_calls(conn)
+    _t97_freeze(monkeypatch, final)
+    with pytest.raises(JobDeferred) as exc_info:
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert len(call_log) == 1
+    assert exc_info.value.next_attempt_at == isoformat_utc(
+        final + timedelta(seconds=60)
+    ), (
+        "mutant -> at this assertion: correct = F + 60s (record_http_backoff's"
+        " default initial delay with no Retry-After header), mutant (the"
+        " domain backoff's default delay changed, or the 429 branch stopped"
+        " raising JobDeferred with that time) = a different value"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["status"] == "partial", (
+        "mutant -> at this assertion: correct = unchanged (a 429 only"
+        " records a domain backoff and a last_error; it never touches the"
+        " row itself), mutant (the row mistakenly marked failed/fetched"
+        " on a 429) = a different status"
+    )
+    assert row["next_attempt_at"] == seeded_next_attempt, (
+        "mutant -> at this assertion: correct = unchanged (F, the row's"
+        " own column), mutant (the row's next_attempt_at mistakenly"
+        " overwritten with the domain-backoff time) = F + 60s"
+    )
+    assert row["last_error"] is not None
+    assert _budget_calls(conn) == before_budget + 1, (
+        "mutant -> at this assertion: correct = spent (a 429 is a"
+        " dispatched, non-refunded call), mutant (the reservation"
+        " refunded on a 429) = unchanged"
+    )
+
+    _t97_freeze(monkeypatch, final + timedelta(seconds=60))
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    assert len(call_log) == 2, (
+        f"the backoff must have cleared by F + 60s, got calls {call_log}"
+    )
+    row = _day_row(conn, station_id, D)
+    assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
+        "mutant -> at this assertion: correct = end + 1h (a successful"
+        " obs-cadence call past F advances to the normal post-finish"
+        " schedule), mutant (the prior 429's backoff state leaked into"
+        " this call's own scheduling) = a different value"
+    )
+    assert _budget_calls(conn) == before_budget + 2
+
+
+def test_finish_exception_marks_the_row_and_the_step_moves_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Plan item 11. ``_finish_waiting_days`` wraps each row's
+    ``_finish_day`` call in its own try/except: an exception for one
+    station-day is caught, logs the documented WARNING naming that
+    station and date, and records a row failure -- it must not stop the
+    loop (a sibling station's row still finishes) or the day's own
+    all_1day call. After three failing attempts the row is no longer
+    retryable and the lane is no longer due for it."""
+    conn = _t97_init_tmp_db(tmp_path)
+    site_id = _make_site(conn)
+    pws_a = "WSTATION01"
+    pws_b = "WSTATION02"
+    station_a = _make_station(conn, site_id, pws_a)
+    station_b = _make_station(conn, site_id, pws_b)
+    today = date(2026, 3, 10)
+    yesterday = today - timedelta(days=1)
+    set_wind_basis_state(conn, site_id, "pair_max")
+    start, _end, _ = local_day_slots(yesterday, _TZ)
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    now = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+    due_next_attempt = isoformat_utc(now - timedelta(minutes=1))
+    for station_id in (station_a, station_b):
+        _insert_day(
+            conn,
+            station_id,
+            yesterday,
+            status="partial",
+            record_count=1,
+        )
+        conn.execute(
+            "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
+            " VALUES (?, ?, 1.0)",
+            (station_id, isoformat_utc(start + timedelta(hours=1))),
+        )
+        _insert_day(
+            conn,
+            station_id,
+            today,
+            status="partial",
+            next_attempt_at=due_next_attempt,
+        )
+    conn.commit()
+
+    import wxverify.worker.wind_days as wind_days_module
+
+    real_derive_days = wind_days_module._derive_days  # noqa: SLF001 -- test wrapper
+
+    def failing_derive_days(conn: sqlite3.Connection, **kwargs: object) -> object:
+        if (
+            kwargs.get("station_id") == station_a
+            and kwargs.get("local_date") == yesterday
+        ):
+            raise RuntimeError("synthetic finish failure")
+        return real_derive_days(conn, **kwargs)
+
+    monkeypatch.setattr(wind_days_module, "_derive_days", failing_derive_days)
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _t97_freeze(monkeypatch, now)
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+
+    row_b = _day_row(conn, station_b, yesterday)
+    assert row_b["status"] == "fetched", (
+        "mutant -> at this assertion: correct = fetched (station B's"
+        " finish succeeds independently of A's exception), mutant (the"
+        " per-row try/except dropped, so one exception aborts the whole"
+        " loop) = unchanged (partial)"
+    )
+    assert any("observations/all/1day" in url for url in call_log), (
+        "mutant -> at this assertion: correct = today's due all_1day call"
+        " still happens after the finish step (a finish exception must"
+        " not abort the rest of the job), mutant (the exception"
+        " propagates out of _finish_waiting_days uncaught, aborting the"
+        f" chunk before the fetch loop runs) = no such call, got {call_log}"
+    )
+    warning_text = (
+        f"wind day finish failed site={site_id} station={pws_a}"
+        f" date={yesterday}: synthetic finish failure"
+    )
+    matching = [rec for rec in caplog.records if rec.message == warning_text]
+    assert len(matching) == 1, (
+        "mutant -> at this assertion: correct = exactly one WARNING"
+        " naming station A, yesterday's date and the exception text,"
+        " mutant (the log message format, or the except block itself,"
+        f" dropped) = {[rec.message for rec in caplog.records]}"
+    )
+    row_a = _day_row(conn, station_a, yesterday)
+    assert row_a["status"] == "failed"
+    assert row_a["attempts"] == 1, (
+        "mutant -> at this assertion: correct = 1 (the except block"
+        " records an ordinary row failure), mutant (the except block"
+        " swallows the exception without a row failure) = 0"
+    )
+
+    for _ in range(2):
+        caplog.clear()
+        now = now + timedelta(hours=5)
+        _t97_freeze(monkeypatch, now)
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+
+    row_a = _day_row(conn, station_a, yesterday)
+    assert row_a["attempts"] == 3, (
+        "mutant -> at this assertion: correct = 3 (every finish exception"
+        " is an ordinary row failure, incrementing attempts each time),"
+        " mutant (attempts capped early, or not incremented on repeat"
+        " failures) = a different value"
+    )
+    no_longer_finishable = conn.execute(
+        _FINISHABLE_SQL,
+        {
+            "site_id": site_id,
+            "today": today.isoformat(),
+            "floor": _finish_floor(today),
+            "station_id": station_a,
+            "local_date": yesterday.isoformat(),
+            "limit": 1,
+        },
+    ).fetchone()
+    assert no_longer_finishable is None, (
+        "mutant -> at this assertion: correct = excluded (status='failed'"
+        " with attempts >= 3 matches none of _FINISHABLE_SQL's status"
+        " clauses, the same retry-exhaustion rule any other failed row"
+        " follows), mutant (repeated finish exceptions never reach"
+        " attempts >= 3, or the allowlist's failed/attempts<3 clause"
+        " dropped) = still matched"
     )
