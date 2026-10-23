@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.9
+
+Each station's wind readings for today are now fetched one last time
+shortly before local midnight, about 35 minutes before, with one retry
+about 20 minutes before if the first attempt fails. Before, the hours
+right before midnight could be lost once the day rolled over.
+
+A finish step now completes days from the past 30 days that were still
+waiting for their final wind collection while full history downloads
+were held, marking each one either collected or unavailable so it
+stops waiting.
+
+The pipeline health check now reports when a station's last wind
+collection before midnight was missed for a past day.
+
+Each station's daily call budget now accounts for the extra calls this
+final collection and retry need.
+
 ## 0.16.8
 
 Long verification work no longer holds up the daily forecast record

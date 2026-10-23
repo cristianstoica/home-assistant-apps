@@ -29,6 +29,7 @@ from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
 from wxverify.db.runtime_state import get_runtime_state
 from wxverify.db.wind_basis import (
+    count_missed_final,
     json_object,
     read_auth_holds,
     wind_basis_state,
@@ -442,7 +443,7 @@ def _wind_history_trips(
     """``(sites tripped, the first tripped site's first reason)`` for wind_history.
 
     Evaluated per enabled site with at least one enabled station, in site id
-    order, over the checks (a) to (h) of plan §10, in that order. Read-only.
+    order, over the checks (a) to (i) of plan §10, in that order. Read-only.
     """
     holds = read_auth_holds(conn)
     hold_reasons = [
@@ -497,6 +498,19 @@ def _wind_history_trips(
             reasons.extend(hold_reasons)
         else:
             reasons.extend(_wind_day_reasons(conn, site_id, today))
+            # (i) yesterday's final collection before midnight was missed.
+            if (
+                state == "pair_max"
+                and "history_all" in holds
+                and "all_1day" not in holds
+            ):
+                yesterday = today - timedelta(days=1)
+                missed, total = count_missed_final(conn, site_id, yesterday, tz_name)
+                if missed > 0:
+                    reasons.append(
+                        "wind: last collection before midnight missed for "
+                        f"{missed} of {total} stations ({yesterday})"
+                    )
             today_rows = conn.execute(
                 _WIND_TODAY_ROWS_SQL, (today.isoformat(), site_id)
             ).fetchall()

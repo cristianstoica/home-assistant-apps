@@ -632,6 +632,111 @@ def test_t74h_switching_state_skips_today_checks(tmp_path: Path) -> None:
     assert first.startswith("wind rebuild has made no progress")
 
 
+def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
+    """(i): yesterday's missed final ``all_1day`` collection trips, named by
+    date and station count -- three cases on one ``_healthy_site`` baseline,
+    which seeds only today's (2026-09-22) row, plus a ``history_all`` hold
+    (the check's own gate: ``"history_all" in holds``). Each case seeds
+    yesterday's (2026-09-21) row with a different ``last_ok_at`` or hold set,
+    isolating the (i) condition itself from every other check.
+
+    Case 1 (``last_ok_at`` 2h before local midnight, outside
+    ``[end - WIND_FINAL_LEAD, end)``): the missed text is the FIRST reason --
+    it is read before (e)/(g) in ``_wind_history_trips``' per-site branch.
+    Case 2 (``last_ok_at`` 10 min before local midnight, inside the window):
+    no missed text at all; the first reason falls through to the existing
+    (g) hold text (same text ``test_t74g_auth_hold_trips`` pins). Case 3
+    reuses case 1's missing-coverage data but also holds ``all_1day`` --
+    the ``"all_1day" not in holds`` guard suppresses the missed text even
+    though the underlying data is identical to case 1, proving the
+    suppression is driven by the hold, not by the data (paired negative).
+    """
+
+    def _seed_yesterday(
+        conn: sqlite3.Connection, station_id: int, last_ok_at: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO station_wind_days"
+            " (station_id, local_date, status, record_count, last_ok_at, attempts,"
+            "  legacy_hours, updated_at)"
+            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, 0, ?)",
+            (station_id, last_ok_at, isoformat_utc(_NOW)),
+        )
+
+    missed_last_ok_at = isoformat_utc(_NOW - timedelta(hours=14))  # 2026-09-21T22:00Z
+    not_missed_last_ok_at = isoformat_utc(datetime(2026, 9, 21, 23, 50, 0, tzinfo=UTC))
+
+    # Case 1: missed -> the missed text is the first reason.
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
+    site_id, station_id = _healthy_site(conn)
+    _seed_yesterday(conn, station_id, missed_last_ok_at)
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    conn.commit()
+    tripped, first = _trips(conn)
+    assert tripped == 1
+    assert first == (
+        "wind: last collection before midnight missed for 1 of 1 stations (2026-09-21)"
+    ), (
+        "mutant -> at this assertion: correct = the missed text (missed=1,"
+        " total=1, yesterday=2026-09-21), mutant (count_missed_final's"
+        " window comparison inverted, or the check's own `missed > 0`"
+        " dropped) = a different first reason (the (g) hold text) or none"
+    )
+
+    # Case 2: not missed -> no missed text; the (g) hold text leads instead
+    # (the same text test_t74g_auth_hold_trips pins), proving case 1's
+    # result was a real divergence on the DATA, not an artifact of the hold
+    # always firing first regardless of coverage.
+    conn2 = sqlite3.connect(":memory:")
+    conn2.row_factory = sqlite3.Row
+    run_migrations(conn2)
+    site_id2, station_id2 = _healthy_site(conn2)
+    _seed_yesterday(conn2, station_id2, not_missed_last_ok_at)
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    conn2.commit()
+    tripped2, first2 = _trips(conn2)
+    assert tripped2 == 1
+    assert first2 == "wind history paused: weather.com refused the key (history_all)", (
+        "mutant -> at this assertion: correct = the (g) hold text (missed=0,"
+        " so (i) adds nothing), mutant (the missed-window boundary widened"
+        " so a last_ok_at inside the window is still counted missed) = the"
+        " missed text instead"
+    )
+    assert "missed" not in first2
+
+    # Case 3: same missing coverage as case 1, but all_1day is ALSO held --
+    # the guard suppresses the missed text entirely (paired negative against
+    # case 1's positive).
+    conn3 = sqlite3.connect(":memory:")
+    conn3.row_factory = sqlite3.Row
+    run_migrations(conn3)
+    site_id3, station_id3 = _healthy_site(conn3)
+    _seed_yesterday(conn3, station_id3, missed_last_ok_at)
+    write_auth_hold(
+        conn3, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    write_auth_hold(
+        conn3, "all_1day", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    conn3.commit()
+    tripped3, first3 = _trips(conn3)
+    assert tripped3 == 1
+    assert first3 is not None
+    assert "missed" not in first3, (
+        "mutant -> at this assertion: correct = no reason contains 'missed'"
+        " (the all_1day-held guard suppresses (i) even though the"
+        " underlying coverage data is identical to case 1's), mutant (the"
+        " `'all_1day' not in holds` clause dropped from the guard) = the"
+        " missed text appears despite all_1day being held"
+    )
+
+
 # ---------------------------------------------------------------------------
 # T78 -- wind_history in the pipeline-disabled skip list
 # ---------------------------------------------------------------------------

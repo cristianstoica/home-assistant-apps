@@ -19,11 +19,11 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Final, Literal, LiteralString, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.core.timeutil import utc_now
+from wxverify.core.timeutil import isoformat_utc, local_day_slots, utc_now
 from wxverify.db.runtime_state import (
     delete_runtime_state,
     get_runtime_state,
@@ -369,6 +369,33 @@ def read_auth_holds(conn: sqlite3.Connection) -> dict[AuthHoldEndpoint, AuthHold
         if hold is not None:
             holds[endpoint] = hold
     return holds
+
+
+#: Today's final ``all_1day`` call is due this long before the local day ends,
+#: before the one-day product resets at local midnight.
+WIND_FINAL_LEAD: Final = timedelta(minutes=35)
+
+
+def count_missed_final(
+    conn: sqlite3.Connection, site_id: int, local_date: date, tz_name: str
+) -> tuple[int, int]:
+    """(missed, total) over the site's enabled stations' rows for local_date.
+    Missed = no successful call in [end - WIND_FINAL_LEAD, end). Read-only."""
+    _, end, _ = local_day_slots(local_date, tz_name)
+    row = conn.execute(
+        "SELECT COUNT(*) AS total, COALESCE(SUM(NOT COALESCE("
+        " julianday(d.last_ok_at) >= julianday(?)"
+        " AND julianday(d.last_ok_at) < julianday(?), 0)), 0) AS missed"
+        " FROM station_wind_days d JOIN stations st ON st.id = d.station_id"
+        " WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date = ?",
+        (
+            isoformat_utc(end - WIND_FINAL_LEAD),
+            isoformat_utc(end),
+            site_id,
+            local_date.isoformat(),
+        ),
+    ).fetchone()
+    return int(row["missed"]), int(row["total"])
 
 
 # --- progress --------------------------------------------------------------
