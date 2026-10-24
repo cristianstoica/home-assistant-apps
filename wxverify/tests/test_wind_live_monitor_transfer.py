@@ -43,13 +43,8 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import Job
-from wxverify.db.runtime_state import delete_runtime_state, set_runtime_state
-from wxverify.db.wind_basis import (
-    set_wind_basis_state,
-    wind_blocked_key,
-    wind_progress_key,
-    write_auth_hold,
-)
+from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.wind_basis import write_auth_hold
 from wxverify.monitor import (
     _wind_history_trips,  # noqa: PLC2701 -- private, exercised directly
     build_verdict,
@@ -411,15 +406,14 @@ _NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)  # past local midnight + 6h g
 def _healthy_site(conn: sqlite3.Connection) -> tuple[int, int]:
     """A site/station pair that trips none of (a)-(h) at ``_NOW``.
 
-    ``pair_max`` skips (b); a fresh, well-attended ``station_wind_days`` row
-    for today (non-zero ``record_count``, ``last_ok_at`` inside the
-    2x-interval window) clears (e) and (h); no failed/unavailable rows
-    clears (c)/(d); no auth hold clears (g); a plain 'UTC' timezone clears
-    (f). Each test below mutates exactly one of these away from healthy.
+    A fresh, well-attended ``station_wind_days`` row for today (non-zero
+    ``record_count``, ``last_ok_at`` inside the 2x-interval window) clears
+    (e) and (h); no failed/unavailable rows clears (c)/(d); no auth hold
+    clears (g); a plain 'UTC' timezone clears (f). Each test below mutates
+    exactly one of these away from healthy.
     """
     site_id = _seed_site(conn)
     station_id = _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
@@ -447,42 +441,6 @@ def test_t74_healthy_site_trips_nothing(tmp_path: Path) -> None:
     assert _trips(conn) == (0, None)
 
 
-def test_t74a_blocked_switch_trips(tmp_path: Path) -> None:
-    """(a): a runtime-state blocked marker trips, naming the stored reason."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, _ = _healthy_site(conn)
-    set_runtime_state(
-        conn, wind_blocked_key(site_id), json.dumps({"reason": "no eligible stations"})
-    )
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == "wind rebuild blocked: no eligible stations"
-
-
-def test_t74b_stalled_rebuild_trips_with_headroom_detail(tmp_path: Path) -> None:
-    """(b): a non-``pair_max`` site with no (or stale) progress stamp trips;
-    the reason names the state and, when call headroom is exhausted, says so.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, _ = _healthy_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
-    # set_wind_basis_state itself stamps progress via the real wall clock
-    # (stamp_wind_progress), which is not frozen in this sync harness and
-    # lands AFTER _NOW -- erase it so "no progress" is genuinely true at
-    # _NOW, the state this check actually reads.
-    delete_runtime_state(conn, wind_progress_key(site_id))
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first is not None
-    assert "wind rebuild has made no progress since never (state staging)" in first
-
-
 def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     """(c): a station-day that failed after >=3 attempts inside the last 7
     local days trips, independent of today's own row.
@@ -503,35 +461,6 @@ def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     assert tripped == 1
     assert first == (
         "wind history: 1 station-days failed after 3 attempts in the last 7 days"
-    )
-
-
-def test_t74d_unavailable_share_over_threshold_trips(tmp_path: Path) -> None:
-    """(d): unavailable legacy-wind station-days over 10% of the lookback
-    window trips -- 2 of 9 (> 10%) but 1 of 10 (= 10%, not > 10%) does not.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, station_id = _healthy_site(conn)
-    for day, status in [
-        ("2026-09-01", "unavailable"),
-        ("2026-09-02", "unavailable"),
-        *[(f"2026-09-{d:02d}", "fetched") for d in range(3, 10)],  # 7 fetched
-    ]:
-        conn.execute(
-            "INSERT INTO station_wind_days"
-            " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-            "  legacy_hours, updated_at)"
-            " VALUES (?, ?, ?, 1, NULL, 1, 1, ?)",
-            (station_id, day, status, isoformat_utc(_NOW)),
-        )
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == (
-        "wind history: 2 of 9 station-days with old wind are unavailable from"
-        " weather.com (last 30 days)"
     )
 
 
@@ -559,7 +488,6 @@ def test_t74e_no_wind_readings_today_trips(tmp_path: Path) -> None:
     run_migrations(conn)
     site_id = _seed_site(conn)
     _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
     conn.commit()  # no station_wind_days row for today at all
     tripped, first = _trips(conn)
     assert tripped == 1
@@ -590,7 +518,6 @@ def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
     site_id = _seed_site(conn)
-    set_wind_basis_state(conn, site_id, "pair_max")
     missing_row_station = _seed_enabled_station(conn, site_id, "WSTATION01")
     null_last_ok_station = _seed_enabled_station(conn, site_id, "WSTATION02")
     conn.execute(
@@ -609,28 +536,6 @@ def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
     # NULL-last_ok_at station would also produce) is what's checked here.
     assert first == "wind for WSTATION01 has not updated since midnight"
     assert missing_row_station != null_last_ok_station
-
-
-def test_t74h_switching_state_skips_today_checks(tmp_path: Path) -> None:
-    """(h)/(e) grace carve-out: ``switching``/``rescoring`` never run the
-    today checks at all, paired against the healthy ``pair_max`` baseline
-    above where the same "no today row" fixture DOES trip.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id = _seed_site(conn)
-    _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    delete_runtime_state(conn, wind_progress_key(site_id))
-    conn.commit()
-    tripped, first = _trips(conn)
-    # (b) still fires (state != pair_max, no progress stamp) but (e)/(h) do not
-    # add their own reasons on top -- confirmed by there being exactly the one
-    # (b) reason, not more.
-    assert tripped == 1
-    assert first is not None
-    assert first.startswith("wind rebuild has made no progress")
 
 
 def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:

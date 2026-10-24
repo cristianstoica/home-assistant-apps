@@ -648,8 +648,8 @@
       captionText += ", browser local time";
     }
     captionText += ". " + xs.length + " hour" + (xs.length === 1 ? "" : "s") + ".";
-    // Plan §10: while wind is recomputed (or too few feeds have a track
-    // record) the hourly payload carries notes.wind; say why wind is blank.
+    // Plan §10: when too few feeds have a track record the hourly payload
+    // carries notes.wind; say why wind is blank.
     if (payload.notes && typeof payload.notes.wind === "string" && payload.notes.wind) {
       captionText += " Wind: " + payload.notes.wind;
     }

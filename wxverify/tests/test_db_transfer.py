@@ -48,7 +48,6 @@ from wxverify.db.migrations import (
     schema_table_names,
 )
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import wind_basis_key
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1501,79 +1500,6 @@ def test_import_db_without_wind_tables_creates_them(
         }
         assert present == {"station_wind_days", "station_wind_records"}, (
             "both wind tables must be recreated by the post-swap reopen"
-        )
-    finally:
-        direct.close()
-
-
-def test_import_pair_max_db_with_old_wind_rows_reopens_in_staging(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """T79: importing a DB whose site is stamped ``pair_max`` but still
-    carries a pre-pair-max wind row (``source_raw`` not ``'pair-max '``-
-    prefixed) must have the post-swap reopen's ``init_wind_basis`` downgrade
-    that site back to ``staging`` -- the same rule T24 pins for a direct
-    ``replace_from``, exercised here through the actual HTTP import route.
-    """
-    conn = _init_tmp_db(tmp_path)
-    _make_site(conn, "Pre Import Site")
-    conn.commit()
-
-    b_path = tmp_path / "source-pair-max-old-rows.db"
-    b_db = Database(str(b_path))
-    try:
-        site_id = _make_site(b_db._conn, "Pair Max Old Rows Site")  # noqa: SLF001
-        station_id = int(
-            b_db._conn.execute(  # noqa: SLF001
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'SYN-STATION-W1', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_id,),
-            ).lastrowid
-        )
-        # A legacy wind row: source_raw does NOT carry the pair-max prefix.
-        b_db._conn.execute(  # noqa: SLF001
-            """
-            INSERT INTO station_observations
-                (station_id, variable, valid_at, value, qc_flag, source_raw)
-            VALUES (?, 'wind', '2035-06-01T00:00:00Z', 3.0, 'ok', '10.8 km/h')
-            """,
-            (station_id,),
-        )
-        b_db._conn.execute(  # noqa: SLF001
-            "INSERT OR REPLACE INTO runtime_state (key, value) VALUES (?, 'pair_max')",
-            (wind_basis_key(site_id),),
-        )
-        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        b_db._conn.commit()  # noqa: SLF001
-    finally:
-        b_db.close()
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-    assert resp.status_code == 200, resp.text
-
-    direct = sqlite3.connect(config.db_path)
-    direct.row_factory = sqlite3.Row
-    try:
-        imported_site_id = int(
-            direct.execute(
-                "SELECT id FROM sites WHERE name='Pair Max Old Rows Site'"
-            ).fetchone()["id"]
-        )
-        state_row = direct.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (wind_basis_key(imported_site_id),),
-        ).fetchone()
-        assert state_row is not None
-        assert state_row["value"] == "staging", (
-            "a pair_max site imported with old (non-pair-max) wind rows must "
-            "reopen downgraded to staging, not stay pair_max"
         )
     finally:
         direct.close()

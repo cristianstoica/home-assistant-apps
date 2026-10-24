@@ -42,7 +42,6 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
-from wxverify.db.wind_basis import wind_basis_state
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import (
@@ -109,9 +108,6 @@ JOB_HOUSEKEEPING_INTERVAL_SECONDS = 3600
 # (ScoringInputsBusy) waits before it is claimed again; a deferral does not
 # count as a failed attempt.
 _SCORING_BUSY_DEFER: Final = timedelta(seconds=60)
-# How long a timezone_correction job waits while its site's wind history
-# switch is in progress (switching or rescoring).
-_WIND_SWITCH_CORRECTION_DEFER: Final = timedelta(minutes=10)
 
 logger = logging.getLogger(__name__)
 
@@ -727,9 +723,7 @@ async def dispatch(
         # it); the continuation re-enqueues the chain, and claim_next_job's
         # priority tier lets other job types interleave between chunks.
         more = await writer.write(
-            lambda conn: _advance_correction_outside_wind_switch(
-                conn, site_id, job.payload
-            )
+            lambda conn: advance_correction(conn, site_id, job.payload)
         )
         return build_continuation(site_id, job.payload) if more else None
     if job.type == "forecast_record":
@@ -1117,19 +1111,6 @@ async def _fetch_feed(
         # the adapter could not be built, so no fetch ran and nothing about
         # an earlier failure of this scope has been resolved.
         raise JobCancelled()
-
-
-def _advance_correction_outside_wind_switch(
-    conn: sqlite3.Connection, site_id: int, payload: dict[str, object]
-) -> bool:
-    """``advance_correction``, deferred while the site's wind switch runs.
-
-    The state is read in the correction's own transaction, so a switch that
-    starts between claim and chunk still defers it (plan §8.12).
-    """
-    if wind_basis_state(conn, site_id) in ("switching", "rescoring"):
-        raise JobDeferred(isoformat_utc(utc_now() + _WIND_SWITCH_CORRECTION_DEFER))
-    return advance_correction(conn, site_id, payload)
 
 
 def _enabled_stations(

@@ -45,7 +45,6 @@ from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.wind_basis import (
     read_auth_hold,
-    set_wind_basis_state,
     write_auth_hold,
 )
 from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
@@ -688,12 +687,11 @@ def test_t83_no_due_row_makes_no_call() -> None:
 
 
 def _healthy_site_no_hold(conn: sqlite3.Connection) -> int:
-    """A site that would NOT trip wind_history on its own: pair_max basis
-    (skips (b)), a valid tz (skips (f)), a station with a today reading
-    (skips (e)) and a fresh ``last_ok_at`` (skips (h))."""
+    """A site that would NOT trip wind_history on its own: a valid tz (skips
+    (f)), a station with a today reading (skips (e)) and a fresh
+    ``last_ok_at`` (skips (h))."""
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "KTEST001")
-    set_wind_basis_state(conn, site_id, "pair_max")
     today = date(2026, 3, 10)
     conn.execute(
         "INSERT INTO station_wind_days"
@@ -750,8 +748,12 @@ def test_t84_ops_page_shows_the_stalled_text_and_the_button(
 
         resp = client.get("/ops")
 
+        history_title = (
+            "This weather.com key cannot download wind history for past days,"
+            " a known limit of the key"
+        )
         assert resp.status_code == 200
-        assert "Rebuild stalled: weather.com refused the key" in resp.text
+        assert history_title in resp.text
         assert 'id="wind-auth-hold-history_all"' in resp.text
         assert "Try again</button>" in resp.text
     close_db()

@@ -19,7 +19,6 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
-from wxverify.core.units import kmh_to_ms
 from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.wind_pairs import WindRecord
 
@@ -732,23 +731,6 @@ def observations_from_payload(
                     valid_at=row.valid_at,
                     value=temp,
                     source_raw=f"{temp} C",
-                )
-            )
-        wind = _number(
-            metric,
-            "windSpeed",
-            "windSpeedAvg",
-            "windspeedAvg",
-            "windGust",
-            "windgustHigh",
-        )
-        if wind is not None:
-            out.append(
-                PwsObservation(
-                    variable="wind",
-                    valid_at=row.valid_at,
-                    value=kmh_to_ms(wind),
-                    source_raw=f"{wind} km/h",
                 )
             )
         precip_increment = precip_increments.get(row.index)

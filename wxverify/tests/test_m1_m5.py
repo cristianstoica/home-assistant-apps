@@ -830,12 +830,10 @@ def test_pws_parser_and_fetch_obs_refresh(
     )
     assert [(row.variable, row.valid_at) for row in parsed] == [
         ("temperature", "2026-01-01T01:00:00Z"),
-        ("wind", "2026-01-01T01:00:00Z"),
         ("precip", "2026-01-01T01:00:00Z"),
     ]
     assert parsed[0].value == 6.5
-    assert parsed[1].value == pytest.approx(10.0)
-    assert parsed[2].value == 0.3
+    assert parsed[1].value == 0.3
     precip_series = [
         row
         for row in observations_from_payload(
@@ -917,7 +915,6 @@ def test_pws_parser_and_fetch_obs_refresh(
     ranged = asyncio.run(read_history_range())
     assert [(row.variable, row.valid_at, row.value) for row in ranged] == [
         ("temperature", "2026-06-22T00:00:00Z", 2.0),
-        ("wind", "2026-06-22T00:00:00Z", pytest.approx(10.0)),
         ("precip", "2026-06-22T00:00:00Z", 0.2),
     ]
 

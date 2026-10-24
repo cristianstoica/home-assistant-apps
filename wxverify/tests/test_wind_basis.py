@@ -321,9 +321,8 @@ def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
             " '2026-07-01T03:00:00Z', 10.0, 'ok', '10 km/h', ?)",
             (site_id, isoformat_utc()),
         )
-        # init_wind_basis already ran once at Database() construction (when
-        # the site didn't exist yet); clear the key it would have left so
-        # this file truly carries no wind_basis key for the new site.
+        # No open writes a wind_basis key any more; the delete makes sure
+        # this file truly carries none for the new site.
         conn.execute(
             "DELETE FROM runtime_state WHERE key = ?", (wind_basis_key(site_id),)
         )
@@ -334,17 +333,19 @@ def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
     return path
 
 
-def test_replace_from_reopen_runs_init_wind_basis_on_the_imported_file(
+def test_replace_from_reopen_writes_no_wind_basis_key_on_the_imported_file(
     tmp_path: Path,
 ) -> None:
     """Drives the real import-swap path end to end: ``replace_from`` ->
-    ``_open`` -> ``run_migrations`` -> ``init_wind_basis``.
-    mutant_init_not_wired -> at this assertion: correct = "staging" (the
-    swapped-in file's legacy row is recognized on reopen), mutant (init
-    removed from run_migrations, or only run at process-start) leaves the
-    key absent, which ``wind_basis_state`` reads back as "pair_max"."""
+    ``_open`` -> ``run_migrations``. Opening a database writes no wind key
+    (plan §3 item 1), so the swapped-in file's old wind row leaves the site
+    without one.
+    mutant_open_writes_wind_key -> at this assertion: correct = None (no
+    ``wind_basis:`` key after the reopen), mutant (``run_migrations``
+    calling the removed open-time wind initializer again) = "staging", the
+    swapped-in file's legacy row recognized on reopen."""
 
-    async def _run() -> str:
+    async def _run() -> str | None:
         db = Database(str(tmp_path / "live.db"))
         try:
             new_path = _build_legacy_shaped_replacement(tmp_path, "legacy-import.db")
@@ -360,7 +361,7 @@ def test_replace_from_reopen_runs_init_wind_basis_on_the_imported_file(
             db.close()
 
     state = asyncio.run(_run())
-    assert state == "staging"
+    assert state is None
 
 
 # --- T25 -------------------------------------------------------------------

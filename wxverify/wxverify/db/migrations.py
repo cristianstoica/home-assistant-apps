@@ -17,7 +17,6 @@ from wxverify.db.tz_generations import (
     invalid_published_pointers,
     repair_dangling_published_pointers,
 )
-from wxverify.db.wind_basis import init_wind_basis
 
 logger = logging.getLogger(__name__)
 
@@ -1090,7 +1089,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)
-    init_wind_basis(conn)
     logger.debug("migrations seeded sources+feeds+settings")
     repair_published_pointers(conn)
     bootstrap_publish_hold(conn, pre_migration_user_version=current)

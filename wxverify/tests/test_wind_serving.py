@@ -11,8 +11,7 @@ same seeded feeds) since these tests exercise ``build_forecast``/
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 
 import pytest
 
@@ -26,7 +25,7 @@ from tests.test_forecast_service import (
 )
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import set_wind_basis_state
+from wxverify.db.wind_basis import write_auth_hold
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
@@ -110,7 +109,7 @@ def test_t59_one_eligible_feed_tile_is_not_available() -> None:
     assert tile.wind.max_kmh is None
 
 
-# --- T60: staging/switching/rescoring display ------------------------------
+# --- T60: stored states and the dashboard banner ---------------------------
 
 
 @pytest.mark.parametrize("state", ["switching", "rescoring"])
@@ -162,74 +161,30 @@ def test_t60_stored_switching_or_rescoring_key_serves_weighted_wind(
     assert payload["notes"] == {"wind": None}
 
 
-def _make_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO stations (site_id, pws_station_id, lat, lon,
-                               dem_elevation_m, enabled)
-        VALUES (?, ?, 10.0, 20.0, 50.0, 1)
-        """,
-        (site_id, pws_id),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
+def test_t60_banner_is_none_without_holds_and_shows_a_held_title() -> None:
+    """The dashboard banner (``load_wind_banner``) is None while no
+    weather.com auth hold exists, and carries the hold's title once one is
+    written -- paired, so the None proves the hold check rather than a
+    banner that can never fire.
 
-
-def test_t60_staging_banner_shows_inventory_counts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """In ``staging``, the dashboard banner (``load_wind_banner``) carries
-    the rebuild note with the station-day inventory counts; paired with the
-    injected absence case, ``pair_max`` with no rebuild note and no auth
-    hold, where the banner is None -- the positive proves the note actually
-    fires on real counts, not that ``pair_max`` merely happens not to
-    trigger it.
-
-    The site is pinned to a non-UTC zone (``Etc/GMT-3``, a neutral offset)
-    and the clock ``wind_rebuild_progress`` reads (``wind_basis.utc_now``)
-    is pinned to an instant chosen so the site's local date and the UTC
-    date differ -- 22:00 UTC is already past local midnight at UTC+3 --
-    so the station-day seeding below is anchored to the site's actual
-    local "today" rather than to the machine's wall-clock date, and the
-    result can't depend on the machine's time zone.
+    mutant_banner_without_holds -> at the first ``is None``: correct = None
+    (no hold), mutant (a ``WindBanner`` returned with an empty ``holds``) =
+    ``WindBanner(holds=[])``.
     """
-    conn = _make_db()
-    conn.execute("UPDATE sites SET timezone = 'Etc/GMT-3' WHERE id = 1")
-    set_wind_basis_state(conn, 1, "staging")
-    station_id = _make_station(conn, 1, "KTEST001")
-    pinned_now = datetime(2026, 1, 2, 22, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.db.wind_basis.utc_now", lambda: pinned_now)
-    site_today = pinned_now.astimezone(ZoneInfo("Etc/GMT-3")).date()
-    assert site_today != pinned_now.date()
-    yesterday = (site_today - timedelta(days=1)).isoformat()
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'fetched', 0, 24, 24, 0, '2026-01-01T00:00:00Z')",
-        (station_id, yesterday),
+    history_title = (
+        "This weather.com key cannot download wind history for past days,"
+        " a known limit of the key"
     )
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, (site_today - timedelta(days=2)).isoformat()),
+    conn = _make_db()
+    assert load_wind_banner(conn, 1) is None
+
+    write_auth_hold(
+        conn, "history_all", status="held", since="2026-01-02T22:00:00Z", error=None
     )
     conn.commit()
     banner = load_wind_banner(conn, 1)
     assert banner is not None
-    assert banner.note == (
-        "Wind history is being rebuilt in the background: 1 of 2 "
-        "station-days fetched. Wind values are still on the old basis until "
-        "the switch."
-    )
-    assert banner.holds == []
-
-    conn2 = _make_db()
-    set_wind_basis_state(conn2, 1, "pair_max")
-    conn2.commit()
-    assert load_wind_banner(conn2, 1) is None
+    assert banner.holds == [history_title]
 
 
 # --- T66: build_hourly in weighted mode -------------------------------------
