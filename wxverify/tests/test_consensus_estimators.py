@@ -17,16 +17,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import seed_pair_max_wind
 from wxverify import config
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.scoring.consensus import (
     StationReading,
     _low_trim,
     _mean,
     _p90,
     compute_consensus,
-    insert_station_observation,
 )
 
 
@@ -325,9 +324,6 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
             """
         ).lastrowid
     )
-    # A fresh site opens in pair_max, where the insert guard drops old-style
-    # wind rows; staging keeps the legacy hourly wind path under test.
-    set_wind_basis_state(conn, site_id, "staging")
     valid_at = "2026-01-01T00:00:00Z"
     values = [3.0, 3.0, 3.0, 3.0, 20.0]
     for index, value in enumerate(values):
@@ -341,13 +337,8 @@ def test_materialize_consensus_wind_p90_through_real_write_path(
                 (site_id, f"STATION{index}"),
             ).lastrowid
         )
-        insert_station_observation(
-            conn,
-            station_id=station_id,
-            variable="wind",
-            valid_at=valid_at,
-            value=value,
-            source_raw=f"{value} m/s",
+        seed_pair_max_wind(
+            conn, site_id=site_id, station_id=station_id, valid_at=valid_at, value=value
         )
     row = conn.execute(
         """

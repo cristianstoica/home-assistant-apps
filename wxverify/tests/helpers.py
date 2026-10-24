@@ -13,9 +13,11 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 
+from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.scoring.consensus import materialize_consensus, write_station_observation
 from wxverify.verification.decision import ContinuousLead, OccurrenceLead
 from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
@@ -555,3 +557,23 @@ def alive_after_wait(
     while any(r() is not None for r in refs) and time.monotonic() < deadline:
         time.sleep(0.01)
     return [r() is not None for r in refs]
+
+
+def seed_pair_max_wind(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    valid_at: str,
+    value: float,
+) -> None:
+    """One pair-max station wind row (value in m/s) and its consensus hour."""
+    write_station_observation(
+        conn,
+        station_id=station_id,
+        variable="wind",
+        valid_at=valid_at,
+        value=value,
+        source_raw=f"pair-max {round(ms_to_kmh(value), 2)} km/h",
+    )
+    materialize_consensus(conn, site_id=site_id, variable="wind", valid_at=valid_at)
