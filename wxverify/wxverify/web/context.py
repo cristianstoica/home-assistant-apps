@@ -35,10 +35,8 @@ from wxverify.db.wind_basis import (
     read_auth_holds,
     wind_basis_state,
     wind_blocked_key,
-    wind_open_clause,
     wind_rebuild_progress,
     wind_report_key,
-    wind_station_row_clause,
 )
 from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_with_status
@@ -747,7 +745,7 @@ def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthR
 
 def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
     rows = conn.execute(
-        f"""
+        """
         SELECT sites.name AS site_name, stations.pws_station_id, so.variable,
                COUNT(*) AS n,
                AVG(so.value - observations.value) AS mean_delta
@@ -759,8 +757,6 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
          AND observations.variable = so.variable
          AND observations.valid_at = so.valid_at
         WHERE so.qc_flag = 'ok'
-          AND {wind_station_row_clause("stations.site_id")}
-          AND {wind_open_clause("so.variable", "stations.site_id")}
         GROUP BY stations.id, so.variable
         HAVING n > 0
         ORDER BY ABS(mean_delta) DESC, sites.name COLLATE NOCASE

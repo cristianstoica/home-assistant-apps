@@ -176,14 +176,15 @@ def _obs_rows(
 # ---------------------------------------------------------------------------
 
 
-def test_t70_live_fetch_writes_wind_only_while_staging(
+def test_t70_live_fetch_writes_no_wind_whatever_the_stored_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``insert_station_observation`` (consensus.py:166-211) gates wind rows on
-    the site's wind-basis state ('staging' only); temperature is unguarded.
+    """``insert_station_observation`` (``scoring/consensus.py``) drops every
+    wind row offered to it, whatever the site's stored ``wind_basis`` key;
+    temperature is unguarded.
 
     Two site/station pairs, same response shape, differing only in the
-    wind-basis state set before the fetch runs.
+    ``wind_basis`` key written (by its literal name) before the fetch runs.
     """
     conn = _init_tmp_db(tmp_path)
     now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
@@ -191,8 +192,8 @@ def test_t70_live_fetch_writes_wind_only_while_staging(
 
     staging_site, staging_station = _seed_site_and_station(conn, "WSTATION01")
     pm_site, pm_station = _seed_site_and_station(conn, "WSTATION02")
-    set_wind_basis_state(conn, staging_site, "staging")
-    set_wind_basis_state(conn, pm_site, "pair_max")
+    set_runtime_state(conn, f"wind_basis:{staging_site}", "staging")
+    set_runtime_state(conn, f"wind_basis:{pm_site}", "pair_max")
 
     db = get_db()
     writer = FencedWriter(db, db.generation)
@@ -203,10 +204,9 @@ def test_t70_live_fetch_writes_wind_only_while_staging(
     _run_fetch_obs(db, writer, staging_site, handler)
     _run_fetch_obs(db, writer, pm_site, handler)
 
-    # staging: both variables land.
+    # Both keys: temperature lands, wind is dropped.
     assert len(_obs_rows(conn, staging_station, "temperature")) == 1
-    assert len(_obs_rows(conn, staging_station, "wind")) == 1
-    # pair_max: temperature still lands, wind is gated out.
+    assert len(_obs_rows(conn, staging_station, "wind")) == 0
     assert len(_obs_rows(conn, pm_station, "temperature")) == 1
     assert len(_obs_rows(conn, pm_station, "wind")) == 0
 
@@ -223,7 +223,7 @@ def test_t72_live_fetch_never_writes_wind_history_tables(
     now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, now)
     site_id, station_id = _seed_site_and_station(conn)
-    set_wind_basis_state(conn, site_id, "staging")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
 
     db = get_db()
     writer = FencedWriter(db, db.generation)
@@ -233,7 +233,8 @@ def test_t72_live_fetch_never_writes_wind_history_tables(
 
     _run_fetch_obs(db, writer, site_id, handler)
 
-    assert len(_obs_rows(conn, station_id, "wind")) == 1  # the gate did fire
+    assert len(_obs_rows(conn, station_id, "temperature")) == 1  # the fetch ran
+    assert len(_obs_rows(conn, station_id, "wind")) == 0  # the guard dropped it
     assert conn.execute("SELECT COUNT(*) FROM station_wind_records").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM station_wind_days").fetchone()[0] == 0
 

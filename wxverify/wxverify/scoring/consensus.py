@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.tz_generations import published_generation_clause
-from wxverify.db.wind_basis import wind_state_sql, wind_station_row_clause
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
 from wxverify.verification.truth import mark_daily_truth_stale
 
@@ -174,24 +173,12 @@ def insert_station_observation(
 ) -> bool:
     """Write one station reading and re-materialize its consensus hour.
 
-    Wind rows are written only while the station's site is in ``staging``
-    (the old hourly figure); in every other state, and for a missing station,
-    a wind write is skipped and returns False. Other variables are unchanged.
+    Wind rows are never written here: the wind lane derives and writes them
+    through ``write_station_observation``.
     """
     if variable == "wind":
-        row = conn.execute(
-            "SELECT "
-            + wind_state_sql("s.site_id")
-            + " AS state FROM stations s WHERE s.id = ?",
-            (station_id,),
-        ).fetchone()
-        if row is None or row["state"] != "staging":
-            logger.debug(
-                "wind station row skipped station=%s state=%s",
-                station_id,
-                None if row is None else row["state"],
-            )
-            return False
+        logger.debug("wind station row skipped station=%s", station_id)
+        return False
     if not write_station_observation(
         conn,
         station_id=station_id,
@@ -222,9 +209,9 @@ def write_station_observation(
 ) -> bool:
     """Upsert one ``station_observations`` row; True when it changed.
 
-    The unguarded write body: it does not consult the wind basis and does not
-    materialize. Callers are ``insert_station_observation`` and the
-    wind-history lane.
+    The unguarded write body: it does not materialize. Callers are
+    ``insert_station_observation``, which never writes wind, and the wind
+    lane, which derives every wind row and writes it through here.
     """
     if variable in TARGET_VARIABLES and not source_raw:
         raise ValueError("target observation writes require source_raw")
@@ -303,8 +290,7 @@ def materialize_consensus(
           AND so.variable = ?
           AND so.valid_at = ?
           AND so.qc_flag = 'ok'
-          AND """
-        + wind_station_row_clause("s.site_id"),
+        """,
         (site_id, variable, valid_at),
     ).fetchall()
     readings = [

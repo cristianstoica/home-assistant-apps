@@ -27,7 +27,6 @@ from wxverify.db.wind_basis import (
     LEGACY_WIND_SQL,
     PAIR_MAX_SOURCE_PREFIX,
     PAIR_MAX_WIND_SQL,
-    STATES,
     init_wind_basis,
     read_wind_cursor,
     set_wind_basis_state,
@@ -40,7 +39,6 @@ from wxverify.db.wind_basis import (
 )
 from wxverify.scoring.consensus import (
     insert_station_observation,
-    materialize_consensus,
     write_station_observation,
 )
 from wxverify.scoring.engine import _distinct_cells  # noqa: PLC2701 - direct unit test
@@ -208,177 +206,40 @@ def test_init_wind_basis_pair_max_without_legacy_rows_stays_pair_max() -> None:
     assert get_runtime_state(conn, wind_basis_key(site)) == "pair_max"
 
 
-# --- T21 -----------------------------------------------------------------
-
-
-def _seed_published_wind_pair(conn: sqlite3.Connection, site: int, feed: int) -> None:
-    generation = ensure_published_generation(conn, site)
-    conn.execute(
-        "INSERT INTO forecast_pairs"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
-        "  day_ahead, forecast, observed, error, abs_error, sq_error,"
-        "  first_known_at, tz_generation_id)"
-        " VALUES (?, ?, 'wind', '2026-07-01T00:00:00Z', '2026-07-01T03:00:00Z',"
-        "  3, 0, 10.0, 12.0, -2.0, 2.0, 4.0, '2026-07-01T00:00:00Z', ?)",
-        (site, feed, generation),
-    )
-
-
-def _legacy_row(conn: sqlite3.Connection, station: int, value: float = 10.0) -> None:
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', ?, 'ok', '10 km/h', ?)",
-        (station, value, isoformat_utc()),
-    )
-
-
-def _pair_max_row(conn: sqlite3.Connection, station: int, value: float = 20.0) -> None:
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', ?, 'ok', 'pair-max 20.0', ?)",
-        (station, value, isoformat_utc()),
-    )
-
-
-@pytest.mark.parametrize(
-    ("state", "expect_value"),
-    [
-        ("staging", 10.0),
-        ("switching", 20.0),
-        ("rescoring", 20.0),
-        ("pair_max", 20.0),
-    ],
-)
-def test_materialize_consensus_wind_picks_the_states_own_basis(
-    state: str, expect_value: float
-) -> None:
-    """mutant_missing_else_0 (unknown state) is covered by the next test;
-    this one pins staging->legacy, the other three->pair-max. Two
-    DIFFERENT stations carry the two shapes (a single station_observations
-    row is keyed on (station_id, variable, valid_at), so one station
-    cannot hold both at once) -- mirrors a real site with old and new
-    rows briefly coexisting mid-migration.
-    mutant_gate_after_invalidation would still produce the right consensus
-    VALUE here (the row clause filters correctly either way), so it is
-    killed by the invalidation-ran assertion below, not by this value."""
-    conn = _make_db()
-    site = _make_site(conn)
-    feed = _make_feed(conn, "wind-model")
-    legacy_station = _make_station(conn, site, "KTEST001")
-    pair_max_station = _make_station(conn, site, "KTEST002")
-    set_wind_basis_state(conn, site, state)
-    _legacy_row(conn, legacy_station, 10.0)
-    _pair_max_row(conn, pair_max_station, 20.0)
-    _seed_published_wind_pair(conn, site, feed)
-
-    materialize_consensus(
-        conn, site_id=site, variable="wind", valid_at="2026-07-01T03:00:00Z"
-    )
-
-    row = conn.execute(
-        "SELECT value FROM observations WHERE site_id=? AND variable='wind'"
-        " AND valid_at='2026-07-01T03:00:00Z'",
-        (site,),
-    ).fetchone()
-    assert row is not None
-    assert row["value"] == expect_value
-
-    # _invalidate_consensus_dependents ran: the seeded published pair is gone.
-    pair_count = conn.execute(
-        "SELECT COUNT(*) FROM forecast_pairs WHERE site_id=? AND variable='wind'",
-        (site,),
-    ).fetchone()[0]
-    assert pair_count == 0
-
-
-def test_materialize_consensus_wind_unknown_state_deletes_observation() -> None:
-    """mutant_missing_else_0 -> at this assertion: correct = None (row
-    deleted), mutant (ELSE 0 dropped, falling through to the last WHEN or a
-    default admit) leaves the row present."""
-    conn = _make_db()
-    site = _make_site(conn)
-    legacy_station = _make_station(conn, site, "KTEST001")
-    pair_max_station = _make_station(conn, site, "KTEST002")
-    set_runtime_state(conn, wind_basis_key(site), "bogus-state")
-    _legacy_row(conn, legacy_station, 10.0)
-    _pair_max_row(conn, pair_max_station, 20.0)
-    # Seed a pre-existing observations row directly (bypassing the insert
-    # guard, which would itself refuse an unknown state) so the delete
-    # branch has something to delete.
-    conn.execute(
-        "INSERT INTO observations (site_id, variable, valid_at, value,"
-        " n_stations, rejected_stations, computed_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', 15.0, 1, 0, ?)",
-        (site, isoformat_utc()),
-    )
-
-    materialize_consensus(
-        conn, site_id=site, variable="wind", valid_at="2026-07-01T03:00:00Z"
-    )
-
-    row = conn.execute(
-        "SELECT value FROM observations WHERE site_id=? AND variable='wind'"
-        " AND valid_at='2026-07-01T03:00:00Z'",
-        (site,),
-    ).fetchone()
-    assert row is None
-
-
-# --- T22 -------------------------------------------------------------------
-
-
-def test_null_source_raw_wind_row_counts_as_old_in_staging_excluded_in_pair_max() -> (
-    None
-):
-    """mutant_not_legacy -> at this assertion: in staging, correct = 10.0
-    (the NULL-source_raw row counts as legacy and is picked up), mutant
-    (``PAIR_MAX_WIND_SQL`` written as ``NOT LEGACY_WIND_SQL`` instead of its
-    own substr test) would make a NULL evaluate falsy in both clauses and
-    exclude the row from staging's own figure too."""
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, "staging")
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', 10.0, 'ok', NULL, ?)",
-        (station, isoformat_utc()),
-    )
-    materialize_consensus(
-        conn, site_id=site, variable="wind", valid_at="2026-07-01T03:00:00Z"
-    )
-    row = conn.execute(
-        "SELECT value FROM observations WHERE site_id=? AND variable='wind'", (site,)
-    ).fetchone()
-    assert row is not None
-    assert row["value"] == 10.0
-
-    set_wind_basis_state(conn, site, "pair_max")
-    materialize_consensus(
-        conn, site_id=site, variable="wind", valid_at="2026-07-01T03:00:00Z"
-    )
-    row = conn.execute(
-        "SELECT value FROM observations WHERE site_id=? AND variable='wind'", (site,)
-    ).fetchone()
-    assert row is None
-
-
 # --- T23 ---------------------------------------------------------------
 
+# Every value a site's ``wind_basis`` key held before the removal, a junk
+# value, and no key at all. No package code reads the key any more, so every
+# test parametrized over these expects the same outcome for each.
+_STORED_WIND_KEY_VALUES: list[str | None] = [
+    "staging",
+    "switching",
+    "rescoring",
+    "pair_max",
+    "bogus",
+    None,
+]
 
-@pytest.mark.parametrize("state", ["switching", "rescoring", "pair_max"])
-def test_insert_guard_refuses_wind_outside_staging(state: str) -> None:
-    """mutant_denylist -> at this assertion: correct = False (every
-    non-staging state refused), a ``state != 'switching'`` denylist mutant
-    would instead ACCEPT the write in ``rescoring``/``pair_max``, making
-    this assert False fail with True."""
+
+def _store_wind_key(conn: sqlite3.Connection, site: int, value: str | None) -> None:
+    """Write the site's wind_basis key by its literal name; None writes none."""
+    key = f"wind_basis:{site}"
+    if value is None:
+        assert get_runtime_state(conn, key) is None, "precondition: no key"
+        return
+    set_runtime_state(conn, key, value)
+
+
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_insert_guard_refuses_wind_whatever_the_stored_key(state: str | None) -> None:
+    """Correct = False in every state: the wind lane writes every wind row
+    through ``write_station_observation``. A guard that still admits wind in
+    some state (the old ``staging`` allowlist) returns True for that id; no
+    guard at all (plan M1) returns True for every id."""
     conn = _make_db()
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, state)
+    _store_wind_key(conn, site, state)
     result = insert_station_observation(
         conn,
         station_id=station,
@@ -395,44 +256,6 @@ def test_insert_guard_refuses_wind_outside_staging(state: str) -> None:
     assert row is None
 
 
-def test_insert_guard_refuses_wind_for_unknown_state() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    set_runtime_state(conn, wind_basis_key(site), "bogus-state")
-    result = insert_station_observation(
-        conn,
-        station_id=station,
-        variable="wind",
-        valid_at="2026-07-01T03:00:00Z",
-        value=10.0,
-        source_raw="pair-max 10.0",
-    )
-    assert result is False
-
-
-def test_insert_guard_accepts_wind_in_staging() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, "staging")
-    result = insert_station_observation(
-        conn,
-        station_id=station,
-        variable="wind",
-        valid_at="2026-07-01T03:00:00Z",
-        value=10.0,
-        source_raw="10 km/h",
-    )
-    assert result is True
-    row = conn.execute(
-        "SELECT value FROM station_observations WHERE station_id=? AND variable='wind'",
-        (station,),
-    ).fetchone()
-    assert row is not None
-    assert row["value"] == 10.0
-
-
 def test_insert_guard_refuses_wind_for_missing_station() -> None:
     conn = _make_db()
     result = insert_station_observation(
@@ -446,16 +269,16 @@ def test_insert_guard_refuses_wind_for_missing_station() -> None:
     assert result is False
 
 
-@pytest.mark.parametrize("state", ["staging", "switching", "rescoring", "pair_max"])
-def test_insert_guard_always_accepts_temperature(state: str) -> None:
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_insert_guard_always_accepts_temperature(state: str | None) -> None:
     """mutant_guard_every_variable -> at this assertion: correct = True in
     every state (temperature is never gated), mutant (the wind guard
-    accidentally covers every ``variable``) would refuse this in any
-    non-staging state."""
+    accidentally covers every ``variable``) would refuse this in every
+    state."""
     conn = _make_db()
     site = _make_site(conn)
     station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, state)
+    _store_wind_key(conn, site, state)
     result = insert_station_observation(
         conn,
         station_id=station,
@@ -647,35 +470,22 @@ def _seed_station_trust_wind_rows(conn: sqlite3.Connection, site: int) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("state", "expect_station"),
-    [
-        ("staging", "KTEST001"),  # legacy shape admitted
-        ("switching", None),  # open_clause blocks wind entirely
-        ("rescoring", "KTEST002"),  # pair-max shape admitted
-        ("pair_max", "KTEST002"),  # pair-max shape admitted
-        ("bogus-state", None),  # row_clause ELSE 0 + open_clause both block
-    ],
-)
-def test_station_trust_reader_follows_wind_basis_state(
-    state: str, expect_station: str | None
-) -> None:
-    """mutant_clause_dropped -> at this assertion: a reader missing either
-    ``wind_station_row_clause`` (the shape CASE) or ``wind_open_clause``
-    (the state-membership gate) would show BOTH stations' wind rows, or
-    show the wrong-shaped one, in at least one state here."""
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_station_trust_reader_ignores_wind_basis_state(state: str | None) -> None:
+    """Station trust tests neither the stored key nor ``source_raw`` for wind
+    (plan §5.3 item 10), so both stations' wind rows show in every state. A
+    reader that still gates wind on the state, or on the row's shape, drops
+    one or both stations for some id; one that excludes wind (plan M18)
+    drops both for every id."""
     from wxverify.web.context import load_station_trust
 
     conn = _make_db()
     site = _make_site(conn)
-    if state in STATES:
-        set_wind_basis_state(conn, site, state)
-    else:
-        set_runtime_state(conn, wind_basis_key(site), state)
+    _store_wind_key(conn, site, state)
     _seed_station_trust_wind_rows(conn, site)
     rows = load_station_trust(conn)
     wind_stations = {r.station for r in rows if r.variable == "wind"}
-    assert wind_stations == (set() if expect_station is None else {expect_station})
+    assert wind_stations == {"KTEST001", "KTEST002"}
 
 
 def _seed_real_model_candidate(
@@ -696,31 +506,19 @@ def _seed_real_model_candidate(
     )
 
 
-@pytest.mark.parametrize(
-    ("state", "wind_visible"),
-    [
-        ("staging", True),
-        ("switching", False),
-        ("rescoring", True),
-        ("pair_max", True),
-        ("bogus-state", False),
-    ],
-)
-def test_real_model_pairing_reader_follows_wind_basis_state(
-    state: str, wind_visible: bool
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_real_model_pairing_reader_ignores_wind_basis_state(
+    state: str | None,
 ) -> None:
     conn = _make_db()
     site = _make_site(conn)
     feed = _make_feed(conn, "real-model")
-    if state in STATES:
-        set_wind_basis_state(conn, site, state)
-    else:
-        set_runtime_state(conn, wind_basis_key(site), state)
+    _store_wind_key(conn, site, state)
     _seed_real_model_candidate(conn, site, feed, "wind")
     _seed_real_model_candidate(conn, site, feed, "temperature")
     delta = compute_real_model_pairs(conn, site)
     variables = {str(op.values[2]) for op in delta.ops}
-    assert ("wind" in variables) is wind_visible
+    assert "wind" in variables
     assert "temperature" in variables
 
 
@@ -746,55 +544,42 @@ def _seed_persistence_candidate(conn: sqlite3.Connection, site: int) -> None:
         )
 
 
-@pytest.mark.parametrize(
-    ("state", "wind_visible"),
-    [
-        ("staging", True),
-        ("switching", False),
-        ("rescoring", True),
-        ("pair_max", True),
-        ("bogus-state", False),
-    ],
-)
-def test_persistence_pairing_reader_follows_wind_basis_state(
-    state: str, wind_visible: bool
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_persistence_pairing_reader_ignores_wind_basis_state(
+    state: str | None,
 ) -> None:
     conn = _make_db()
     site = _make_site(conn)
-    if state in STATES:
-        set_wind_basis_state(conn, site, state)
-    else:
-        set_runtime_state(conn, wind_basis_key(site), state)
+    _store_wind_key(conn, site, state)
     _seed_persistence_candidate(conn, site)
     delta = compute_persistence_pairs(conn, site)
     variables = {str(op.values[2]) for op in delta.ops}
-    assert ("wind" in variables) is wind_visible
+    assert "wind" in variables
     assert "temperature" in variables
 
 
-@pytest.mark.parametrize(
-    ("state", "wind_visible"),
-    [
-        ("staging", True),
-        ("switching", False),
-        ("rescoring", True),
-        ("pair_max", True),
-        ("bogus-state", False),
-    ],
-)
-def test_distinct_cells_reader_follows_wind_basis_state(
-    state: str, wind_visible: bool
-) -> None:
+def _seed_published_wind_pair(conn: sqlite3.Connection, site: int, feed: int) -> None:
+    generation = ensure_published_generation(conn, site)
+    conn.execute(
+        "INSERT INTO forecast_pairs"
+        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
+        "  day_ahead, forecast, observed, error, abs_error, sq_error,"
+        "  first_known_at, tz_generation_id)"
+        " VALUES (?, ?, 'wind', '2026-07-01T00:00:00Z', '2026-07-01T03:00:00Z',"
+        "  3, 0, 10.0, 12.0, -2.0, 2.0, 4.0, '2026-07-01T00:00:00Z', ?)",
+        (site, feed, generation),
+    )
+
+
+@pytest.mark.parametrize("state", _STORED_WIND_KEY_VALUES)
+def test_distinct_cells_reader_ignores_wind_basis_state(state: str | None) -> None:
     conn = _make_db()
     site = _make_site(conn)
     feed = _make_feed(conn, "wind-model")
-    if state in STATES:
-        set_wind_basis_state(conn, site, state)
-    else:
-        set_runtime_state(conn, wind_basis_key(site), state)
+    _store_wind_key(conn, site, state)
     _seed_published_wind_pair(conn, site, feed)
-    # Also a temperature cell, always visible, to prove the clause is
-    # variable-scoped and not an accidental whole-site filter.
+    # Also a temperature cell: the reader returns wind's cell alongside the
+    # other variables', not in place of them.
     generation = ensure_published_generation(conn, site)
     conn.execute(
         "INSERT INTO forecast_pairs (site_id, feed_id, variable, issued_at,"
@@ -807,7 +592,7 @@ def test_distinct_cells_reader_follows_wind_basis_state(
     )
     cells = _distinct_cells(conn, site)
     variables = {c.variable for c in cells}
-    assert ("wind" in variables) is wind_visible
+    assert "wind" in variables
     assert "temperature" in variables
 
 
@@ -902,52 +687,6 @@ def test_pair_max_source_prefix_is_exactly_nine_chars_and_in_both_sql_fragments(
     assert len(PAIR_MAX_SOURCE_PREFIX) == 9
     assert PAIR_MAX_SOURCE_PREFIX in PAIR_MAX_WIND_SQL
     assert PAIR_MAX_SOURCE_PREFIX in LEGACY_WIND_SQL
-
-
-# --- T109 ------------------------------------------------------------------
-
-
-def test_insert_guard_reads_state_per_call_not_cached_at_job_start() -> None:
-    """A job enqueued while the site was staging, but run after a switch has
-    moved it to switching, must still see (and obey) the CURRENT state: the
-    guard re-reads ``wind_state_sql`` on every call, it is never cached in a
-    long-lived object across calls. mutant_cached_at_job_start -> at this
-    assertion: correct = False (the second call, after the state moved,
-    is refused), mutant (state captured once and reused) = True."""
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, "staging")
-
-    first = insert_station_observation(
-        conn,
-        station_id=station,
-        variable="wind",
-        valid_at="2026-07-01T03:00:00Z",
-        value=10.0,
-        source_raw="10 km/h",
-    )
-    assert first is True
-
-    # The switch starts between the two calls -- no job-scoped object is
-    # involved; the guard must observe this on its very next invocation.
-    set_wind_basis_state(conn, site, "switching")
-
-    second = insert_station_observation(
-        conn,
-        station_id=station,
-        variable="wind",
-        valid_at="2026-07-01T04:00:00Z",
-        value=11.0,
-        source_raw="pair-max 11.0",
-    )
-    assert second is False
-    row = conn.execute(
-        "SELECT 1 FROM station_observations WHERE station_id=? AND variable='wind'"
-        " AND valid_at='2026-07-01T04:00:00Z'",
-        (station,),
-    ).fetchone()
-    assert row is None
 
 
 # --- T110 --------------------------------------------------------------

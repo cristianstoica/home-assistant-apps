@@ -27,7 +27,6 @@ from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc
 from wxverify.db.tz_generations import published_generation_clause
-from wxverify.db.wind_basis import wind_open_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, PairValues, apply_delta
 
@@ -82,7 +81,7 @@ def compute_persistence_pairs(
         return PairDelta((), (), _PERSISTENCE_INSERT_SQL, count=None)
     feed_id = int(feed["id"])
     max_lead = int(feed["max_lead_hours"])
-    where = "" if site_id is None else "AND o.site_id = ?"
+    where = "" if site_id is None else "WHERE site_id = ?"
     params: tuple[object, ...] = () if site_id is None else (site_id,)
     observations = conn.execute(
         f"""
@@ -90,7 +89,6 @@ def compute_persistence_pairs(
                s.timezone, s.rain_threshold_mm
         FROM observations o
         JOIN sites s ON s.id = o.site_id
-        WHERE {wind_open_clause("o.variable", "o.site_id")}
         {where}
         """,
         params,

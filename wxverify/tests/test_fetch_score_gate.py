@@ -288,28 +288,10 @@ def test_probe_pair_under_unpublished_generation_still_pends() -> None:
     assert real_model_pair_pending(conn, (sample_id,)) is True
 
 
-def test_probe_wind_switching_site_returns_false() -> None:
-    conn = _conn()
-    _seed_site(conn)
-    sample_id, _ = _candidate(conn, variable="wind")
-    conn.execute(
-        "INSERT INTO runtime_state (key, value) VALUES ('wind_basis:1', 'switching')"
-    )
-    assert real_model_pair_pending(conn, (sample_id,)) is False
-
-
-def test_probe_wind_unknown_state_returns_false() -> None:
-    conn = _conn()
-    _seed_site(conn)
-    sample_id, _ = _candidate(conn, variable="wind")
-    conn.execute(
-        "INSERT INTO runtime_state (key, value) VALUES ('wind_basis:1', 'bogus')"
-    )
-    assert real_model_pair_pending(conn, (sample_id,)) is False
-
-
-@pytest.mark.parametrize("state", ["staging", "rescoring", None])
-def test_probe_wind_open_state_returns_true(state: str | None) -> None:
+@pytest.mark.parametrize(
+    "state", ["staging", "switching", "rescoring", "pair_max", "bogus", None]
+)
+def test_probe_wind_ignores_any_stored_state(state: str | None) -> None:
     conn = _conn()
     _seed_site(conn)
     sample_id, _ = _candidate(conn, variable="wind")
@@ -323,16 +305,6 @@ def test_probe_wind_open_state_returns_true(state: str | None) -> None:
             "INSERT INTO runtime_state (key, value) VALUES ('wind_basis:1', ?)",
             (state,),
         )
-    assert real_model_pair_pending(conn, (sample_id,)) is True
-
-
-def test_probe_temperature_unaffected_by_switching_wind_basis() -> None:
-    conn = _conn()
-    _seed_site(conn)
-    sample_id, _ = _candidate(conn, variable="temperature")
-    conn.execute(
-        "INSERT INTO runtime_state (key, value) VALUES ('wind_basis:1', 'switching')"
-    )
     assert real_model_pair_pending(conn, (sample_id,)) is True
 
 

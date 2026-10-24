@@ -9,17 +9,15 @@ from typing import Final
 
 from wxverify.core.timeutil import day_ahead
 from wxverify.db.tz_generations import published_generation_clause
-from wxverify.db.wind_basis import wind_open_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
 
 logger = logging.getLogger(__name__)
 
 # The real-model pairing candidates: a sample with a matching observation, a
-# lead in the feed's range, no published pair yet, and an open wind basis for
-# wind. compute_real_model_pairs runs it whole or for one site;
-# real_model_pair_pending runs it for one sample id, so both read the same
-# predicate.
+# lead in the feed's range and no published pair yet. compute_real_model_pairs
+# runs it whole or for one site; real_model_pair_pending runs it for one
+# sample id, so both read the same predicate.
 _CANDIDATE_PAIRS_SQL: Final = f"""
         SELECT fs.site_id, fs.feed_id, fs.variable, fs.issued_at, fs.valid_at,
                fs.lead_hours, fs.value AS forecast, fs.fetched_at,
@@ -42,7 +40,6 @@ _CANDIDATE_PAIRS_SQL: Final = f"""
                 AND fp.valid_at = fs.valid_at
                 AND {published_generation_clause("fp")}
           )
-          AND {wind_open_clause("fs.variable", "fs.site_id")}
         """
 REAL_MODEL_PAIR_PROBE_SQL: Final = _CANDIDATE_PAIRS_SQL + " AND fs.id = ?"
 _PAIR_MAX_DAY_AHEAD: Final = 7
