@@ -13,6 +13,10 @@ from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.tz_generations import (
+    invalid_published_pointers,
+    repair_dangling_published_pointers,
+)
 from wxverify.db.wind_basis import init_wind_basis
 
 logger = logging.getLogger(__name__)
@@ -824,6 +828,56 @@ def bootstrap_publish_hold(
     conn.execute("RELEASE bootstrap_publish_hold")
 
 
+def repair_published_pointers(conn: sqlite3.Connection) -> None:
+    """Repair dangling published time zone pointers and log the other bad ones.
+
+    Runs on every open, after the seeds and before `bootstrap_publish_hold`,
+    which stays the last step. Process start and an import's reopen both
+    come through here, so an imported file is repaired before the
+    post-import rebuild reads it.
+
+    Best-effort, like the sanitize pass in `Database._open`: an Exception is
+    logged and the open continues with every pointer as it was. One
+    SAVEPOINT makes the repair all-or-nothing. On the writer, executescript
+    has already committed the outer BEGIN IMMEDIATE (see
+    `bootstrap_publish_hold`), so the savepoint is the whole transaction
+    and its RELEASE commits it; nothing here calls commit(). SQLite ends
+    the whole transaction by itself on some errors (disk full, I/O error),
+    which also drops the savepoint, hence the in_transaction check before
+    ROLLBACK TO. A BaseException that is not an Exception unwinds the
+    savepoint and propagates.
+    """
+    conn.execute("SAVEPOINT repair_published_pointers")
+    try:
+        repaired = repair_dangling_published_pointers(conn)
+        invalid = invalid_published_pointers(conn)
+        conn.execute("RELEASE repair_published_pointers")
+    except BaseException as exc:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO repair_published_pointers")
+            conn.execute("RELEASE repair_published_pointers")
+        if not isinstance(exc, Exception):
+            raise
+        logger.exception("published-pointer repair failed; continuing open")
+        return
+    if repaired:
+        logger.warning(
+            "published-pointer repair: re-created the time zone generation of "
+            "site(s) %s; each was re-added on an earlier version and its "
+            "pointer named a generation that no longer exists. Other state it "
+            "inherited is unchanged; delete and re-add the site to reset it "
+            "fully",
+            repaired,
+        )
+    if invalid:
+        logger.warning(
+            "published-pointer repair: site(s) %s have a time zone pointer "
+            "that does not name their own published generation; left "
+            "unchanged. Delete and re-add the site to reset it",
+            invalid,
+        )
+
+
 def seed_default_settings(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -1038,6 +1092,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_settings(conn)
     init_wind_basis(conn)
     logger.debug("migrations seeded sources+feeds+settings")
+    repair_published_pointers(conn)
     bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
     logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)

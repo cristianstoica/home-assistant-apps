@@ -1309,6 +1309,13 @@ def _persist_station_observations(
             )
             or changed
         )
+    # Queue the score run with this station's observations, so a later
+    # station's failure in the same obs cycle cannot drop the trigger.
+    # _complete_obs_cycle's own enqueue stays and dedupes against this one.
+    if changed:
+        enqueue_if_absent(
+            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+        )
     clear_domain_backoff(conn, source_domain("weathercom"))
     conn.execute(
         """

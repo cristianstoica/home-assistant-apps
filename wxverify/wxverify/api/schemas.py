@@ -15,11 +15,11 @@ class StrictModel(BaseModel):
 
 class SiteCreate(StrictModel):
     name: str
-    forecast_lat: float
-    forecast_lon: float
-    elevation_m: float
+    forecast_lat: float = Field(allow_inf_nan=False)
+    forecast_lon: float = Field(allow_inf_nan=False)
+    elevation_m: float = Field(allow_inf_nan=False)
     timezone: str
-    rain_threshold_mm: float = Field(default=0.2, ge=0)
+    rain_threshold_mm: float = Field(default=0.2, ge=0, allow_inf_nan=False)
 
     @field_validator("timezone")
     @classmethod
@@ -34,7 +34,7 @@ class SiteCreate(StrictModel):
 class SiteUpdate(StrictModel):
     name: str | None = None
     enabled: bool | None = None
-    rain_threshold_mm: float | None = Field(default=None, ge=0)
+    rain_threshold_mm: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class TimezoneCorrectionIn(StrictModel):

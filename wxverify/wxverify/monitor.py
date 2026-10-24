@@ -611,6 +611,65 @@ def _wind_stale_station_reasons(
     return reasons
 
 
+# A running verification_run chunk's progress evidence for problem_jobs.
+# One compound statement, so each job row and its heartbeat come from one read
+# snapshot. With two reads, a chunk that fails for good between them would be
+# counted as stuck: the terminal-failure write deletes the heartbeat in the same
+# transaction that marks the row failed, and the first read would still have
+# seen the row running. The heartbeat key is stored data, 'verification_heartbeat:'
+# followed by the site id, written by wxverify.worker.verification_run. It is
+# spelled out here, and the problem_jobs progress tests write the heartbeat
+# through the worker's own key function and _heartbeat, so a change to the
+# format on either side fails them. site_id is never NULL for this type (the
+# jobs CHECK), and at most one verification_run row per site is active.
+_VERIFICATION_PROGRESS_SQL: Final = """
+    SELECT r.value
+      FROM jobs AS j
+      LEFT JOIN runtime_state AS r
+        ON r.key = 'verification_heartbeat:' || j.site_id
+     WHERE j.status = 'running'
+       AND j.type = 'verification_run'
+       AND j.updated_at <= ?
+"""
+
+# How far a heartbeat may lie ahead of the monitor's now and still count as
+# progress. now is taken before the read, so a day that commits while the read
+# waits for a pooled connection is legitimately newer. Five minutes covers that
+# wait with room to spare. It can hold off the stall count by up to five more
+# minutes; when an alert actually fires also depends on how often the monitor
+# runs, on read delays and on later clock changes. A heartbeat further ahead is
+# not valid clock evidence. It is treated as missing, not clamped to now: a
+# clamped value would read as fresh at every read until the clock caught up
+# with it.
+_HEARTBEAT_FUTURE_TOLERANCE: Final = timedelta(minutes=5)
+
+
+def _stuck_verification_chunks(
+    conn: sqlite3.Connection, now: datetime, claim_cutoff: str
+) -> int:
+    """Count running verification_run chunks with no recent progress.
+
+    A chunk counts when it was claimed at or before ``claim_cutoff`` (text
+    comparison, like the rest of the running arm) and its site's heartbeat is
+    missing, unreadable, at or before ``now`` minus STUCK_RUNNING_MINUTES, or
+    later than ``now`` plus _HEARTBEAT_FUTURE_TOLERANCE. The heartbeat is
+    parsed rather than compared as text: '.' sorts before 'Z', so text order
+    is not time order, and a value that does not parse (for example 'zzzz') is
+    no evidence of progress. A heartbeat more than the tolerance ahead of
+    ``now`` is treated like a missing one. One up to the tolerance ahead still
+    reads as progress, because ``now`` is taken before the read and a day
+    committed in between is legitimately newer.
+    """
+    progress_cutoff = now - timedelta(minutes=STUCK_RUNNING_MINUTES)
+    future_limit = now + _HEARTBEAT_FUTURE_TOLERANCE
+    stuck = 0
+    for row in conn.execute(_VERIFICATION_PROGRESS_SQL, (claim_cutoff,)):
+        beat = _parse_or_none(row[0])
+        if beat is None or beat <= progress_cutoff or beat > future_limit:
+            stuck += 1
+    return stuck
+
+
 def _pipeline_conditions(
     conn: sqlite3.Connection, now: datetime, *, grace_active: bool
 ) -> list[Condition]:
@@ -691,8 +750,11 @@ def _pipeline_conditions(
     # them, so retention is unchanged and the count cannot be cleared by
     # anything but a real success. "Later" is id order, matched NULL-safely
     # with IS because job_key and site_id are nullable. The in-flight arm
-    # below is unchanged: stuck running (>20m) or overdue pending (>15m),
-    # counted per row.
+    # below counts per row: pending overdue by at least 15 min, and running
+    # claimed at least 20 min ago, except that a running verification_run
+    # chunk counts only when its site's heartbeat is also at least 20 min
+    # old, more than 5 min in the future, missing or unreadable
+    # (_stuck_verification_chunks).
     # The pending arm mirrors claim_next_job's claim contract, which
     # treats `next_attempt_at IS NULL OR next_attempt_at <= now` as claimable —
     # so a stuck pending job can carry next_attempt_at=NULL. COALESCE(...,
@@ -727,7 +789,7 @@ def _pipeline_conditions(
         conn,
         """
         SELECT COUNT(*) FROM jobs
-        WHERE (status='running' AND updated_at <= ?)
+        WHERE (status='running' AND type != 'verification_run' AND updated_at <= ?)
            OR (status='pending'
                AND (COALESCE(next_attempt_at, updated_at) <= ?
                     OR (next_attempt_at IS NOT NULL
@@ -737,6 +799,7 @@ def _pipeline_conditions(
         """,
         (stuck_cutoff, pending_cutoff),
     )
+    inflight_n += _stuck_verification_chunks(conn, now, stuck_cutoff)
     problem_jobs_n = failed_scopes_n + inflight_n
 
     # forecast_record_gap (§16): enabled sites whose record log has begun

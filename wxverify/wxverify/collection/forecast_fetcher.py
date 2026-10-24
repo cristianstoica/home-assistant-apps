@@ -36,11 +36,16 @@ class PersistOutcome:
     ``usable_sample_count`` counts samples with ``lead_hours >= 1`` the fetch
     produced (the forward-path no-op predicate); ``inserted_count`` is the
     ``INSERT OR IGNORE`` rowcount sum (an idempotent re-fetch inserts 0 while
-    still being usable). Callers gate scoring on ``inserted_count``.
+    still being usable). ``inserted_sample_ids`` holds the
+    ``forecast_samples.id`` of each row this call inserted, in insert order, so
+    ``inserted_count == len(inserted_sample_ids)``. The forward fetch path
+    gates its score enqueue on these ids
+    (``worker.feed_fetch._persist_fetch_success``).
     """
 
     usable_sample_count: int
     inserted_count: int
+    inserted_sample_ids: tuple[int, ...]
 
 
 def register_feed_if_needed(
@@ -78,6 +83,7 @@ def persist_fetch_result(
     advance_last_run_at: bool = True,
 ) -> PersistOutcome:
     inserted = 0
+    inserted_ids: list[int] = []
     usable = 0
     has_valid = False
     fetched_at = fetched_at or isoformat_utc()
@@ -106,6 +112,13 @@ def persist_fetch_result(
                 fetched_at,
             ),
         )
+        # After an ignored insert, lastrowid still holds the connection's
+        # previous rowid, so read it only when this insert happened.
+        if cur.rowcount == 1:
+            rowid = cur.lastrowid
+            if rowid is None:
+                raise RuntimeError("forecast_samples insert reported no rowid")
+            inserted_ids.append(rowid)
         inserted += cur.rowcount
         if not has_valid:
             has_valid = _sample_is_valid(conn, sample)
@@ -135,7 +148,11 @@ def persist_fetch_result(
         usable,
         inserted,
     )
-    return PersistOutcome(usable_sample_count=usable, inserted_count=inserted)
+    return PersistOutcome(
+        usable_sample_count=usable,
+        inserted_count=inserted,
+        inserted_sample_ids=tuple(inserted_ids),
+    )
 
 
 def _sample_is_valid(conn: sqlite3.Connection, sample: NormalizedSample) -> bool:

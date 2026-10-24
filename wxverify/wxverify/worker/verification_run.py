@@ -132,6 +132,9 @@ SUPERSEDED_REASON = "superseded: input fingerprint changed between decide and st
 FORCED_START_REASON = "started after 2 fingerprint re-derivations"
 
 _STATE_KEY_PREFIX = "verification_state:"
+# The monitor's problem_jobs check (wxverify.monitor, _VERIFICATION_PROGRESS_SQL)
+# reads this key by its literal text as a running chunk's progress evidence.
+# Change both together; the problem_jobs progress tests fail if they differ.
 _HEARTBEAT_KEY_PREFIX = "verification_heartbeat:"
 
 #: Phases whose days are computed on a read snapshot and persisted one day

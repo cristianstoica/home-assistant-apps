@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Final, TypeVar
 
 import httpx
 
@@ -32,6 +33,7 @@ from wxverify.feeds.seam import (
     ForecastAdapter,
     ForecastRequest,
 )
+from wxverify.scoring.pairing import real_model_pair_pending
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
@@ -46,6 +48,11 @@ AdapterBuilder = Callable[[str, httpx.AsyncClient], ForecastAdapter]
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+# Probe time above which the fetch score gate logs at INFO. The same figure
+# as the fetch-scoring-gate plan's section 2 threshold for a set-based probe;
+# change both together.
+SCORE_GATE_SLOW_SECONDS: Final = 0.25
 
 
 @dataclass(frozen=True)
@@ -228,12 +235,6 @@ async def fetch_feed_once(
         ),
         reservation,
     )
-    if persist_outcome.inserted_count:
-        await _write(
-            lambda conn: enqueue_if_absent(
-                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-            )
-        )
     if persist_outcome.usable_sample_count == 0:
         logger.warning(
             "fetch no usable samples site=%s feed=%s source=%s",
@@ -451,10 +452,41 @@ def _persist_fetch_success(
     conn: sqlite3.Connection, target: FeedFetchTarget, result: FetchResult
 ) -> PersistOutcome:
     clear_domain_backoff(conn, source_domain(target.source))
-    return persist_fetch_result(
+    outcome = persist_fetch_result(
         conn,
         site_id=target.site_id,
         source=target.source,
         fetch_feed_id=target.feed_id,
         result=result,
     )
+    # Queue a score run only when an inserted sample would pair now, in this
+    # transaction, so the job commits or rolls back with the samples.
+    started = time.monotonic()
+    pairable = bool(outcome.inserted_sample_ids) and real_model_pair_pending(
+        conn, outcome.inserted_sample_ids
+    )
+    elapsed = time.monotonic() - started
+    created: bool | None = None
+    if pairable:
+        created = enqueue_if_absent(
+            conn, "pair_and_score", target.site_id, "score", {"site_id": target.site_id}
+        ).created
+    logger.debug(
+        "fetch score gate site=%s feed=%s inserted=%d pairable=%s created=%s "
+        "elapsed=%.3fs",
+        target.site_id,
+        target.feed_id,
+        outcome.inserted_count,
+        pairable,
+        created,
+        elapsed,
+    )
+    if elapsed > SCORE_GATE_SLOW_SECONDS:
+        logger.info(
+            "fetch score gate slow site=%s feed=%s ids=%d elapsed=%.3fs",
+            target.site_id,
+            target.feed_id,
+            len(outcome.inserted_sample_ids),
+            elapsed,
+        )
+    return outcome

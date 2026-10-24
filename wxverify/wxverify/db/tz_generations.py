@@ -132,6 +132,88 @@ def ensure_published_generation(conn: sqlite3.Connection, site_id: int) -> int:
     return generation_id
 
 
+def repair_dangling_published_pointers(conn: sqlite3.Connection) -> list[int]:
+    """Re-seed each site whose published pointer names no generation at all.
+
+    Every writer of the pointer stores the decimal text of a generation id
+    it has just inserted or published, and generation rows are removed only
+    by the ``sites`` cascade. A pointer that names no generation row was
+    therefore inherited from a deleted site whose id was reused. A site is
+    repaired only when all three hold: the pointer is canonical integer
+    text, no generation has that id, and the site has no published
+    generation of its own. Its pointer is deleted and
+    :func:`ensure_published_generation` seeds a new ``initial`` generation,
+    the same shape a newly created site gets. Foreign keys stop any row from
+    referencing a missing generation, so nothing refers to the old id.
+
+    A pointer whose site row does not exist is left alone; creating a site
+    on that id clears it. Candidates are read in full before the first
+    write, because a repaired site's new generation can take the id that
+    another candidate's pointer names.
+
+    Must run on a write connection, inside the caller's transaction.
+    Returns the repaired site ids in ascending order.
+    """
+    site_ids = [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            SELECT s.id
+            FROM sites s
+            JOIN runtime_state rs
+              ON rs.key = '{_POINTER_KEY_PREFIX}' || s.id
+            WHERE rs.value = CAST(CAST(rs.value AS INTEGER) AS TEXT)
+              AND NOT EXISTS (
+                  SELECT 1 FROM timezone_generations g
+                  WHERE g.id = CAST(rs.value AS INTEGER)
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM timezone_generations g
+                  WHERE g.site_id = s.id AND g.state = 'published'
+              )
+            ORDER BY s.id
+            """
+        ).fetchall()
+    ]
+    for site_id in site_ids:
+        delete_runtime_state(conn, published_pointer_key(site_id))
+        ensure_published_generation(conn, site_id)
+    return site_ids
+
+
+def invalid_published_pointers(conn: sqlite3.Connection) -> list[int]:
+    """Ids of sites whose published pointer does not name, by its canonical
+    text, a published generation of that same site.
+
+    Read-only. Reports a pointer that names another site's generation, one
+    that names a building, retired or failed generation of the site itself,
+    one that names no generation (left by
+    :func:`repair_dangling_published_pointers` because the site already has
+    a published generation), and one whose text is not canonical integer
+    text, which ``int()`` and SQL ``CAST`` can read differently. Sites with
+    no pointer, and pointers with no site row, are not reported.
+    """
+    return [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            SELECT s.id
+            FROM sites s
+            JOIN runtime_state rs
+              ON rs.key = '{_POINTER_KEY_PREFIX}' || s.id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM timezone_generations g
+                WHERE g.id = CAST(rs.value AS INTEGER)
+                  AND rs.value = CAST(g.id AS TEXT)
+                  AND g.site_id = s.id
+                  AND g.state = 'published'
+            )
+            ORDER BY s.id
+            """
+        ).fetchall()
+    ]
+
+
 def published_generation_clause(alias: str) -> str:
     """SQL predicate binding a pairs read to the row's site's published
     generation.

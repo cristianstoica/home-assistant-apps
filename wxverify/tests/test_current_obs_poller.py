@@ -1360,12 +1360,12 @@ def test_claim_line_reads_real_station_and_prev_job_fields_end_to_end(
 def test_malformed_created_and_due_are_read_without_aborting_the_real_transaction() -> (
     None
 ):
-    """Both created_at and the due basis (next_poll_at) are corrupted, and
-    the claim runs inside a REAL `BEGIN IMMEDIATE` / commit transaction --
-    mirroring `Database._run_immediate` exactly, not merely calling the
-    claim function directly on an autocommit connection. A raise inside
-    would roll the whole transaction back and strand the job pending; this
-    proves the transaction actually commits with the job left running.
+    """Both created_at and the due basis (next_poll_at) are corrupted, and the claim
+    runs inside a REAL `BEGIN IMMEDIATE` / commit transaction -- mirroring the
+    success path of `Database._run_immediate`, not merely calling the claim function
+    directly on an autocommit connection. A raise inside would roll the whole
+    transaction back and strand the job pending; this proves the transaction
+    actually commits with the job left running.
     """
     conn = _make_conn()
     site_id = _seed_site(conn)

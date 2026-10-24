@@ -225,29 +225,32 @@ def test_database_open_sanitizes_a_wedged_jobs_row_on_every_open(
         reopened.close()
 
 
-def test_boot_guard_clears_open_transaction_after_swallowed_commit_failure(
+def test_boot_guard_clears_open_transaction_after_failed_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_run_immediate``'s ``commit()`` sits outside its own try/except, so
-    a commit-time failure during the boot-time sanitize pass leaves the
-    writer connection inside an open ``BEGIN IMMEDIATE`` even though the
-    guard around it swallows the exception. Left uncleared, that holds the
-    write lock for the process lifetime and makes every later
-    ``_run_immediate`` fail with "cannot start a transaction within a
-    transaction". This pins that the guard rolls the open transaction back,
-    proven by a real write succeeding after boot -- not merely by boot not
-    raising, which the broken code also satisfies.
+    """``_run_immediate`` now rolls back a failed COMMIT itself, so the boot
+    guard around the sanitize pass is only reached when THAT rollback also
+    raises. This pins the guard for that case: it rolls the still-open
+    transaction back a second time, proven by a real write succeeding after
+    boot -- not merely by boot not raising, which the broken code also
+    satisfies.
     """
     db_path = tmp_path / "guard.db"
     real_connect = sqlite3.connect
-    state = {"commits": 0, "writer_opened": False}
+    state = {"commits": 0, "rollbacks": 0, "writer_opened": False}
 
     class FlakyConnection(sqlite3.Connection):
         def commit(self) -> None:
             state["commits"] += 1
             if state["commits"] == 2:
-                raise sqlite3.OperationalError("disk I/O error")
+                raise sqlite3.OperationalError("synthetic commit failure")
             super().commit()
+
+        def rollback(self) -> None:
+            state["rollbacks"] += 1
+            if state["rollbacks"] == 1:
+                raise sqlite3.OperationalError("synthetic rollback failure")
+            super().rollback()
 
     def fake_connect(
         path: object, *args: object, **kwargs: object
@@ -263,10 +266,15 @@ def test_boot_guard_clears_open_transaction_after_swallowed_commit_failure(
     try:
         # The first commit (run_migrations) must have succeeded and the
         # second (sanitize) must have raised for this test to exercise the
-        # intended path at all.
+        # intended path at all. The fake raises without issuing COMMIT,
+        # which models a COMMIT failure that leaves the transaction open.
         assert state["commits"] == 2
+        # rollbacks[0] is _run_immediate's own, which fails; rollbacks[1]
+        # is the guard's, which succeeds.
+        assert state["rollbacks"] == 2
         assert not db._conn.in_transaction, (  # noqa: SLF001
-            "a swallowed commit failure must leave no open transaction"
+            "a failed rollback inside _run_immediate must still leave no "
+            "open transaction, once the guard's own rollback runs"
         )
         result = db.write_sync(lambda conn: conn.execute("SELECT 1").fetchone()[0])
         assert result == 1, (

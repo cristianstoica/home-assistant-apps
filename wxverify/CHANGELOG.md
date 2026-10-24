@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.16.10
+
+The Sites card and the verification page now show a site's rain
+threshold as stored instead of rounded to one decimal, and the Sites
+form's threshold input accepts any decimal, not only tenths. A site's
+latitude, longitude, elevation or rain threshold is now rejected with a
+422 if it is non-finite (infinity or not-a-number). Before, an infinity
+was stored and then broke later reads, and a not-a-number value failed
+with a 500. A request body holding a bare NaN or Infinity value that
+fails validation now gets back a 422 whose body is valid JSON, instead
+of a 500.
+
+A failed database commit is now rolled back before the error is
+raised, so a write that fails to commit no longer leaves every later
+write failing until the add-on restarts. The pipeline health check no
+longer reports a nightly verification chunk as a stuck job while it is
+still making progress. Each time the database is opened, at startup or
+after an import, a site whose published time zone pointer names a
+generation that no longer exists, left over from a deleted site whose
+id was reused, gets a new one, provided it has no published generation
+of its own. Any other site whose pointer does not name its own
+published generation is logged as a warning and left unchanged.
+
+A forecast fetch now queues scoring only when one of its newly stored
+samples can be paired with a stored observation, instead of after
+every fetch that stored new samples; the check runs in the same write
+as the samples, so a failure rolls both back. To keep rankings fresh
+when nothing new pairs, the scheduler now queues a score run for each
+enabled site whose last completed one is six hours old. An observation
+cycle now queues scoring as soon as a station's stored readings change,
+so a station that fails later in the same cycle no longer drops it.
+Changing the rolling window now requests a rescore for each enabled
+site, only when the value actually changes; a site whose score run is
+already running finishes it with the old window and picks up the new
+one on its next trigger.
+
 ## 0.16.9
 
 Each station's wind readings for today are now fetched one last time

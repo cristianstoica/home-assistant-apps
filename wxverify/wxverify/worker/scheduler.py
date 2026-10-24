@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timedelta
+from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
-from wxverify.db.queue import LATEST_JOB_SQL, enqueue_if_absent_with_cooldown
+from wxverify.db.queue import (
+    LATEST_JOB_SQL,
+    enqueue_if_absent,
+    enqueue_if_absent_with_cooldown,
+)
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
 from wxverify.worker.wind_days import (
@@ -45,6 +50,14 @@ _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 # re-runs at 24 instead of one per worker-loop iteration.
 RECORD_RETRY_INTERVAL = timedelta(hours=1)
 
+# How old a site's last completed score run may get before the scheduler
+# queues a refresh when nothing new can pair. Six hours matches the
+# fetch-block spacing the old fetch trigger refreshed at, is half the
+# monitor's PAIR_SCORE_LIVE_HOURS, and is under 1 % of a 30-day window's
+# time span. The served ranking is older by the tick delay, queue wait and
+# run time on top. See the fetch-scoring-gate plan, section 9.
+SCORE_REFRESH_MAX_AGE: Final = timedelta(hours=6)
+
 
 def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
     """Whether ``now`` is still inside the day's late-write window.
@@ -68,6 +81,7 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_wind_days(conn)
     _enqueue_due_forecast_records(conn)
     _enqueue_due_verification_runs(conn)
+    _enqueue_due_score_refresh(conn)
 
 
 # Site-local wall-clock time at/after which the nightly verification trigger
@@ -417,6 +431,62 @@ def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
             {},
             cooldown=_DUE_JOB_FAILURE_COOLDOWN,
             success_cooldown=success_cooldown,
+        )
+
+
+def _enqueue_due_score_refresh(conn: sqlite3.Connection) -> None:
+    """Queue a score run for each enabled site whose last one is stale.
+
+    The time backstop behind the fetch score gate: a forward fetch queues
+    ``pair_and_score`` only when an inserted sample would pair now, so a
+    site with no new pairs and no page visits is rescored here once its
+    latest completed score job is ``SCORE_REFRESH_MAX_AGE`` old.
+
+    - A cancelled completion (``result`` NULL) counts as fresh.
+    - A terminal failure suppresses the backstop for
+      ``_DUE_JOB_FAILURE_COOLDOWN`` (1 h).
+    - A site that has never had a score job is skipped; its first run comes
+      from an observation insert or a read. The same holds for a site whose
+      only score rows were failed rows older than 168 h:
+      ``purge_failed_jobs_older_than`` deletes them, so the latest row is
+      gone and the backstop stops for that site until an observation insert
+      or a read queues a run.
+
+    An unreadable success stamp fails open here: the wrapper's success
+    cooldown fails closed on it, and with the non-date-scoped ``score`` key
+    that would stop the backstop for good and log a warning every tick.
+    Queueing once clears it, because the queued job becomes the latest row
+    and its completion rewrites ``updated_at`` with a valid stamp.
+    """
+    for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
+        site_id = int(row["id"])
+        latest = conn.execute(
+            LATEST_JOB_SQL, ("pair_and_score", "score", site_id)
+        ).fetchone()
+        if latest is None:
+            # Never scored: the first run comes from an obs insert or a read.
+            continue
+        if str(latest["status"]) == "completed":
+            try:
+                parse_utc(str(latest["updated_at"]))
+            except ValueError:
+                logger.warning(
+                    "score refresh: unreadable updated_at on latest completed"
+                    " score job site=%s; queueing a refresh",
+                    site_id,
+                )
+                enqueue_if_absent(
+                    conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+                )
+                continue
+        enqueue_if_absent_with_cooldown(
+            conn,
+            "pair_and_score",
+            site_id,
+            "score",
+            {"site_id": site_id},
+            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
+            success_cooldown=SCORE_REFRESH_MAX_AGE,
         )
 
 
