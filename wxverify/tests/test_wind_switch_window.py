@@ -5,10 +5,11 @@ Covers three independent seams that go quiet while a site's wind basis is
 
 - T101: `_blocking_gate` (worker/verification_run.py) skips a verification
   trigger on those two states only, via `_decide_phase` and `_start_phase`.
-- T102: `_input_mismatches` (verification/runs.py) includes `wind_basis` in
-  its divergence tuple, so `assert_inputs_unpinned_unchanged` and
-  `assert_inputs_unchanged_readonly` raise when the stored state moves
-  mid-run.
+- T102: `capture_config_snapshot` (verification/runs.py) always records
+  `wind_basis` as `pair_max`, so a stored state that moves mid-run no longer
+  trips `assert_inputs_unpinned_unchanged` or
+  `assert_inputs_unchanged_readonly`; `_input_mismatches` still compares the
+  field, so a run pinned without it still fails.
 - T103: `_advance_correction_outside_wind_switch` (worker/processor.py)
   defers a `timezone_correction` chunk instead of calling `advance_correction`.
 
@@ -26,6 +27,7 @@ from typing import Any
 import pytest
 
 from wxverify.db.migrations import run_migrations
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.verification.runs import (
     RunConfig,
@@ -178,39 +180,41 @@ def test_decide_phase_not_skipped_by_wind_switch_in_open_states(state: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# T102 -- wind_basis divergence trips the pinned-inputs integrity check
+# T102 -- the snapshot's wind_basis is always pair_max
 # ---------------------------------------------------------------------------
 
 
-def test_assert_inputs_unpinned_unchanged_raises_on_wind_basis_divergence() -> None:
+def test_assert_inputs_unpinned_unchanged_ignores_a_stored_state_change() -> None:
+    """Nothing reads the stored key any more: the snapshot records
+    `pair_max` whatever it holds, so a stored state that moves mid-run is no
+    divergence.
+    """
     conn = _make_db()
     site_id = _make_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
     conn.commit()
     snapshot = capture_config_snapshot(conn, site_id)
-    assert snapshot["wind_basis"] == "staging"
+    assert snapshot["wind_basis"] == "pair_max"
     cfg = _runconfig_from_snapshot(conn, site_id, snapshot)
 
-    set_wind_basis_state(conn, site_id, "switching")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
     conn.commit()
 
-    with pytest.raises(RuntimeError, match="wind_basis"):
-        assert_inputs_unpinned_unchanged(conn, cfg)
+    assert_inputs_unpinned_unchanged(conn, cfg)  # must not raise
 
 
-def test_assert_inputs_unchanged_readonly_raises_on_wind_basis_divergence() -> None:
+def test_assert_inputs_unchanged_readonly_ignores_a_stored_state_change() -> None:
     conn = _make_db()
     site_id = _make_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
     conn.commit()
     snapshot = capture_config_snapshot(conn, site_id)
     cfg = _runconfig_from_snapshot(conn, site_id, snapshot)
 
-    set_wind_basis_state(conn, site_id, "switching")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
     conn.commit()
 
-    with pytest.raises(RuntimeError, match="wind_basis"):
-        assert_inputs_unchanged_readonly(conn, cfg)
+    assert_inputs_unchanged_readonly(conn, cfg)  # must not raise
 
 
 def test_assert_inputs_unpinned_unchanged_does_not_raise_when_state_unchanged() -> None:
@@ -225,15 +229,14 @@ def test_assert_inputs_unpinned_unchanged_does_not_raise_when_state_unchanged() 
     assert_inputs_unchanged_readonly(conn, cfg)  # must not raise
 
 
-def test_pinned_none_vs_stored_staging_counts_as_wind_basis_divergence() -> None:
+def test_pinned_none_counts_as_wind_basis_divergence() -> None:
     """A run begun before the 0.16.6 upgrade pinned `wind_basis=None`; once
-    resumed against a live `staging` state, that counts as a divergence too
-    (plan §8.12: "accepted" to fail once, not silently treated as a match).
+    resumed against the live snapshot's `pair_max`, that counts as a
+    divergence (plan §8.12: "accepted" to fail once, not silently treated as
+    a match).
     """
     conn = _make_db()
     site_id = _make_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
-    conn.commit()
     snapshot = capture_config_snapshot(conn, site_id)
     cfg = _runconfig_from_snapshot(conn, site_id, snapshot)
     cfg_pre_upgrade = RunConfig(

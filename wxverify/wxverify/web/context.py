@@ -934,7 +934,8 @@ def load_wind_banner(conn: sqlite3.Connection, site_id: int) -> WindBanner | Non
 def load_wind_weights(
     conn: sqlite3.Connection, site: SiteView, day_ahead: int
 ) -> list[WindWeightRow] | None:
-    """The dashboard wind weights for one lead; None unless wind is weighted.
+    """The dashboard wind weights for one lead; None when the site's time
+    zone cannot be loaded.
 
     Uses the same :func:`load_wind_serving` call as the Forecast page. The
     weight (%) is each feed's share among the feeds with a track record at
@@ -947,8 +948,6 @@ def load_wind_weights(
     serving = load_wind_serving(
         conn, site_id=site.id, timezone=site.timezone, today=today, as_of=None
     )
-    if serving.mode != "weighted" or serving.weights is None:
-        return None
     at_lead = {
         feed_id: weight
         for (feed_id, k), weight in serving.weights.items()

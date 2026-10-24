@@ -39,12 +39,8 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.service import build_forecast, build_hourly
-from wxverify.forecast.wind_blend import (
-    FALLBACK_NOT_ENOUGH_FEEDS,
-    FALLBACK_SWITCH_IN_PROGRESS,
-)
+from wxverify.forecast.wind_blend import FALLBACK_NOT_ENOUGH_FEEDS
 from wxverify.settings.keys import set_setting
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
 from wxverify.verification.record import (
@@ -714,21 +710,26 @@ def test_zero_sample_day_writes_no_rows() -> None:
     # Paired positive, so the assertion above is not vacuously satisfied by a
     # builder that writes nothing at all: the same day WITH samples is written.
     other = asof_make_site(conn, "record-partial-site")
-    # Legacy wind selects every sampled feed; a fresh site opens in pair_max,
-    # where wind serves only feeds with trained weights (none here).
-    set_wind_basis_state(conn, other, "staging")
     ensure_published_generation(conn, other)
     _seed_full_grid(conn, other, _DAY, tag="-partial")
     build_forecast_record(
         conn, other, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
     )
     rows = conn.execute(
-        "SELECT status, selected_feed_ids FROM forecast_of_record WHERE site_id = ?",
+        "SELECT variable, status, selected_feed_ids FROM forecast_of_record"
+        " WHERE site_id = ?",
         (other,),
     ).fetchall()
     assert len(rows) == 24
     assert all(str(r["status"]) == "recorded" for r in rows)
-    assert all(json.loads(str(r["selected_feed_ids"])) != [] for r in rows)
+    # Wind serves only feeds with trained weights (none here), so its rows
+    # are written with no feed selected; the other variables select the feed.
+    for r in rows:
+        selected = json.loads(str(r["selected_feed_ids"]))
+        if str(r["variable"]) == "wind":
+            assert selected == []
+        else:
+            assert selected != []
 
 
 # ---------------------------------------------------------------------------
@@ -789,9 +790,6 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-parity-site")
-    # The wind pins below are the legacy clearing-subset blend; a fresh site
-    # opens in pair_max, where wind is the accuracy-weighted daily high.
-    set_wind_basis_state(conn, site_id, "staging")
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
@@ -870,11 +868,16 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     assert temp["partial"] is False
     assert temp["low_confidence"] is True  # unscored ladder rung
 
-    wind = displayed("wind")
-    max_ms = wind["max_ms"]
-    assert isinstance(max_ms, float)
-    assert tile.wind.max_kmh == ms_to_kmh(max_ms)
-    assert max_ms == 8.0  # A's peak; 14.0 without the subset, 11.5 blended
+    # Wind serves only feeds with trained weights (none here): no feed is
+    # selected and neither the record nor the tile has a wind high. The record
+    # still stores the old method's figure, over the clearing subset.
+    wind_row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
+    assert json.loads(str(wind_row["selected_feed_ids"])) == []
+    wind = dict(json.loads(str(wind_row["daily_quantities"]))["displayed"])
+    assert wind["max_ms"] is None
+    assert tile.wind.max_kmh is None
+    # A's peak; 14.0 without the subset, 11.5 blended.
+    assert wind["legacy_max_ms"] == 8.0
 
     precip = displayed("precip")
     assert precip["total_mm"] == tile.precip.total_mm
@@ -1086,7 +1089,6 @@ def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() 
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-parity-site")
-    set_wind_basis_state(conn, site_id, "pair_max")
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
@@ -1185,7 +1187,6 @@ def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-weights-sum-site")
-    set_wind_basis_state(conn, site_id, "pair_max")
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
@@ -1235,73 +1236,23 @@ def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
     assert sum(weights.values()) == pytest.approx(1.0, abs=1e-9)
 
 
-def test_t63_closed_mode_row_has_empty_weights_and_switch_in_progress() -> None:
-    """§15.1 T63: a closed-mode (``switching``) row is still written, with
-    empty ``feed_weights`` and ``fallback_reason ==
-    "wind_switch_in_progress"`` -- the row is never skipped just because
-    wind has nothing to serve.
-
-    mutant_served_instead_of_none -> at
-    ``assert displayed["fallback_reason"] == FALLBACK_SWITCH_IN_PROGRESS``:
-    correct = ``"wind_switch_in_progress"`` (the closed branch of
-    ``_served_wind`` returns unconditionally), mutant (swapping
-    ``FALLBACK_SWITCH_IN_PROGRESS`` for ``FALLBACK_NOT_ENOUGH_FEEDS`` in
-    that branch's ``"fallback_reason"`` entry) = ``"not_enough_feeds"``,
-    the wrong reason for a row that was never eligible to begin with (the
-    state is closed, not wind-blend-too-few-feeds).
-    """
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "wind-closed-row-site")
-    set_wind_basis_state(conn, site_id, "switching")
-    ensure_published_generation(conn, site_id)
-    feed_a = asof_make_real_feed(conn, "model-a")
-    conn.commit()
-
-    _insert_var_day(
-        conn,
-        site_id=site_id,
-        feed_id=feed_a,
-        variable="wind",
-        local_date=_DAY,
-        hours=range(24),
-        value_fn=lambda _h: 4.0,
-    )
-    conn.commit()
-
-    t = _t()
-    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
-    conn.commit()
-
-    row = _cell(conn, site_id, _DAY.isoformat(), "wind", 0)
-    for column in _RECORD_WIND_COLUMNS:
-        assert row[column] is not None
-        json.loads(str(row[column]))
-
-    assert json.loads(str(row["feed_weights"])) == {}
-    assert json.loads(str(row["selected_feed_ids"])) == []
-    displayed = json.loads(str(row["daily_quantities"]))["displayed"]
-    assert displayed["fallback_reason"] == FALLBACK_SWITCH_IN_PROGRESS
-
-
 def test_t63_pair_max_one_feed_has_not_enough_feeds() -> None:
     """§15.1 T63: a ``pair_max`` row with only one weighted-eligible feed
     (below ``MIN_FEEDS=2``) still writes a row, with empty ``feed_weights``
-    and ``fallback_reason == "not_enough_feeds"`` -- distinct from the
-    closed-mode reason above.
+    and ``fallback_reason == "not_enough_feeds"`` -- the row is never
+    skipped just because wind has nothing to serve.
 
-    mutant_switch_in_progress_instead -> at
+    mutant_reason_dropped -> at
     ``assert displayed["fallback_reason"] == FALLBACK_NOT_ENOUGH_FEEDS``:
     correct = ``"not_enough_feeds"`` (``choose_wind_feeds`` returns
     ``weights={}`` and an unavailable selection below ``MIN_FEEDS``, so
-    ``_served_wind``'s ``served`` is False), mutant (swapping
-    ``FALLBACK_NOT_ENOUGH_FEEDS`` for ``FALLBACK_SWITCH_IN_PROGRESS`` in
-    that branch's ``"fallback_reason": None if served else
-    FALLBACK_NOT_ENOUGH_FEEDS``) = ``"wind_switch_in_progress"``, the
-    closed-mode reason on a row that is actually in ``pair_max``.
+    ``_served_wind``'s ``served`` is False), mutant (replacing
+    ``"fallback_reason": None if served else FALLBACK_NOT_ENOUGH_FEEDS``
+    with ``"fallback_reason": None``) = ``None``, a row that does not say
+    why it serves nothing.
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-one-feed-site")
-    set_wind_basis_state(conn, site_id, "pair_max")
     ensure_published_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     conn.commit()

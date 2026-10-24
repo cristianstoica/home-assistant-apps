@@ -16,7 +16,6 @@ import wxverify.verification.record as record_mod
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.settings.keys import set_setting
 from wxverify.verification.record import (
     MISSED_WINDOW_CLOSED,
@@ -205,9 +204,6 @@ def test_snapshot_wall_clock_resolution_order() -> None:
 def test_record_job_writes_full_grid() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    # The day-5 wind pin below is the legacy depth blend's selection; a fresh
-    # site opens in pair_max, where wind serves only feeds with trained weights.
-    set_wind_basis_state(conn, site_id, "staging")
     ensure_published_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _insert_full_grid(
@@ -260,10 +256,12 @@ def test_record_job_writes_full_grid() -> None:
     policy = json.loads(str(day0_temp["policy"]))
     assert set(policy) >= {"blend_depth", "min_n", "window_days", "rain_threshold_mm"}
 
+    # Wind serves only feeds with trained weights, and this one feed has none:
+    # the day-5 wind row is still written, with no feed selected.
     day5_wind = next(
         r for r in rows if str(r["variable"]) == "wind" and int(r["display_lead"]) == 5
     )
-    assert json.loads(str(day5_wind["selected_feed_ids"])) == [feed_id]
+    assert json.loads(str(day5_wind["selected_feed_ids"])) == []
 
 
 def test_record_skips_cells_with_no_samples() -> None:
