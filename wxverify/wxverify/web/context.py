@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -20,7 +21,7 @@ from wxverify.collection.wind_quota import (
 )
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
-from wxverify.core.timeutil import utc_now
+from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.queue import ACTIVE_JOB_SQL
 from wxverify.db.tz_generations import (
@@ -60,6 +61,7 @@ class StationView:
     lon: float
     dem_elevation_m: float
     enabled: bool
+    observation_age: str | None
 
 
 @dataclass(frozen=True)
@@ -1097,16 +1099,46 @@ def _site_from_row(conn: sqlite3.Connection, row: sqlite3.Row) -> SiteView:
     )
 
 
+def observation_age_text(last_obstime: str | None, *, now: datetime) -> str | None:
+    """Say how old a station's latest kept reading is, or ``None`` to show nothing.
+
+    ``last_obstime`` is the stored stamp of that reading, ``None`` when the
+    station has none; ``now`` is passed in, so this reads no clock. A reading
+    at most 60 minutes old shows nothing: the Home Assistant integration treats
+    a reading as current up to one hour, so the age starts showing where that
+    stops. A reading dated in the future has a negative age and shows nothing
+    either. Older readings read ``N h old`` below 24 hours and ``N d old`` from
+    24 hours, in whole hours or whole days rounded down -- the units of
+    ``forecast.service.relative_ago`` from one hour up. A stamp that
+    ``parse_utc`` rejects reads ``age unknown``.
+    """
+    if last_obstime is None:
+        return None
+    try:
+        observed = parse_utc(last_obstime)
+    except ValueError:
+        return "age unknown"
+    age = now - observed
+    if age <= timedelta(minutes=60):
+        return None
+    if age < timedelta(hours=24):
+        return f"{age // timedelta(hours=1)} h old"
+    return f"{age // timedelta(days=1)} d old"
+
+
 def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
     rows = conn.execute(
         """
-        SELECT *
-        FROM stations
-        WHERE site_id=?
-        ORDER BY enabled DESC, pws_station_id COLLATE NOCASE
+        SELECT st.id, st.pws_station_id, st.lat, st.lon, st.dem_elevation_m,
+               st.enabled, sps.last_obstime AS last_obstime
+        FROM stations st
+        LEFT JOIN station_poll_state sps ON sps.station_id = st.id
+        WHERE st.site_id = ?
+        ORDER BY st.enabled DESC, st.pws_station_id COLLATE NOCASE
         """,
         (site_id,),
     ).fetchall()
+    now = utc_now()
     return [
         StationView(
             id=int(row["id"]),
@@ -1115,6 +1147,7 @@ def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
             lon=float(row["lon"]),
             dem_elevation_m=float(row["dem_elevation_m"]),
             enabled=bool(row["enabled"]),
+            observation_age=observation_age_text(row["last_obstime"], now=now),
         )
         for row in rows
     ]
