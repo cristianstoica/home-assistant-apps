@@ -643,6 +643,52 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     )
 
 
+def test_d23_missed_final_collection_ignores_a_leftover_wind_basis_key(
+    tmp_path: Path,
+) -> None:
+    """D23 (old-wind-method-removal plan §10.4): (i)'s missed-final-collection
+    reason fires regardless of a stray ``wind_basis:<site>`` key, left over
+    from the old method and never cleaned up. Reuses
+    ``test_t74i_missed_final_collection_reason``'s case 1 setup, plus that
+    leftover key set to ``staging``.
+    """
+
+    def _seed_yesterday(
+        conn: sqlite3.Connection, station_id: int, last_ok_at: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO station_wind_days"
+            " (station_id, local_date, status, record_count, last_ok_at, attempts,"
+            "  updated_at)"
+            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, ?)",
+            (station_id, last_ok_at, isoformat_utc(_NOW)),
+        )
+
+    missed_last_ok_at = isoformat_utc(_NOW - timedelta(hours=14))  # 2026-09-21T22:00Z
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
+    site_id, station_id = _healthy_site(conn)
+    _seed_yesterday(conn, station_id, missed_last_ok_at)
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
+    conn.commit()
+
+    tripped, first = _trips(conn)
+    assert tripped == 1
+    assert first == (
+        "wind: last collection before midnight missed for 1 of 1 stations (2026-09-21)"
+    ), (
+        "mutant -> at this assertion: correct = the missed text, mutant"
+        " (base's (b) wind-rebuild-progress check fires first for a"
+        " non-pair_max state and (i) itself requires state == 'pair_max')"
+        f" = a different first reason; got {first!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # T78 -- wind_history in the pipeline-disabled skip list
 # ---------------------------------------------------------------------------

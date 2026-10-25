@@ -2597,6 +2597,125 @@ def test_wind_lane_due_while_a_finishable_row_waits(
     )
 
 
+@pytest.mark.parametrize("basis_value", ["staging", "bogus"])
+def test_d22_finish_step_ignores_a_leftover_wind_basis_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, basis_value: str
+) -> None:
+    """D22 (old-wind-method-removal plan §10.4): a stray ``wind_basis:<site>``
+    runtime_state key, left over from the old method and never cleaned up,
+    must not stop the finish step -- it reads nothing about wind basis at
+    all. Modeled on ``test_wind_lane_due_while_a_finishable_row_waits``'s
+    first two legs, once through ``_finish_day`` directly and once through
+    a real ``run_wind_days`` job."""
+    from zoneinfo import ZoneInfo
+
+    today = date(2026, 3, 15)
+    yesterday = today - timedelta(days=1)
+    start, _end, _ = local_day_slots(yesterday, _TZ)
+    future_next_attempt = isoformat_utc(
+        datetime.combine(today, datetime.min.time(), tzinfo=UTC) + timedelta(hours=1)
+    )
+    now = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+
+    # -- leg 1: direct _finish_day, against wind_lane_due -------------------
+    conn = _make_db()
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    set_runtime_state(conn, f"wind_basis:{site_id}", basis_value)
+    conn.commit()
+    _insert_day(
+        conn, station_id, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(
+        conn,
+        station_id,
+        yesterday,
+        status="partial",
+        next_attempt_at=future_next_attempt,
+    )
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is True, (
+        "mutant -> at this assertion: correct = True (a held hold plus a"
+        " waiting finishable row is due no matter what a leftover"
+        f" wind_basis key ({basis_value!r}) holds), mutant (M40: the due"
+        " check's finish branch also requires that key absent or"
+        " pair_max) = False"
+    )
+    finished = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert finished is True, (
+        "mutant -> at this assertion: correct = True, mutant (M39:"
+        f" _finish_day returns False while wind_basis holds {basis_value!r}"
+        " instead of pair_max) = False"
+    )
+    row = conn.execute(
+        "SELECT status FROM station_wind_days WHERE station_id = ? AND local_date = ?",
+        (station_id, yesterday.isoformat()),
+    ).fetchone()
+    assert row["status"] != "partial", (
+        "mutant -> at this assertion: correct = no longer partial, mutant"
+        " (M39's gate stops _finish_day before it writes) = still partial"
+    )
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is False, (
+        "mutant -> at this assertion: correct = False (the row is"
+        " finished, so no finishable row remains), mutant (the finish"
+        " step never ran, so the row is still waiting) = True"
+    )
+
+    # -- leg 2: the same rows and key through a real run_wind_days job ------
+    conn2 = _t97_init_tmp_db(tmp_path)
+    site_id2 = _make_site(conn2)
+    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
+    set_runtime_state(conn2, f"wind_basis:{site_id2}", basis_value)
+    conn2.commit()
+    _insert_day(
+        conn2, station_id2, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(
+        conn2,
+        station_id2,
+        yesterday,
+        status="partial",
+        next_attempt_at=future_next_attempt,
+    )
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _t97_freeze(monkeypatch, now)
+    _t97_run_wind_days(site_id2, handler, monkeypatch=monkeypatch)  # must not raise
+    assert call_log == [], (
+        "mutant -> at this assertion: correct = [] (nothing is due or"
+        " finishable by a real call, so run_wind_days makes none), mutant"
+        f" (got {call_log})"
+    )
+    row2 = conn2.execute(
+        "SELECT status FROM station_wind_days WHERE station_id = ? AND local_date = ?",
+        (station_id2, yesterday.isoformat()),
+    ).fetchone()
+    assert row2["status"] != "partial", (
+        "mutant -> at this assertion: correct = no longer partial (only"
+        " _run_fetch_chunk's own finish call reaches this row), mutant"
+        f" (M41: _run_fetch_chunk also requires wind_basis absent or"
+        f" pair_max, true is false while it holds {basis_value!r}) ="
+        " still partial"
+    )
+
+
 def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
