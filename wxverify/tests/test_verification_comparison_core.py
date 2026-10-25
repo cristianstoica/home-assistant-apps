@@ -333,8 +333,10 @@ def test_o12_contract_text_and_core_map() -> None:
 
 def test_o13_methodology_and_schema_versions_moved_together() -> None:
     # This change (pairwise decision cores) bumped both counters together;
-    # a mutant reverting either one in isolation fails this assertion.
-    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (3, 2)
+    # a mutant reverting either one in isolation fails this assertion. The
+    # rain-label-boundary release moves only METHODOLOGY_VERSION, not
+    # VERIFICATION_SCHEMA.
+    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (4, 2)
 
 
 # ---------------------------------------------------------------------------

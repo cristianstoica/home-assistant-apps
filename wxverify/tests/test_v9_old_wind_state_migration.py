@@ -171,9 +171,9 @@ def test_d18_v9_step_drops_legacy_hours_matching_a_fresh_database() -> None:
         assert after_row["updated_at"] == before_row["updated_at"]
 
     row = conn.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == TARGET_USER_VERSION == 9, (
-        "mutant -> at this assertion: correct = user_version 9, mutant"
-        " (TARGET_USER_VERSION left at 8) = user_version 8"
+    assert int(row[0]) == TARGET_USER_VERSION == 10, (
+        "mutant -> at this assertion: correct = user_version 10, mutant"
+        " (TARGET_USER_VERSION left at 9) = user_version 9"
     )
 
     empty = sqlite3.connect(":memory:")
@@ -274,7 +274,7 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
     for key in (*_KEPT_KEYS, *_DECOY_KEYS):
         assert key in after_column_first
     row = column_already_dropped.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 9
+    assert int(row[0]) == 10
 
     caplog.clear()
     keys_already_deleted = _v8_fixture_conn()
@@ -317,6 +317,6 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
         " removed) = a line logged anyway"
     )
     row = both_already_done.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 9
+    assert int(row[0]) == 10
     assert _all_runtime_state(both_already_done) == before_keys
     assert _wind_days_rows(both_already_done) == before_rows

@@ -27,7 +27,6 @@ import pytest
 
 import scripts.icon_eu_coverage_check as _coverage_check
 from scripts.icon_eu_post_release_check import (
-    MIN_HOURS,
     MIN_IN_WINDOW_FETCHES,
     Fetch,
     Row,
@@ -96,9 +95,9 @@ def _stamp(dt: datetime) -> str:
 
 
 #: Production stores leads 1..120 for icon_eu (``OPEN_METEO_MAX_LEAD_HOURS``).
-#: A literal, not ``MIN_HOURS``-derived, so a fixture built from it reaches
-#: a max lead >= 100 -- the only way a "full if max lead >= 100" mutant (P2b)
-#: can diverge from the real, pure count/whole-hour/no-gap rule.
+#: A literal, not ``MIN_HOURS_BY_VARIABLE``-derived, so a fixture built from
+#: it reaches a max lead >= 100 -- the only way a "full if max lead >= 100"
+#: mutant (P2b) can diverge from the real, pure count/whole-hour/no-gap rule.
 _FULL_HOURS = 120
 
 
@@ -209,34 +208,49 @@ def _hourly(start: datetime, count: int) -> list[datetime]:
 
 
 def test_is_full_true_at_exactly_the_minimum_hour_count() -> None:
-    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS)
-    assert _is_full(stamps) is True
+    # 96, not MIN_HOURS_BY_VARIABLE-derived: the minimum now varies by
+    # variable, so this pins the non-precip minimum as a literal.
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 96)
+    assert _is_full(stamps, 96) is True
 
 
 def test_is_full_false_one_short_of_the_minimum() -> None:
-    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS - 1)
-    assert _is_full(stamps) is False
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 95)
+    assert _is_full(stamps, 96) is False
 
 
 def test_is_full_false_on_a_single_internal_gap() -> None:
     # Same count as the passing case, but one hour skipped and one hour
     # added past the far end -- count matches, span does not.
-    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS + 1)
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 97)
     del stamps[50]
-    assert len(stamps) == MIN_HOURS
-    assert _is_full(stamps) is False
+    assert len(stamps) == 96
+    assert _is_full(stamps, 96) is False
 
 
 def test_is_full_true_with_no_gap_at_the_same_count() -> None:
     # Paired positive for the gap check: identical count, contiguous span.
-    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS)
-    assert _is_full(stamps) is True
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 96)
+    assert _is_full(stamps, 96) is True
 
 
 def test_is_full_false_on_a_non_whole_hour_stamp() -> None:
-    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS)
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 96)
     stamps[0] = stamps[0].replace(minute=30)
-    assert _is_full(stamps) is False
+    assert _is_full(stamps, 96) is False
+
+
+def test_is_full_true_at_the_precip_minimum_of_95() -> None:
+    # Precip is labelled by the start of its hour, one hour earlier than
+    # temperature/wind, so a full icon_eu fetch stores one fewer precip
+    # hour than the other variables: its own minimum is 95, not 96.
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 95)
+    assert _is_full(stamps, 95) is True
+
+
+def test_is_full_false_one_short_of_the_precip_minimum() -> None:
+    stamps = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 94)
+    assert _is_full(stamps, 95) is False
 
 
 # ---------------------------------------------------------------------------
@@ -333,8 +347,8 @@ def _fetch(*, full: bool, in_window: bool) -> Fetch:
         fetched=datetime(2026, 6, 1, 1, 0, tzinfo=UTC),
         in_window=in_window,
         full=full,
-        hours=MIN_HOURS,
-        max_lead=MIN_HOURS,
+        hours=96,
+        max_lead=96,
     )
 
 
@@ -498,8 +512,9 @@ def test_main_literal_96_vs_95_hour_fetches_not_min_hours_derived(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Two hand-built fetches sized by LITERAL row counts (96 and 95), never
-    # by importing MIN_HOURS itself: a mutant that resizes MIN_HOURS would
-    # also resize a fixture built FROM that constant, hiding the mutant.
+    # by importing MIN_HOURS_BY_VARIABLE itself: a mutant that resizes it
+    # would also resize a fixture built FROM that constant, hiding the
+    # mutant.
     db_path = _marker_db(tmp_path)
     db_path, site_id, feed_id = _make_db(tmp_path, db_path=db_path)
     rows: list[Row] = []
@@ -536,6 +551,69 @@ def test_main_literal_96_vs_95_hour_fetches_not_min_hours_derived(
     assert code == 1
     assert "full yes hours 95 max lead 96" in out
     assert "full no hours 94 max lead 95" in out
+
+
+def test_main_full_fetch_now_allows_precip_one_hour_shorter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Precip is labelled by the start of its hour, one hour earlier than
+    # temperature/wind: a real, otherwise-full icon_eu fetch stores precip
+    # leads 1..95 while temperature/wind reach 1..96. A single fetch isn't
+    # enough to PASS (MIN_IN_WINDOW_FETCHES), so the verdict pins full/no
+    # coverage directly rather than PASS/FAIL.
+    db_path = _marker_db(tmp_path)
+    db_path, site_id, feed_id = _make_db(tmp_path, db_path=db_path)
+    label = datetime(2026, 6, 1, tzinfo=UTC)
+    fetched = label + timedelta(hours=1)
+    rows: list[Row] = []
+    for variable, hours in (("temperature", 96), ("wind", 96), ("precip", 95)):
+        for hour in range(1, hours + 1):
+            rows.append(
+                (
+                    site_id,
+                    _stamp(label),
+                    _stamp(label + timedelta(hours=hour)),
+                    variable,
+                    hour,
+                    _stamp(fetched),
+                )
+            )
+    _insert_rows(db_path, site_id, feed_id, rows)
+    code, out, _err = _run_main_verified(db_path, ["--db", str(db_path)], capsys)
+    assert code == 3
+    assert "full yes hours 94 max lead 96" in out
+    assert "post-release verdict: CAN'T TELL (too few samples)" in out
+
+
+def test_main_precip_still_short_one_hour_below_its_own_minimum(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Paired negative for the test above, and a preservation case: one hour
+    # short of precip's OWN minimum (94, not 95) still FAILs, unchanged by
+    # the rain-label-start rework -- this fetch was already short before it
+    # and stays short after.
+    db_path = _marker_db(tmp_path)
+    db_path, site_id, feed_id = _make_db(tmp_path, db_path=db_path)
+    label = datetime(2026, 6, 1, tzinfo=UTC)
+    fetched = label + timedelta(hours=1)
+    rows: list[Row] = []
+    for variable, hours in (("temperature", 96), ("wind", 96), ("precip", 94)):
+        for hour in range(1, hours + 1):
+            rows.append(
+                (
+                    site_id,
+                    _stamp(label),
+                    _stamp(label + timedelta(hours=hour)),
+                    variable,
+                    hour,
+                    _stamp(fetched),
+                )
+            )
+    _insert_rows(db_path, site_id, feed_id, rows)
+    code, out, _err = _run_main_verified(db_path, ["--db", str(db_path)], capsys)
+    assert code == 1
+    assert "full no hours 93 max lead 96" in out
+    assert "post-release verdict: FAIL (short coverage)" in out
 
 
 def test_main_unreadable_db_exits_2_with_an_error_line(
@@ -620,14 +698,14 @@ def test_in_side_window_matches_the_coverage_scripts_copy_aware_and_naive() -> N
 
 
 def test_is_full_whole_hours_microsecond_and_second_shifts() -> None:
-    base = _hourly(datetime(2026, 6, 1, tzinfo=UTC), MIN_HOURS)
-    assert _is_full(base) is True
+    base = _hourly(datetime(2026, 6, 1, tzinfo=UTC), 96)
+    assert _is_full(base, 96) is True
 
     shifted_micro = [stamp.replace(microsecond=500000) for stamp in base]
-    assert _is_full(shifted_micro) is False
+    assert _is_full(shifted_micro, 96) is False
 
     shifted_second = [stamp.replace(second=1) for stamp in base]
-    assert _is_full(shifted_second) is False
+    assert _is_full(shifted_second, 96) is False
 
 
 # ---------------------------------------------------------------------------

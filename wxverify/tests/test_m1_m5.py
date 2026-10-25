@@ -3132,9 +3132,10 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """
                     INSERT INTO forecast_samples
                         (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                         value, source_raw, model_run_id)
+                         value, source_raw, model_run_id, fetched_at)
                     VALUES (?, ?, ?, '2035-01-01T00:00:00Z',
-                            '2035-01-02T00:00:00Z', 24, ?, 'raw', ?)
+                            '2035-01-02T00:00:00Z', 24, ?, 'raw', ?,
+                            '2035-01-01T00:00:00Z')
                     """,
                     (site_id, feed_id, variable, forecast, f"{variable}-run"),
                 )
@@ -3761,6 +3762,10 @@ def test_ui_dashboard_ops_overlay_smoke_and_key_status(
 
 
 def test_open_meteo_trace_negative_precip_clamp_preserves_source_raw() -> None:
+    # Precip is labelled by the start of its hour: the raw
+    # 01:00 reading becomes lead 0 against the 2026-01-01T00:00:00Z issue
+    # time and is dropped, so label 01:00Z now holds the raw 02:00 value and
+    # there is no 03:00Z precip label at all.
     samples = open_meteo_samples_from_hourly(
         "jma_gsm",
         "2026-01-01T00:00:00Z",
@@ -3777,12 +3782,12 @@ def test_open_meteo_trace_negative_precip_clamp_preserves_source_raw() -> None:
     )
 
     precip = {sample.valid_at: sample for sample in samples}
+    assert "2026-01-01T00:00:00Z" not in precip
     assert precip["2026-01-01T01:00:00Z"].value == 0.0
-    assert precip["2026-01-01T01:00:00Z"].source_raw == "-0.1"
-    assert precip["2026-01-01T02:00:00Z"].value == 0.0
-    assert precip["2026-01-01T02:00:00Z"].source_raw == "-0.01"
-    assert precip["2026-01-01T03:00:00Z"].value == -0.2
-    assert precip["2026-01-01T03:00:00Z"].source_raw == "-0.2"
+    assert precip["2026-01-01T01:00:00Z"].source_raw == "-0.01"
+    assert precip["2026-01-01T02:00:00Z"].value == -0.2
+    assert precip["2026-01-01T02:00:00Z"].source_raw == "-0.2"
+    assert "2026-01-01T03:00:00Z" not in precip
 
 
 def test_open_meteo_historical_trace_negative_precip_clamp_preserves_raw() -> None:
@@ -3817,11 +3822,14 @@ def test_open_meteo_historical_trace_negative_precip_clamp_preserves_raw() -> No
             )
 
         assert historical is not None
+        # Part B: previous-runs precip is labelled one hour earlier than the
+        # raw time it was reported at, same as the forward feed -- raw 01:00
+        # becomes label 00:00Z and raw 02:00 becomes label 01:00Z.
         precip = {sample.valid_at: sample for sample in historical.samples}
-        assert precip["2026-01-02T01:00:00Z"].value == 0.0
-        assert precip["2026-01-02T01:00:00Z"].source_raw == "-0.1 previous_day1"
-        assert precip["2026-01-02T02:00:00Z"].value == -0.2
-        assert precip["2026-01-02T02:00:00Z"].source_raw == "-0.2 previous_day1"
+        assert precip["2026-01-02T00:00:00Z"].value == 0.0
+        assert precip["2026-01-02T00:00:00Z"].source_raw == "-0.1 previous_day1"
+        assert precip["2026-01-02T01:00:00Z"].value == -0.2
+        assert precip["2026-01-02T01:00:00Z"].source_raw == "-0.2 previous_day1"
 
     asyncio.run(_run())
 
@@ -3845,7 +3853,10 @@ def test_meteoblue_parser_and_member_registration(
         open_values = {sample.variable: sample.value for sample in open_meteo}
         assert open_values["temperature"] == 2.0
         assert open_values["wind"] == pytest.approx(10.0)
-        assert open_values["precip"] == 0.2
+        # Precip is labelled by the start of its hour: the raw
+        # 01:00 reading becomes lead 0 against the 2026-01-01T00:00:00Z
+        # issue time and is dropped, so there is no forward precip sample.
+        assert "precip" not in open_values
         assert {sample.valid_at for sample in open_meteo} == {"2026-01-01T01:00:00Z"}
 
         def open_meteo_history_handler(request: httpx.Request) -> httpx.Response:
@@ -3892,7 +3903,14 @@ def test_meteoblue_parser_and_member_registration(
         assert historical_values["temperature"].valid_at == "2026-01-03T00:00:00Z"
         assert historical_values["temperature"].lead_hours == 48
         assert historical_values["wind"].value == pytest.approx(10.0)
+        # Precip's label shifts one hour earlier than temperature/wind's:
+        # raw 2026-01-03T00:00 (previous_day2) labels
+        # 2026-01-02T23:00:00Z, at lead previous_run_lead_hours("precip", 2)
+        # == 47, not the raw label's 48.
         assert historical_values["precip"].value == 0.3
+        assert historical_values["precip"].valid_at == "2026-01-02T23:00:00Z"
+        assert historical_values["precip"].lead_hours == 47
+        assert historical_values["precip"].issued_at == "2026-01-01T00:00:00Z"
 
         meteoblue_payload = {
             "metadata": {

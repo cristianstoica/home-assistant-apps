@@ -2,8 +2,9 @@
 
 Looks at every forward ``icon_eu`` fetch the add-on has stored and asks one
 question: did each fetch store usable, gap-free coverage of at least 96 hours
-for every variable? It measures usable coverage only, not which model run
-supplied it or whether runs are stitched.
+(95 for rain, whose first hour the adapter drops) for every variable? It
+measures usable coverage only, not which model run supplied it or whether
+runs are stitched.
 
 Run from the add-on directory (``uv sync`` does not install the package)::
 
@@ -26,7 +27,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -36,7 +37,11 @@ from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.core.timeutil import floor_hour, parse_utc
 
 VARIABLES: Final[tuple[str, ...]] = ("temperature", "wind", "precip")
-MIN_HOURS: Final = 96
+MIN_HOURS_BY_VARIABLE: Final[Mapping[str, int]] = {
+    "temperature": 96,
+    "wind": 96,
+    "precip": 95,
+}
 MIN_IN_WINDOW_FETCHES: Final = 8
 #: A stored row younger than this at storage time is a forward row; history
 #: rows from backfill and catch-up are at least 24 h old.
@@ -123,10 +128,11 @@ def _is_forward(row: Row) -> bool:
     return fetched - issued < FORWARD_AGE
 
 
-def _is_full(stamps: Sequence[datetime]) -> bool:
-    """Whole hours (minute, second and microsecond zero), at least 96 of them,
-    and no gap between first and last."""
-    if len(stamps) < MIN_HOURS:
+def _is_full(stamps: Sequence[datetime], min_hours: int) -> bool:
+    """Whole hours (minute, second and microsecond zero), at least ``min_hours``
+    of them (96, or 95 for rain, whose first hour the adapter drops), and no
+    gap between first and last."""
+    if len(stamps) < min_hours:
         return False
     if any(
         stamp.minute != 0 or stamp.second != 0 or stamp.microsecond != 0
@@ -162,7 +168,10 @@ def _fetch(
         label=label,
         fetched=fetched,
         in_window=in_side_window(fetched),
-        full=all(_is_full(by_variable[variable]) for variable in VARIABLES),
+        full=all(
+            _is_full(by_variable[variable], MIN_HOURS_BY_VARIABLE[variable])
+            for variable in VARIABLES
+        ),
         hours=min(_hours_after(by_variable[variable], base) for variable in VARIABLES),
         max_lead=max(leads, default=0),
     )

@@ -11,16 +11,25 @@ from typing import Final
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
+from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 from wxverify.core.timeutil import isoformat_utc, utc_now
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.runtime_state import (
+    delete_runtime_state,
+    get_runtime_state,
+    set_runtime_state,
+)
 from wxverify.db.tz_generations import (
+    correction_heartbeat_key,
+    correction_job_key,
+    correction_state_key,
     invalid_published_pointers,
     repair_dangling_published_pointers,
 )
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 9
+TARGET_USER_VERSION = 10
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -1107,6 +1116,105 @@ def pause_dropped_meteoblue_members(conn: sqlite3.Connection) -> None:
         set_runtime_state(conn, METEOBLUE_MEMBER_DROP_KEY, "applied")
 
 
+def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
+    """Keep rain stored under end-of-hour labels out of scoring, once.
+
+    Open-Meteo and meteoblue label rain by the hour's end; their adapters
+    now store it under the hour's start (`precip_hour_start`). Stored rows
+    are not relabelled. This step records the newest parseable `fetched_at`
+    of their real-feed rain under `PRECIP_HOUR_START_BOUNDARY_KEY`, and
+    `precip_label_eligible_sql` keeps every such row fetched at or before
+    it out of pairing, rebuilds and the served forecast. The pick orders by
+    `julianday`, not text: as text, a stamp with fractional seconds sorts
+    below the same second without them. With no such row the boundary is
+    the `1970-01-01T00:00:00Z` sentinel. No clock is read.
+
+    Then, in order: delete those feeds' and the multimodel mean's rain
+    pairs in every generation, since the pairer never revisits a pair that
+    exists; restart each building timezone-correction generation (state
+    and heartbeat deleted, job re-queued), so its chain rebuilds under the
+    new gate; delete the rain `score_cache` rows and queue scoring for each
+    enabled site. The key is written last. No `forecast_samples` row
+    changes.
+
+    Gated on the key, not on `user_version`, whose number depends on which
+    release ships first; an older backup imported later carries no key and
+    gets a boundary from its own stamps. Deleting the key by hand is a
+    reset: the next open records the newest stored stamp.
+
+    One SAVEPOINT makes the step all-or-nothing. On the writer,
+    executescript has already committed the outer BEGIN IMMEDIATE (see
+    `bootstrap_publish_hold`), so the savepoint is the whole transaction.
+    SQLite ends the whole transaction by itself on some errors (disk full,
+    I/O error), which also drops the savepoint, hence the in_transaction
+    check before ROLLBACK TO. Unlike `repair_published_pointers`, nothing
+    is swallowed: the open fails before the `user_version` write and the
+    next open retries.
+    """
+    if get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY) is not None:
+        return
+    conn.execute("SAVEPOINT migrate_precip_hour_start_boundary")
+    try:
+        newest = conn.execute(
+            """
+            SELECT fs.fetched_at
+            FROM forecast_samples fs JOIN feeds f ON f.id = fs.feed_id
+            WHERE fs.variable = 'precip'
+              AND f.source IN ('open-meteo', 'meteoblue') AND f.is_virtual = 0
+              AND julianday(fs.fetched_at) IS NOT NULL
+            ORDER BY julianday(fs.fetched_at) DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        boundary = "1970-01-01T00:00:00Z" if newest is None else str(newest[0])
+        deleted_pairs = conn.execute(
+            """
+            DELETE FROM forecast_pairs
+            WHERE variable = 'precip'
+              AND feed_id IN (
+                  SELECT id FROM feeds
+                  WHERE (source IN ('open-meteo', 'meteoblue') AND is_virtual = 0)
+                     OR (source = 'virtual' AND model = '_multimodel_mean')
+              )
+            """
+        ).rowcount
+        for row in conn.execute(
+            "SELECT id, site_id FROM timezone_generations "
+            "WHERE mode = 'retrospective_correction' AND state = 'building'"
+        ).fetchall():
+            generation_id = int(row[0])
+            delete_runtime_state(
+                conn,
+                correction_state_key(generation_id),
+                correction_heartbeat_key(generation_id),
+            )
+            enqueue_if_absent(
+                conn,
+                "timezone_correction",
+                int(row[1]),
+                correction_job_key(generation_id),
+                {"generation_id": generation_id},
+            )
+        conn.execute("DELETE FROM score_cache WHERE variable = 'precip'")
+        for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
+            site_id = int(row[0])
+            enqueue_if_absent(
+                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+            )
+        set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, boundary)
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_precip_hour_start_boundary")
+            conn.execute("RELEASE migrate_precip_hour_start_boundary")
+        raise
+    conn.execute("RELEASE migrate_precip_hour_start_boundary")
+    logger.info(
+        "precip hour-start boundary recorded at %s; %d rain pair(s) deleted",
+        boundary,
+        deleted_pairs,
+    )
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -1156,6 +1264,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_settings(conn)
     logger.debug("migrations seeded sources+feeds+settings")
     repair_published_pointers(conn)
+    record_precip_hour_start_boundary(conn)
     bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
     logger.debug("migrations done user_version=%s", TARGET_USER_VERSION)

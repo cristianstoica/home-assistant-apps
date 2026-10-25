@@ -27,6 +27,7 @@ from wxverify.collection.forecast_validation import (
     FORECAST_VARIABLES,
     invalid_forecast_sample_sql,
 )
+from wxverify.collection.precip_labels import precip_label_eligible_sql
 from wxverify.core.timeutil import parse_utc
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import (
@@ -139,6 +140,8 @@ def load_future_samples(
     window function, so an invalid sample from a newer run still cannot shadow a
     valid older one. ``variable IN (...)`` is implied by ``NOT invalid`` and is
     stated only to make idx_samples_site_var_valid's valid_at range reachable.
+    The rain-label boundary (:func:`precip_label_eligible_sql`) is applied there
+    too, so an excluded newer run cannot hide an eligible older one.
 
     ``as_of`` (plan §6): restrict to runs available at T — ``issued_at <= T``
     AND ``fetched_at <= T`` — applied BEFORE the latest-run pick, so the
@@ -153,6 +156,7 @@ def load_future_samples(
     passes False because it filters to its pinned roster.
     """
     invalid = invalid_forecast_sample_sql("fs")
+    eligible = precip_label_eligible_sql("fs", "f")
     variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
     asof_clause = ""
     asof_params: tuple[object, ...] = ()
@@ -180,6 +184,7 @@ def load_future_samples(
               AND fs.valid_at >= ?
               AND {EXCLUDED_FEEDS_SQL}
               AND NOT {invalid}
+              AND {eligible}
               {asof_clause}
         )
         WHERE rn = 1
@@ -211,10 +216,12 @@ def count_null_availability_samples(
     The as-of path (:func:`load_future_samples` with ``as_of``) cannot place
     a NULL-availability run on the timeline; plan §6 requires the exclusion
     to be recorded, not silent. Same eligibility predicates as the loader
-    (variables, valid_at floor, feed exclusions, validity) so the count is
-    exactly the rows the as-of restriction dropped for this reason.
+    (variables, valid_at floor, feed exclusions, validity, rain-label boundary)
+    so the count is exactly the rows the as-of restriction dropped for this
+    reason.
     """
     invalid = invalid_forecast_sample_sql("fs")
+    eligible = precip_label_eligible_sql("fs", "f")
     variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
     row = conn.execute(
         f"""
@@ -226,6 +233,7 @@ def count_null_availability_samples(
           AND fs.valid_at >= ?
           AND {EXCLUDED_FEEDS_SQL}
           AND NOT {invalid}
+          AND {eligible}
           AND fs.fetched_at IS NULL
         """,
         (site_id, since_valid_at),

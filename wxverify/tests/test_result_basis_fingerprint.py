@@ -1133,13 +1133,13 @@ def test_e3_migration_preserves_an_existing_v4_run_row() -> None:
 
 
 def test_e4_run_migrations_lands_on_target_user_version() -> None:
-    """e4 -> at ``_user_version(conn) == 9``: correct = 9 (the literal),
+    """e4 -> at ``_user_version(conn) == 10``: correct = 10 (the literal),
     mutant = a different literal if ``TARGET_USER_VERSION`` is bumped
     without also bumping the literal every caller of this suite expects."""
-    assert TARGET_USER_VERSION == 9
+    assert TARGET_USER_VERSION == 10
     conn = _bare_db(user_version=4)
     run_migrations(conn)
-    assert _user_version(conn) == 9
+    assert _user_version(conn) == 10
 
 
 # ---------------------------------------------------------------------------

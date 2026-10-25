@@ -1621,7 +1621,7 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
         }
         assert "legacy_hours" not in live_cols
         live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 9
+        assert int(live_version[0]) == 10
     finally:
         direct.close()
 

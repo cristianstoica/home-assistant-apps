@@ -17,6 +17,7 @@ from wxverify.feeds.seam import (
     ForecastRequest,
     GridProvenance,
     NormalizedSample,
+    precip_hour_start,
 )
 
 RUN_CADENCE_HOURS: Final[dict[str, int]] = {
@@ -233,6 +234,8 @@ def _samples_from_hourly(
             if not isinstance(raw_obj, str | int | float):
                 continue
             valid_at = isoformat_utc(parse_utc(str(raw_time)))
+            if variable == "precip":
+                valid_at = precip_hour_start(valid_at)
             raw_value = float(raw_obj)
             value = _normalized_value(variable, raw_value)
             lead = int(
@@ -313,6 +316,16 @@ def _historical_samples_from_hourly(
     return out
 
 
+def previous_run_lead_hours(variable: str, day: int) -> int:
+    """Lead of a previous-runs value ``day`` days back, in whole hours.
+
+    The run is dated from the raw hour; rain is labelled one hour earlier
+    (``precip_hour_start``), so its lead is one hour shorter. The adapter and
+    the ICON-EU coverage check both call this, so they cannot drift.
+    """
+    return day * 24 - (1 if variable == "precip" else 0)
+
+
 def _historical_series_samples(
     *,
     req: ForecastRequest,
@@ -330,11 +343,16 @@ def _historical_series_samples(
         raw_value = values[idx]
         if not isinstance(raw_value, str | int | float):
             continue
-        valid_at = isoformat_utc(parse_utc(str(raw_time)))
+        raw_dt = parse_utc(str(raw_time))
+        valid_at = isoformat_utc(raw_dt)
+        if variable == "precip":
+            valid_at = precip_hour_start(valid_at)
         valid_dt = parse_utc(valid_at)
         if valid_dt < start or valid_dt >= end:
             continue
-        issued_at = isoformat_utc(valid_dt - timedelta(days=day))
+        # The run is dated from the raw hour, so every variable of one raw
+        # hour keeps the same issued_at; only the rain label moves.
+        issued_at = isoformat_utc(raw_dt - timedelta(days=day))
         value = _normalized_value(variable, float(raw_value))
         out.append(
             NormalizedSample(
@@ -342,7 +360,7 @@ def _historical_series_samples(
                 variable=variable,
                 issued_at=issued_at,
                 valid_at=valid_at,
-                lead_hours=day * 24,
+                lead_hours=previous_run_lead_hours(variable, day),
                 value=value,
                 source_raw=f"{raw_value} previous_day{day}",
                 model_run_id=f"{req.model}:{issued_at}",
