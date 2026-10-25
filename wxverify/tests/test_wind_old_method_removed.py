@@ -839,13 +839,28 @@ def _wxverify_py_files() -> list[Path]:
 def test_source_scan_no_module_defines_or_calls_a_deleted_key_builder() -> None:
     """None of the six deleted ``runtime_state`` key-builder names may
     appear as an identifier anywhere under the ``wxverify`` package --
-    not just unimported, genuinely gone."""
+    as a definition, a plain or qualified use, or an import -- not just
+    unimported, genuinely gone."""
     offenders: list[str] = []
     for path in _wxverify_py_files():
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
-            if isinstance(node, ast.Name) and node.id in _DELETED_KEY_BUILDERS:
-                offenders.append(f"{path}:{node.lineno}:{node.id}")
+            name: str | None = None
+            lineno = 0
+            if isinstance(node, ast.Name):
+                name = node.id
+                lineno = node.lineno
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = node.name
+                lineno = node.lineno
+            elif isinstance(node, ast.Attribute):
+                name = node.attr
+                lineno = node.lineno
+            elif isinstance(node, ast.alias):
+                name = node.name
+                lineno = node.lineno
+            if name in _DELETED_KEY_BUILDERS:
+                offenders.append(f"{path}:{lineno}:{name}")
 
     assert offenders == []
 

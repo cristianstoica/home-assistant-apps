@@ -404,13 +404,15 @@ _NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)  # past local midnight + 6h g
 
 
 def _healthy_site(conn: sqlite3.Connection) -> tuple[int, int]:
-    """A site/station pair that trips none of (a)-(h) at ``_NOW``.
+    """A site/station pair that trips none of (c), (e) to (h) at ``_NOW``.
 
     A fresh, well-attended ``station_wind_days`` row for today (non-zero
     ``record_count``, ``last_ok_at`` inside the 2x-interval window) clears
-    (e) and (h); no failed/unavailable rows clears (c)/(d); no auth hold
-    clears (g); a plain 'UTC' timezone clears (f). Each test below mutates
-    exactly one of these away from healthy.
+    (e) and (h); no failed rows clears (c); no auth hold clears (g); a
+    plain 'UTC' timezone clears (f). (i) is gated on a ``history_all``
+    auth hold being held at all -- this baseline has none, so (i) is never
+    reached here, not demonstrated clear. Each test below mutates exactly
+    one of these away from healthy.
     """
     site_id = _seed_site(conn)
     station_id = _seed_enabled_station(conn, site_id, "WSTATION01")

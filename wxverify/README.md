@@ -462,7 +462,7 @@ Everything else stays as it was:
 
 - The day's hourly chart still plots every selected feed, including feeds that
   cover only part of the day.
-- The `partial` badge keeps its meaning: for temperature, wind or rain, none
+- The `partial` badge keeps its meaning: for temperature or rain, none
   of the selected feeds covers at least 18 hours of that day. It can appear
   with or without the unavailable label, because it answers a different
   question.

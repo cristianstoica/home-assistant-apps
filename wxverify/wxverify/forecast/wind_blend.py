@@ -1,14 +1,14 @@
 """Weighted wind forecast: every eligible feed, weighted by past accuracy (§11).
 
-In the ``pair_max`` state the served wind is no longer the blend-depth
-selection. Each feed's weight at a lead ``k`` is ``1 / max(MAE, FLOOR_MS)``,
-where the MAE compares the feed's forecast daily high (the latest run with at
-least ``MIN_RUN_HOURS`` hours for the target day) with the observed daily
-high (a local day with at least ``MIN_OBS_HOURS`` hours) over the last
-``TRAINING_DAYS`` complete local days. A feed needs ``MIN_TRAINING_DAYS``
-matched days to get a weight, and a cell needs ``MIN_FEEDS`` weighted feeds
-with ``MIN_RUN_HOURS`` hours to be served at all; otherwise it is shown as
-unavailable with a note, never silently narrowed.
+The served wind is not the blend-depth selection. Each feed's weight at a lead
+``k`` is ``1 / max(MAE, FLOOR_MS)``, where the MAE compares the feed's
+forecast daily high (the latest run with at least ``MIN_RUN_HOURS`` hours for
+the target day) with the observed daily high (a local day with at least
+``MIN_OBS_HOURS`` hours) over the last ``TRAINING_DAYS`` complete local days.
+A feed needs ``MIN_TRAINING_DAYS`` matched days to get a weight, and a cell
+needs ``MIN_FEEDS`` weighted feeds with ``MIN_RUN_HOURS`` hours to be served
+at all; otherwise it is shown as unavailable with a note, never silently
+narrowed.
 
 Units are m/s throughout, like storage; the callers convert for display.
 
