@@ -434,9 +434,14 @@ def _wind_history_trips(
     order, over the checks (c) and (e) to (i) of plan §10, in that order. Read-only.
     """
     holds = read_auth_holds(conn)
+    # A history_all hold alone is a known limit of the key: past days are
+    # finished from the records already stored, and check (i) reports a
+    # missed collection before midnight. It is a reason only next to an
+    # all_1day hold.
     hold_reasons = [
         f"wind history paused: weather.com refused the key ({endpoint})"
         for endpoint in holds
+        if endpoint != "history_all" or "all_1day" in holds
     ]
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
     tripped = 0
@@ -477,7 +482,7 @@ def _wind_history_trips(
                 for row in today_rows
             ):
                 reasons.append("no wind readings today from any station")
-            # (g) weather.com refused the key.
+            # (g) weather.com refused the key; see hold_reasons for history_all.
             reasons.extend(hold_reasons)
             # (h) one station's today refresh keeps failing.
             if today_checks:
@@ -776,9 +781,9 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # wind_history (plan §10): per enabled site with an enabled station, a
-    # weather.com auth hold, a failing station-day, a missed collection before
-    # midnight, or a station whose wind stopped updating today.
+    # wind_history (plan §10): per enabled site with an enabled station, an
+    # all_1day weather.com auth hold, a failing station-day, a missed collection
+    # before midnight, or a station whose wind stopped updating today.
     wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
 
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:

@@ -926,7 +926,7 @@ when, while the key cannot download past days, yesterday's last collection
 before midnight was missed for a station; from 6 hours after local midnight,
 when no station has any
 wind records today or one station's wind has stopped updating today; or when
-weather.com refused the key for a wind request. Its `count` is the number of sites tripped and its `detail` the first
+weather.com refused the key for today's wind. A key that cannot download past days does not trip it on that alone. Its `count` is the number of sites tripped and its `detail` the first
 reason. When the site's time zone cannot be loaded it reports
 `cannot evaluate` rather than passing.
 

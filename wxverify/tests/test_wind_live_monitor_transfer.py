@@ -44,7 +44,7 @@ from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import Job
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import write_auth_hold
+from wxverify.db.wind_basis import AuthHoldEndpoint, AuthHoldStatus, write_auth_hold
 from wxverify.monitor import (
     _wind_history_trips,  # noqa: PLC2701 -- private, exercised directly
     build_verdict,
@@ -496,19 +496,43 @@ def test_t74e_no_wind_readings_today_trips(tmp_path: Path) -> None:
     assert first == "no wind readings today from any station"
 
 
-def test_t74g_auth_hold_trips(tmp_path: Path) -> None:
-    """(g): a held weather.com auth hold trips, named by endpoint."""
+@pytest.mark.parametrize("status", ["held", "probing"])
+@pytest.mark.parametrize(
+    ("endpoints", "expected"),
+    [
+        pytest.param(("history_all",), (0, None), id="history_all-alone"),
+        pytest.param(
+            ("all_1day",),
+            (1, "wind history paused: weather.com refused the key (all_1day)"),
+            id="all_1day-alone",
+        ),
+        pytest.param(
+            ("history_all", "all_1day"),
+            (1, "wind history paused: weather.com refused the key (history_all)"),
+            id="both",
+        ),
+    ],
+)
+def test_t74g_auth_hold_trips(
+    tmp_path: Path,
+    endpoints: tuple[AuthHoldEndpoint, ...],
+    expected: tuple[int, str | None],
+    status: AuthHoldStatus,
+) -> None:
+    """(g): an ``all_1day`` hold trips, named by endpoint; a ``history_all``
+    hold trips only next to an ``all_1day`` hold, and its text then comes
+    first. ``held`` and ``probing`` count alike.
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
     _healthy_site(conn)
-    write_auth_hold(
-        conn, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
-    )
+    for endpoint in endpoints:
+        write_auth_hold(
+            conn, endpoint, status=status, since=isoformat_utc(_NOW), error="401"
+        )
     conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == "wind history paused: weather.com refused the key (history_all)"
+    assert _trips(conn) == expected
 
 
 def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
@@ -551,13 +575,13 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     Case 1 (``last_ok_at`` 2h before local midnight, outside
     ``[end - WIND_FINAL_LEAD, end)``): the missed text is the FIRST reason --
     it is read before (e)/(g) in ``_wind_history_trips``' per-site branch.
-    Case 2 (``last_ok_at`` 10 min before local midnight, inside the window):
-    no missed text at all; the first reason falls through to the existing
-    (g) hold text (same text ``test_t74g_auth_hold_trips`` pins). Case 3
+    Case 2 (last): not missed -> no missed text, and a history_all hold
+    alone adds no (g) reason, so nothing trips; case 2 runs last. Case 3
     reuses case 1's missing-coverage data but also holds ``all_1day`` --
     the ``"all_1day" not in holds`` guard suppresses the missed text even
     though the underlying data is identical to case 1, proving the
     suppression is driven by the hold, not by the data (paired negative).
+    With both held, the first reason is the ``history_all`` hold text.
     """
 
     def _seed_yesterday(
@@ -592,31 +616,8 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         "mutant -> at this assertion: correct = the missed text (missed=1,"
         " total=1, yesterday=2026-09-21), mutant (count_missed_final's"
         " window comparison inverted, or the check's own `missed > 0`"
-        " dropped) = a different first reason (the (g) hold text) or none"
+        " dropped) = no reason (a history_all hold alone adds none)"
     )
-
-    # Case 2: not missed -> no missed text; the (g) hold text leads instead
-    # (the same text test_t74g_auth_hold_trips pins), proving case 1's
-    # result was a real divergence on the DATA, not an artifact of the hold
-    # always firing first regardless of coverage.
-    conn2 = sqlite3.connect(":memory:")
-    conn2.row_factory = sqlite3.Row
-    run_migrations(conn2)
-    site_id2, station_id2 = _healthy_site(conn2)
-    _seed_yesterday(conn2, station_id2, not_missed_last_ok_at)
-    write_auth_hold(
-        conn2, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
-    )
-    conn2.commit()
-    tripped2, first2 = _trips(conn2)
-    assert tripped2 == 1
-    assert first2 == "wind history paused: weather.com refused the key (history_all)", (
-        "mutant -> at this assertion: correct = the (g) hold text (missed=0,"
-        " so (i) adds nothing), mutant (the missed-window boundary widened"
-        " so a last_ok_at inside the window is still counted missed) = the"
-        " missed text instead"
-    )
-    assert "missed" not in first2
 
     # Case 3: same missing coverage as case 1, but all_1day is ALSO held --
     # the guard suppresses the missed text entirely (paired negative against
@@ -642,6 +643,32 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         " underlying coverage data is identical to case 1's), mutant (the"
         " `'all_1day' not in holds` clause dropped from the guard) = the"
         " missed text appears despite all_1day being held"
+    )
+    assert first3 == "wind history paused: weather.com refused the key (history_all)", (
+        "mutant -> at this assertion: correct = the history_all hold text"
+        " first (both endpoints held), mutant (the history_all reason left out"
+        " even when all_1day is held) = the all_1day hold text"
+    )
+
+    # Case 2 (last): not missed -> no missed text, and a history_all hold
+    # alone adds no (g) reason, so nothing trips. This proves case 1's
+    # result came from the data.
+    conn2 = sqlite3.connect(":memory:")
+    conn2.row_factory = sqlite3.Row
+    run_migrations(conn2)
+    site_id2, station_id2 = _healthy_site(conn2)
+    _seed_yesterday(conn2, station_id2, not_missed_last_ok_at)
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    conn2.commit()
+    tripped2, first2 = _trips(conn2)
+    assert (tripped2, first2) == (0, None), (
+        "mutant -> at this assertion: correct = nothing trips (missed=0, so (i)"
+        " adds nothing, and a history_all hold alone adds no (g) reason),"
+        " mutant (the missed-window boundary widened so a last_ok_at inside"
+        " the window is still counted missed) = the missed text, mutant (the"
+        " history_all reason added back unconditionally) = the (g) hold text"
     )
 
 

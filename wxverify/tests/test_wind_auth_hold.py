@@ -44,6 +44,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.wind_basis import (
+    clear_auth_hold,
     read_auth_hold,
     write_auth_hold,
 )
@@ -709,7 +710,7 @@ def _healthy_site_no_hold(conn: sqlite3.Connection) -> int:
     return site_id
 
 
-def test_t84_monitor_condition_g_trips_only_with_a_hold_present() -> None:
+def test_t84_monitor_condition_g_needs_an_all_1day_hold() -> None:
     now = datetime(2026, 3, 10, 23, 0, 0, tzinfo=UTC)
     conn = _make_db()
     _healthy_site_no_hold(conn)
@@ -719,15 +720,36 @@ def test_t84_monitor_condition_g_trips_only_with_a_hold_present() -> None:
 
     write_auth_hold(
         conn,
+        "all_1day",
+        status="held",
+        since="2026-03-09T00:00:00Z",
+        error="refused",
+    )
+    conn.commit()
+    tripped1, reason1 = _wind_history_trips(conn, now)
+    assert tripped1 == 1
+    assert reason1 == "wind history paused: weather.com refused the key (all_1day)"
+
+    write_auth_hold(
+        conn,
         "history_all",
         status="held",
         since="2026-03-09T00:00:00Z",
         error="refused",
     )
     conn.commit()
-    tripped_after, reason = _wind_history_trips(conn, now)
-    assert tripped_after == 1
-    assert reason == "wind history paused: weather.com refused the key (history_all)"
+    tripped2, reason2 = _wind_history_trips(conn, now)
+    assert tripped2 == 1
+    assert reason2 == "wind history paused: weather.com refused the key (history_all)"
+
+    clear_auth_hold(conn, "all_1day")
+    conn.commit()
+    tripped3, reason3 = _wind_history_trips(conn, now)
+    assert (tripped3, reason3) == (0, None), (
+        "mutant -> at this assertion: correct = (0, None) (a history_all hold"
+        " alone adds no (g) reason), mutant (the history_all reason added"
+        " back unconditionally) = (1, the history_all hold text)"
+    )
 
 
 def test_t84_ops_page_shows_the_stalled_text_and_the_button(
