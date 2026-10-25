@@ -30,6 +30,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.forecast import wind_blend
 from wxverify.forecast.service import (
     RAIN_GLYPH_MIN_WET_HOURS,
     build_forecast,
@@ -1249,6 +1250,19 @@ def _seed_wind_training(
             )
 
 
+def _pause_feed(conn: sqlite3.Connection, pause_kind: str, feed_id: int) -> None:
+    """Pause ``feed_id`` at site 1, per ``pause_kind`` ("none" is a no-op)."""
+    if pause_kind == "none":
+        return
+    if pause_kind == "global":
+        conn.execute("UPDATE feeds SET enabled = 0 WHERE id = ?", (feed_id,))
+    else:
+        conn.execute(
+            "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (1, ?, 0)",
+            (feed_id,),
+        )
+
+
 def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
     """Two trained feeds: the wind line is their accuracy-weighted mean.
 
@@ -1285,6 +1299,202 @@ def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
         feed_a: pytest.approx([ms_to_kmh(4.0)] * 24),
         feed_b: pytest.approx([ms_to_kmh(7.0)] * 24),
     }
+
+
+# ---------------------------------------------------------------------------
+# A paused feed (global or site-level) never trains and never serves wind.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pause_kind", ["global", "site"])
+def test_wind_training_skips_paused_feed(pause_kind: str) -> None:
+    """Pausing feed C drops it out of ``load_wind_training``'s feed_highs.
+
+    Catches: no filter at all on the training read (``feed_c`` would stay
+    in ``after.feed_highs`` for both ``pause_kind`` values); a bare
+    ``feeds.enabled`` check (the ``site`` case alone would then still keep
+    ``feed_c``, since pausing via ``site_feed_state`` never flips
+    ``feeds.enabled``).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_c = _feed_id(conn, "open-meteo", "icon_global")
+    _seed_wind_training(
+        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
+    )
+    conn.commit()
+
+    before = wind_blend.load_wind_training(
+        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+    )
+    assert {feed_id for feed_id, _ in before.feed_highs} == {feed_a, feed_b, feed_c}
+
+    _pause_feed(conn, pause_kind, feed_c)
+    conn.commit()
+
+    after = wind_blend.load_wind_training(
+        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+    )
+    assert {feed_id for feed_id, _ in after.feed_highs} == {feed_a, feed_b}
+
+
+@pytest.mark.parametrize("pause_kind", ["global", "site"])
+def test_build_hourly_wind_excludes_paused_feed(pause_kind: str) -> None:
+    """Pausing feed C drops it from the served wind blend and its weights.
+
+    Before the pause, A (weight 1/MAE=1.0), B (0.5), and C (2.0) blend
+    tomorrow's 4.0/7.0/9.0 m/s to 25.5/3.5 m/s = 26.23 km/h. After, only A
+    and B remain and the blend/weights match the two-feed baseline above
+    (18.0 km/h, 2/3 and 1/3).
+
+    Catches: no filter on the serving path (the post-pause blend, weights,
+    and ``payload["feeds"]`` would still include C, identical to the
+    pre-pause call).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_c = _feed_id(conn, "open-meteo", "icon_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(
+        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
+    )
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_c, 9.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    conn.commit()
+
+    before = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert before["blend"]["wind_kmh"] == pytest.approx([25.5 / 3.5 * 3.6] * 24)
+
+    _pause_feed(conn, pause_kind, feed_c)
+    conn.commit()
+
+    after = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert after["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert after["weights"] == {
+        "wind": {str(feed_a): pytest.approx(2 / 3), str(feed_b): pytest.approx(1 / 3)}
+    }
+    feed_ids_after = {feed["feed_id"] for feed in after["feeds"]}
+    assert feed_c not in feed_ids_after
+
+
+# ---------------------------------------------------------------------------
+# A paused feed is never picked by build_forecast/build_hourly, no matter
+# which selection rung (sample count, coverage pool) would otherwise pick it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_paused_feed_not_picked_by_sample_count(pause_kind: str) -> None:
+    """At blend depth 1, a paused B is never picked even with twice A's hours.
+
+    Unpaused (``none``), B's 24 hours beat A's 12 on sample count and B is
+    the lone selection. Paused (``global``/``site``), B drops out of the
+    pool entirely and A -- the only feed left -- is selected instead.
+
+    Catches: the loader filter missing at ``build_hourly``/``build_forecast``
+    (the ``global``/``site`` cases would still pick B); a bare ``enabled``
+    check (the ``site`` case alone would still pick B).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    set_setting(conn, "forecast_blend_depth", "1")
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 12),
+    )
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 24),
+    )
+    _pause_feed(conn, pause_kind, feed_b)
+    conn.commit()
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    tile = next(t for t in view.tiles if t.day_index == 0)
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+
+    if pause_kind == "none":
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_b}
+        assert payload["hours"] == _hours("2026-07-20", 0, 24)
+        assert tile.temp.meta.contributor_ids == (feed_b,)
+    else:
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_a}
+        assert payload["hours"] == _hours("2026-07-20", 0, 12)
+        assert tile.temp.meta.contributor_ids == (feed_a,)
+
+
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_paused_feed_does_not_narrow_the_pool(pause_kind: str) -> None:
+    """A confident 4-hour A beats an unconfident 24-hour B -- unless B is
+    paused, in which case B never reaches the pool and the outcome is
+    exactly what A alone produces.
+
+    Unpaused, B is picked (24h, unconfident but present) and the tile is
+    ``low_confidence``. Paused, only A remains: 4 hours, ``normal`` state.
+
+    Catches: pausing B "narrowing" the pool by removing a competitor rather
+    than removing B itself (the ``global``/``site`` cases would then still
+    show B's hours/feed_id, just picked for a different reason).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    set_setting(conn, "forecast_blend_depth", "1")
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 4, 4),
+    )
+    _make_confident(conn, feed_id=feed_a, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 24),
+    )
+    _pause_feed(conn, pause_kind, feed_b)
+    conn.commit()
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    tile = next(t for t in view.tiles if t.day_index == 0)
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+
+    if pause_kind == "none":
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_b}
+        assert payload["states"]["temperature"] == "low_confidence"
+        assert tile.temp.meta.contributor_ids == (feed_b,)
+    else:
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_a}
+        assert payload["hours"] == _hours("2026-07-20", 4, 4)
+        assert payload["states"]["temperature"] == "normal"
+        assert tile.temp.meta.contributor_ids == (feed_a,)
 
 
 # ---------------------------------------------------------------------------

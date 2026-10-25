@@ -236,7 +236,7 @@ def test_post_t_sample_backfill_leaves_asof_selection_bit_identical() -> None:
     )
     since = "2035-01-01T00:00:00Z"
     baseline = load_future_samples(
-        conn, site_id=site_id, since_valid_at=since, as_of=_T
+        conn, site_id=site_id, since_valid_at=since, as_of=_T, served_only=False
     )
     assert [row.value for row in baseline] == [1.0, 1.5]
 
@@ -299,12 +299,16 @@ def test_post_t_sample_backfill_leaves_asof_selection_bit_identical() -> None:
         fetched_at="2035-01-02T20:00:00Z",
     )
 
-    after = load_future_samples(conn, site_id=site_id, since_valid_at=since, as_of=_T)
+    after = load_future_samples(
+        conn, site_id=site_id, since_valid_at=since, as_of=_T, served_only=False
+    )
     assert after == baseline
     assert {row.feed_id for row in after} == {feed_a}
     # Paired positive: the injected rows ARE live-visible — the as-of absence
     # above is the bound at work, not invalid rows being dropped.
-    live = load_future_samples(conn, site_id=site_id, since_valid_at=since)
+    live = load_future_samples(
+        conn, site_id=site_id, since_valid_at=since, served_only=False
+    )
     assert {row.value for row in live} == {3.0, 3.5, 4.0}
     assert (
         count_null_availability_samples(conn, site_id=site_id, since_valid_at=since)

@@ -367,7 +367,9 @@ def _candidate_universe(
         source = str(row["source"])
         model = str(row["model"])
         # Mirrors EXCLUDED_FEEDS_SQL (forecast/data.py): what the loader can
-        # never return, and therefore what can never be selected.
+        # never return, and therefore what can never be selected. The loader
+        # also drops feeds not served at the site (served_only), so those never
+        # reach sampled_feed_ids.
         loadable = not bool(row["is_virtual"]) and not (
             source == "meteoblue" and model == "multimodel"
         )
@@ -719,7 +721,11 @@ def compute_forecast_record(
     bounds = local_day_bounds(local_date, timezone)
     since_valid_at = isoformat_utc(bounds.start_utc)
     samples = load_future_samples(
-        conn, site_id=site_id, since_valid_at=since_valid_at, as_of=as_of
+        conn,
+        site_id=site_id,
+        since_valid_at=since_valid_at,
+        served_only=True,
+        as_of=as_of,
     )
     null_availability = count_null_availability_samples(
         conn, site_id=site_id, since_valid_at=since_valid_at
@@ -1062,6 +1068,7 @@ def assess_record_day(
         conn,
         site_id=site_id,
         since_valid_at=isoformat_utc(bounds.start_utc),
+        served_only=True,
         as_of=as_of,
     )
     grouped = _group_samples(samples, timezone=timezone, now=snapshot_utc)

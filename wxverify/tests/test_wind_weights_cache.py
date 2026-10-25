@@ -664,6 +664,41 @@ def test_t121_excluded_feeds_absent(fx: _Fixture) -> None:
     assert any(key[0] == fx.virtual_feed for key in served_after.weights)
 
 
+# --- T121b: a paused feed loses its weight ----------------------------------
+
+
+def test_t121b_paused_feed_loses_its_weight(fx: _Fixture) -> None:
+    """Pausing ``feed_b`` (``UPDATE feeds SET enabled = 0``) removes it from
+    both the uncached weights and the served ones.
+
+    Plan Step 3 T121b. mutant_drop_served_filter_from_training -> at the
+    final assertion: correct = no key in ``new_uncached`` has ``feed_b`` as
+    its first element (``served_feed_ids`` excludes a globally-disabled
+    feed, so ``load_wind_training`` skips it), mutant (training reads every
+    feed regardless of ``enabled``) = ``fx.feed_b`` still keys
+    ``new_uncached`` with a real weight. mutant_stale_cache_after_pause ->
+    at the ``served.weights == new_uncached`` assertion: correct = the
+    pause is an external commit, so the cache misses and ``served`` equals
+    the fresh uncached read, mutant (serving the stale pre-pause cache
+    entry) = ``served.weights`` still contains ``fx.feed_b``.
+    """
+    db = fx.db
+    before = _serve(db, fx)
+    assert any(key[0] == fx.feed_b for key in before.weights)
+
+    asyncio.run(
+        db.write(
+            lambda c: c.execute(
+                "UPDATE feeds SET enabled = 0 WHERE id = ?", (fx.feed_b,)
+            )
+        )
+    )
+    new_uncached = _uncached(db, fx)
+    assert all(key[0] != fx.feed_b for key in new_uncached)
+    served = _serve(db, fx)
+    assert served.weights == new_uncached
+
+
 # --- T122: the heartbeat moves neither count --------------------------------
 
 
@@ -2202,6 +2237,10 @@ def test_t131_pooled_reader_snapshot_order(fx: _Fixture) -> None:
     ``baseline.weights`` (the re-read already reflects the raw commit, so
     the follow-up ``_serve``'s unchanged ``ext`` now matches the stored
     key and wrongly hits the stale pre-commit entry).
+
+    The served-feeds read runs inside the same snapshot, after ``BEGIN``
+    and before the pairs read, so the paused-feed filter sees the same
+    state as the training rows.
     """
     db = fx.db
     baseline = _serve(db, fx)
@@ -2246,11 +2285,12 @@ def test_t131_pooled_reader_snapshot_order(fx: _Fixture) -> None:
     served = asyncio.run(db.read(_run))
 
     assert triggered
-    order = before_commit[-4:]
+    order = before_commit[-5:]
     assert order[0] == "PRAGMA query_only=ON"
     assert order[1] == "BEGIN DEFERRED"
     assert order[2] == "PRAGMA user_version"
-    assert order[3].startswith("SELECT fp.feed_id")
+    assert order[3].startswith("SELECT f.id")
+    assert order[4].startswith("SELECT fp.feed_id")
     assert served.weights == baseline.weights
 
     uncached_after = _uncached(db, fx)
@@ -2278,6 +2318,10 @@ def test_t131_foreign_connection_snapshot_order(fx: _Fixture) -> None:
     write. The triggering call itself goes through a foreign (non-pooled)
     connection, so it never stores a cache entry -- the follow-up miss is
     really invalidating the earlier ``baseline`` entry.
+
+    The served-feeds read runs inside the same snapshot, after ``BEGIN``
+    and before the pairs read, so the paused-feed filter sees the same
+    state as the training rows.
     """
     db = fx.db
     baseline = _serve(db, fx)
@@ -2315,10 +2359,11 @@ def test_t131_foreign_connection_snapshot_order(fx: _Fixture) -> None:
         raw.close()
 
     assert triggered
-    order = before_commit[-3:]
+    order = before_commit[-4:]
     assert order[0] == "BEGIN DEFERRED"
     assert order[1] == "PRAGMA user_version"
-    assert order[2].startswith("SELECT fp.feed_id")
+    assert order[2].startswith("SELECT f.id")
+    assert order[3].startswith("SELECT fp.feed_id")
     assert served.weights == baseline.weights
 
     uncached_after = _uncached(db, fx)

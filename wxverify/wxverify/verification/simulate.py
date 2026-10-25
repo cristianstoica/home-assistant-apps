@@ -480,6 +480,7 @@ def _snapshot_samples(
             conn,
             site_id=cfg.site_id,
             since_valid_at=isoformat_utc(bounds.start_utc),
+            served_only=False,
             as_of=as_of,
         )
         if s.feed_id in roster_ids

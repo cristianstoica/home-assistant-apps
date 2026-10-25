@@ -106,7 +106,9 @@ def test_load_future_samples_picks_latest_run_per_slot() -> None:
         valid_at="2026-07-01T00:00:00Z",
         value=20.0,
     )
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert len(rows) == 1
     assert rows[0].value == 20.0
     assert rows[0].issued_at == "2026-06-30T00:00:00Z"
@@ -135,7 +137,9 @@ def test_load_future_samples_newer_invalid_does_not_shadow_valid_older() -> None
         valid_at="2026-07-01T00:00:00Z",
         value=200.0,
     )
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert len(rows) == 1
     assert rows[0].value == 20.0
     assert rows[0].issued_at == "2026-06-25T00:00:00Z"
@@ -161,7 +165,9 @@ def test_load_future_samples_excludes_virtual_and_package_feeds() -> None:
             value=10.0,
         )
 
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     feed_ids = {row.feed_id for row in rows}
     assert feed_ids == {member_id}
 
@@ -199,7 +205,9 @@ def test_load_future_samples_orders_by_valid_at_then_feed() -> None:
         value=12.0,
     )
 
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert [(row.valid_at, row.feed_id) for row in rows] == [
         ("2026-07-01T00:00:00Z", feed_b),
         ("2026-07-01T00:00:00Z", feed_a),

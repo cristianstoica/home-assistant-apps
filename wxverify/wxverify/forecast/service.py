@@ -201,6 +201,7 @@ def build_forecast(
         conn,
         site_id=site_id,
         since_valid_at=isoformat_utc(local_day_start(at, timezone)),
+        served_only=True,
     )
     fingerprint = forecast_fingerprint(conn, site_id=site_id)
     if not samples:
@@ -365,6 +366,7 @@ def build_hourly(
         conn,
         site_id=site_id,
         since_valid_at=isoformat_utc(local_day_start(at, timezone)),
+        served_only=True,
     )
     grouped = _group_samples(samples, timezone=timezone, now=at)
     depths = effective_blend_depths(conn)

@@ -230,11 +230,15 @@ def test_load_future_samples_asof_bounds_before_latest_run_pick() -> None:
         fetched_at="2035-01-02T18:00:00Z",
     )
     live = load_future_samples(
-        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z"
+        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z", served_only=False
     )
     assert [row.value for row in live] == [2.0]
     asof = load_future_samples(
-        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z", as_of=_T
+        conn,
+        site_id=site_id,
+        since_valid_at="2035-01-01T00:00:00Z",
+        as_of=_T,
+        served_only=False,
     )
     assert [row.value for row in asof] == [1.0]
 
@@ -269,11 +273,15 @@ def test_load_future_samples_asof_excludes_post_t_issuance_and_null_fetched() ->
         fetched_at="2035-01-02T11:00:00Z",
     )
     live = load_future_samples(
-        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z"
+        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z", served_only=False
     )
     assert {row.value for row in live} == {3.0, 4.0}
     asof = load_future_samples(
-        conn, site_id=site_id, since_valid_at="2035-01-01T00:00:00Z", as_of=_T
+        conn,
+        site_id=site_id,
+        since_valid_at="2035-01-01T00:00:00Z",
+        as_of=_T,
+        served_only=False,
     )
     assert asof == []
     assert (

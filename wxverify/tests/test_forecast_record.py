@@ -292,6 +292,89 @@ def test_record_skips_cells_with_no_samples() -> None:
     ]
 
 
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_record_leaves_out_paused_feed(pause_kind: str) -> None:
+    """A feed paused globally or at the site is dropped from the record's
+    selected feeds and candidates, leaving the other feed alone selected.
+
+    Plan Step 5. Catches: compute_forecast_record passing served_only=False.
+    """
+    conn = _conn()
+    site_id = _make_site(conn, "site-a")
+    ensure_published_generation(conn, site_id)
+    feed_a = _make_feed(conn, "model-a")
+    feed_b = _make_feed(conn, "model-b")
+    _seed_grid_for(conn, site_id=site_id, feed_id=feed_a, day=_DAY)
+    _seed_grid_for(conn, site_id=site_id, feed_id=feed_b, day=_DAY)
+
+    if pause_kind == "global":
+        conn.execute("UPDATE feeds SET enabled = 0 WHERE id = ?", (feed_b,))
+    elif pause_kind == "site":
+        conn.execute(
+            "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (?, ?, 0)",
+            (site_id, feed_b),
+        )
+
+    t = _snapshot_t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(minutes=5))
+    day0_temp = conn.execute(
+        "SELECT * FROM forecast_of_record"
+        " WHERE site_id = ? AND variable = 'temperature' AND display_lead = 0",
+        (site_id,),
+    ).fetchone()
+    assert day0_temp is not None
+    selected = json.loads(str(day0_temp["selected_feed_ids"]))
+    candidate_ids = {
+        entry["feed_id"] for entry in json.loads(str(day0_temp["candidates"]))
+    }
+
+    if pause_kind == "none":
+        assert selected == [feed_a, feed_b]
+        assert feed_b in candidate_ids
+    else:
+        assert selected == [feed_a]
+        assert feed_b not in candidate_ids
+
+
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_record_day_with_only_paused_samples(pause_kind: str) -> None:
+    """When the SOLE feed with a full grid is paused, both the gap-scan
+    probe (assess_record_day) and the builder report nothing knowable for
+    every identity, never a mismatched pair.
+
+    Plan Step 5. Catches: assess_record_day passing False while the
+    builder passes True (it would report "knowable" for days the builder
+    never writes, and the gap scan would then pick the wrong missed
+    reason); the builder passing False (24 rows).
+    """
+    conn = _conn()
+    site_id = _make_site(conn, "site-a")
+    ensure_published_generation(conn, site_id)
+    feed_b = _make_feed(conn, "model-b")
+    _seed_grid_for(conn, site_id=site_id, feed_id=feed_b, day=_DAY)
+
+    if pause_kind == "global":
+        conn.execute("UPDATE feeds SET enabled = 0 WHERE id = ?", (feed_b,))
+    elif pause_kind == "site":
+        conn.execute(
+            "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (?, ?, 0)",
+            (site_id, feed_b),
+        )
+
+    knowable = record_mod.assess_record_day(
+        conn, site_id, _DAY, as_of=isoformat_utc(_snapshot_t())
+    )
+    t = _snapshot_t()
+    build_forecast_record(conn, site_id, _DAY.isoformat(), now=t + timedelta(minutes=5))
+
+    if pause_kind == "none":
+        assert all(knowable.values())
+        assert _row_count(conn, site_id) == 24
+    else:
+        assert not any(knowable.values())
+        assert _row_count(conn, site_id) == 0
+
+
 def test_record_retry_is_idempotent() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")

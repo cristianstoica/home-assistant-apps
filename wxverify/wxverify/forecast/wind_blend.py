@@ -35,7 +35,7 @@ from wxverify.db.connection import Database, InputCounts, current_db
 from wxverify.db.snapshot import read_only_snapshot, read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.forecast.aggregate import EXTREMA_COVERAGE_NOT_EVALUATED
-from wxverify.forecast.data import EXCLUDED_FEEDS_SQL
+from wxverify.forecast.data import EXCLUDED_FEEDS_SQL, served_feed_ids
 from wxverify.forecast.selection import CellCandidate, CellSelection
 from wxverify.verification.asof import knowable_pair_predicate
 
@@ -169,12 +169,16 @@ def load_wind_training(
     Only complete days train: the window ends at today's local midnight, and
     a target date with any unsettled enabled-station inventory row is left
     out of the observed side. A row whose stamp does not parse is skipped.
+    Paused feeds do not train: a feed not in :func:`served_feed_ids` is skipped.
     """
     tz = ZoneInfo(timezone)
     lo, hi = training_window(today, timezone)
     sql, params = training_pairs_query(site_id=site_id, lo=lo, hi=hi, as_of=as_of)
+    served = served_feed_ids(conn, site_id=site_id)
     latest: dict[tuple[int, int, date], tuple[datetime, float]] = {}
     for row in conn.execute(sql, params):
+        if int(row["feed_id"]) not in served:
+            continue
         try:
             issued = parse_utc(str(row["issued_at"]))
             target = parse_utc(str(row["first_valid"])).astimezone(tz).date()
