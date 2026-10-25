@@ -1440,7 +1440,8 @@ def _materialize(conn: sqlite3.Connection, site_id: int, valid_at: str) -> None:
     A string that will not parse (an imported row) cannot go through
     ``materialize_consensus`` when the persistence feed exists, because that
     parses it. Such a string takes the same invalidation steps directly and
-    then deletes the observation, with a WARNING, so the switch cannot wedge.
+    then deletes the observation, with a WARNING, so one such hour cannot
+    stop ``_derive_days``.
     """
     try:
         parse_utc(valid_at)

@@ -122,7 +122,6 @@ def _insert_day(
     attempts: int = 0,
     record_count: int = 0,
     pair_hours: int = 0,
-    legacy_hours: int | None = None,
     next_attempt_at: str | None = None,
     refetch_at: str | None = None,
     refetched: int = 0,
@@ -134,9 +133,9 @@ def _insert_day(
         """
         INSERT INTO station_wind_days
             (station_id, local_date, status, attempts, record_count, pair_hours,
-             legacy_hours, next_attempt_at, refetch_at, refetched, last_error,
-             last_ok_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')
+             next_attempt_at, refetch_at, refetched, last_error, last_ok_at,
+             updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')
         """,
         (
             station_id,
@@ -145,7 +144,6 @@ def _insert_day(
             attempts,
             record_count,
             pair_hours,
-            legacy_hours,
             next_attempt_at,
             refetch_at,
             refetched,

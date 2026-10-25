@@ -20,7 +20,7 @@ from wxverify.db.tz_generations import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 8
+TARGET_USER_VERSION = 9
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -103,8 +103,6 @@ def create_tables(conn: sqlite3.Connection) -> None:
                     ('pending','partial','fetched','unavailable','failed')),
             record_count INTEGER NOT NULL DEFAULT 0,   -- records inside the day
             pair_hours INTEGER NOT NULL DEFAULT 0,     -- hours with a pair
-            -- old wind rows on the day; NULL until counted
-            legacy_hours INTEGER,
             attempts INTEGER NOT NULL DEFAULT 0,
             next_attempt_at TEXT,
             -- always via core/error_sanitize.sanitized_exception
@@ -1081,6 +1079,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 8:
         logger.debug("migrations applying v8 last usable fetch stamp")
         migrate_v8_last_usable_fetch_at(conn)
+    if current < 9:
+        logger.debug("migrations applying v9 old wind state removal")
+        migrate_v9_drop_old_wind_state(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1609,6 +1610,56 @@ def migrate_v8_last_usable_fetch_at(conn: sqlite3.Connection) -> None:
     if "last_usable_fetch_at" not in _table_columns(conn, "site_feed_state"):
         conn.execute("ALTER TABLE site_feed_state ADD COLUMN last_usable_fetch_at TEXT")
     conn.execute(SEED_LAST_USABLE_FETCH_SQL)
+
+
+def migrate_v9_drop_old_wind_state(conn: sqlite3.Connection) -> None:
+    """Delete the six per-site wind key kinds and drop ``legacy_hours``.
+
+    Both are left over from the 0.16.6 wind switch and nothing reads them any
+    more: the ``runtime_state`` keys ``wind_basis:``,
+    ``wind_basis_progress_at:``, ``wind_basis_cursor:``,
+    ``wind_basis_blocked:``, ``wind_rebuild_report:`` and
+    ``wind_rebuild_done_at:`` of every site, and the column
+    ``station_wind_days.legacy_hours``. Forward-only: nothing puts them back,
+    and once ``run_migrations`` has written ``user_version`` 9 an older
+    release refuses the database.
+
+    The six prefixes are written out here, so the step keeps meaning the same
+    keys whatever later code does. A key matches only when its whole first
+    segment, up to and including its first colon, is one of the six; ``IN``
+    compares case-sensitively. ``LIKE`` is not used: its ``_`` matches any one
+    character and it ignores ASCII case. The weather.com auth holds
+    (``wind_history_auth_hold:<endpoint>``) and the call counters stay.
+
+    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a stop after the ``DELETE`` or after the ``ALTER`` leaves
+    user_version 8 and the next boot re-enters the ``current < 9`` gate. Each
+    part is safe to run again: the ``DELETE`` then matches nothing and the
+    column probe skips a column already gone. :func:`create_tables` no longer
+    creates the column, so on a fresh database the step deletes nothing,
+    drops nothing and logs nothing. ``DROP COLUMN`` keeps the order of the
+    columns it leaves, so a fresh and a migrated database agree on column
+    order, not just membership. One INFO line is logged only when the step
+    removed something.
+    """
+    started = time.perf_counter()
+    deleted = conn.execute(
+        "DELETE FROM runtime_state"
+        " WHERE substr(key, 1, instr(key, ':')) IN ("
+        "'wind_basis:', 'wind_basis_progress_at:', 'wind_basis_cursor:',"
+        " 'wind_basis_blocked:', 'wind_rebuild_report:', 'wind_rebuild_done_at:')"
+    ).rowcount
+    dropped = "legacy_hours" in _table_columns(conn, "station_wind_days")
+    if dropped:
+        conn.execute("ALTER TABLE station_wind_days DROP COLUMN legacy_hours")
+    if deleted or dropped:
+        logger.info(
+            "old wind state removed: %d keys deleted, legacy_hours column %s, %d ms",
+            deleted,
+            "dropped" if dropped else "already gone",
+            int((time.perf_counter() - started) * 1000),
+        )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

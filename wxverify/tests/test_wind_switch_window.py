@@ -20,7 +20,6 @@ import pytest
 
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.verification.runs import (
     RunConfig,
     _parse_roster,  # noqa: PLC2701
@@ -115,7 +114,7 @@ def test_assert_inputs_unchanged_readonly_ignores_a_stored_state_change() -> Non
 def test_assert_inputs_unpinned_unchanged_does_not_raise_when_state_unchanged() -> None:
     conn = _make_db()
     site_id = _make_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
     conn.commit()
     snapshot = capture_config_snapshot(conn, site_id)
     cfg = _runconfig_from_snapshot(conn, site_id, snapshot)

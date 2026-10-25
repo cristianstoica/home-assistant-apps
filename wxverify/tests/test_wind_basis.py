@@ -1,5 +1,9 @@
-"""The per-site wind basis state machine and its writer/reader gates
-(plan §8-9, §15.1 T20-T28, T109, T110).
+"""The station wind writer and readers, and the pair-max row predicate
+(plan §8-9, §15.1 T23-T28, T110).
+
+No package code reads a site's old ``wind_basis`` key any more. Tests that
+store one write it by its literal name and expect the same outcome whatever
+it holds.
 
 Isolation: fresh ``sqlite3.connect(":memory:")`` + ``run_migrations`` per
 test (mirrors test_forecast_service.py), except T24 which drives the real
@@ -11,7 +15,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import logging
 import re
 import sqlite3
 from pathlib import Path
@@ -23,20 +26,7 @@ from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import (
-    LEGACY_WIND_SQL,
-    PAIR_MAX_SOURCE_PREFIX,
-    PAIR_MAX_WIND_SQL,
-    init_wind_basis,
-    read_wind_cursor,
-    set_wind_basis_state,
-    transition_wind_basis,
-    wind_basis_key,
-    wind_blocked_key,
-    wind_cursor_key,
-    wind_done_at_key,
-    wind_report_key,
-)
+from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX, PAIR_MAX_WIND_SQL
 from wxverify.scoring.consensus import (
     insert_station_observation,
     write_station_observation,
@@ -84,126 +74,6 @@ def _make_feed(conn: sqlite3.Connection, model: str) -> int:
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)
-
-
-# --- T20 ---------------------------------------------------------------
-
-
-def test_init_wind_basis_staging_stays_unchanged_no_log(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    set_wind_basis_state(conn, site, "staging")
-    with caplog.at_level(logging.INFO):
-        init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "staging"
-    assert caplog.records == []
-
-
-def test_init_wind_basis_unknown_value_resets_to_staging_with_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """mutant_denylist_states -> at this assertion: correct = "staging",
-    mutant leaves an allowlist-only implementation returning the raw
-    unknown value unchanged (no WARNING emitted either)."""
-    conn = _make_db()
-    site = _make_site(conn)
-    set_runtime_state(conn, wind_basis_key(site), "bogus-state")
-    with caplog.at_level(logging.WARNING):
-        init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "staging"
-    assert any(
-        r.levelno == logging.WARNING and "bogus-state" in r.getMessage()
-        for r in caplog.records
-    )
-
-
-@pytest.mark.parametrize("stored", ["switching", "rescoring"])
-def test_init_wind_basis_mid_switch_with_old_rows_restarts_as_switching(
-    stored: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A switch in progress, but old wind rows reappear (e.g. a restored
-    partial import): restart the switch from the purge phase.
-    mutant_forgets_downgrade -> at the cursor assertion: correct =
-    ("purge", None), mutant leaves the cursor untouched (phase/cursor_date
-    from before, or absent)."""
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    set_wind_basis_state(conn, site, stored)
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', 10.0, 'ok', '10 km/h', ?)",
-        (station, isoformat_utc()),
-    )
-    with caplog.at_level(logging.INFO):
-        init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "switching"
-    cursor = read_wind_cursor(conn, site)
-    assert cursor.phase == "purge"
-    assert cursor.cursor_date is None
-    assert any(r.levelno == logging.INFO for r in caplog.records)
-
-
-def test_init_wind_basis_pair_max_with_old_rows_resets_to_staging_and_clears_keys() -> (
-    None
-):
-    """A downgrade/old import: pair_max claims the new figure but old rows
-    exist. mutant_keeps_keys -> at the keys assertion: correct = (None,
-    None, None, None), mutant leaves at least one of the four stamped."""
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST002")
-    set_wind_basis_state(conn, site, "pair_max")
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', 10.0, 'ok', '10 km/h', ?)",
-        (station, isoformat_utc()),
-    )
-    init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "staging"
-    assert get_runtime_state(conn, wind_cursor_key(site)) is None
-    assert get_runtime_state(conn, wind_blocked_key(site)) is None
-    assert get_runtime_state(conn, wind_report_key(site)) is None
-    assert get_runtime_state(conn, wind_done_at_key(site)) is None
-
-
-def test_init_wind_basis_absent_with_legacy_wind_becomes_staging() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST003")
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
-        " VALUES (?, 'wind', '2026-07-01T03:00:00Z', 10.0, 'ok', '10 km/h', ?)",
-        (station, isoformat_utc()),
-    )
-    init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "staging"
-
-
-def test_init_wind_basis_absent_without_legacy_wind_becomes_pair_max() -> None:
-    """A brand new site, or one born after the switch: no legacy rows to
-    carry means it starts served from the new figure.
-    mutant_default_staging -> at this assertion: correct = "pair_max",
-    mutant = "staging"."""
-    conn = _make_db()
-    site = _make_site(conn)
-    _make_station(conn, site, "KTEST004")
-    init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "pair_max"
-
-
-def test_init_wind_basis_pair_max_without_legacy_rows_stays_pair_max() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    _make_station(conn, site, "KTEST005")
-    set_wind_basis_state(conn, site, "pair_max")
-    init_wind_basis(conn)
-    assert get_runtime_state(conn, wind_basis_key(site)) == "pair_max"
 
 
 # --- T23 ---------------------------------------------------------------
@@ -294,9 +164,9 @@ def test_insert_guard_always_accepts_temperature(state: str | None) -> None:
 
 
 def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
-    """A standalone, fully-migrated replacement db carrying a legacy wind
-    row with NO ``wind_basis`` key -- as if the migration that introduced
-    the key had never run on it (a genuine 0.16.5-shaped import)."""
+    """A standalone, fully-migrated replacement db carrying an old-figure
+    wind row (``source_raw`` ``"10 km/h"``) and no ``wind_basis`` key, the
+    shape of an import from before the pair-max figure."""
     path = tmp_path / filename
     db = Database(str(path))
     try:
@@ -312,19 +182,13 @@ def _build_legacy_shaped_replacement(tmp_path: Path, filename: str) -> Path:
             (site_id,),
         )
         assert station_cur.lastrowid is not None
-        # Legacy row, planted directly: bypasses the key machinery, exactly
-        # mirroring how a pre-wind-basis import would arrive.
+        # Old-figure row, planted directly, as such an import carries it.
         conn.execute(
             "INSERT INTO station_observations (station_id, variable, valid_at,"
             " value, qc_flag, source_raw, fetched_at) VALUES"
             " ((SELECT id FROM stations WHERE site_id=?), 'wind',"
             " '2026-07-01T03:00:00Z', 10.0, 'ok', '10 km/h', ?)",
             (site_id, isoformat_utc()),
-        )
-        # No open writes a wind_basis key any more; the delete makes sure
-        # this file truly carries none for the new site.
-        conn.execute(
-            "DELETE FROM runtime_state WHERE key = ?", (wind_basis_key(site_id),)
         )
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn.commit()
@@ -644,50 +508,9 @@ def test_watermark_is_none_when_only_wind_rows_exist() -> None:
 # --- T28 -----------------------------------------------------------------
 
 
-def test_transition_wind_basis_cas_fails_on_wrong_expected() -> None:
-    """mutant_unconditional_set -> at this assertion: correct = False (the
-    stale expected value is refused and nothing changes), mutant (an
-    unconditional SET instead of the WHERE value=expected CAS) would
-    return True and advance the state anyway."""
-    conn = _make_db()
-    site = _make_site(conn)
-    set_wind_basis_state(conn, site, "staging")
-    ok = transition_wind_basis(conn, site, expected="switching", new="rescoring")
-    assert ok is False
-    assert get_runtime_state(conn, wind_basis_key(site)) == "staging"
-
-
-def test_transition_wind_basis_succeeds_on_matching_expected() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    set_wind_basis_state(conn, site, "staging")
-    ok = transition_wind_basis(conn, site, expected="staging", new="switching")
-    assert ok is True
-    assert get_runtime_state(conn, wind_basis_key(site)) == "switching"
-
-
-@pytest.mark.parametrize(
-    ("expected", "new"),
-    [
-        ("staging", "rescoring"),  # skips switching
-        ("switching", "staging"),  # backward
-        ("pair_max", "staging"),  # backward from the terminal state
-    ],
-)
-def test_transition_wind_basis_raises_on_illegal_moves(expected: str, new: str) -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    set_wind_basis_state(conn, site, expected)
-    with pytest.raises(ValueError, match="illegal wind basis transition"):
-        transition_wind_basis(conn, site, expected=expected, new=new)
-
-
-def test_pair_max_source_prefix_is_exactly_nine_chars_and_in_both_sql_fragments() -> (
-    None
-):
+def test_pair_max_source_prefix_is_nine_chars_and_in_the_sql_fragment() -> None:
     assert len(PAIR_MAX_SOURCE_PREFIX) == 9
     assert PAIR_MAX_SOURCE_PREFIX in PAIR_MAX_WIND_SQL
-    assert PAIR_MAX_SOURCE_PREFIX in LEGACY_WIND_SQL
 
 
 # --- T110 --------------------------------------------------------------

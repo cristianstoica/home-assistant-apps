@@ -1,13 +1,16 @@
-"""HTTP-level regression test for ``DELETE /api/sites/{site_id}`` wind-state
-cleanup (release 0.16.6).
+"""HTTP-level regression tests for the site and generation state that
+``DELETE /api/sites/{site_id}`` and ``POST /api/sites`` clear.
 
-Site ids are reused (``sites.id INTEGER PRIMARY KEY``, no ``AUTOINCREMENT``),
-and an absent ``wind_basis:<id>`` key means ``pair_max``
-(``wxverify.db.wind_basis.wind_basis_state``). Before this fix, deleting a
-site left its six per-site ``runtime_state`` wind keys behind; a later site
-recreated at the same id would then inherit whatever stale wind-basis state
-(e.g. ``staging``) the deleted site had stamped, instead of starting fresh at
-``pair_max``.
+Site and timezone generation ids are reused (``INTEGER PRIMARY KEY``, no
+``AUTOINCREMENT``), and the ``runtime_state`` and ``settings`` rows keyed by
+them have no foreign key, so the ``sites`` cascade never reaches them. A
+delete drops the site's published generation pointer, verification state and
+heartbeat, published run, gap-scan failures and per-site snapshot time, plus
+the correction-chain state and heartbeat of each of its generations, and
+leaves every other site's rows and the shared auth hold intact; a create
+clears whatever a pre-0.16.7 delete left on the reused id before seeding the
+new site. A verification day computed before a delete and recreate is
+discarded, and a failed cleanup rolls the whole delete back.
 
 Isolation: a real tmp-file SQLite DB via ``init_db``/``close_db`` + an idle
 worker + ``TestClient`` (mirrors ``tests/test_forecast_routes.py`` /
@@ -43,16 +46,7 @@ from wxverify.db.tz_generations import (
     published_generation_id,
     published_pointer_key,
 )
-from wxverify.db.wind_basis import (
-    auth_hold_key,
-    wind_basis_key,
-    wind_basis_state,
-    wind_blocked_key,
-    wind_cursor_key,
-    wind_done_at_key,
-    wind_progress_key,
-    wind_report_key,
-)
+from wxverify.db.wind_basis import auth_hold_key
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.verification.record import (
     SNAPSHOT_TIME_KEY,
@@ -107,103 +101,6 @@ def _make_site(conn: sqlite3.Connection, name: str) -> int:
     )
 
 
-def _wind_keys(site_id: int) -> tuple[str, ...]:
-    return (
-        wind_basis_key(site_id),
-        wind_progress_key(site_id),
-        wind_cursor_key(site_id),
-        wind_blocked_key(site_id),
-        wind_report_key(site_id),
-        wind_done_at_key(site_id),
-    )
-
-
-def _seed_wind_keys(conn: sqlite3.Connection, site_id: int) -> None:
-    for key in _wind_keys(site_id):
-        set_runtime_state(conn, key, "staging")
-
-
-def _assert_all_present(conn: sqlite3.Connection, site_id: int) -> None:
-    for key in _wind_keys(site_id):
-        assert get_runtime_state(conn, key) is not None, key
-
-
-def _assert_all_absent(conn: sqlite3.Connection, site_id: int) -> None:
-    for key in _wind_keys(site_id):
-        assert get_runtime_state(conn, key) is None, key
-
-
-# ---------------------------------------------------------------------------
-# DELETE /api/sites/{site_id} — wind-state cleanup, scoped to the deleted
-# site only, and a reused id starts fresh at pair_max.
-# ---------------------------------------------------------------------------
-
-
-def test_delete_site_drops_its_wind_state_leaves_other_site_and_auth_hold_intact(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    site_y = _make_site(conn, "Testsite Y")
-    site_x = _make_site(conn, "Testsite X")  # created second -> highest id
-    assert site_x > site_y
-
-    _seed_wind_keys(conn, site_x)
-    _seed_wind_keys(conn, site_y)
-    hold_key = auth_hold_key("history_all")
-    set_runtime_state(conn, hold_key, "held")
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        # The app's lifespan calls init_db() again on startup, replacing the
-        # Database (and closing the seeding connection above); re-fetch the
-        # live connection for every assertion from here on.
-        conn = get_db()._conn  # noqa: SLF001
-
-        csrf = client.get("/api/csrf").json()["csrf_token"]
-        headers = {"Origin": "http://testserver", "X-CSRF-Token": csrf}
-
-        response = client.delete(f"/api/sites/{site_x}", headers=headers)
-        assert response.status_code == 200
-
-        # X's six wind keys are gone; Y's and the auth-hold key are intact.
-        _assert_all_absent(conn, site_x)
-        _assert_all_present(conn, site_y)
-        assert get_runtime_state(conn, hold_key) == "held"
-
-        # A new site reuses X's id (INTEGER PRIMARY KEY, no AUTOINCREMENT)
-        # and must start at the absent-key default, pair_max -- not inherit
-        # X's stale "staging" state.
-        create_resp = client.post(
-            "/api/sites",
-            headers=headers,
-            json={
-                "name": "Testsite Z",
-                "forecast_lat": 41.0,
-                "forecast_lon": -104.0,
-                "elevation_m": 950.0,
-                "timezone": "UTC",
-                "rain_threshold_mm": 0.5,
-            },
-        )
-        assert create_resp.status_code == 200
-        new_id = create_resp.json()["id"]
-        assert new_id == site_x, (
-            "precondition for this regression: deleted site's id must be "
-            "reused by the next insert (INTEGER PRIMARY KEY, no "
-            "AUTOINCREMENT) -- if this fails, the id-reuse precondition no "
-            "longer holds and the test needs to be rebuilt, not weakened"
-        )
-        assert wind_basis_state(conn, new_id) == "pair_max"
-
-        # Paired negative: deleting a nonexistent site 404s and touches no
-        # state at all.
-        missing_id = site_x + 1000
-        missing_resp = client.delete(f"/api/sites/{missing_id}", headers=headers)
-        assert missing_resp.status_code == 404
-        _assert_all_present(conn, site_y)
-        assert get_runtime_state(conn, hold_key) == "held"
-
-
 # ---------------------------------------------------------------------------
 # Test A/B/D/F helpers (plan §6).
 # ---------------------------------------------------------------------------
@@ -216,7 +113,6 @@ def _site_keys(site_id: int) -> tuple[str, ...]:
         verification_heartbeat_key(site_id),
         published_run_key(site_id),
         gap_scan_failures_key(site_id),
-        *_wind_keys(site_id),
     )
 
 
@@ -277,7 +173,6 @@ def test_delete_site_drops_all_site_and_generation_state_and_a_reused_id_starts_
         (site_y, "2026-03-08T07:00:00Z", "06:15"),
         (site_x, "2026-03-09T07:00:00Z", "05:45"),
     ):
-        _seed_wind_keys(conn, site)
         set_runtime_state(
             conn, verification_state_key(site), '{"phase":"bootstrap","run_id":7}'
         )
@@ -336,6 +231,15 @@ def test_delete_site_drops_all_site_and_generation_state_and_a_reused_id_starts_
         assert get_runtime_state(conn, hold_key) == "held"
         assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
 
+        # Paired negative: deleting a nonexistent site 404s and touches no
+        # state at all.
+        missing_id = site_x + 1000
+        missing_resp = client.delete(f"/api/sites/{missing_id}", headers=headers)
+        assert missing_resp.status_code == 404
+        for key in _site_keys(site_y):
+            assert get_runtime_state(conn, key) is not None, key
+        assert get_runtime_state(conn, hold_key) == "held"
+
         # 4. Recreate.
         create_resp = _post_create(client, headers, "Testsite Z")
         assert create_resp.status_code == 200
@@ -360,7 +264,6 @@ def test_delete_site_drops_all_site_and_generation_state_and_a_reused_id_starts_
             assert get_runtime_state(conn, key) is None, key
         assert published_run_id(conn, new_id) is None
         assert snapshot_wall_clock(conn, new_id) == "05:00"
-        assert wind_basis_state(conn, new_id) == "pair_max"
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +315,6 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
         conn, verification_state_key(orphan), '{"phase":"bootstrap","run_id":7}'
     )
     set_runtime_state(conn, published_run_key(orphan), "7")
-    _seed_wind_keys(conn, orphan)
     set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{orphan}", "05:45")
 
     app = _make_app(monkeypatch)
@@ -447,7 +349,6 @@ def test_create_site_clears_keys_a_pre_fix_delete_left_on_the_reused_id(
         assert published_run_id(conn, new_id) is None
         assert gap_scan_degraded_sites(conn) == (1, "2026-03-08T07:00:00Z")
         assert get_setting(conn, f"{SNAPSHOT_TIME_KEY}:{new_id}") is None
-        assert wind_basis_state(conn, new_id) == "pair_max"
         assert published_generation_id(conn, site_y) == gen_y
 
 
@@ -506,7 +407,6 @@ def test_delete_site_rolls_back_entirely_when_the_state_cleanup_fails(
     conn = _init_tmp_db(tmp_path)
     site_x = _make_site(conn, "Testsite X")
     gen_x = ensure_published_generation(conn, site_x)
-    _seed_wind_keys(conn, site_x)
     set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{site_x}", "05:45")
 
     def _boom(*_args: object, **_kwargs: object) -> None:
@@ -537,6 +437,4 @@ def test_delete_site_rolls_back_entirely_when_the_state_cleanup_fails(
             == 1
         )
         assert published_generation_id(conn, site_x) == gen_x
-        for key in _wind_keys(site_x):
-            assert get_runtime_state(conn, key) is not None, key
         assert get_setting(conn, f"{SNAPSHOT_TIME_KEY}:{site_x}") == "05:45"

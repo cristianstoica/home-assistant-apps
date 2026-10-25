@@ -417,8 +417,8 @@ def _healthy_site(conn: sqlite3.Connection) -> tuple[int, int]:
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-22', 'fetched', 24, ?, 1, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-22', 'fetched', 24, ?, 1, ?)",
         (
             station_id,
             isoformat_utc(_NOW - timedelta(minutes=30)),
@@ -452,8 +452,8 @@ def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-20', 'failed', 0, NULL, 3, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-20', 'failed', 0, NULL, 3, ?)",
         (station_id, isoformat_utc(_NOW)),
     )
     conn.commit()
@@ -523,8 +523,8 @@ def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-22', 'fetched', 24, NULL, 1, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-22', 'fetched', 24, NULL, 1, ?)",
         (null_last_ok_station, isoformat_utc(_NOW)),
     )
     conn.commit()
@@ -564,8 +564,8 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO station_wind_days"
             " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-            "  legacy_hours, updated_at)"
-            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, 0, ?)",
+            "  updated_at)"
+            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, ?)",
             (station_id, last_ok_at, isoformat_utc(_NOW)),
         )
 
