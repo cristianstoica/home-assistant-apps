@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from zoneinfo import ZoneInfo
 
+from wxverify.collection.precip_labels import precip_label_eligible_sql
 from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.effective import active_competitor_clause
@@ -194,7 +195,7 @@ def _rebuild_real_pairs(
     end: str,
 ) -> None:
     rows = conn.execute(
-        """
+        f"""
         SELECT fs.feed_id, fs.variable, fs.issued_at, fs.valid_at,
                fs.lead_hours, fs.value AS forecast, fs.fetched_at,
                obs.value AS observed, s.rain_threshold_mm
@@ -210,6 +211,7 @@ def _rebuild_real_pairs(
           AND fs.lead_hours BETWEEN 1 AND f.max_lead_hours
           AND julianday(fs.valid_at) >= julianday(?)
           AND julianday(fs.valid_at) < julianday(?)
+          AND {precip_label_eligible_sql("fs", "f")}
         """,
         (site_id, start, end),
     ).fetchall()

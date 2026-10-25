@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import ClassVar, Protocol
 
 from pydantic import BaseModel, ConfigDict
+
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 
 
 class GridProvenance(BaseModel):
@@ -66,3 +69,15 @@ class ForecastAdapter(Protocol):
     def estimate_historical_cost(
         self, req: ForecastRequest, *, window_start: str, window_end: str
     ) -> CostEstimate: ...
+
+
+def precip_hour_start(hour_end: str) -> str:
+    """Canonical label for a rain value a provider files under the END of its hour.
+
+    A stored rain value at ``valid_at = H`` is the rain in the hour that
+    starts at H. Used by Open-Meteo and meteoblue only; Google already labels
+    rain by the hour's start. Visual Crossing, OpenWeatherMap, WeatherAPI and
+    Meteosource do not document which hour their rain covers; their labels
+    are stored as received until settled (README, Site Field Notes).
+    """
+    return isoformat_utc(parse_utc(hour_end) - timedelta(hours=1))

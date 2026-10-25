@@ -33,8 +33,9 @@ def test_precip_hour_start_subtracts_one_hour_across_a_year_boundary() -> None:
     assert precip_hour_start("2026-01-01T00:00:00Z") == "2025-12-31T23:00:00Z"
 
 
-def test_open_meteo_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_label(
-) -> None:
+def test_open_meteo_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_label() -> (  # noqa: E501
+    None
+):
     # Raw hourly rows at 01:00/02:00/03:00 against a 00:00Z issue time.
     # Precip's raw 01:00 row becomes label 00:00Z (lead 0) and is dropped;
     # the raw 02:00 row becomes label 01:00Z (lead 1); temperature at 01:00
@@ -80,8 +81,9 @@ def test_previous_run_lead_hours_precip_is_one_less_than_temperature() -> None:
     assert previous_run_lead_hours("temperature", 2) == 48
 
 
-def test_meteoblue_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_label(
-) -> None:
+def test_meteoblue_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_label() -> (
+    None
+):
     # Same shift/drop rule, through meteoblue's own parser (one model, one
     # member row per matrix column).
     from wxverify.feeds.meteoblue import MeteoblueResponse, _to_fetch_result
@@ -115,9 +117,7 @@ def test_meteoblue_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_labe
     )
     result = _to_fetch_result(req, payload)
     precip = {s.valid_at: s for s in result.samples if s.variable == "precip"}
-    temperature = {
-        s.valid_at: s for s in result.samples if s.variable == "temperature"
-    }
+    temperature = {s.valid_at: s for s in result.samples if s.variable == "temperature"}
 
     assert "2026-07-15T00:00:00Z" not in precip
     assert precip["2026-07-15T01:00:00Z"].value == 2.0
@@ -221,7 +221,7 @@ def test_readme_names_the_four_flagged_providers_together() -> None:
     # provider-key row in the settings table), so a bare substring check on
     # the whole file would pass vacuously whether or not B9's addition ever
     # lands. Require them on ONE line together, naming them as the group
-    # left unconverted by this rework -- a line that does not exist yet.
+    # left unconverted by this rework.
     readme = Path(__file__).resolve().parent.parent / "README.md"
     lines = readme.read_text(encoding="utf-8").splitlines()
     assert any(

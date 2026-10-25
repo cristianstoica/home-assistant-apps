@@ -1044,7 +1044,7 @@ def _assert_v2_seed_state(conn: sqlite3.Connection) -> None:
     assert conn.execute("SELECT COUNT(*) FROM sites").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM forecast_pairs").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 2
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 4
 
     settings = {
         row["key"]: row["value"]
@@ -1075,6 +1075,8 @@ def _assert_v2_seed_state(conn: sqlite3.Connection) -> None:
     assert [tuple(r) for r in jobs] == [
         (1, "fetch_feed", 1, "k1"),
         (2, "catchup", None, None),
+        (3, "pair_and_score", 1, "score"),
+        (4, "pair_and_score", 2, "score"),
     ]
 
 
@@ -1318,6 +1320,8 @@ def test_o9_interrupted_v2_boot_inside_create_indexes_converges_no_reseed(
     assert [tuple(row) for row in jobs] == [
         (1, "fetch_feed", 1, "k1"),
         (2, "catchup", None, None),
+        (3, "pair_and_score", 1, "score"),
+        (4, "pair_and_score", 2, "score"),
     ]
 
 

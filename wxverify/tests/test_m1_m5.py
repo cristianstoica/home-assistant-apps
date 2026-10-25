@@ -3132,9 +3132,10 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                     """
                     INSERT INTO forecast_samples
                         (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                         value, source_raw, model_run_id)
+                         value, source_raw, model_run_id, fetched_at)
                     VALUES (?, ?, ?, '2035-01-01T00:00:00Z',
-                            '2035-01-02T00:00:00Z', 24, ?, 'raw', ?)
+                            '2035-01-02T00:00:00Z', 24, ?, 'raw', ?,
+                            '2035-01-01T00:00:00Z')
                     """,
                     (site_id, feed_id, variable, forecast, f"{variable}-run"),
                 )

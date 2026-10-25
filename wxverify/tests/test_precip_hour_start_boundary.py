@@ -43,7 +43,10 @@ _K = "2026-01-01T12:00:00Z"
 
 
 def _connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path)
+    # 0.16.12: autocommit mode, matching the app's own connections, so the
+    # migration runner's own SAVEPOINT does not nest inside an implicit
+    # legacy-mode BEGIN.
+    conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -51,7 +54,9 @@ def _connect(path: str) -> sqlite3.Connection:
 
 def _make_db() -> sqlite3.Connection:
     """In-memory connection, migrated schema, one enabled synthetic site."""
-    conn = sqlite3.connect(":memory:")
+    # 0.16.12: autocommit mode, matching _connect above; existing .commit()
+    # calls on this connection become harmless no-ops.
+    conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
@@ -110,9 +115,9 @@ def _insert_sample(
     value: float,
     fetched_at: str | None,
 ) -> int:
-    """A copy of ``test_forecast_extrema_coverage.py``'s ``_insert_sample``
-    (``:111-130``) that takes an explicit ``fetched_at`` instead of defaulting
-    it to ``issued_at`` -- needed because every M-test below drives the
+    """A copy of ``test_forecast_extrema_coverage._insert_sample`` that
+    takes an explicit ``fetched_at`` instead of defaulting it to
+    ``issued_at`` -- needed because every M-test below drives the
     eligibility gate through the stamp, not through the issue time."""
     cur = conn.execute(
         """
@@ -148,8 +153,7 @@ def _insert_pair(
     forecast: float,
     observed: float = 10.0,
 ) -> int:
-    """A copy of ``test_forecast_extrema_coverage.py``'s ``_insert_pair``
-    (``:133-170``)."""
+    """A copy of ``test_forecast_extrema_coverage._insert_pair``."""
     from wxverify.db.tz_generations import ensure_published_generation
 
     error = forecast - observed
@@ -197,7 +201,9 @@ def _insert_observation(
     )
 
 
-def _pending_job_count(conn: sqlite3.Connection, job_type: str, site_id: int | None = None) -> int:
+def _pending_job_count(
+    conn: sqlite3.Connection, job_type: str, site_id: int | None = None
+) -> int:
     if site_id is None:
         row = conn.execute(
             "SELECT COUNT(*) AS n FROM jobs WHERE type=? AND status='pending'",
@@ -205,7 +211,8 @@ def _pending_job_count(conn: sqlite3.Connection, job_type: str, site_id: int | N
         ).fetchone()
     else:
         row = conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type=? AND site_id=? AND status='pending'",
+            "SELECT COUNT(*) AS n FROM jobs"
+            " WHERE type=? AND site_id=? AND status='pending'",
             (job_type, site_id),
         ).fetchone()
     return int(row["n"])
@@ -231,9 +238,8 @@ def _clear_boundary_and_seed(conn: sqlite3.Connection) -> None:
 
 
 def test_m1a_boundary_is_the_sentinel_with_no_affected_row() -> None:
-    # Fails today: record_precip_hour_start_boundary does not exist yet
-    # (ImportError). Once it lands, with no Open-Meteo/meteoblue rain row at
-    # all, the boundary must be the 1970 sentinel, not NULL or an error.
+    # With no Open-Meteo/meteoblue rain row at all, the boundary must be
+    # the 1970 sentinel, not NULL or an error.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.db.migrations import record_precip_hour_start_boundary
 
@@ -246,12 +252,11 @@ def test_m1a_boundary_is_the_sentinel_with_no_affected_row() -> None:
 
 
 def test_m1b_boundary_uses_julianday_order_not_text_order() -> None:
-    # Fails today for the same ImportError reason. Once the function exists,
-    # this is the test that tells a julianday-ordered MAX apart from a text
+    # This is the test that tells a julianday-ordered MAX apart from a text
     # MAX: "Z" sorts after "." in plain text, so a text MAX would pick
     # 2026-01-01T10:00:00Z over 2026-01-01T10:00:00.500000Z, which is
-    # chronologically later. MU19 (the plan's own named mutant for this
-    # case) reintroduces exactly that text-order bug.
+    # chronologically later. A bug that orders the stamps as text instead
+    # of by time reintroduces exactly that mistake.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.db.migrations import record_precip_hour_start_boundary
 
@@ -261,29 +266,58 @@ def test_m1b_boundary_uses_julianday_order_not_text_order() -> None:
     google = _feed_id(conn, "google", "blend")
 
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T10:00:00Z", value=1.0, fetched_at="2026-01-01T10:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T10:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T10:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T11:00:00Z", value=1.0,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T11:00:00Z",
+        value=1.0,
         fetched_at="2026-01-01T10:00:00.500000Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T09:00:00Z", value=1.0, fetched_at="2026-01-01T09:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T09:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T09:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T08:00:00Z", value=1.0, fetched_at=None,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T08:00:00Z",
+        value=1.0,
+        fetched_at=None,
     )
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-02-01T00:00:00Z",
-        valid_at="2026-02-01T01:00:00Z", value=1.0, fetched_at="2026-02-01T00:00:00Z",
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-02-01T00:00:00Z",
+        valid_at="2026-02-01T01:00:00Z",
+        value=1.0,
+        fetched_at="2026-02-01T00:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="temperature", issued_at="2026-03-01T00:00:00Z",
-        valid_at="2026-03-01T01:00:00Z", value=10.0, fetched_at="2026-03-01T00:00:00Z",
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-03-01T00:00:00Z",
+        valid_at="2026-03-01T01:00:00Z",
+        value=10.0,
+        fetched_at="2026-03-01T00:00:00Z",
     )
 
     record_precip_hour_start_boundary(conn)
@@ -295,9 +329,9 @@ def test_m1b_boundary_uses_julianday_order_not_text_order() -> None:
 
 
 def test_m1c_only_null_stamped_rain_leaves_the_sentinel() -> None:
-    # Fails today with the same ImportError. Pairs with M1(a) and M1(b): a
-    # present-but-all-NULL affected row set must behave exactly like an
-    # absent one, never like a parseable stamp of "now" or an error.
+    # Pairs with M1(a) and M1(b): a present-but-all-NULL affected row set
+    # must behave exactly like an absent one, never like a parseable stamp
+    # of "now" or an error.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.db.migrations import record_precip_hour_start_boundary
 
@@ -306,12 +340,22 @@ def test_m1c_only_null_stamped_rain_leaves_the_sentinel() -> None:
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
 
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T08:00:00Z", value=1.0, fetched_at=None,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T08:00:00Z",
+        value=1.0,
+        fetched_at=None,
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T09:00:00Z", value=1.0, fetched_at=None,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T09:00:00Z",
+        value=1.0,
+        fetched_at=None,
     )
 
     record_precip_hour_start_boundary(conn)
@@ -325,9 +369,9 @@ def test_m1c_only_null_stamped_rain_leaves_the_sentinel() -> None:
 
 
 def test_m2_boundary_step_changes_no_sample_row() -> None:
-    # Fails today: ImportError. The step deletes pairs/score-cache rows and
-    # restarts generations but must never touch forecast_samples -- the
-    # samples are evidence of what was fetched, not of what is eligible.
+    # The step deletes pairs/score-cache rows and restarts generations but
+    # must never touch forecast_samples -- the samples are evidence of what
+    # was fetched, not of what is eligible.
     from wxverify.db.migrations import record_precip_hour_start_boundary
 
     conn = _make_db()
@@ -336,34 +380,46 @@ def test_m2_boundary_step_changes_no_sample_row() -> None:
     google = _feed_id(conn, "google", "blend)".rstrip(")"))
     sample_ids = [
         _insert_sample(
-            conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-            valid_at="2026-01-01T13:00:00Z", value=1.0,
+            conn,
+            feed_id=om,
+            variable="precip",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-01-01T13:00:00Z",
+            value=1.0,
             fetched_at="2026-01-01T11:00:00Z",
         ),
         _insert_sample(
-            conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-            valid_at="2026-01-01T13:00:00Z", value=10.0,
+            conn,
+            feed_id=om,
+            variable="temperature",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-01-01T13:00:00Z",
+            value=10.0,
             fetched_at="2026-01-01T11:00:00Z",
         ),
         _insert_sample(
-            conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-            valid_at="2026-01-01T13:00:00Z", value=0.5,
+            conn,
+            feed_id=google,
+            variable="precip",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at="2026-01-01T13:00:00Z",
+            value=0.5,
             fetched_at="2026-01-01T11:00:00Z",
         ),
     ]
     before = [
-        tuple(conn.execute(
-            "SELECT * FROM forecast_samples WHERE id=?", (sid,)
-        ).fetchone())
+        tuple(
+            conn.execute("SELECT * FROM forecast_samples WHERE id=?", (sid,)).fetchone()
+        )
         for sid in sample_ids
     ]
 
     record_precip_hour_start_boundary(conn)
 
     after = [
-        tuple(conn.execute(
-            "SELECT * FROM forecast_samples WHERE id=?", (sid,)
-        ).fetchone())
+        tuple(
+            conn.execute("SELECT * FROM forecast_samples WHERE id=?", (sid,)).fetchone()
+        )
         for sid in sample_ids
     ]
     assert before == after
@@ -375,12 +431,13 @@ def test_m2_boundary_step_changes_no_sample_row() -> None:
 
 
 def test_m3_pairer_and_probe_use_the_same_gate() -> None:
-    # Fails today for a different reason than most M-tests: pairing.py runs
-    # without error, but with no eligibility clause every one of the seven
-    # samples pairs (or none do, for lack of the gate's exclusions), so the
-    # named counts (4 eligible, exactly 3 excluded) do not hold.
+    # Pins the pairer and the probe to the same eligibility gate: the named
+    # counts (4 eligible, exactly 3 excluded) must hold.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.scoring.pairing import compute_real_model_pairs, real_model_pair_pending
+    from wxverify.scoring.pairing import (
+        compute_real_model_pairs,
+        real_model_pair_pending,
+    )
 
     conn = _make_db()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -403,35 +460,70 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
     excluded_ids = [
         # Fetched exactly at K: strict > required, so this stays excluded.
         _insert_sample(
-            conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-            valid_at=valid_ats[0], value=1.0, fetched_at=_K,
+            conn,
+            feed_id=om,
+            variable="precip",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at=valid_ats[0],
+            value=1.0,
+            fetched_at=_K,
         ),
         # Fetched before K.
         _insert_sample(
-            conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-            valid_at=valid_ats[1], value=1.0, fetched_at="2026-01-01T11:00:00Z",
+            conn,
+            feed_id=om,
+            variable="precip",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at=valid_ats[1],
+            value=1.0,
+            fetched_at="2026-01-01T11:00:00Z",
         ),
         # NULL fetched_at: fails closed.
         _insert_sample(
-            conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-            valid_at=valid_ats[2], value=1.0, fetched_at=None,
+            conn,
+            feed_id=om,
+            variable="precip",
+            issued_at="2026-01-01T00:00:00Z",
+            valid_at=valid_ats[2],
+            value=1.0,
+            fetched_at=None,
         ),
     ]
     eligible_om_id = _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[3], value=1.0, fetched_at="2026-01-01T12:00:01Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[3],
+        value=1.0,
+        fetched_at="2026-01-01T12:00:01Z",
     )
     _insert_sample(
-        conn, feed_id=meteoblue, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[4], value=1.0, fetched_at="2026-01-01T12:00:01Z",
+        conn,
+        feed_id=meteoblue,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[4],
+        value=1.0,
+        fetched_at="2026-01-01T12:00:01Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[5], value=10.0, fetched_at="2026-01-01T11:00:00Z",
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[5],
+        value=10.0,
+        fetched_at="2026-01-01T11:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[6], value=1.0, fetched_at="2026-01-01T11:00:00Z",
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[6],
+        value=1.0,
+        fetched_at="2026-01-01T11:00:00Z",
     )
     _insert_observation(conn, variable="temperature", valid_at=valid_ats[5], value=10.0)
 
@@ -447,9 +539,15 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
 
     apply_delta(conn, delta)
     rows = conn.execute(
-        "SELECT valid_at FROM forecast_pairs WHERE variable='precip' OR variable='temperature'"
+        "SELECT valid_at FROM forecast_pairs"
+        " WHERE variable='precip' OR variable='temperature'"
     ).fetchall()
-    assert {r["valid_at"] for r in rows} == {valid_ats[3], valid_ats[4], valid_ats[5], valid_ats[6]}
+    assert {r["valid_at"] for r in rows} == {
+        valid_ats[3],
+        valid_ats[4],
+        valid_ats[5],
+        valid_ats[6],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -458,7 +556,8 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
 
 
 def test_m4_second_call_changes_nothing() -> None:
-    # Fails today: ImportError on record_precip_hour_start_boundary.
+    # A second call must leave the boundary and the existing pair alone and
+    # enqueue no further rescore job.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.scoring.pairing import compute_real_model_pairs
@@ -469,20 +568,35 @@ def test_m4_second_call_changes_nothing() -> None:
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
 
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", value=1.0, fetched_at="2026-01-01T10:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T10:00:00Z",
     )
     record_precip_hour_start_boundary(conn)
-    assert get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY) == "2026-01-01T10:00:00Z"
+    assert (
+        get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
+        == "2026-01-01T10:00:00Z"
+    )
 
     _complete_jobs(conn, "pair_and_score")
 
     # Seed an eligible row + its pair after the first call.
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-02T00:00:00Z",
-        valid_at="2026-01-02T13:00:00Z", value=1.0, fetched_at="2026-01-02T00:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-02T00:00:00Z",
+        valid_at="2026-01-02T13:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-02T00:00:00Z",
     )
-    _insert_observation(conn, variable="precip", valid_at="2026-01-02T13:00:00Z", value=0.0)
+    _insert_observation(
+        conn, variable="precip", valid_at="2026-01-02T13:00:00Z", value=0.0
+    )
     delta = compute_real_model_pairs(conn)
     apply_delta(conn, delta)
     pair_count_before = conn.execute(
@@ -492,7 +606,10 @@ def test_m4_second_call_changes_nothing() -> None:
 
     record_precip_hour_start_boundary(conn)
 
-    assert get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY) == "2026-01-01T10:00:00Z"
+    assert (
+        get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
+        == "2026-01-01T10:00:00Z"
+    )
     pair_count_after = conn.execute(
         "SELECT COUNT(*) AS n FROM forecast_pairs WHERE variable='precip'"
     ).fetchone()["n"]
@@ -505,9 +622,11 @@ def test_m4_second_call_changes_nothing() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_m5_fresh_install_reads_the_sentinel_with_no_rescore_job(tmp_path: Path) -> None:
-    # Fails today: ImportError (the PRECIP_HOUR_START_BOUNDARY_KEY module
-    # does not exist), not a Database construction failure.
+def test_m5_fresh_install_reads_the_sentinel_with_no_rescore_job(
+    tmp_path: Path,
+) -> None:
+    # A brand-new database must read the sentinel boundary key with no
+    # pending rescore job.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.db.connection import Database
 
@@ -540,11 +659,22 @@ def _build_backup_bytes(path: Path, *, boundary_key_value: str | None) -> bytes:
     else:
         set_runtime_state(conn, _BOUNDARY_KEY, boundary_key_value)
     _insert_sample(
-        conn, site_id=site_id, feed_id=om, variable="precip",
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-01T13:00:00Z",
-        value=1.0, fetched_at="2026-01-01T10:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T10:00:00Z",
     )
-    _insert_observation(conn, site_id=site_id, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0)
+    _insert_observation(
+        conn,
+        site_id=site_id,
+        variable="precip",
+        valid_at="2026-01-01T13:00:00Z",
+        value=0.0,
+    )
     from wxverify.db.tz_generations import ensure_published_generation
 
     conn.execute(
@@ -570,7 +700,9 @@ async def _idle_worker(_db: object) -> None:
     await asyncio.Event().wait()
 
 
-def _csrf_headers(client: object, *, origin: str = "http://testserver") -> dict[str, str]:
+def _csrf_headers(
+    client: object, *, origin: str = "http://testserver"
+) -> dict[str, str]:
     token = client.get("/api/csrf").json()["csrf_token"]  # type: ignore[attr-defined]
     return {
         "Origin": origin,
@@ -582,16 +714,18 @@ def _csrf_headers(client: object, *, origin: str = "http://testserver") -> dict[
 def test_m6_import_recomputes_boundary_for_an_old_backup_but_not_a_new_one(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Fails today: ImportError (the module under test for the boundary
-    # computation does not exist, so the import after a successful HTTP
-    # import never produces the expected key value).
+    # An import of an old backup must recompute the boundary key from the
+    # imported samples; an import of a new backup must keep its own key.
     from fastapi.testclient import TestClient
 
     from wxverify import config
+    from wxverify.collection.precip_labels import precip_label_eligible_sql
     from wxverify.db.connection import close_db, init_db
 
     old_backup = _build_backup_bytes(tmp_path / "old.db", boundary_key_value=None)
-    new_backup = _build_backup_bytes(tmp_path / "new.db", boundary_key_value="2026-01-01T10:00:00Z")
+    new_backup = _build_backup_bytes(
+        tmp_path / "new.db", boundary_key_value="2026-01-01T09:00:00Z"
+    )
 
     close_db()
     config.db_path = str(tmp_path / "live.db")
@@ -604,34 +738,40 @@ def test_m6_import_recomputes_boundary_for_an_old_backup_but_not_a_new_one(
         app = create_app(root_path="")
         client = TestClient(app, raise_server_exceptions=False)
 
+        eligible_sql = (
+            "SELECT COUNT(*) FROM forecast_samples fs"
+            " JOIN feeds f ON f.id = fs.feed_id"
+            f" WHERE fs.id = ? AND {precip_label_eligible_sql('fs', 'f')}"
+        )
+
         resp = client.post(
             "/api/import/db", content=old_backup, headers=_csrf_headers(client)
         )
         assert resp.status_code == 200
 
         conn = db._conn  # noqa: SLF001
+        # 0.16.12: an old backup carries no boundary key, so the import must
+        # recompute it from the imported samples' own fetched_at (plan §19.6).
         assert get_runtime_state(conn, _BOUNDARY_KEY) == "2026-01-01T10:00:00Z"
         row = conn.execute(
             "SELECT id FROM forecast_samples WHERE variable='precip'"
         ).fetchone()
-        from wxverify.scoring.pairing import real_model_pair_pending
-
-        assert real_model_pair_pending(conn, [int(row["id"])]) is False
-        pair_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM forecast_pairs WHERE variable='precip'"
-        ).fetchone()["n"]
-        assert pair_count == 0
+        eligible_count = conn.execute(eligible_sql, (int(row["id"]),)).fetchone()[0]
+        assert eligible_count == 0
 
         resp2 = client.post(
             "/api/import/db", content=new_backup, headers=_csrf_headers(client)
         )
         assert resp2.status_code == 200
         conn2 = db._conn  # noqa: SLF001
-        assert get_runtime_state(conn2, _BOUNDARY_KEY) == "2026-01-01T10:00:00Z"
-        pair_count2 = conn2.execute(
-            "SELECT COUNT(*) AS n FROM forecast_pairs WHERE variable='precip'"
-        ).fetchone()["n"]
-        assert pair_count2 == 1
+        # 0.16.12: a new backup already carries its own boundary key, so the
+        # import must keep it rather than recomputing from scratch.
+        assert get_runtime_state(conn2, _BOUNDARY_KEY) == "2026-01-01T09:00:00Z"
+        row2 = conn2.execute(
+            "SELECT id FROM forecast_samples WHERE variable='precip'"
+        ).fetchone()
+        eligible_count2 = conn2.execute(eligible_sql, (int(row2["id"]),)).fetchone()[0]
+        assert eligible_count2 == 1
     finally:
         close_db()
 
@@ -658,15 +798,21 @@ def _snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
         "runtime_state",
         "timezone_generations",
     )
-    snap = {t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")] for t in tables}
+    snap = {
+        t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")]
+        for t in tables
+    }
     snap["user_version"] = [conn.execute("PRAGMA user_version").fetchone()[0]]
     return snap
 
 
 def test_m7_boundary_step_rolls_back_atomically_on_failure(tmp_path: Path) -> None:
-    # Fails today: ImportError (record_precip_hour_start_boundary absent),
-    # so nothing in this body executes past the import line.
-    from wxverify.db.migrations import TARGET_USER_VERSION, record_precip_hour_start_boundary  # noqa: F401
+    # The boundary step must roll back atomically on failure, leaving every
+    # marker -- user_version, boundary key, pairs, cache -- unchanged.
+    from wxverify.db.migrations import (  # noqa: F401
+        TARGET_USER_VERSION,
+        record_precip_hour_start_boundary,
+    )
     from wxverify.scoring.cache import upsert_score_cache
     from wxverify.scoring.metrics import MetricResult
 
@@ -683,19 +829,42 @@ def test_m7_boundary_step_rolls_back_atomically_on_failure(tmp_path: Path) -> No
     site_id = _make_site(conn, enabled=1)
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _insert_sample(
-        conn, site_id=site_id, feed_id=om, variable="precip",
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-01T13:00:00Z",
-        value=1.0, fetched_at="2026-01-01T10:00:00Z",
+        conn,
+        site_id=site_id,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T10:00:00Z",
     )
-    _insert_observation(conn, site_id=site_id, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0)
+    _insert_observation(
+        conn,
+        site_id=site_id,
+        variable="precip",
+        valid_at="2026-01-01T13:00:00Z",
+        value=0.0,
+    )
     _insert_pair(
-        conn, site_id=site_id, feed_id=om, variable="precip",
-        issued_at="2026-01-01T00:00:00Z", valid_at="2026-01-01T13:00:00Z",
-        lead_hours=13, day_ahead=0, forecast=1.0, observed=0.0,
+        conn,
+        site_id=site_id,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        lead_hours=13,
+        day_ahead=0,
+        forecast=1.0,
+        observed=0.0,
     )
     upsert_score_cache(
-        conn, site_id=site_id, feed_id=om, variable="precip", day_ahead=0,
-        window_key="w:7", result=MetricResult(n=1, confident=False),
+        conn,
+        site_id=site_id,
+        feed_id=om,
+        variable="precip",
+        day_ahead=0,
+        window_key="w:7",
+        result=MetricResult(n=1, confident=False),
         computed_at="2026-01-01T12:00:00Z",
     )
     from wxverify.db.tz_generations import start_retrospective_correction
@@ -751,11 +920,13 @@ def test_m7_boundary_step_rolls_back_atomically_on_failure(tmp_path: Path) -> No
 
 
 def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
-    # Fails today with the WRONG row (or a wrong count), not an ImportError:
-    # load_future_samples and count_null_availability_samples already exist
-    # and run; neither yet carries the eligibility clause (forecast/data.py).
+    # The eligibility clause must sit before load_future_samples' row-number
+    # pick, and count_null_availability_samples must apply it too.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.forecast.data import count_null_availability_samples, load_future_samples
+    from wxverify.forecast.data import (
+        count_null_availability_samples,
+        load_future_samples,
+    )
 
     conn = _make_db()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -764,63 +935,109 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
 
     # Slot 1: two competing OM rain rows at the same valid_at.
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-02T00:00:00Z", value=1.0, fetched_at="2026-01-01T13:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T13:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T06:00:00Z",
-        valid_at="2026-01-02T00:00:00Z", value=2.0, fetched_at="2026-01-01T07:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T06:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
+        value=2.0,
+        fetched_at="2026-01-01T07:00:00Z",
     )
     # Slot 2: NULL-stamped OM rain, excluded.
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-03T00:00:00Z", value=5.0, fetched_at=None,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-03T00:00:00Z",
+        value=5.0,
+        fetched_at=None,
     )
     # OM temperature and Google rain fetched before K, both returned.
     _insert_sample(
-        conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-02T00:00:00Z", value=10.0, fetched_at="2026-01-01T07:00:00Z",
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T00:00:00Z",
+        value=10.0,
+        fetched_at="2026-01-01T07:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-02T01:00:00Z", value=0.5, fetched_at="2026-01-01T07:00:00Z",
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-02T01:00:00Z",
+        value=0.5,
+        fetched_at="2026-01-01T07:00:00Z",
     )
     # Slot 3: Google rain with NULL fetched_at.
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-04T00:00:00Z", value=0.5, fetched_at=None,
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-04T00:00:00Z",
+        value=0.5,
+        fetched_at=None,
     )
 
     live = load_future_samples(
-        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False,
+        conn,
+        site_id=1,
+        since_valid_at="2026-01-01T00:00:00Z",
+        served_only=False,
     )
     live_om_rain = [
-        s for s in live
-        if s.feed_id == om and s.variable == "precip" and s.valid_at == "2026-01-02T00:00:00Z"
+        s
+        for s in live
+        if s.feed_id == om
+        and s.variable == "precip"
+        and s.valid_at == "2026-01-02T00:00:00Z"
     ]
     assert len(live_om_rain) == 1
     assert live_om_rain[0].value == 1.0
 
     as_of = load_future_samples(
-        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z",
-        served_only=False, as_of="2026-01-01T14:00:00Z",
+        conn,
+        site_id=1,
+        since_valid_at="2026-01-01T00:00:00Z",
+        served_only=False,
+        as_of="2026-01-01T14:00:00Z",
     )
     as_of_om_rain = [
-        s for s in as_of
-        if s.feed_id == om and s.variable == "precip" and s.valid_at == "2026-01-02T00:00:00Z"
+        s
+        for s in as_of
+        if s.feed_id == om
+        and s.variable == "precip"
+        and s.valid_at == "2026-01-02T00:00:00Z"
     ]
     assert len(as_of_om_rain) == 1
     assert as_of_om_rain[0].value == 1.0
 
     assert not any(
-        s.feed_id == om and s.variable == "precip" and s.valid_at == "2026-01-03T00:00:00Z"
+        s.feed_id == om
+        and s.variable == "precip"
+        and s.valid_at == "2026-01-03T00:00:00Z"
         for s in live
     )
     assert any(s.feed_id == om and s.variable == "temperature" for s in live)
     assert any(s.feed_id == google and s.variable == "precip" for s in live)
 
     null_count = count_null_availability_samples(
-        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z",
+        conn,
+        site_id=1,
+        since_valid_at="2026-01-01T00:00:00Z",
     )
     assert null_count == 1
 
@@ -831,11 +1048,9 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
 
 
 def test_m9_affected_pairs_deleted_in_every_generation_others_kept() -> None:
-    # Fails today: ImportError. Once the step exists, the live (unmodified)
-    # step would also pass this today-check trivially since no deletion
-    # happens at all -- the assertions below require the Open-Meteo,
-    # meteoblue and multimodel-mean precip pairs to be GONE, so a no-op
-    # step fails them.
+    # The assertions below require the Open-Meteo, meteoblue and
+    # multimodel-mean precip pairs to be GONE across every generation, so a
+    # no-op step fails them.
     from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.db.tz_generations import start_retrospective_correction
 
@@ -849,36 +1064,75 @@ def test_m9_affected_pairs_deleted_in_every_generation_others_kept() -> None:
     google = _feed_id(conn, "google", "blend")
 
     published_pair = _insert_pair(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", lead_hours=13, day_ahead=0, forecast=1.0,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        lead_hours=13,
+        day_ahead=0,
+        forecast=1.0,
     )
     meteoblue_pair = _insert_pair(
-        conn, feed_id=meteoblue, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z", lead_hours=14, day_ahead=0, forecast=1.0,
+        conn,
+        feed_id=meteoblue,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T14:00:00Z",
+        lead_hours=14,
+        day_ahead=0,
+        forecast=1.0,
     )
     mean_pair = _insert_pair(
-        conn, feed_id=mean, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T15:00:00Z", lead_hours=15, day_ahead=0, forecast=1.0,
+        conn,
+        feed_id=mean,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T15:00:00Z",
+        lead_hours=15,
+        day_ahead=0,
+        forecast=1.0,
     )
     persistence_pair = _insert_pair(
-        conn, feed_id=persistence, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T16:00:00Z", lead_hours=16, day_ahead=0, forecast=1.0,
+        conn,
+        feed_id=persistence,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T16:00:00Z",
+        lead_hours=16,
+        day_ahead=0,
+        forecast=1.0,
     )
     google_pair = _insert_pair(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T17:00:00Z", lead_hours=17, day_ahead=0, forecast=1.0,
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T17:00:00Z",
+        lead_hours=17,
+        day_ahead=0,
+        forecast=1.0,
     )
     temp_pair = _insert_pair(
-        conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T18:00:00Z", lead_hours=18, day_ahead=0, forecast=10.0,
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T18:00:00Z",
+        lead_hours=18,
+        day_ahead=0,
+        forecast=10.0,
     )
 
     generation_id = start_retrospective_correction(conn, site_id, "UTC")
-    from wxverify.db.tz_generations import correction_job_key
     from wxverify.db.queue import enqueue_if_absent
+    from wxverify.db.tz_generations import correction_job_key
 
     enqueue_if_absent(
-        conn, "timezone_correction", site_id, correction_job_key(generation_id),
+        conn,
+        "timezone_correction",
+        site_id,
+        correction_job_key(generation_id),
         {"generation_id": generation_id},
     )
     building_om_pair = conn.execute(
@@ -896,8 +1150,7 @@ def test_m9_affected_pairs_deleted_in_every_generation_others_kept() -> None:
     record_precip_hour_start_boundary(conn)
 
     remaining = {
-        int(r["id"])
-        for r in conn.execute("SELECT id FROM forecast_pairs").fetchall()
+        int(r["id"]) for r in conn.execute("SELECT id FROM forecast_pairs").fetchall()
     }
     assert published_pair not in remaining
     assert meteoblue_pair not in remaining
@@ -914,7 +1167,8 @@ def test_m9_affected_pairs_deleted_in_every_generation_others_kept() -> None:
 
 
 def test_m11_precip_cache_cleared_and_one_rescore_job_per_enabled_site() -> None:
-    # Fails today: ImportError.
+    # The step must clear only the precip score-cache rows and enqueue
+    # exactly one rescore job per enabled site.
     from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.scoring.cache import upsert_score_cache
     from wxverify.scoring.metrics import MetricResult
@@ -926,18 +1180,33 @@ def test_m11_precip_cache_cleared_and_one_rescore_job_per_enabled_site() -> None
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
 
     upsert_score_cache(
-        conn, site_id=enabled_site, feed_id=om, variable="precip", day_ahead=0,
-        window_key="w:7", result=MetricResult(n=1, confident=False),
+        conn,
+        site_id=enabled_site,
+        feed_id=om,
+        variable="precip",
+        day_ahead=0,
+        window_key="w:7",
+        result=MetricResult(n=1, confident=False),
         computed_at="2026-01-01T12:00:00Z",
     )
     upsert_score_cache(
-        conn, site_id=disabled_site, feed_id=om, variable="precip", day_ahead=0,
-        window_key="w:7", result=MetricResult(n=1, confident=False),
+        conn,
+        site_id=disabled_site,
+        feed_id=om,
+        variable="precip",
+        day_ahead=0,
+        window_key="w:7",
+        result=MetricResult(n=1, confident=False),
         computed_at="2026-01-01T12:00:00Z",
     )
     upsert_score_cache(
-        conn, site_id=enabled_site, feed_id=om, variable="temperature", day_ahead=0,
-        window_key="w:7", result=MetricResult(n=1, confident=False),
+        conn,
+        site_id=enabled_site,
+        feed_id=om,
+        variable="temperature",
+        day_ahead=0,
+        window_key="w:7",
+        result=MetricResult(n=1, confident=False),
         computed_at="2026-01-01T12:00:00Z",
     )
 
@@ -961,7 +1230,8 @@ def test_m11_precip_cache_cleared_and_one_rescore_job_per_enabled_site() -> None
 
 
 def test_m12_building_generations_restarted() -> None:
-    # Fails today: ImportError.
+    # A building timezone-correction generation must be restarted by the
+    # boundary step.
     from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.db.tz_generations import (
         correction_heartbeat_key,
@@ -975,7 +1245,9 @@ def test_m12_building_generations_restarted() -> None:
     site_id = 1
     generation_id = start_retrospective_correction(conn, site_id, "UTC")
     set_runtime_state(
-        conn, correction_state_key(generation_id), json.dumps({"phase": "days", "attempts": 2}),
+        conn,
+        correction_state_key(generation_id),
+        json.dumps({"phase": "days", "attempts": 2}),
     )
     set_runtime_state_now(conn, correction_heartbeat_key(generation_id))
     conn.commit()
@@ -989,12 +1261,18 @@ def test_m12_building_generations_restarted() -> None:
     conn.execute("BEGIN IMMEDIATE")
     advance_correction(conn, site_id, {"generation_id": generation_id})
     conn.execute("COMMIT")
-    blob = json.loads(get_runtime_state(conn, correction_state_key(generation_id)) or "{}")
+    blob = json.loads(
+        get_runtime_state(conn, correction_state_key(generation_id)) or "{}"
+    )
     assert blob["attempts"] == 1
 
     # Case (b): complete the start call's own queued job, then run the step
     # again -- still exactly one pending job (the restart's own enqueue).
+    # 0.16.12: the first call already wrote the boundary key, so without
+    # clearing it a second call returns at the key gate before it ever
+    # reaches the restart logic (plan §19.6).
     _complete_jobs(conn, "timezone_correction")
+    _clear_boundary_and_seed(conn)
     record_precip_hour_start_boundary(conn)
     assert _pending_job_count(conn, "timezone_correction") == 1
 
@@ -1005,9 +1283,8 @@ def test_m12_building_generations_restarted() -> None:
 
 
 def test_m13_generation_rebuild_writes_pairs_for_the_four_eligible_samples() -> None:
-    # Fails today with wrong counts/rows, not an ImportError:
-    # rebuild_generation_day/_rebuild_real_pairs already run but have no
-    # eligibility clause yet, so all seven M3-style samples would pair.
+    # rebuild_generation_day's real-pair rebuild must apply the same
+    # eligibility clause, so only the four eligible M3-style samples pair.
     from datetime import date
 
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
@@ -1023,8 +1300,12 @@ def test_m13_generation_rebuild_writes_pairs_for_the_four_eligible_samples() -> 
     generation_id = start_retrospective_correction(conn, site_id, "UTC")
 
     valid_ats = [
-        "2026-01-01T13:00:00Z", "2026-01-01T14:00:00Z", "2026-01-01T15:00:00Z",
-        "2026-01-01T16:00:00Z", "2026-01-01T17:00:00Z", "2026-01-01T18:00:00Z",
+        "2026-01-01T13:00:00Z",
+        "2026-01-01T14:00:00Z",
+        "2026-01-01T15:00:00Z",
+        "2026-01-01T16:00:00Z",
+        "2026-01-01T17:00:00Z",
+        "2026-01-01T18:00:00Z",
         "2026-01-01T19:00:00Z",
     ]
     for valid_at in valid_ats:
@@ -1032,50 +1313,99 @@ def test_m13_generation_rebuild_writes_pairs_for_the_four_eligible_samples() -> 
     _insert_observation(conn, variable="temperature", valid_at=valid_ats[5], value=10.0)
 
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[0], value=1.0, fetched_at=_K,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[0],
+        value=1.0,
+        fetched_at=_K,
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[1], value=1.0, fetched_at="2026-01-01T11:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[1],
+        value=1.0,
+        fetched_at="2026-01-01T11:00:00Z",
     )
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[2], value=1.0, fetched_at=None,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=valid_ats[2],
+        value=1.0,
+        fetched_at=None,
     )
     eligible_om_valid_at = valid_ats[3]
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_om_valid_at, value=1.0, fetched_at="2026-01-01T12:00:01Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=eligible_om_valid_at,
+        value=1.0,
+        fetched_at="2026-01-01T12:00:01Z",
     )
     eligible_meteoblue_valid_at = valid_ats[4]
     _insert_sample(
-        conn, feed_id=meteoblue, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_meteoblue_valid_at, value=1.0, fetched_at="2026-01-01T12:00:01Z",
+        conn,
+        feed_id=meteoblue,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=eligible_meteoblue_valid_at,
+        value=1.0,
+        fetched_at="2026-01-01T12:00:01Z",
     )
     eligible_temp_valid_at = valid_ats[5]
     _insert_sample(
-        conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_temp_valid_at, value=10.0, fetched_at="2026-01-01T11:00:00Z",
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=eligible_temp_valid_at,
+        value=10.0,
+        fetched_at="2026-01-01T11:00:00Z",
     )
     eligible_google_valid_at = valid_ats[6]
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_google_valid_at, value=1.0, fetched_at="2026-01-01T11:00:00Z",
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at=eligible_google_valid_at,
+        value=1.0,
+        fetched_at="2026-01-01T11:00:00Z",
     )
 
     rebuild_generation_day(
-        conn, site_id=site_id, generation_id=generation_id, timezone="UTC",
-        day=date(2026, 1, 1), count=False,
+        conn,
+        site_id=site_id,
+        generation_id=generation_id,
+        timezone="UTC",
+        day=date(2026, 1, 1),
+        count=False,
     )
 
+    # 0.16.12: a generation also carries the `_persistence` virtual feed's
+    # own lagged pairs, so the real-feed rows must be isolated by excluding
+    # virtual feeds rather than reading valid_at alone (plan §19.6).
     rows = conn.execute(
-        "SELECT valid_at FROM forecast_pairs WHERE tz_generation_id=?",
+        """
+        SELECT fp.feed_id, fp.variable, fp.valid_at
+        FROM forecast_pairs fp
+        JOIN feeds f ON f.id = fp.feed_id
+        WHERE fp.tz_generation_id = ? AND f.is_virtual = 0
+        """,
         (generation_id,),
     ).fetchall()
-    assert {r["valid_at"] for r in rows} == {
-        eligible_om_valid_at, eligible_meteoblue_valid_at,
-        eligible_temp_valid_at, eligible_google_valid_at,
+    assert {(r["feed_id"], r["variable"], r["valid_at"]) for r in rows} == {
+        (om, "precip", eligible_om_valid_at),
+        (meteoblue, "precip", eligible_meteoblue_valid_at),
+        (om, "temperature", eligible_temp_valid_at),
+        (google, "precip", eligible_google_valid_at),
     }
 
 
@@ -1087,13 +1417,11 @@ def test_m13_generation_rebuild_writes_pairs_for_the_four_eligible_samples() -> 
 def test_m14_boot_refuses_a_file_newer_than_the_running_app(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # N is the literal current TARGET_USER_VERSION on this tree (9 at
-    # c8789f2). Today: the file's real stamped version is also 9 (no bump
-    # has landed), so 9 > 9 is False and nothing raises -- fails for the
-    # wrong-reason-shaped cause (no raise), not an import error. After the
-    # bump to 10 lands, the file is stamped 10 and 10 > 9 raises.
-    from wxverify.db.connection import Database
+    # n is deliberately lower than the real TARGET_USER_VERSION, so the
+    # file on disk is stamped with a version newer than the (monkeypatched)
+    # running app; boot must refuse it rather than silently proceed.
     import wxverify.db.migrations as migrations
+    from wxverify.db.connection import Database
 
     n = 9
     path = tmp_path / "newer.db"
@@ -1131,7 +1459,9 @@ def test_m14_import_rejects_a_backup_newer_than_the_running_app(
         app = create_app(root_path="")
         client = TestClient(app, raise_server_exceptions=False)
         resp = client.post(
-            "/api/import/db", content=backup_bytes, headers=_csrf_headers(client),
+            "/api/import/db",
+            content=backup_bytes,
+            headers=_csrf_headers(client),
         )
         assert resp.status_code == 422
         assert resp.json() == {"error": "exported by a newer wxverify"}
@@ -1143,9 +1473,8 @@ def test_m14_literal_version_fence_check() -> None:
     from wxverify.db.migrations import TARGET_USER_VERSION
 
     n = 9
-    # Today: TARGET_USER_VERSION is still 9, so this is False (fails the
-    # "the bump landed" claim); once the bump to 10 lands it is True.
-    assert TARGET_USER_VERSION > n
+    # Pins the version bump itself: n must stay below TARGET_USER_VERSION.
+    assert n < TARGET_USER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -1153,10 +1482,14 @@ def test_m14_literal_version_fence_check() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_stored_rows() -> None:
-    # Fails today: ImportError on PRECIP_HOUR_START_BOUNDARY_KEY (the module
-    # does not exist, so the key cannot even be set to exercise the clause).
+def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_stored_rows() -> (  # noqa: E501
+    None
+):
+    # A missing boundary key must exclude affected rows (fail closed), and
+    # reopening must recompute the key from the stored rows' own
+    # fetched_at.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
+    from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.forecast.data import load_future_samples
     from wxverify.scoring.pairing import compute_real_model_pairs
 
@@ -1165,17 +1498,39 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
     google = _feed_id(conn, "google", "blend")
     set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
     _insert_sample(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", value=1.0, fetched_at="2026-01-01T13:00:00Z",
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        value=1.0,
+        fetched_at="2026-01-01T13:00:00Z",
     )
-    _insert_observation(conn, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0)
-    _insert_sample(
-        conn, feed_id=om, variable="temperature", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", value=10.0, fetched_at="2026-01-01T13:00:00Z",
+    _insert_observation(
+        conn, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0
     )
     _insert_sample(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z", value=0.5, fetched_at="2026-01-01T13:00:00Z",
+        conn,
+        feed_id=om,
+        variable="temperature",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        value=10.0,
+        fetched_at="2026-01-01T13:00:00Z",
+    )
+    # 0.16.12: without an observation, no temperature pair can form at all,
+    # so the "temperature stays eligible" half of this test needs one.
+    _insert_observation(
+        conn, variable="temperature", valid_at="2026-01-01T13:00:00Z", value=10.0
+    )
+    _insert_sample(
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T14:00:00Z",
+        value=0.5,
+        fetched_at="2026-01-01T13:00:00Z",
     )
 
     delete_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
@@ -1184,10 +1539,24 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
     assert not any(op.values[2] == "precip" and op.values[1] == om for op in delta.ops)
     assert any(op.values[2] == "temperature" for op in delta.ops)
 
-    live = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False)
+    live = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert not any(s.feed_id == om and s.variable == "precip" for s in live)
     assert any(s.feed_id == om and s.variable == "temperature" for s in live)
     assert any(s.feed_id == google and s.variable == "precip" for s in live)
+
+    # 0.16.12: a reopen recomputes the boundary from the stored rows' own
+    # fetched_at rather than leaving the key missing forever (plan §19.6).
+    record_precip_hour_start_boundary(conn)
+    assert (
+        get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY)
+        == "2026-01-01T13:00:00Z"
+    )
+    delta_after_reopen = compute_real_model_pairs(conn)
+    assert not any(
+        op.values[2] == "precip" and op.values[1] == om for op in delta_after_reopen.ops
+    )
 
     conn.commit()
     conn.close()
@@ -1199,38 +1568,63 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
 
 
 def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
-    # Fails today: ImportError on the boundary key -- persist_fetch_result
-    # itself already runs, but there is no eligibility gate to prove the
-    # row stays excluded, and no boundary key to set up K.
+    # A refetch of the same model run keeps the old row's fetched_at and
+    # excluded status; a genuinely new run is eligible.
+    from wxverify.collection.forecast_fetcher import (
+        persist_fetch_result,
+    )
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.collection.forecast_fetcher import PersistOutcome, persist_fetch_result
     from wxverify.feeds.seam import FetchResult, NormalizedSample
     from wxverify.forecast.data import load_future_samples
-    from wxverify.scoring.pairing import compute_real_model_pairs, real_model_pair_pending
+    from wxverify.scoring.pairing import (
+        compute_real_model_pairs,
+        real_model_pair_pending,
+    )
 
     conn = _make_db()
     site_id = 1
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
-    _insert_observation(conn, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0)
+    _insert_observation(
+        conn, variable="precip", valid_at="2026-01-01T13:00:00Z", value=0.0
+    )
 
     def _sample(*, issued_at: str, lead_hours: int, value: float) -> NormalizedSample:
         return NormalizedSample(
-            model="ecmwf_ifs", variable="precip", issued_at=issued_at,
-            valid_at="2026-01-01T13:00:00Z", lead_hours=lead_hours, value=value,
-            source_raw=str(value), model_run_id=f"ecmwf_ifs:{issued_at}",
+            model="ecmwf_ifs",
+            variable="precip",
+            issued_at=issued_at,
+            valid_at="2026-01-01T13:00:00Z",
+            lead_hours=lead_hours,
+            value=value,
+            source_raw=str(value),
+            model_run_id=f"ecmwf_ifs:{issued_at}",
         )
 
     outcome_a = persist_fetch_result(
-        conn, site_id=site_id, source="open-meteo", fetch_feed_id=om,
-        result=FetchResult(samples=[_sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=1.0)]),
+        conn,
+        site_id=site_id,
+        source="open-meteo",
+        fetch_feed_id=om,
+        result=FetchResult(
+            samples=[
+                _sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=1.0)
+            ]
+        ),
         fetched_at="2026-01-01T11:00:00Z",
     )
     assert outcome_a.inserted_count == 1
 
     outcome_b = persist_fetch_result(
-        conn, site_id=site_id, source="open-meteo", fetch_feed_id=om,
-        result=FetchResult(samples=[_sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=2.0)]),
+        conn,
+        site_id=site_id,
+        source="open-meteo",
+        fetch_feed_id=om,
+        result=FetchResult(
+            samples=[
+                _sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=2.0)
+            ]
+        ),
     )
     assert outcome_b.inserted_count == 0
     assert outcome_b.usable_sample_count == 1
@@ -1241,21 +1635,31 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
     assert row["fetched_at"] == "2026-01-01T11:00:00Z"
     assert row["value"] == 1.0
 
-    id_row = conn.execute("SELECT id FROM forecast_samples WHERE variable='precip'").fetchone()
+    id_row = conn.execute(
+        "SELECT id FROM forecast_samples WHERE variable='precip'"
+    ).fetchone()
     delta = compute_real_model_pairs(conn)
     assert not any(op.values[2] == "precip" for op in delta.ops)
     assert real_model_pair_pending(conn, [int(id_row["id"])]) is False
-    live = load_future_samples(conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False)
+    live = load_future_samples(
+        conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert not any(s.feed_id == om and s.variable == "precip" for s in live)
 
     outcome_c = persist_fetch_result(
-        conn, site_id=site_id, source="open-meteo", fetch_feed_id=om,
-        result=FetchResult(samples=[_sample(issued_at="2026-01-01T06:00:00Z", lead_hours=7, value=3.0)]),
+        conn,
+        site_id=site_id,
+        source="open-meteo",
+        fetch_feed_id=om,
+        result=FetchResult(
+            samples=[_sample(issued_at="2026-01-01T06:00:00Z", lead_hours=7, value=3.0)]
+        ),
     )
     assert outcome_c.inserted_count == 1
 
     new_row = conn.execute(
-        "SELECT id, fetched_at FROM forecast_samples WHERE variable='precip' AND issued_at='2026-01-01T06:00:00Z'"
+        "SELECT id, fetched_at FROM forecast_samples"
+        " WHERE variable='precip' AND issued_at='2026-01-01T06:00:00Z'"
     ).fetchone()
     assert new_row is not None
     from wxverify.core.timeutil import parse_utc
@@ -1264,10 +1668,13 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
 
     delta2 = compute_real_model_pairs(conn)
     assert any(
-        op.values[2] == "precip" and op.values[3] == "2026-01-01T06:00:00Z" for op in delta2.ops
+        op.values[2] == "precip" and op.values[3] == "2026-01-01T06:00:00Z"
+        for op in delta2.ops
     )
     assert real_model_pair_pending(conn, [int(new_row["id"])]) is True
-    live2 = load_future_samples(conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False)
+    live2 = load_future_samples(
+        conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     matches = [s for s in live2 if s.feed_id == om and s.variable == "precip"]
     assert len(matches) == 1
     assert matches[0].value == 3.0
@@ -1294,20 +1701,31 @@ def _m17_insert_samples_every_hour(
         stamp = excluded_fetched_at if valid_at in excluded_hours else fetched_at
         lead_hours = 18 + h
         _insert_sample(
-            conn, feed_id=feed_id, variable=variable, issued_at="2026-01-01T06:00:00Z",
-            valid_at=valid_at, lead_hours=lead_hours, value=value, fetched_at=stamp,
+            conn,
+            feed_id=feed_id,
+            variable=variable,
+            issued_at="2026-01-01T06:00:00Z",
+            valid_at=valid_at,
+            lead_hours=lead_hours,
+            value=value,
+            fetched_at=stamp,
         )
 
 
-def _m17_build_forecast_tile(conn: sqlite3.Connection, site_id: int = 1):
+def _m17_build_forecast_tile(
+    conn: sqlite3.Connection, site_id: int = 1, depth: str = "2"
+):
     from datetime import UTC, datetime
 
     from wxverify.forecast.service import build_forecast
     from wxverify.settings.keys import set_setting
 
-    set_setting(conn, "forecast_blend_depth", "2")
+    set_setting(conn, "forecast_blend_depth", depth)
     view = build_forecast(
-        conn, site_id=site_id, timezone="UTC", rain_threshold_mm=0.2,
+        conn,
+        site_id=site_id,
+        timezone="UTC",
+        rain_threshold_mm=0.2,
         now=datetime(2026, 1, 2, 2, tzinfo=UTC),
     )
     tile = next(t for t in view.tiles if t.date_iso == "2026-01-02")
@@ -1315,9 +1733,8 @@ def _m17_build_forecast_tile(conn: sqlite3.Connection, site_id: int = 1):
 
 
 def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
-    # Fails today with the wrong total (18.0, both feeds blended), not an
-    # ImportError: build_forecast already runs end to end, but
-    # load_future_samples has no eligibility clause yet.
+    # The excluded feed's rain must be dropped from the blend entirely, not
+    # just scored differently.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 
     conn = _make_db()
@@ -1326,8 +1743,20 @@ def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
     _subscribe(conn, 1, google)
     set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
 
-    _m17_insert_samples_every_hour(conn, feed_id=om, variable="precip", value=1.0, fetched_at="2026-01-01T11:00:00Z")
-    _m17_insert_samples_every_hour(conn, feed_id=google, variable="precip", value=0.5, fetched_at="2026-01-01T13:00:00Z")
+    _m17_insert_samples_every_hour(
+        conn,
+        feed_id=om,
+        variable="precip",
+        value=1.0,
+        fetched_at="2026-01-01T11:00:00Z",
+    )
+    _m17_insert_samples_every_hour(
+        conn,
+        feed_id=google,
+        variable="precip",
+        value=0.5,
+        fetched_at="2026-01-01T13:00:00Z",
+    )
 
     tile = _m17_build_forecast_tile(conn)
 
@@ -1338,17 +1767,28 @@ def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
 
 
 def test_m17b_a_fully_excluded_rain_feed_is_not_available_not_zero() -> None:
-    # Fails today: the excluded-only feed's rain is still blended in (no
-    # gate yet), so the cell reads available with a non-null total instead
-    # of not_available with total_mm/wet_hours both None.
+    # A feed whose rain is entirely excluded must read not_available, with
+    # total_mm and wet_hours both None -- never a zero total.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 
     conn = _make_db()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
 
-    _m17_insert_samples_every_hour(conn, feed_id=om, variable="precip", value=1.0, fetched_at="2026-01-01T11:00:00Z")
-    _m17_insert_samples_every_hour(conn, feed_id=om, variable="temperature", value=10.0, fetched_at="2026-01-01T13:00:00Z")
+    _m17_insert_samples_every_hour(
+        conn,
+        feed_id=om,
+        variable="precip",
+        value=1.0,
+        fetched_at="2026-01-01T11:00:00Z",
+    )
+    _m17_insert_samples_every_hour(
+        conn,
+        feed_id=om,
+        variable="temperature",
+        value=10.0,
+        fetched_at="2026-01-01T13:00:00Z",
+    )
 
     tile = _m17_build_forecast_tile(conn)
 
@@ -1358,9 +1798,9 @@ def test_m17b_a_fully_excluded_rain_feed_is_not_available_not_zero() -> None:
 
 
 def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
-    # Fails today: the one truly eligible hour plus the 23 excluded hours
-    # are all blended, giving a non-null total instead of the extrema-
-    # unavailable, total/wet_hours-None, empty-feeds outcome.
+    # A single eligible hour out of 24 must never substitute for the full
+    # day: the outcome is extrema_unavailable, with total_mm, wet_hours and
+    # feeds all empty/None.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 
     conn = _make_db()
@@ -1370,9 +1810,13 @@ def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
     eligible_hour = {"2026-01-02T00:00:00Z"}
     excluded_hours = {f"2026-01-02T{h:02d}:00:00Z" for h in range(1, 24)}
     _m17_insert_samples_every_hour(
-        conn, feed_id=om, variable="precip", value=1.0,
+        conn,
+        feed_id=om,
+        variable="precip",
+        value=1.0,
         fetched_at="2026-01-01T13:00:00Z",
-        excluded_hours=excluded_hours, excluded_fetched_at="2026-01-01T11:00:00Z",
+        excluded_hours=excluded_hours,
+        excluded_fetched_at="2026-01-01T11:00:00Z",
     )
     # (The "eligible_hour" set is implicit: every hour not in excluded_hours
     # keeps the eligible stamp -- only 00:00 keeps "2026-01-01T13:00:00Z".)
@@ -1386,10 +1830,12 @@ def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
     assert tile.precip.meta.feeds == []
 
 
-def test_m17d_mean_pair_drops_the_excluded_contributor_and_keeps_no_group_of_one() -> None:
-    # Fails today: ImportError (record_precip_hour_start_boundary absent),
-    # so the OM contribution at 13:00 is never deleted and the mean would
-    # hold two pairs instead of exactly one.
+def test_m17d_mean_pair_drops_the_excluded_contributor_and_keeps_no_group_of_one() -> (
+    None
+):
+    # The step deletes every Open-Meteo rain pair, so at 13:00 only Google is
+    # left and the mean writes no pair (never a group of one); at 14:00 Google
+    # and Visual Crossing give the one remaining mean pair.
     from wxverify.db.migrations import record_precip_hour_start_boundary
     from wxverify.scoring.multimodel import materialize_multimodel_mean
 
@@ -1403,24 +1849,59 @@ def test_m17d_mean_pair_drops_the_excluded_contributor_and_keeps_no_group_of_one
     _subscribe(conn, site_id, vc)
 
     _insert_pair(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", lead_hours=13, day_ahead=0, forecast=3.0, observed=0.0,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        lead_hours=13,
+        day_ahead=0,
+        forecast=3.0,
+        observed=0.0,
     )
     _insert_pair(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z", lead_hours=13, day_ahead=0, forecast=1.0, observed=0.0,
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T13:00:00Z",
+        lead_hours=13,
+        day_ahead=0,
+        forecast=1.0,
+        observed=0.0,
     )
     _insert_pair(
-        conn, feed_id=om, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z", lead_hours=14, day_ahead=0, forecast=3.0, observed=0.0,
+        conn,
+        feed_id=om,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T14:00:00Z",
+        lead_hours=14,
+        day_ahead=0,
+        forecast=3.0,
+        observed=0.0,
     )
     _insert_pair(
-        conn, feed_id=google, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z", lead_hours=14, day_ahead=0, forecast=1.0, observed=0.0,
+        conn,
+        feed_id=google,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T14:00:00Z",
+        lead_hours=14,
+        day_ahead=0,
+        forecast=1.0,
+        observed=0.0,
     )
     _insert_pair(
-        conn, feed_id=vc, variable="precip", issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z", lead_hours=14, day_ahead=0, forecast=2.0, observed=0.0,
+        conn,
+        feed_id=vc,
+        variable="precip",
+        issued_at="2026-01-01T00:00:00Z",
+        valid_at="2026-01-01T14:00:00Z",
+        lead_hours=14,
+        day_ahead=0,
+        forecast=2.0,
+        observed=0.0,
     )
 
     record_precip_hour_start_boundary(conn)
@@ -1429,7 +1910,9 @@ def test_m17d_mean_pair_drops_the_excluded_contributor_and_keeps_no_group_of_one
     rows = conn.execute(
         """
         SELECT valid_at, forecast, contributors FROM forecast_pairs
-        WHERE feed_id = (SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean')
+        WHERE feed_id = (
+            SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'
+        )
           AND variable = 'precip'
         """
     ).fetchall()
@@ -1461,33 +1944,58 @@ def _m18_seed_feed_rain(conn: sqlite3.Connection, feed_id: int, value: float) ->
     for h in range(24):
         valid_at = f"2026-01-02T{h:02d}:00:00Z"
         _insert_sample(
-            conn, feed_id=feed_id, variable="precip", issued_at="2026-01-01T06:00:00Z",
-            valid_at=valid_at, lead_hours=18 + h, value=value, fetched_at="2026-01-01T13:00:00Z",
+            conn,
+            feed_id=feed_id,
+            variable="precip",
+            issued_at="2026-01-01T06:00:00Z",
+            valid_at=valid_at,
+            lead_hours=18 + h,
+            value=value,
+            fetched_at="2026-01-01T13:00:00Z",
         )
 
 
 def _m18_seed_rank(
-    conn: sqlite3.Connection, *, feed_id: int, n: int, skill: float | None,
+    conn: sqlite3.Connection,
+    *,
+    feed_id: int,
+    n: int,
+    skill: float | None,
 ) -> None:
     from wxverify.scoring.cache import upsert_score_cache
     from wxverify.scoring.leaderboard import resolve_window
     from wxverify.scoring.metrics import MetricResult
 
     far_future_valid_ats = (
-        "2035-07-01T00:00:00Z", "2035-07-01T01:00:00Z", "2035-07-01T02:00:00Z",
+        "2035-07-01T00:00:00Z",
+        "2035-07-01T01:00:00Z",
+        "2035-07-01T02:00:00Z",
     )
     far_future_leads = (24, 25, 26)
-    for valid_at, lead_hours in zip(far_future_valid_ats, far_future_leads, strict=True):
+    for valid_at, lead_hours in zip(
+        far_future_valid_ats, far_future_leads, strict=True
+    ):
         _insert_pair(
-            conn, feed_id=feed_id, variable="precip", issued_at="2035-06-30T00:00:00Z",
-            valid_at=valid_at, lead_hours=lead_hours, day_ahead=1, forecast=0.0, observed=0.0,
+            conn,
+            feed_id=feed_id,
+            variable="precip",
+            issued_at="2035-06-30T00:00:00Z",
+            valid_at=valid_at,
+            lead_hours=lead_hours,
+            day_ahead=1,
+            forecast=0.0,
+            observed=0.0,
         )
     window_key = resolve_window(conn, "rolling").window_key
     confident = n >= 3 and skill is not None
     from wxverify.core.timeutil import isoformat_utc, utc_now
 
     upsert_score_cache(
-        conn, site_id=1, feed_id=feed_id, variable="precip", day_ahead=1,
+        conn,
+        site_id=1,
+        feed_id=feed_id,
+        variable="precip",
+        day_ahead=1,
         window_key=window_key,
         result=MetricResult(n=n, ets=skill, skill_score=skill, confident=confident),
         computed_at=isoformat_utc(utc_now()),
@@ -1495,12 +2003,9 @@ def _m18_seed_rank(
 
 
 def test_m18a0_control_two_confident_feeds_both_selected() -> None:
-    from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
-    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
     _m18_seed_feed_rain(conn, om, 1.0)
     _m18_seed_feed_rain(conn, google, 0.5)
     _m18_seed_rank(conn, feed_id=om, n=3, skill=0.7)
@@ -1522,17 +2027,15 @@ def test_m18a0_control_two_confident_feeds_both_selected() -> None:
     ],
 )
 def test_m18a_available_but_not_ranked_is_not_selected(
-    om_n: int, om_skill: float | None,
+    om_n: int,
+    om_skill: float | None,
 ) -> None:
-    # Fails today with the wrong feed set: the loader's eligibility gate is
-    # missing (same root cause as M17), so Open-Meteo's rain is already
-    # present whether or not this parametrization even reaches ranking.
-    from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-
+    # Pins availability vs. selection: a feed present in the data but not
+    # confidently ranked (no row, skill None, or below min_n) must still be
+    # left out of the blend's selected feeds.
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
-    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
     _m18_seed_feed_rain(conn, om, 1.0)
     _m18_seed_feed_rain(conn, google, 0.5)
     _m18_seed_rank(conn, feed_id=google, n=3, skill=0.5)
@@ -1549,14 +2052,10 @@ def test_m18a_available_but_not_ranked_is_not_selected(
 
 
 def test_m18b_confident_but_outside_blend_depth_is_not_selected() -> None:
-    from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.settings.keys import set_setting
-
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
     vc = _feed_id(conn, "visualcrossing", "blend")
-    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
     _m18_seed_feed_rain(conn, om, 1.0)
     _m18_seed_feed_rain(conn, google, 0.5)
     _m18_seed_feed_rain(conn, vc, 0.25)
@@ -1571,8 +2070,7 @@ def test_m18b_confident_but_outside_blend_depth_is_not_selected() -> None:
     assert tile_depth2.precip.total_mm == 9.0
     assert tile_depth2.precip.wet_hours == 24
 
-    set_setting(conn, "forecast_blend_depth", "3")
-    tile_depth3 = _m17_build_forecast_tile(conn)
+    tile_depth3 = _m17_build_forecast_tile(conn, depth="3")
     assert [f.feed_id for f in tile_depth3.precip.meta.feeds] == [google, vc, om]
     assert tile_depth3.precip.total_mm == 14.0
     assert tile_depth3.precip.wet_hours == 24

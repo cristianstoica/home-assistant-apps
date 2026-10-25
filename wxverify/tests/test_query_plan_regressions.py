@@ -1488,18 +1488,18 @@ def test_real_model_pair_probe_sql_seeks_fs_by_rowid_after_seeding_and_analyze()
 def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     """T-EQP-exact: the whole plan of ``REAL_MODEL_PAIR_PROBE_SQL`` on a
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
-    including the ``CORRELATED SCALAR SUBQUERY`` headers, in the order the
-    planner prints them. Taken from CI's shipping-SQLite job (SQLite 3.53.4)
-    on 0.16.11; 0.16.12's rain-label-boundary clause (§11.3) adds a
-    ``SCALAR SUBQUERY`` and a ``runtime_state`` ``SEARCH`` line to this plan,
-    so this literal is STALE pending CI's new output and py-architect's
-    sign-off on it (plan §13.3: "never pasted from CI's output into the
-    test") -- it is deliberately left unchanged here, not updated to a
-    guessed value. The pin is fresh-schema only: after
+    including the ``CORRELATED SCALAR SUBQUERY`` and ``SCALAR SUBQUERY``
+    headers, in the order the planner prints them. The rain-label boundary
+    clause (``precip_label_eligible_sql``) adds ``SCALAR SUBQUERY 3`` with its
+    ``runtime_state`` lookup and moves the ``f`` seek ahead of ``obs``.
+    Measured in the add-on's dev venv (SQLite 3.53.1), where the previous
+    pin, without the clause, also matched line for line; CI's shipping-SQLite
+    job (``WXV_EQP_SHIPPING=1``) runs it. The pin is fresh-schema only: after
     ``ANALYZE`` the ``s``/``f``/``obs`` join order moves, and the relational
     pins above cover that case."""
     conn = _fresh_conn()
-    assert _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,)) == [
+    plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
+    assert plan == [
         "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)",
         # NOT EXISTS (forecast_pairs ...), with published_generation_clause's
         # runtime_state pointer lookup (alias rs) nested inside it.
@@ -1508,11 +1508,14 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
         "CORRELATED SCALAR SUBQUERY 1",
         "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
+        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
+        # precip_label_eligible_sql's boundary-key lookup in runtime_state.
+        "SCALAR SUBQUERY 3",
+        "SEARCH runtime_state USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
         "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
         " (site_id=? AND variable=? AND valid_at=?)",
-        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
-    ]
+    ], plan
 
 
 def test_candidate_pairs_sql_scans_on_a_fresh_schema() -> None:

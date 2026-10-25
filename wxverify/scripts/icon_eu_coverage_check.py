@@ -54,7 +54,11 @@ import httpx
 from wxverify.collection.forecast_validation import FORECAST_VALUE_RANGES
 from wxverify.config import OPEN_METEO_MAX_LEAD_HOURS
 from wxverify.core.timeutil import floor_hour, parse_utc, utc_now
-from wxverify.feeds.open_meteo import VARIABLE_MAP, OpenMeteoAdapter
+from wxverify.feeds.open_meteo import (
+    VARIABLE_MAP,
+    OpenMeteoAdapter,
+    previous_run_lead_hours,
+)
 from wxverify.feeds.seam import ForecastRequest, NormalizedSample
 
 
@@ -396,7 +400,7 @@ def previous_runs_verdict(
                 _parse_stamp(sample.valid_at)
                 for sample in samples
                 if sample.variable == variable
-                and sample.lead_hours == 24 * previous_day
+                and sample.lead_hours == previous_run_lead_hours(variable, previous_day)
             ]
             stamps = sorted(stamp for stamp in found if stamp is not None)
             if len(found) != len(stamps) or stamps != expected:

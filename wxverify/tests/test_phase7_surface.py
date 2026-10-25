@@ -704,17 +704,17 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
 
         # O-V3, v1 arm: this fixture's run was scored under methodology
         # version 1 (the shape of the live published run today), which does
-        # not match this build's version 3 -- so the endpoint refuses to
+        # not match this build's version 4 -- so the endpoint refuses to
         # answer with the current constants/contract rather than describing
         # a run under a version it does not carry. See
         # test_api_methodology_matches_the_build_version_it_was_scored_under
-        # for the matching-version (v3) arm.
+        # for the matching-version (v4) arm.
         meth = client.get(f"/api/verification/runs/{run_id}/methodology").json()
         assert meth["contract"] is None
         assert meth["constants"] is None
         assert meth["contract_unavailable_reason"] is not None
         assert "methodology version 1" in meth["contract_unavailable_reason"]
-        assert "methodology version 3" in meth["contract_unavailable_reason"]
+        assert "methodology version 4" in meth["contract_unavailable_reason"]
         assert meth["provenance"]["run_id"] == run_id
 
         latest = client.get(
@@ -736,7 +736,7 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
 def test_api_methodology_matches_the_build_version_it_was_scored_under(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """O-V3, v3 arm: a run scored under this build's own methodology
+    """O-V3, v4 arm: a run scored under this build's own methodology
     version gets the real contract/constants, paired with the v1 refusal
     arm above (`_seed_published_run`'s default) so a mutant that always
     refuses -- or always answers -- is caught by whichever arm it breaks.

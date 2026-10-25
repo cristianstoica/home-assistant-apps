@@ -541,9 +541,7 @@ def _hand_built_previous_run_samples(
     return samples
 
 
-def test_previous_runs_too_few_values_when_precip_still_lands_on_the_raw_lead() -> (
-    None
-):
+def test_previous_runs_too_few_values_when_precip_still_lands_on_the_raw_lead() -> None:
     # Every variable's sample sits at lead 24*N (precip_lead_offset=0), the
     # rule used before the rain-label-start rework. Precip is now expected
     # one hour earlier (lead 24*N - 1), so these precip samples no longer
@@ -557,7 +555,7 @@ def test_previous_runs_too_few_values_when_precip_still_lands_on_the_raw_lead() 
     )
 
 
-def test_previous_runs_pass_with_precip_one_hour_earlier_than_temperature_and_wind() -> (
+def test_previous_runs_pass_with_precip_one_hour_earlier_than_temperature_and_wind() -> (  # noqa: E501
     None
 ):
     # Paired positive: precip's sample sits at lead 24*N - 1, one hour

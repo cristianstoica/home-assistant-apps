@@ -209,6 +209,14 @@ It only affects precipitation: event scoring and the Forecast page's wet-hour
 count. Temperature and wind are unaffected. Changing it later recomputes precip
 pairs and cached scores for that site.
 
+A rain value for an hour is the rain that falls in the hour that starts at that
+time. Open-Meteo and meteoblue label rain by the hour's end, so wxverify moves
+the rain it fetches from them back one hour; their rain fetched before this
+change is no longer scored or served.
+Google labels it by the hour's start. Visual Crossing, OpenWeatherMap, WeatherAPI
+and Meteosource do not say which hour they mean, and their values are stored as
+received.
+
 `elevation_m` is the reference elevation for the verification location. wxverify
 uses it when building the temperature consensus: station temperatures are
 lapse-normalized to the site elevation before taking the median. That keeps a

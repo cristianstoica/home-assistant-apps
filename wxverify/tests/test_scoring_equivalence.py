@@ -404,8 +404,9 @@ def _make_db() -> sqlite3.Connection:
                             """
                             INSERT OR IGNORE INTO forecast_samples
                                 (site_id, feed_id, variable, issued_at, valid_at,
-                                 lead_hours, value, source_raw, model_run_id)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 lead_hours, value, source_raw, model_run_id,
+                                 fetched_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 site_id,
@@ -417,6 +418,7 @@ def _make_db() -> sqlite3.Connection:
                                 _forecast_value(variable, feed_index, lead, valid_hour),
                                 _SOURCE_RAW,
                                 f"run-{issued_hour}",
+                                _hour(issued_hour),
                             ),
                         )
     conn.commit()

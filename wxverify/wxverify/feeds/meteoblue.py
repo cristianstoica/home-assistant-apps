@@ -17,6 +17,7 @@ from wxverify.feeds.seam import (
     ForecastRequest,
     GridProvenance,
     NormalizedSample,
+    precip_hour_start,
 )
 
 VARIABLE_MAP: Final[dict[str, tuple[str, str]]] = {
@@ -153,13 +154,18 @@ def _to_fetch_result(req: ForecastRequest, payload: MeteoblueResponse) -> FetchR
             if model_index >= len(matrix):
                 continue
             values = matrix[model_index]
-            for time_index, valid_at in enumerate(times):
+            for time_index, raw_valid_at in enumerate(times):
                 if time_index >= len(values):
                     continue
                 raw_value = values[time_index]
                 if raw_value is None:
                     continue
                 value = _convert_value(variable, raw_value)
+                valid_at = (
+                    precip_hour_start(raw_valid_at)
+                    if variable == "precip"
+                    else raw_valid_at
+                )
                 lead = lead_hours(issued_at, valid_at)
                 if lead < 1 or lead > req.max_lead_hours:
                     continue
