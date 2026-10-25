@@ -121,7 +121,7 @@ value plus an optional override per variable:
 | ----------------------------------- | ----- | ------------------------------------------ |
 | `forecast_blend_depth`              | 1–6   | Global depth, used wherever no override set |
 | `forecast_blend_depth_temperature`  | 1–6   | Overrides the global depth for temperature |
-| `forecast_blend_depth_wind`         | 1–6   | Used for wind only until the wind history switch completes; after that, wind is weighted by past accuracy. Kept so existing configurations still load |
+| `forecast_blend_depth_wind`         | 1–6   | Not used: wind is weighted by past accuracy. Kept so existing configurations still load |
 | `forecast_blend_depth_precip`       | 1–6   | Overrides the global depth for precip      |
 
 **The three per-variable overrides belong to the add-on options, not to the
@@ -266,48 +266,37 @@ statistic; it makes no claim to match a WMO definition. The site's hourly wind
 is still the 90th percentile of its stations' values, and the daily reference is
 the day's highest site hourly value.
 
-**The rebuild.** Older versions stored a different station wind figure. On
-upgrade, every stored wind value is rebuilt on the new figure, and old and new
-values are never mixed. The rebuild runs per site in stages:
+A background wind lane fetches the 5-minute records for every enabled
+station-day, from the site's first stored observation through today, and
+derives the hourly pair-max figure from them. Past station-days use only the
+weather.com headroom left under the daily limit after today's own use, the
+expected remaining live demand and a 200-call reserve, so live observations
+always come first. The lane keeps today's and yesterday's station wind current
+on the observation interval, with a last call shortly before local midnight and
+one retry if that call fails; today's figure never includes the hour still in
+progress. When the key cannot download past days, each past day is finished
+from the records already stored. A past station-day whose call keeps failing is
+given up after 3 attempts and counted as failed; one the provider has no data
+for is counted as unavailable.
 
-- **Staging.** A background lane fetches the 5-minute records for every enabled
-  station-day, from the site's first stored observation through today. It uses
-  only the weather.com headroom left under the daily limit after today's own
-  use, the expected remaining live demand and a 200-call reserve, so live
-  observations always come first. The old wind keeps serving, and the Dashboard
-  shows a banner with the progress. A past station-day whose call keeps failing
-  is given up after 3 attempts and counted as failed; one the provider has no
-  data for is counted as unavailable.
-- **Switch.** When every station-day is accounted for, the site switches: the
-  old wind is cleared, the new wind is derived from the stored records, and the
-  feeds are rescored. The switch makes no weather.com calls and takes about 1–2
-  hours. During it, wind shows "—" with a progress note on the Forecast page
-  and the Dashboard.
-- **After the switch** the same lane keeps today's and yesterday's station wind
-  current on the observation interval. Today's figure never includes the hour
-  still in progress.
+The Ops page's `Wind History` panel shows the station-day counts, today's call
+headroom and the lane's calls, and the latest errors. If weather.com refuses
+the key for a wind request, the lane stops that request type and holds it until
+you press `Try again` on that panel; the next wind fetch then makes one check
+call, and only a successful call clears the hold.
 
-The Ops page's `Wind History` panel shows each site's stage, the station-day
-counts, today's call headroom and the lane's calls, the reason a switch is
-blocked and what to do about it, the latest errors, and the report written at
-the switch. If weather.com refuses the key for a wind request, the lane stops
-that request type and holds it until you press `Try again` on that panel; the
-next wind fetch then makes one check call, and only a successful call clears the
-hold.
-
-**The served wind forecast.** Once a site has switched, its forecast wind uses
-every feed with a track record, weighted by past accuracy. For each day-ahead
-(today through 7 days ahead), a feed's weight is `1 / MAE` of its daily wind
-high over the 30 complete local days before today, with the MAE floored at
-`0.1 m/s`. An observed day counts when it has at least 22 hours; a feed's day
-counts when its latest run at that day-ahead covers at least 20 hours of it;
-and a feed needs at least 20 such days. Today, and any day whose rebuild is
-still open, are left out of the training. The daily wind is the weighted mean of
-the feeds' daily highs, and the hourly line is the weighted mean at each hour,
-over the feeds present at that hour. With fewer than two eligible feeds, wind
-shows "—" with the note "Not enough feeds with a wind track record yet"; it is
-never a silent single-feed value. There is no setting for this and no switch
-back. Rain and temperature are unchanged.
+**The served wind forecast.** The forecast wind uses every feed with a track
+record, weighted by past accuracy. For each day-ahead (today through 7 days
+ahead), a feed's weight is `1 / MAE` of its daily wind high over the 30 complete
+local days before today, with the MAE floored at `0.1 m/s`. An observed day
+counts when it has at least 22 hours; a feed's day counts when its latest run at
+that day-ahead covers at least 20 hours of it; and a feed needs at least 20 such
+days. Today, and any day whose station history is not settled yet, are left out
+of the training. The daily wind is the weighted mean of the feeds' daily highs,
+and the hourly line is the weighted mean at each hour, over the feeds present at
+that hour. With fewer than two eligible feeds, wind shows "—" with the note "Not
+enough feeds with a wind track record yet"; it is never a silent single-feed
+value. There is no setting for this. Rain and temperature are unchanged.
 
 Forecasts use one configured query point per site: `forecast_lat` and
 `forecast_lon`. Every forecast feed uses that same point so model comparisons
@@ -415,13 +404,11 @@ Dashboard panels:
 - `Best forecast` (top card) names, in plain words, the single best feed for the
   current site, variable, window, and lead, with its runner-up and how many
   verified forecasts back it. When the top two are too close to separate it says
-  so instead, and when no feed beats its baseline it adds that caveat. For wind
-  at a site that has finished the wind history switch, this card shows the wind
-  weights instead: each feed's MAE (km/h), the number of days behind it and its
-  share of the weight for the selected lead. The `Leaderboard` stays as
-  information for wind and highlights no winner. While the switch is pending or
-  running, or while weather.com refuses the key for wind, a banner above the
-  panels says so.
+  so instead, and when no feed beats its baseline it adds that caveat. For wind,
+  this card shows the wind weights instead: each feed's MAE (km/h), the number
+  of days behind it and its share of the weight for the selected lead. The
+  `Leaderboard` stays as information for wind and highlights no winner. While
+  weather.com refuses the key for wind, a banner above the panels says so.
 - `Leaderboard` is the main ranking for the selected site, variable, window,
   and lead. `Samples` is the number of matched forecast-vs-observation pairs.
   `Skill` is a `0-100` badge: temperature and wind use skill against the
@@ -475,14 +462,14 @@ Everything else stays as it was:
 
 - The day's hourly chart still plots every selected feed, including feeds that
   cover only part of the day.
-- The `partial` badge keeps its meaning: for temperature, wind or rain, none
+- The `partial` badge keeps its meaning: for temperature or rain, none
   of the selected feeds covers at least 18 hours of that day. It can appear
   with or without the unavailable label, because it answers a different
   question.
-- `Wind max` is not affected by this rule. Once the site has finished the wind
-  history switch, `Wind max` is the weighted mean of the feeds' daily maxima
-  (see [Station wind](#station-wind)), and the `partial` badge is never set for
-  weighted wind. `Rain` has a stricter rule of its own, described below.
+- `Wind max` is not affected by this rule. `Wind max` is the weighted mean of
+  the feeds' daily maxima (see [Station wind](#station-wind)), and the `partial`
+  badge is never set for wind. `Rain` has a stricter rule of its own, described
+  below.
 
 The `Today` tile normally shows a high and low too. Adding a site's station
 starts a setup backfill, which fetches earlier forecast runs of every
@@ -934,12 +921,12 @@ its conditions report `skipped`. The `process` group has no toggle — it runs n
 queries, so switching it off could only hide a fault, never save any work.
 
 The pipeline group includes a `wind_history` warning. For each enabled site with
-an enabled station it trips when the wind history switch is blocked; when the
-rebuild has recorded no progress for 24 hours; when a station-day kept failing
-in the last 7 days; when too many station-days that had old wind values came
-back with no data; from 6 hours after local midnight, when no station has any
+an enabled station it trips when a station-day kept failing in the last 7 days;
+when, while the key cannot download past days, yesterday's last collection
+before midnight was missed for a station; from 6 hours after local midnight,
+when no station has any
 wind records today or one station's wind has stopped updating today; or when
-weather.com refused the key for a wind request. Its `count` is the number of sites tripped and its `detail` the first
+weather.com refused the key for today's wind. A key that cannot download past days does not trip it on that alone. Its `count` is the number of sites tripped and its `detail` the first
 reason. When the site's time zone cannot be loaded it reports
 `cannot evaluate` rather than passing.
 

@@ -592,6 +592,10 @@ def _providers_subscription(args: argparse.Namespace, *, enabled: bool) -> int:
         ]
         for feed in selection.feeds:
             try:
+                # Runs inside this write_sync transaction, as
+                # set_site_subscription requires: its stored-value check
+                # then sees every committed change, and nothing can commit
+                # between that check and its upsert.
                 result = set_site_subscription(
                     conn,
                     args.site_id,
@@ -617,6 +621,7 @@ def _providers_subscription(args: argparse.Namespace, *, enabled: bool) -> int:
                 "source": feed.source,
                 "model": feed.model,
                 "status": status,
+                "changed": result.changed,
             }
             if fetch is not None:
                 row["fetch_enqueued"] = fetch.enqueued

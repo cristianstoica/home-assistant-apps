@@ -143,7 +143,8 @@ def select_cell_feeds(
 
     ``candidates`` must already be restricted to feeds that have future
     samples for the tile day (the ranking itself is exclusion-filtered
-    upstream in :func:`wxverify.forecast.data.forecast_ranking`).
+    upstream in :func:`wxverify.forecast.data.forecast_ranking`) and to feeds
+    served at the site (the sample loader's ``served_only``).
 
     ``feeds`` and ``low_confidence`` are the blend set, chosen by the ladder
     over the coverage pool. ``extrema_coverage_required`` has no default so

@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.16.11
+
+The old wind method and its switch are removed: wind is always served
+by the weighted method. The Wind History panel on Ops shows the lane's
+counts, calls, holds and errors. The health monitor's `wind_history`
+warning no longer checks the switch, and the switch's leftover stored
+state is removed. The Dashboard notice for a weather.com key that cannot
+download wind history for past days now names it as a known limit of
+the key, instead of saying the key was refused. The `wind_history`
+warning no longer goes off only because of that limit; it still goes
+off when the key is refused for today's wind, or when a station's last
+collection before midnight was missed.
+
+A switched-off feed, whether off for every site or for one site, is now
+left out of the served forecast, the hourly view, the Dashboard wind
+weights and the daily forecast record, as it already was left out of
+the Leaderboard. A day that only switched-off feeds cover now shows no
+forecast. At the first start of this version, six meteoblue models
+(NMM22, NEMSGLOBAL, NEMSGLOBAL_E, NEMS12, NEMS12_E and NEMS4) are
+switched off once, with their history kept; a model switched back on
+afterwards stays on across restarts. The first scoring pass after the
+update rewrites the stored meteoblue mean once. A verification run that
+was already queued when the update installs fails once because its
+feed list changed; the next nightly run starts on its own.
+
+The Sites page now shows, for each station whose latest stored reading
+is more than an hour old, how old that reading is.
+
+On the Sites page, a site's feed buttons now lock and show a status
+while a change applies. Asking for the state a feed is already in no
+longer reruns the rebuild, and the page says nothing changed. The
+subscription API response and the `providers enable` and
+`providers disable` command output gain a `changed` field. Deleting a
+site and removing a station from a site now ask for confirmation first.
+
+The database schema moves to `user_version 9`. Once a database has been
+opened by this version, it can no longer be opened by 0.16.10 or
+earlier. Back up the add-on before upgrading; going back means restoring
+that backup.
+
 ## 0.16.10
 
 The Sites card and the verification page now show a site's rain

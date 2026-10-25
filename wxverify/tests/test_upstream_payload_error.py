@@ -298,7 +298,7 @@ def test_success_path_stays_untouched() -> None:
         ) as diagnose_spy,
     ):
         result = _run(_fetch_hourly_via(handler))
-    assert len(result) == 3  # temperature + wind + precip (first-row increment = total)
+    assert len(result) == 2  # temperature + precip (first-row increment = total)
     # _diagnose must only build diagnostics on the raising path -- the
     # success path must never call it.
     diagnose_spy.assert_not_called()

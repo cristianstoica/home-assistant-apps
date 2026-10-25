@@ -14,8 +14,10 @@ published against silently stale inputs.
 Fixture discipline: a raw ``INSERT INTO daily_truth`` is never used on any
 path in this file. Every truth row is produced by a production function --
 ``materialize_daily_truth`` from raw ``observations`` seed rows (O11b, O11,
-O13, O13b) or by ``insert_station_observation`` driving the real consensus
-pipeline (O11c, O11d, O11e). O12 seeds a second, retired timezone
+O13, O13b) or by station rows driving the real consensus pipeline (O11c,
+O11d, O11e): temperature through ``insert_station_observation``, wind
+through ``seed_pair_max_wind`` (``write_station_observation`` then
+``materialize_consensus``). O12 seeds a second, retired timezone
 generation directly (permitted -- the fixture rule scopes ``daily_truth``
 only) to prove the gate's stored-row fetch is generation-scoped.
 
@@ -37,10 +39,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.helpers import asof_conn, asof_make_real_feed
+from tests.helpers import asof_conn, asof_make_real_feed, seed_pair_max_wind
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
-from wxverify.scoring.consensus import insert_station_observation
+from wxverify.scoring.consensus import (
+    insert_station_observation,
+    write_station_observation,
+)
 from wxverify.verification.engine import publish_verified_run
 from wxverify.verification.runs import published_run_id, run_config_from_row
 from wxverify.verification.truth import (
@@ -519,9 +523,10 @@ def test_o13b_the_identical_divergence_at_the_horizon_boundary_blocks_publish() 
 
 
 # ---------------------------------------------------------------------------
-# O11c / O11d / O11e -- seeded via insert_station_observation (the real
-# consensus pipeline), each isolating exactly ONE of the three compared
-# fields (value / eligible / covered_hours) so a mutant that drops any one
+# O11c / O11d / O11e -- seeded via station rows through the real consensus
+# pipeline (insert_station_observation for temperature, seed_pair_max_wind
+# for wind), each isolating exactly ONE of the three compared fields
+# (value / eligible / covered_hours) so a mutant that drops any one
 # comparison is caught by the oracle built to isolate it.
 # ---------------------------------------------------------------------------
 
@@ -569,9 +574,6 @@ def test_o11c_adjacent_station_driven_eligibility_flip_is_caught() -> None:
     claiming the o11d identifier."""
     conn = asof_conn()
     site_id, _feeds, generation_id = _make_site(conn)
-    # Old-style wind writes below: a fresh site opens in pair_max, where the
-    # insert guard drops them. Seeded before the run so its snapshot matches.
-    set_wind_basis_state(conn, site_id, "staging")
     day = "2026-06-01"
     station_id = _make_station(conn, site_id, "gate-station-eligibility")
     run_id = _drive_until_publish_pending(conn, site_id, {"trigger_date": "2026-06-06"})
@@ -592,15 +594,22 @@ def test_o11c_adjacent_station_driven_eligibility_flip_is_caught() -> None:
     # consensus (qc_flag='range' is filtered by the consensus SELECT):
     # covered_hours 24 -> 22, below the near-complete floor of 23.
     for hour in (3, 4):
-        changed = insert_station_observation(
+        seed_pair_max_wind(
             conn,
+            site_id=site_id,
             station_id=station_id,
-            variable="wind",
             valid_at=f"{day}T{hour:02d}:00:00Z",
             value=999.0,
-            source_raw="{}",
         )
-        assert changed
+    flagged = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM station_observations
+        WHERE station_id = ? AND variable = 'wind' AND qc_flag = 'range'
+        """,
+        (station_id,),
+    ).fetchone()
+    assert flagged is not None
+    assert int(flagged["n"]) == 2
     assert _stale_quantities(conn, site_id, day) == {"wind_max"}
 
     divergent = divergent_truth_in_horizon(
@@ -636,9 +645,6 @@ def test_o11d_byte_identical_reinsert_is_not_a_divergence_false_positive() -> No
     idempotent refetch, and must never wedge publication."""
     conn = asof_conn()
     site_id, _feeds, generation_id = _make_site(conn)
-    # Old-style wind writes below: a fresh site opens in pair_max, where the
-    # insert guard drops them. Seeded before the run so its snapshot matches.
-    set_wind_basis_state(conn, site_id, "staging")
     day = "2026-06-01"
     station_id = _make_station(conn, site_id, "gate-station-d")
     run_id = _drive_until_publish_pending(conn, site_id, {"trigger_date": "2026-06-06"})
@@ -648,15 +654,21 @@ def test_o11d_byte_identical_reinsert_is_not_a_divergence_false_positive() -> No
     # existing consensus exactly -- establishes the station_observations
     # row this test's re-insert will be byte-identical against, without
     # itself changing what the day's truth re-derives to.
-    primed = insert_station_observation(
+    seed_pair_max_wind(
         conn,
+        site_id=site_id,
         station_id=station_id,
-        variable="wind",
         valid_at=f"{day}T03:00:00Z",
         value=_WIND_VALUE,
-        source_raw="{}",
     )
-    assert primed is True
+    primed = conn.execute(
+        """
+        SELECT source_raw FROM station_observations
+        WHERE station_id = ? AND variable = 'wind' AND valid_at = ?
+        """,
+        (station_id, f"{day}T03:00:00Z"),
+    ).fetchone()
+    assert primed is not None
 
     stale_before = conn.execute(
         "SELECT COUNT(*) AS n FROM daily_truth WHERE site_id = ? AND stale = 1",
@@ -668,14 +680,16 @@ def test_o11d_byte_identical_reinsert_is_not_a_divergence_false_positive() -> No
     assert int(stale_before["n"]) == 1
 
     # Byte-identical re-insert: same station, same variable, same instant,
-    # same value, same source_raw -- the routine idempotent refetch.
-    changed = insert_station_observation(
+    # same value, same source_raw -- the routine idempotent refetch. The
+    # wind-history lane writes through write_station_observation and
+    # re-materializes only an hour whose write returned True.
+    changed = write_station_observation(
         conn,
         station_id=station_id,
         variable="wind",
         valid_at=f"{day}T03:00:00Z",
         value=_WIND_VALUE,
-        source_raw="{}",
+        source_raw=str(primed["source_raw"]),
     )
     assert changed is False
 

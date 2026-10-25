@@ -61,7 +61,6 @@ from wxverify.forecast.selection import (
 )
 from wxverify.forecast.wind_blend import (
     FALLBACK_NOT_ENOUGH_FEEDS,
-    FALLBACK_SWITCH_IN_PROGRESS,
     FLOOR_MS,
     MIN_FEEDS,
     MIN_OBS_HOURS,
@@ -368,7 +367,9 @@ def _candidate_universe(
         source = str(row["source"])
         model = str(row["model"])
         # Mirrors EXCLUDED_FEEDS_SQL (forecast/data.py): what the loader can
-        # never return, and therefore what can never be selected.
+        # never return, and therefore what can never be selected. The loader
+        # also drops feeds not served at the site (served_only), so those never
+        # reach sampled_feed_ids.
         loadable = not bool(row["is_virtual"]) and not (
             source == "meteoblue" and model == "multimodel"
         )
@@ -463,17 +464,9 @@ def _blend_hourly(
     return out
 
 
-#: ``policy.wind_method`` per serving mode (§11.5).
-_POLICY_WIND_METHOD: dict[str, str | None] = {
-    "weighted": WIND_METHOD,
-    "legacy": "legacy_blend_depth",
-    "closed": None,
-}
-
-
 @dataclass(frozen=True)
 class _ServedWind:
-    """A wind cell's recorded product outside legacy mode (§11.5)."""
+    """A wind cell's recorded product for wind (§11.5)."""
 
     feed_ids: list[int]
     #: The weights column: normalized weight per served feed; empty when none.
@@ -491,30 +484,17 @@ def _served_wind(
     legacy_max_ms: object,
     legacy_hourly: list[tuple[str, float]],
 ) -> _ServedWind:
-    """What the record stores for wind in ``weighted`` or ``closed`` mode.
+    """What the record stores for wind.
 
-    Weighted mode stores the weighted product the Forecast page serves (the
-    same :func:`choose_wind_feeds` and blends), and beside it the old
-    method's figures: ``legacy_max_ms`` over the clearing subset and
-    ``legacy_hourly`` blended over that same subset, the basis the old
-    outcomes were scored on. Closed mode stores no product: the row is still
-    written, with empty weights and ``wind_switch_in_progress``.
+    It stores the weighted product the Forecast page serves (the same
+    :func:`choose_wind_feeds` and blends), and beside it the old method's
+    figures: ``legacy_max_ms`` over the clearing subset and ``legacy_hourly``
+    blended over that same subset, the basis the old outcomes were scored on.
     """
-    if serving.mode == "closed":
-        return _ServedWind(
-            feed_ids=[],
-            weights={},
-            hourly=[],
-            displayed={
-                "max_ms": None,
-                "method": None,
-                "fallback_reason": FALLBACK_SWITCH_IN_PROGRESS,
-            },
-        )
     choice = choose_wind_feeds(
         candidates,
         {int(feed_id): k for feed_id, k in effective_cells.items()},
-        serving.weights or {},
+        serving.weights,
     )
     feed_ids = [c.feed_id for c in choice.selection.feeds]
     served = choice.selection.available
@@ -741,7 +721,11 @@ def compute_forecast_record(
     bounds = local_day_bounds(local_date, timezone)
     since_valid_at = isoformat_utc(bounds.start_utc)
     samples = load_future_samples(
-        conn, site_id=site_id, since_valid_at=since_valid_at, as_of=as_of
+        conn,
+        site_id=site_id,
+        since_valid_at=since_valid_at,
+        served_only=True,
+        as_of=as_of,
     )
     null_availability = count_null_availability_samples(
         conn, site_id=site_id, since_valid_at=since_valid_at
@@ -756,7 +740,8 @@ def compute_forecast_record(
     declared_window_days = get_number_setting(
         conn, "rolling_window_days", 30, minimum=1
     )
-    # One wind state per build, read inside the caller's snapshot (§11.5).
+    # One set of wind weights per build, read inside the caller's snapshot
+    # (§11.5).
     wind_serving = load_wind_serving(
         conn, site_id=site_id, timezone=timezone, today=local_date, as_of=as_of
     )
@@ -771,14 +756,14 @@ def compute_forecast_record(
             "window_days": declared_window_days,
             "rain_threshold_mm": rain_threshold_mm,
             "null_fetched_at_samples": null_availability,
-            "wind_method": _POLICY_WIND_METHOD[wind_serving.mode],
+            "wind_method": WIND_METHOD,
             "wind_weight_floor_ms": FLOOR_MS,
             "wind_training_days": TRAINING_DAYS,
             "wind_min_obs_hours": MIN_OBS_HOURS,
             "wind_min_run_hours": MIN_RUN_HOURS,
             "wind_min_training_days": MIN_TRAINING_DAYS,
             "wind_min_feeds": MIN_FEEDS,
-            "wind_basis": wind_serving.state,
+            "wind_basis": "pair_max",
         }
     )
     latency = int((at - snapshot_utc).total_seconds())
@@ -928,11 +913,11 @@ def compute_forecast_record(
                 str(fid): weight for fid in selected_ids
             }
             source_ids = selected_ids
-            if variable == "wind" and wind_serving.mode != "legacy":
-                # Outside legacy mode the served wind replaces the product
-                # computed above, which survives only as the legacy figures:
-                # the weighted feeds are selected, aggregated, displayed and
-                # scored alike, and the outcomes are the weighted hourly's.
+            if variable == "wind":
+                # The served wind replaces the product computed above, which
+                # survives only as the legacy figures: the weighted feeds are
+                # selected, aggregated, displayed and scored alike, and the
+                # outcomes are the weighted hourly's.
                 served_wind = _served_wind(
                     wind_serving,
                     candidates=candidates,
@@ -1083,6 +1068,7 @@ def assess_record_day(
         conn,
         site_id=site_id,
         since_valid_at=isoformat_utc(bounds.start_utc),
+        served_only=True,
         as_of=as_of,
     )
     grouped = _group_samples(samples, timezone=timezone, now=snapshot_utc)

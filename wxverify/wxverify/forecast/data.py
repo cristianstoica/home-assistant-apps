@@ -11,6 +11,9 @@ incidentally via intersections):
 * samples failing :func:`invalid_forecast_sample_sql` (out-of-range values,
   unknown variables, malformed timestamps, ``lead_hours < 1``) are dropped,
   which is also what filters negative precip out of daily totals.
+
+The sample loader adds one more: feeds not served at the site, through
+``served_only`` on :func:`load_future_samples` (:func:`served_feed_ids`).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from wxverify.collection.forecast_validation import (
     invalid_forecast_sample_sql,
 )
 from wxverify.core.timeutil import parse_utc
+from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import (
     LeaderboardRow,
     LeaderboardStatus,
@@ -94,11 +98,34 @@ class ForecastRanking:
     status: LeaderboardStatus
 
 
+def served_feed_ids(conn: sqlite3.Connection, *, site_id: int) -> frozenset[int]:
+    """Real feeds served at ``site_id``: the Leaderboard rule, minus virtual
+    feeds and the meteoblue package row. Same set as ``roster_feeds``.
+
+    Reads on ``conn`` inside whatever snapshot the caller holds; it opens no
+    transaction of its own.
+    """
+    clause = active_competitor_clause(site_expr=str(int(site_id)))
+    rows = conn.execute(
+        f"""
+        SELECT f.id
+        FROM feeds f
+        LEFT JOIN site_feed_state sfs
+          ON sfs.site_id = ? AND sfs.feed_id = f.id
+        WHERE {EXCLUDED_FEEDS_SQL}
+          AND {clause}
+        """,
+        (site_id,),
+    ).fetchall()
+    return frozenset(int(row[0]) for row in rows)
+
+
 def load_future_samples(
     conn: sqlite3.Connection,
     *,
     site_id: int,
     since_valid_at: str,
+    served_only: bool,
     as_of: str | None = None,
 ) -> list[FutureSampleRow]:
     """Load the latest-run future samples for a site.
@@ -119,6 +146,11 @@ def load_future_samples(
     are excluded (count them via :func:`count_null_availability_samples` and
     record :data:`SAMPLE_EXCLUDE_NULL_FETCHED_AT`). With ``as_of=None`` the
     statement is byte-identical to the production one.
+
+    ``served_only`` has no default so each caller states its policy: when
+    True, rows whose feed is not in :func:`served_feed_ids` are dropped after
+    the read, in Python, leaving the statement untouched. The simulation
+    passes False because it filters to its pinned roster.
     """
     invalid = invalid_forecast_sample_sql("fs")
     variables = ", ".join(f"'{variable}'" for variable in FORECAST_VARIABLES)
@@ -155,6 +187,7 @@ def load_future_samples(
         """,
         (site_id, since_valid_at, *asof_params),
     ).fetchall()
+    served = served_feed_ids(conn, site_id=site_id) if served_only else None
     return [
         FutureSampleRow(
             feed_id=int(row["feed_id"]),
@@ -166,6 +199,7 @@ def load_future_samples(
             value=float(row["value"]),
         )
         for row in rows
+        if served is None or int(row["feed_id"]) in served
     ]
 
 

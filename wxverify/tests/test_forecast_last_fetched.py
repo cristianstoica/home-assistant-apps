@@ -41,7 +41,6 @@ from wxverify.collection.forecast_fetcher import persist_fetch_result
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import forecast_fingerprint, samples_fingerprint
 from wxverify.forecast.service import build_forecast
@@ -70,9 +69,6 @@ def _make_db() -> sqlite3.Connection:
         VALUES (1, 'Test Site', 40.0, -105.0, 900.0, 'UTC')
         """
     )
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
     return conn
 
 
@@ -155,12 +151,12 @@ def _render_tiles(*, site_id: int, view: object) -> str:
     )
 
 
-def _wind_sample(
+def _temp_sample(
     *, issued_at: str, valid_at: str, lead_hours: int, value: float = 5.0
 ) -> NormalizedSample:
     return NormalizedSample(
         model="ecmwf_ifs",
-        variable="wind",
+        variable="temperature",
         issued_at=issued_at,
         valid_at=valid_at,
         lead_hours=lead_hours,
@@ -170,35 +166,34 @@ def _wind_sample(
     )
 
 
-def _baseline_wind_batch() -> list[NormalizedSample]:
-    """5-hour wind batch -- the same shape as the known-good ``available``
-    fixture in tests/test_forecast_service.py's
-    ``test_wind_partial_badge_when_under_coverage_tile_stays_populated``
-    (wind alone does not need the >=18h clearing subset, nor a skill score,
-    to leave ``CellMeta.available`` True).
+def _baseline_temp_batch() -> list[NormalizedSample]:
+    """5-hour temperature batch: a selected feed leaves ``CellMeta.available``
+    True without a skill score, and when no feed clears the >=18h subset
+    every selected feed still contributes (``clearing_subset``), so this
+    feed is the cell's contributor.
 
     Fixed 2026-07-20 stamps -- only valid against a caller-supplied,
     equally-fixed ``now`` (``build_forecast(..., now=...)``). Never use this
     against a harness that reads the REAL wall clock (``load_future_samples``
     filters to ``since_valid_at=local_day_start(now, tz)``): see
-    ``_future_wind_batch`` for that case."""
+    ``_future_temp_batch`` for that case."""
     return [
-        _wind_sample(issued_at="2026-07-19T20:00:00Z", valid_at=v, lead_hours=i + 1)
+        _temp_sample(issued_at="2026-07-19T20:00:00Z", valid_at=v, lead_hours=i + 1)
         for i, v in enumerate(_hours("2026-07-20", 4, 5))
     ]
 
 
-def _future_wind_batch() -> list[NormalizedSample]:
-    """5-hour wind batch anchored to the REAL wall clock, for harnesses that
-    call ``build_forecast`` without a fixed ``now`` (the route/HTTP test) --
-    ``load_future_samples`` filters to today-local-midnight-or-later, so a
+def _future_temp_batch() -> list[NormalizedSample]:
+    """5-hour temperature batch anchored to the REAL wall clock, for harnesses
+    that call ``build_forecast`` without a fixed ``now`` (the route/HTTP test)
+    -- ``load_future_samples`` filters to today-local-midnight-or-later, so a
     fixed historical batch would silently produce an empty view there."""
     # microsecond=0: the shared validator's timestamp shape check
     # (FORECAST_TIMESTAMP_LIKE) requires no fractional seconds, or every
     # sample reads as invalid and the fetch never advances the stamp.
     issued = utc_now().replace(microsecond=0)
     return [
-        _wind_sample(
+        _temp_sample(
             issued_at=isoformat_utc(issued),
             valid_at=isoformat_utc(issued + timedelta(hours=i + 1)),
             lead_hours=i + 1,
@@ -219,7 +214,7 @@ def test_fetch_age_label_and_title() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_id,
-        variable="wind",
+        variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=_hours("2026-07-20", 4, 5),
         value=5.0,
@@ -257,7 +252,7 @@ def test_unknown_fallback_no_stamp_omits_data_updated_at() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_id,
-        variable="wind",
+        variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=_hours("2026-07-20", 4, 5),
         value=5.0,
@@ -291,7 +286,7 @@ def test_unparseable_stamp_alone_reads_as_unknown_and_fingerprint_ignores_it() -
     _seed_hourly(
         conn,
         feed_id=feed_id,
-        variable="wind",
+        variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=_hours("2026-07-20", 4, 5),
         value=5.0,
@@ -320,13 +315,13 @@ def test_unparseable_stamp_paired_with_valid_stamp_keeps_the_good_one() -> None:
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
-    # Full local day on BOTH feeds so both land in the wind cell's
+    # Full local day on BOTH feeds so both land in the temperature cell's
     # contributor_ids (mirrors test_newest_across_feeds_picks_the_later_...).
     valid_ats = _hours("2026-01-01", 0, 24)
     _seed_hourly(
         conn,
         feed_id=feed_a,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=5.0,
@@ -334,7 +329,7 @@ def test_unparseable_stamp_paired_with_valid_stamp_keeps_the_good_one() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_b,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=6.0,
@@ -363,7 +358,7 @@ def test_blob_stamp_is_skipped_by_forecast_fingerprints_non_string_guard() -> No
     _seed_hourly(
         conn,
         feed_id=feed_id,
-        variable="wind",
+        variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=_hours("2026-07-20", 4, 5),
         value=5.0,
@@ -399,7 +394,7 @@ def test_blob_stamp_is_skipped_by_forecast_fingerprints_non_string_guard() -> No
 def test_duplicates_only_fetch_moves_label_advances_forecast_fingerprint_only() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    batch = _baseline_wind_batch()
+    batch = _baseline_temp_batch()
 
     outcome1 = persist_fetch_result(
         conn,
@@ -460,7 +455,7 @@ def test_no_op_fetch_leaves_label_and_forecast_fingerprint_unchanged() -> None:
         site_id=1,
         source="open-meteo",
         fetch_feed_id=feed_id,
-        result=FetchResult(samples=_baseline_wind_batch()),
+        result=FetchResult(samples=_baseline_temp_batch()),
         fetched_at="2026-07-20T01:00:00Z",
     )
     conn.commit()
@@ -472,7 +467,7 @@ def test_no_op_fetch_leaves_label_and_forecast_fingerprint_unchanged() -> None:
 
     no_op = NormalizedSample(
         model="ecmwf_ifs",
-        variable="wind",
+        variable="temperature",
         issued_at="2026-07-20T00:00:00Z",
         valid_at="2026-07-20T00:00:00Z",
         lead_hours=0,  # < 1 -> never counted as usable
@@ -507,7 +502,7 @@ def test_error_fetch_leaves_label_and_forecast_fingerprint_unchanged() -> None:
         site_id=1,
         source="open-meteo",
         fetch_feed_id=feed_id,
-        result=FetchResult(samples=_baseline_wind_batch()),
+        result=FetchResult(samples=_baseline_temp_batch()),
         fetched_at="2026-07-20T01:00:00Z",
     )
     conn.commit()
@@ -549,13 +544,13 @@ def test_newest_across_feeds_picks_the_later_stamp_not_earlier() -> None:
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
     # Full local day (24h) on BOTH feeds so both individually clear the
-    # >=18h coverage guard and both land in the wind cell's
+    # >=18h coverage guard and both land in the temperature cell's
     # contributor_ids (clearing_subset keeps every feed that clears alone).
     valid_ats = _hours("2026-01-01", 0, 24)
     _seed_hourly(
         conn,
         feed_id=feed_a,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=5.0,
@@ -563,7 +558,7 @@ def test_newest_across_feeds_picks_the_later_stamp_not_earlier() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_b,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=6.0,
@@ -598,7 +593,7 @@ def test_last_fetched_uses_parsed_instant_not_raw_string_order() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_a,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=5.0,
@@ -606,7 +601,7 @@ def test_last_fetched_uses_parsed_instant_not_raw_string_order() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_b,
-        variable="wind",
+        variable="temperature",
         issued_at="2025-12-31T18:00:00Z",
         valid_ats=valid_ats,
         value=6.0,
@@ -708,11 +703,8 @@ def test_route_duplicates_only_serves_moved_label_and_drops_unknown_badge(
     see the note at the final assertions."""
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, site_id, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    batch = _future_wind_batch()  # real wall clock: no fixed `now` here
+    batch = _future_temp_batch()  # real wall clock: no fixed `now` here
 
     # Samples land WITHOUT going through persist_fetch_result, so no
     # site_feed_state row -- and hence no stamp -- exists yet.

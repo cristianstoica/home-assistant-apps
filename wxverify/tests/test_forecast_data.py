@@ -202,7 +202,9 @@ def test_latest_run_pick_keeps_newest_issued_at_value() -> None:
         valid_at="2026-07-01T00:00:00Z",
         value=20.0,
     )
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     assert len(rows) == 1
     assert rows[0].value == 20.0
     assert rows[0].issued_at == "2026-06-30T00:00:00Z"
@@ -227,7 +229,9 @@ def test_stray_negative_precip_filtered_boundary_zero_included() -> None:
         valid_at="2026-07-01T01:00:00Z",
         value=0.0,
     )
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     values = [row.value for row in rows]
     assert -1.0 not in values
     assert 0.0 in values
@@ -265,7 +269,9 @@ def test_virtual_and_meteoblue_package_samples_excluded_member_included() -> Non
         value=5.0,
     )
 
-    rows = load_future_samples(conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z")
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
     feed_ids = {row.feed_id for row in rows}
     assert persistence_id not in feed_ids
     assert package_id not in feed_ids
@@ -292,7 +298,9 @@ def test_since_valid_at_boundary_inclusive_at_exclusive_before() -> None:
         valid_at="2026-06-30T23:00:00Z",
         value=2.0,
     )
-    rows = load_future_samples(conn, site_id=1, since_valid_at=cutoff)
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at=cutoff, served_only=False
+    )
     values = [row.value for row in rows]
     assert values == [1.0]
 

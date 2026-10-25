@@ -19,8 +19,8 @@ there). This file covers F-T6 through F-T31:
   when their contributor sets differ, and roll up identically to
   ``today``'s state when the contributor set is shared, swept over fresh,
   stale, low-confidence and low-confidence-plus-rebuilding.
-* F-T27 — wind stays immune to temperature's extrema-side state, for both
-  the warning badges and the stale badge. (Its precipitation half moved to
+* F-T27 — retired with the old wind method: weighted wind's state ignores
+  the ranking, and it has no extrema set. (Its precipitation half moved to
   ``tests/test_forecast_precip_coverage.py`` G-T23 through G-T26 once
   precipitation adopted its own extrema-coverage rule under Item G.)
 * F-T28 through F-T30 — tile-level state/confidence-state rollup across
@@ -46,10 +46,8 @@ from types import SimpleNamespace
 
 from tests.helpers import asof_persistence_feed_id
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
-from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_INSUFFICIENT,
     covers_local_day,
@@ -688,17 +686,13 @@ def test_hourly_drilldown_survives_temperature_suppression() -> None:
 
 
 # ===========================================================================
-# F-T17 -- wind stays untouched while temperature suppresses; precipitation
-# now shares temperature's extrema-coverage rule (Item G), so the SAME 12h
-# partial fixture suppresses precip too.
+# F-T17 -- precipitation shares temperature's extrema-coverage rule (Item G),
+# so the SAME 12h partial fixture suppresses both.
 # ===========================================================================
 
 
-def test_wind_untouched_while_temperature_and_precip_suppress() -> None:
+def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
     conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 14, 0, tzinfo=UTC)
 
@@ -714,14 +708,6 @@ def test_wind_untouched_while_temperature_and_precip_suppress() -> None:
     _seed_hourly(
         conn,
         feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=valid_ats,
-        value=5.0,
-    )
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
         variable="precip",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=valid_ats,
@@ -733,12 +719,6 @@ def test_wind_untouched_while_temperature_and_precip_suppress() -> None:
     )
     today = view.tiles[0]
     assert today.temp.meta.extrema_unavailable is True  # temperature suppressed
-
-    # Wind never consults extrema_eligible: the same 12h partial fixture
-    # still aggregates, tagged "partial" rather than suppressed.
-    assert today.wind.meta.extrema_unavailable is False
-    assert today.wind.max_kmh == ms_to_kmh(5.0)
-    assert today.wind.meta.partial is True
 
     # Precipitation (Item G) now shares temperature's rule: 12 of 24 hours
     # is short of a whole local day covered exactly once, so the feed is
@@ -1801,7 +1781,7 @@ def test_shared_contributor_set_confidence_states_are_independent_per_side() -> 
     # (extrema set == blend set, not just both confidence-linked) is
     # exercised separately below, in
     # ``test_shared_contributor_set_states_roll_up_identically_to_today``;
-    # its stale+rebuilding-beside-low-confidence-wind case is F-T28(5).
+    # its stale+rebuilding-beside-low-confidence-cell case is F-T28(5).
 
     # Case 1: both confident -- normal/normal, no badges.
     conn = _make_db()
@@ -1960,8 +1940,8 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     # clearing subset exactly. Swept over fresh, stale, low-confidence and
     # low-confidence-plus-rebuilding: in every state the two sides read
     # identically, because they ARE the same ranking over the same
-    # candidates. The plan's stale-rebuilding-beside-a-low-confidence-wind-
-    # cell case is F-T28(5), not repeated here.
+    # candidates. The plan's stale-rebuilding-beside-a-low-confidence-cell
+    # case is F-T28(5), not repeated here.
 
     # Fresh, both confident.
     conn = _make_db()
@@ -2034,143 +2014,17 @@ def test_shared_contributor_set_states_roll_up_identically_to_today() -> None:
     assert '<span class="badge warn">low confidence</span>' not in html
 
 
-def test_wind_warnings_unchanged_while_temperature_extrema_differs() -> None:
-    # F-T27: wind never has an extrema set (``extrema_state`` is always
-    # "not_available" for it per ``_cell_meta_and_values``), so its own
-    # state/stale/badge reads must be driven purely by its normal aggregate
-    # set, unaffected by the temperature extrema-side low-confidence signal
-    # this fixture also carries. Precipitation now shares temperature's
-    # extrema-coverage rule (Item G) and is covered separately by
-    # G-T23-G-T26, not re-derived here.
-    conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    feed_a, feed_b = _seed_ab_fixture(conn, seed_b_scoring=False)
-    wind_ats = _hours(_AB_VALID_DAY, 0, 20)
-    _seed_hourly(
-        conn,
-        feed_id=feed_a,
-        variable="wind",
-        issued_at=_AB_FRESH_ISSUED,
-        valid_ats=wind_ats,
-        value=5.0,
-    )
-    # Give wind ITS OWN confident ranking (own scoring pairs + cache, same
-    # shape as temperature's) -- so its "normal" read below is a genuine
-    # positive, not just the default absence of any wind scoring pairs
-    # (which would read low_confidence regardless of temperature and prove
-    # nothing about independence).
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="wind", day_ahead=0, forecast=5.02
-    )
-    _seed_complete_score_cache(conn, variable="wind", day_ahead=0)
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    today = view.tiles[0]
-    # Temperature's extrema side IS low-confidence (paired control: proves
-    # the fixture actually exercises the case wind must stay immune to).
-    assert today.temp.meta.extrema_state == "low_confidence"
-    assert today.wind.meta.extrema_state == "not_available"
-    assert today.wind.meta.extrema_unavailable is False
-    assert today.wind.meta.state == "normal"
-
-
-def test_wind_stale_badge_unaffected_by_temperature_extrema_state() -> None:
-    # L4: paired stale variant of the test above -- wind's own ``stale``
-    # read comes from its own feed's freshness, independent of
-    # temperature's extrema-side state carried by the same shared fixture.
-    # ``load_feed_freshness`` judges staleness PER FEED (one last usable
-    # fetch shared by ALL that feed's variables), so wind uses a feed
-    # EXCLUSIVE to it (icon_global) rather than feed_a, whose fresh fetch
-    # stamp would otherwise mask a stale wind one.
-    conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_ab_fixture(conn, seed_b_scoring=False)
-    wind_feed = _feed_id(conn, "open-meteo", "icon_global")
-    wind_ats = _hours(_AB_VALID_DAY, 0, 20)
-    _seed_hourly(
-        conn,
-        feed_id=wind_feed,
-        variable="wind",
-        issued_at=_AB_STALE_ISSUED,
-        valid_ats=wind_ats,
-        value=5.0,
-    )
-    _stamp_usable_fetch(conn, feed_id=wind_feed, at=_AB_STALE_ISSUED)
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=wind_feed, variable="wind", day_ahead=0, forecast=5.02
-    )
-    _seed_complete_score_cache(conn, variable="wind", day_ahead=0)
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    today = view.tiles[0]
-    # Paired control: temperature's extrema side is still low-confidence,
-    # proving this is the same shared fixture as the test above.
-    assert today.temp.meta.extrema_state == "low_confidence"
-    assert today.wind.meta.stale is True
-    assert today.wind.meta.extrema_unavailable is False
-    html = _render_tiles(site_id=1, view=view)
-    assert _STALE_BADGE in html
-
-
-def _seed_wind_confident(
-    conn: sqlite3.Connection, *, feed_id: int, issued_at: str, persistence_id: int
-) -> None:
-    """Wind's own confident ranking (F-T27's shape): a genuine "normal"
-    read, not the rung-3 low_confidence default absent any scoring pairs.
-    """
-    wind_ats = _hours(_AB_VALID_DAY, 0, 20)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at=issued_at,
-        valid_ats=wind_ats,
-        value=5.0,
-    )
-    _stamp_usable_fetch(conn, feed_id=feed_id, at=issued_at)
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="wind", day_ahead=0, forecast=3.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_id, variable="wind", day_ahead=0, forecast=5.02
-    )
-    _seed_complete_score_cache(conn, variable="wind", day_ahead=0)
-
-
 def test_tile_level_rollup_across_variables() -> None:
     # F-T28: ``DayTile.stale`` and ``DayTile.confidence_state`` roll up
-    # across cells (temperature, wind, precip), not just within a single
+    # across cells (here temperature and precip), not just within a single
     # cell's own blend/extrema split -- five independent sub-fixtures, each
     # isolating one source of a tile-level signal.
 
     # (1) Only temperature's extrema contributor (B) is stale -- the same
     # per-cell signal F-T22 pins, checked here at the TILE level.
     conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    feed_a, _feed_b = _seed_ab_fixture(
+    _seed_ab_fixture(
         conn, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_STALE_ISSUED
-    )
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_wind_confident(
-        conn, feed_id=feed_a, issued_at=_AB_FRESH_ISSUED, persistence_id=persistence_id
     )
     conn.commit()
     view = build_forecast(
@@ -2178,55 +2032,56 @@ def test_tile_level_rollup_across_variables() -> None:
     )
     assert view.tiles[0].stale is True
 
-    # (2) Only wind's own clearing subset is stale -- temperature fully
-    # fresh, proving the tile-level ``stale`` union reaches wind's cell too,
-    # not only temperature's. Wind uses a THIRD feed (never touched by
-    # temperature) rather than feed_a: ``load_feed_freshness`` judges
-    # staleness per FEED on one last usable fetch shared by ALL that feed's
-    # variables (``wxverify/forecast/data.py``), so a stale wind cell on
-    # feed_a would be masked by that same feed's fresh stamp -- the trap
-    # this isolation avoids.
+    # (2) Only precipitation's own clearing subset is stale -- temperature
+    # fully fresh, proving the tile-level ``stale`` union reaches another
+    # cell too, not only temperature's. Precipitation uses a THIRD feed
+    # (never touched by temperature) rather than feed_a:
+    # ``load_feed_freshness`` judges staleness per FEED on one last usable
+    # fetch shared by ALL that feed's variables (``wxverify/forecast/data.py``),
+    # so a stale precipitation cell on feed_a would be masked by that same
+    # feed's fresh stamp -- the trap this isolation avoids.
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    _feed_a, _feed_b = _seed_ab_fixture(conn)
-    wind_feed = _feed_id(conn, "open-meteo", "icon_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_wind_confident(
+    _seed_ab_fixture(conn)
+    precip_feed = _feed_id(conn, "open-meteo", "icon_global")
+    _seed_hourly(
         conn,
-        feed_id=wind_feed,
+        feed_id=precip_feed,
+        variable="precip",
         issued_at=_AB_STALE_ISSUED,
-        persistence_id=persistence_id,
+        valid_ats=_hours(_AB_VALID_DAY, 0, 20),
+        value=0.5,
     )
+    _stamp_usable_fetch(conn, feed_id=precip_feed, at=_AB_STALE_ISSUED)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
     assert today.temp.meta.stale is False  # isolates which cell carries it
+    assert today.precip.meta.stale is True
     assert today.stale is True
 
-    # (3) Only a low-confidence WIND cell -- no scoring pairs at all for
-    # wind (rung 3) beside a fully confident temperature. Because
-    # ``DayTile.state`` rolls up cells' plain ``state`` (not ``extrema_state``),
-    # a low-confidence BLEND-side cell (unlike case (4) below) moves both
-    # ``state`` and ``confidence_state`` together.
+    # (3) Only a low-confidence PRECIPITATION cell -- no scoring pairs at all
+    # for precipitation (rung 3) beside a fully confident temperature.
+    # Because ``DayTile.state`` rolls up cells' plain ``state`` (not
+    # ``extrema_state``), a low-confidence BLEND-side cell (unlike case (4)
+    # below) moves both ``state`` and ``confidence_state`` together.
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
     feed_a, _feed_b = _seed_ab_fixture(conn)
     _seed_hourly(
         conn,
         feed_id=feed_a,
-        variable="wind",
+        variable="precip",
         issued_at=_AB_FRESH_ISSUED,
         valid_ats=_hours(_AB_VALID_DAY, 0, 20),
-        value=5.0,
+        value=0.5,
     )
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
-    assert today.wind.meta.state == "low_confidence"
+    assert today.precip.meta.state == "low_confidence"
     assert today.state == "low_confidence"
     assert today.confidence_state == "low_confidence"
     html = _render_tiles(site_id=1, view=view)
@@ -2234,16 +2089,11 @@ def test_tile_level_rollup_across_variables() -> None:
     assert '<span class="badge warn">low confidence</span>' in html
 
     # (4) Only temperature's EXTREMA set is low-confidence (blend side
-    # confident, wind confident) -- ``state`` (CSS class) stays "normal"
-    # because it never looks at ``extrema_state``, while ``confidence_state``
-    # (badges) picks it up, the pairing F.6 requires kept independent.
+    # confident) -- ``state`` (CSS class) stays "normal" because it never
+    # looks at ``extrema_state``, while ``confidence_state`` (badges) picks
+    # it up, the pairing F.6 requires kept independent.
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    feed_a, _feed_b = _seed_ab_fixture(conn, seed_b_scoring=False)
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_wind_confident(
-        conn, feed_id=feed_a, issued_at=_AB_FRESH_ISSUED, persistence_id=persistence_id
-    )
+    _seed_ab_fixture(conn, seed_b_scoring=False)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -2251,7 +2101,6 @@ def test_tile_level_rollup_across_variables() -> None:
     today = view.tiles[0]
     assert today.temp.meta.state == "normal"
     assert today.temp.meta.extrema_state == "low_confidence"
-    assert today.wind.meta.state == "normal"
     assert today.state == "normal"
     assert today.confidence_state == "low_confidence"
     html = _render_tiles(site_id=1, view=view)
@@ -2259,12 +2108,11 @@ def test_tile_level_rollup_across_variables() -> None:
     assert '<span class="badge warn">low confidence</span>' in html
 
     # (5) Temperature's extrema set is rebuilding (F-T30's construction)
-    # BESIDE a low-confidence wind cell -- the rollup's precedence (low
-    # confidence outranks rebuilding) must resolve ACROSS cells, not only
-    # within one cell's own blend/extrema pair: the badge row shows "low
-    # confidence" alone, never "ranking updating" beside it.
+    # BESIDE a low-confidence precipitation cell -- the rollup's precedence
+    # (low confidence outranks rebuilding) must resolve ACROSS cells, not
+    # only within one cell's own blend/extrema pair: the badge row shows
+    # "low confidence" alone, never "ranking updating" beside it.
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     persistence_id = _feed_id(conn, "virtual", "_persistence")
@@ -2299,14 +2147,14 @@ def test_tile_level_rollup_across_variables() -> None:
     _seed_scoring_pairs(
         conn, feed_id=feed_b, variable="temperature", day_ahead=1, forecast=9.0
     )
-    # Wind: no scoring pairs at all -- low-confidence (rung 3).
+    # Precipitation: no scoring pairs at all -- low-confidence (rung 3).
     _seed_hourly(
         conn,
         feed_id=feed_a,
-        variable="wind",
+        variable="precip",
         issued_at=_AB_FRESH_ISSUED,
         valid_ats=a_ats,
-        value=5.0,
+        value=0.5,
     )
     conn.commit()
     view = build_forecast(
@@ -2314,24 +2162,19 @@ def test_tile_level_rollup_across_variables() -> None:
     )
     today = view.tiles[0]
     assert today.temp.meta.extrema_state == "rebuilding"
-    assert today.wind.meta.state == "low_confidence"
+    assert today.precip.meta.state == "low_confidence"
     assert today.confidence_state == "low_confidence"
     html = _render_tiles(site_id=1, view=view)
     assert '<span class="badge warn">low confidence</span>' in html
     assert '<span class="badge muted">ranking updating</span>' not in html
 
-    # (6) None of the above -- both temperature and wind fully confident
-    # and fresh, precip left unpopulated (``not_available``, ignored by
-    # both rollups): no badge row renders at all. Paired negative for every
+    # (6) None of the above -- temperature fully confident and fresh, wind
+    # and precip left unpopulated (``not_available``, ignored by both
+    # rollups): no badge row renders at all. Paired negative for every
     # positive badge assertion above -- proves the badge row isn't ambiently
     # present regardless of state.
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    feed_a, _feed_b = _seed_ab_fixture(conn)
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    _seed_wind_confident(
-        conn, feed_id=feed_a, issued_at=_AB_FRESH_ISSUED, persistence_id=persistence_id
-    )
+    _seed_ab_fixture(conn)
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW

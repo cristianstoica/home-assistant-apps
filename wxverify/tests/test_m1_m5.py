@@ -18,6 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.helpers import seed_pair_max_wind
 from wxverify import __version__, config
 from wxverify.api.app import _default_stop_process, _stop_on_worker_done, create_app
 from wxverify.api.routes.feeds import _rebuild_mean_for_site
@@ -34,7 +35,6 @@ from wxverify.db.queue import (
     reclaim_all_stale,
 )
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.feeds.meteoblue import MeteoblueAdapter
 from wxverify.feeds.open_meteo import (
     OpenMeteoAdapter,
@@ -61,6 +61,7 @@ from wxverify.scoring.consensus import (
     StationReading,
     compute_consensus,
     insert_station_observation,
+    write_station_observation,
 )
 from wxverify.scoring.engine import pair_and_score
 from wxverify.scoring.leaderboard import (
@@ -829,12 +830,10 @@ def test_pws_parser_and_fetch_obs_refresh(
     )
     assert [(row.variable, row.valid_at) for row in parsed] == [
         ("temperature", "2026-01-01T01:00:00Z"),
-        ("wind", "2026-01-01T01:00:00Z"),
         ("precip", "2026-01-01T01:00:00Z"),
     ]
     assert parsed[0].value == 6.5
-    assert parsed[1].value == pytest.approx(10.0)
-    assert parsed[2].value == 0.3
+    assert parsed[1].value == 0.3
     precip_series = [
         row
         for row in observations_from_payload(
@@ -916,7 +915,6 @@ def test_pws_parser_and_fetch_obs_refresh(
     ranged = asyncio.run(read_history_range())
     assert [(row.variable, row.valid_at, row.value) for row in ranged] == [
         ("temperature", "2026-06-22T00:00:00Z", 2.0),
-        ("wind", "2026-06-22T00:00:00Z", pytest.approx(10.0)),
         ("precip", "2026-06-22T00:00:00Z", 0.2),
     ]
 
@@ -1587,9 +1585,6 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
                 (f"Catchup {index}", 40.0 + index),
             ).lastrowid
         )
-        # The hourly wind row below is an old-style row; a fresh site opens in
-        # pair_max, where the insert guard drops it, so hold it in staging.
-        set_wind_basis_state(conn, site_id, "staging")
         station_id = int(
             conn.execute(
                 """
@@ -1608,13 +1603,12 @@ def test_catchup_replays_open_meteo_and_continues_by_site(
             value=10.0 + index,
             source_raw="10.0 C",
         )
-        insert_station_observation(
+        seed_pair_max_wind(
             conn,
+            site_id=site_id,
             station_id=station_id,
-            variable="wind",
             valid_at="2026-06-23T00:00:00Z",
             value=3.0,
-            source_raw="10.8 km/h",
         )
         insert_station_observation(
             conn,
@@ -1761,9 +1755,6 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
             """
         ).lastrowid
     )
-    # The wind write below must reach the source_raw check; a fresh site opens
-    # in pair_max, where the insert guard skips wind writes before that check.
-    set_wind_basis_state(conn, site_id, "staging")
     station_id = int(
         conn.execute(
             """
@@ -1811,7 +1802,7 @@ def test_consensus_pairing_settings_and_cache_freshness(tmp_path: Path) -> None:
     assert obs["n_stations"] == 3
     assert obs["rejected_stations"] == 0
     try:
-        insert_station_observation(
+        write_station_observation(
             conn,
             station_id=station_id,
             variable="wind",

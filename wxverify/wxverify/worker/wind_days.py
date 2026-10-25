@@ -1,29 +1,26 @@
-"""The wind-history lane: raw station wind records, day by day, and the switch.
+"""The wind-history lane: raw station wind records, day by day.
 
 One ``fetch_obs`` job with the job key ``wind-days`` runs one bounded chunk
-for one site. In ``staging`` it fetches every past station-day's raw 5-minute
-records (counts only), then switches the site's station wind to
-``max_adjacent_pair_mean_wind``: pass (i) removes the old wind, pass (ii)
-installs the new, and a rescore follows. In ``pair_max`` it keeps today and
-yesterday current. ``switching`` and ``rescoring`` never call the provider.
+for one site. It fetches each station-day's raw 5-minute records and derives
+the pair-max hourly station wind (``max_adjacent_pair_mean_wind``). It keeps
+today and yesterday current, with a final call shortly before local midnight,
+and while the ``history_all`` hold is held it finishes past days with the
+records they have.
 
-The state machine is in :mod:`wxverify.db.wind_basis`; the lane's share of
-the weather.com budget is in :mod:`wxverify.collection.wind_quota`.
+The lane's share of the weather.com budget is in
+:mod:`wxverify.collection.wind_quota`.
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
-import os
-import shutil
 import sqlite3
 import statistics
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Final, Literal, LiteralString
+from typing import Final, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -53,40 +50,19 @@ from wxverify.core.timeutil import (
 from wxverify.core.units import kmh_to_ms
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.queue import enqueue_if_absent
-from wxverify.db.runtime_state import (
-    delete_runtime_state,
-    get_runtime_state,
-    set_runtime_state,
-    set_runtime_state_now,
-)
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
-    LEGACY_WIND_SQL,
     PAIR_MAX_WIND_SQL,
-    STATES,
     WIND_FINAL_LEAD,
     AuthHold,
     AuthHoldEndpoint,
-    WindCursor,
     clear_auth_hold,
     count_missed_final,
-    json_object,
-    julian_to_utc,
     read_auth_hold,
     read_auth_holds,
-    read_wind_cursor,
-    set_wind_basis_state,
-    stamp_wind_progress,
-    transition_wind_basis,
-    wind_basis_state,
-    wind_blocked_key,
-    wind_cursor_key,
-    wind_done_at_key,
-    wind_report_key,
     write_auth_hold,
-    write_wind_cursor,
 )
-from wxverify.forecast.wind_blend import MIN_OBS_HOURS, TRAINING_DAYS
+from wxverify.forecast.wind_blend import TRAINING_DAYS
 from wxverify.obs.pws_adapter import (
     UpstreamPayloadError,
     fetch_all_1day,
@@ -105,12 +81,6 @@ from wxverify.worker.domain_backoff import (
     record_http_backoff,
     source_domain,
 )
-from wxverify.worker.score_batches import (
-    SCORING_CAS_ATTEMPTS,
-    ScoringInputsBusy,
-    run_batched_scoring,
-    run_split_pair_phases,
-)
 from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
 
 logger = logging.getLogger(__name__)
@@ -118,14 +88,9 @@ logger = logging.getLogger(__name__)
 WIND_DAYS_JOB_KEY: Final = "wind-days"
 #: The scheduler's success cooldown between two lane jobs of one site.
 WIND_DAYS_SPACING: Final = timedelta(minutes=5)
-#: Free space the switch needs beside the database: max(2 x the peak growth
-#: measured in the copy rehearsal, 256 MiB), rounded up to a MiB (plan §17).
-WIND_SWITCH_MIN_FREE_BYTES: Final = 374 * 1024 * 1024
 
-_RESCORE_BUSY_DEFER: Final = timedelta(seconds=60)
 _CHUNK_CALLS: Final = 6
 _CHUNK_ROWS: Final = 24
-_DAY_TRANSACTIONS: Final = 14
 _MAX_ATTEMPTS: Final = 3
 _TRANSPORT_DEFER: Final = timedelta(minutes=15)
 _FINAL_RETRY_LEAD: Final = timedelta(minutes=20)
@@ -139,7 +104,6 @@ _EMPTY_YESTERDAY_RETRY: Final = timedelta(hours=4)
 _RECONCILE_RATIO: Final = 0.9
 _RECONCILE_POOL: Final = 7
 _RECONCILE_MIN: Final = 3
-_FAILED_FINAL_SHARE: Final = 0.10
 _ONE_HOUR: Final = timedelta(hours=1)
 _ONE_DAY: Final = timedelta(days=1)
 _ENDPOINTS: Final[tuple[AuthHoldEndpoint, ...]] = ("history_all", "all_1day")
@@ -361,17 +325,6 @@ def ensure_wind_days(
         )
 
 
-def _has_pair_max_rows(conn: sqlite3.Connection, site_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM station_observations so"
-        " JOIN stations s ON s.id = so.station_id"
-        " WHERE s.site_id = ? AND so.variable = 'wind'"
-        f" AND {PAIR_MAX_WIND_SQL} LIMIT 1",
-        (site_id,),
-    ).fetchone()
-    return row is not None
-
-
 def _missing_today_row(conn: sqlite3.Connection, site_id: int, today: date) -> bool:
     row = conn.execute(
         """
@@ -392,11 +345,6 @@ def wind_lane_due(
     conn: sqlite3.Connection, site_id: int, tz: ZoneInfo, *, now: datetime
 ) -> bool:
     """True when the site's lane has work: the scheduler's due test (plan §8.13)."""
-    state = wind_basis_state(conn, site_id)
-    if state not in STATES or state in ("switching", "rescoring"):
-        return True
-    if state == "staging" and _has_pair_max_rows(conn, site_id):
-        return True
     today = now.astimezone(tz).date()
     holds = read_auth_holds(conn)
     opened = open_endpoints(holds, probing_open=True)
@@ -406,8 +354,7 @@ def wind_lane_due(
         return True
     history = holds.get("history_all")
     if (
-        state == "pair_max"
-        and history is not None
+        history is not None
         and history.status == "held"
         and conn.execute(
             _FINISHABLE_SQL,
@@ -432,8 +379,6 @@ def wind_lane_due(
 @dataclass(frozen=True)
 class _JobStart:
     tz_name: str
-    state: str
-    has_pair_max: bool
     holds: dict[AuthHoldEndpoint, AuthHold]
 
 
@@ -450,20 +395,8 @@ def _start_job(conn: sqlite3.Connection, site_id: int) -> _JobStart:
         logger.warning("wind lane cancelled: unusable time zone site=%s", site_id)
         raise JobCancelled() from None
     ensure_wind_days(conn, site_id, tz, utc_now().astimezone(tz).date())
-    state = wind_basis_state(conn, site_id)
     holds = read_auth_holds(conn)
-    if state not in STATES:
-        logger.warning(
-            "wind basis unknown value reset to staging site=%s value=%r",
-            site_id,
-            state,
-        )
-        set_wind_basis_state(conn, site_id, "staging")
-        state = "staging"
-    has_pair_max = state == "staging" and _has_pair_max_rows(conn, site_id)
-    return _JobStart(
-        tz_name=tz_name, state=state, has_pair_max=has_pair_max, holds=holds
-    )
+    return _JobStart(tz_name=tz_name, holds=holds)
 
 
 async def run_wind_days(
@@ -478,30 +411,6 @@ async def run_wind_days(
     ``client`` is for tests; the job opens its own ``httpx.AsyncClient``.
     """
     start = await writer.write(lambda conn: _start_job(conn, site_id))
-    if start.state == "switching":
-        await _run_switching(writer, site_id, start.tz_name)
-        return
-    if start.state == "rescoring":
-        await _run_rescoring(writer, site_id)
-        return
-    if start.state == "staging":
-        if start.has_pair_max:
-            await _run_staging_purge(writer, site_id, start.tz_name)
-            return
-        free = _free_bytes(db.path)
-        try:
-            switched = await writer.write(
-                lambda conn: _switch_check(conn, site_id, start.tz_name, free)
-            )
-        except (sqlite3.Error, ValueError) as exc:
-            logger.warning(
-                "wind switch check failed, retried next job site=%s: %s",
-                site_id,
-                sanitized_exception(exc),
-            )
-            switched = False
-        if switched:
-            return
     if client is not None:
         await _run_fetch_chunk(db, writer, site_id, start, client)
         return
@@ -549,8 +458,7 @@ async def _run_fetch_chunk(
         tz_name=start.tz_name,
         today=today,
     )
-    if start.state == "pair_max":
-        await _finish_waiting_days(chunk, start)
+    await _finish_waiting_days(chunk, start)
     for endpoint in _ENDPOINTS:
         hold = start.holds.get(endpoint)
         if hold is None or hold.status != "probing":
@@ -796,7 +704,6 @@ async def _run_row(
                 chunk.writer,
                 lambda conn: _row_failure(
                     conn,
-                    site_id=site_id,
                     station_id=row.station_id,
                     local_date=row.local_date,
                     tz_name=chunk.tz_name,
@@ -829,7 +736,6 @@ async def _fetch_failed(
     exempt: bool,
 ) -> _FailureOutcome:
     """Record a failed call (not a probe). Raises ``JobDeferred`` where §8.7 says."""
-    site_id = chunk.site_id
     station_id = row.station_id
     local_date = row.local_date
     tz_name = chunk.tz_name
@@ -838,7 +744,6 @@ async def _fetch_failed(
     def failure(conn: sqlite3.Connection) -> None:
         _row_failure(
             conn,
-            site_id=site_id,
             station_id=station_id,
             local_date=local_date,
             tz_name=tz_name,
@@ -1103,11 +1008,8 @@ def _persist_day(
     records: Sequence[WindRecord],
     probe: AuthHoldEndpoint | None,
 ) -> None:
-    """Store one fetched station-day and advance its row (plan §8.5).
-
-    The site's state, read here, picks the persist: ``pair_max`` writes and
-    materializes pair-max station rows; any other state updates counts only.
-    """
+    """Store one fetched station-day, derive its pair-max station rows, and
+    advance its row."""
     now = utc_now()
     yesterday = today - _ONE_DAY
     start, end, _ = local_day_slots(local_date, tz_name)
@@ -1129,7 +1031,6 @@ def _persist_day(
         """,
         [(station_id, isoformat_utc(r.obs_at), r.speed_kmh) for r in kept],
     )
-    pair_max = wind_basis_state(conn, site_id) == "pair_max"
     _derive_days(
         conn,
         site_id=site_id,
@@ -1137,22 +1038,7 @@ def _persist_day(
         local_date=local_date,
         tz_name=tz_name,
         today=today,
-        write_rows=pair_max,
     )
-    if not pair_max:
-        legacy = conn.execute(
-            "SELECT COUNT(*) AS n FROM station_observations so"
-            " WHERE so.station_id = ? AND so.variable = 'wind'"
-            f" AND {LEGACY_WIND_SQL}"
-            " AND julianday(so.valid_at) >= julianday(?)"
-            " AND julianday(so.valid_at) < julianday(?)",
-            (station_id, isoformat_utc(start), isoformat_utc(end)),
-        ).fetchone()
-        conn.execute(
-            "UPDATE station_wind_days SET legacy_hours = ?"
-            " WHERE station_id = ? AND local_date = ?",
-            (int(legacy["n"]), station_id, local_date.isoformat()),
-        )
     row = _read_day(conn, station_id, local_date)
     if row is None:
         logger.warning(
@@ -1161,7 +1047,6 @@ def _persist_day(
             local_date,
         )
         return
-    old_status = str(row["status"])
     attempts = int(row["attempts"])
     refetch = _is_refetch(row)
     count_row = conn.execute(
@@ -1208,8 +1093,6 @@ def _persist_day(
     clear_domain_backoff(conn, source_domain("weathercom"))
     if probe is not None:
         clear_auth_hold(conn, probe)
-    if not refetch and local_date < yesterday and status != old_status:
-        stamp_wind_progress(conn, site_id)
 
 
 def _derive_days(
@@ -1220,10 +1103,9 @@ def _derive_days(
     local_date: date,
     tz_name: str,
     today: date,
-    write_rows: bool,
 ) -> None:
-    """Pair hours for d and its fetched/partial neighbours; in ``pair_max``
-    also write, delete and materialize the station rows."""
+    """Pair hours for d and its fetched/partial neighbours, and write, delete
+    and materialize the station rows."""
     days = [local_date]
     neighbours = conn.execute(
         """
@@ -1256,35 +1138,34 @@ def _derive_days(
             max(all_hours) + _ONE_HOUR,
         )
     pairs = pair_max_by_hour(records, all_hours)
-    if write_rows:
-        changed: set[datetime] = set()
-        for hour in sorted(pairs):
-            speed = pairs[hour]
-            if write_station_observation(
-                conn,
-                station_id=station_id,
-                variable="wind",
-                valid_at=isoformat_utc(hour),
-                value=kmh_to_ms(speed),
-                source_raw=f"pair-max {round(speed, 2)} km/h",
-            ):
-                changed.add(hour)
-        for hour in sorted(set(all_hours) - set(pairs)):
-            deleted = conn.execute(
-                "DELETE FROM station_observations WHERE id IN ("
-                " SELECT so.id FROM station_observations so"
-                " WHERE so.station_id = ? AND so.variable = 'wind'"
-                f" AND so.valid_at = ? AND {PAIR_MAX_WIND_SQL})",
-                (station_id, isoformat_utc(hour)),
-            ).rowcount
-            if deleted:
-                changed.add(hour)
-        for hour in sorted(changed):
-            _materialize(conn, site_id, isoformat_utc(hour))
-        if changed:
-            enqueue_if_absent(
-                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-            )
+    changed: set[datetime] = set()
+    for hour in sorted(pairs):
+        speed = pairs[hour]
+        if write_station_observation(
+            conn,
+            station_id=station_id,
+            variable="wind",
+            valid_at=isoformat_utc(hour),
+            value=kmh_to_ms(speed),
+            source_raw=f"pair-max {round(speed, 2)} km/h",
+        ):
+            changed.add(hour)
+    for hour in sorted(set(all_hours) - set(pairs)):
+        deleted = conn.execute(
+            "DELETE FROM station_observations WHERE id IN ("
+            " SELECT so.id FROM station_observations so"
+            " WHERE so.station_id = ? AND so.variable = 'wind'"
+            f" AND so.valid_at = ? AND {PAIR_MAX_WIND_SQL})",
+            (station_id, isoformat_utc(hour)),
+        ).rowcount
+        if deleted:
+            changed.add(hour)
+    for hour in sorted(changed):
+        _materialize(conn, site_id, isoformat_utc(hour))
+    if changed:
+        enqueue_if_absent(
+            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+        )
     for day in days:
         conn.execute(
             "UPDATE station_wind_days SET pair_hours = ?"
@@ -1390,7 +1271,6 @@ async def _finish_waiting_days(chunk: _Chunk, start: _JobStart) -> None:
             await chunk.writer.write(
                 lambda conn, sid=station_id, day=local_date, text=message: _row_failure(
                     conn,
-                    site_id=site_id,
                     station_id=sid,
                     local_date=day,
                     tz_name=tz_name,
@@ -1433,15 +1313,13 @@ def _finish_day(
 ) -> bool:
     """Finish one past row with the records it has (plan §4); False if gated.
 
-    The gate is an allowlist read in this transaction: the site is
-    ``pair_max``, the ``history_all`` hold is ``held``, and the row matches
-    ``_FINISHABLE_SQL``. A pending refetch on a fetched or unavailable row is
-    closed; any other row becomes fetched or unavailable and is derived as a
-    past day. ``attempts``, ``last_ok_at``, ``last_error``, the records and
-    the hold are left as they are.
+    The gate is an allowlist read in this transaction: the ``history_all``
+    hold is ``held`` and the row matches ``_FINISHABLE_SQL``. A pending
+    refetch on a fetched or unavailable row is closed; any other row becomes
+    fetched or unavailable and is derived as a past day. ``attempts``,
+    ``last_ok_at``, ``last_error``, the records and the hold are left as they
+    are.
     """
-    if wind_basis_state(conn, site_id) != "pair_max":
-        return False
     hold = read_auth_hold(conn, "history_all")
     if hold is None or hold.status != "held":
         return False
@@ -1499,7 +1377,6 @@ def _finish_day(
         local_date=local_date,
         tz_name=tz_name,
         today=today,
-        write_rows=True,
     )
     return True
 
@@ -1507,7 +1384,6 @@ def _finish_day(
 def _row_failure(
     conn: sqlite3.Connection,
     *,
-    site_id: int,
     station_id: int,
     local_date: date,
     tz_name: str,
@@ -1520,7 +1396,6 @@ def _row_failure(
         return
     now = utc_now()
     stamp = isoformat_utc(now)
-    old_status = str(row["status"])
     if _is_refetch(row):
         conn.execute(
             "UPDATE station_wind_days SET refetched = 1, last_error = ?,"
@@ -1541,7 +1416,6 @@ def _row_failure(
                 local_date.isoformat(),
             ),
         )
-        new_status = "partial"
     else:
         attempts = int(row["attempts"]) + 1
         retry = _FIRST_RETRY if attempts == 1 else _LATER_RETRY
@@ -1558,9 +1432,6 @@ def _row_failure(
                 local_date.isoformat(),
             ),
         )
-        new_status = "failed"
-    if local_date < today - _ONE_DAY and new_status != old_status:
-        stamp_wind_progress(conn, site_id)
 
 
 def _materialize(conn: sqlite3.Connection, site_id: int, valid_at: str) -> None:
@@ -1569,7 +1440,8 @@ def _materialize(conn: sqlite3.Connection, site_id: int, valid_at: str) -> None:
     A string that will not parse (an imported row) cannot go through
     ``materialize_consensus`` when the persistence feed exists, because that
     parses it. Such a string takes the same invalidation steps directly and
-    then deletes the observation, with a WARNING, so the switch cannot wedge.
+    then deletes the observation, with a WARNING, so one such hour cannot
+    stop ``_derive_days``.
     """
     try:
         parse_utc(valid_at)
@@ -1609,618 +1481,3 @@ def _invalidate_unparseable(
         " AND valid_at = ?",
         (site_id, valid_at),
     )
-
-
-# --- day windows -----------------------------------------------------------
-
-
-def _local_today(tz_name: str) -> date:
-    return utc_now().astimezone(ZoneInfo(tz_name)).date()
-
-
-def _julian_local_window(julian: float, tz_name: str) -> tuple[date, str, str] | None:
-    """The local day holding a julianday value, and its UTC bounds."""
-    try:
-        day = julian_to_utc(julian).astimezone(ZoneInfo(tz_name)).date()
-        start, end, _ = local_day_slots(day, tz_name)
-    except (ZoneInfoNotFoundError, ValueError, OverflowError, OSError):
-        return None
-    return day, isoformat_utc(start), isoformat_utc(end)
-
-
-def _range_sql(column: LiteralString) -> LiteralString:
-    """``[start, end)`` by julianday, or exactly the MIN; NULL bounds -> MIN only."""
-    return (
-        f"((julianday({column}) >= julianday(?)"
-        f" AND julianday({column}) < julianday(?))"
-        f" OR julianday({column}) = ?)"
-    )
-
-
-def _materialize_all(
-    conn: sqlite3.Connection, site_id: int, valid_ats: Collection[str]
-) -> None:
-    for valid_at in sorted(valid_ats):
-        _materialize(conn, site_id, valid_at)
-
-
-def _delete_station_rows(conn: sqlite3.Connection, ids: Sequence[int]) -> None:
-    conn.executemany(
-        "DELETE FROM station_observations WHERE id = ?", [(row_id,) for row_id in ids]
-    )
-
-
-# --- staging purge ---------------------------------------------------------
-
-
-async def _run_staging_purge(writer: FencedWriter, site_id: int, tz_name: str) -> None:
-    for _ in range(_DAY_TRANSACTIONS):
-        more = await writer.write(
-            lambda conn: _staging_purge_day(conn, site_id, tz_name)
-        )
-        if not more:
-            return
-
-
-def _staging_purge_day(conn: sqlite3.Connection, site_id: int, tz_name: str) -> bool:
-    """Delete one local day of pair-max rows in ``staging`` and re-materialize.
-
-    True while more days may remain.
-    """
-    if wind_basis_state(conn, site_id) != "staging":
-        return False
-    row = conn.execute(
-        "SELECT MIN(julianday(so.valid_at)) AS j FROM station_observations so"
-        " JOIN stations s ON s.id = so.station_id"
-        " WHERE s.site_id = ? AND so.variable = 'wind'"
-        f" AND {PAIR_MAX_WIND_SQL}",
-        (site_id,),
-    ).fetchone()
-    if row is None or row["j"] is None:
-        stray = conn.execute(
-            "SELECT so.id, so.valid_at FROM station_observations so"
-            " JOIN stations s ON s.id = so.station_id"
-            " WHERE s.site_id = ? AND so.variable = 'wind'"
-            f" AND {PAIR_MAX_WIND_SQL} AND julianday(so.valid_at) IS NULL",
-            (site_id,),
-        ).fetchall()
-        if not stray:
-            return False
-        _delete_station_rows(conn, [int(r["id"]) for r in stray])
-        _materialize_all(conn, site_id, {str(r["valid_at"]) for r in stray})
-        logger.warning(
-            "pair-max wind rows with an unreadable time purged site=%s rows=%s",
-            site_id,
-            len(stray),
-        )
-        stamp_wind_progress(conn, site_id)
-        return False
-    julian = float(row["j"])
-    window = _julian_local_window(julian, tz_name)
-    lo, hi = (None, None) if window is None else (window[1], window[2])
-    rows = conn.execute(
-        "SELECT so.id, so.valid_at FROM station_observations so"
-        " JOIN stations s ON s.id = so.station_id"
-        " WHERE s.site_id = ? AND so.variable = 'wind'"
-        f" AND {PAIR_MAX_WIND_SQL} AND {_range_sql('so.valid_at')}",
-        (site_id, lo, hi, julian),
-    ).fetchall()
-    _delete_station_rows(conn, [int(r["id"]) for r in rows])
-    _materialize_all(conn, site_id, {str(r["valid_at"]) for r in rows})
-    stamp_wind_progress(conn, site_id)
-    return True
-
-
-# --- switch check (plan §8.9) ----------------------------------------------
-
-
-@dataclass(frozen=True)
-class _SwitchCounts:
-    retry_before_yesterday: int
-    retry_before_today: int
-    yesterday_fetched: int
-    yesterday_usable: int
-    failed_final: int
-    before_today: int
-
-
-def _switch_counts(
-    conn: sqlite3.Connection, site_id: int, today: date
-) -> _SwitchCounts:
-    yesterday = (today - _ONE_DAY).isoformat()
-    row = conn.execute(
-        f"""
-        SELECT
-          SUM(CASE WHEN d.local_date < :yesterday AND {_RETRYABLE_SQL}
-                   THEN 1 ELSE 0 END) AS retry_before_yesterday,
-          SUM(CASE WHEN d.local_date < :today AND {_RETRYABLE_SQL}
-                   THEN 1 ELSE 0 END) AS retry_before_today,
-          SUM(CASE WHEN d.local_date = :yesterday AND d.status = 'fetched'
-                   THEN 1 ELSE 0 END) AS yesterday_fetched,
-          SUM(CASE WHEN d.local_date = :yesterday AND d.status = 'fetched'
-                        AND d.pair_hours >= :min_pair_hours
-                   THEN 1 ELSE 0 END) AS yesterday_usable,
-          SUM(CASE WHEN d.local_date < :today AND d.status = 'failed'
-                        AND d.attempts >= 3
-                   THEN 1 ELSE 0 END) AS failed_final,
-          SUM(CASE WHEN d.local_date < :today THEN 1 ELSE 0 END) AS before_today
-        FROM station_wind_days d JOIN stations st ON st.id = d.station_id
-        WHERE st.site_id = :site_id AND st.enabled = 1
-        """,
-        {
-            "site_id": site_id,
-            "today": today.isoformat(),
-            "yesterday": yesterday,
-            "min_pair_hours": MIN_OBS_HOURS,
-        },
-    ).fetchone()
-    return _SwitchCounts(
-        retry_before_yesterday=int(row["retry_before_yesterday"] or 0),
-        retry_before_today=int(row["retry_before_today"] or 0),
-        yesterday_fetched=int(row["yesterday_fetched"] or 0),
-        yesterday_usable=int(row["yesterday_usable"] or 0),
-        failed_final=int(row["failed_final"] or 0),
-        before_today=int(row["before_today"] or 0),
-    )
-
-
-def _generation_building(conn: sqlite3.Connection, site_id: int) -> bool:
-    row = conn.execute(
-        """
-        SELECT id FROM timezone_generations
-        WHERE site_id = ? AND state = 'building'
-        LIMIT 1
-        """,
-        (site_id,),
-    ).fetchone()
-    return row is not None
-
-
-def _free_bytes(path: str) -> int | None:
-    """Free bytes on the database's filesystem; None when it cannot be read."""
-    try:
-        return shutil.disk_usage(os.path.dirname(os.path.abspath(path))).free
-    except OSError:
-        return None
-
-
-def _report_counts(
-    conn: sqlite3.Connection, site_id: int, upper: date
-) -> dict[str, object]:
-    """The rebuild report's counts over enabled-station rows before ``upper``."""
-    row = conn.execute(
-        """
-        SELECT
-          SUM(CASE WHEN d.status = 'fetched' THEN 1 ELSE 0 END) AS fetched,
-          SUM(CASE WHEN d.status = 'unavailable' THEN 1 ELSE 0 END) AS unavailable,
-          SUM(CASE WHEN d.status = 'failed' AND d.attempts >= 3
-                   THEN 1 ELSE 0 END) AS failed_final,
-          SUM(CASE WHEN d.status = 'unavailable' AND d.legacy_hours > 0
-                   THEN 1 ELSE 0 END) AS unavailable_with_legacy,
-          SUM(d.pair_hours) AS pair_hours,
-          SUM(COALESCE(d.legacy_hours, 0)) AS legacy_hours,
-          MIN(d.local_date) AS first_date,
-          MAX(d.local_date) AS last_date
-        FROM station_wind_days d JOIN stations st ON st.id = d.station_id
-        WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date < ?
-        """,
-        (site_id, upper.isoformat()),
-    ).fetchone()
-    return {
-        "fetched": int(row["fetched"] or 0),
-        "unavailable": int(row["unavailable"] or 0),
-        "failed_final": int(row["failed_final"] or 0),
-        "unavailable_with_legacy": int(row["unavailable_with_legacy"] or 0),
-        "pair_hours": int(row["pair_hours"] or 0),
-        "legacy_hours": int(row["legacy_hours"] or 0),
-        "first_date": None if row["first_date"] is None else str(row["first_date"]),
-        "last_date": None if row["last_date"] is None else str(row["last_date"]),
-    }
-
-
-def _switch_check(
-    conn: sqlite3.Connection, site_id: int, tz_name: str, free: int | None
-) -> bool:
-    """Pass, waiting or blocked (plan §8.9). True only on a pass."""
-    state = wind_basis_state(conn, site_id)
-    if state != "staging":
-        # The basis moved since _start_job's transaction (site deleted ->
-        # key gone -> pair_max, or deleted and recreated at the same id).
-        # Write nothing; mirrors _staging_purge_day.
-        logger.info("wind switch check skipped: basis is %s site=%s", state, site_id)
-        return False
-    today = _local_today(tz_name)
-    counts = _switch_counts(conn, site_id, today)
-    p1 = counts.retry_before_yesterday == 0
-    p2 = counts.yesterday_usable > 0
-    p3 = counts.failed_final <= _FAILED_FINAL_SHARE * counts.before_today
-    p4 = not _has_pair_max_rows(conn, site_id)
-    p5 = not _generation_building(conn, site_id)
-    p6 = not read_auth_holds(conn)
-    if free is None:
-        logger.warning("wind switch held: free disk space unreadable site=%s", site_id)
-    p7 = free is not None and free >= WIND_SWITCH_MIN_FREE_BYTES
-    exhausted = counts.retry_before_today == 0 and (
-        counts.yesterday_usable == 0 or not p3
-    )
-    if not p7 or exhausted:
-        if free is None:
-            reason = "free disk space could not be read"
-        elif not p7:
-            reason = "not enough free disk space for the switch"
-        elif not p3:
-            reason = "too many station-days failed"
-        elif counts.yesterday_fetched > 0:
-            reason = (
-                "no station had 22 hours of wind readings at most 10 minutes "
-                "apart yesterday"
-            )
-        else:
-            reason = "no station returned yesterday's data"
-        _write_blocked(conn, site_id, today, reason)
-        return False
-    if not (p1 and p2 and p3 and p4 and p5 and p6):
-        return False
-    if not transition_wind_basis(conn, site_id, expected="staging", new="switching"):
-        logger.warning("wind switch lost its compare-and-set site=%s", site_id)
-        return False
-    report: dict[str, object] = {
-        "switched_at": isoformat_utc(utc_now()),
-        **_report_counts(conn, site_id, today),
-    }
-    set_runtime_state(conn, wind_report_key(site_id), json.dumps(report))
-    delete_runtime_state(conn, wind_blocked_key(site_id))
-    write_wind_cursor(conn, site_id, phase="purge", cursor_date=None)
-    stamp_wind_progress(conn, site_id)
-    logger.info("wind switch started site=%s", site_id)
-    return True
-
-
-def _write_blocked(
-    conn: sqlite3.Connection, site_id: int, today: date, reason: str
-) -> None:
-    """Write the blocked key; reset failed-final rows at most once per UTC day."""
-    key = wind_blocked_key(site_id)
-    raw = get_runtime_state(conn, key)
-    existing = json_object(raw)
-    now = utc_now()
-    since: object = None if existing is None else existing.get("since")
-    reset_on: object = None if existing is None else existing.get("reset_on")
-    utc_day = now.date().isoformat()
-    if reset_on != utc_day:
-        scope = (
-            " WHERE status = 'failed' AND attempts >= 3 AND local_date < ?"
-            " AND station_id IN (SELECT id FROM stations"
-            " WHERE site_id = ? AND enabled = 1)"
-        )
-        params = (today.isoformat(), site_id)
-        earliest = conn.execute(
-            "SELECT MIN(local_date) AS first FROM station_wind_days" + scope, params
-        ).fetchone()
-        reset = conn.execute(
-            "UPDATE station_wind_days SET status = 'pending', attempts = 0,"
-            " next_attempt_at = NULL, updated_at = ?" + scope,
-            (isoformat_utc(now), *params),
-        ).rowcount
-        if reset:
-            logger.warning(
-                "wind switch blocked, failed station-days reset site=%s rows=%s",
-                site_id,
-                reset,
-            )
-            first = earliest["first"]
-            if first is not None and str(first) < (today - _ONE_DAY).isoformat():
-                stamp_wind_progress(conn, site_id)
-        reset_on = utc_day
-    value = {
-        "reason": reason,
-        "since": since if isinstance(since, str) else isoformat_utc(now),
-        "reset_on": reset_on,
-    }
-    if existing != value:
-        set_runtime_state(conn, key, json.dumps(value))
-        if existing is None or existing.get("reason") != reason:
-            logger.warning("wind switch blocked site=%s: %s", site_id, reason)
-
-
-# --- switching (plan §8.10) ------------------------------------------------
-
-
-async def _run_switching(writer: FencedWriter, site_id: int, tz_name: str) -> None:
-    for _ in range(_DAY_TRANSACTIONS):
-        more = await writer.write(lambda conn: _switching_step(conn, site_id, tz_name))
-        if not more:
-            return
-
-
-def _switching_step(conn: sqlite3.Connection, site_id: int, tz_name: str) -> bool:
-    """One pass (i) or pass (ii) transaction; True while the job may go on."""
-    if wind_basis_state(conn, site_id) != "switching":
-        return False
-    cursor = read_wind_cursor(conn, site_id)
-    if cursor.phase is None:
-        logger.warning("unreadable wind switch cursor reset to purge site=%s", site_id)
-        write_wind_cursor(conn, site_id, phase="purge", cursor_date=None)
-        return True
-    today = _local_today(tz_name)
-    if cursor.phase == "purge":
-        return _purge_step(conn, site_id, tz_name, today)
-    return _install_step(conn, site_id, tz_name, today, cursor)
-
-
-def _purge_step(
-    conn: sqlite3.Connection, site_id: int, tz_name: str, today: date
-) -> bool:
-    row = conn.execute(
-        """
-        SELECT MIN(j) AS j FROM (
-            SELECT MIN(julianday(so.valid_at)) AS j
-            FROM station_observations so JOIN stations s ON s.id = so.station_id
-            WHERE s.site_id = ? AND so.variable = 'wind'
-            UNION ALL
-            SELECT MIN(julianday(o.valid_at)) AS j
-            FROM observations o WHERE o.site_id = ? AND o.variable = 'wind'
-        )
-        """,
-        (site_id, site_id),
-    ).fetchone()
-    if row is None or row["j"] is None:
-        _end_purge(conn, site_id, today)
-        return True
-    julian = float(row["j"])
-    window = _julian_local_window(julian, tz_name)
-    lo, hi = (None, None) if window is None else (window[1], window[2])
-    if window is not None:
-        conn.execute(
-            f"""
-            UPDATE station_wind_days
-            SET legacy_hours = (
-                    SELECT COUNT(*) FROM station_observations so
-                    WHERE so.station_id = station_wind_days.station_id
-                      AND so.variable = 'wind' AND {LEGACY_WIND_SQL}
-                      AND julianday(so.valid_at) >= julianday(?)
-                      AND julianday(so.valid_at) < julianday(?)),
-                updated_at = ?
-            WHERE local_date = ?
-              AND station_id IN (SELECT id FROM stations
-                                 WHERE site_id = ? AND enabled = 1)
-            """,
-            (lo, hi, isoformat_utc(utc_now()), window[0].isoformat(), site_id),
-        )
-    station_rows = conn.execute(
-        "SELECT so.id, so.valid_at FROM station_observations so"
-        " JOIN stations s ON s.id = so.station_id"
-        " WHERE s.site_id = ? AND so.variable = 'wind'"
-        f" AND {_range_sql('so.valid_at')}",
-        (site_id, lo, hi, julian),
-    ).fetchall()
-    observation_rows = conn.execute(
-        "SELECT o.valid_at FROM observations o"
-        " WHERE o.site_id = ? AND o.variable = 'wind'"
-        f" AND {_range_sql('o.valid_at')}",
-        (site_id, lo, hi, julian),
-    ).fetchall()
-    _delete_station_rows(conn, [int(r["id"]) for r in station_rows])
-    valid_ats = {str(r["valid_at"]) for r in station_rows}
-    valid_ats.update(str(r["valid_at"]) for r in observation_rows)
-    _materialize_all(conn, site_id, valid_ats)
-    stamp_wind_progress(conn, site_id)
-    return True
-
-
-def _end_purge(conn: sqlite3.Connection, site_id: int, today: date) -> None:
-    """Sweep what pass (i) could not date, confirm, and start pass (ii)."""
-    stray_rows = conn.execute(
-        "SELECT so.id, so.valid_at FROM station_observations so"
-        " JOIN stations s ON s.id = so.station_id"
-        " WHERE s.site_id = ? AND so.variable = 'wind'"
-        " AND julianday(so.valid_at) IS NULL",
-        (site_id,),
-    ).fetchall()
-    stray_observations = conn.execute(
-        "SELECT valid_at FROM observations WHERE site_id = ? AND variable = 'wind'"
-        " AND julianday(valid_at) IS NULL",
-        (site_id,),
-    ).fetchall()
-    # Station rows first: materializing while a stray pair-max row stood would
-    # re-create the observation the confirm step below must not find.
-    _delete_station_rows(conn, [int(r["id"]) for r in stray_rows])
-    valid_ats = {str(r["valid_at"]) for r in stray_rows}
-    valid_ats.update(str(r["valid_at"]) for r in stray_observations)
-    _materialize_all(conn, site_id, valid_ats)
-    if stray_rows or stray_observations:
-        logger.warning(
-            "wind rows with an unreadable time purged site=%s station_rows=%s"
-            " observations=%s",
-            site_id,
-            len(stray_rows),
-            len(stray_observations),
-        )
-    pairs = conn.execute(
-        "DELETE FROM forecast_pairs WHERE site_id = ? AND variable = 'wind'"
-        f" AND {published_generation_clause('forecast_pairs')}",
-        (site_id,),
-    ).rowcount
-    scores = conn.execute(
-        "DELETE FROM score_cache WHERE site_id = ? AND variable = 'wind'", (site_id,)
-    ).rowcount
-    if pairs or scores:
-        logger.warning(
-            "wind switch swept leftover pairs site=%s pairs=%s scores=%s",
-            site_id,
-            pairs,
-            scores,
-        )
-    left = conn.execute(
-        """
-        SELECT
-          (SELECT COUNT(*) FROM station_observations so
-           JOIN stations s ON s.id = so.station_id
-           WHERE s.site_id = ? AND so.variable = 'wind') AS station_rows,
-          (SELECT COUNT(*) FROM observations
-           WHERE site_id = ? AND variable = 'wind') AS observations
-        """,
-        (site_id, site_id),
-    ).fetchone()
-    if int(left["station_rows"]) or int(left["observations"]):
-        raise RuntimeError(
-            f"wind switch purge incomplete site={site_id}"
-            f" station_rows={int(left['station_rows'])}"
-            f" observations={int(left['observations'])}"
-        )
-    _refresh_report(conn, site_id, today)
-    first = conn.execute(
-        """
-        SELECT MIN(d.local_date) AS first
-        FROM station_wind_days d JOIN stations st ON st.id = d.station_id
-        WHERE st.site_id = ? AND st.enabled = 1
-        """,
-        (site_id,),
-    ).fetchone()
-    write_wind_cursor(
-        conn, site_id, phase="install", cursor_date=_date_or(first["first"], today)
-    )
-    stamp_wind_progress(conn, site_id)
-
-
-def _date_or(value: object, fallback: date) -> date:
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value)
-        except ValueError:
-            return fallback
-    return fallback
-
-
-def _refresh_report(conn: sqlite3.Connection, site_id: int, today: date) -> None:
-    """Refresh ``legacy_hours`` and ``unavailable_with_legacy`` after pass (i)."""
-    key = wind_report_key(site_id)
-    report = json_object(get_runtime_state(conn, key))
-    if report is None:
-        logger.warning("unreadable wind rebuild report rebuilt site=%s", site_id)
-        rebuilt: dict[str, object] = {
-            "switched_at": None,
-            **_report_counts(conn, site_id, today),
-        }
-        set_runtime_state(conn, key, json.dumps(rebuilt))
-        return
-    last = report.get("last_date")
-    upper = _date_or(last, today - _ONE_DAY) + _ONE_DAY if last else today
-    counts = _report_counts(conn, site_id, upper)
-    report["legacy_hours"] = counts["legacy_hours"]
-    report["unavailable_with_legacy"] = counts["unavailable_with_legacy"]
-    set_runtime_state(conn, key, json.dumps(report))
-
-
-def _earliest_inventory_date(
-    conn: sqlite3.Connection, site_id: int, today: date
-) -> date:
-    row = conn.execute(
-        """
-        SELECT MIN(d.local_date) AS first
-        FROM station_wind_days d JOIN stations st ON st.id = d.station_id
-        WHERE st.site_id = ? AND st.enabled = 1
-        """,
-        (site_id,),
-    ).fetchone()
-    return _date_or(row["first"], today)
-
-
-def _install_step(
-    conn: sqlite3.Connection,
-    site_id: int,
-    tz_name: str,
-    today: date,
-    cursor: WindCursor,
-) -> bool:
-    day = cursor.cursor_date
-    if day is None:
-        logger.warning(
-            "unreadable wind switch cursor date reset to the first day site=%s",
-            site_id,
-        )
-        write_wind_cursor(
-            conn,
-            site_id,
-            phase="install",
-            cursor_date=_earliest_inventory_date(conn, site_id, today),
-        )
-        return True
-    if day > today:
-        if not transition_wind_basis(
-            conn, site_id, expected="switching", new="rescoring"
-        ):
-            logger.warning(
-                "wind switch lost its compare-and-set to rescoring site=%s", site_id
-            )
-            return False
-        delete_runtime_state(conn, wind_cursor_key(site_id))
-        logger.info("wind switch installed, rescoring site=%s", site_id)
-        return False
-    station_ids = [
-        int(row["station_id"])
-        for row in conn.execute(
-            """
-            SELECT d.station_id
-            FROM station_wind_days d JOIN stations st ON st.id = d.station_id
-            WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date = ?
-              AND d.status IN ('fetched','partial')
-            ORDER BY d.station_id
-            """,
-            (site_id, day.isoformat()),
-        )
-    ]
-    written: set[str] = set()
-    for station_id in station_ids:
-        hours = _derive_hours(conn, station_id, day, tz_name, today)
-        if not hours:
-            continue
-        records = _read_records(
-            conn, station_id, hours[0] - _PAIR_LOOKBACK, hours[-1] + _ONE_HOUR
-        )
-        pairs = pair_max_by_hour(records, hours)
-        for hour in sorted(pairs):
-            speed = pairs[hour]
-            valid_at = isoformat_utc(hour)
-            write_station_observation(
-                conn,
-                station_id=station_id,
-                variable="wind",
-                valid_at=valid_at,
-                value=kmh_to_ms(speed),
-                source_raw=f"pair-max {round(speed, 2)} km/h",
-            )
-            written.add(valid_at)
-    _materialize_all(conn, site_id, written)
-    write_wind_cursor(conn, site_id, phase="install", cursor_date=day + _ONE_DAY)
-    stamp_wind_progress(conn, site_id)
-    return True
-
-
-# --- rescoring (plan §8.11) ------------------------------------------------
-
-
-async def _run_rescoring(writer: FencedWriter, site_id: int) -> None:
-    try:
-        await run_split_pair_phases(writer, site_id, require_enabled=True)
-        await run_batched_scoring(writer, site_id)
-    except ScoringInputsBusy as exc:
-        logger.warning(
-            "wind rescore deferred site=%s step=%s: inputs changed on every one"
-            " of %d attempts",
-            site_id,
-            exc.step,
-            SCORING_CAS_ATTEMPTS,
-        )
-        raise JobDeferred(isoformat_utc(utc_now() + _RESCORE_BUSY_DEFER)) from exc
-    await writer.write(lambda conn: _finish_rescoring(conn, site_id))
-
-
-def _finish_rescoring(conn: sqlite3.Connection, site_id: int) -> None:
-    if not transition_wind_basis(conn, site_id, expected="rescoring", new="pair_max"):
-        logger.warning(
-            "wind rescore lost its compare-and-set to pair_max site=%s", site_id
-        )
-        return
-    set_runtime_state_now(conn, wind_done_at_key(site_id))
-    logger.info("wind switch complete site=%s", site_id)

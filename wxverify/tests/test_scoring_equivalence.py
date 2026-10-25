@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.helpers import seed_pair_max_wind
 from tests.scoring_ref_0164 import materialize_multimodel_mean_0164
 from wxverify.core.timeutil import (
     day_ahead,
@@ -47,7 +48,6 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
@@ -361,22 +361,28 @@ def _make_db() -> sqlite3.Connection:
                 (site_id, f"TESTPWS{site_id}{n:03d}", 900.0 + 5.0 * n),
             )
             station_ids[site_id].append(int(cur.lastrowid or 0))
-        # The hourly wind rows below are old-style rows; a fresh site opens in
-        # pair_max, where the insert guard drops them, so hold it in staging.
-        set_wind_basis_state(conn, site_id, "staging")
 
-    for stations in station_ids.values():
+    for site_id, stations in station_ids.items():
         for hour in range(_OBS_HOURS):
             for variable in ("temperature", "wind", "precip"):
                 for offset, station_id in enumerate(stations):
-                    insert_station_observation(
-                        conn,
-                        station_id=station_id,
-                        variable=variable,
-                        valid_at=_hour(hour),
-                        value=_obs_value(variable, offset, hour),
-                        source_raw=_SOURCE_RAW,
-                    )
+                    if variable == "wind":
+                        seed_pair_max_wind(
+                            conn,
+                            site_id=site_id,
+                            station_id=station_id,
+                            valid_at=_hour(hour),
+                            value=_obs_value(variable, offset, hour),
+                        )
+                    else:
+                        insert_station_observation(
+                            conn,
+                            station_id=station_id,
+                            variable=variable,
+                            valid_at=_hour(hour),
+                            value=_obs_value(variable, offset, hour),
+                            source_raw=_SOURCE_RAW,
+                        )
 
     feeds = conn.execute(
         """
@@ -465,14 +471,23 @@ def _add_obs_hour(conn: sqlite3.Connection) -> None:
     ).fetchall()
     for offset, row in enumerate(stations):
         for variable in ("temperature", "wind", "precip"):
-            insert_station_observation(
-                conn,
-                station_id=int(row["id"]),
-                variable=variable,
-                valid_at=_hour(_OBS_HOURS),
-                value=_obs_value(variable, offset, _OBS_HOURS),
-                source_raw=_SOURCE_RAW,
-            )
+            if variable == "wind":
+                seed_pair_max_wind(
+                    conn,
+                    site_id=1,
+                    station_id=int(row["id"]),
+                    valid_at=_hour(_OBS_HOURS),
+                    value=_obs_value(variable, offset, _OBS_HOURS),
+                )
+            else:
+                insert_station_observation(
+                    conn,
+                    station_id=int(row["id"]),
+                    variable=variable,
+                    valid_at=_hour(_OBS_HOURS),
+                    value=_obs_value(variable, offset, _OBS_HOURS),
+                    source_raw=_SOURCE_RAW,
+                )
 
 
 def _change_obs_value(conn: sqlite3.Connection) -> None:

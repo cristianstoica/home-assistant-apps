@@ -250,9 +250,9 @@ def _entities_for_selection(
     # clearing subset ``displayed`` is computed over -- is the feed set of
     # record for everything that qualifies it: the blended hourly series,
     # the covered-hour count and the contributor count alike.
-    # Wind here models the legacy depth blend only (plan §13). A site in
-    # ``pair_max`` serves the accuracy-weighted wind of forecast/wind_blend.py,
-    # which this simulation does not reproduce.
+    # Wind here models the equal-weight depth blend only (plan §13). Served
+    # wind is the accuracy-weighted wind of forecast/wind_blend.py, which this
+    # simulation does not reproduce.
     hourly = _blend_hourly(agg_ids, feeds_samples)
     hours = covered_hours(valid_at for valid_at, _ in hourly)
     outcomes = _quantity_outcomes(
@@ -480,6 +480,7 @@ def _snapshot_samples(
             conn,
             site_id=cfg.site_id,
             since_valid_at=isoformat_utc(bounds.start_utc),
+            served_only=False,
             as_of=as_of,
         )
         if s.feed_id in roster_ids

@@ -12,6 +12,8 @@
         hx-delete="{{ url('/api/sites/' ~ site.id) }}"
         hx-ext="json-enc"
         hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+        hx-confirm="Delete {{ site.name }}? This removes the site and all of its stored data: stations, observations, forecasts, scores and verification history. It cannot be undone."
+        hx-disabled-elt="this"
         hx-target="#site-cards"
         hx-swap="outerHTML">Delete</button>
     </div>

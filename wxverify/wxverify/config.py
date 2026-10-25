@@ -182,6 +182,22 @@ FEED_SEEDS: Final[tuple[FeedSeed, ...]] = (
     )
 )
 
+#: The meteoblue package members dropped on 2026-10-22, by the model name the
+#: package response carries. Names match case-sensitively, so each must be
+#: spelled exactly as stored; a test pins every name to a described meteoblue
+#: model. Single source for the one-shot start-up pause
+#: `db.migrations.pause_dropped_meteoblue_members`.
+DROPPED_METEOBLUE_MEMBERS: Final[tuple[str, ...]] = (
+    "NMM22",
+    "NEMSGLOBAL",
+    "NEMSGLOBAL_E",
+    "NEMS12",
+    "NEMS12_E",
+    "NEMS4",
+)
+#: The `feeds.disabled_reason` that pause writes on each dropped member.
+DROPPED_METEOBLUE_REASON: Final = "Dropped 2026-10-22: not worth keeping (feed study)"
+
 
 def ensure_parent_dir(path: str) -> None:
     parent = Path(path).expanduser().resolve().parent

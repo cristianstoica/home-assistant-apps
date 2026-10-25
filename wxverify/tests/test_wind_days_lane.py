@@ -1,30 +1,23 @@
 """Tests: the wind-history lane, group 1 of plan section 15.1 (2026-09-30).
 
-Covers T8, T30-T34, T36-T42, T44, T45, T47, T48, T104-T107 against
-``wxverify/worker/wind_days.py`` (selector, persist, staging purge, switch
-check, switching/rescoring, scheduler integration) using a real sqlite3
-``:memory:`` connection + ``run_migrations`` for the sync surface, and a
-tmp-path ``Database``/``FencedWriter`` for the handful of cases that go
-through an async write path (T45, T47 via dispatch/scheduler).
+Covers T8, T30, T33, T34, T36, T44, T45, T47, T104-T107 against
+``wxverify/worker/wind_days.py`` (selector, persist, scheduler integration)
+using a real sqlite3 ``:memory:`` connection + ``run_migrations`` for the
+sync surface, and a tmp-path ``Database``/``FencedWriter`` for the handful
+of cases that go through an async write path (T45, T47 via dispatch/scheduler).
 
 Also covers T35 (the ``_fetch_failed`` >=500/payload-fault/refundable-
 transport-error dispatch -- in ``tests/test_wind_auth_hold.py``, alongside
-its existing 401/403/429 coverage), T43 (``_run_rescoring``'s
-``ScoringInputsBusy`` defer, via injected failing fakes for
-``run_split_pair_phases``/``run_batched_scoring``), T46's chunk-level
+its existing 401/403/429 coverage), T46's chunk-level
 headroom-exhaustion integration (``_run_fetch_chunk`` raising
 ``WindHeadroomExhausted`` through a live chunk loop -- in
-``tests/test_wind_quota.py``, reusing its headroom-0 fixture), and T97 (a
+``tests/test_wind_quota.py``, reusing its headroom-0 fixture), T97 (a
 station-day stuck on repeated 500s going final after 3 attempts across 4
 real jobs, driven through ``run_wind_days`` with a tmp-path DB +
 ``httpx.MockTransport``, mirroring ``tests/test_wind_auth_hold.py``'s async
-harness), T98 (``switching``/``rescoring`` dispatch never reaching the fetch
-chunk even with a due row, an active domain backoff and today's spend at
-cap), T99 (the same two states never probing a ``probing`` auth hold, paired
-against a positive showing the first ``pair_max`` job does probe it), and
-T100 (a prior job's bad exit -- a headroom-0 ``JobDeferred``, or the switch
-check itself raising -- never gates the next job's fresh switch check). T98-
-T100 reuse T97's async dispatch + ``httpx.MockTransport`` harness
+harness), and T99 (a ``pair_max`` job probing a ``probing`` auth hold once
+and clearing it on success). T99 reuses T97's async dispatch +
+``httpx.MockTransport`` harness
 (``_t97_init_tmp_db``/``_t97_freeze``/``_t97_run_wind_days``).
 
 Every station id, site name and coordinate below is synthetic (public repo):
@@ -34,9 +27,7 @@ timezone "UTC" or "Etc/UTC", coordinates 0.0/0.0.
 
 from __future__ import annotations
 
-import ast
 import asyncio
-import json
 import logging
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
@@ -51,27 +42,9 @@ from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.queue import Job, claim_next_job
-from wxverify.db.runtime_state import (
-    delete_runtime_state,
-    get_runtime_state,
-    set_runtime_state,
-)
-from wxverify.db.wind_basis import (
-    WIND_FINAL_LEAD,
-    read_auth_hold,
-    read_wind_cursor,
-    set_wind_basis_state,
-    wind_basis_key,
-    wind_basis_state,
-    wind_blocked_key,
-    wind_cursor_key,
-    wind_done_at_key,
-    wind_progress_key,
-    wind_report_key,
-    write_auth_hold,
-    write_wind_cursor,
-)
-from wxverify.forecast.wind_blend import MIN_OBS_HOURS, TRAINING_DAYS
+from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.wind_basis import WIND_FINAL_LEAD, read_auth_hold, write_auth_hold
+from wxverify.forecast.wind_blend import TRAINING_DAYS
 from wxverify.monitor import (  # noqa: PLC2701 -- private, exercised directly
     _wind_history_trips,
 )
@@ -82,25 +55,17 @@ from wxverify.worker.processor import dispatch
 from wxverify.worker.scheduler import (
     _enqueue_due_wind_days,  # noqa: PLC2701 -- private, exercised directly (T47)
 )
-from wxverify.worker.score_batches import ScoringInputsBusy
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
     _FINAL_RETRY_LEAD,
     _FINISHABLE_SQL,
     WIND_DAYS_JOB_KEY,
     _derive_days,
-    _end_purge,
     _finish_day,
     _finish_floor,
     _headroom_wake,
-    _install_step,
     _persist_day,
-    _purge_step,
     _reconcile,
-    _run_rescoring,
-    _staging_purge_day,
-    _switch_check,
     _today_next_attempt,
-    _write_blocked,
     endpoint_for,
     ensure_wind_days,
     open_endpoints,
@@ -157,7 +122,6 @@ def _insert_day(
     attempts: int = 0,
     record_count: int = 0,
     pair_hours: int = 0,
-    legacy_hours: int | None = None,
     next_attempt_at: str | None = None,
     refetch_at: str | None = None,
     refetched: int = 0,
@@ -169,9 +133,9 @@ def _insert_day(
         """
         INSERT INTO station_wind_days
             (station_id, local_date, status, attempts, record_count, pair_hours,
-             legacy_hours, next_attempt_at, refetch_at, refetched, last_error,
-             last_ok_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')
+             next_attempt_at, refetch_at, refetched, last_error, last_ok_at,
+             updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')
         """,
         (
             station_id,
@@ -180,7 +144,6 @@ def _insert_day(
             attempts,
             record_count,
             pair_hours,
-            legacy_hours,
             next_attempt_at,
             refetch_at,
             refetched,
@@ -189,15 +152,6 @@ def _insert_day(
         ),
     )
     conn.commit()
-
-
-def _freeze_wind_days_today(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
-    """``_switch_check``/``_run_switching`` compute ``today`` internally via
-    ``_local_today(tz_name)`` -> ``utc_now()`` -- freeze the clock the lane
-    module itself imported, not the wall clock."""
-    import wxverify.worker.wind_days as wind_days_module
-
-    monkeypatch.setattr(wind_days_module, "utc_now", lambda: when)
 
 
 def _freeze_scheduler_now(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
@@ -241,18 +195,6 @@ def _day_row(
     return row
 
 
-def _insert_pair_max_obs(
-    conn: sqlite3.Connection, station_id: int, valid_at: str, speed_kmh: float = 10.0
-) -> None:
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw)"
-        " VALUES (?, 'wind', ?, ?, 'ok', ?)",
-        (station_id, valid_at, speed_kmh / 3.6, f"pair-max {speed_kmh} km/h"),
-    )
-    conn.commit()
-
-
 # =============================================================================
 # T8 -- a record outside the stored window is not stored; record_count counts
 # in-day records only.
@@ -269,7 +211,6 @@ def test_persist_day_window_and_record_count_scope() -> None:
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2020, 1, 15)
-    set_wind_basis_state(conn, site_id, "staging")
     _insert_day(conn, station_id, local_date, status="pending")
 
     start = datetime(2020, 1, 15, 0, 0, 0, tzinfo=UTC)
@@ -389,137 +330,6 @@ def test_ensure_wind_days_deletes_unparseable_local_date(
         " still present"
     )
     assert any("unreadable date deleted" in rec.message for rec in caplog.records)
-
-
-# =============================================================================
-# T31 -- persist in `staging` is counts-only: no station row/observation/job
-# =============================================================================
-
-
-def test_persist_day_in_staging_updates_counts_only_no_observation_written() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    local_date = date(2026, 3, 5)
-    set_wind_basis_state(conn, site_id, "staging")
-    _insert_day(conn, station_id, local_date, status="pending")
-
-    start = datetime(2026, 3, 5, 0, 0, 0, tzinfo=UTC)
-    records = [
-        WindRecord(obs_at=start + timedelta(hours=1), speed_kmh=5.0),
-        WindRecord(obs_at=start + timedelta(hours=1, minutes=3), speed_kmh=6.0),
-    ]
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=local_date,
-        tz_name=_TZ,
-        today=date(2026, 3, 10),
-        records=records,
-        probe=None,
-    )
-
-    obs = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert obs["n"] == 0, (
-        "mutant -> at this assertion: correct = 0 (staging writes no station"
-        " observation row), mutant (pair_max flag inverted so staging also"
-        " materializes) = 1"
-    )
-    jobs = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
-    assert jobs["n"] == 0, (
-        "mutant -> at this assertion: correct = 0 (no pair_and_score"
-        " enqueue in staging), mutant (enqueue runs unconditionally) = 1"
-    )
-    row = _day_row(conn, station_id, local_date)
-    assert row["record_count"] == 2
-    assert row["pair_hours"] == 1  # the two records pair into one hour
-    assert row["status"] == "fetched"
-
-
-# =============================================================================
-# T32 -- staging purge: day by day, re-materialize, NULL-julianday handling
-# =============================================================================
-
-
-def test_staging_purge_day_deletes_oldest_day_first_then_stray_then_stops(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    _insert_pair_max_obs(conn, station_id, "2026-03-02T01:00:00Z")
-    _insert_pair_max_obs(conn, station_id, "2026-03-04T01:00:00Z")
-    _insert_pair_max_obs(conn, station_id, "garbage-timestamp")
-
-    # Round 1: the earliest parseable day (03-02) is purged; the later day
-    # and the unparseable row are untouched.
-    more1 = _staging_purge_day(conn, site_id, _TZ)
-    assert more1 is True
-    remaining = {
-        str(r["valid_at"])
-        for r in conn.execute(
-            "SELECT valid_at FROM station_observations WHERE station_id = ?",
-            (station_id,),
-        )
-    }
-    assert remaining == {"2026-03-04T01:00:00Z", "garbage-timestamp"}, (
-        "mutant -> at this assertion: correct = the 03-02 row alone removed"
-        " (oldest parseable day first), mutant (whole-table purge in one"
-        " call) = an empty remaining set"
-    )
-
-    # Round 2: the remaining parseable day (03-04) is purged.
-    more2 = _staging_purge_day(conn, site_id, _TZ)
-    assert more2 is True
-    remaining2 = {
-        str(r["valid_at"])
-        for r in conn.execute(
-            "SELECT valid_at FROM station_observations WHERE station_id = ?",
-            (station_id,),
-        )
-    }
-    assert remaining2 == {"garbage-timestamp"}
-
-    # Round 3: only the unparseable row is left -> MIN(julianday) is NULL ->
-    # the stray branch purges it directly and logs a WARNING, then stops.
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
-        more3 = _staging_purge_day(conn, site_id, _TZ)
-    assert more3 is False, (
-        "mutant -> at this assertion: correct = False (nothing left after"
-        " the stray sweep), mutant (stray branch returns True, looping"
-        " forever) = True"
-    )
-    final = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert final["n"] == 0
-    assert any("unreadable time purged" in rec.message for rec in caplog.records)
-
-
-def test_staging_purge_day_false_when_not_in_staging() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
-    _insert_pair_max_obs(conn, station_id, "2026-03-02T01:00:00Z")
-
-    more = _staging_purge_day(conn, site_id, _TZ)
-
-    assert more is False, (
-        "mutant -> at this assertion: correct = False (the state guard"
-        " refuses to run outside staging), mutant (guard dropped) = True"
-    )
-    still_there = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert still_there["n"] == 1
 
 
 # =============================================================================
@@ -779,7 +589,6 @@ def test_persist_day_pair_max_materializes_changed_hours_and_enqueues() -> None:
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2026, 3, 5)
-    set_wind_basis_state(conn, site_id, "pair_max")
     _insert_day(conn, station_id, local_date, status="pending")
 
     start = datetime(2026, 3, 5, 0, 0, 0, tzinfo=UTC)
@@ -804,7 +613,7 @@ def test_persist_day_pair_max_materializes_changed_hours_and_enqueues() -> None:
     ).fetchall()
     assert len(obs) == 1, (
         "mutant -> at this assertion: correct = 1 row (one paired hour),"
-        " mutant (write_rows gated wrong so nothing is written) = 0"
+        " mutant (the row-write loop skipped so nothing is written) = 0"
     )
     assert str(obs[0]["source_raw"]).startswith("pair-max ")
     jobs = conn.execute(
@@ -812,9 +621,8 @@ def test_persist_day_pair_max_materializes_changed_hours_and_enqueues() -> None:
     ).fetchone()
     assert jobs["n"] == 1, (
         "mutant -> at this assertion: correct = 1 (changed hours enqueue"
-        " pair_and_score), mutant (enqueue gated on `if write_rows` dropped"
-        " the `if changed` check) = 0 when nothing changed, but here"
-        " something did change, so a broken enqueue shows as 0"
+        " pair_and_score), mutant (the enqueue under `if changed` dropped)"
+        " = 0"
     )
 
     # A second persist with identical data writes no new observation and
@@ -841,892 +649,8 @@ def test_persist_day_pair_max_materializes_changed_hours_and_enqueues() -> None:
 
 
 # =============================================================================
-# T37/T38/T39/T40 -- switch check (plan section 8.9)
+# T143 -- record reads in a non-whole-hour offset zone (plan 15.1)
 # =============================================================================
-
-
-def _seed_switchable_site(conn: sqlite3.Connection) -> tuple[int, int]:
-    """A site with one station whose yesterday row is fetched and nothing
-    else outstanding -- a pass under every predicate."""
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    today = date(2026, 3, 10)
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=5,
-        pair_hours=MIN_OBS_HOURS,
-    )
-    return site_id, station_id
-
-
-_BIG_FREE = 1024 * 1024 * 1024
-
-
-def test_switch_check_passes_when_all_seven_predicates_hold(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id, _ = _seed_switchable_site(conn)
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is True
-    assert wind_basis_state(conn, site_id) == "switching", (
-        "mutant -> at this assertion: correct = 'switching' (the CAS moved"
-        " the site forward), mutant (any one predicate inverted) = the"
-        " state stays 'staging'"
-    )
-
-
-@pytest.mark.parametrize(
-    "break_predicate",
-    [
-        "p1_retry_before_yesterday",
-        "p2_yesterday_usable_no_fetched_row",
-        "p2_yesterday_usable_pair_hours_zero",
-        "p4_pair_max_rows",
-        "p6_auth_hold",
-    ],
-)
-def test_switch_check_fails_on_each_predicate(
-    break_predicate: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id, station_id = _seed_switchable_site(conn)
-    today = date(2026, 3, 10)
-
-    if break_predicate == "p1_retry_before_yesterday":
-        _insert_day(
-            conn, station_id, today - timedelta(days=3), status="pending", attempts=0
-        )
-    elif break_predicate == "p2_yesterday_usable_no_fetched_row":
-        # 'partial' (not 'unavailable') keeps retry_before_today > 0 via
-        # yesterday's own row, so `exhausted` stays False and p2 alone is
-        # what blocks the switch -- 'unavailable' would make this
-        # indistinguishable from the exhausted-dominated path. No row at
-        # all meets predicate 2 (none is `fetched`).
-        conn.execute(
-            "UPDATE station_wind_days SET status = 'partial'"
-            " WHERE station_id = ? AND local_date = ?",
-            (station_id, (today - timedelta(days=1)).isoformat()),
-        )
-        conn.commit()
-    elif break_predicate == "p2_yesterday_usable_pair_hours_zero":
-        # The other way predicate 2 can fail: yesterday IS `fetched`, but
-        # its `pair_hours` is 0 (records that never paired). This drives
-        # `exhausted` True (yesterday is final, not retryable), so the
-        # check takes the blocked branch -- still `switched is False`.
-        conn.execute(
-            "UPDATE station_wind_days SET pair_hours = 0"
-            " WHERE station_id = ? AND local_date = ?",
-            (station_id, (today - timedelta(days=1)).isoformat()),
-        )
-        conn.commit()
-    elif break_predicate == "p4_pair_max_rows":
-        _insert_pair_max_obs(conn, station_id, "2026-03-01T01:00:00Z")
-    elif break_predicate == "p6_auth_hold":
-        from wxverify.db.wind_basis import write_auth_hold
-
-        write_auth_hold(
-            conn, "history_all", status="held", since="2026-03-01T00:00:00Z", error=None
-        )
-        conn.commit()
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is False, (
-        f"mutant -> at this assertion: correct = False (breaking"
-        f" {break_predicate} alone must block the switch), mutant (that"
-        " predicate dropped from the `and` chain) = True"
-    )
-    assert wind_basis_state(conn, site_id) == "staging"
-
-
-def test_switch_check_p7_free_disk_none_blocks_with_warning(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id, _ = _seed_switchable_site(conn)
-
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
-        switched = _switch_check(conn, site_id, _TZ, None)
-
-    assert switched is False, (
-        "mutant -> at this assertion: correct = False (an unreadable free-"
-        "disk value blocks the switch), mutant (`free is None` treated as"
-        " passing p7) = True"
-    )
-    assert any("free disk space unreadable" in rec.message for rec in caplog.records)
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None
-    reason = json.loads(blocked)["reason"]
-    assert reason == "free disk space could not be read", (
-        "mutant -> at this assertion: correct = 'free disk space could not"
-        " be read' (reason 1, §8.9), mutant (a different reason string"
-        " written, or reason 1 not checked first) ="
-        f" {reason!r}"
-    )
-
-
-def test_switch_check_writes_nothing_once_the_site_is_deleted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id, _ = _seed_switchable_site(conn)
-    # The delete route's transaction as this lane sees it. _make_db leaves
-    # foreign keys off, so station rows survive; free=None forces the blocked
-    # branch (p7) whatever the counts are.
-    conn.execute("DELETE FROM sites WHERE id = ?", (site_id,))
-    delete_runtime_state(
-        conn,
-        wind_basis_key(site_id),
-        wind_progress_key(site_id),
-        wind_cursor_key(site_id),
-        wind_blocked_key(site_id),
-        wind_report_key(site_id),
-        wind_done_at_key(site_id),
-    )
-    conn.commit()
-
-    switched = _switch_check(conn, site_id, _TZ, None)
-
-    assert switched is False
-    assert get_runtime_state(conn, wind_blocked_key(site_id)) is None, (
-        "mutant -> at this assertion: correct = None, mutant (no basis"
-        " guard) ="
-        ' {"reason": "free disk space could not be read", ...}'
-    )
-    for key in (
-        wind_basis_key(site_id),
-        wind_progress_key(site_id),
-        wind_cursor_key(site_id),
-        wind_report_key(site_id),
-        wind_done_at_key(site_id),
-    ):
-        assert get_runtime_state(conn, key) is None, key
-
-
-def test_switch_check_blocked_vs_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``exhausted`` (all retryable work for yesterday done, none fetched, or
-    the failed-final share too high) writes the blocked key; a retry still
-    pending (p1 false but not exhausted) leaves no blocked key."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    today = date(2026, 3, 10)
-    # Yesterday's only row ends unavailable (nothing fetched) and no retry
-    # is pending anywhere -> exhausted -> blocked.
-    _insert_day(conn, station_id, today - timedelta(days=1), status="unavailable")
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is False
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None, (
-        "mutant -> at this assertion: correct = a blocked key IS written"
-        " (yesterday fully exhausted with nothing fetched), mutant (the"
-        " `exhausted` condition dropped the `yesterday_usable == 0` arm)"
-        " = no blocked key"
-    )
-    reason = json.loads(blocked)["reason"]
-    assert reason == "no station returned yesterday's data", (
-        "mutant -> at this assertion: correct = 'no station returned"
-        " yesterday's data' (reason 5, §8.9 -- yesterday_fetched == 0),"
-        " mutant (reason 4's text written instead, or the two reasons"
-        f" swapped) = {reason!r}"
-    )
-
-    # The other exhausted-blocked shape: yesterday IS fetched, but its
-    # pair_hours is 0 (records that never paired) -> reason 4, not 5.
-    conn1b = _make_db()
-    site_id1b = _make_site(conn1b)
-    station_id1b = _make_station(conn1b, site_id1b, "WSTATION01")
-    set_wind_basis_state(conn1b, site_id1b, "staging")
-    _insert_day(
-        conn1b,
-        station_id1b,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=0,
-    )
-    switched1b = _switch_check(conn1b, site_id1b, _TZ, _BIG_FREE)
-    assert switched1b is False
-    blocked1b = get_runtime_state(conn1b, wind_blocked_key(site_id1b))
-    assert blocked1b is not None
-    reason1b = json.loads(blocked1b)["reason"]
-    assert reason1b == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    ), (
-        "mutant -> at this assertion: correct = reason 4's text, naming"
-        f" MIN_OBS_HOURS (22), mutant (reason 5's text, or a different"
-        f" threshold) = {reason1b!r}"
-    )
-    assert f"{MIN_OBS_HOURS} hours" in reason1b
-
-    # Now add a still-pending retry for an older day: p1 is false (not
-    # waiting-exhausted, since retry_before_today > 0) -> no blocked key.
-    conn2 = _make_db()
-    site_id2 = _make_site(conn2)
-    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_wind_basis_state(conn2, site_id2, "staging")
-    _insert_day(conn2, station_id2, today - timedelta(days=1), status="unavailable")
-    _insert_day(
-        conn2, station_id2, today - timedelta(days=3), status="pending", attempts=0
-    )
-    switched2 = _switch_check(conn2, site_id2, _TZ, _BIG_FREE)
-    assert switched2 is False
-    blocked2 = get_runtime_state(conn2, wind_blocked_key(site_id2))
-    assert blocked2 is None, (
-        "mutant -> at this assertion: correct = None (a pending retry"
-        " elsewhere means the site is still WAITING, not blocked), mutant"
-        " (every non-switch outcome writes blocked) = not None"
-    )
-
-
-def test_switch_check_too_little_disk_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id, _ = _seed_switchable_site(conn)
-
-    switched = _switch_check(conn, site_id, _TZ, 1024)  # far below the 256 MiB floor
-
-    assert switched is False, (
-        "mutant -> at this assertion: correct = False (free bytes below"
-        " WIND_SWITCH_MIN_FREE_BYTES blocks), mutant (p7 threshold check"
-        " dropped) = True"
-    )
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None
-    reason = json.loads(blocked)["reason"]
-    assert reason == "not enough free disk space for the switch", (
-        "mutant -> at this assertion: correct = 'not enough free disk space"
-        " for the switch' (reason 2, §8.9), mutant (reason 1's text written"
-        f" instead, or a different message) = {reason!r}"
-    )
-
-
-def test_switch_check_too_many_failed_final_blocks_with_reason_3(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Failed-final rows above 10% of before-today rows block with reason 3
-    -- even when yesterday is also unusable (predicate 2 failing too), the
-    first-applicable-reason ordering (§8.9) still picks reason 3. The
-    second (``conn2``) fixture below is the identical shape also pinned
-    directly inside ``test_t138_records_that_never_pair_block_the_switch``'s
-    third case, driven through T138's own assertions rather than only
-    here."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    today = date(2026, 3, 10)
-    # Yesterday usable (pair_hours >= MIN_OBS_HOURS) so predicate 2 alone
-    # does not also block -- isolates predicate 3.
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS,
-    )
-    # 9 more final rows before today: 2 failed-final (attempts=3), 7 fetched
-    # -> failed_final=2, before_today=10, share=20% > 10%.
-    for n in range(2, 9):
-        _insert_day(
-            conn,
-            station_id,
-            today - timedelta(days=n),
-            status="fetched",
-            record_count=24,
-        )
-    _insert_day(
-        conn, station_id, today - timedelta(days=9), status="failed", attempts=3
-    )
-    _insert_day(
-        conn, station_id, today - timedelta(days=10), status="failed", attempts=3
-    )
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is False
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None
-    reason = json.loads(blocked)["reason"]
-    assert reason == "too many station-days failed", (
-        "mutant -> at this assertion: correct = 'too many station-days"
-        " failed' (reason 3, §8.9, failed_final > 10% of before_today),"
-        f" mutant (predicate 3's check dropped or its reason text wrong) ="
-        f" {reason!r}"
-    )
-
-    # Same failed-final overflow, but now yesterday ALSO fails predicate 2
-    # (pair_hours 0) -- reason 3 still wins, being first in the §8.9 order.
-    conn2 = _make_db()
-    site_id2 = _make_site(conn2)
-    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_wind_basis_state(conn2, site_id2, "staging")
-    _insert_day(
-        conn2,
-        station_id2,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=0,
-    )
-    for n in range(2, 9):
-        _insert_day(
-            conn2,
-            station_id2,
-            today - timedelta(days=n),
-            status="fetched",
-            record_count=24,
-        )
-    _insert_day(
-        conn2, station_id2, today - timedelta(days=9), status="failed", attempts=3
-    )
-    _insert_day(
-        conn2, station_id2, today - timedelta(days=10), status="failed", attempts=3
-    )
-
-    switched2 = _switch_check(conn2, site_id2, _TZ, _BIG_FREE)
-
-    assert switched2 is False
-    blocked2 = get_runtime_state(conn2, wind_blocked_key(site_id2))
-    assert blocked2 is not None
-    reason2 = json.loads(blocked2)["reason"]
-    assert reason2 == "too many station-days failed", (
-        "mutant -> at this assertion: correct = reason 3 (checked before"
-        " reason 4 in the §8.9 order, even though predicate 2 also fails"
-        " here), mutant (the order flipped so reason 4's text wins) ="
-        f" {reason2!r}"
-    )
-
-
-# =============================================================================
-# T138-T143 -- switch coverage, record reads and site deletion (plan 15.1)
-# =============================================================================
-
-
-def test_t138_records_that_never_pair_block_the_switch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Every predicate holds except predicate 2: the enabled station's
-    yesterday row is `fetched` with a full day of records (96) but zero
-    pairing hours. A second case drives the reason-3-before-reason-4
-    ordering (the same mutant shape ``test_switch_check_too_many_failed_
-    final_blocks_with_reason_3`` above pins against its own ``conn2``)
-    directly through this test's own fixture and assertions too: yesterday
-    is unusable (predicate 2 fails, as in the primary case) AND
-    failed-final rows exceed the 10% share (predicate 3 also fails), so
-    reason 3 must still win over reason 4."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    today = date(2026, 3, 10)
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=0,
-    )
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is False, (
-        "mutant -> at this assertion: correct = False (predicate 2 fails --"
-        " yesterday is `fetched` but has zero pairing hours), mutant (the"
-        " SQL form: the `pair_hours >= :min_pair_hours` clause dropped from"
-        " `yesterday_usable`'s CASE expression in the SQL query, so it"
-        " counts `fetched` alone, ignoring pair_hours) = True. (The Python"
-        " form, `p2 = counts.yesterday_fetched > 0` in place of"
-        " `counts.yesterday_usable > 0`, is killed by T140, not here.)"
-    )
-    assert wind_basis_state(conn, site_id) == "staging"
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None
-    reason = json.loads(blocked)["reason"]
-    assert reason == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    ), (
-        "mutant -> at this assertion: correct = reason 4's text, naming"
-        f" MIN_OBS_HOURS, mutant (a different reason) = {reason!r}"
-    )
-    assert f"{MIN_OBS_HOURS} hours" in reason
-
-    # Sub-case: yesterday fetched with pair_hours=0 (predicate 2 fails, as
-    # above) AND failed-final rows exceed the 10% share (predicate 3 also
-    # fails) -- reason 3 must still win, being checked first in the §8.9
-    # order. Mirrors test_switch_check_too_many_failed_final_blocks_with_
-    # reason_3's conn2, but pinned directly here in T138.
-    conn3 = _make_db()
-    site_id3 = _make_site(conn3)
-    station_id3 = _make_station(conn3, site_id3, "WSTATION01")
-    set_wind_basis_state(conn3, site_id3, "staging")
-    _insert_day(
-        conn3,
-        station_id3,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=0,
-    )
-    for n in range(2, 9):
-        _insert_day(
-            conn3,
-            station_id3,
-            today - timedelta(days=n),
-            status="fetched",
-            record_count=24,
-        )
-    _insert_day(
-        conn3, station_id3, today - timedelta(days=9), status="failed", attempts=3
-    )
-    _insert_day(
-        conn3, station_id3, today - timedelta(days=10), status="failed", attempts=3
-    )
-
-    switched3 = _switch_check(conn3, site_id3, _TZ, _BIG_FREE)
-
-    assert switched3 is False
-    blocked3 = get_runtime_state(conn3, wind_blocked_key(site_id3))
-    assert blocked3 is not None
-    reason3 = json.loads(blocked3)["reason"]
-    assert reason3 == "too many station-days failed", (
-        "mutant -> at this assertion: correct = 'too many station-days"
-        " failed' (reason 3, checked before reason 4 in the §8.9 order,"
-        " even though predicate 2 also fails here), mutant (the reason-4"
-        " branch moved above the `elif not p3` check, e.g. written as"
-        " `elif counts.yesterday_usable == 0 and counts.yesterday_fetched >"
-        " 0:`) = reason 4's text instead"
-    )
-
-
-def test_t139_switch_pair_hours_boundary_and_at_least_one_station_semantics(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The predicate-2 threshold boundary at MIN_OBS_HOURS, and the "at
-    least one station" semantics -- the switch counts stations whose own
-    `pair_hours >= MIN_OBS_HOURS`, not a per-station AND, and not a total
-    `pair_hours` summed across stations."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    today = date(2026, 3, 10)
-
-    # 21 (MIN_OBS_HOURS - 1): blocked, reason 4.
-    conn1 = _make_db()
-    site_id1 = _make_site(conn1)
-    station_id1 = _make_station(conn1, site_id1, "WSTATION01")
-    set_wind_basis_state(conn1, site_id1, "staging")
-    _insert_day(
-        conn1,
-        station_id1,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS - 1,
-    )
-    switched1 = _switch_check(conn1, site_id1, _TZ, _BIG_FREE)
-    assert switched1 is False, (
-        "mutant -> at this assertion: correct = False (pair_hours ="
-        f" {MIN_OBS_HOURS - 1}, below MIN_OBS_HOURS), mutant (a threshold"
-        f" lowered to {MIN_OBS_HOURS - 1} or below) = True. (The `>`-for-"
-        "`>=` mutant is NOT caught here -- 21 > 22 and 21 >= 22 are both"
-        " False; the 22-hour case below is the one that catches it.)"
-    )
-    blocked1 = get_runtime_state(conn1, wind_blocked_key(site_id1))
-    assert blocked1 is not None
-    assert json.loads(blocked1)["reason"] == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    )
-
-    # 22 (== MIN_OBS_HOURS): passes.
-    conn2 = _make_db()
-    site_id2 = _make_site(conn2)
-    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_wind_basis_state(conn2, site_id2, "staging")
-    _insert_day(
-        conn2,
-        station_id2,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS,
-    )
-    switched2 = _switch_check(conn2, site_id2, _TZ, _BIG_FREE)
-    assert switched2 is True, (
-        "mutant -> at this assertion: correct = True (pair_hours =="
-        f" {MIN_OBS_HOURS} meets the threshold), mutant (`>` used for `>=`,"
-        " requiring one more hour) = False"
-    )
-    assert wind_basis_state(conn2, site_id2) == "switching"
-
-    # Two stations: one at 0, one at MIN_OBS_HOURS -- "at least one usable
-    # station", not "every enabled station usable".
-    conn3 = _make_db()
-    site_id3 = _make_site(conn3)
-    station_a = _make_station(conn3, site_id3, "WSTATION01")
-    station_b = _make_station(conn3, site_id3, "WSTATION02")
-    set_wind_basis_state(conn3, site_id3, "staging")
-    _insert_day(
-        conn3,
-        station_a,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=0,
-    )
-    _insert_day(
-        conn3,
-        station_b,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS,
-    )
-    switched3 = _switch_check(conn3, site_id3, _TZ, _BIG_FREE)
-    assert switched3 is True, (
-        "mutant -> at this assertion: correct = True (station B alone"
-        " meets the threshold -- the count counts stations whose own"
-        " pair_hours >= MIN_OBS_HOURS), mutant (predicate 2 required over"
-        " EVERY station) = False"
-    )
-    assert wind_basis_state(conn3, site_id3) == "switching"
-
-    # Two stations, each with pair_hours == MIN_OBS_HOURS // 2: neither
-    # station alone reaches the threshold, but their total across stations
-    # (MIN_OBS_HOURS) would. A "total hours across stations" rewrite of
-    # `yesterday_usable` would pass here; the correct per-station count
-    # must not.
-    conn4 = _make_db()
-    site_id4 = _make_site(conn4)
-    station_c = _make_station(conn4, site_id4, "WSTATION01")
-    station_d = _make_station(conn4, site_id4, "WSTATION02")
-    set_wind_basis_state(conn4, site_id4, "staging")
-    _insert_day(
-        conn4,
-        station_c,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS // 2,
-    )
-    _insert_day(
-        conn4,
-        station_d,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=96,
-        pair_hours=MIN_OBS_HOURS // 2,
-    )
-    switched4 = _switch_check(conn4, site_id4, _TZ, _BIG_FREE)
-    assert switched4 is False, (
-        "mutant -> at this assertion: correct = False (neither station's"
-        f" own pair_hours ({MIN_OBS_HOURS // 2}) reaches MIN_OBS_HOURS, even"
-        f" though their total ({2 * (MIN_OBS_HOURS // 2)}) would), mutant"
-        " (`yesterday_usable` rewritten to sum `pair_hours` across every"
-        " enabled station and compare the total to MIN_OBS_HOURS) = True"
-    )
-    assert wind_basis_state(conn4, site_id4) == "staging"
-    blocked4 = get_runtime_state(conn4, wind_blocked_key(site_id4))
-    assert blocked4 is not None
-    reason4 = json.loads(blocked4)["reason"]
-    assert reason4 == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    ), (
-        "mutant -> at this assertion: correct = reason 4's text, naming"
-        f" MIN_OBS_HOURS, mutant (a different reason) = {reason4!r}"
-    )
-
-
-def test_t140_waiting_not_blocked_when_another_station_is_still_due(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Station A's yesterday is unusable (pair_hours 0), but station B's
-    yesterday row is still `pending`: predicate 1 (nothing retryable
-    strictly before yesterday) still holds, and `exhausted` is False
-    because B's own row is retryable through today -- so the check returns
-    False WITHOUT writing a `wind_basis_blocked` key: waiting, not
-    blocked."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    today = date(2026, 3, 10)
-    yesterday = today - timedelta(days=1)
-
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_a = _make_station(conn, site_id, "WSTATION01")
-    station_b = _make_station(conn, site_id, "WSTATION02")
-    set_wind_basis_state(conn, site_id, "staging")
-    _insert_day(
-        conn, station_a, yesterday, status="fetched", record_count=96, pair_hours=0
-    )
-    _insert_day(conn, station_b, yesterday, status="pending")
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is False
-    assert wind_basis_state(conn, site_id) == "staging"
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is None, (
-        "mutant -> at this assertion: correct = None (B's yesterday-dated"
-        " `pending` row keeps `retry_before_today` > 0, so `exhausted`"
-        " stays False and nothing is written -- the site is merely"
-        " waiting), mutant (`retry_before_today` computed only over rows"
-        " strictly before YESTERDAY, like predicate 1, missing B's row) ="
-        f" a blocked key written = {blocked!r}"
-    )
-
-    # Control: B's row `unavailable` (final, not retryable) instead --
-    # now nothing is retryable through today, `exhausted` is True, and the
-    # same predicate-2 failure blocks with reason 4.
-    conn2 = _make_db()
-    site_id2 = _make_site(conn2)
-    station_a2 = _make_station(conn2, site_id2, "WSTATION01")
-    station_b2 = _make_station(conn2, site_id2, "WSTATION02")
-    set_wind_basis_state(conn2, site_id2, "staging")
-    _insert_day(
-        conn2, station_a2, yesterday, status="fetched", record_count=96, pair_hours=0
-    )
-    _insert_day(conn2, station_b2, yesterday, status="unavailable")
-
-    switched2 = _switch_check(conn2, site_id2, _TZ, _BIG_FREE)
-
-    assert switched2 is False
-    blocked2 = get_runtime_state(conn2, wind_blocked_key(site_id2))
-    assert blocked2 is not None, (
-        "mutant -> at this assertion: correct = a blocked key IS written"
-        " once B's row is no longer retryable (exhausted becomes True),"
-        " mutant (the waiting/blocked distinction collapsed so this stays"
-        " unblocked too) = None"
-    )
-    assert json.loads(blocked2)["reason"] == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    )
-
-
-def test_t141_persist_day_writes_pair_hours_through_the_counts_only_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """End to end through the counts-only persist (`staging`, not
-    `pair_max`): `_persist_day` must itself write `pair_hours` from the
-    real records, not merely `record_count` -- 900 s spacing never pairs
-    (gap > MAX_PAIR_GAP_SECONDS), 300 s spacing pairs every hour."""
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    today = date(2026, 3, 10)
-    yesterday = today - timedelta(days=1)
-    start = datetime(2026, 3, 9, 0, 0, 0, tzinfo=UTC)
-
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_runtime_state(conn, wind_basis_key(site_id), "staging")
-    _insert_day(conn, station_id, yesterday, status="pending")
-
-    spaced_900 = [
-        WindRecord(obs_at=start + timedelta(seconds=900 * i), speed_kmh=5.0)
-        for i in range(96)
-    ]
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=yesterday,
-        tz_name=_TZ,
-        today=today,
-        records=spaced_900,
-        probe=None,
-    )
-    row = _day_row(conn, station_id, yesterday)
-    assert row["status"] == "fetched"
-    assert row["record_count"] == 96
-    assert row["pair_hours"] == 0, (
-        "mutant -> at this assertion: correct = 0 (900 s spacing exceeds"
-        " the 600 s pair gap, no pair in any hour), mutant (`pair_hours`"
-        " not written by the counts-only persist, left at its default, or"
-        " read from `record_count` instead) = " + repr(row["pair_hours"])
-    )
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-    assert switched is False, (
-        "mutant -> at this assertion: correct = False (predicate 2 reads"
-        " the just-persisted pair_hours, which is 0), mutant (predicate 2"
-        " read from record_count instead, seeing 96 and passing) = True"
-    )
-    blocked = get_runtime_state(conn, wind_blocked_key(site_id))
-    assert blocked is not None
-    assert json.loads(blocked)["reason"] == (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    )
-
-    # Same day, 300 s spacing: every adjacent pair is inside the gap, so
-    # every one of the 24 hours gets a pair.
-    conn2 = _make_db()
-    site_id2 = _make_site(conn2)
-    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_runtime_state(conn2, wind_basis_key(site_id2), "staging")
-    _insert_day(conn2, station_id2, yesterday, status="pending")
-
-    spaced_300 = [
-        WindRecord(obs_at=start + timedelta(seconds=300 * i), speed_kmh=5.0)
-        for i in range(288)
-    ]
-    _persist_day(
-        conn2,
-        site_id=site_id2,
-        station_id=station_id2,
-        local_date=yesterday,
-        tz_name=_TZ,
-        today=today,
-        records=spaced_300,
-        probe=None,
-    )
-    row2 = _day_row(conn2, station_id2, yesterday)
-    assert row2["status"] == "fetched"
-    assert row2["pair_hours"] == 24, (
-        "mutant -> at this assertion: correct = 24 (5-minute spacing pairs"
-        " every hour of the day), mutant (`pair_hours` not written by the"
-        " counts-only persist) = " + repr(row2["pair_hours"])
-    )
-
-    switched2 = _switch_check(conn2, site_id2, _TZ, _BIG_FREE)
-    assert switched2 is True, (
-        "mutant -> at this assertion: correct = True (pair_hours == 24 >="
-        " MIN_OBS_HOURS), mutant (`pair_hours` never persisted outside"
-        " `pair_max`, staying 0) = False"
-    )
-    assert wind_basis_state(conn2, site_id2) == "switching"
-
-
-def test_t142_switch_check_reasons_match_the_remedies_map() -> None:
-    """AST walk of `_switch_check` (plan section 15.1 T142): the string
-    constants it can assign to `reason` are exactly the five section-8.9
-    reasons, and exactly the keys of `WIND_BLOCKED_REMEDIES`; the reason-4
-    and reason-5 remedies never fall back to "disable a station", which
-    cannot help when the problem IS that a station has no data."""
-    import wxverify.worker.wind_days as wind_days_module
-    from wxverify.web.context import WIND_BLOCKED_REMEDIES
-
-    source = Path(wind_days_module.__file__).read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    switch_check = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_switch_check"
-    )
-    reasons: set[str] = set()
-    for node in ast.walk(switch_check):
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-            and node.targets[0].id == "reason"
-            and isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
-            reasons.add(node.value.value)
-
-    reason_4 = (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    )
-    reason_5 = "no station returned yesterday's data"
-    expected_reasons = {
-        "free disk space could not be read",
-        "not enough free disk space for the switch",
-        "too many station-days failed",
-        reason_4,
-        reason_5,
-    }
-    assert reasons == expected_reasons, (
-        "mutant -> at this assertion: correct = the five section-8.9"
-        " reason strings, mutant (a reason string reworded or dropped"
-        f" from `_switch_check`) = {reasons!r}"
-    )
-    assert reasons == set(WIND_BLOCKED_REMEDIES), (
-        "mutant -> at this assertion: correct = WIND_BLOCKED_REMEDIES has"
-        " exactly these five keys, mutant (a reason missing from the map,"
-        " falling back to the disable-a-station default for it) ="
-        f" {set(WIND_BLOCKED_REMEDIES)!r}"
-    )
-
-    assert WIND_BLOCKED_REMEDIES[reason_4] == (
-        "make sure at least one station uploads its readings at least"
-        " every 10 minutes all day; the switch checks again once the next"
-        " day is fetched"
-    ), (
-        "mutant -> at this assertion: correct = the section-8.9 reason-4"
-        " remedy verbatim, mutant (a different or disable-a-station"
-        f" remedy) = {WIND_BLOCKED_REMEDIES[reason_4]!r}"
-    )
-    assert WIND_BLOCKED_REMEDIES[reason_5] == (
-        "check that at least one station is online and uploading to"
-        " weather.com; the switch checks again once the next day is"
-        " fetched"
-    ), (
-        "mutant -> at this assertion: correct = the section-8.9 reason-5"
-        " remedy verbatim, mutant (a different or disable-a-station"
-        f" remedy) = {WIND_BLOCKED_REMEDIES[reason_5]!r}"
-    )
-    assert "disable" not in WIND_BLOCKED_REMEDIES[reason_4].lower(), (
-        "mutant -> at this assertion: correct = no 'disable a station'"
-        " language for reason 4 (it is a data-coverage problem, not a"
-        " faulty-station one), mutant (the generic disable-a-station"
-        f" fallback used here) = {WIND_BLOCKED_REMEDIES[reason_4]!r}"
-    )
-    assert "disable" not in WIND_BLOCKED_REMEDIES[reason_5].lower(), (
-        "mutant -> at this assertion: correct = no 'disable a station'"
-        " language for reason 5, mutant (the generic disable-a-station"
-        f" fallback used here) = {WIND_BLOCKED_REMEDIES[reason_5]!r}"
-    )
-
-
-def test_t142_load_wind_history_surfaces_the_reason_4_remedy() -> None:
-    """`load_wind_history` must surface the reason-4 remedy for a site
-    whose `wind_basis_blocked` key holds reason 4 -- the panel-level wiring
-    `WIND_BLOCKED_REMEDIES` alone cannot prove."""
-    from wxverify.web.context import load_wind_history
-
-    conn = _make_db()
-    site_id = _make_site(conn)
-    _make_station(conn, site_id, "WSTATION01")
-    reason_4 = (
-        "no station had 22 hours of wind readings at most 10 minutes apart yesterday"
-    )
-    set_runtime_state(
-        conn,
-        wind_blocked_key(site_id),
-        json.dumps(
-            {"reason": reason_4, "since": "2026-03-01T00:00:00Z", "reset_on": None}
-        ),
-    )
-
-    panel = load_wind_history(conn)
-
-    site_row = next(s for s in panel.sites if s.site_id == site_id)
-    assert site_row.blocked_reason == reason_4
-    assert site_row.remedy == (
-        "make sure at least one station uploads its readings at least"
-        " every 10 minutes all day; the switch checks again once the next"
-        " day is fetched"
-    ), (
-        "mutant -> at this assertion: correct = the reason-4 remedy,"
-        " mutant (WIND_BLOCKED_REMEDIES missing reason 4, falling back to"
-        f" the disable-a-station default) = {site_row.remedy!r}"
-    )
 
 
 def _t143_insert_records(conn: sqlite3.Connection, station_id: int) -> None:
@@ -1764,44 +688,12 @@ def test_t143_record_read_in_a_non_whole_hour_offset_zone() -> None:
     one (``hours[-1] + 1h``), not ``local_day_slots``'s own end."""
     d = date(2026, 3, 10)
     tz = "Asia/Kolkata"
-    from wxverify.db.wind_basis import WindCursor
-
-    # -- install leg: `switching`, D `fetched`. ------------------------
-    conn1 = _make_db()
-    site_id1 = _make_site(conn1, tz=tz)
-    station_id1 = _make_station(conn1, site_id1, "WSTATION01")
-    set_wind_basis_state(conn1, site_id1, "switching")
-    _insert_day(conn1, station_id1, d, status="fetched", record_count=288)
-    _t143_insert_records(conn1, station_id1)
-
-    more = _install_step(
-        conn1,
-        site_id1,
-        tz,
-        d + timedelta(days=2),
-        WindCursor(phase="install", cursor_date=d, date_present=True),
-    )
-    assert more is True
-    row1 = conn1.execute(
-        "SELECT source_raw FROM station_observations"
-        " WHERE station_id = ? AND valid_at = '2026-03-10T18:00:00Z'",
-        (station_id1,),
-    ).fetchone()
-    assert row1 is not None and row1["source_raw"] == "pair-max 40.0 km/h", (
-        "mutant -> at this assertion: correct = 'pair-max 40.0 km/h' (the"
-        " 18:40/45/50Z records are read because the bound is the"
-        " UTC-hour one), mutant (the read bounded by D's own local"
-        " midnight, 18:30Z, instead -- those records fall outside it and"
-        " the hour's only pair is 5.0) = "
-        + repr(None if row1 is None else row1["source_raw"])
-    )
 
     # -- last-derived-day leg: `pair_max`, D `fetched`, D+1 neither
     # `fetched` nor `partial`. ------------------------------------------
     conn2 = _make_db()
     site_id2 = _make_site(conn2, tz=tz)
     station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_wind_basis_state(conn2, site_id2, "pair_max")
     _insert_day(conn2, station_id2, d, status="fetched", record_count=288)
     _insert_day(conn2, station_id2, d + timedelta(days=1), status="pending")
     _t143_insert_records(conn2, station_id2)
@@ -1813,7 +705,6 @@ def test_t143_record_read_in_a_non_whole_hour_offset_zone() -> None:
         local_date=d,
         tz_name=tz,
         today=d + timedelta(days=2),
-        write_rows=True,
     )
     row2 = conn2.execute(
         "SELECT source_raw FROM station_observations"
@@ -1837,32 +728,9 @@ def test_t143_record_read_in_a_non_whole_hour_offset_zone() -> None:
     # so a local-midnight bound and the UTC-hour bound coincide; this leg
     # alone cannot distinguish the mutant above, only confirms the
     # non-tz-shifted case still produces the expected value. ------------
-    conn3 = _make_db()
-    site_id3 = _make_site(conn3, tz="UTC")
-    station_id3 = _make_station(conn3, site_id3, "WSTATION01")
-    set_wind_basis_state(conn3, site_id3, "switching")
-    _insert_day(conn3, station_id3, d, status="fetched", record_count=288)
-    _t143_insert_records(conn3, station_id3)
-
-    more3 = _install_step(
-        conn3,
-        site_id3,
-        "UTC",
-        d + timedelta(days=2),
-        WindCursor(phase="install", cursor_date=d, date_present=True),
-    )
-    assert more3 is True
-    row3 = conn3.execute(
-        "SELECT source_raw FROM station_observations"
-        " WHERE station_id = ? AND valid_at = '2026-03-10T18:00:00Z'",
-        (station_id3,),
-    ).fetchone()
-    assert row3 is not None and row3["source_raw"] == "pair-max 40.0 km/h"
-
     conn4 = _make_db()
     site_id4 = _make_site(conn4, tz="UTC")
     station_id4 = _make_station(conn4, site_id4, "WSTATION01")
-    set_wind_basis_state(conn4, site_id4, "pair_max")
     _insert_day(conn4, station_id4, d, status="fetched", record_count=288)
     _insert_day(conn4, station_id4, d + timedelta(days=1), status="pending")
     _t143_insert_records(conn4, station_id4)
@@ -1873,7 +741,6 @@ def test_t143_record_read_in_a_non_whole_hour_offset_zone() -> None:
         local_date=d,
         tz_name="UTC",
         today=d + timedelta(days=2),
-        write_rows=True,
     )
     row4 = conn4.execute(
         "SELECT source_raw FROM station_observations"
@@ -1884,66 +751,7 @@ def test_t143_record_read_in_a_non_whole_hour_offset_zone() -> None:
 
 
 # =============================================================================
-# T43 -- rescoring defers on ScoringInputsBusy
-# =============================================================================
-
-
-def test_t43_scoring_inputs_busy_on_every_cas_attempt_defers_the_rescore(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``_run_rescoring`` catches ``ScoringInputsBusy`` (every CAS attempt in
-    ``run_batched_scoring``/``run_split_pair_phases`` lost to concurrent
-    writes) and converts it to a ``JobDeferred`` 60s out, rather than letting
-    the scoring internals' exception propagate raw. The two scoring
-    functions are injected failing fakes here -- their own CAS-retry
-    internals are a different unit, already exercised elsewhere; this test
-    targets only ``_run_rescoring``'s own except/defer wiring.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    db = init_db(str(db_path))
-    site_id = _make_site(db._conn)  # noqa: SLF001
-    db._conn.commit()  # noqa: SLF001
-    writer = FencedWriter(db, db.generation)
-
-    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
-    _freeze_wind_days_today(monkeypatch, now)
-
-    async def fake_split_pair_phases(
-        writer: FencedWriter, site_id: int, *, require_enabled: bool
-    ) -> None:
-        return None
-
-    async def fake_batched_scoring(writer: FencedWriter, site_id: int) -> None:
-        raise ScoringInputsBusy(site_id, "window w1")
-
-    monkeypatch.setattr(
-        "wxverify.worker.wind_days.run_split_pair_phases", fake_split_pair_phases
-    )
-    monkeypatch.setattr(
-        "wxverify.worker.wind_days.run_batched_scoring", fake_batched_scoring
-    )
-
-    from wxverify.worker.control import JobDeferred
-
-    with pytest.raises(JobDeferred) as exc_info:
-        asyncio.run(_run_rescoring(writer, site_id))
-
-    assert exc_info.value.next_attempt_at == isoformat_utc(
-        now + timedelta(seconds=60)
-    ), (
-        "mutant -> at this assertion: correct = the wake time is exactly"
-        " now + 60s (_RESCORE_BUSY_DEFER), mutant (a different/zero defer"
-        " duration spliced into the JobDeferred) = a different"
-        " next_attempt_at"
-    )
-
-
-# =============================================================================
-# T97 -- a station-day stuck on repeated 500s becomes final after 3 attempts,
-# and no longer blocks the switch's own "retry before yesterday" predicate
+# T97 -- a station-day stuck on repeated 500s becomes final after 3 attempts
 # =============================================================================
 
 
@@ -1988,10 +796,8 @@ def test_t97_a_row_stuck_on_500s_goes_final_after_three_attempts(
 ) -> None:
     """Drives four real jobs through ``run_wind_days`` against a single
     enabled station with one station-day two days before today (strictly
-    before "yesterday", so it feeds the switch check's own
-    ``retry_before_yesterday`` predicate), where ``history/all`` always
-    answers 500. Today's auto-fabricated row is pre-closed so it never
-    competes for a call.
+    before "yesterday"), where ``history/all`` always answers 500. Today's
+    auto-fabricated row is pre-closed so it never competes for a call.
 
     Jobs 1-3 each make exactly one request, record a row failure (attempts
     1, 2, 3; next_attempt_at +1h then +4h) and a domain backoff, and each
@@ -2084,105 +890,8 @@ def test_t97_a_row_stuck_on_500s_goes_final_after_three_attempts(
     assert row["attempts"] == 3
 
 
-# =============================================================================
-# T98 -- switching and rescoring never reach the fetch chunk, even with a due
-# row, an active domain backoff and today's spend at the cap
-# =============================================================================
-
-
-def _t98_seed_traps(conn: sqlite3.Connection, station_id: int, today: date) -> None:
-    """A due (exempt) row, an active weathercom domain backoff and today's
-    spend at the stored cap -- three independent reasons a wrongly-dispatched
-    fetch chunk would be blocked or would fail loudly, none of which the
-    correct switching/rescoring dispatch ever reaches."""
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, (today - timedelta(days=1)).isoformat()),
-    )
-    conn.execute(
-        "INSERT INTO domain_backoffs (domain, next_attempt_at, retry_count)"
-        " VALUES ('api.weather.com', '2026-03-10T23:00:00Z', 1)"
-    )
-    conn.execute("UPDATE sources SET daily_call_limit = 1 WHERE source = 'weathercom'")
-    conn.execute(
-        "INSERT INTO api_budget (source, billing_day, calls) VALUES"
-        " ('weathercom', ?, 1)",
-        (today.isoformat(),),
-    )
-    conn.commit()
-
-
-def test_t98_switching_makes_no_fetch_even_with_a_due_row_backoff_and_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "switching")
-    write_wind_cursor(
-        conn, site_id, phase="install", cursor_date=today - timedelta(days=20)
-    )
-    _t98_seed_traps(conn, station_id, today)
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        raise httpx.ConnectError("refused", request=request)
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)  # must not raise
-
-    assert len(call_log) == 0
-    cursor = read_wind_cursor(conn, site_id)
-    assert cursor.cursor_date == today - timedelta(days=6), (
-        "mutant -> at this assertion: correct = the switching lane advanced"
-        " the install cursor 14 days (``_DAY_TRANSACTIONS``) to today - 6 and"
-        " returned, mutant (the early return after ``_run_switching`` dropped,"
-        " so the job falls through) = the cursor never advances because the"
-        " fallthrough raises JobDeferred before any install step runs"
-    )
-    assert wind_basis_state(conn, site_id) == "switching"
-
-
-def test_t98_rescoring_makes_no_fetch_even_with_a_due_row_backoff_and_cap(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "rescoring")
-    _t98_seed_traps(conn, station_id, today)
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        raise httpx.ConnectError("refused", request=request)
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)  # must not raise
-
-    assert len(call_log) == 0
-    assert wind_basis_state(conn, site_id) == "pair_max", (
-        "mutant -> at this assertion: correct = 'pair_max' (rescoring reaches"
-        " the scoring step and transitions normally), mutant (the early"
-        " return after ``_run_rescoring`` dropped) = the job raises"
-        " JobDeferred from the fallthrough fetch attempt instead of returning"
-    )
-    assert get_runtime_state(conn, wind_done_at_key(site_id)) is not None
-
-
 # ---------------------------------------------------------------------------
-# T99 -- switching and rescoring never probe a `probing` hold; the first
-# `pair_max` job does.
+# T99 -- a wind job probes a `probing` hold.
 # ---------------------------------------------------------------------------
 
 
@@ -2208,81 +917,11 @@ def _t99_seed_probing_due_row(
     conn.commit()
 
 
-def test_t99_switching_does_not_probe_a_probing_hold(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "switching")
-    write_auth_hold(
-        conn, "history_all", status="probing", since="2026-03-09T00:00:00Z", error="x"
-    )
-    _t99_seed_probing_due_row(conn, station_id, today)
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        raise httpx.ConnectError("refused", request=request)
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)  # must not raise
-
-    assert len(call_log) == 0, (
-        "mutant -> at this assertion: correct = the switching lane never"
-        " reaches the probe step (len(call_log) == 0), mutant (the probe run"
-        " in every state) = the probing hold's due row is fetched even while"
-        " switching"
-    )
-    hold = read_auth_hold(conn, "history_all")
-    assert hold is not None
-    assert hold.status == "probing"
-
-
-def test_t99_rescoring_does_not_probe_a_probing_hold(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "rescoring")
-    write_auth_hold(
-        conn, "history_all", status="probing", since="2026-03-09T00:00:00Z", error="x"
-    )
-    _t99_seed_probing_due_row(conn, station_id, today)
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        raise httpx.ConnectError("refused", request=request)
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)  # must not raise
-
-    assert len(call_log) == 0, (
-        "mutant -> at this assertion: correct = the rescoring lane never"
-        " reaches the probe step (len(call_log) == 0), mutant (the probe run"
-        " in every state) = the probing hold's due row is fetched even while"
-        " rescoring"
-    )
-    hold = read_auth_hold(conn, "history_all")
-    assert hold is not None
-    assert hold.status == "probing"
-
-
 def test_t99_pair_max_probes_the_held_endpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Paired positive for the two tests above: once the site is in
-    ``pair_max`` (the default, untouched state), the same probing hold and
-    due row DO get a single probe call -- proving the switching/rescoring
-    suppression is a real state check, not a harness artifact."""
+    """A probing ``history_all`` hold with a due row gets a single probe
+    call, and a successful probe clears the hold."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
@@ -2306,382 +945,6 @@ def test_t99_pair_max_probes_the_held_endpoint(
     assert read_auth_hold(conn, "history_all") is None, (
         "a successful probe clears the hold"
     )
-
-
-# ---------------------------------------------------------------------------
-# T100 -- a prior job's bad exit (headroom-0 ``JobDeferred``, or the switch
-# check itself raising) never gates the next job's fresh switch check.
-# ---------------------------------------------------------------------------
-
-
-def test_t100_a_prior_headroom_deferral_does_not_block_the_next_switch_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from wxverify.worker.control import JobDeferred
-
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "staging")
-    # Job 1: yesterday not yet fetched (switch check predicate 2 fails), and
-    # a true backfill row (today - 2, non-exempt) is due with headroom 0 --
-    # the fallthrough fetch chunk ends in JobDeferred.
-    _insert_day(conn, station_id, today - timedelta(days=2), status="pending")
-    _insert_day(conn, station_id, today - timedelta(days=1), status="pending")
-    conn.execute("UPDATE sources SET daily_call_limit = 0 WHERE source = 'weathercom'")
-    conn.commit()
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(200, json={"observations": []})
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-    with pytest.raises(JobDeferred):
-        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-    assert len(call_log) == 0
-    assert wind_basis_state(conn, site_id) == "staging"
-
-    # Job 2: yesterday is now fetched, the backfill row is closed and
-    # headroom is restored -- the switch check passes fresh, and the job
-    # returns before the fetch chunk runs at all.
-    conn.execute(
-        "UPDATE station_wind_days SET status = 'fetched', record_count = 24,"
-        " pair_hours = 24 WHERE station_id = ? AND local_date IN (?, ?)",
-        (
-            station_id,
-            (today - timedelta(days=2)).isoformat(),
-            (today - timedelta(days=1)).isoformat(),
-        ),
-    )
-    conn.execute(
-        "UPDATE sources SET daily_call_limit = 1000 WHERE source = 'weathercom'"
-    )
-    conn.commit()
-
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-    assert len(call_log) == 0, (
-        "mutant -> at this assertion: correct = the switch check passes and"
-        " the job returns before the fetch chunk (0 requests), mutant (the"
-        " fetch chunk run before the check, or the check gated on job 1's"
-        " JobDeferred exit) = the chunk runs anyway and makes a request"
-    )
-    assert wind_basis_state(conn, site_id) == "switching"
-
-
-def test_t100_a_prior_raising_switch_check_does_not_block_the_next_one(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _t97_init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    set_wind_basis_state(conn, site_id, "staging")
-    # Both past rows start final/fetched so job 2's real switch check will
-    # pass; job 1's own call is forced to raise instead of evaluating them.
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=2),
-        status="fetched",
-        record_count=24,
-        pair_hours=24,
-    )
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=288,
-        pair_hours=24,
-    )
-    # Yesterday's `pair_hours` literal above does not survive job 1: its
-    # fetch chunk persists TODAY's auto-fabricated row, and `_derive_days`
-    # pulls in yesterday as a `status='fetched'` neighbour and recomputes
-    # its `pair_hours` from the actual `station_wind_records` rows -- with
-    # none stored, that recompute silently zeroes the literal back out.
-    # Back it with real 5-minute-spaced records so the recompute reproduces
-    # 24 paired hours instead of wiping the column.
-    yesterday_start = datetime(2026, 3, 9, 0, 0, 0, tzinfo=UTC)
-    conn.executemany(
-        "INSERT OR IGNORE INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, ?)",
-        [
-            (
-                station_id,
-                isoformat_utc(yesterday_start + timedelta(minutes=5 * i)),
-                5.0,
-            )
-            for i in range(288)
-        ],
-    )
-    conn.commit()
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(200, json={"observations": []})
-
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _t97_freeze(monkeypatch, now)
-
-    def _raising_switch_check(
-        conn: sqlite3.Connection, site_id: int, tz_name: str, free: int | None
-    ) -> bool:
-        raise ValueError("injected: switch check unreadable")
-
-    monkeypatch.setattr(
-        "wxverify.worker.wind_days._switch_check", _raising_switch_check
-    )
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)  # caught; falls
-    # through to the fetch chunk, which closes today's due live row.
-    # mutant -> at this call: correct = the raised ValueError is caught
-    # internally and the call above returns normally; mutant (narrowing
-    # `except (sqlite3.Error, ValueError)` to `except sqlite3.Error` in
-    # wind_days.py) = job 1's own call above raises `ValueError: injected:
-    # switch check unreadable`, uncaught -- this is the real divergence
-    # point, confirmed by a real mutant run, not the final assertion below.
-    assert wind_basis_state(conn, site_id) == "staging"
-    monkeypatch.undo()
-    _t97_freeze(monkeypatch, now)
-
-    call_log.clear()
-    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-    assert len(call_log) == 0, (
-        "job 2's fresh switch check passes and the job returns before the"
-        " fetch chunk (0 requests); under the mutant above, execution never"
-        " reaches this line at all, so this assertion is a same-run sanity"
-        " check on the non-mutant path, not the mutant's divergence point"
-    )
-    assert wind_basis_state(conn, site_id) == "switching"
-
-
-def test_write_blocked_resets_failed_final_rows_once_per_utc_day() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    _insert_day(
-        conn, station_id, today - timedelta(days=5), status="failed", attempts=3
-    )
-
-    _write_blocked(conn, site_id, today, "test reason")
-    row_after_1 = _day_row(conn, station_id, today - timedelta(days=5))
-    assert row_after_1["status"] == "pending", (
-        "mutant -> at this assertion: correct = 'pending' (blocked resets"
-        " failed-final rows), mutant (the reset UPDATE scope/condition"
-        " broken) = still 'failed'"
-    )
-    assert row_after_1["attempts"] == 0
-
-    # Mark it failed-final again and call _write_blocked a second time the
-    # same UTC day: the reset must not fire twice.
-    conn.execute(
-        "UPDATE station_wind_days SET status = 'failed', attempts = 3"
-        " WHERE station_id = ? AND local_date = ?",
-        (station_id, (today - timedelta(days=5)).isoformat()),
-    )
-    conn.commit()
-    _write_blocked(conn, site_id, today, "test reason")
-    row_after_2 = _day_row(conn, station_id, today - timedelta(days=5))
-    assert row_after_2["status"] == "failed", (
-        "mutant -> at this assertion: correct = 'failed' (the reset already"
-        " ran today -- `reset_on` gates a second reset the same UTC day),"
-        " mutant (the `reset_on != utc_day` gate dropped) = 'pending' again"
-    )
-
-
-# =============================================================================
-# T41 -- switch pass (i): per-day purge + end-of-purge confirm/sweep
-# =============================================================================
-
-
-def test_purge_step_deletes_legacy_rows_day_by_day_with_sweep() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    write_wind_cursor(conn, site_id, phase="purge", cursor_date=None)
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw)"
-        " VALUES (?, 'wind', '2026-03-01T01:00:00Z', 1.0, 'ok', 'legacy raw')",
-        (station_id,),
-    )
-    conn.commit()
-    today = date(2026, 3, 10)
-
-    more = _purge_step(conn, site_id, _TZ, today)
-
-    assert more is True
-    left = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert left["n"] == 0, (
-        "mutant -> at this assertion: correct = 0 (the legacy wind row for"
-        " that day is deleted), mutant (the day-window range check broken)"
-        " = 1"
-    )
-
-
-def test_end_purge_confirm_raises_on_leftover_row() -> None:
-    """A planted leftover row (simulating the confirm step finding an
-    unaccounted-for row) raises RuntimeError and the whole transaction rolls
-    back -- that is the caller's responsibility in sqlite3's isolation
-    model, so here we assert the raise itself and that nothing downstream
-    (the cursor write) happened before it."""
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw)"
-        " VALUES (?, 'wind', '2026-03-01T01:00:00Z', 1.0, 'ok', 'leftover raw')",
-        (station_id,),
-    )
-    conn.commit()
-    today = date(2026, 3, 10)
-
-    with pytest.raises(RuntimeError, match="purge incomplete"):
-        _end_purge(conn, site_id, today)
-
-    cursor = read_wind_cursor(conn, site_id)
-    assert cursor.phase is None, (
-        "mutant -> at this assertion: correct = None (the confirm raise"
-        " happens before the cursor is advanced to 'install'), mutant (the"
-        " confirm check dropped so _end_purge proceeds past the leftover"
-        " row) = 'install'"
-    )
-
-
-def test_end_purge_sweeps_unparseable_rows_with_warning(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    conn.execute(
-        "INSERT INTO station_observations"
-        " (station_id, variable, valid_at, value, qc_flag, source_raw)"
-        " VALUES (?, 'wind', 'not-a-time', 1.0, 'ok', 'stray raw')",
-        (station_id,),
-    )
-    conn.commit()
-    today = date(2026, 3, 10)
-
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
-        _end_purge(conn, site_id, today)
-
-    left = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert left["n"] == 0, (
-        "mutant -> at this assertion: correct = 0 (unparseable rows are"
-        " swept outside the dated range_sql), mutant (the stray sweep"
-        " limited to parseable rows only) = 1"
-    )
-    assert any("unreadable time purged" in rec.message for rec in caplog.records)
-    cursor = read_wind_cursor(conn, site_id)
-    assert cursor.phase == "install", (
-        "mutant -> at this assertion: correct = 'install' (confirm passed,"
-        " pass (ii) begins), mutant (phase left at 'purge') = 'purge'"
-    )
-
-
-# =============================================================================
-# T42 -- switch pass (ii): install, ascending cursor, midnight carry
-# =============================================================================
-
-
-def test_install_step_writes_pairs_and_advances_cursor() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    day = date(2026, 3, 1)
-    _insert_day(conn, station_id, day, status="fetched", record_count=2)
-    start = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
-    conn.executemany(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, ?)",
-        [
-            (
-                station_id,
-                (start + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-                5.0,
-            ),
-            (
-                station_id,
-                (start + timedelta(hours=1, minutes=3))
-                .isoformat()
-                .replace("+00:00", "Z"),
-                9.0,
-            ),
-        ],
-    )
-    conn.commit()
-    from wxverify.db.wind_basis import WindCursor
-
-    more = _install_step(
-        conn,
-        site_id,
-        _TZ,
-        date(2026, 3, 10),
-        WindCursor(phase="install", cursor_date=day, date_present=True),
-    )
-
-    assert more is True
-    obs = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert obs["n"] == 1, (
-        "mutant -> at this assertion: correct = 1 paired hour written,"
-        " mutant (the day's fetched/partial status filter dropped so no"
-        " stations qualify) = 0"
-    )
-    cursor = read_wind_cursor(conn, site_id)
-    assert cursor.cursor_date == day + timedelta(days=1), (
-        "mutant -> at this assertion: correct = day+1 (cursor advances one"
-        " day), mutant (cursor_date left unchanged, an infinite loop) ="
-        " unchanged day"
-    )
-
-
-def test_install_step_past_today_transitions_to_rescoring() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    write_wind_cursor(conn, site_id, phase="install", cursor_date=date(2026, 3, 11))
-    from wxverify.db.wind_basis import WindCursor
-
-    more = _install_step(
-        conn,
-        site_id,
-        _TZ,
-        date(2026, 3, 10),
-        WindCursor(phase="install", cursor_date=date(2026, 3, 11), date_present=True),
-    )
-
-    assert more is False, (
-        "mutant -> at this assertion: correct = False (install is done, the"
-        " job stops), mutant (`day > today` comparison inverted) = True"
-    )
-    assert wind_basis_state(conn, site_id) == "rescoring", (
-        "mutant -> at this assertion: correct = 'rescoring' (the CAS moved"
-        " the site forward past install), mutant (transition call dropped)"
-        " = 'switching'"
-    )
-    assert get_runtime_state(conn, wind_cursor_key(site_id)) is None
 
 
 # =============================================================================
@@ -2810,7 +1073,6 @@ def test_persist_day_refetch_correction_in_pair_max_enqueues() -> None:
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2026, 3, 5)
-    set_wind_basis_state(conn, site_id, "pair_max")
     _insert_day(
         conn,
         station_id,
@@ -2855,53 +1117,6 @@ def test_persist_day_refetch_correction_in_pair_max_enqueues() -> None:
     assert jobs["n"] == 1
 
 
-def test_persist_day_refetch_correction_in_staging_no_station_row_no_enqueue() -> None:
-    """T106 (staging branch): same refetch correction but in `staging` --
-    counts update, no station row, no enqueue."""
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    local_date = date(2026, 3, 5)
-    set_wind_basis_state(conn, site_id, "staging")
-    _insert_day(
-        conn,
-        station_id,
-        local_date,
-        status="unavailable",
-        record_count=0,
-        refetch_at="2026-03-06T01:00:00Z",
-        refetched=0,
-    )
-
-    start = datetime(2026, 3, 5, 0, 0, 0, tzinfo=UTC)
-    records = [WindRecord(obs_at=start + timedelta(hours=1), speed_kmh=5.0)]
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=local_date,
-        tz_name=_TZ,
-        today=date(2026, 3, 10),
-        records=records,
-        probe=None,
-    )
-
-    row = _day_row(conn, station_id, local_date)
-    assert row["status"] == "fetched"
-    assert row["record_count"] == 1
-    obs = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations WHERE station_id = ?",
-        (station_id,),
-    ).fetchone()
-    assert obs["n"] == 0, (
-        "mutant -> at this assertion: correct = 0 (staging never writes a"
-        " station row even on a refetch correction), mutant (the refetch"
-        " path bypasses the pair_max gate) = 1"
-    )
-    jobs = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
-    assert jobs["n"] == 0
-
-
 def test_persist_day_refetch_partial_response_keeps_stored_record_count() -> None:
     """T107: a refetch response holding fewer records than already stored
     leaves ``record_count`` at the larger, already-stored figure -- it is
@@ -2910,7 +1125,6 @@ def test_persist_day_refetch_partial_response_keeps_stored_record_count() -> Non
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     local_date = date(2026, 3, 5)
-    set_wind_basis_state(conn, site_id, "staging")
     _insert_day(
         conn,
         station_id,
@@ -3110,10 +1324,9 @@ def test_enqueue_due_wind_days_enqueues_for_a_site_with_an_enabled_station() -> 
     conn = _make_db()
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
-    # staging + no pair-max rows + nothing due + today's row already present
-    # would make wind_lane_due False; to make it due, leave today's row
-    # missing (ensure_wind_days has not run yet in this bare fixture).
+    # nothing due + today's row already present would make wind_lane_due
+    # False; to make it due, leave today's row missing (ensure_wind_days has
+    # not run yet in this bare fixture).
 
     _enqueue_due_wind_days(conn)
 
@@ -3146,29 +1359,27 @@ def test_enqueue_due_wind_days_skips_a_site_with_no_enabled_station() -> None:
     assert jobs["n"] == 0
 
 
-def test_enqueue_due_wind_days_excludes_a_disabled_only_site_even_when_due() -> None:
+def test_enqueue_due_wind_days_excludes_a_disabled_only_site_even_when_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The real (non-equivalent) kill of the site-selection EXISTS clause the
     test above's docstring deferred: a second site whose only station is
-    disabled, but whose wind-basis state is forced outside ``STATES``.
-    ``wind_lane_due``'s own first branch (``state not in STATES -> True``)
-    would call that site due unconditionally, with no reference to station
-    enablement at all -- so the ONLY thing standing between it and an
-    enqueued job is the outer site-selection ``EXISTS (... st.enabled=1)``
-    clause itself. A disabled-only site with a normal state (the test above)
-    never reaches that shortcut and is equivalent; corrupting the state
-    closes that gap and makes the kill real.
+    disabled, with ``wind_lane_due`` patched to return True for every site.
+    The patched ``wind_lane_due`` calls that site due unconditionally, with
+    no reference to station enablement at all -- so the ONLY thing standing
+    between it and an enqueued job is the outer site-selection
+    ``EXISTS (... st.enabled=1)`` clause itself. A disabled-only site with
+    the real ``wind_lane_due`` (the test above) is equivalent; patching it
+    to return True closes that gap and makes the kill real.
     """
     conn = _make_db()
     due_site_id = _make_site(conn, "Due Site")
     _make_station(conn, due_site_id, "WSTATION01")
-    set_wind_basis_state(conn, due_site_id, "staging")
 
     disabled_site_id = _make_site(conn, "Disabled Station Site")
     _make_station(conn, disabled_site_id, "WSTATION02", enabled=False)
-    # set_wind_basis_state rejects an unknown state; write it directly to
-    # force wind_lane_due's unconditional-True branch regardless of any
-    # station's enabled flag.
-    set_runtime_state(conn, wind_basis_key(disabled_site_id), "corrupted-state")
+    # Every site is due, whatever any station's enabled flag says.
+    monkeypatch.setattr("wxverify.worker.scheduler.wind_lane_due", lambda *a, **k: True)
 
     _enqueue_due_wind_days(conn)
 
@@ -3184,8 +1395,8 @@ def test_enqueue_due_wind_days_excludes_a_disabled_only_site_even_when_due() -> 
         " site's job (the disabled-station-only site is excluded before"
         " wind_lane_due ever runs), mutant (st.enabled=1 dropped from the"
         " site-selection EXISTS clause) = both sites' jobs, because the"
-        " disabled-station site's corrupted state makes wind_lane_due"
-        " return True unconditionally once it is no longer excluded"
+        " patched wind_lane_due returns True for every site, the"
+        " disabled-station site included once it is no longer excluded"
         " upstream"
     )
 
@@ -3202,7 +1413,6 @@ def test_enqueue_due_wind_days_respects_the_success_cooldown_spacing(
     conn = _make_db()
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze_scheduler_now(monkeypatch, now)
 
@@ -3264,7 +1474,6 @@ def test_enqueue_due_wind_days_fails_open_on_an_unreadable_success_stamp(
     conn = _make_db()
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
     _insert_job(
         conn,
         "fetch_obs",
@@ -3323,19 +1532,15 @@ def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
     conn = _make_db()
     good1_id = _make_site(conn, name="Testsite-good1", tz="UTC")
     _make_station(conn, good1_id, "KTEST001")
-    set_wind_basis_state(conn, good1_id, "staging")
 
     bad_zinfe_id = _make_site(conn, name="Testsite-bad-zinfe", tz="Not/AZone")
     _make_station(conn, bad_zinfe_id, "KTEST002")
-    set_wind_basis_state(conn, bad_zinfe_id, "staging")
 
     bad_value_id = _make_site(conn, name="Testsite-bad-value", tz="../etc/zone")
     _make_station(conn, bad_value_id, "KTEST003")
-    set_wind_basis_state(conn, bad_value_id, "staging")
 
     good2_id = _make_site(conn, name="Testsite-good2", tz="UTC")
     _make_station(conn, good2_id, "KTEST004")
-    set_wind_basis_state(conn, good2_id, "staging")
 
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
         # mutant -> at this call: correct = returns normally (both bad
@@ -3362,13 +1567,14 @@ def test_enqueue_due_wind_days_skips_a_site_with_an_unusable_time_zone(
     )
 
 
-def test_wind_lane_due_true_for_switching_rescoring_and_an_unknown_state() -> None:
-    """wind_lane_due's unconditional-True branch (wind_days.py:375): any
-    state outside ``STATES``, or either of the two transitional states
-    themselves, is due regardless of any other condition. Paired against a
-    quiescent ``pair_max`` site (today's row already fetched, no pair-max
-    observations) that is NOT due on its own, so each state below is a real
-    divergence rather than "everything in this fixture is due.\""""
+@pytest.mark.parametrize("value", ["pair_max", "staging", "switching", "bogus"])
+def test_wind_lane_due_ignores_any_stored_wind_basis_value(value: str) -> None:
+    """``wind_lane_due`` reads no stored wind-basis key: a quiescent site
+    (today's row already fetched, nothing else due) stays not due whatever
+    value an old ``wind_basis:<site_id>`` key holds, the old transitional
+    ``switching`` value and an unknown ``bogus`` value included. Paired
+    against the same site before any key is written, so each value is a
+    real divergence rather than a fixture in which nothing is ever due."""
     from zoneinfo import ZoneInfo
 
     conn = _make_db()
@@ -3378,63 +1584,19 @@ def test_wind_lane_due_true_for_switching_rescoring_and_an_unknown_state() -> No
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     today = now.date()
     _insert_day(conn, station_id, today, status="fetched", record_count=1)
-    set_wind_basis_state(conn, site_id, "pair_max")
 
     assert wind_lane_due(conn, site_id, tz, now=now) is False, (
-        "setup check: a quiescent pair_max site with today's row already"
-        " fetched and no pair-max observations must not be due, or the"
-        " states below prove nothing"
+        "setup check: a quiescent site with today's row already fetched and"
+        " no stored key must not be due, or the value below proves nothing"
     )
 
-    for state in ("switching", "rescoring"):
-        set_runtime_state(conn, wind_basis_key(site_id), state)
-        assert wind_lane_due(conn, site_id, tz, now=now) is True, (
-            f"mutant -> at this assertion (state={state}): correct = True"
-            " (switching/rescoring are unconditionally due), mutant (the"
-            ' `state in ("switching", "rescoring")` clause dropped) = False,'
-            " falling through to the same quiescent checks that returned"
-            " False above"
-        )
-
-    set_runtime_state(conn, wind_basis_key(site_id), "corrupted-state")
-    assert wind_lane_due(conn, site_id, tz, now=now) is True, (
-        "mutant -> at this assertion: correct = True (an unknown state"
-        " outside STATES is unconditionally due), mutant (`state not in"
-        " STATES` dropped) = False"
-    )
-
-
-def test_wind_lane_due_true_for_staging_with_pair_max_rows_present() -> None:
-    """wind_lane_due's staging+pair-max-rows branch (wind_days.py:377):
-    staging normally defers to the ordinary due checks, but a pair-max
-    observation already present (installed ahead of the staging rows
-    themselves) makes the lane due immediately. Paired against the same
-    staging site with no pair-max rows and today's row already fetched, so
-    this is a real divergence on the pair-max-rows clause itself."""
-    from zoneinfo import ZoneInfo
-
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    tz = ZoneInfo(_TZ)
-    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
-    today = now.date()
-    _insert_day(conn, station_id, today, status="fetched", record_count=1)
-    set_wind_basis_state(conn, site_id, "staging")
-
+    set_runtime_state(conn, f"wind_basis:{site_id}", value)
     assert wind_lane_due(conn, site_id, tz, now=now) is False, (
-        "setup check: staging with today's row fetched and no pair-max"
-        " observations must not be due on its own, or the pair-max rows"
-        " below prove nothing"
-    )
-
-    _insert_pair_max_obs(conn, station_id, "2026-03-09T12:00:00Z")
-
-    assert wind_lane_due(conn, site_id, tz, now=now) is True, (
-        "mutant -> at this assertion: correct = True (staging with a"
-        " pair-max observation present is due), mutant (the"
-        ' `state == "staging" and _has_pair_max_rows(...)` clause dropped)'
-        " = False"
+        f"mutant -> at this assertion (value={value}): correct = False"
+        " (wind_lane_due reads no stored key, so the quiescent site stays"
+        " not due), mutant (a branch on the stored value restored, such as"
+        ' `state in ("switching", "rescoring")` or an unknown-value branch)'
+        " = True"
     )
 
 
@@ -3468,7 +1630,6 @@ def test_wind_days_lane_quiescence_leaves_a_claim_window_for_verification_run(
     conn = _make_db()
     site_id = _make_site(conn)
     _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "staging")
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze_scheduler_now(monkeypatch, now)
 
@@ -3541,180 +1702,6 @@ def test_wind_days_lane_quiescence_leaves_a_claim_window_for_verification_run(
 
 
 # =============================================================================
-# T48 -- progress stamp
-# =============================================================================
-
-
-def test_progress_stamp_moves_on_pre_yesterday_status_change_only() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    older = today - timedelta(days=5)
-    _insert_day(conn, station_id, older, status="pending", attempts=0)
-    before = get_runtime_state(conn, wind_progress_key(site_id))
-
-    # A status change on a date before yesterday (unavailable, since the
-    # record_count is 0) must stamp progress.
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=older,
-        tz_name=_TZ,
-        today=today,
-        records=[],
-        probe=None,
-    )
-    after = get_runtime_state(conn, wind_progress_key(site_id))
-    assert after is not None and after != before, (
-        "mutant -> at this assertion: correct = the progress stamp moves"
-        " (status changed pending -> unavailable, date before yesterday),"
-        " mutant (the `local_date < yesterday` guard dropped so a today-"
-        "window change is required too) = the stamp stays unset/unchanged"
-    )
-
-
-def test_progress_stamp_does_not_move_when_today_row_only_refreshes() -> None:
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    _insert_day(conn, station_id, today, status="partial", attempts=0)
-    before = get_runtime_state(conn, wind_progress_key(site_id))
-
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=today,
-        tz_name=_TZ,
-        today=today,
-        records=[],
-        probe=None,
-    )
-
-    after = get_runtime_state(conn, wind_progress_key(site_id))
-    assert after == before, (
-        "mutant -> at this assertion: correct = unchanged (today's row"
-        " staying 'partial' is not a status change before yesterday),"
-        " mutant (stamp_wind_progress called unconditionally on every"
-        " persist) = a new stamp value"
-    )
-
-
-def test_progress_stamp_moves_on_the_switch_pass_transaction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``_switch_check``'s own unconditional stamp (wind_days.py, right after
-    the compare-and-set to 'switching') -- distinct from every other stamp
-    site in this file, none of which drive a pass through here.
-
-    Seeds the state directly via ``set_runtime_state`` rather than
-    ``_seed_switchable_site``'s usual ``set_wind_basis_state``: the latter
-    stamps progress itself, and that setup stamp and the switch's own stamp
-    both come from SQLite's own ``strftime('...','now')`` on one connection
-    -- a real sub-millisecond clock with no Python-side seam to freeze --
-    so a before/after value diff can collide. Keeping ``before`` at its
-    true unset baseline (``None``) avoids relying on clock resolution.
-    """
-    _freeze_wind_days_today(monkeypatch, datetime(2026, 3, 10, 12, tzinfo=UTC))
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    set_runtime_state(conn, wind_basis_key(site_id), "staging")
-    today = date(2026, 3, 10)
-    _insert_day(
-        conn,
-        station_id,
-        today - timedelta(days=1),
-        status="fetched",
-        record_count=5,
-        pair_hours=MIN_OBS_HOURS,
-    )
-    before = get_runtime_state(conn, wind_progress_key(site_id))
-    assert before is None, "fixture bug: expected no progress stamp before the switch"
-
-    switched = _switch_check(conn, site_id, _TZ, _BIG_FREE)
-
-    assert switched is True
-    after = get_runtime_state(conn, wind_progress_key(site_id))
-    assert after is not None and after != before, (
-        "mutant -> at this assertion: correct = the progress stamp moves on"
-        " a successful switch pass, mutant (BOTH the CAS's own"
-        " `transition_wind_basis` success-path stamp AND `_switch_check`'s"
-        " own `stamp_wind_progress` call after the CAS dropped) = the stamp"
-        " stays unset/unchanged. Dropping only `_switch_check`'s own call"
-        " does NOT move this assertion: `transition_wind_basis` already"
-        " stamps progress on a successful compare-and-set, so that single"
-        " mutant survives this test and is not claimed here."
-    )
-
-
-def test_progress_stamp_moves_on_a_blocked_reset_state_change() -> None:
-    """``_write_blocked``'s own conditional stamp: when the once-per-UTC-day
-    failed-final reset actually flips a pre-yesterday row back to pending,
-    progress must move -- a state change distinct from ``_persist_day``'s."""
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    _insert_day(
-        conn, station_id, today - timedelta(days=5), status="failed", attempts=3
-    )
-    before = get_runtime_state(conn, wind_progress_key(site_id))
-
-    _write_blocked(conn, site_id, today, "test reason")
-
-    row = _day_row(conn, station_id, today - timedelta(days=5))
-    assert row["status"] == "pending"
-    after = get_runtime_state(conn, wind_progress_key(site_id))
-    assert after is not None and after != before, (
-        "mutant -> at this assertion: correct = the progress stamp moves"
-        " when the failed-final reset actually resets a pre-yesterday row,"
-        " mutant (the `stamp_wind_progress` call inside the reset-fired"
-        " branch dropped) = the stamp stays unset/unchanged"
-    )
-
-
-def test_progress_stamp_does_not_move_on_a_chunk_that_only_fetched_yesterday() -> None:
-    """``_persist_day``'s guard is ``local_date < yesterday`` (strictly
-    pre-yesterday) -- yesterday itself is excluded even though its status
-    changes pending -> fetched. Distinct from the existing today-only and
-    five-days-back cases: this is the boundary the guard must still reject."""
-    conn = _make_db()
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "WSTATION01")
-    today = date(2026, 3, 10)
-    yesterday = today - timedelta(days=1)
-    _insert_day(conn, station_id, yesterday, status="pending", attempts=0)
-    before = get_runtime_state(conn, wind_progress_key(site_id))
-
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=yesterday,
-        tz_name=_TZ,
-        today=today,
-        records=[
-            WindRecord(obs_at=datetime(2026, 3, 9, 12, 0, 0, tzinfo=UTC), speed_kmh=5.0)
-        ],
-        probe=None,
-    )
-
-    row = _day_row(conn, station_id, yesterday)
-    assert row["status"] == "fetched", "fixture bug: expected a status change"
-    after = get_runtime_state(conn, wind_progress_key(site_id))
-    assert after == before, (
-        "mutant -> at this assertion: correct = unchanged (yesterday fetching"
-        " is excluded by `local_date < yesterday`, even though its status"
-        " changed pending -> fetched), mutant (the guard loosened to"
-        " `<=`, stamping on yesterday-only chunks too) = a new stamp value"
-    )
-
-
-# =============================================================================
 # 2026-10-23 wind pre-midnight fetch (plan §9) -- S1-S6, items 1-8, 10, 11.
 # D = the local day under test; start, end = local_day_slots(D, tz)[:2];
 # F = end - WIND_FINAL_LEAD; R = end - _FINAL_RETRY_LEAD. Every expected
@@ -3770,7 +1757,6 @@ def test_all_1day_only_day_finishes_with_eligible_wind_truth(
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
     final = end - WIND_FINAL_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -3877,9 +1863,8 @@ def test_all_1day_only_day_finishes_with_eligible_wind_truth(
     assert hour_23_rows == 1, (
         "mutant -> at this assertion: correct = 1 (D's own neighbour is"
         " never a 'fetched'/'partial' row at this point, so only"
-        " `_finish_day`'s own `_derive_days(..., write_rows=True)` call can"
-        " write D's hour 23), mutant (`write_rows=True` dropped to False in"
-        " `_finish_day`) = 0"
+        " `_finish_day`'s own `_derive_days` call can write D's hour 23),"
+        " mutant (that `_derive_days` call dropped from `_finish_day`) = 0"
     )
 
     outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=D.isoformat())
@@ -3894,7 +1879,7 @@ def test_all_1day_only_day_finishes_with_eligible_wind_truth(
     assert wind_max.covered_hours == wind_max.expected_slots == 24, (
         "mutant -> at this assertion: correct = 24 == 24 (hour 23 is"
         " written by the past-day derive inside the finish step), mutant"
-        " (the finish step's write_rows=True dropped, or _derive_hours'"
+        " (the finish step's own _derive_days call dropped, or _derive_hours'"
         " `local_date != today` branch never taken) = 23 covered"
     )
 
@@ -3912,7 +1897,6 @@ def test_fall_back_day_final_call_covers_25_hours(
         "fixture bug: 2026-11-01 must be the America/Denver fall-back day"
     )
     final = end - WIND_FINAL_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4022,7 +2006,6 @@ def test_missed_final_call_is_reported_and_the_day_still_finishes(
     start, end, _ = local_day_slots(D, _TZ)
     final = end - WIND_FINAL_LEAD
     retry = end - _FINAL_RETRY_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4123,7 +2106,6 @@ def test_final_call_refused_keeps_hold_behaviour(
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
     final = end - WIND_FINAL_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4225,7 +2207,6 @@ def test_budget_exhausted_final_call_defers_and_the_day_still_finishes(
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
     final = end - WIND_FINAL_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4296,12 +2277,11 @@ def test_finish_gate_is_an_allowlist() -> None:
     start, end, _ = local_day_slots(yesterday, _TZ)
 
     def _setup(
-        *, state: str = "pair_max", hold_status: str | None = "held"
+        *, hold_status: str | None = "held"
     ) -> tuple[sqlite3.Connection, int, int]:
         conn = _make_db()
         site_id = _make_site(conn)
         station_id = _make_station(conn, site_id, "WSTATION01")
-        set_wind_basis_state(conn, site_id, state)
         if hold_status is not None:
             write_auth_hold(
                 conn,
@@ -4345,20 +2325,6 @@ def test_finish_gate_is_an_allowlist() -> None:
 
     # -- False: probing ----------------------------------------------------
     conn, site_id, station_id = _setup(hold_status="probing")
-    _insert_day(conn, station_id, yesterday, status="pending")
-    before = dict(_day_row(conn, station_id, yesterday))
-    got = _finish_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=yesterday,
-        tz_name=_TZ,
-        today=today,
-    )
-    _unchanged(got, conn, station_id, before)
-
-    # -- False: state staging ----------------------------------------------
-    conn, site_id, station_id = _setup(state="staging")
     _insert_day(conn, station_id, yesterday, status="pending")
     before = dict(_day_row(conn, station_id, yesterday))
     got = _finish_day(
@@ -4537,7 +2503,6 @@ def test_wind_lane_due_while_a_finishable_row_waits(
     conn = _make_db()
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
     _insert_day(
         conn, station_id, today, status="fetched", next_attempt_at=future_next_attempt
     )
@@ -4593,7 +2558,6 @@ def test_wind_lane_due_while_a_finishable_row_waits(
     conn2 = _t97_init_tmp_db(tmp_path)
     site_id2 = _make_site(conn2)
     station_id2 = _make_station(conn2, site_id2, "WSTATION01")
-    set_wind_basis_state(conn2, site_id2, "pair_max")
     write_auth_hold(
         conn2, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4633,6 +2597,125 @@ def test_wind_lane_due_while_a_finishable_row_waits(
     )
 
 
+@pytest.mark.parametrize("basis_value", ["staging", "bogus"])
+def test_d22_finish_step_ignores_a_leftover_wind_basis_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, basis_value: str
+) -> None:
+    """D22 (old-wind-method-removal plan §10.4): a stray ``wind_basis:<site>``
+    runtime_state key, left over from the old method and never cleaned up,
+    must not stop the finish step -- it reads nothing about wind basis at
+    all. Modeled on ``test_wind_lane_due_while_a_finishable_row_waits``'s
+    first two legs, once through ``_finish_day`` directly and once through
+    a real ``run_wind_days`` job."""
+    from zoneinfo import ZoneInfo
+
+    today = date(2026, 3, 15)
+    yesterday = today - timedelta(days=1)
+    start, _end, _ = local_day_slots(yesterday, _TZ)
+    future_next_attempt = isoformat_utc(
+        datetime.combine(today, datetime.min.time(), tzinfo=UTC) + timedelta(hours=1)
+    )
+    now = datetime.combine(today, datetime.min.time(), tzinfo=UTC)
+
+    # -- leg 1: direct _finish_day, against wind_lane_due -------------------
+    conn = _make_db()
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "WSTATION01")
+    set_runtime_state(conn, f"wind_basis:{site_id}", basis_value)
+    conn.commit()
+    _insert_day(
+        conn, station_id, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(
+        conn,
+        station_id,
+        yesterday,
+        status="partial",
+        next_attempt_at=future_next_attempt,
+    )
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is True, (
+        "mutant -> at this assertion: correct = True (a held hold plus a"
+        " waiting finishable row is due no matter what a leftover"
+        f" wind_basis key ({basis_value!r}) holds), mutant (M40: the due"
+        " check's finish branch also requires that key absent or"
+        " pair_max) = False"
+    )
+    finished = _finish_day(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=yesterday,
+        tz_name=_TZ,
+        today=today,
+    )
+    assert finished is True, (
+        "mutant -> at this assertion: correct = True, mutant (M39:"
+        f" _finish_day returns False while wind_basis holds {basis_value!r}"
+        " instead of pair_max) = False"
+    )
+    row = conn.execute(
+        "SELECT status FROM station_wind_days WHERE station_id = ? AND local_date = ?",
+        (station_id, yesterday.isoformat()),
+    ).fetchone()
+    assert row["status"] != "partial", (
+        "mutant -> at this assertion: correct = no longer partial, mutant"
+        " (M39's gate stops _finish_day before it writes) = still partial"
+    )
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=now) is False, (
+        "mutant -> at this assertion: correct = False (the row is"
+        " finished, so no finishable row remains), mutant (the finish"
+        " step never ran, so the row is still waiting) = True"
+    )
+
+    # -- leg 2: the same rows and key through a real run_wind_days job ------
+    conn2 = _t97_init_tmp_db(tmp_path)
+    site_id2 = _make_site(conn2)
+    station_id2 = _make_station(conn2, site_id2, "WSTATION01")
+    set_runtime_state(conn2, f"wind_basis:{site_id2}", basis_value)
+    conn2.commit()
+    _insert_day(
+        conn2, station_id2, today, status="fetched", next_attempt_at=future_next_attempt
+    )
+    _insert_day(
+        conn2,
+        station_id2,
+        yesterday,
+        status="partial",
+        next_attempt_at=future_next_attempt,
+    )
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(start), error="401"
+    )
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _t97_freeze(monkeypatch, now)
+    _t97_run_wind_days(site_id2, handler, monkeypatch=monkeypatch)  # must not raise
+    assert call_log == [], (
+        "mutant -> at this assertion: correct = [] (nothing is due or"
+        " finishable by a real call, so run_wind_days makes none), mutant"
+        f" (got {call_log})"
+    )
+    row2 = conn2.execute(
+        "SELECT status FROM station_wind_days WHERE station_id = ? AND local_date = ?",
+        (station_id2, yesterday.isoformat()),
+    ).fetchone()
+    assert row2["status"] != "partial", (
+        "mutant -> at this assertion: correct = no longer partial (only"
+        " _run_fetch_chunk's own finish call reaches this row), mutant"
+        f" (M41: _run_fetch_chunk also requires wind_basis absent or"
+        f" pair_max, true is false while it holds {basis_value!r}) ="
+        " still partial"
+    )
+
+
 def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4648,7 +2731,6 @@ def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
     final = end - WIND_FINAL_LEAD
-    set_wind_basis_state(conn, site_id, "pair_max")
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -4733,7 +2815,6 @@ def test_finish_exception_marks_the_row_and_the_step_moves_on(
     station_b = _make_station(conn, site_id, pws_b)
     today = date(2026, 3, 10)
     yesterday = today - timedelta(days=1)
-    set_wind_basis_state(conn, site_id, "pair_max")
     start, _end, _ = local_day_slots(yesterday, _TZ)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"

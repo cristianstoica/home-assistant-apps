@@ -4,6 +4,7 @@
       <h3>Feed Subscriptions</h3>
       <span>{{ site.feeds|selectattr("effective_enabled")|list|length }} active</span>
     </div>
+    <p class="muted" role="status" aria-live="polite" data-sub-status>{{ toggle_notice or "" }}</p>
     <div class="toggle-list">
       {% for feed in site.feeds %}
         <div class="toggle-row">
@@ -21,11 +22,13 @@
           <button
             type="button"
             class="{{ 'on' if feed.effective_enabled else 'off' }}"
+            data-sub-toggle
             hx-put="{{ url('/api/sites/' ~ site.id ~ '/feeds/' ~ feed.id) }}"
             hx-ext="json-enc"
             hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
             hx-vals='{"enabled": {{ (not feed.effective_enabled)|tojson }}}'
             hx-target="#feed-toggles-{{ site.id }}"
+            hx-disabled-elt="#feed-toggles-{{ site.id }} button"
             hx-swap="outerHTML">{{ "On" if feed.effective_enabled else "Off" }}</button>
         </div>
       {% endfor %}

@@ -404,7 +404,7 @@ def test_fresh_and_migrated_schemas_agree_on_site_feed_state_columns() -> None:
     assert fresh_cols == migrated_cols
 
 
-def test_run_migrations_lands_on_user_version_eight_from_a_v7_db() -> None:
+def test_run_migrations_lands_on_target_user_version_from_a_v7_db() -> None:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
@@ -413,9 +413,9 @@ def test_run_migrations_lands_on_user_version_eight_from_a_v7_db() -> None:
 
     run_migrations(conn)
 
-    assert TARGET_USER_VERSION == 8
+    assert TARGET_USER_VERSION == 9
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 8
+    assert version == 9
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +520,6 @@ def test_populated_v6_db_upgrade_seeds_per_row_by_the_logical_rule() -> None:
     run_migrations(conn)
 
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 8
+    assert version == 9
     assert _stamp(conn, 101) == "2026-07-20T12:00:00Z"
     assert _stamp(conn, 102) is None

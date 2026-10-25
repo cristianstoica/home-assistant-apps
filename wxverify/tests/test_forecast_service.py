@@ -26,11 +26,12 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from wxverify.collection.forecast_fetcher import register_feed_if_needed
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.migrations import run_migrations
+from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
+from wxverify.forecast import wind_blend
 from wxverify.forecast.service import (
     RAIN_GLYPH_MIN_WET_HOURS,
     build_forecast,
@@ -483,8 +484,7 @@ def test_stale_badge_orthogonal_to_normal_state() -> None:
 
 # ---------------------------------------------------------------------------
 # Minimum-coverage guard: a cell whose selected feeds don't reach
-# MIN_COVERAGE_HOURS still carries the "partial" badge. Wind alone still
-# aggregates its partial data (tile stays populated). For temperature
+# MIN_COVERAGE_HOURS still carries the "partial" badge. For temperature
 # (Item F) and precipitation (Item G), under-coverage means the feed is not
 # extrema-eligible (it does not cover the whole local day exactly), so the
 # daily high/low, and the daily total/wet-hours, are suppressed rather than
@@ -525,41 +525,6 @@ def test_temperature_extrema_suppressed_under_coverage_partial_badge_set() -> No
     assert today.partial is True
 
 
-def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
-    # Paired positive for the temperature suppression above: wind does not
-    # adopt the extrema-coverage rule (F.4/G.3 scope it to temperature and
-    # precipitation), so the SAME under-coverage shape still aggregates the
-    # partial data and just carries the "partial" badge -- the behaviour
-    # this test file originally pinned. If the eligibility filter ever
-    # leaked into wind's value path, this would fail where the temperature
-    # test above would not catch it.
-    conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-
-    valid_ats = _hours("2026-07-20", 4, 5)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=valid_ats,
-        value=5.0,  # m/s
-    )
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    today = view.tiles[0]
-    assert today.wind.meta.partial is True
-    assert today.wind.meta.available is True  # tile stays populated
-    assert today.wind.max_kmh == ms_to_kmh(5.0)
-    assert today.partial is True
-
-
 # ---------------------------------------------------------------------------
 # Tile-level precedence rollup: not_available cells are excluded from the
 # rollup; among the rest, low_confidence beats normal.
@@ -568,9 +533,6 @@ def test_wind_partial_badge_when_under_coverage_tile_stays_populated() -> None:
 
 def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() -> None:
     conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
@@ -587,27 +549,27 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
     _make_confident(conn, feed_id=ecmwf_id, variable="temperature", day_ahead=1)
     _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
 
-    # wind: samples present, but zero forecast_pairs anywhere -> low_confidence
-    # (fresh-install sample-count rung).
+    # precip: samples present, but zero forecast_pairs anywhere ->
+    # low_confidence (fresh-install sample-count rung).
     _seed_hourly(
         conn,
         feed_id=gfs_id,
-        variable="wind",
+        variable="precip",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=valid_ats,
         value=5.0,
     )
 
-    # precip: no samples at all -> not_available.
+    # wind: no samples at all -> not_available.
 
-    # The wind cell's leaderboard read is "empty" (no forecast_pairs at all),
-    # not "rebuilding" (an absent/mismatched cache snapshot over a REAL
+    # The precip cell's leaderboard read is "empty" (no forecast_pairs at
+    # all), not "rebuilding" (an absent/mismatched cache snapshot over a REAL
     # expected feed universe) -- states why the cell stays low_confidence
     # rather than becoming rebuilding.
     conn.commit()
     assert (
         leaderboard_with_status(
-            conn, site_id=1, variable="wind", day_ahead=1, window="rolling"
+            conn, site_id=1, variable="precip", day_ahead=1, window="rolling"
         ).status
         == "empty"
     )
@@ -617,11 +579,11 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
     )
     today = view.tiles[0]
     assert today.temp.meta.state == "normal"
-    assert today.wind.meta.state == "low_confidence"
-    assert today.precip.meta.state == "not_available"
-    assert today.precip.meta.available is False
-    # Precedence: not_available (precip) excluded from the rollup; among the
-    # populated cells, low_confidence (wind) beats normal (temp).
+    assert today.precip.meta.state == "low_confidence"
+    assert today.wind.meta.state == "not_available"
+    assert today.wind.meta.available is False
+    # Precedence: not_available (wind) excluded from the rollup; among the
+    # populated cells, low_confidence (precip) beats normal (temp).
     assert today.state == "low_confidence"
 
     # Paired negative: a day with NO data anywhere is fully not_available at
@@ -643,19 +605,16 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     """O4: tile rollup precedence over the new vocabulary member.
 
     Day tile 0: temp is `low_confidence` from an EMPTY leaderboard read (no
-    forecast_pairs at all), wind is `rebuilding` -- the rollup must still
+    forecast_pairs at all), precip is `rebuilding` -- the rollup must still
     read `low_confidence`, because that caveat does not resolve on its own.
-    Day tile 1: temp is confident/`normal`, wind is `rebuilding` and nothing
-    else is degraded -- the rollup must read `rebuilding`.
+    Day tile 1: temp is confident/`normal`, precip is `rebuilding` and
+    nothing else is degraded -- the rollup must read `rebuilding`.
 
     Both feeds are single-candidate cells (agg_feeds == selection.feeds), so
     this is purely about D4's precedence, not D2's per-surface width -- that
     is O8's job.
     """
     conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
     icon_id = _feed_id(conn, "open-meteo", "icon_global")
@@ -676,15 +635,15 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     _seed_hourly(
         conn,
         feed_id=gfs_id,
-        variable="wind",
+        variable="precip",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=day0_valid_ats,
         value=5.0,
     )
     _seed_scoring_pairs(
-        conn, feed_id=gfs_id, variable="wind", day_ahead=1, forecast=10.5
+        conn, feed_id=gfs_id, variable="precip", day_ahead=1, forecast=10.5
     )
-    # No score_cache seeded at (wind, 1) -> a real expected universe with no
+    # No score_cache seeded at (precip, 1) -> a real expected universe with no
     # snapshot -> "rebuilding".
 
     # --- Day tile 1 ("2026-07-21"): representative day_ahead=2 (issued two
@@ -707,15 +666,15 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     _seed_hourly(
         conn,
         feed_id=icon_id,
-        variable="wind",
+        variable="precip",
         issued_at="2026-07-19T00:00:00Z",
         valid_ats=day1_valid_ats,
         value=5.0,
     )
     _seed_scoring_pairs(
-        conn, feed_id=icon_id, variable="wind", day_ahead=2, forecast=10.5
+        conn, feed_id=icon_id, variable="precip", day_ahead=2, forecast=10.5
     )
-    # No score_cache seeded at (wind, 2) either -> "rebuilding".
+    # No score_cache seeded at (precip, 2) either -> "rebuilding".
 
     conn.commit()
     assert (
@@ -726,13 +685,13 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     )
     assert (
         leaderboard_with_status(
-            conn, site_id=1, variable="wind", day_ahead=1, window="rolling"
+            conn, site_id=1, variable="precip", day_ahead=1, window="rolling"
         ).status
         == "rebuilding"
     )
     assert (
         leaderboard_with_status(
-            conn, site_id=1, variable="wind", day_ahead=2, window="rolling"
+            conn, site_id=1, variable="precip", day_ahead=2, window="rolling"
         ).status
         == "rebuilding"
     )
@@ -743,16 +702,16 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
 
     today = view.tiles[0]
     assert today.temp.meta.state == "low_confidence"
-    assert today.wind.meta.state == "rebuilding"
-    assert today.precip.meta.state == "not_available"
+    assert today.precip.meta.state == "rebuilding"
+    assert today.wind.meta.state == "not_available"
     # low_confidence (a caveat that does not resolve on its own) outranks
     # rebuilding (a caveat that resolves itself) -- D4.
     assert today.state == "low_confidence"
 
     tomorrow = view.tiles[1]
     assert tomorrow.temp.meta.state == "normal"
-    assert tomorrow.wind.meta.state == "rebuilding"
-    assert tomorrow.precip.meta.state == "not_available"
+    assert tomorrow.precip.meta.state == "rebuilding"
+    assert tomorrow.wind.meta.state == "not_available"
     # No cell is low_confidence; the only degraded populated cell is
     # rebuilding, so the rollup reads rebuilding, not normal.
     assert tomorrow.state == "rebuilding"
@@ -998,34 +957,6 @@ def test_build_forecast_empty_when_no_samples_at_all() -> None:
     assert view.tiles == []
     assert view.updated_at is None
     assert view.updated_ago is None
-
-
-# ---------------------------------------------------------------------------
-# Wind display conversion: raw samples are m/s; the tile's max_kmh is
-# ms_to_kmh-converted, not a re-implemented/duplicated conversion.
-# ---------------------------------------------------------------------------
-
-
-def test_wind_tile_max_is_ms_to_kmh_converted() -> None:
-    conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 3),
-        value=5.0,  # m/s
-    )
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    assert view.tiles[0].wind.max_kmh == 18.0  # 5 m/s * 3.6
 
 
 # ---------------------------------------------------------------------------
@@ -1320,6 +1251,19 @@ def _seed_wind_training(
             )
 
 
+def _pause_feed(conn: sqlite3.Connection, pause_kind: str, feed_id: int) -> None:
+    """Pause ``feed_id`` at site 1, per ``pause_kind`` ("none" is a no-op)."""
+    if pause_kind == "none":
+        return
+    if pause_kind == "global":
+        conn.execute("UPDATE feeds SET enabled = 0 WHERE id = ?", (feed_id,))
+    else:
+        conn.execute(
+            "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (1, ?, 0)",
+            (feed_id,),
+        )
+
+
 def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
     """Two trained feeds: the wind line is their accuracy-weighted mean.
 
@@ -1356,6 +1300,278 @@ def test_build_hourly_wind_series_weighted_and_kmh_converted() -> None:
         feed_a: pytest.approx([ms_to_kmh(4.0)] * 24),
         feed_b: pytest.approx([ms_to_kmh(7.0)] * 24),
     }
+
+
+# ---------------------------------------------------------------------------
+# A paused feed (global or site-level) never trains and never serves wind.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pause_kind", ["global", "site"])
+def test_wind_training_skips_paused_feed(pause_kind: str) -> None:
+    """Pausing feed C drops it out of ``load_wind_training``'s feed_highs.
+
+    Catches: no filter at all on the training read (``feed_c`` would stay
+    in ``after.feed_highs`` for both ``pause_kind`` values); a bare
+    ``feeds.enabled`` check (the ``site`` case alone would then still keep
+    ``feed_c``, since pausing via ``site_feed_state`` never flips
+    ``feeds.enabled``).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_c = _feed_id(conn, "open-meteo", "icon_global")
+    _seed_wind_training(
+        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
+    )
+    conn.commit()
+
+    before = wind_blend.load_wind_training(
+        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+    )
+    assert {feed_id for feed_id, _ in before.feed_highs} == {feed_a, feed_b, feed_c}
+
+    _pause_feed(conn, pause_kind, feed_c)
+    conn.commit()
+
+    after = wind_blend.load_wind_training(
+        conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+    )
+    assert {feed_id for feed_id, _ in after.feed_highs} == {feed_a, feed_b}
+
+
+@pytest.mark.parametrize("pause_kind", ["global", "site"])
+def test_build_hourly_wind_excludes_paused_feed(pause_kind: str) -> None:
+    """Pausing feed C drops it from the served wind blend and its weights.
+
+    Before the pause, A (weight 1/MAE=1.0), B (0.5), and C (2.0) blend
+    tomorrow's 4.0/7.0/9.0 m/s to 25.5/3.5 m/s = 26.23 km/h. After, only A
+    and B remain and the blend/weights match the two-feed baseline above
+    (18.0 km/h, 2/3 and 1/3).
+
+    Catches: no filter on the serving path (the post-pause blend, weights,
+    and ``payload["feeds"]`` would still include C, identical to the
+    pre-pause call).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_c = _feed_id(conn, "open-meteo", "icon_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(
+        conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_c: 4.5}, observed=4.0
+    )
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_c, 9.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    conn.commit()
+
+    before = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert before["blend"]["wind_kmh"] == pytest.approx([25.5 / 3.5 * 3.6] * 24)
+
+    _pause_feed(conn, pause_kind, feed_c)
+    conn.commit()
+
+    after = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert after["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert after["weights"] == {
+        "wind": {str(feed_a): pytest.approx(2 / 3), str(feed_b): pytest.approx(1 / 3)}
+    }
+    feed_ids_after = {feed["feed_id"] for feed in after["feeds"]}
+    assert feed_c not in feed_ids_after
+
+
+# ---------------------------------------------------------------------------
+# A paused feed is never picked by build_forecast/build_hourly, no matter
+# which selection rung (sample count, coverage pool) would otherwise pick it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_paused_feed_not_picked_by_sample_count(pause_kind: str) -> None:
+    """At blend depth 1, a paused B is never picked even with twice A's hours.
+
+    Unpaused (``none``), B's 24 hours beat A's 12 on sample count and B is
+    the lone selection. Paused (``global``/``site``), B drops out of the
+    pool entirely and A -- the only feed left -- is selected instead.
+
+    Catches: the loader filter missing at ``build_hourly``/``build_forecast``
+    (the ``global``/``site`` cases would still pick B); a bare ``enabled``
+    check (the ``site`` case alone would still pick B).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    set_setting(conn, "forecast_blend_depth", "1")
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 12),
+    )
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 24),
+    )
+    _pause_feed(conn, pause_kind, feed_b)
+    conn.commit()
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    tile = next(t for t in view.tiles if t.day_index == 0)
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+
+    if pause_kind == "none":
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_b}
+        assert payload["hours"] == _hours("2026-07-20", 0, 24)
+        assert tile.temp.meta.contributor_ids == (feed_b,)
+    else:
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_a}
+        assert payload["hours"] == _hours("2026-07-20", 0, 12)
+        assert tile.temp.meta.contributor_ids == (feed_a,)
+
+
+@pytest.mark.parametrize("pause_kind", ["none", "global", "site"])
+def test_paused_feed_does_not_narrow_the_pool(pause_kind: str) -> None:
+    """A confident 4-hour A beats an unconfident 24-hour B -- unless B is
+    paused, in which case B never reaches the pool and the outcome is
+    exactly what A alone produces.
+
+    Unpaused, B is picked (24h, unconfident but present) and the tile is
+    ``low_confidence``. Paused, only A remains: 4 hours, ``normal`` state.
+
+    Catches: pausing B "narrowing" the pool by removing a competitor rather
+    than removing B itself (the ``global``/``site`` cases would then still
+    show B's hours/feed_id, just picked for a different reason).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    set_setting(conn, "forecast_blend_depth", "1")
+    _seed_hourly(
+        conn,
+        feed_id=feed_a,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 4, 4),
+    )
+    _make_confident(conn, feed_id=feed_a, variable="temperature", day_ahead=1)
+    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
+    _seed_hourly(
+        conn,
+        feed_id=feed_b,
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 24),
+    )
+    _pause_feed(conn, pause_kind, feed_b)
+    conn.commit()
+
+    view = build_forecast(
+        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    )
+    tile = next(t for t in view.tiles if t.day_index == 0)
+    payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+
+    if pause_kind == "none":
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_b}
+        assert payload["states"]["temperature"] == "low_confidence"
+        assert tile.temp.meta.contributor_ids == (feed_b,)
+    else:
+        assert {feed["feed_id"] for feed in payload["feeds"]} == {feed_a}
+        assert payload["hours"] == _hours("2026-07-20", 4, 4)
+        assert payload["states"]["temperature"] == "normal"
+        assert tile.temp.meta.contributor_ids == (feed_a,)
+
+
+def test_drop_takes_a_member_off_the_served_wind() -> None:
+    """The dropped-member pause (plan Step 6) reaches the served wind blend,
+    its weights, its per-feed listing and its training set -- not just the
+    feed's own row.
+
+    A real meteoblue member registers through the fetcher's own
+    registration path, trains alongside two open-meteo feeds, and is
+    confirmed served, weighted and trained BEFORE the pause (so the pass
+    below is not vacuous); the pause then removes it from all four.
+
+    Catches: a pause that misses the member row the fetcher creates (wrong
+    ``source`` or case -- the member would keep its control-era payload
+    weight); Step 3 missing (the member would stay in the training ids;
+    the payload alone cannot show this, because Step 2 already drops the
+    member's samples from ``build_hourly``'s candidates).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_m = register_feed_if_needed(
+        conn, "meteoblue", "NEMS4", fetch_interval_minutes=60
+    )
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    conn.execute(
+        "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (1, ?, 1)",
+        (package_id,),
+    )
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(
+        conn,
+        forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_m: 4.5},
+        observed=4.0,
+    )
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_m, 9.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    conn.commit()
+
+    def _training_ids() -> set[int]:
+        training = wind_blend.load_wind_training(
+            conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+        )
+        return {feed_id for feed_id, _ in training.feed_highs}
+
+    before = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert before["weights"] == {
+        "wind": {
+            str(feed_a): pytest.approx(2 / 7),
+            str(feed_b): pytest.approx(1 / 7),
+            str(feed_m): pytest.approx(4 / 7),
+        }
+    }
+    assert before["blend"]["wind_kmh"] == pytest.approx([25.5 / 3.5 * 3.6] * 24)
+    assert feed_m in {feed["feed_id"] for feed in before["feeds"]}
+    assert _training_ids() == {feed_a, feed_b, feed_m}
+
+    pause_dropped_meteoblue_members(conn)
+    conn.commit()
+
+    after = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert after["weights"] == {
+        "wind": {str(feed_a): pytest.approx(2 / 3), str(feed_b): pytest.approx(1 / 3)}
+    }
+    assert after["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert after["notes"] == {"wind": None}
+    assert feed_m not in {feed["feed_id"] for feed in after["feeds"]}
+    assert _training_ids() == {feed_a, feed_b}
 
 
 # ---------------------------------------------------------------------------
@@ -1486,97 +1702,6 @@ def test_build_hourly_far_tile_is_not_a_single_point() -> None:
     assert isinstance(temp_c, list)
     non_none = [v for v in temp_c if v is not None]
     assert len(non_none) > 1
-
-
-def test_coverage_gate_wind_aggregates_precip_suppresses() -> None:
-    """Wind and precipitation no longer share one story under this gate.
-
-    Discriminating construction: the single-slot gfs feed carries scoring pairs
-    (pair_n = 3, no persistence => not confident but on the SCORED rung), the
-    15h ecmwf feed has none (pair_n = 0). Pre-fix the pool == candidates, so
-    the scored rung selects the single-slot feed alone -> wind.max_kmh 108.0
-    (30 m/s). Post-fix the >=12h adequate pool excludes the single-slot feed,
-    so wind's covered-feed aggregate (max 10.0 m/s) renders instead -- wind
-    still aggregates a partial range, unchanged from before Item G.
-
-    Precipitation's 15h feed, however, is short of a whole local day, so
-    under G.3 (``covers_local_day_exactly``) it is not extrema-eligible
-    either -- neither feed qualifies, so the daily total and wet-hour count
-    are suppressed rather than aggregated from the partial range."""
-    conn = _make_db()
-    # Legacy wind under test: a fresh site opens in pair_max (accuracy-weighted
-    # wind), so hold the site in staging.
-    set_wind_basis_state(conn, 1, "staging")
-    single_id = _feed_id(conn, "open-meteo", "gfs_global")
-    covered_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    day = "2026-07-25"  # D+5
-    issued = "2026-07-20T00:00:00Z"  # day_ahead=5
-    hrs = _hours(day, 0, 15)
-
-    # Covered feed: 15h of wind (max 10.0 m/s) and precip (total 7.5 mm).
-    _seed_varying(
-        conn,
-        feed_id=covered_id,
-        variable="wind",
-        issued_at=issued,
-        valid_ats=hrs,
-        values=[10.0 - i * 0.5 for i in range(15)],  # max 10.0
-    )
-    _seed_varying(
-        conn,
-        feed_id=covered_id,
-        variable="precip",
-        issued_at=issued,
-        valid_ats=hrs,
-        values=[0.5] * 15,  # total 7.5
-    )
-    # Single-slot feed: one wind + one precip sample, but scored so it out-ranks
-    # the unscored covered feed on the pre-fix ladder.
-    _insert_sample(
-        conn,
-        feed_id=single_id,
-        variable="wind",
-        issued_at=issued,
-        valid_at=f"{day}T12:00:00Z",
-        lead_hours=12,
-        value=30.0,
-    )
-    _insert_sample(
-        conn,
-        feed_id=single_id,
-        variable="precip",
-        issued_at=issued,
-        valid_at=f"{day}T12:00:00Z",
-        lead_hours=12,
-        value=0.0,
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=single_id, variable="wind", day_ahead=5, forecast=10.5
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=single_id, variable="precip", day_ahead=5, forecast=10.5
-    )
-    _seed_complete_score_cache(conn, variable="wind", day_ahead=5)
-    _seed_complete_score_cache(conn, variable="precip", day_ahead=5)
-
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    tile = view.tiles[5]
-    assert tile.wind.max_kmh == ms_to_kmh(10.0)  # 36.0, not the single-slot's 108
-    wind_labels = [ref.label for ref in tile.wind.meta.feeds]
-    assert feed_label("open-meteo", "gfs_global") not in wind_labels
-    assert feed_label("open-meteo", "ecmwf_ifs") in wind_labels
-
-    # Neither feed covers a whole local day exactly (15h < 24h, 1-sample
-    # single-slot feed), so precip's extrema set is empty: total/wet-hours
-    # are suppressed, not aggregated from the 15h partial range.
-    assert tile.precip.total_mm is None
-    assert tile.precip.wet_hours is None
-    assert tile.precip.meta.extrema_unavailable is True
-    assert tile.precip.meta.feeds == []
 
 
 def test_far_horizon_multipoint_tier_rescues_when_best_below_adequate() -> None:

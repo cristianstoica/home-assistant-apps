@@ -34,7 +34,6 @@ from types import SimpleNamespace
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import set_wind_basis_state
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     EXTREMA_COVERAGE_INSUFFICIENT,
@@ -858,9 +857,9 @@ def test_reconciliation_invariant_23h_and_25h_days() -> None:
 # G-T12 -- an axis instant no member supplies is null, and the drill-down's
 # total agrees with the rendered tile (the underlying null-vs-renormalise
 # rule is pinned directly against `fixed_membership_series` in
-# test_forecast_aggregate.py; this off-hour instant comes from a wind feed,
-# so both precip members lack it and cannot distinguish null-by-rule from
-# a renormalising bug here).
+# test_forecast_aggregate.py; this off-hour instant comes from a temperature
+# feed, so both precip members lack it and cannot distinguish null-by-rule
+# from a renormalising bug here).
 # ===========================================================================
 
 
@@ -868,12 +867,9 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
     import pytest
 
     conn = _make_db()
-    # The off-hour instant reaches the axis through the legacy wind blend; in
-    # pair_max an untrained wind feed contributes no hours.
-    set_wind_basis_state(conn, 1, "staging")
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    wind_feed = _feed_id(conn, "open-meteo", "icon_global")
+    temp_feed = _feed_id(conn, "open-meteo", "icon_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
     ats = _hours("2026-07-20", 0, 24)
     _seed_varying(
@@ -892,12 +888,12 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
         valid_ats=ats,
         values=[0.05 * i for i in range(24)],
     )
-    # An off-hour instant on a wind feed: never a precip contributor, but it
-    # widens the drill-down's hour axis.
+    # An off-hour instant on a temperature feed: never a precip contributor,
+    # but it widens the drill-down's hour axis.
     _insert_sample(
         conn,
-        feed_id=wind_feed,
-        variable="wind",
+        feed_id=temp_feed,
+        variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_at="2026-07-20T10:30:00Z",
         lead_hours=15,

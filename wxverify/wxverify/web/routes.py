@@ -250,9 +250,30 @@ async def render_station_cluster(request: Request, site_id: int) -> HTMLResponse
     return render_fragment(request, "sites/_station_cluster.html", site=site)
 
 
-async def render_feed_toggles(request: Request, site_id: int) -> HTMLResponse:
+async def render_feed_toggles(
+    request: Request, site_id: int, *, feed_id: int, enabled: bool, changed: bool
+) -> HTMLResponse:
+    """Render a site's subscription section after a toggle write.
+
+    The section's status line names the feed and its new state, and says
+    whether the write changed it (``changed``) or found it already set.
+    """
     site = await get_db().read(lambda conn: load_site(conn, site_id))
-    return render_fragment(request, "sites/_feed_toggles.html", site=site)
+    toggle_notice: str | None = None
+    if site is not None:
+        label = next(
+            (feed.label for feed in site.feeds if feed.id == feed_id),
+            f"Feed {feed_id}",
+        )
+        state = "on" if enabled else "off"
+        toggle_notice = (
+            f"Saved. {label} is now {state} for this site."
+            if changed
+            else f"No change. {label} was already {state} for this site."
+        )
+    return render_fragment(
+        request, "sites/_feed_toggles.html", site=site, toggle_notice=toggle_notice
+    )
 
 
 async def render_backfill(request: Request) -> HTMLResponse:

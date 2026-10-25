@@ -40,7 +40,7 @@
                 <td>{{ "%.4f"|format(station.lat) }}</td>
                 <td>{{ "%.4f"|format(station.lon) }}</td>
                 <td>{{ "%.0f"|format(station.dem_elevation_m) }}</td>
-                <td>{{ "Enabled" if station.enabled else "Disabled" }}</td>
+                <td>{{ "Enabled" if station.enabled else "Disabled" }}{% if station.observation_age is not none %} · latest observation {{ station.observation_age }}{% endif %}</td>
                 <td class="actions">
                   <button
                     type="button"
@@ -58,6 +58,8 @@
                     hx-delete="{{ url('/api/sites/' ~ site.id ~ '/stations/' ~ station.id) }}"
                     hx-ext="json-enc"
                     hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                    hx-confirm="Remove station {{ station.pws_station_id }} from {{ site.name }}? Its stored observations are deleted. It cannot be undone."
+                    hx-disabled-elt="this"
                     hx-target="#station-cluster-{{ site.id }}"
                     hx-swap="outerHTML">Remove</button>
                 </td>

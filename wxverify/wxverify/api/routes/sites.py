@@ -28,14 +28,6 @@ from wxverify.db.tz_generations import (
     published_pointer_key,
     start_retrospective_correction,
 )
-from wxverify.db.wind_basis import (
-    wind_basis_key,
-    wind_blocked_key,
-    wind_cursor_key,
-    wind_done_at_key,
-    wind_progress_key,
-    wind_report_key,
-)
 from wxverify.scoring.engine import pair_and_score
 from wxverify.verification.record import SNAPSHOT_TIME_KEY, gap_scan_failures_key
 from wxverify.verification.runs import published_run_key
@@ -206,12 +198,6 @@ def _clear_site_state(
     ]
     delete_runtime_state(
         conn,
-        wind_basis_key(site_id),
-        wind_progress_key(site_id),
-        wind_cursor_key(site_id),
-        wind_blocked_key(site_id),
-        wind_report_key(site_id),
-        wind_done_at_key(site_id),
         published_pointer_key(site_id),
         verification_state_key(site_id),
         verification_heartbeat_key(site_id),

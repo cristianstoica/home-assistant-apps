@@ -43,13 +43,8 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import Job
-from wxverify.db.runtime_state import delete_runtime_state, set_runtime_state
-from wxverify.db.wind_basis import (
-    set_wind_basis_state,
-    wind_blocked_key,
-    wind_progress_key,
-    write_auth_hold,
-)
+from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.wind_basis import AuthHoldEndpoint, AuthHoldStatus, write_auth_hold
 from wxverify.monitor import (
     _wind_history_trips,  # noqa: PLC2701 -- private, exercised directly
     build_verdict,
@@ -176,14 +171,15 @@ def _obs_rows(
 # ---------------------------------------------------------------------------
 
 
-def test_t70_live_fetch_writes_wind_only_while_staging(
+def test_t70_live_fetch_writes_no_wind_whatever_the_stored_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``insert_station_observation`` (consensus.py:166-211) gates wind rows on
-    the site's wind-basis state ('staging' only); temperature is unguarded.
+    """``insert_station_observation`` (``scoring/consensus.py``) drops every
+    wind row offered to it, whatever the site's stored ``wind_basis`` key;
+    temperature is unguarded.
 
     Two site/station pairs, same response shape, differing only in the
-    wind-basis state set before the fetch runs.
+    ``wind_basis`` key written (by its literal name) before the fetch runs.
     """
     conn = _init_tmp_db(tmp_path)
     now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
@@ -191,8 +187,8 @@ def test_t70_live_fetch_writes_wind_only_while_staging(
 
     staging_site, staging_station = _seed_site_and_station(conn, "WSTATION01")
     pm_site, pm_station = _seed_site_and_station(conn, "WSTATION02")
-    set_wind_basis_state(conn, staging_site, "staging")
-    set_wind_basis_state(conn, pm_site, "pair_max")
+    set_runtime_state(conn, f"wind_basis:{staging_site}", "staging")
+    set_runtime_state(conn, f"wind_basis:{pm_site}", "pair_max")
 
     db = get_db()
     writer = FencedWriter(db, db.generation)
@@ -203,10 +199,9 @@ def test_t70_live_fetch_writes_wind_only_while_staging(
     _run_fetch_obs(db, writer, staging_site, handler)
     _run_fetch_obs(db, writer, pm_site, handler)
 
-    # staging: both variables land.
+    # Both keys: temperature lands, wind is dropped.
     assert len(_obs_rows(conn, staging_station, "temperature")) == 1
-    assert len(_obs_rows(conn, staging_station, "wind")) == 1
-    # pair_max: temperature still lands, wind is gated out.
+    assert len(_obs_rows(conn, staging_station, "wind")) == 0
     assert len(_obs_rows(conn, pm_station, "temperature")) == 1
     assert len(_obs_rows(conn, pm_station, "wind")) == 0
 
@@ -223,7 +218,7 @@ def test_t72_live_fetch_never_writes_wind_history_tables(
     now = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, now)
     site_id, station_id = _seed_site_and_station(conn)
-    set_wind_basis_state(conn, site_id, "staging")
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
 
     db = get_db()
     writer = FencedWriter(db, db.generation)
@@ -233,7 +228,8 @@ def test_t72_live_fetch_never_writes_wind_history_tables(
 
     _run_fetch_obs(db, writer, site_id, handler)
 
-    assert len(_obs_rows(conn, station_id, "wind")) == 1  # the gate did fire
+    assert len(_obs_rows(conn, station_id, "temperature")) == 1  # the fetch ran
+    assert len(_obs_rows(conn, station_id, "wind")) == 0  # the guard dropped it
     assert conn.execute("SELECT COUNT(*) FROM station_wind_records").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM station_wind_days").fetchone()[0] == 0
 
@@ -408,22 +404,23 @@ _NOW = datetime(2026, 9, 22, 12, 0, 0, tzinfo=UTC)  # past local midnight + 6h g
 
 
 def _healthy_site(conn: sqlite3.Connection) -> tuple[int, int]:
-    """A site/station pair that trips none of (a)-(h) at ``_NOW``.
+    """A site/station pair that trips none of (c), (e) to (h) at ``_NOW``.
 
-    ``pair_max`` skips (b); a fresh, well-attended ``station_wind_days`` row
-    for today (non-zero ``record_count``, ``last_ok_at`` inside the
-    2x-interval window) clears (e) and (h); no failed/unavailable rows
-    clears (c)/(d); no auth hold clears (g); a plain 'UTC' timezone clears
-    (f). Each test below mutates exactly one of these away from healthy.
+    A fresh, well-attended ``station_wind_days`` row for today (non-zero
+    ``record_count``, ``last_ok_at`` inside the 2x-interval window) clears
+    (e) and (h); no failed rows clears (c); no auth hold clears (g); a
+    plain 'UTC' timezone clears (f). (i) is gated on a ``history_all``
+    auth hold being held at all -- this baseline has none, so (i) is never
+    reached here, not demonstrated clear. Each test below mutates exactly
+    one of these away from healthy.
     """
     site_id = _seed_site(conn)
     station_id = _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-22', 'fetched', 24, ?, 1, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-22', 'fetched', 24, ?, 1, ?)",
         (
             station_id,
             isoformat_utc(_NOW - timedelta(minutes=30)),
@@ -446,42 +443,6 @@ def test_t74_healthy_site_trips_nothing(tmp_path: Path) -> None:
     assert _trips(conn) == (0, None)
 
 
-def test_t74a_blocked_switch_trips(tmp_path: Path) -> None:
-    """(a): a runtime-state blocked marker trips, naming the stored reason."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, _ = _healthy_site(conn)
-    set_runtime_state(
-        conn, wind_blocked_key(site_id), json.dumps({"reason": "no eligible stations"})
-    )
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == "wind rebuild blocked: no eligible stations"
-
-
-def test_t74b_stalled_rebuild_trips_with_headroom_detail(tmp_path: Path) -> None:
-    """(b): a non-``pair_max`` site with no (or stale) progress stamp trips;
-    the reason names the state and, when call headroom is exhausted, says so.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, _ = _healthy_site(conn)
-    set_wind_basis_state(conn, site_id, "staging")
-    # set_wind_basis_state itself stamps progress via the real wall clock
-    # (stamp_wind_progress), which is not frozen in this sync harness and
-    # lands AFTER _NOW -- erase it so "no progress" is genuinely true at
-    # _NOW, the state this check actually reads.
-    delete_runtime_state(conn, wind_progress_key(site_id))
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first is not None
-    assert "wind rebuild has made no progress since never (state staging)" in first
-
-
 def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     """(c): a station-day that failed after >=3 attempts inside the last 7
     local days trips, independent of today's own row.
@@ -493,8 +454,8 @@ def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-20', 'failed', 0, NULL, 3, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-20', 'failed', 0, NULL, 3, ?)",
         (station_id, isoformat_utc(_NOW)),
     )
     conn.commit()
@@ -502,35 +463,6 @@ def test_t74c_failed_station_days_trip(tmp_path: Path) -> None:
     assert tripped == 1
     assert first == (
         "wind history: 1 station-days failed after 3 attempts in the last 7 days"
-    )
-
-
-def test_t74d_unavailable_share_over_threshold_trips(tmp_path: Path) -> None:
-    """(d): unavailable legacy-wind station-days over 10% of the lookback
-    window trips -- 2 of 9 (> 10%) but 1 of 10 (= 10%, not > 10%) does not.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, station_id = _healthy_site(conn)
-    for day, status in [
-        ("2026-09-01", "unavailable"),
-        ("2026-09-02", "unavailable"),
-        *[(f"2026-09-{d:02d}", "fetched") for d in range(3, 10)],  # 7 fetched
-    ]:
-        conn.execute(
-            "INSERT INTO station_wind_days"
-            " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-            "  legacy_hours, updated_at)"
-            " VALUES (?, ?, ?, 1, NULL, 1, 1, ?)",
-            (station_id, day, status, isoformat_utc(_NOW)),
-        )
-    conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == (
-        "wind history: 2 of 9 station-days with old wind are unavailable from"
-        " weather.com (last 30 days)"
     )
 
 
@@ -558,26 +490,49 @@ def test_t74e_no_wind_readings_today_trips(tmp_path: Path) -> None:
     run_migrations(conn)
     site_id = _seed_site(conn)
     _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "pair_max")
     conn.commit()  # no station_wind_days row for today at all
     tripped, first = _trips(conn)
     assert tripped == 1
     assert first == "no wind readings today from any station"
 
 
-def test_t74g_auth_hold_trips(tmp_path: Path) -> None:
-    """(g): a held weather.com auth hold trips, named by endpoint."""
+@pytest.mark.parametrize("status", ["held", "probing"])
+@pytest.mark.parametrize(
+    ("endpoints", "expected"),
+    [
+        pytest.param(("history_all",), (0, None), id="history_all-alone"),
+        pytest.param(
+            ("all_1day",),
+            (1, "wind history paused: weather.com refused the key (all_1day)"),
+            id="all_1day-alone",
+        ),
+        pytest.param(
+            ("history_all", "all_1day"),
+            (1, "wind history paused: weather.com refused the key (history_all)"),
+            id="both",
+        ),
+    ],
+)
+def test_t74g_auth_hold_trips(
+    tmp_path: Path,
+    endpoints: tuple[AuthHoldEndpoint, ...],
+    expected: tuple[int, str | None],
+    status: AuthHoldStatus,
+) -> None:
+    """(g): an ``all_1day`` hold trips, named by endpoint; a ``history_all``
+    hold trips only next to an ``all_1day`` hold, and its text then comes
+    first. ``held`` and ``probing`` count alike.
+    """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
     _healthy_site(conn)
-    write_auth_hold(
-        conn, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
-    )
+    for endpoint in endpoints:
+        write_auth_hold(
+            conn, endpoint, status=status, since=isoformat_utc(_NOW), error="401"
+        )
     conn.commit()
-    tripped, first = _trips(conn)
-    assert tripped == 1
-    assert first == "wind history paused: weather.com refused the key (history_all)"
+    assert _trips(conn) == expected
 
 
 def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
@@ -589,14 +544,13 @@ def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
     site_id = _seed_site(conn)
-    set_wind_basis_state(conn, site_id, "pair_max")
     missing_row_station = _seed_enabled_station(conn, site_id, "WSTATION01")
     null_last_ok_station = _seed_enabled_station(conn, site_id, "WSTATION02")
     conn.execute(
         "INSERT INTO station_wind_days"
         " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-        "  legacy_hours, updated_at)"
-        " VALUES (?, '2026-09-22', 'fetched', 24, NULL, 1, 0, ?)",
+        "  updated_at)"
+        " VALUES (?, '2026-09-22', 'fetched', 24, NULL, 1, ?)",
         (null_last_ok_station, isoformat_utc(_NOW)),
     )
     conn.commit()
@@ -610,28 +564,6 @@ def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
     assert missing_row_station != null_last_ok_station
 
 
-def test_t74h_switching_state_skips_today_checks(tmp_path: Path) -> None:
-    """(h)/(e) grace carve-out: ``switching``/``rescoring`` never run the
-    today checks at all, paired against the healthy ``pair_max`` baseline
-    above where the same "no today row" fixture DOES trip.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id = _seed_site(conn)
-    _seed_enabled_station(conn, site_id, "WSTATION01")
-    set_wind_basis_state(conn, site_id, "switching")
-    delete_runtime_state(conn, wind_progress_key(site_id))
-    conn.commit()
-    tripped, first = _trips(conn)
-    # (b) still fires (state != pair_max, no progress stamp) but (e)/(h) do not
-    # add their own reasons on top -- confirmed by there being exactly the one
-    # (b) reason, not more.
-    assert tripped == 1
-    assert first is not None
-    assert first.startswith("wind rebuild has made no progress")
-
-
 def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     """(i): yesterday's missed final ``all_1day`` collection trips, named by
     date and station count -- three cases on one ``_healthy_site`` baseline,
@@ -643,13 +575,13 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     Case 1 (``last_ok_at`` 2h before local midnight, outside
     ``[end - WIND_FINAL_LEAD, end)``): the missed text is the FIRST reason --
     it is read before (e)/(g) in ``_wind_history_trips``' per-site branch.
-    Case 2 (``last_ok_at`` 10 min before local midnight, inside the window):
-    no missed text at all; the first reason falls through to the existing
-    (g) hold text (same text ``test_t74g_auth_hold_trips`` pins). Case 3
+    Case 2 (last): not missed -> no missed text, and a history_all hold
+    alone adds no (g) reason, so nothing trips; case 2 runs last. Case 3
     reuses case 1's missing-coverage data but also holds ``all_1day`` --
     the ``"all_1day" not in holds`` guard suppresses the missed text even
     though the underlying data is identical to case 1, proving the
     suppression is driven by the hold, not by the data (paired negative).
+    With both held, the first reason is the ``history_all`` hold text.
     """
 
     def _seed_yesterday(
@@ -658,8 +590,8 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         conn.execute(
             "INSERT INTO station_wind_days"
             " (station_id, local_date, status, record_count, last_ok_at, attempts,"
-            "  legacy_hours, updated_at)"
-            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, 0, ?)",
+            "  updated_at)"
+            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, ?)",
             (station_id, last_ok_at, isoformat_utc(_NOW)),
         )
 
@@ -684,31 +616,8 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         "mutant -> at this assertion: correct = the missed text (missed=1,"
         " total=1, yesterday=2026-09-21), mutant (count_missed_final's"
         " window comparison inverted, or the check's own `missed > 0`"
-        " dropped) = a different first reason (the (g) hold text) or none"
+        " dropped) = no reason (a history_all hold alone adds none)"
     )
-
-    # Case 2: not missed -> no missed text; the (g) hold text leads instead
-    # (the same text test_t74g_auth_hold_trips pins), proving case 1's
-    # result was a real divergence on the DATA, not an artifact of the hold
-    # always firing first regardless of coverage.
-    conn2 = sqlite3.connect(":memory:")
-    conn2.row_factory = sqlite3.Row
-    run_migrations(conn2)
-    site_id2, station_id2 = _healthy_site(conn2)
-    _seed_yesterday(conn2, station_id2, not_missed_last_ok_at)
-    write_auth_hold(
-        conn2, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
-    )
-    conn2.commit()
-    tripped2, first2 = _trips(conn2)
-    assert tripped2 == 1
-    assert first2 == "wind history paused: weather.com refused the key (history_all)", (
-        "mutant -> at this assertion: correct = the (g) hold text (missed=0,"
-        " so (i) adds nothing), mutant (the missed-window boundary widened"
-        " so a last_ok_at inside the window is still counted missed) = the"
-        " missed text instead"
-    )
-    assert "missed" not in first2
 
     # Case 3: same missing coverage as case 1, but all_1day is ALSO held --
     # the guard suppresses the missed text entirely (paired negative against
@@ -734,6 +643,78 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         " underlying coverage data is identical to case 1's), mutant (the"
         " `'all_1day' not in holds` clause dropped from the guard) = the"
         " missed text appears despite all_1day being held"
+    )
+    assert first3 == "wind history paused: weather.com refused the key (history_all)", (
+        "mutant -> at this assertion: correct = the history_all hold text"
+        " first (both endpoints held), mutant (the history_all reason left out"
+        " even when all_1day is held) = the all_1day hold text"
+    )
+
+    # Case 2 (last): not missed -> no missed text, and a history_all hold
+    # alone adds no (g) reason, so nothing trips. This proves case 1's
+    # result came from the data.
+    conn2 = sqlite3.connect(":memory:")
+    conn2.row_factory = sqlite3.Row
+    run_migrations(conn2)
+    site_id2, station_id2 = _healthy_site(conn2)
+    _seed_yesterday(conn2, station_id2, not_missed_last_ok_at)
+    write_auth_hold(
+        conn2, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    conn2.commit()
+    tripped2, first2 = _trips(conn2)
+    assert (tripped2, first2) == (0, None), (
+        "mutant -> at this assertion: correct = nothing trips (missed=0, so (i)"
+        " adds nothing, and a history_all hold alone adds no (g) reason),"
+        " mutant (the missed-window boundary widened so a last_ok_at inside"
+        " the window is still counted missed) = the missed text, mutant (the"
+        " history_all reason added back unconditionally) = the (g) hold text"
+    )
+
+
+def test_d23_missed_final_collection_ignores_a_leftover_wind_basis_key(
+    tmp_path: Path,
+) -> None:
+    """D23 (old-wind-method-removal plan §10.4): (i)'s missed-final-collection
+    reason fires regardless of a stray ``wind_basis:<site>`` key, left over
+    from the old method and never cleaned up. Reuses
+    ``test_t74i_missed_final_collection_reason``'s case 1 setup, plus that
+    leftover key set to ``staging``.
+    """
+
+    def _seed_yesterday(
+        conn: sqlite3.Connection, station_id: int, last_ok_at: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO station_wind_days"
+            " (station_id, local_date, status, record_count, last_ok_at, attempts,"
+            "  updated_at)"
+            " VALUES (?, '2026-09-21', 'fetched', 24, ?, 1, ?)",
+            (station_id, last_ok_at, isoformat_utc(_NOW)),
+        )
+
+    missed_last_ok_at = isoformat_utc(_NOW - timedelta(hours=14))  # 2026-09-21T22:00Z
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
+    site_id, station_id = _healthy_site(conn)
+    _seed_yesterday(conn, station_id, missed_last_ok_at)
+    write_auth_hold(
+        conn, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
+    )
+    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
+    conn.commit()
+
+    tripped, first = _trips(conn)
+    assert tripped == 1
+    assert first == (
+        "wind: last collection before midnight missed for 1 of 1 stations (2026-09-21)"
+    ), (
+        "mutant -> at this assertion: correct = the missed text, mutant"
+        " (base's (b) wind-rebuild-progress check fires first for a"
+        " non-pair_max state and (i) itself requires state == 'pair_max')"
+        f" = a different first reason; got {first!r}"
     )
 
 

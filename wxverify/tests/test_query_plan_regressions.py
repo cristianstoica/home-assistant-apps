@@ -38,8 +38,6 @@ from wxverify.db.queue import (
     ACTIVE_JOB_SQL,
     LATEST_JOB_SQL,
 )
-from wxverify.db.tz_generations import published_generation_clause
-from wxverify.db.wind_basis import wind_open_clause
 from wxverify.forecast.wind_blend import training_pairs_query
 from wxverify.monitor import FAILED_SCOPES_SQL
 from wxverify.provider_ops import (
@@ -48,9 +46,6 @@ from wxverify.provider_ops import (
     recent_model_run_count_sql,
     recent_sample_rollup_sql,
     sample_rollup_sql,
-)
-from wxverify.scoring.engine import (
-    _distinct_cells,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
 )
 from wxverify.scoring.multimodel import existing_mean_rows_sql
 from wxverify.scoring.pairing import (
@@ -77,36 +72,6 @@ def _plan(conn: sqlite3.Connection, sql: str, params: tuple[object, ...]) -> lis
     return [
         str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
     ]
-
-
-def _plan_rows(
-    conn: sqlite3.Connection, sql: str, params: tuple[object, ...]
-) -> list[tuple[int, int, str]]:
-    return [
-        (int(row["id"]), int(row["parent"]), str(row["detail"]))
-        for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
-    ]
-
-
-def _root_ancestor(rows: list[tuple[int, int, str]], row_id: int) -> int:
-    """Walk the EQP parent chain up to the top-level (parent 0) ancestor."""
-    parents = {rid: parent for rid, parent, _detail in rows}
-    current = row_id
-    while parents.get(current, 0) != 0:
-        current = parents[current]
-    return current
-
-
-def _subtree_ids(rows: list[tuple[int, int, str]], root_id: int) -> set[int]:
-    subtree = {root_id}
-    changed = True
-    while changed:
-        changed = False
-        for row_id, parent, _detail in rows:
-            if parent in subtree and row_id not in subtree:
-                subtree.add(row_id)
-                changed = True
-    return subtree
 
 
 def _seed_meteoblue_package_with_16_members(
@@ -1400,76 +1365,6 @@ def test_training_pairs_query_seeks_leaderboard_index_with_valid_at_range() -> N
     assert "valid_at>?" not in dropped_seeks[0], dropped_plan
 
 
-def test_distinct_cells_materializes_before_the_wind_open_check() -> None:
-    """T62(b) -- ``scoring/engine.py:_distinct_cells``'s ``WITH cells AS
-    MATERIALIZED (...)`` fence must keep ``forecast_pairs`` scanned and
-    deduplicated INSIDE the materialized subtree, with the wind-open-state
-    check (``wind_open_clause``, reading ``runtime_state``) sitting entirely
-    OUTSIDE it -- in the outer loop that reads the already-deduplicated
-    cells -- so the check runs once per distinct cell, not once per raw
-    pair row.
-    """
-    conn = _fresh_conn()
-    statements: list[str] = []
-    conn.set_trace_callback(statements.append)
-    try:
-        _distinct_cells(conn, 1)
-    finally:
-        conn.set_trace_callback(None)
-
-    traced = [sql for sql in statements if "forecast_pairs" in sql]
-    assert len(traced) == 1, statements
-    assert "AS MATERIALIZED" in traced[0], traced[0]
-
-    # set_trace_callback hands back the statement with bound parameters
-    # already substituted as literals, so EXPLAIN QUERY PLAN takes no params.
-    rows = _plan_rows(conn, traced[0], ())
-    materialize_row = next(row for row in rows if row[2] == "MATERIALIZE cells")
-    pairs_row = next(row for row in rows if "forecast_pairs" in row[2])
-    wind_rows = [
-        row for row in rows if re.match(r"^(SCAN|SEARCH) runtime_state\b", row[2])
-    ]
-    assert wind_rows, rows
-
-    # forecast_pairs is scanned (and deduplicated) INSIDE the fence...
-    assert pairs_row[1] == materialize_row[0], rows
-    # ...and the wind-open check's whole correlated-subquery node sits
-    # entirely outside that fenced subtree, at the top level alongside
-    # "SCAN cells" -- it runs in the outer loop over the deduplicated
-    # cells, never inside the loop that built them.
-    fenced_subtree = _subtree_ids(rows, materialize_row[0])
-    wind_roots = {_root_ancestor(rows, row[0]) for row in wind_rows}
-    assert not (wind_roots & fenced_subtree), rows
-
-    # Negative control: the inline form (the wind clause folded straight into
-    # the forecast_pairs WHERE, no CTE/fence) has no MATERIALIZE node at all
-    # -- both the pair scan and the wind-open check sit at the top level of
-    # the SAME unfenced query block, so the check runs once per raw pair row
-    # -- proving the fenced assertions above are discriminating, not
-    # vacuously true.
-    inline_sql = (
-        "SELECT DISTINCT site_id, feed_id, variable, day_ahead "
-        "FROM forecast_pairs "
-        f"WHERE {published_generation_clause('forecast_pairs')} "
-        "AND site_id = ? "
-        f"AND {wind_open_clause('variable', 'site_id')}"
-    )
-    inline_rows = _plan_rows(conn, inline_sql, (1,))
-    assert not any(row[2] == "MATERIALIZE cells" for row in inline_rows), inline_rows
-    inline_pairs_row = next(row for row in inline_rows if "forecast_pairs" in row[2])
-    inline_wind_rows = [
-        row
-        for row in inline_rows
-        if re.match(r"^(SCAN|SEARCH) runtime_state\b", row[2])
-    ]
-    assert inline_wind_rows, inline_rows
-    # With no MATERIALIZE node to nest under, the pair scan sits at the top
-    # level of the one and only query block -- the same block the wind
-    # check's correlated subquery belongs to, so nothing fences the check
-    # off from running once per raw pair row.
-    assert inline_pairs_row[1] == 0, inline_rows
-
-
 # -- §11.6 "T-EQP" -- REAL_MODEL_PAIR_PROBE_SQL (plan #79 fetch-scoring-gate) --
 #
 # Synthetic fixtures: 'Testsite'/'Testsite B' at 12.3456/65.4321, 2035 (plan §11).
@@ -1594,8 +1489,8 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     """T-EQP-exact: the whole plan of ``REAL_MODEL_PAIR_PROBE_SQL`` on a
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
     including the ``CORRELATED SCALAR SUBQUERY`` headers, in the order the
-    planner prints them. Measured on the #79 implementation base in the
-    worktree venv, SQLite 3.53.1. The pin is fresh-schema only: after
+    planner prints them. Taken from CI's shipping-SQLite job (SQLite 3.53.4)
+    on 0.16.11. The pin is fresh-schema only: after
     ``ANALYZE`` the ``s``/``f``/``obs`` join order moves, and the relational
     pins above cover that case."""
     conn = _fresh_conn()
@@ -1608,12 +1503,9 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
         "CORRELATED SCALAR SUBQUERY 1",
         "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
-        # wind_open_clause's wind_state_sql: the unaliased runtime_state read.
-        "CORRELATED SCALAR SUBQUERY 3",
-        "SEARCH runtime_state USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
-        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
         " (site_id=? AND variable=? AND valid_at=?)",
+        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
     ]
 

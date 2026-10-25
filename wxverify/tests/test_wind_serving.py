@@ -1,6 +1,6 @@
-"""Wind serving: eligibility floor, staging/switching/rescoring display,
-the double read, build_hourly's weighted axis, and the state allowlist
-(plan §11.4, §15.1 T59, T60, T65, T66, T67).
+"""Wind serving: eligibility floor, stored states that no longer close wind,
+the dashboard banner, and build_hourly's weighted axis (plan §11.4, §15.1
+T59, T60, T66).
 
 Isolation: fresh ``sqlite3.connect(":memory:")`` + ``run_migrations`` per
 test, mirroring ``tests/test_forecast_service.py`` (site id=1 fixed, the
@@ -11,8 +11,7 @@ same seeded feeds) since these tests exercise ``build_forecast``/
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import UTC, datetime
 
 import pytest
 
@@ -25,7 +24,8 @@ from tests.test_forecast_service import (
     _seed_wind_training,
 )
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.wind_basis import set_wind_basis_state, wind_serving_mode
+from wxverify.db.runtime_state import set_runtime_state
+from wxverify.db.wind_basis import write_auth_hold
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
@@ -109,245 +109,82 @@ def test_t59_one_eligible_feed_tile_is_not_available() -> None:
     assert tile.wind.max_kmh is None
 
 
-# --- T60: staging/switching/rescoring display ------------------------------
+# --- T60: stored states and the dashboard banner ---------------------------
 
 
-def test_t60_staging_tile_and_hourly_match_golden() -> None:
-    """Golden copy of base-commit 12a14bd's legacy (``staging``) wind
-    output. Captured by running this exact fixture against the pre-change
-    code, extracted read-only via ``git archive 12a14bd`` and imported off
-    ``sys.path`` (``wxverify.__file__`` printed and asserted to come from
-    the extracted tree, never the live package) -- see the mutation report
-    for the capture script and its printed output. Staging must still
-    render byte-for-byte like before the weighted-wind change landed.
+@pytest.mark.parametrize("state", ["switching", "rescoring"])
+def test_t60_stored_switching_or_rescoring_key_serves_weighted_wind(
+    state: str,
+) -> None:
+    """A stored ``switching`` or ``rescoring`` key no longer closes wind:
+    nothing reads it, so the tile and the hourly line serve the weighted
+    blend, with no progress note.
+
+    Two trained feeds, A (MAE 1.0) and B (MAE 2.0), take weights 2/3 and
+    1/3; A forecasts 4.0 m/s and B 7.0 m/s all day, so the daily high and
+    every hour read 2/3 * 4.0 + 1/3 * 7.0 = 5.0 m/s, 18.0 km/h.
+
+    mutant_wind_line_plain_mean -> at
+    ``assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)``:
+    correct = ``18.0`` at every hour, mutant (``"wind_kmh":
+    blend_series("wind")`` in place of ``wind_line()``) = ``19.8`` at every
+    hour, the unweighted mean of A's 14.4 and B's 25.2 km/h.
     """
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
     hours = _hours("2026-07-20", 0, 24)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=hours,
-        value=5.0,
-    )
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    set_runtime_state(conn, "wind_basis:1", state)
     conn.commit()
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     tile = view.tiles[0]
-    assert tile.wind.max_kmh == 18.0
-    assert tile.wind.meta.state == "low_confidence"
+    assert tile.wind.max_kmh == pytest.approx(18.0)
     assert tile.wind.meta.available is True
-    assert tile.wind.meta.feed_labels == "open-meteo / ecmwf_ifs"
+    assert tile.wind.note is None
 
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
-    assert payload["hours"] == hours
     assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
-    assert payload["states"]["wind"] == "low_confidence"
-    per_feed = {f["feed_id"]: f["wind_kmh"] for f in payload["feeds"]}
-    assert per_feed[feed_id] == pytest.approx([18.0] * 24)
+    assert payload["notes"] == {"wind": None}
 
 
-def test_t60_switching_and_rescoring_tile_shows_dash_with_progress_note() -> None:
-    """``switching`` with no cursor/station rows yet shows '--' (no value,
-    unavailable) with the "starting" progress note; ``rescoring`` always
-    reads "rescoring feeds" regardless of cursor state.
+def test_t60_banner_is_none_without_holds_and_shows_a_held_title() -> None:
+    """The dashboard banner (``load_wind_banner``) is None while no
+    weather.com auth hold exists, and carries the hold's title once one is
+    written -- paired, so the None proves the hold check rather than a
+    banner that can never fire.
+
+    mutant_banner_without_holds -> at the first ``is None``: correct = None
+    (no hold), mutant (a ``WindBanner`` returned with an empty ``holds``) =
+    ``WindBanner(holds=[])``.
     """
+    history_title = (
+        "This weather.com key cannot download wind history for past days,"
+        " a known limit of the key"
+    )
     conn = _make_db()
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 3),
-        value=5.0,
-    )
-    conn.commit()
-    set_wind_basis_state(conn, 1, "switching")
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    tile = view.tiles[0]
-    assert tile.wind.max_kmh is None
-    assert tile.wind.meta.available is False
-    assert tile.wind.note == "Wind is being recomputed on the new basis: starting"
+    assert load_wind_banner(conn, 1) is None
 
-    conn2 = _make_db()
-    feed_id2 = _feed_id(conn2, "open-meteo", "ecmwf_ifs")
-    _seed_hourly(
-        conn2,
-        feed_id=feed_id2,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 3),
-        value=5.0,
-    )
-    conn2.commit()
-    set_wind_basis_state(conn2, 1, "rescoring")
-    view2 = build_forecast(
-        conn2, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    tile2 = view2.tiles[0]
-    assert tile2.wind.max_kmh is None
-    assert (
-        tile2.wind.note == "Wind is being recomputed on the new basis: rescoring feeds"
-    )
-
-
-def _make_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO stations (site_id, pws_station_id, lat, lon,
-                               dem_elevation_m, enabled)
-        VALUES (?, ?, 10.0, 20.0, 50.0, 1)
-        """,
-        (site_id, pws_id),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def test_t60_staging_banner_shows_inventory_counts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """In ``staging``, the dashboard banner (``load_wind_banner``) carries
-    the rebuild note with the station-day inventory counts; paired with the
-    injected absence case, ``pair_max`` with no rebuild note and no auth
-    hold, where the banner is None -- the positive proves the note actually
-    fires on real counts, not that ``pair_max`` merely happens not to
-    trigger it.
-
-    The site is pinned to a non-UTC zone (``Etc/GMT-3``, a neutral offset)
-    and the clock ``wind_rebuild_progress`` reads (``wind_basis.utc_now``)
-    is pinned to an instant chosen so the site's local date and the UTC
-    date differ -- 22:00 UTC is already past local midnight at UTC+3 --
-    so the station-day seeding below is anchored to the site's actual
-    local "today" rather than to the machine's wall-clock date, and the
-    result can't depend on the machine's time zone.
-    """
-    conn = _make_db()
-    conn.execute("UPDATE sites SET timezone = 'Etc/GMT-3' WHERE id = 1")
-    set_wind_basis_state(conn, 1, "staging")
-    station_id = _make_station(conn, 1, "KTEST001")
-    pinned_now = datetime(2026, 1, 2, 22, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.db.wind_basis.utc_now", lambda: pinned_now)
-    site_today = pinned_now.astimezone(ZoneInfo("Etc/GMT-3")).date()
-    assert site_today != pinned_now.date()
-    yesterday = (site_today - timedelta(days=1)).isoformat()
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'fetched', 0, 24, 24, 0, '2026-01-01T00:00:00Z')",
-        (station_id, yesterday),
-    )
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, (site_today - timedelta(days=2)).isoformat()),
+    write_auth_hold(
+        conn, "history_all", status="held", since="2026-01-02T22:00:00Z", error=None
     )
     conn.commit()
     banner = load_wind_banner(conn, 1)
     assert banner is not None
-    assert banner.note == (
-        "Wind history is being rebuilt in the background: 1 of 2 "
-        "station-days fetched. Wind values are still on the old basis until "
-        "the switch."
-    )
-    assert banner.holds == []
-
-    conn2 = _make_db()
-    set_wind_basis_state(conn2, 1, "pair_max")
-    conn2.commit()
-    assert load_wind_banner(conn2, 1) is None
-
-
-# --- T65: the double read ---------------------------------------------------
-
-
-def test_t65_double_read_differs_closes_wind(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The state read is monkeypatched to return ``staging`` on the first
-    call (used as ``serving.state``) and ``switching`` on the second (the
-    post-build re-check) -- a switch transaction landing mid-request -- so
-    wind must be forced closed for this request even though the stored
-    state was legacy when the cells were built.
-
-    mutant_drop_second_read -> at
-    ``assert tile.wind.max_kmh is None``: correct = ``None`` (the second
-    read disagrees with the first, so wind is forced closed), mutant
-    (deleting the
-    ``if wind_blend.read_wind_state(conn, site_id) != serving.state:``
-    block) = ``18.0``, because the legacy cells built from the first read
-    are served as-is with no re-check.
-    """
-    conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 3),
-        value=5.0,
-    )
-    conn.commit()
-
-    real_read = wind_blend.read_wind_state
-    calls = {"n": 0}
-
-    def fake_read(c: object, sid: int) -> str:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return real_read(c, sid)  # type: ignore[arg-type]
-        return "switching"
-
-    monkeypatch.setattr(wind_blend, "read_wind_state", fake_read)
-
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    tile = view.tiles[0]
-    assert tile.wind.max_kmh is None
-    assert tile.wind.meta.available is False
-    assert calls["n"] == 2
-
-
-def test_t65_double_read_same_value_serves_normally() -> None:
-    """Paired positive: with nothing patched, both reads see the same
-    stored state and wind is served normally -- the double read exists to
-    catch a DIFFERENCE between the two reads, not to close wind on every
-    request.
-    """
-    conn = _make_db()
-    set_wind_basis_state(conn, 1, "staging")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=_hours("2026-07-20", 4, 3),
-        value=5.0,
-    )
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    tile = view.tiles[0]
-    assert tile.wind.max_kmh == 18.0
-    assert tile.wind.meta.available is True
+    assert banner.holds == [history_title]
 
 
 # --- T66: build_hourly in weighted mode -------------------------------------
@@ -594,8 +431,7 @@ def test_t66_weighted_states_wind_ignores_rebuilding() -> None:
     mutant_consult_rebuilding -> at
     ``assert payload["states"]["wind"] == "normal"``: correct = ``"normal"``
     (the override short-circuits before ``_any_rebuilding`` is called),
-    mutant (removing the
-    ``False if variable == "wind" and wind_mode != "legacy" else ...``
+    mutant (removing the ``False if variable == "wind" else ...``
     override, so ``_any_rebuilding`` is always called) raises
     ``KeyError`` instead of returning any state string, because
     ``_any_rebuilding`` indexes ``rebuilding_by_feed[c.feed_id]`` directly
@@ -621,58 +457,51 @@ def test_t66_weighted_states_wind_ignores_rebuilding() -> None:
     assert payload["states"]["wind"] == "normal"
 
 
-def test_t66_closed_mode_wind_kmh_all_none_note_set() -> None:
-    """In ``closed`` mode (``switching``), the wind line is all None and
-    ``notes["wind"]`` carries the progress note; the other variables are
-    unaffected.
+def test_t66_stored_switching_key_still_serves_the_weighted_line() -> None:
+    """A stored ``switching`` key no longer closes the hourly wind line: it
+    is the weighted blend (18.0 km/h at every hour, as in the T60 rewrite),
+    ``notes["wind"]`` is None, and temperature is unaffected. The live
+    weights come through the cache, which counts the call.
+
+    mutant_live_and_as_of_swapped -> at the ``calls`` assertion: correct =
+    one call more (``load_wind_serving`` with ``as_of`` None reads the live
+    weights through ``live_wind_weights``, which counts every call), mutant
+    (``load_wind_serving``'s two branches swapped, so a live request
+    computes its weights uncached) = no call counted, while the weights,
+    and so the line, stay the same.
     """
     conn = _make_db()
-    set_wind_basis_state(conn, 1, "switching")
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    hours = _hours("2026-07-20", 0, 3)
+    _seed_wind_training(conn, forecast_by_feed={feed_a: 5.0, feed_b: 6.0}, observed=4.0)
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
     _seed_hourly(
         conn,
-        feed_id=feed_id,
+        feed_id=feed_a,
         variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=hours,
         value=15.0,
     )
-    _seed_hourly(
-        conn,
-        feed_id=feed_id,
-        variable="wind",
-        issued_at="2026-07-19T20:00:00Z",
-        valid_ats=hours,
-        value=5.0,
-    )
+    set_runtime_state(conn, "wind_basis:1", "switching")
     conn.commit()
+    before = wind_blend.wind_weights_cache_stats()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
-    assert payload["blend"]["wind_kmh"] == [None, None, None]
-    assert payload["notes"]["wind"] == (
-        "Wind is being recomputed on the new basis: starting"
+    after = wind_blend.wind_weights_cache_stats()
+    assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert payload["notes"] == {"wind": None}
+    assert payload["blend"]["temp_c"] == pytest.approx([15.0] * 24)
+    assert (
+        sum(after["calls"].values())  # type: ignore[union-attr]
+        == sum(before["calls"].values()) + 1  # type: ignore[union-attr]
     )
-    assert payload["blend"]["temp_c"] == pytest.approx([15.0, 15.0, 15.0])
-
-
-# --- T67: wind_serving_mode is an allowlist ---------------------------------
-
-
-def test_t67_wind_serving_mode_allowlist() -> None:
-    """``staging`` -> legacy, ``pair_max`` -> weighted; ``switching``,
-    ``rescoring``, the empty string, and an unknown string all -> closed --
-    an allowlist of the two special states, not a denylist of them.
-
-    mutant_denylist -> at
-    ``assert wind_serving_mode("bogus-state") == "closed"``: correct =
-    ``"closed"`` (anything not explicitly ``staging``/``pair_max`` is
-    closed), mutant (a denylist mapping ``{"switching": "closed",
-    "rescoring": "closed"}`` with ``.get(state, "legacy")``) = ``"legacy"``,
-    because an unrecognized state falls through the denylist's default
-    instead of being closed.
-    """
-    assert wind_serving_mode("staging") == "legacy"
-    assert wind_serving_mode("pair_max") == "weighted"
-    for state in ("switching", "rescoring", "", "bogus-state"):
-        assert wind_serving_mode(state) == "closed"

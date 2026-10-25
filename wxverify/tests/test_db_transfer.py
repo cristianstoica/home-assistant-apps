@@ -34,6 +34,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.testclient import TestClient
 
+from tests.helpers import make_v8_wind_state
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.api.csrf import issue_csrf_pair
@@ -47,8 +48,8 @@ from wxverify.db.migrations import (
     run_migrations,
     schema_table_names,
 )
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import wind_basis_key
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1506,48 +1507,72 @@ def test_import_db_without_wind_tables_creates_them(
         direct.close()
 
 
-def test_import_pair_max_db_with_old_wind_rows_reopens_in_staging(
+_D21_KEPT_KEYS = (
+    "wind_history_auth_hold:history_all",
+    "wind_backfill_calls",
+    "verification_state:1",
+)
+_D21_DECOY_KEYS = ("wind-basis:1", "WIND_BASIS:1", "wind_basis_extra:1")
+_D21_REMOVED_KEY_KINDS = (
+    "wind_basis",
+    "wind_basis_progress_at",
+    "wind_basis_cursor",
+    "wind_basis_blocked",
+    "wind_rebuild_report",
+    "wind_rebuild_done_at",
+)
+
+
+def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T79: importing a DB whose site is stamped ``pair_max`` but still
-    carries a pre-pair-max wind row (``source_raw`` not ``'pair-max '``-
-    prefixed) must have the post-swap reopen's ``init_wind_basis`` downgrade
-    that site back to ``staging`` -- the same rule T24 pins for a direct
-    ``replace_from``, exercised here through the actual HTTP import route.
+    """D21: importing a ``user_version`` 8 DB still carrying the six
+    leftover per-site wind key kinds and ``station_wind_days.legacy_hours``
+    has the post-swap reopen's ``run_migrations`` apply the v9 step, exactly
+    as it would for any other v8 upload (plan §10.5).
     """
     conn = _init_tmp_db(tmp_path)
     _make_site(conn, "Pre Import Site")
     conn.commit()
 
-    b_path = tmp_path / "source-pair-max-old-rows.db"
+    b_path = tmp_path / "source-v8-old-wind-state.db"
     b_db = Database(str(b_path))
+    b_conn = b_db._conn  # noqa: SLF001
     try:
-        site_id = _make_site(b_db._conn, "Pair Max Old Rows Site")  # noqa: SLF001
+        make_v8_wind_state(b_conn)
+        site_id = _make_site(b_conn, "Testsite")
+        assert site_id == 1
         station_id = int(
-            b_db._conn.execute(  # noqa: SLF001
+            b_conn.execute(
                 """
                 INSERT INTO stations
                     (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'SYN-STATION-W1', 40.0, -105.0, 900.0, 1)
+                VALUES (?, 'WSTATION01', 40.0, -105.0, 900.0, 1)
                 """,
                 (site_id,),
             ).lastrowid
         )
-        # A legacy wind row: source_raw does NOT carry the pair-max prefix.
-        b_db._conn.execute(  # noqa: SLF001
-            """
-            INSERT INTO station_observations
-                (station_id, variable, valid_at, value, qc_flag, source_raw)
-            VALUES (?, 'wind', '2035-06-01T00:00:00Z', 3.0, 'ok', '10.8 km/h')
-            """,
+        b_conn.execute(
+            "INSERT INTO station_wind_days (station_id, local_date, status,"
+            " legacy_hours, updated_at) VALUES (?, '2035-06-01', 'fetched', 3,"
+            " '2035-06-01T23:00:00Z')",
             (station_id,),
         )
-        b_db._conn.execute(  # noqa: SLF001
-            "INSERT OR REPLACE INTO runtime_state (key, value) VALUES (?, 'pair_max')",
-            (wind_basis_key(site_id),),
-        )
-        b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
-        b_db._conn.commit()  # noqa: SLF001
+        for kind in _D21_REMOVED_KEY_KINDS:
+            set_runtime_state(b_conn, f"{kind}:{site_id}", "leftover")
+        for key in _D21_KEPT_KEYS:
+            set_runtime_state(b_conn, key, "keep")
+        for key in _D21_DECOY_KEYS:
+            set_runtime_state(b_conn, key, "decoy")
+        b_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        b_conn.commit()
+
+        version_row = b_conn.execute("PRAGMA user_version").fetchone()
+        assert int(version_row[0]) == 8
+        cols_before = {
+            r["name"] for r in b_conn.execute("PRAGMA table_info(station_wind_days)")
+        }
+        assert "legacy_hours" in cols_before
     finally:
         b_db.close()
     payload = b_path.read_bytes()
@@ -1561,20 +1586,42 @@ def test_import_pair_max_db_with_old_wind_rows_reopens_in_staging(
     direct = sqlite3.connect(config.db_path)
     direct.row_factory = sqlite3.Row
     try:
-        imported_site_id = int(
-            direct.execute(
-                "SELECT id FROM sites WHERE name='Pair Max Old Rows Site'"
-            ).fetchone()["id"]
-        )
-        state_row = direct.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (wind_basis_key(imported_site_id),),
+        site_row = direct.execute(
+            "SELECT id FROM sites WHERE name='Testsite'"
         ).fetchone()
-        assert state_row is not None
-        assert state_row["value"] == "staging", (
-            "a pair_max site imported with old (non-pair-max) wind rows must "
-            "reopen downgraded to staging, not stay pair_max"
+        imported_site_id = int(site_row["id"])
+        for kind in _D21_REMOVED_KEY_KINDS:
+            row = direct.execute(
+                "SELECT value FROM runtime_state WHERE key = ?",
+                (f"{kind}:{imported_site_id}",),
+            ).fetchone()
+            assert row is None, (
+                f"{kind}:{imported_site_id} must be gone after the reopen migrates"
+            )
+        for key in _D21_KEPT_KEYS[:2]:
+            row = direct.execute(
+                "SELECT value FROM runtime_state WHERE key = ?", (key,)
+            ).fetchone()
+            assert row is not None and row["value"] == "keep"
+        for key in _D21_DECOY_KEYS:
+            row = direct.execute(
+                "SELECT value FROM runtime_state WHERE key = ?", (key,)
+            ).fetchone()
+            assert row is not None and row["value"] == "decoy"
+        verification_row = direct.execute(
+            "SELECT value FROM runtime_state WHERE key = ?",
+            (f"verification_state:{imported_site_id}",),
+        ).fetchone()
+        assert verification_row is None, (
+            "_neutralize_imported_verification_chains deletes each imported"
+            " site's verification_state key before the reopen"
         )
+        live_cols = {
+            r["name"] for r in direct.execute("PRAGMA table_info(station_wind_days)")
+        }
+        assert "legacy_hours" not in live_cols
+        live_version = direct.execute("PRAGMA user_version").fetchone()
+        assert int(live_version[0]) == 9
     finally:
         direct.close()
 

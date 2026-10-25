@@ -13,9 +13,11 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 
+from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
 from wxverify.db.migrations import run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.scoring.consensus import materialize_consensus, write_station_observation
 from wxverify.verification.decision import ContinuousLead, OccurrenceLead
 from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
@@ -555,3 +557,73 @@ def alive_after_wait(
     while any(r() is not None for r in refs) and time.monotonic() < deadline:
         time.sleep(0.01)
     return [r() is not None for r in refs]
+
+
+def seed_pair_max_wind(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    valid_at: str,
+    value: float,
+) -> None:
+    """One pair-max station wind row (value in m/s) and its consensus hour."""
+    write_station_observation(
+        conn,
+        station_id=station_id,
+        variable="wind",
+        valid_at=valid_at,
+        value=value,
+        source_raw=f"pair-max {round(ms_to_kmh(value), 2)} km/h",
+    )
+    materialize_consensus(conn, site_id=site_id, variable="wind", valid_at=valid_at)
+
+
+# ---------------------------------------------------------------------------
+# v8-shape station_wind_days (old-wind-method-removal plan §10.5). Shared by
+# test_v9_old_wind_state_migration.py and test_db_transfer.py's D21: puts a
+# migrated-to-8 database back in the exact v8 shape the owner's database has,
+# with ``legacy_hours`` between ``pair_hours`` and ``attempts``.
+# ---------------------------------------------------------------------------
+
+_V8_STATION_WIND_DAYS_DDL = """
+    CREATE TABLE station_wind_days (
+        station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+        local_date TEXT NOT NULL,        -- YYYY-MM-DD in the site time zone
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN
+                ('pending','partial','fetched','unavailable','failed')),
+        record_count INTEGER NOT NULL DEFAULT 0,   -- records inside the day
+        pair_hours INTEGER NOT NULL DEFAULT 0,     -- hours with a pair
+        -- old wind rows on the day; NULL until counted
+        legacy_hours INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at TEXT,
+        -- always via core/error_sanitize.sanitized_exception
+        last_error TEXT,
+        last_ok_at TEXT,                 -- last successful persist, a 204 included
+        refetch_at TEXT,                 -- reconcile refetch due time
+        refetched INTEGER NOT NULL DEFAULT 0 CHECK (refetched IN (0, 1)),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (station_id, local_date)
+    )
+"""
+
+
+def make_v8_wind_state(conn: sqlite3.Connection) -> None:
+    """Put a migrated database back in the v8 ``station_wind_days`` shape.
+
+    Drops the table (safe: nothing references or indexes it, plan §6.9) and
+    recreates it from a frozen copy of the v8 DDL, verbatim, so
+    ``legacy_hours`` sits between ``pair_hours`` and ``attempts`` as on the
+    owner's database -- not via ``ALTER TABLE ... ADD COLUMN``, which would
+    put the column last. Asserts ``legacy_hours`` is present as an
+    anti-vacuity guard, then sets ``PRAGMA user_version = 8``.
+    """
+    conn.execute("DROP TABLE station_wind_days")
+    conn.execute(_V8_STATION_WIND_DAYS_DDL)
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(station_wind_days)")
+    }
+    assert "legacy_hours" in columns, "v8 DDL copy is missing legacy_hours"
+    conn.execute("PRAGMA user_version = 8")

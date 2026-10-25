@@ -1,20 +1,16 @@
 """Weighted wind forecast: every eligible feed, weighted by past accuracy (§11).
 
-In the ``pair_max`` state the served wind is no longer the blend-depth
-selection. Each feed's weight at a lead ``k`` is ``1 / max(MAE, FLOOR_MS)``,
-where the MAE compares the feed's forecast daily high (the latest run with at
-least ``MIN_RUN_HOURS`` hours for the target day) with the observed daily
-high (a local day with at least ``MIN_OBS_HOURS`` hours) over the last
-``TRAINING_DAYS`` complete local days. A feed needs ``MIN_TRAINING_DAYS``
-matched days to get a weight, and a cell needs ``MIN_FEEDS`` weighted feeds
-with ``MIN_RUN_HOURS`` hours to be served at all; otherwise it is shown as
-unavailable with a note, never silently narrowed.
+The served wind is not the blend-depth selection. Each feed's weight at a lead
+``k`` is ``1 / max(MAE, FLOOR_MS)``, where the MAE compares the feed's
+forecast daily high (the latest run with at least ``MIN_RUN_HOURS`` hours for
+the target day) with the observed daily high (a local day with at least
+``MIN_OBS_HOURS`` hours) over the last ``TRAINING_DAYS`` complete local days.
+A feed needs ``MIN_TRAINING_DAYS`` matched days to get a weight, and a cell
+needs ``MIN_FEEDS`` weighted feeds with ``MIN_RUN_HOURS`` hours to be served
+at all; otherwise it is shown as unavailable with a note, never silently
+narrowed.
 
-The serving mode comes from the stored wind state
-(:func:`wxverify.db.wind_basis.wind_serving_mode`): ``staging`` serves the
-legacy blend, ``pair_max`` serves the weighted one, and every other state
-serves wind closed with the rebuild's progress note. Units are m/s
-throughout, like storage; the callers convert for display.
+Units are m/s throughout, like storage; the callers convert for display.
 
 Live weights come from an in-process cache (§11.7) keyed on the process
 database, its input epoch and its external-commit count, so a cached result
@@ -38,13 +34,8 @@ from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc, ut
 from wxverify.db.connection import Database, InputCounts, current_db
 from wxverify.db.snapshot import read_only_snapshot, read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
-from wxverify.db.wind_basis import (
-    wind_basis_state,
-    wind_rebuild_progress,
-    wind_serving_mode,
-)
 from wxverify.forecast.aggregate import EXTREMA_COVERAGE_NOT_EVALUATED
-from wxverify.forecast.data import EXCLUDED_FEEDS_SQL
+from wxverify.forecast.data import EXCLUDED_FEEDS_SQL, served_feed_ids
 from wxverify.forecast.selection import CellCandidate, CellSelection
 from wxverify.verification.asof import knowable_pair_predicate
 
@@ -62,9 +53,6 @@ WIND_METHOD: Final = "inverse_mae_daily_high_v1"
 NOT_ENOUGH_FEEDS_NOTE: Final = "Not enough feeds with a wind track record yet"
 #: ``displayed.fallback_reason`` values in the forecast record (§11.5).
 FALLBACK_NOT_ENOUGH_FEEDS: Final = "not_enough_feeds"
-FALLBACK_SWITCH_IN_PROGRESS: Final = "wind_switch_in_progress"
-
-WindServingMode = Literal["legacy", "weighted", "closed"]
 
 # Target dates whose station inventory is not settled yet: an enabled
 # station's row is still to fetch, retryable, or waiting on a reconcile
@@ -119,12 +107,7 @@ class WindChoice:
 class WindServing:
     """What one request (or one record build) serves for wind."""
 
-    mode: WindServingMode
-    #: Loaded only in ``weighted`` mode.
-    weights: WindWeights | None
-    #: The progress note in ``closed`` mode; None otherwise.
-    note: str | None
-    state: str
+    weights: WindWeights
 
 
 def training_window(today: date, timezone: str) -> tuple[str, str]:
@@ -186,12 +169,16 @@ def load_wind_training(
     Only complete days train: the window ends at today's local midnight, and
     a target date with any unsettled enabled-station inventory row is left
     out of the observed side. A row whose stamp does not parse is skipped.
+    Paused feeds do not train: a feed not in :func:`served_feed_ids` is skipped.
     """
     tz = ZoneInfo(timezone)
     lo, hi = training_window(today, timezone)
     sql, params = training_pairs_query(site_id=site_id, lo=lo, hi=hi, as_of=as_of)
+    served = served_feed_ids(conn, site_id=site_id)
     latest: dict[tuple[int, int, date], tuple[datetime, float]] = {}
     for row in conn.execute(sql, params):
+        if int(row["feed_id"]) not in served:
+            continue
         try:
             issued = parse_utc(str(row["issued_at"]))
             target = parse_utc(str(row["first_valid"])).astimezone(tz).date()
@@ -362,19 +349,6 @@ def weighted_hourly(
         for hour in sorted(numerator)
         if denominator[hour] > 0
     }
-
-
-def read_wind_state(conn: sqlite3.Connection, site_id: int) -> str:
-    """The stored wind state, read once at each end of the serving double read.
-
-    Both reads go through this one function so the check has a single seam.
-    """
-    return wind_basis_state(conn, site_id)
-
-
-def closed_wind_note(conn: sqlite3.Connection, site_id: int) -> str:
-    """The progress note shown while wind is served closed."""
-    return wind_rebuild_progress(conn, site_id).closed_note
 
 
 # --- Weights cache (§11.7) ---------------------------------------------------
@@ -706,31 +680,17 @@ def load_wind_serving(
     today: date,
     as_of: str | None,
 ) -> WindServing:
-    """Read the state once and what its mode needs: weights or the note.
-
-    The state is read on every call and never cached. Live weights
-    (``as_of is None``) come through the cache (``live_wind_weights``); a
-    record build's (``as_of`` given) are computed uncached.
+    """The wind weights: live ones through the cache, a record build's
+    (``as_of`` given) computed uncached.
     """
-    state = read_wind_state(conn, site_id)
-    mode = wind_serving_mode(state)
-    if mode == "weighted":
-        if as_of is None:
-            weights = live_wind_weights(
-                conn, site_id=site_id, timezone=timezone, today=today
-            )
-        else:
-            weights = compute_wind_weights(
-                load_wind_training(
-                    conn, site_id=site_id, timezone=timezone, today=today, as_of=as_of
-                )
-            )
-        return WindServing(mode=mode, weights=weights, note=None, state=state)
-    if mode == "closed":
-        return WindServing(
-            mode=mode,
-            weights=None,
-            note=closed_wind_note(conn, site_id),
-            state=state,
+    if as_of is None:
+        weights = live_wind_weights(
+            conn, site_id=site_id, timezone=timezone, today=today
         )
-    return WindServing(mode=mode, weights=None, note=None, state=state)
+    else:
+        weights = compute_wind_weights(
+            load_wind_training(
+                conn, site_id=site_id, timezone=timezone, today=today, as_of=as_of
+            )
+        )
+    return WindServing(weights=weights)

@@ -73,7 +73,6 @@ from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_id,
 )
-from wxverify.db.wind_basis import wind_basis_state
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting
@@ -224,7 +223,7 @@ def _config_snapshot(
         "min_n": get_number_setting(conn, "min_n", 30, minimum=0),
         "window_days": get_number_setting(conn, "rolling_window_days", 30, minimum=1),
         "tz_generation_id": tz_generation_id,
-        "wind_basis": wind_basis_state(conn, site_id),
+        "wind_basis": "pair_max",
         "roster": [
             {
                 "feed_id": f.feed_id,

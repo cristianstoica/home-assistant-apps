@@ -120,7 +120,10 @@ def test_live_path_sql_never_carries_knowability_or_availability_clause() -> Non
             min_n=1,
         )
         samples = load_future_samples(
-            conn, site_id=site_id, since_valid_at=isoformat_utc(now)
+            conn,
+            site_id=site_id,
+            since_valid_at=isoformat_utc(now),
+            served_only=True,
         )
         forecast_ranking(
             conn, site_id=site_id, variable="temperature", day_ahead=1, window="30d"
