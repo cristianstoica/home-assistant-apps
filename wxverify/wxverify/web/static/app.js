@@ -754,6 +754,98 @@
     });
   });
 
+  // Feed subscription toggles: progress text while a change applies, the
+  // fragment guard, and the outcome when no fragment came back. Each Sites
+  // page toggle carries data-sub-toggle (data-feed-toggle is the chart
+  // checkbox above) and an hx-disabled-elt naming every button in its own
+  // section, so htmx locks that section while the request is in flight. A
+  // success swaps in a fresh section whose status line the server wrote; only
+  // the paths that leave the old section in place write the line here.
+  var SUB_BUSY = "Applying the change. This can take several minutes; the buttons stay locked until it finishes.";
+  var SUB_UNKNOWN = "No answer yet. The change may still be applying. Wait a few minutes, then reload the page to see the current state before clicking again.";
+  var SUB_SESSION = "Session expired or request blocked — reload the page to continue";
+
+  function subSection(elt) {
+    return elt.closest("section[id^='feed-toggles-']");
+  }
+
+  function subLine(section, text) {
+    var line = section && section.querySelector("[data-sub-status]");
+    if (line) {
+      line.textContent = text;
+    }
+  }
+
+  document.body.addEventListener("htmx:beforeRequest", function (event) {
+    var elt = event.detail.elt;
+    if (!elt || !elt.matches("[data-sub-toggle]")) {
+      return;
+    }
+    var section = subSection(elt);
+    if (section) {
+      section.setAttribute("aria-busy", "true");
+    }
+    subLine(section, SUB_BUSY);
+  });
+
+  document.body.addEventListener("htmx:beforeSwap", function (event) {
+    // beforeSwap fires on the swap target (the section), not on the button,
+    // so the toggle is identified by the element that sent the request.
+    var req = event.detail.requestConfig && event.detail.requestConfig.elt;
+    if (!req || !req.matches("[data-sub-toggle]")) {
+      return;
+    }
+    // A 2xx body that is not the section (a login page, say) must not land
+    // in the card; afterRequest then reports it as no answer.
+    var body = String(event.detail.serverResponse || "");
+    if (event.detail.shouldSwap && body.indexOf('id="feed-toggles-') === -1) {
+      event.detail.shouldSwap = false;
+    }
+  });
+
+  document.body.addEventListener("htmx:afterRequest", function (event) {
+    // After a swap htmx fires this on the detached old button, then on the
+    // nearest ancestor still in the page; both are ignored, so a toggle
+    // still connected here means its section was not replaced. htmx has
+    // already re-enabled the section's buttons by now, so disabling them
+    // again below sticks.
+    var elt = event.detail.elt;
+    if (!elt || !elt.matches("[data-sub-toggle]") || !elt.isConnected) {
+      return;
+    }
+    var section = subSection(elt);
+    if (section) {
+      section.removeAttribute("aria-busy");
+    }
+    var xhr = event.detail.xhr;
+    var status = xhr ? xhr.status : 0;
+    if (status === 403) {
+      subLine(section, SUB_SESSION);
+      return;
+    }
+    // Only the add-on's own rejections, raised before anything is written,
+    // count as "not changed". Every other outcome (0, 5xx, any other 4xx, a
+    // 2xx that was not swapped) may still be applying.
+    var message = "";
+    if (status === 400 || status === 404 || status === 422) {
+      try {
+        message = JSON.parse(xhr.responseText).error;
+      } catch (e) {
+        message = "";
+      }
+    }
+    if (typeof message === "string" && message) {
+      subLine(section, "Not changed: " + message + ".");
+      return;
+    }
+    subLine(section, SUB_UNKNOWN);
+    if (section) {
+      section.querySelectorAll("button").forEach(function (button) {
+        button.disabled = true;
+      });
+    }
+  });
+
   // "Last fetched X ago" stays honest between polls: the tiles fragment
   // answers 204 (no swap) while data is unchanged, so the text is re-derived
   // client-side from the data-updated-at timestamp once a minute.

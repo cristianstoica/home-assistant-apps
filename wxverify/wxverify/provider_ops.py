@@ -87,6 +87,7 @@ class SubscriptionResult:
     site_id: int
     feed_id: int
     enabled: bool
+    changed: bool
     fetch: FetchQueueResult | None = None
 
 
@@ -204,6 +205,15 @@ def set_site_subscription(
     enabled: bool,
     enqueue_on_enable: bool = False,
 ) -> SubscriptionResult:
+    """Set one site's subscription to one feed, rebuilding its mean on a change.
+
+    Must be called inside the caller's write transaction, so the stored value
+    read here cannot move before the upsert, and a failed rebuild rolls the
+    upsert back with it. Only an explicit stored value equal to ``enabled``
+    counts as unchanged: a missing row or a NULL ``enabled`` (inherit) is
+    written and rebuilt as a change. An unchanged value writes nothing and
+    skips the rebuild; the fetch rule on enable runs either way.
+    """
     if conn.execute("SELECT 1 FROM sites WHERE id=?", (site_id,)).fetchone() is None:
         raise ProviderOpsError(404, "site not found")
     feed = conn.execute("SELECT * FROM feeds WHERE id=?", (feed_id,)).fetchone()
@@ -215,22 +225,36 @@ def set_site_subscription(
         raise ProviderOpsError(
             400, "meteoblue members resolve through the package feed"
         )
-    conn.execute(
-        """
-        INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)
-        VALUES (?, ?, ?, 0)
-        ON CONFLICT(site_id, feed_id) DO UPDATE SET enabled=excluded.enabled
-        """,
-        (site_id, feed_id, 1 if enabled else 0),
+    stored = conn.execute(
+        "SELECT enabled FROM site_feed_state WHERE site_id=? AND feed_id=?",
+        (site_id, feed_id),
+    ).fetchone()
+    changed = (
+        stored is None
+        or stored["enabled"] is None
+        or bool(stored["enabled"]) != enabled
     )
-    rebuild_mean_for_site(conn, site_id)
+    if changed:
+        conn.execute(
+            """
+            INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(site_id, feed_id) DO UPDATE SET enabled=excluded.enabled
+            """,
+            (site_id, feed_id, 1 if enabled else 0),
+        )
+        rebuild_mean_for_site(conn, site_id)
     fetch_result = (
         enqueue_fetch_for_feed(conn, site_id, feed_id)
         if enabled and enqueue_on_enable
         else None
     )
     return SubscriptionResult(
-        site_id=site_id, feed_id=feed_id, enabled=enabled, fetch=fetch_result
+        site_id=site_id,
+        feed_id=feed_id,
+        enabled=enabled,
+        changed=changed,
+        fetch=fetch_result,
     )
 
 

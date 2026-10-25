@@ -45,6 +45,7 @@
         }
       });
       document.body.addEventListener("htmx:responseError", function (event) {
+        if (event.detail.elt && event.detail.elt.matches("[data-sub-toggle]")) { return; }
         var notice = document.getElementById("mutation-notice");
         var text = document.getElementById("mutation-notice-text");
         var status = event.detail.xhr.status;

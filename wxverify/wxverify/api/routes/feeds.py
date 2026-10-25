@@ -13,6 +13,7 @@ from wxverify.db.connection import get_db
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.provider_ops import (
     ProviderOpsError,
+    SubscriptionResult,
     set_site_subscription,
 )
 from wxverify.provider_ops import (
@@ -100,20 +101,14 @@ async def update_feed(feed_id: int, body: FeedUpdate) -> FeedOut:
 async def update_subscription(
     request: Request, site_id: int, feed_id: int, body: SubscriptionUpdate
 ) -> dict[str, object] | HTMLResponse:
-    def _write(conn: sqlite3.Connection) -> dict[str, object]:
-        result = set_site_subscription(
+    def _write(conn: sqlite3.Connection) -> SubscriptionResult:
+        return set_site_subscription(
             conn,
             site_id,
             feed_id,
             enabled=body.enabled,
             enqueue_on_enable=True,
         )
-        return {
-            "site_id": result.site_id,
-            "feed_id": result.feed_id,
-            "enabled": result.enabled,
-            "fetch_enqueued": None if result.fetch is None else result.fetch.enqueued,
-        }
 
     try:
         result = await get_db().write(_write)
@@ -122,8 +117,20 @@ async def update_subscription(
     if _wants_html(request):
         from wxverify.web.routes import render_feed_toggles
 
-        return await render_feed_toggles(request, site_id)
-    return result
+        return await render_feed_toggles(
+            request,
+            site_id,
+            feed_id=feed_id,
+            enabled=result.enabled,
+            changed=result.changed,
+        )
+    return {
+        "site_id": result.site_id,
+        "feed_id": result.feed_id,
+        "enabled": result.enabled,
+        "changed": result.changed,
+        "fetch_enqueued": None if result.fetch is None else result.fetch.enqueued,
+    }
 
 
 def _affected_sites_for_feed_change(
