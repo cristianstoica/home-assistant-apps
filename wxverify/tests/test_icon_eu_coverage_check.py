@@ -504,6 +504,71 @@ def test_previous_runs_too_few_values_when_a_required_day_is_missing() -> None:
     )
 
 
+def _hand_built_previous_run_samples(
+    day: date, *, precip_lead_offset: int
+) -> list[NormalizedSample]:
+    """One sample per (variable, required previous day, hour-of-day), built
+    directly rather than through the adapter -- a pure test of the matching
+    rule in ``previous_runs_verdict`` itself. The adapter path
+    (``_historical_samples_via_adapter``) applies the new precip lead itself,
+    so it could never produce a sample at the OLD, pre-rework lead -- only a
+    hand-built sample can show that case. Every variable's ``valid_at``
+    covers the day's 24 hourly labels; ``lead_hours`` is ``24 * previous_day``
+    for temperature/wind, and ``24 * previous_day - precip_lead_offset`` for
+    precip, so the offset alone selects which rule the fixture pins.
+    """
+    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
+    samples: list[NormalizedSample] = []
+    for variable in VARIABLES:
+        for previous_day in (1, 2, 3):
+            offset = precip_lead_offset if variable == "precip" else 0
+            lead = 24 * previous_day - offset
+            for hour in range(24):
+                valid_at = day_start + hour * timedelta(hours=1)
+                issued_at = valid_at - timedelta(hours=lead)
+                samples.append(
+                    NormalizedSample(
+                        model=MODEL,
+                        variable=variable,
+                        issued_at=issued_at.isoformat(),
+                        valid_at=valid_at.isoformat(),
+                        lead_hours=lead,
+                        value=1.0,
+                        source_raw="1.0",
+                        model_run_id=f"{MODEL}:{issued_at.isoformat()}",
+                    )
+                )
+    return samples
+
+
+def test_previous_runs_too_few_values_when_precip_still_lands_on_the_raw_lead() -> (
+    None
+):
+    # Every variable's sample sits at lead 24*N (precip_lead_offset=0), the
+    # rule used before the rain-label-start rework. Precip is now expected
+    # one hour earlier (lead 24*N - 1), so these precip samples no longer
+    # match and the day is reported as missing precip coverage.
+    day = date(2026, 6, 1)
+    payload = _pr_payload(day)
+    samples = _hand_built_previous_run_samples(day, precip_lead_offset=0)
+    assert previous_runs_verdict(payload, samples, day) == (
+        Verdict.FAIL,
+        "too few values",
+    )
+
+
+def test_previous_runs_pass_with_precip_one_hour_earlier_than_temperature_and_wind() -> (
+    None
+):
+    # Paired positive: precip's sample sits at lead 24*N - 1, one hour
+    # earlier than temperature/wind's 24*N, matching the rain-label-start
+    # rule -- every variable is now found and the day passes.
+    day = date(2026, 6, 1)
+    payload = _pr_payload(day)
+    samples = _hand_built_previous_run_samples(day, precip_lead_offset=1)
+    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
+
+
 def test_previous_runs_pass_with_every_required_sample_present() -> None:
     day = date(2026, 6, 1)
     samples = _historical_samples_via_adapter(day)

@@ -948,7 +948,7 @@ def test_scored_temperature_entity_is_the_pre_f_clearing_subset_value() -> None:
     # NOT extrema-eligible via covers_local_day, which needs all 24).
     from wxverify.verification.methodology import METHODOLOGY_VERSION
 
-    assert METHODOLOGY_VERSION == 3
+    assert METHODOLOGY_VERSION == 4
 
     conn = _record_conn()
     site_id = _record_site(conn, "site-a")

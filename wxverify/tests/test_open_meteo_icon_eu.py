@@ -443,8 +443,13 @@ def test_d1_t9b_adapter_normalization_keeps_every_lead_up_to_120(
     }
     for sample in result.samples:
         leads_by_variable[sample.variable].append(sample.lead_hours)
+    # Precip is labelled by the start of its hour, one hour
+    # earlier than temperature/wind: its top raw hour (120) now labels lead
+    # 119, and its lead-0 drop lands on raw hour 1 instead of raw hour 0, so
+    # its normalized range is 1..119 while temperature and wind stay 1..120.
     for variable, leads in leads_by_variable.items():
-        assert sorted(leads) == list(range(1, 121)), variable
+        expected = range(1, 119 + 1) if variable == "precip" else range(1, 121)
+        assert sorted(leads) == list(expected), variable
 
 
 def test_d1_t9c_multimodel_mean_main_and_side_class() -> None:

@@ -1258,7 +1258,7 @@ def test_persisted_row_suppressed_day() -> None:
 
 
 def test_scored_precip_entities_are_the_pre_g_clearing_subset_values() -> None:
-    assert METHODOLOGY_VERSION == 3
+    assert METHODOLOGY_VERSION == 4
 
     conn = _record_conn()
     generation_id = ensure_published_generation(conn, 1)

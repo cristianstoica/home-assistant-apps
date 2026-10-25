@@ -743,7 +743,7 @@ def test_api_methodology_matches_the_build_version_it_was_scored_under(
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
-    run_id = _seed_published_run(conn, site_id, methodology_version=3)
+    run_id = _seed_published_run(conn, site_id, methodology_version=4)
     conn.commit()
 
     app = _make_app(monkeypatch)
@@ -752,7 +752,7 @@ def test_api_methodology_matches_the_build_version_it_was_scored_under(
         assert meth["contract_unavailable_reason"] is None
         assert meth["contract"] is not None
         assert meth["constants"] is not None
-        assert meth["constants"]["methodology_version"] == 3
+        assert meth["constants"]["methodology_version"] == 4
         assert meth["constants"]["bootstrap_resamples"] == 10_000
         assert meth["constants"]["simulated_depths"] == [1, 2, 3, 4]
         assert meth["contract"]["units"]["wind_max"] == "m/s"

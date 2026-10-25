@@ -1490,7 +1490,12 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
     including the ``CORRELATED SCALAR SUBQUERY`` headers, in the order the
     planner prints them. Taken from CI's shipping-SQLite job (SQLite 3.53.4)
-    on 0.16.11. The pin is fresh-schema only: after
+    on 0.16.11; 0.16.12's rain-label-boundary clause (§11.3) adds a
+    ``SCALAR SUBQUERY`` and a ``runtime_state`` ``SEARCH`` line to this plan,
+    so this literal is STALE pending CI's new output and py-architect's
+    sign-off on it (plan §13.3: "never pasted from CI's output into the
+    test") -- it is deliberately left unchanged here, not updated to a
+    guessed value. The pin is fresh-schema only: after
     ``ANALYZE`` the ``s``/``f``/``obs`` join order moves, and the relational
     pins above cover that case."""
     conn = _fresh_conn()

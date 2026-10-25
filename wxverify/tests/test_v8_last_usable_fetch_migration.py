@@ -413,9 +413,9 @@ def test_run_migrations_lands_on_target_user_version_from_a_v7_db() -> None:
 
     run_migrations(conn)
 
-    assert TARGET_USER_VERSION == 9
+    assert TARGET_USER_VERSION == 10
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 9
+    assert version == 10
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +520,6 @@ def test_populated_v6_db_upgrade_seeds_per_row_by_the_logical_rule() -> None:
     run_migrations(conn)
 
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == 9
+    assert version == 10
     assert _stamp(conn, 101) == "2026-07-20T12:00:00Z"
     assert _stamp(conn, 102) is None
