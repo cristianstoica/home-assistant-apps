@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.12
+
+Open-Meteo and meteoblue give each hour's rain at the end of that
+hour. Their rain is now stored at the start of the hour it fell in,
+for forecasts fetched after the update; their temperature and wind
+are unchanged. Their rain stored before the update is kept, but it is
+no longer scored or served, so the rain ranks of the Open-Meteo and
+meteoblue models start again from the first forecasts fetched after
+the update. At the first start of this version the stored rain scores
+are cleared, and the first scoring pass rebuilds them, including the
+multi-model mean's rain. A database upgraded by this version cannot be
+opened by 0.16.11.
+
 ## 0.16.11
 
 The old wind method and its switch are removed: wind is always served
