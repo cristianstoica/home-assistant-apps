@@ -1489,8 +1489,8 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     """T-EQP-exact: the whole plan of ``REAL_MODEL_PAIR_PROBE_SQL`` on a
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
     including the ``CORRELATED SCALAR SUBQUERY`` headers, in the order the
-    planner prints them. Confirmed on the 0.16.11 base by CI's shipping-SQLite
-    job. The pin is fresh-schema only: after
+    planner prints them. Taken from CI's shipping-SQLite job (SQLite 3.53.4)
+    on 0.16.11. The pin is fresh-schema only: after
     ``ANALYZE`` the ``s``/``f``/``obs`` join order moves, and the relational
     pins above cover that case."""
     conn = _fresh_conn()
@@ -1503,9 +1503,9 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
         "CORRELATED SCALAR SUBQUERY 1",
         "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
-        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
         " (site_id=? AND variable=? AND valid_at=?)",
+        "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
     ]
 
