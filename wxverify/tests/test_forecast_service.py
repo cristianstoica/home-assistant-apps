@@ -26,9 +26,10 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from wxverify.collection.forecast_fetcher import register_feed_if_needed
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.migrations import run_migrations
+from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migrations
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import (
@@ -1495,6 +1496,82 @@ def test_paused_feed_does_not_narrow_the_pool(pause_kind: str) -> None:
         assert payload["hours"] == _hours("2026-07-20", 4, 4)
         assert payload["states"]["temperature"] == "normal"
         assert tile.temp.meta.contributor_ids == (feed_a,)
+
+
+def test_drop_takes_a_member_off_the_served_wind() -> None:
+    """The dropped-member pause (plan Step 6) reaches the served wind blend,
+    its weights, its per-feed listing and its training set -- not just the
+    feed's own row.
+
+    A real meteoblue member registers through the fetcher's own
+    registration path, trains alongside two open-meteo feeds, and is
+    confirmed served, weighted and trained BEFORE the pause (so the pass
+    below is not vacuous); the pause then removes it from all four.
+
+    Catches: a pause that misses the member row the fetcher creates (wrong
+    ``source`` or case -- the member would keep its control-era payload
+    weight); Step 3 missing (the member would stay in the training ids;
+    the payload alone cannot show this, because Step 2 already drops the
+    member's samples from ``build_hourly``'s candidates).
+    """
+    conn = _make_db()
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    feed_b = _feed_id(conn, "open-meteo", "gfs_global")
+    feed_m = register_feed_if_needed(
+        conn, "meteoblue", "NEMS4", fetch_interval_minutes=60
+    )
+    package_id = _feed_id(conn, "meteoblue", "multimodel")
+    conn.execute(
+        "INSERT INTO site_feed_state (site_id, feed_id, enabled) VALUES (1, ?, 1)",
+        (package_id,),
+    )
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    _seed_wind_training(
+        conn,
+        forecast_by_feed={feed_a: 5.0, feed_b: 6.0, feed_m: 4.5},
+        observed=4.0,
+    )
+    hours = _hours("2026-07-20", 0, 24)
+    for feed_id, value in ((feed_a, 4.0), (feed_b, 7.0), (feed_m, 9.0)):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T20:00:00Z",
+            valid_ats=hours,
+            value=value,
+        )
+    conn.commit()
+
+    def _training_ids() -> set[int]:
+        training = wind_blend.load_wind_training(
+            conn, site_id=1, timezone="UTC", today=date(2026, 7, 20), as_of=None
+        )
+        return {feed_id for feed_id, _ in training.feed_highs}
+
+    before = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert before["weights"] == {
+        "wind": {
+            str(feed_a): pytest.approx(2 / 7),
+            str(feed_b): pytest.approx(1 / 7),
+            str(feed_m): pytest.approx(4 / 7),
+        }
+    }
+    assert before["blend"]["wind_kmh"] == pytest.approx([25.5 / 3.5 * 3.6] * 24)
+    assert feed_m in {feed["feed_id"] for feed in before["feeds"]}
+    assert _training_ids() == {feed_a, feed_b, feed_m}
+
+    pause_dropped_meteoblue_members(conn)
+    conn.commit()
+
+    after = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
+    assert after["weights"] == {
+        "wind": {str(feed_a): pytest.approx(2 / 3), str(feed_b): pytest.approx(1 / 3)}
+    }
+    assert after["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
+    assert after["notes"] == {"wind": None}
+    assert feed_m not in {feed["feed_id"] for feed in after["feeds"]}
+    assert _training_ids() == {feed_a, feed_b}
 
 
 # ---------------------------------------------------------------------------

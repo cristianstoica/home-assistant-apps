@@ -1044,6 +1044,69 @@ def correct_open_meteo_fetch_intervals(conn: sqlite3.Connection) -> None:
     set_runtime_state(conn, OPEN_METEO_INTERVAL_CORRECTION_KEY, "applied")
 
 
+#: One-shot marker for the meteoblue member drop. Presence -- not value -- is
+#: the gate, matching GOOGLE_HORIZON_CORRECTION_KEY. The key holds no colon, so
+#: the v9 step's first-segment key match can never delete it.
+METEOBLUE_MEMBER_DROP_KEY = "meteoblue_member_drop_applied"
+
+
+def pause_dropped_meteoblue_members(conn: sqlite3.Connection) -> None:
+    """Switch off the dropped meteoblue package members, once.
+
+    Each member named in `config.DROPPED_METEOBLUE_MEMBERS` gets
+    `enabled = 0` and `config.DROPPED_METEOBLUE_REASON` as its
+    `disabled_reason`. The match needs `source = 'meteoblue'` as well as
+    the model name, so a feed of another source with the same model name
+    and the package row itself keep their state.
+
+    Not a `user_version` migration: no schema shape changes, and older
+    code reads a paused row correctly, so bumping the version would
+    assert an incompatibility that does not exist.
+
+    The `runtime_state` marker -- not the `enabled = 1` predicate -- is
+    what makes this one-shot: once it is written, a member the operator
+    switches back on stays on.
+
+    The marker is written when at least one member row exists, not when
+    the `UPDATE` changed a row. Members are not seeded: they appear at
+    the first package fetch, through `register_feed_if_needed` at
+    `enabled = 1`. So on a database that holds none of them yet no
+    marker is written and the next boot still pauses them; on one where
+    every member is already off the marker is still written, so a later
+    switch back on stays.
+
+    Statement order is the crash guard, so no SAVEPOINT is needed:
+    `UPDATE` first, marker last. The `UPDATE` is one statement, so it
+    lands for every matching row or for none. A crash between them
+    leaves the members off with no marker, and the next boot re-runs an
+    `UPDATE` that matches nothing and writes the marker. Marker first
+    would be the bug: a crash after it would leave the members on for
+    good.
+    """
+    if get_runtime_state(conn, METEOBLUE_MEMBER_DROP_KEY) is not None:
+        return
+    members = config.DROPPED_METEOBLUE_MEMBERS
+    placeholders = ", ".join("?" for _ in members)
+    changed = conn.execute(
+        f"""
+        UPDATE feeds SET enabled = 0, disabled_reason = ?
+        WHERE source = 'meteoblue' AND model IN ({placeholders}) AND enabled = 1
+        """,
+        (config.DROPPED_METEOBLUE_REASON, *members),
+    ).rowcount
+    logger.info("meteoblue member drop: %d feed(s) paused", changed)
+    present = conn.execute(
+        f"""
+        SELECT 1 FROM feeds
+        WHERE source = 'meteoblue' AND model IN ({placeholders})
+        LIMIT 1
+        """,
+        members,
+    ).fetchone()
+    if present is not None:
+        set_runtime_state(conn, METEOBLUE_MEMBER_DROP_KEY, "applied")
+
+
 def run_migrations(conn: sqlite3.Connection) -> None:
     row = conn.execute("PRAGMA user_version").fetchone()
     current = int(row[0]) if row is not None else 0
@@ -1087,6 +1150,7 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     correct_google_horizon(conn)
     correct_open_meteo_horizons(conn)
     correct_open_meteo_fetch_intervals(conn)
+    pause_dropped_meteoblue_members(conn)
     seed_default_sources(conn)
     seed_default_feeds(conn)
     seed_default_settings(conn)
