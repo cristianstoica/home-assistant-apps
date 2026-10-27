@@ -121,10 +121,11 @@ _ELIGIBLE_OBS_WHERE = """
 # of work and a later GENUINE success in the scope is a real recovery. A
 # genuine success is a completed row carrying result='ok', which only
 # _complete_and_continue writes, on a normal dispatch return; the worker's
-# JobCancelled branch (target deleted or disabled, or a feed adapter that
-# cannot be built) completes with result NULL, as did every completion
-# before the marker existed, and none of those rows resolves anything. The
-# chain types (verification_run, backfill_site, timezone_correction,
+# JobCancelled branch (target deleted or disabled, a feed adapter that cannot
+# be built, or an hourly cycle stopped by a refused-access hold) completes
+# with result NULL, as did every completion before the marker existed, and
+# none of those rows resolves anything.
+# The chain types (verification_run, backfill_site, timezone_correction,
 # record_gap_scan, catchup) are deliberately absent: _complete_and_continue
 # completes every finished chunk under the chain's own key, so a later
 # completed row there is a chunk, not a resolution, and those scopes count by
