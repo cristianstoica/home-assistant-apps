@@ -1,6 +1,6 @@
 """Contract tests: GET /api/observations/current.
 
-Eight oracles:
+Nine oracles:
 
 1. Cold station (sps.health_state='cold', no station_current_obs row)
    → all obs fields null; health_state == "cold".
@@ -31,6 +31,12 @@ Eight oracles:
    at all (precedent: test_error_count_null_when_poll_state_absent): False,
    not None.
 
+9. A weather.com refused-access hold (401/403, plan 2026-10-27
+   refused-access-hold §13.9 API1) does not change this route's reply: the
+   hold lives in runtime_state, a table this route never reads/joins, so a
+   held current_obs kind must leave every value and the whole key set
+   byte-identical to the pre-hold baseline.
+
 Cold (1) and Offline-with-last-good (2) form the required paired positive/negative:
 cold-null is meaningful only because the offline-non-null case can go red — the
 pair ensures neither assertion is vacuous. Likewise, oracle 7's offline case
@@ -44,15 +50,20 @@ the background task from interfering with the DB state.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, get_db
+from wxverify.db.queue import claim_next_current_obs_job, enqueue_if_absent
+from wxverify.worker.access_hold import read_access_record
+from wxverify.worker.processor import run_claimed_job
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -79,6 +90,42 @@ _PRECIP_TOTAL_MM = 2.1
 
 # Synthetic neighborhood (opsec: public repo)
 _NEIGHBORHOOD = "Synthetic Test Valley"
+
+# Synthetic station id, distinct from the other oracles' constants (plan
+# §13.9 API1).
+_PWS_REFUSED = "ISTATION06"
+
+# Due before any "now" the route itself reads (the route never consults
+# next_poll_at; this is only so the job-claim query treats the job as due).
+_PAST_ISO = "2026-07-10T11:59:00Z"
+
+_WEATHER_COM_URL = httpx.URL("https://api.weather.com/v2/pws/observations/current")
+
+# The route's full key set today (api/routes/health.py observations_current).
+# Pinned here so oracle 9 can assert the hold changed neither a value nor the
+# shape.
+_OBSERVATIONS_CURRENT_KEYS = {
+    "station_id",
+    "pws_station_id",
+    "health_state",
+    "provider_reported_offline",
+    "obs_time_utc",
+    "temp",
+    "humidity",
+    "dewpt",
+    "wind_speed",
+    "wind_gust",
+    "wind_dir",
+    "pressure",
+    "precip_rate",
+    "precip_total",
+    "uv",
+    "neighborhood",
+    "next_poll_at",
+    "last_error",
+    "error_count",
+    "last_poll_at",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -744,4 +791,138 @@ def test_provider_reported_offline_false_when_poll_state_absent(
         assert value is False, (
             "provider_reported_offline must be False (not null) when "
             f"station_poll_state row is absent, got {value!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Oracle 9 (plan §13.9, API1) — a refused-access hold does not change this
+#            route's reply
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("refusal_status", [401, 403])
+def test_refused_access_hold_does_not_change_observations_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal_status: int
+) -> None:
+    """A weather.com refused-access hold, written by the REAL poll path (a
+    claimed ``fetch_current_obs`` job answered 401/403), leaves this
+    route's reply byte-identical.
+
+    The hold lives in ``runtime_state``, a table this route never reads or
+    joins, so a real refusal must change neither a value nor the key set.
+    Paired positive: the baseline response is captured and compared, not
+    assumed — if a future change made this route read the hold and null
+    out or flag held stations, the after-the-hold response would diverge
+    from the captured baseline and this test would catch it. Precedent:
+    test_wind_pressure_precip_returned_in_native_units (oracle 5) pins the
+    same route's value-passthrough the same way.
+
+    Driving the refusal through ``run_claimed_job`` (rather than a direct
+    ``record_access_refused`` call) is the point: it is what distinguishes
+    this test from one that would also pass if ``_fetch_current_obs``'s
+    401/403 branch were removed and the refusal fell through to the
+    ordinary TERMINAL persist path instead (a 24h ``next_poll_at``, no
+    ``runtime_state`` row) — that regression writes to
+    ``station_poll_state``, not ``runtime_state``, so this route (which
+    joins ``station_poll_state``) would then see a changed ``health_state``
+    and this test would go red for the right reason.
+
+    Arrange: one enabled station with a full station_poll_state (online) +
+             station_current_obs row, and a due ``fetch_current_obs`` job.
+    Act: GET (baseline); claim and run the job with
+         ``fetch_current_observation`` patched to answer ``refusal_status``;
+         GET again.
+    Assert: the hold row now exists (positive — the refusal really landed);
+            both responses have the pinned key set, and the held response
+            equals the baseline response exactly.
+    """
+    close_db()
+    config.db_path = str(tmp_path / f"refused-{refusal_status}.db")
+    config.options_path = str(tmp_path / "options.json")
+    Path(config.options_path).write_text(
+        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
+    )
+    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
+    app = create_app(root_path="")
+    with TestClient(app) as client:
+        db = get_db()
+
+        def _seed(conn: sqlite3.Connection) -> tuple[int, int]:
+            site_id = _seed_site(conn)
+            station_id = _seed_station(conn, site_id, pws_id=_PWS_REFUSED)
+            _seed_poll_state(
+                conn,
+                station_id,
+                health_state="online",
+                next_poll_at=_PAST_ISO,
+                last_poll_at=_OBS_TIME,
+                error_count=0,
+            )
+            _seed_current_obs(conn, station_id)
+            enqueue_if_absent(
+                conn,
+                "fetch_current_obs",
+                site_id,
+                f"curobs:{station_id}",
+                {"station_id": station_id},
+            )
+            return station_id, site_id
+
+        station_id, _site_id = db.write_sync(_seed)
+
+        baseline_resp = client.get("/api/observations/current")
+        assert baseline_resp.status_code == 200
+        baseline_rows = baseline_resp.json()
+        assert len(baseline_rows) == 1
+        baseline_row = baseline_rows[0]
+        assert baseline_row["station_id"] == station_id
+        assert set(baseline_row) == _OBSERVATIONS_CURRENT_KEYS, (
+            f"observations/current key set changed: {set(baseline_row)}"
+        )
+
+        async def _fake_fetch(
+            pws_station_id: str,
+            api_key: str,
+            *,
+            client: httpx.AsyncClient | None = None,
+            timeout_seconds: float = 10.0,
+        ) -> httpx.Response:
+            return httpx.Response(
+                refusal_status,
+                content=b"",
+                headers={},
+                request=httpx.Request("GET", str(_WEATHER_COM_URL)),
+            )
+
+        monkeypatch.setattr(
+            "wxverify.worker.processor.fetch_current_observation", _fake_fetch
+        )
+
+        async def _run_the_refused_job() -> None:
+            job = await db.write(claim_next_current_obs_job)
+            assert job is not None
+            await run_claimed_job(db, job, lane="current_obs")
+
+        asyncio.run(_run_the_refused_job())
+
+        held_record = db.read_sync(lambda conn: read_access_record(conn, "current_obs"))
+        assert held_record is not None, (
+            "the real poll path must have written the current_obs hold row"
+        )
+        assert held_record.status == refusal_status
+
+        held_resp = client.get("/api/observations/current")
+        assert held_resp.status_code == 200
+        held_rows = held_resp.json()
+        assert len(held_rows) == 1
+        held_row = held_rows[0]
+
+        assert set(held_row) == _OBSERVATIONS_CURRENT_KEYS, (
+            "observations/current key set changed while a current_obs"
+            f" access hold was in force: {set(held_row)}"
+        )
+        assert held_row == baseline_row, (
+            "a weather.com refused-access hold (status="
+            f"{refusal_status}) must not change observations/current's"
+            f" reply; baseline={baseline_row!r} held={held_row!r}"
         )

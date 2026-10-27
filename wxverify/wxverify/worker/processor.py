@@ -57,6 +57,12 @@ from wxverify.verification.record import (
     persist_forecast_record,
     run_record_gap_scan,
 )
+from wxverify.worker.access_hold import (
+    AccessHeld,
+    check_access_hold,
+    clear_access_refused,
+    record_access_refused,
+)
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -932,7 +938,10 @@ async def _fetch_current_obs(
     (last-good snapshot), never ``stations``. One station per job, one
     provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
     recorded and the job is deferred; on transport failure the poll is marked
-    transient and deferred to the floor.
+    transient and deferred to the floor. On 401/403 the ``current_obs``
+    refused-access hold (``worker.access_hold``) is recorded in place of any
+    poll state and the job is deferred to the hold's end, as is a try that
+    meets the hold; a 2xx reply clears it.
     """
     api_key = resolve_secret("weathercom")
     if not api_key:
@@ -954,13 +963,20 @@ async def _fetch_current_obs(
     # outcome write (see worker.station_pacing.weathercom_call_lock).
     async with weathercom_call_lock():
         # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
-        # gate first (raises JobDeferred if active), then budget (raises JobDeferred
+        # gate first (raises JobDeferred if active), then the current_obs
+        # refused-access hold (raises AccessHeld), then budget (raises JobDeferred
         # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
         # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
         # design.
-        reservation = await writer.write(
-            lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
-        )
+        try:
+            reservation = await writer.write(
+                lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
+            )
+        except AccessHeld as held:
+            # A held try: the reservation write rolled back, so no call, no
+            # budget and no poll state. The job waits, pending, for the hold's
+            # end, which is the poll's next try.
+            raise JobDeferred(held.until) from None
 
         try:
             response = await fetch_current_observation(
@@ -991,6 +1007,20 @@ async def _fetch_current_obs(
 
         status = response.status_code
 
+        # 401 / 403: weather.com refused access. Hold the current_obs kind for
+        # every station and defer to the hold's end. The call was made, so the
+        # reservation is not refunded; the poll state is not written, so the
+        # station keeps what its last real reply left (classify_current_obs's
+        # TERMINAL for these codes is never persisted).
+        if status in (401, 403):
+            until = await write_after_reservation(
+                db,
+                writer,
+                lambda conn, s=status: record_access_refused(conn, "current_obs", s),
+                reservation,
+            )
+            raise JobDeferred(until)
+
         # 429 / >=500: record the shared domain backoff (single write with the
         # transient poll-state) and defer, exactly as the hourly stream does.
         # Classification already returned TRANSIENT for these codes.
@@ -1009,8 +1039,8 @@ async def _fetch_current_obs(
         await write_after_reservation(
             db,
             writer,
-            lambda conn, out=outcome: persist_poll_result(
-                conn, site_id, station_id, out
+            lambda conn, out=outcome, s=status: _persist_poll_result_clearing(
+                conn, site_id, station_id, out, s
             ),
             reservation,
         )
@@ -1022,7 +1052,9 @@ def _reserve_current_obs_call(
     """Domain-backoff gate then budget reservation (mirrors _reserve_obs_call).
 
     Raises ``JobDeferred`` if the shared weather.com backoff is active or the
-    daily budget is exhausted; ``JobCancelled`` if the station is gone/disabled.
+    daily budget is exhausted; ``AccessHeld`` if the ``current_obs``
+    refused-access hold is in force; ``JobCancelled`` if the station is
+    gone/disabled.
     Returns the ``Reservation`` so a refundable transport failure can refund it
     (mirrors ``_fetch_obs``'s pattern; this call site previously discarded it).
     """
@@ -1038,7 +1070,25 @@ def _reserve_current_obs_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
+    check_access_hold(conn, "current_obs")
     return reserve_budget(conn, "weathercom", 1)
+
+
+def _persist_poll_result_clearing(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    outcome: PollOutcome,
+    status: int,
+) -> None:
+    """Persist the poll-state and, on a 2xx reply, clear the current_obs hold.
+
+    One transaction, so the clear and the persist land together. A granted
+    call clears its own kind only; the other kinds' holds are left as they are.
+    """
+    persist_poll_result(conn, site_id, station_id, outcome)
+    if 200 <= status < 300:
+        clear_access_refused(conn, "current_obs")
 
 
 def _persist_poll_result_and_refund(
