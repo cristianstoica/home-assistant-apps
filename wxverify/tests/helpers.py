@@ -10,12 +10,16 @@ import hashlib
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
+from typing import Final
+from zoneinfo import ZoneInfo
 
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, parse_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
 from wxverify.db.migrations import run_migrations
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
 from wxverify.verification.decision import ContinuousLead, OccurrenceLead
@@ -627,3 +631,189 @@ def make_v8_wind_state(conn: sqlite3.Connection) -> None:
     }
     assert "legacy_hours" in columns, "v8 DDL copy is missing legacy_hours"
     conn.execute("PRAGMA user_version = 8")
+
+
+# ---------------------------------------------------------------------------
+# Daily-close day-state fixture (plan 2026-10-20-daily-close-day-state-and-
+# guard.md §13.1). Station ids are synthetic (ISTATION01, ISTATION02, ...),
+# zones are UTC/Etc/GMT only, and D is a fixed synthetic date well in the
+# past so the real clock never catches up with a test's faked one.
+# ---------------------------------------------------------------------------
+
+D: Final = date(2024, 6, 10)
+NOW: Final = datetime(D.year, D.month, D.day, 12, 0, tzinfo=UTC)
+
+_DAY_CLOSE_STATION_A = "ISTATION01"
+_DAY_CLOSE_STATION_B = "ISTATION02"
+
+_day_close_conns: list[sqlite3.Connection] = []
+_day_close_latest_clock: datetime = NOW
+
+
+def day_close_site(
+    conn: sqlite3.Connection,
+    *,
+    timezone: str = "UTC",
+    close_on: bool = True,
+    with_records: bool = True,
+) -> int:
+    """Build the daily-close plan's shared fixture site (plan §13.1).
+
+    Makes a site under ``timezone`` with two enabled stations, A
+    (``ISTATION01``) and B (``ISTATION02``), each seeded with an ``added``
+    station_changes row dated D-10 (``reason="test_seed"``). With
+    ``close_on``, sets ``DAILY_CLOSE_ON_KEY``. With ``with_records``, also
+    starts the site at D-3 and fills through its next local date, then moves
+    D-3 to ``closed`` and D-2 to ``missed`` (``never_attempted``), each 30
+    minutes after that day's own ``day_end_utc``.
+    """
+    # wxverify.db.site_days arrives in Step 4 piece 2 of the daily-close
+    # plan; importing it inside this function body, rather than at module
+    # top, keeps every other test module that imports this file collecting
+    # until then.
+    from wxverify.db.site_days import (
+        DAILY_CLOSE_ON_KEY,
+        begin_close,
+        ensure_site_days,
+        finish_close,
+        mark_missed,
+        start_site_days,
+    )
+
+    site_id = asof_make_site(conn, "day-close-site")
+    conn.execute("UPDATE sites SET timezone = ? WHERE id = ?", (timezone, site_id))
+    ensure_published_generation(conn, site_id)
+
+    seed_date = (D - timedelta(days=10)).isoformat()
+    seed_changed_at = isoformat_utc_micro(
+        datetime(D.year, D.month, D.day, tzinfo=UTC) - timedelta(days=10)
+    )
+    for pws_id in (_DAY_CLOSE_STATION_A, _DAY_CLOSE_STATION_B):
+        cur = conn.execute(
+            """
+            INSERT INTO stations
+                (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
+            VALUES (?, ?, 0.0, 0.0, 0.0, 1)
+            """,
+            (site_id, pws_id),
+        )
+        assert cur.lastrowid is not None
+        station_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO station_changes
+                (site_id, station_id, change, effective_date, reason, changed_at)
+            VALUES (?, ?, 'added', ?, 'test_seed', ?)
+            """,
+            (site_id, station_id, seed_date, seed_changed_at),
+        )
+
+    if close_on:
+        set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(NOW))
+
+    if with_records:
+        d_minus_3 = D - timedelta(days=3)
+        start_site_days(
+            conn,
+            site_id,
+            d_minus_3,
+            now_utc=datetime(
+                d_minus_3.year, d_minus_3.month, d_minus_3.day, tzinfo=UTC
+            ),
+        )
+        ensure_site_days(conn, site_id, now_utc=NOW)
+
+        d3_row = conn.execute(
+            "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, d_minus_3.isoformat()),
+        ).fetchone()
+        assert d3_row is not None
+        t1 = parse_utc(d3_row[0]) + timedelta(minutes=30)
+        begin_close(conn, site_id, d_minus_3, now_utc=t1)
+        finish_close(conn, site_id, d_minus_3, now_utc=t1)
+
+        d_minus_2 = D - timedelta(days=2)
+        d2_row = conn.execute(
+            "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, d_minus_2.isoformat()),
+        ).fetchone()
+        assert d2_row is not None
+        t2 = parse_utc(d2_row[0]) + timedelta(minutes=30)
+        mark_missed(conn, site_id, d_minus_2, now_utc=t2, reason="never_attempted")
+
+    _day_close_conns.append(conn)
+    return site_id
+
+
+def note_day_clock(t: datetime) -> datetime:
+    """Raise the helper's latest-known test clock to ``t`` when later, and
+    return ``t`` unchanged (plan §13.1).
+
+    Any ``now_utc`` later than :data:`NOW` that reaches ``ensure_site_days``
+    -- directly, or through the guard -- must be passed through this first
+    (``now_utc=note_day_clock(t)`` works inline), so
+    :func:`check_day_close_records` knows how far forward new records are
+    allowed to run. A forgotten call can only fail an otherwise-correct
+    test: without it the bound stays at :data:`NOW`, which is always too
+    early, never late enough to let a wrong fill pass.
+    """
+    global _day_close_latest_clock  # noqa: PLW0603
+    if t > _day_close_latest_clock:
+        _day_close_latest_clock = t
+    return t
+
+
+def check_day_close_records() -> None:
+    """Assert every connection :func:`day_close_site` built holds no
+    ``site_days`` record dated past the bound the test's clocks allow
+    (plan §13.1).
+
+    Imports nothing from ``wxverify.db.site_days``, so it shares no bug with
+    the code under test: every read here is plain SQL against the
+    ``site_days`` table.
+    """
+    global _day_close_latest_clock  # noqa: PLW0603
+    try:
+        clock_stamp = isoformat_utc(_day_close_latest_clock)
+        for conn in _day_close_conns:
+            try:
+                site_rows = conn.execute(
+                    "SELECT DISTINCT site_id FROM site_days"
+                ).fetchall()
+            except sqlite3.ProgrammingError:
+                continue  # the test closed this connection; nothing to check
+            for (site_id,) in site_rows:
+                tz_row = conn.execute(
+                    "SELECT timezone FROM sites WHERE id = ?", (site_id,)
+                ).fetchone()
+                if tz_row is None:
+                    continue  # the test deleted the site itself
+                bounds = [
+                    _day_close_latest_clock.astimezone(ZoneInfo(tz_row[0])).date()
+                ]
+                holder = conn.execute(
+                    """
+                    SELECT local_date FROM site_days
+                    WHERE site_id = ?
+                      AND julianday(day_start_utc) <= julianday(?)
+                      AND julianday(?) < julianday(day_end_utc)
+                    """,
+                    (site_id, clock_stamp, clock_stamp),
+                ).fetchone()
+                if holder is not None:
+                    bounds.append(date.fromisoformat(holder[0]))
+                bound = max(bounds) + timedelta(days=1)
+                latest = conn.execute(
+                    "SELECT MAX(local_date) FROM site_days WHERE site_id = ?",
+                    (site_id,),
+                ).fetchone()[0]
+                assert latest is not None
+                assert date.fromisoformat(latest) <= bound, (
+                    f"site {site_id} holds a site_days record dated {latest},"
+                    f" past the {bound.isoformat()} bound for the latest test"
+                    f" clock {clock_stamp} -- a missing note_day_clock() call,"
+                    " or ensure_site_days run on the real clock?"
+                )
+    finally:
+        _day_close_conns.clear()
+        _day_close_latest_clock = NOW

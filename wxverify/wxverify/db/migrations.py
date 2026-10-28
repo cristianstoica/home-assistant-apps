@@ -6,13 +6,13 @@ import functools
 import logging
 import sqlite3
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Final
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-from wxverify.core.timeutil import isoformat_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, utc_now
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.runtime_state import (
     delete_runtime_state,
@@ -29,7 +29,7 @@ from wxverify.db.tz_generations import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 10
+TARGET_USER_VERSION = 11
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -82,7 +82,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             history_next_attempt_at TEXT,
             history_last_error TEXT,
-            history_error_count INTEGER NOT NULL DEFAULT 0
+            history_error_count INTEGER NOT NULL DEFAULT 0,
+            retired_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS station_observations (
@@ -539,6 +540,67 @@ def create_tables(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
+
+        CREATE TABLE IF NOT EXISTS site_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            state TEXT NOT NULL
+                CHECK(state IN ('open','closing','retry_due','closed','missed')),
+            day_start_utc TEXT NOT NULL,
+            day_end_utc TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            zone_changeover INTEGER NOT NULL DEFAULT 0
+                CHECK(zone_changeover IN (0,1)),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 2),
+            retry_at TEXT,
+            last_failure TEXT,
+            missed_reason TEXT
+                CHECK(missed_reason IS NULL OR missed_reason IN
+                      ('never_attempted','retry_failed','retry_not_run',
+                       'zone_changeover')),
+            created_at TEXT NOT NULL,
+            state_changed_at TEXT NOT NULL,
+            done_at TEXT,
+            PRIMARY KEY (site_id, local_date),
+            CHECK((state IN ('closed','missed')) = (done_at IS NOT NULL)),
+            CHECK((state = 'missed') = (missed_reason IS NOT NULL)),
+            CHECK(state <> 'open' OR attempts = 0),
+            CHECK(state NOT IN ('closing','closed') OR attempts >= 1),
+            CHECK(state <> 'retry_due' OR attempts = 1),
+            CHECK((retry_at IS NOT NULL) =
+                  (attempts = 2 OR state = 'retry_due'
+                   OR missed_reason IS 'retry_not_run')),
+            CHECK(zone_changeover = 0 OR state IN ('open','missed')),
+            CHECK(missed_reason IS NOT 'zone_changeover' OR zone_changeover = 1)
+        );
+
+        CREATE TABLE IF NOT EXISTS station_changes (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            change TEXT NOT NULL
+                CHECK(change IN ('added','turned_on','turned_off','retired')),
+            effective_date TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS site_day_stations (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            PRIMARY KEY (site_id, local_date, station_id),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS site_zone_changes (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            timezone TEXT NOT NULL,
+            effective_date TEXT NOT NULL,
+            entered_at TEXT NOT NULL
+        );
         """,
     )
 
@@ -614,6 +676,16 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
             ON verification_trigger_decisions(site_id, trigger_date, id);
+
+        CREATE INDEX IF NOT EXISTS idx_site_days_state
+            ON site_days(site_id, state, local_date);
+        CREATE INDEX IF NOT EXISTS idx_station_changes_station
+            ON station_changes(station_id, effective_date);
+        CREATE INDEX IF NOT EXISTS idx_site_zone_changes_site
+            ON site_zone_changes(site_id, effective_date);
+        CREATE INDEX IF NOT EXISTS idx_site_days_writable
+            ON site_days(site_id, local_date)
+            WHERE state IN ('open','closing');
         """,
     )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
@@ -1253,6 +1325,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 9:
         logger.debug("migrations applying v9 old wind state removal")
         migrate_v9_drop_old_wind_state(conn)
+    if current < 11:
+        logger.debug("migrations applying v11 daily-close days")
+        migrate_v11_daily_close_days(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1833,6 +1908,57 @@ def migrate_v9_drop_old_wind_state(conn: sqlite3.Connection) -> None:
             "dropped" if dropped else "already gone",
             int((time.perf_counter() - started) * 1000),
         )
+
+
+# Starts ``station_changes`` in step with today's ``stations.enabled`` flags:
+# one row per station that has no change yet, ``added`` when enabled and
+# ``turned_off`` otherwise. ``:effective_date`` is ``date.min``, earlier than
+# any record's date, so the seed row decides a station's list membership
+# until a route records a change. ``:changed_at`` is one fixed-width stamp
+# for the whole seed. Idempotent through ``NOT EXISTS``; on a fresh database
+# there are no stations and it writes nothing.
+SEED_STATION_CHANGES_SQL: Final[str] = """
+    INSERT INTO station_changes
+        (site_id, station_id, change, effective_date, reason, changed_at)
+    SELECT s.site_id, s.id,
+           CASE WHEN s.enabled = 1 THEN 'added' ELSE 'turned_off' END,
+           :effective_date, 'switch_seed', :changed_at
+    FROM stations AS s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM station_changes AS c WHERE c.station_id = s.id
+    )
+    ORDER BY s.id
+"""
+
+
+def migrate_v11_daily_close_days(conn: sqlite3.Connection) -> None:
+    """Add ``stations.retired_at`` and seed ``station_changes``.
+
+    :func:`create_tables` makes the four daily-close tables (``site_days``,
+    ``station_changes``, ``site_day_stations``, ``site_zone_changes``) before
+    the gates and :func:`create_indexes` their indexes after them, so this
+    step only adds the column and runs :data:`SEED_STATION_CHANGES_SQL`. It
+    creates no ``site_days`` row and seeds no zone change, and it changes no
+    existing row beyond the new NULL column.
+
+    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a crash in between leaves user_version below 11 and the next
+    boot re-enters the ``current < 11`` gate. The column probe skips a column
+    already there -- on a fresh database :func:`create_tables` made it, last
+    in its table, so a fresh and a migrated database agree on column order --
+    and the seed's ``NOT EXISTS`` skips every station already seeded.
+    ``changed_at`` reads the clock through this module's ``utc_now``.
+    """
+    if "retired_at" not in _table_columns(conn, "stations"):
+        conn.execute("ALTER TABLE stations ADD COLUMN retired_at TEXT")
+    conn.execute(
+        SEED_STATION_CHANGES_SQL,
+        {
+            "effective_date": date.min.isoformat(),
+            "changed_at": isoformat_utc_micro(utc_now()),
+        },
+    )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

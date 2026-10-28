@@ -1621,7 +1621,7 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
         }
         assert "legacy_hours" not in live_cols
         live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 10
+        assert int(live_version[0]) == 11
     finally:
         direct.close()
 
@@ -5172,8 +5172,12 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "jobs",
     "runtime_state",
     "settings",
+    "site_day_stations",
+    "site_days",
     "site_feed_state",
+    "site_zone_changes",
     "sources",
+    "station_changes",
     "station_current_obs",
     "station_poll_state",
     "station_wind_days",
@@ -5748,7 +5752,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 29
+    assert len(schema_table_names()) == 33
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(
