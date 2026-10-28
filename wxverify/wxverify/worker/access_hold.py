@@ -32,6 +32,13 @@ AccessKind = Literal["current_obs", "hourly", "five_minute"]
 #: Every kind, in the order readers list them.
 ACCESS_KINDS: Final[tuple[AccessKind, ...]] = ("current_obs", "hourly", "five_minute")
 
+#: Each kind's plain name, as the alert and the Ops page show it.
+ACCESS_KIND_LABELS: Final[dict[AccessKind, str]] = {
+    "current_obs": "current conditions",
+    "hourly": "hourly readings",
+    "five_minute": "5-minute readings",
+}
+
 #: How long a refusal holds its kind, counted from the latest refusal.
 ACCESS_HOLD_SECONDS: Final = 3600
 

@@ -32,7 +32,11 @@ from wxverify.verification.record import (
     gap_scan_degraded_sites,
     sites_with_record_gap,
 )
-from wxverify.worker.access_hold import refused_kinds
+from wxverify.worker.access_hold import (
+    ACCESS_KIND_LABELS,
+    AccessRecord,
+    refused_kinds,
+)
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -972,6 +976,10 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
 
     key_missing_n = _key_missing_count(conn)
 
+    # weathercom_access_refused: every download kind whose latest answer was a
+    # 401/403, listed until 24 h after its hold ended (``refused_kinds``).
+    refused = refused_kinds(conn, now)
+
     def _c(cid: str, sev: str, n: int, detail: str) -> Condition:
         return Condition(
             id=cid,
@@ -1013,7 +1021,46 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
             key_missing_n,
             "keyed provider exercised without a key",
         ),
+        _c(
+            "weathercom_access_refused",
+            "warning",
+            len(refused),
+            _access_refused_detail(refused, now) if refused else "",
+        ),
     ]
+
+
+def _access_refused_detail(refused: list[AccessRecord], now: datetime) -> str:
+    """One line naming the refused kinds, the HTTP status and the hold's times.
+
+    Labels follow ``refused`` (``ACCESS_KINDS`` order). Distinct readable
+    statuses are joined in ascending order (``401/403``); with none, the
+    status part is left out. An unreadable row (``until`` None) is named
+    ``<label> (unreadable hold)`` and gives no time: ``since`` is the earliest
+    and ``held until`` the latest of the readable rows, and with no readable
+    ``until`` still in the future the line ends ``waiting for the next try``.
+    """
+    statuses = sorted({r.status for r in refused if r.status is not None})
+    head = "weather.com access refused"
+    if statuses:
+        head += " (HTTP " + "/".join(str(s) for s in statuses) + ")"
+    labels = ", ".join(
+        ACCESS_KIND_LABELS[r.kind]
+        if r.until is not None
+        else f"{ACCESS_KIND_LABELS[r.kind]} (unreadable hold)"
+        for r in refused
+    )
+    parts = [f"{head}: {labels}"]
+    sinces = [r.since for r in refused if r.until is not None and r.since is not None]
+    if sinces:
+        parts.append("since " + min(sinces, key=parse_utc))
+    untils = [r.until for r in refused if r.until is not None]
+    latest = max(untils, key=parse_utc) if untils else None
+    if latest is not None and parse_utc(latest) > now:
+        parts.append("held until " + latest)
+    else:
+        parts.append("waiting for the next try")
+    return "; ".join(parts)
 
 
 def _key_missing_count(conn: sqlite3.Connection) -> int:
@@ -1154,6 +1201,7 @@ def build_verdict(
                 ("feed_errors", "warning"),
                 ("costed_noop", "warning"),
                 ("key_missing", "warning"),
+                ("weathercom_access_refused", "warning"),
             )
         )
 

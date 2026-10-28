@@ -20,12 +20,17 @@ from wxverify.core.options import (
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.migrations import create_schema
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.monitor import (
     _CURRENT_OBS_FAILURE_COOLDOWN,  # noqa: PLC2701
     OBS_COLLECTION_DELAY_MINUTES,
     Condition,
     _grace_active,
     build_verdict,
+)
+from wxverify.worker.access_hold import (
+    ACCESS_KIND_LABELS,
+    access_hold_key,
 )
 from wxverify.worker.processor import _maybe_stamp_runtime_heartbeat
 from wxverify.worker.scheduler import (
@@ -3366,3 +3371,354 @@ def test_wl16_heartbeat_write_failure_reads_as_stale_evidence_not_hung(
     assert cond["ok"] is False
     assert cond["detail"] == _wl_wording1(-16)
     assert "hung" not in cond["detail"]
+
+
+# ---------------------------------------------------------------------------
+# AL1-AL8 (plan §13.7, 0.16.13): weathercom_access_refused condition.
+#
+# Every case calls build_verdict directly against a bare in-memory
+# schema-current connection (budget_enabled=True unless noted), so every
+# boundary -- the 24h "still listed" cutoff, the detail-string assembly,
+# and the skip-list entry when budget is disabled -- is exact. The access
+# hold rows are written directly via set_runtime_state + json.dumps (never
+# via record_access_refused, which reads the real un-frozen clock), so the
+# `since`/`until`/`status` literals are fully under test control.
+# ---------------------------------------------------------------------------
+
+_AL_N = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def _al_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    create_schema(conn)
+    return conn
+
+
+def _seed_hold(
+    conn: sqlite3.Connection,
+    kind: str,
+    *,
+    since: str,
+    until: str,
+    status: int | None = None,
+    message: str | None = None,
+) -> None:
+    payload = {"since": since, "until": until}
+    if status is not None:
+        payload["status"] = status
+    if message is not None:
+        payload["message"] = message
+    set_runtime_state(conn, access_hold_key(kind), json.dumps(payload))
+
+
+def _seed_unreadable_hold(conn: sqlite3.Connection, kind: str) -> None:
+    # Not a JSON object at all -> json_object() returns None -> fields={},
+    # so until/status/message all read back as None.
+    set_runtime_state(conn, access_hold_key(kind), json.dumps(["not", "an", "object"]))
+
+
+def _seed_until_unreadable_hold(
+    conn: sqlite3.Connection, kind: str, *, status: int
+) -> None:
+    # A readable object whose "until" is not a parseable timestamp -> until
+    # is None (so the row is treated as unreadable for the "since"/"until"
+    # extremes), but status/message still read back fine.
+    set_runtime_state(
+        conn,
+        access_hold_key(kind),
+        json.dumps(
+            {"since": "not-a-timestamp", "until": "not-a-timestamp", "status": status}
+        ),
+    )
+
+
+def _al_verdict(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime = _AL_N,
+    pipeline_enabled: bool = False,
+    budget_enabled: bool = True,
+) -> dict[str, object]:
+    return build_verdict(
+        conn,
+        pipeline_enabled=pipeline_enabled,
+        budget_enabled=budget_enabled,
+        db_enabled=False,
+        now=now,
+        export_sweeper_dead=None,
+    )
+
+
+def _al(conn: sqlite3.Connection, **kwargs: object) -> dict[str, object]:
+    return _cond(_al_verdict(conn, **kwargs), "weathercom_access_refused")  # type: ignore[arg-type]
+
+
+def test_al1_no_holds_reads_ok_with_zero_count() -> None:
+    conn = _al_conn()
+    cond = _al(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+    assert "detail" not in cond
+    assert cond["group"] == "budget"
+    assert cond["severity"] == "warning"
+    assert cond["skipped"] is False
+
+
+def test_al2_single_future_hold_trips_with_full_detail() -> None:
+    conn = _al_conn()
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=isoformat_utc(_AL_N - timedelta(minutes=30)),
+        until=isoformat_utc(_AL_N + timedelta(hours=2)),
+        status=401,
+    )
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    label = ACCESS_KIND_LABELS["current_obs"]
+    since_text = isoformat_utc(_AL_N - timedelta(minutes=30))
+    until_text = isoformat_utc(_AL_N + timedelta(hours=2))
+    assert cond["detail"] == (
+        f"weather.com access refused (HTTP 401): {label}; "
+        f"since {since_text}; held until {until_text}"
+    )
+    assert cond["group"] == "budget"
+    assert cond["severity"] == "warning"
+
+
+def test_al5_current_obs_401_and_five_minute_403_list_both_statuses() -> None:
+    """current_obs (401) and five_minute (403) both trip, with both HTTP
+    statuses and both labels (in ACCESS_KINDS order) in one detail string.
+
+    Kills: reporting only the latest-seeded status instead of both.
+    """
+    conn = _al_conn()
+    since_current_obs = isoformat_utc(_AL_N - timedelta(minutes=10))
+    until_current_obs = isoformat_utc(_AL_N + timedelta(hours=1))
+    since_five_minute = isoformat_utc(_AL_N - timedelta(minutes=30))
+    until_five_minute = isoformat_utc(_AL_N + timedelta(hours=2))
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=since_current_obs,
+        until=until_current_obs,
+        status=401,
+    )
+    _seed_hold(
+        conn,
+        "five_minute",
+        since=since_five_minute,
+        until=until_five_minute,
+        status=403,
+    )
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 2
+    label_current_obs = ACCESS_KIND_LABELS["current_obs"]
+    label_five_minute = ACCESS_KIND_LABELS["five_minute"]
+    assert cond["detail"] == (
+        f"weather.com access refused (HTTP 401/403): "
+        f"{label_current_obs}, {label_five_minute}; "
+        f"since {since_five_minute}; held until {until_five_minute}"
+    )
+
+
+def test_al5b_three_kinds_min_since_max_until_in_access_kinds_order() -> None:
+    """Staggered since/until per kind so neither the first-listed
+    (current_obs) nor the last-listed (five_minute) row's times happen to
+    be the extremes: the correct since is hourly's (listed 2nd, min), the
+    correct until is current_obs's (listed 1st, max).
+
+    Kills: "take the first-listed row's since/until" (would report
+    current_obs's since, -5min, not hourly's -50min); "take the
+    last-listed row's since/until" (would report five_minute's until,
+    +20min, not current_obs's +58min).
+    """
+    conn = _al_conn()
+    since_current_obs = isoformat_utc(_AL_N - timedelta(minutes=5))
+    until_current_obs = isoformat_utc(_AL_N + timedelta(minutes=58))
+    since_hourly = isoformat_utc(_AL_N - timedelta(minutes=50))
+    until_hourly = isoformat_utc(_AL_N + timedelta(minutes=10))
+    since_five_minute = isoformat_utc(_AL_N - timedelta(minutes=20))
+    until_five_minute = isoformat_utc(_AL_N + timedelta(minutes=20))
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=since_current_obs,
+        until=until_current_obs,
+        status=401,
+    )
+    _seed_hold(conn, "hourly", since=since_hourly, until=until_hourly, status=401)
+    _seed_hold(
+        conn,
+        "five_minute",
+        since=since_five_minute,
+        until=until_five_minute,
+        status=403,
+    )
+    conn.commit()
+    cond = _al(conn)
+    assert cond["count"] == 3
+    detail = str(cond["detail"])
+    assert f"since {since_hourly}" in detail
+    assert f"held until {until_current_obs}" in detail
+    assert since_current_obs not in detail
+    assert until_hourly not in detail
+    assert until_five_minute not in detail
+    statuses_part = "(HTTP 401/403)"
+    assert statuses_part in detail
+    labels_part = ", ".join(
+        ACCESS_KIND_LABELS[k] for k in ("current_obs", "hourly", "five_minute")
+    )
+    assert labels_part in detail
+
+
+def test_al4_hold_listed_exactly_at_24h_cutoff_is_excluded() -> None:
+    """``until`` 25h in the past is excluded (``until > now-24h`` is False
+    at 25h back); this seeds the exclusion side of the 24h "still listed"
+    boundary that AL2/AL3 (well inside it) do not reach.
+
+    Kills: dropping the 24h cutoff entirely (refused_kinds would then list
+    every hold regardless of age, and this would wrongly trip).
+    """
+    conn = _al_conn()
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=isoformat_utc(_AL_N - timedelta(hours=30)),
+        until=isoformat_utc(_AL_N - timedelta(hours=25)),
+        status=401,
+    )
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is True
+    assert cond["count"] == 0
+
+
+def test_al6c_hold_with_no_until_is_always_listed_regardless_of_age() -> None:
+    """A hold with ``until=None`` (unreadable) is listed unconditionally by
+    ``refused_kinds`` (``record.until is None or ...``), independent of the
+    24h cutoff that ages out a *readable* hold in AL4.
+
+    Kills: treating ``until=None`` as "age unknown, drop it" instead of
+    "always still listed".
+    """
+    conn = _al_conn()
+    _seed_unreadable_hold(conn, "hourly")
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_al6_partially_unreadable_hold_shows_unreadable_hold_label_text() -> None:
+    """A hold whose ``until`` does not parse, but whose ``status`` does,
+    renders as "<label> (unreadable hold)" with no "since" clause (the row
+    is excluded from the readable-since set) but keeps the HTTP status in
+    the head.
+    """
+    conn = _al_conn()
+    _seed_until_unreadable_hold(conn, "hourly", status=401)
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    label = ACCESS_KIND_LABELS["hourly"]
+    assert cond["detail"] == (
+        f"weather.com access refused (HTTP 401): {label} (unreadable hold); "
+        "waiting for the next try"
+    )
+
+
+def test_al6b_fully_unreadable_hold_drops_status_head_and_since() -> None:
+    """A hold that is not a JSON object at all (status/message/until all
+    None) drops the "(HTTP ...)" head entirely as well as any "since"
+    clause -- the edge case beyond AL6's partial case.
+
+    Kills: emitting a bare "(HTTP None)" head instead of omitting it when
+    no row has a readable status.
+    """
+    conn = _al_conn()
+    _seed_unreadable_hold(conn, "hourly")
+    conn.commit()
+    cond = _al(conn)
+    assert cond["count"] == 1
+    label = ACCESS_KIND_LABELS["hourly"]
+    assert cond["detail"] == (
+        f"weather.com access refused: {label} (unreadable hold); "
+        "waiting for the next try"
+    )
+
+
+def test_al7_grace_active_does_not_suppress_access_refused() -> None:
+    """Unlike the pipeline-group conditions, weathercom_access_refused is
+    independent of grace_active: seed worker_started_at inside the grace
+    window AND a tripping hold, with pipeline_enabled=True so grace_active
+    is actually computed (not merely absent from the envelope), and the
+    condition must still trip.
+
+    Kills: gating the budget-group access-refused condition on
+    grace_active the same way pipeline-group conditions are gated.
+    """
+    conn = _al_conn()
+    set_runtime_state(
+        conn, "worker_started_at", isoformat_utc(_AL_N - timedelta(minutes=2))
+    )
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=isoformat_utc(_AL_N - timedelta(minutes=10)),
+        until=isoformat_utc(_AL_N + timedelta(hours=1)),
+        status=401,
+    )
+    conn.commit()
+    verdict = _al_verdict(conn, pipeline_enabled=True)
+    assert verdict["grace_active"] is True
+    cond = _cond(verdict, "weathercom_access_refused")
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+
+
+def test_al8_budget_disabled_lists_access_refused_as_skipped() -> None:
+    conn = _al_conn()
+    cond = _al(conn, budget_enabled=False)
+    assert cond["skipped"] is True
+    assert cond["ok"] is True
+    assert cond["group"] == "budget"
+    assert cond["severity"] == "warning"
+
+
+def test_al3_expired_hold_still_trips_and_waits_for_the_next_try() -> None:
+    """When the (readable) max until has already passed, the tail reads
+    "waiting for the next try" instead of "held until <past timestamp>".
+
+    Kills: comparing ``until`` to the wrong clock, or omitting the
+    ``until > now`` branch so a past until is still rendered as "held
+    until ...".
+    """
+    conn = _al_conn()
+    since_text = isoformat_utc(_AL_N - timedelta(hours=2))
+    _seed_hold(
+        conn,
+        "current_obs",
+        since=since_text,
+        until=isoformat_utc(_AL_N - timedelta(minutes=5)),
+        status=401,
+    )
+    conn.commit()
+    cond = _al(conn)
+    assert cond["ok"] is False
+    assert cond["count"] == 1
+    label = ACCESS_KIND_LABELS["current_obs"]
+    detail = str(cond["detail"])
+    assert detail.endswith("waiting for the next try")
+    assert "held until" not in detail
+    assert detail == (
+        f"weather.com access refused (HTTP 401): {label}; "
+        f"since {since_text}; waiting for the next try"
+    )

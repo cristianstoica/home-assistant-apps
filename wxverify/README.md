@@ -939,6 +939,14 @@ report a missed last collection. A key that cannot download past days does not t
 reason. When the site's time zone cannot be loaded it reports
 `cannot evaluate` rather than passing.
 
+The budget group includes a `weathercom_access_refused` warning. It trips when
+weather.com refuses (HTTP 401 or 403) one of the three download kinds: current
+conditions, hourly readings or 5-minute readings. Its `count` is the number of
+kinds refused, and its `detail` names them, the HTTP status, since when, and
+until when they are held, or that the hold has ended and the next try is
+awaited. It clears once each refused kind is granted again, or 24 hours after a
+kind's hold ended if that kind is not tried again.
+
 Home Assistant owns the poll loop and delivery: a **REST sensor** polls
 `/api/health/monitor` on the internal add-on network, and two **automations**
 send a persistent notification plus a mobile push when the verdict degrades and
