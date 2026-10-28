@@ -470,23 +470,73 @@ def test_lr5_toggle_off_does_not_touch_closed_or_open_day_data(
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
-        def _snapshot(conn: sqlite3.Connection) -> list[dict[str, object]]:
-            return [
-                dict(r)
-                for r in conn.execute(
-                    "SELECT * FROM observations WHERE site_id=? "
-                    "ORDER BY variable, valid_at",
-                    (site_id,),
-                ).fetchall()
-            ]
+        # B's readings on the open day D-1 and the closed day D-3, and the
+        # site's observations on those hours set to a value their consensus
+        # does not give (plan §13.5 LR5): seeded before the request.
+        lr5_station_value = 12.3
+        lr5_obs_value = 999.0
+        d_minus_1 = (D - timedelta(days=1)).isoformat()
+        d_minus_3 = (D - timedelta(days=3)).isoformat()
 
-        before = get_db().read_sync(_snapshot)
-        client.put(
+        def _seed_readings(conn: sqlite3.Connection) -> None:
+            for day in (d_minus_1, d_minus_3):
+                valid_at = f"{day}T12:00:00Z"
+                conn.execute(
+                    """
+                    INSERT INTO station_observations
+                        (station_id, variable, valid_at, value, qc_flag, source_raw)
+                    VALUES (?, 'temperature', ?, ?, 'ok', 'test_seed')
+                    """,
+                    (b_id, valid_at, lr5_station_value),
+                )
+                asof_insert_observation(
+                    conn,
+                    site_id=site_id,
+                    valid_at=valid_at,
+                    value=lr5_obs_value,
+                    computed_at=None,
+                )
+
+        get_db().write_sync(_seed_readings)
+
+        def _snapshot() -> dict[str, list[dict[str, object]]]:
+            return get_db().read_sync(
+                lambda conn: {
+                    "observations": [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT * FROM observations WHERE site_id = ? "
+                            "ORDER BY variable, valid_at",
+                            (site_id,),
+                        ).fetchall()
+                    ],
+                    "forecast_pairs": [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT * FROM forecast_pairs WHERE site_id = ? "
+                            "ORDER BY variable, valid_at, feed_id",
+                            (site_id,),
+                        ).fetchall()
+                    ],
+                    "daily_truth": [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT * FROM daily_truth WHERE site_id = ? "
+                            "ORDER BY quantity, local_date",
+                            (site_id,),
+                        ).fetchall()
+                    ],
+                }
+            )
+
+        before = _snapshot()
+        resp = client.put(
             f"/api/sites/{site_id}/stations/{b_id}",
             json={"enabled": False},
             headers=headers,
         )
-        after = get_db().read_sync(_snapshot)
+        assert resp.status_code == 200
+        after = _snapshot()
         assert before == after
 
 

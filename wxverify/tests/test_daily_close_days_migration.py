@@ -275,8 +275,9 @@ def test_mg5_site_days_check_constraints(monkeypatch: pytest.MonkeyPatch) -> Non
 
     # closed without done_at
     _insert({"state": "closed", "attempts": 1})
-    # missed without missed_reason
-    _insert({"state": "missed", "attempts": 2, "done_at": isoformat_utc_micro(NOW)})
+    # missed without missed_reason (attempts 0, the never_attempted shape, so
+    # this trips only the missed/missed_reason CHECK and not the retry_at one)
+    _insert({"state": "missed", "attempts": 0, "done_at": isoformat_utc_micro(NOW)})
     # open with attempts 1
     _insert({"state": "open", "attempts": 1})
     # retry_due without retry_at

@@ -1942,10 +1942,20 @@ def test_ds26_open_day_on_copy(tmp_path: Path) -> None:
             marked_conn, marked_site, d_minus_5, now_utc=NOW, live_db_path=live_path
         )
 
+    self_conn, self_path, self_site = _new_copy("live_self.db")
+    set_runtime_state(self_conn, OFFLINE_COPY_KEY, isoformat_utc(NOW))
+    self_conn.commit()
     with pytest.raises(DayStateError):
         open_day_on_copy(
-            marked_conn, marked_site, d_minus_5, now_utc=NOW, live_db_path=marked_path
+            self_conn, self_site, d_minus_5, now_utc=NOW, live_db_path=self_path
         )
+    assert (
+        self_conn.execute(
+            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (self_site,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert get_runtime_state(self_conn, DAILY_CLOSE_ON_KEY) is None
 
     unmarked_conn, unmarked_path, unmarked_site = _new_copy("unmarked.db")
     with pytest.raises(DayStateError):
