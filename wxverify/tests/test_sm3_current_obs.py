@@ -406,12 +406,14 @@ class TestClassifyCurrentObs:
     # -- TERMINAL --------------------------------------------------------------
 
     def test_terminal_401(self) -> None:
-        """401 → TERMINAL."""
+        """401 → TERMINAL, persisted only by the caller's 401/403 branch
+        (refused-access hold)."""
         outcome = classify_current_obs(_fake_response(401))
         assert outcome.health is Health.TERMINAL
 
     def test_terminal_403(self) -> None:
-        """403 → TERMINAL."""
+        """403 → TERMINAL, persisted only by the caller's 401/403 branch
+        (refused-access hold)."""
         outcome = classify_current_obs(_fake_response(403))
         assert outcome.health is Health.TERMINAL
 

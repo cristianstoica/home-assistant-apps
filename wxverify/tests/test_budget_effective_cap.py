@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -47,6 +48,11 @@ from wxverify.worker.control import JobDeferred
 
 _ALLOWANCE = PROVIDER_DAILY_CALL_ALLOWANCE["weathercom"]  # 1500
 assert _ALLOWANCE == 1500, "this suite's fixture math assumes the 1500 allowance"
+
+# refused_kinds (called by _budget_conditions since 0.16.13) computes
+# ``now - 24h``, so a real timezone-aware UTC datetime is required here --
+# ``now=None`` now raises TypeError instead of silently defaulting.
+_NOW = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
 
 _WXVERIFY_SRC = Path(__file__).resolve().parent.parent / "wxverify"
 
@@ -175,7 +181,7 @@ def test_budget_conditions_trips_at_effective_cap_not_configured() -> None:
     conn.commit()
     _fill_budget(conn, "weathercom", 1500)
 
-    conditions = _budget_conditions(conn, now=None)  # type: ignore[arg-type]
+    conditions = _budget_conditions(conn, now=_NOW)
     calls_cond = next(c for c in conditions if c.id == "budget_calls")
 
     assert calls_cond.ok is False
@@ -192,7 +198,7 @@ def test_budget_conditions_not_tripped_one_call_below_effective_cap() -> None:
     conn.commit()
     _fill_budget(conn, "weathercom", 1499)
 
-    conditions = _budget_conditions(conn, now=None)  # type: ignore[arg-type]
+    conditions = _budget_conditions(conn, now=_NOW)
     calls_cond = next(c for c in conditions if c.id == "budget_calls")
 
     assert calls_cond.ok is True

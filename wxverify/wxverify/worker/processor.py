@@ -57,6 +57,12 @@ from wxverify.verification.record import (
     persist_forecast_record,
     run_record_gap_scan,
 )
+from wxverify.worker.access_hold import (
+    AccessHeld,
+    check_access_hold,
+    clear_access_refused,
+    record_access_refused,
+)
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
@@ -805,6 +811,10 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
     changed = False
     newest_obs_at: str | None = None
     skipped_parked = 0
+    # Stations whose call was granted (a 2xx reply) before the cycle stopped.
+    fetched = 0
+    # Set when the hourly refused-access hold stops the cycle: the hold's end.
+    held_until: str | None = None
     async with httpx.AsyncClient() as client:
         now = utc_now()
         for index, station in enumerate(stations):
@@ -825,11 +835,18 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                 index,
             )
             async with weathercom_call_lock():
-                reservation = await writer.write(
-                    lambda conn, station_id=station.id: _reserve_obs_call(
-                        conn, site_id, station_id
+                try:
+                    reservation = await writer.write(
+                        lambda conn, station_id=station.id: _reserve_obs_call(
+                            conn, site_id, station_id
+                        )
                     )
-                )
+                except AccessHeld as held:
+                    # A held try: the reservation write rolled back, so no
+                    # call, no budget and no station write. No later station
+                    # is tried either.
+                    held_until = held.until
+                    break
                 try:
                     observations = await fetch_hourly_history(
                         station.pws_station_id,
@@ -839,6 +856,22 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                         client=client,
                     )
                 except httpx.HTTPStatusError as exc:
+                    # 401 / 403: weather.com refused access. Hold the hourly
+                    # kind for every station and stop the cycle. The call was
+                    # made, so the reservation is not refunded; the station's
+                    # error, its history park and the domain backoff are not
+                    # written.
+                    if exc.response.status_code in (401, 403):
+                        status = exc.response.status_code
+                        held_until = await write_after_reservation(
+                            db,
+                            writer,
+                            lambda conn, s=status: record_access_refused(
+                                conn, "hourly", s
+                            ),
+                            reservation,
+                        )
+                        break
                     error = sanitized_exception(exc)
                     response = exc.response
                     next_attempt_at = await write_after_reservation(
@@ -863,11 +896,12 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                             db,
                             writer,
                             lambda conn, station_id=station.id, err=error: (
-                                _park_station_history(conn, station_id, err)
+                                _park_station_history_clearing(conn, station_id, err)
                             ),
                             reservation,
                         )
                         _log_history_park(site_id, station, park)
+                        fetched += 1
                         continue
                     error = sanitized_exception(exc)
                     refund = reservation if is_refundable_transport_error(exc) else None
@@ -894,6 +928,7 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
                 )
                 if outcome.parked is not None:
                     _log_history_park(site_id, station, outcome.parked)
+                fetched += 1
                 logger.debug(
                     "fetch_obs station result site=%s station=%s changed=%s",
                     site_id,
@@ -920,6 +955,18 @@ async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
             newest_obs_at=newest_obs_at,
         )
     )
+    if held_until is not None:
+        # The cycle is stamped above, so the next try is the next scheduled
+        # cycle. Completing through the cancelled branch, without the success
+        # marker, means a held cycle resolves no earlier failure.
+        logger.info(
+            "fetch_obs held site=%s kind=hourly until=%s fetched=%d of %d",
+            site_id,
+            held_until,
+            fetched,
+            len(stations),
+        )
+        raise JobCancelled()
 
 
 async def _fetch_current_obs(
@@ -932,7 +979,10 @@ async def _fetch_current_obs(
     (last-good snapshot), never ``stations``. One station per job, one
     provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
     recorded and the job is deferred; on transport failure the poll is marked
-    transient and deferred to the floor.
+    transient and deferred to the floor. On 401/403 the ``current_obs``
+    refused-access hold (``worker.access_hold``) is recorded in place of any
+    poll state and the job is deferred to the hold's end, as is a try that
+    meets the hold; a 2xx reply clears it.
     """
     api_key = resolve_secret("weathercom")
     if not api_key:
@@ -954,13 +1004,20 @@ async def _fetch_current_obs(
     # outcome write (see worker.station_pacing.weathercom_call_lock).
     async with weathercom_call_lock():
         # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
-        # gate first (raises JobDeferred if active), then budget (raises JobDeferred
+        # gate first (raises JobDeferred if active), then the current_obs
+        # refused-access hold (raises AccessHeld), then budget (raises JobDeferred
         # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
         # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
         # design.
-        reservation = await writer.write(
-            lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
-        )
+        try:
+            reservation = await writer.write(
+                lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
+            )
+        except AccessHeld as held:
+            # A held try: the reservation write rolled back, so no call, no
+            # budget and no poll state. The job waits, pending, for the hold's
+            # end, which is the poll's next try.
+            raise JobDeferred(held.until) from None
 
         try:
             response = await fetch_current_observation(
@@ -991,6 +1048,20 @@ async def _fetch_current_obs(
 
         status = response.status_code
 
+        # 401 / 403: weather.com refused access. Hold the current_obs kind for
+        # every station and defer to the hold's end. The call was made, so the
+        # reservation is not refunded; the poll state is not written, so the
+        # station keeps what its last real reply left (classify_current_obs's
+        # TERMINAL for these codes is never persisted).
+        if status in (401, 403):
+            until = await write_after_reservation(
+                db,
+                writer,
+                lambda conn, s=status: record_access_refused(conn, "current_obs", s),
+                reservation,
+            )
+            raise JobDeferred(until)
+
         # 429 / >=500: record the shared domain backoff (single write with the
         # transient poll-state) and defer, exactly as the hourly stream does.
         # Classification already returned TRANSIENT for these codes.
@@ -1009,8 +1080,8 @@ async def _fetch_current_obs(
         await write_after_reservation(
             db,
             writer,
-            lambda conn, out=outcome: persist_poll_result(
-                conn, site_id, station_id, out
+            lambda conn, out=outcome, s=status: _persist_poll_result_clearing(
+                conn, site_id, station_id, out, s
             ),
             reservation,
         )
@@ -1022,7 +1093,9 @@ def _reserve_current_obs_call(
     """Domain-backoff gate then budget reservation (mirrors _reserve_obs_call).
 
     Raises ``JobDeferred`` if the shared weather.com backoff is active or the
-    daily budget is exhausted; ``JobCancelled`` if the station is gone/disabled.
+    daily budget is exhausted; ``AccessHeld`` if the ``current_obs``
+    refused-access hold is in force; ``JobCancelled`` if the station is
+    gone/disabled.
     Returns the ``Reservation`` so a refundable transport failure can refund it
     (mirrors ``_fetch_obs``'s pattern; this call site previously discarded it).
     """
@@ -1038,7 +1111,25 @@ def _reserve_current_obs_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
+    check_access_hold(conn, "current_obs")
     return reserve_budget(conn, "weathercom", 1)
+
+
+def _persist_poll_result_clearing(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    outcome: PollOutcome,
+    status: int,
+) -> None:
+    """Persist the poll-state and, on a 2xx reply, clear the current_obs hold.
+
+    One transaction, so the clear and the persist land together. A granted
+    call clears its own kind only; the other kinds' holds are left as they are.
+    """
+    persist_poll_result(conn, site_id, station_id, outcome)
+    if 200 <= status < 300:
+        clear_access_refused(conn, "current_obs")
 
 
 def _persist_poll_result_and_refund(
@@ -1176,6 +1267,7 @@ def _reserve_obs_call(
     if row is None:
         raise JobCancelled()
     check_domain_backoff(conn, source_domain("weathercom"))
+    check_access_hold(conn, "hourly")
     return reserve_budget(conn, "weathercom", 1)
 
 
@@ -1254,6 +1346,19 @@ def _park_station_history(
     return HistoryPark(error_count=count, next_attempt_at=next_attempt_at, reason=error)
 
 
+def _park_station_history_clearing(
+    conn: sqlite3.Connection, station_id: int, error: str
+) -> HistoryPark:
+    """Park the station's history after a 2xx reply with no observations.
+
+    Such a reply is still a granted call, so it also clears the hourly hold, in
+    the same transaction as the park.
+    """
+    park = _park_station_history(conn, station_id, error)
+    clear_access_refused(conn, "hourly")
+    return park
+
+
 def _persist_station_observations(
     conn: sqlite3.Connection,
     site_id: int,
@@ -1298,6 +1403,7 @@ def _persist_station_observations(
             conn, "pair_and_score", site_id, "score", {"site_id": site_id}
         )
     clear_domain_backoff(conn, source_domain("weathercom"))
+    clear_access_refused(conn, "hourly")
     conn.execute(
         """
         UPDATE stations

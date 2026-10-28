@@ -18,11 +18,18 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import timedelta
+from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.db.runtime_state import delete_runtime_state, get_runtime_state
 from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
+
+#: The wind lane's hold on today's 5-minute download, written before 0.16.13.
+#: That download is now held under the ``five_minute`` refused-access kind, so
+#: nothing reads or writes this key any more and a leftover row is deleted.
+_RETIRED_WIND_HOLD_KEY: Final = "wind_history_auth_hold:all_1day"
 
 # Mirrors worker.current_obs.MIN_INTERVAL_SECONDS / _MIN_INTERVAL_FLOOR. Not
 # imported directly -- the db layer must not depend on the worker package --
@@ -52,12 +59,58 @@ def sanitize_wedge_prone_timestamps(conn: sqlite3.Connection) -> None:
 
     A minimal hand-built upload may lack either table (only ``sites``,
     ``stations``, and ``station_observations`` are required at import), so
-    each pass is skipped rather than failing when its table is absent.
+    each pass is skipped rather than failing when its table is absent. Then
+    ``release_key_refused_polls`` runs, with its own table guards.
     """
     if table_exists(conn, "jobs"):
         _sanitize_jobs_next_attempt_at(conn)
     if table_exists(conn, "station_poll_state"):
         _sanitize_station_poll_next_poll_at(conn, table_exists(conn, "settings"))
+    release_key_refused_polls(conn)
+
+
+def release_key_refused_polls(conn: sqlite3.Connection) -> None:
+    """Release current-obs polls an earlier version parked on a 401/403.
+
+    Before 0.16.13 a refused current-conditions poll left its station
+    ``terminal`` with ``last_error`` ``'http 401'`` or ``'http 403'`` and
+    ``next_poll_at`` up to 24 h ahead. Each such poll still in the future is
+    made due now. Only ``next_poll_at`` is written: ``health_state``,
+    ``last_error`` and ``error_count`` stay for the station's next poll to
+    replace. Then the retired ``all_1day`` wind lane hold row is deleted.
+
+    The release is skipped when ``station_poll_state`` or one of the three
+    columns it reads is absent (a minimal hand-built upload), and the delete
+    when ``runtime_state`` is absent; each runs without the other.
+    Idempotent: nothing from 0.16.13 on writes such a poll or such a row, so
+    after the first run neither matches.
+    """
+    if table_exists(conn, "station_poll_state"):
+        columns = {
+            str(row[1]).lower()
+            for row in conn.execute("PRAGMA table_info(station_poll_state)")
+        }
+        if {"health_state", "last_error", "next_poll_at"} <= columns:
+            released = conn.execute(
+                "UPDATE station_poll_state SET next_poll_at = :now"
+                " WHERE health_state = 'terminal'"
+                " AND last_error IN ('http 401', 'http 403')"
+                " AND next_poll_at > :now",
+                {"now": isoformat_utc(utc_now())},
+            ).rowcount
+            if released > 0:
+                logger.info(
+                    "sanitize: released %d current-obs polls parked by a refused key",
+                    released,
+                )
+    if (
+        table_exists(conn, "runtime_state")
+        and get_runtime_state(conn, _RETIRED_WIND_HOLD_KEY) is not None
+    ):
+        delete_runtime_state(conn, _RETIRED_WIND_HOLD_KEY)
+        logger.info(
+            "sanitize: removed the retired wind lane hold %s", _RETIRED_WIND_HOLD_KEY
+        )
 
 
 def _sanitize_jobs_next_attempt_at(conn: sqlite3.Connection) -> None:

@@ -7,6 +7,10 @@ today and yesterday current, with a final call shortly before local midnight,
 and while the ``history_all`` hold is held it finishes past days with the
 records they have.
 
+Today's 5-minute download takes the refused-access hold
+(:mod:`wxverify.worker.access_hold`); only ``history_all`` keeps the lane's own
+hold.
+
 The lane's share of the weather.com budget is in
 :mod:`wxverify.collection.wind_quota`.
 """
@@ -56,6 +60,7 @@ from wxverify.db.wind_basis import (
     WIND_FINAL_LEAD,
     AuthHold,
     AuthHoldEndpoint,
+    WindEndpoint,
     clear_auth_hold,
     count_missed_final,
     read_auth_hold,
@@ -74,6 +79,12 @@ from wxverify.obs.wind_pairs import MAX_PAIR_GAP_SECONDS, WindRecord, pair_max_b
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.truth import mark_daily_truth_stale
+from wxverify.worker.access_hold import (
+    access_held,
+    clear_access_refused,
+    record_access_refused,
+    refused_kinds,
+)
 from wxverify.worker.control import JobCancelled, JobControl, JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -106,7 +117,6 @@ _RECONCILE_POOL: Final = 7
 _RECONCILE_MIN: Final = 3
 _ONE_HOUR: Final = timedelta(hours=1)
 _ONE_DAY: Final = timedelta(days=1)
-_ENDPOINTS: Final[tuple[AuthHoldEndpoint, ...]] = ("history_all", "all_1day")
 _PAYLOAD_ROW_FAULTS: Final = frozenset(
     {"json_decode", "invalid_structure", "provider_error"}
 )
@@ -183,20 +193,30 @@ class DueWindDay:
     exempt: bool
 
 
-def endpoint_for(local_date: date, today: date) -> AuthHoldEndpoint:
+def endpoint_for(local_date: date, today: date) -> WindEndpoint:
     """Today's row calls ``all_1day``; every past date calls ``history_all``."""
     return "all_1day" if local_date == today else "history_all"
 
 
 def open_endpoints(
-    holds: Mapping[AuthHoldEndpoint, AuthHold], *, probing_open: bool
-) -> frozenset[AuthHoldEndpoint]:
-    """The endpoints with no hold; a ``probing`` hold is open when asked."""
-    opened: set[AuthHoldEndpoint] = set()
-    for endpoint in _ENDPOINTS:
-        hold = holds.get(endpoint)
-        if hold is None or (probing_open and hold.status == "probing"):
-            opened.add(endpoint)
+    holds: Mapping[AuthHoldEndpoint, AuthHold],
+    *,
+    probing_open: bool,
+    five_minute_held: bool,
+) -> frozenset[WindEndpoint]:
+    """The endpoints the lane may call now.
+
+    ``history_all`` is open with no lane hold, or with a ``probing`` one when
+    asked. ``all_1day`` has no lane hold: it is open only while the
+    ``five_minute`` refused-access hold is not in force (``five_minute_held``
+    False).
+    """
+    opened: set[WindEndpoint] = set()
+    history = holds.get("history_all")
+    if history is None or (probing_open and history.status == "probing"):
+        opened.add("history_all")
+    if not five_minute_held:
+        opened.add("all_1day")
     return frozenset(opened)
 
 
@@ -206,7 +226,7 @@ def wind_days_due(
     *,
     today: date,
     now: datetime,
-    open_endpoints: Collection[AuthHoldEndpoint],
+    open_endpoints: Collection[WindEndpoint],
     limit: int,
 ) -> list[DueWindDay]:
     """Run ``WIND_DUE_SQL``: exempt rows first, then by date, then by station."""
@@ -347,7 +367,12 @@ def wind_lane_due(
     """True when the site's lane has work: the scheduler's due test (plan §8.13)."""
     today = now.astimezone(tz).date()
     holds = read_auth_holds(conn)
-    opened = open_endpoints(holds, probing_open=True)
+    # While the five_minute hold is in force, today's rows are not due.
+    opened = open_endpoints(
+        holds,
+        probing_open=True,
+        five_minute_held=access_held(conn, "five_minute", now) is not None,
+    )
     if wind_days_due(
         conn, site_id, today=today, now=now, open_endpoints=opened, limit=1
     ):
@@ -459,9 +484,9 @@ async def _run_fetch_chunk(
         today=today,
     )
     await _finish_waiting_days(chunk, start)
-    for endpoint in _ENDPOINTS:
-        hold = start.holds.get(endpoint)
-        if hold is None or hold.status != "probing":
+    # Only a lane hold can be probing, so only history_all is ever probed.
+    for endpoint, hold in start.holds.items():
+        if hold.status != "probing":
             continue
         probe_rows = await db.read(
             lambda conn, ep=endpoint: wind_days_due(
@@ -476,7 +501,15 @@ async def _run_fetch_chunk(
         if outcome != "skipped":
             chunk.calls += 1
     # A probing endpoint gets its one probe per chunk; its other rows wait.
-    opened = set(open_endpoints(await db.read(read_auth_holds), probing_open=False))
+    holds, five_minute_held = await db.read(
+        lambda conn: (
+            read_auth_holds(conn),
+            access_held(conn, "five_minute", now) is not None,
+        )
+    )
+    opened = set(
+        open_endpoints(holds, probing_open=False, five_minute_held=five_minute_held)
+    )
     rows = await db.read(
         lambda conn: wind_days_due(
             conn,
@@ -538,7 +571,7 @@ def _headroom_wake(
     *,
     today: date,
     now: datetime,
-    opened: frozenset[AuthHoldEndpoint],
+    opened: frozenset[WindEndpoint],
 ) -> datetime:
     """min(now + 1 h, the next billing window, the earliest future exempt due)."""
     candidates = [now + _HEADROOM_RETRY]
@@ -756,6 +789,23 @@ async def _fetch_failed(
         status = response.status_code
         if status in (401, 403):
             endpoint = endpoint_for(local_date, today)
+            if endpoint == "all_1day":
+                # Today's 5-minute download was refused: hold the five_minute
+                # kind for every station. The call was made, so nothing is
+                # refunded; the row keeps its next_attempt_at.
+                refused = (
+                    f"station={row.pws_station_id} date={local_date.isoformat()}: "
+                    f"access refused (HTTP {status})"
+                )
+
+                def record_refusal(conn: sqlite3.Connection) -> None:
+                    record_access_refused(conn, "five_minute", status)
+                    _set_last_error(conn, station_id, local_date, refused)
+
+                await write_after_reservation(
+                    chunk.db, chunk.writer, record_refusal, reservation
+                )
+                return "closed"
             await write_after_reservation(
                 chunk.db,
                 chunk.writer,
@@ -1091,6 +1141,9 @@ def _persist_day(
     if local_date == yesterday and status in ("fetched", "unavailable") and not refetch:
         _reconcile(conn, station_id, local_date, tz_name, record_count)
     clear_domain_backoff(conn, source_domain("weathercom"))
+    if local_date == today:
+        # A 2xx on today's 5-minute download: the five_minute kind is granted.
+        clear_access_refused(conn, "five_minute")
     if probe is not None:
         clear_auth_hold(conn, probe)
 
@@ -1225,7 +1278,7 @@ async def _finish_waiting_days(chunk: _Chunk, start: _JobStart) -> None:
     No API call and no budget. Each row is finished in its own transaction; a
     row whose finish raises goes through ``_row_failure``, with a WARNING, and
     the step moves on. After a row dated yesterday is finished, a missed final
-    collection is logged (plan §7) unless ``all_1day`` has a hold.
+    collection is logged (plan §7) unless the ``five_minute`` kind is refused.
     """
     history = start.holds.get("history_all")
     if history is None or history.status != "held":
@@ -1288,11 +1341,18 @@ async def _finish_waiting_days(chunk: _Chunk, start: _JobStart) -> None:
             continue
         if finished and local_date == yesterday:
             finished_yesterday = True
-    if finished_yesterday and "all_1day" not in start.holds:
-        missed, total = await chunk.db.read(
-            lambda conn: count_missed_final(conn, site_id, yesterday, tz_name)
-        )
-        if missed > 0:
+    if finished_yesterday:
+
+        def final_check(conn: sqlite3.Connection) -> tuple[int, int, bool]:
+            missed, total = count_missed_final(conn, site_id, yesterday, tz_name)
+            five_minute_refused = any(
+                record.kind == "five_minute"
+                for record in refused_kinds(conn, utc_now())
+            )
+            return missed, total, five_minute_refused
+
+        missed, total, five_minute_refused = await chunk.db.read(final_check)
+        if missed > 0 and not five_minute_refused:
             logger.warning(
                 "wind final collection missed site=%s date=%s stations=%s/%s",
                 site_id,

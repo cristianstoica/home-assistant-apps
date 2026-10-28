@@ -5,6 +5,7 @@ All fixture data is synthetic -- this is a PUBLIC repo.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ import pytest
 
 from wxverify import config
 from wxverify.api.routes import db_transfer
-from wxverify.core.timeutil import parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database, close_db
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps
 
@@ -375,3 +376,316 @@ def test_sanitize_finds_mixed_case_jobs_and_station_poll_state() -> None:
     assert poll_row["next_poll_at"] is not None
     fixed = parse_utc(poll_row["next_poll_at"])
     assert before < fixed <= before + timedelta(seconds=300 + 5)
+
+
+# ---------------------------------------------------------------------------
+# UP1-UP4 (plan §13.10, 0.16.13): release_key_refused_polls.
+#
+# The minimal `conn` fixture above (only station_id/next_poll_at) has none
+# of the three columns `release_key_refused_polls` requires, so its own
+# column guard skips the pass there -- those tests above keep passing
+# unmodified, now with the release simply skipped. UP1-UP4 need the real
+# columns (health_state, last_error, error_count), so they build a
+# real-schema database via `Database(...)`, exactly like
+# `test_database_open_sanitizes_a_wedged_jobs_row_on_every_open` and
+# `test_stage_pending_rebuild_state_sanitizes_the_staged_upload` above.
+#
+# Synthetic data only (public repo): station ids "KTEST001".."KTEST005".
+# ---------------------------------------------------------------------------
+
+
+def _up_site(conn: sqlite3.Connection) -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('S', 40.0, -105.0, 900.0, 'UTC')"
+        ).lastrowid
+    )
+
+
+def _up_station(conn: sqlite3.Connection, site_id: int, pws_id: str) -> int:
+    return int(
+        conn.execute(
+            "INSERT INTO stations (site_id, pws_station_id, lat, lon,"
+            " dem_elevation_m) VALUES (?, ?, 40.0, -105.0, 900.0)",
+            (site_id, pws_id),
+        ).lastrowid
+    )
+
+
+def _up_poll_state(
+    conn: sqlite3.Connection,
+    station_id: int,
+    *,
+    health_state: str,
+    last_error: str | None,
+    next_poll_at: str | None,
+) -> None:
+    conn.execute(
+        "INSERT INTO station_poll_state"
+        " (station_id, health_state, last_error, next_poll_at)"
+        " VALUES (?, ?, ?, ?)",
+        (station_id, health_state, last_error, next_poll_at),
+    )
+
+
+_UP_NOW = datetime(2026, 10, 28, 12, 0, 0, tzinfo=UTC)
+
+
+def test_up1_releases_only_terminal_401_403_future_polls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Five rows, one release-eligible each of the disqualifying ways:
+    a 404 status (not 401/403), and a `next_poll_at` already in the past
+    (`next_poll_at > :now` dropped). Only the first two (401 future, 403
+    future) are released; `health_state`, `last_error` and `error_count`
+    stay untouched on every row -- only `next_poll_at` is rewritten.
+
+    Kills: matching every `terminal` row regardless of `last_error` (would
+    also release the 404 row); matching `LIKE 'http 4%'` (would also match
+    'http 404'); dropping `next_poll_at > :now` (would also release the
+    already-past 401 row).
+    """
+    caplog.set_level(logging.INFO, logger="wxverify.db.sanitize")
+    monkeypatch.setattr("wxverify.db.sanitize.utc_now", lambda: _UP_NOW)
+    db = Database(str(tmp_path / "up1.db"))
+    try:
+        site_id = _up_site(db._conn)  # noqa: SLF001
+        s1 = _up_station(db._conn, site_id, "KTEST001")  # noqa: SLF001
+        s2 = _up_station(db._conn, site_id, "KTEST002")  # noqa: SLF001
+        s3 = _up_station(db._conn, site_id, "KTEST003")  # noqa: SLF001
+        s4 = _up_station(db._conn, site_id, "KTEST004")  # noqa: SLF001
+        s5 = _up_station(db._conn, site_id, "KTEST005")  # noqa: SLF001
+
+        t_plus20h = isoformat_utc(_UP_NOW + timedelta(hours=20))
+        t_plus5h = isoformat_utc(_UP_NOW + timedelta(hours=5))
+        t_minus1h = isoformat_utc(_UP_NOW - timedelta(hours=1))
+        t_plus5min = isoformat_utc(_UP_NOW + timedelta(minutes=5))
+
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            s1,
+            health_state="terminal",
+            last_error="http 401",
+            next_poll_at=t_plus20h,
+        )
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            s2,
+            health_state="terminal",
+            last_error="http 403",
+            next_poll_at=t_plus5h,
+        )
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            s3,
+            health_state="terminal",
+            last_error="http 404",
+            next_poll_at=t_plus20h,
+        )
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            s4,
+            health_state="terminal",
+            last_error="http 401",
+            next_poll_at=t_minus1h,
+        )
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            s5,
+            health_state="online",
+            last_error=None,
+            next_poll_at=t_plus5min,
+        )
+        db._conn.commit()  # noqa: SLF001
+
+        before = {
+            int(row["station_id"]): dict(row)
+            for row in db._conn.execute(  # noqa: SLF001
+                "SELECT station_id, health_state, last_error, error_count"
+                " FROM station_poll_state"
+            )
+        }
+
+        sanitize_wedge_prone_timestamps(db._conn)  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+
+        rows = {
+            int(row["station_id"]): dict(row)
+            for row in db._conn.execute(  # noqa: SLF001
+                "SELECT station_id, health_state, last_error, error_count,"
+                " next_poll_at FROM station_poll_state"
+            )
+        }
+
+        now_stamp = isoformat_utc(_UP_NOW)
+        assert rows[s1]["next_poll_at"] == now_stamp
+        assert rows[s2]["next_poll_at"] == now_stamp
+        assert rows[s3]["next_poll_at"] == t_plus20h  # 404: not released
+        assert rows[s4]["next_poll_at"] == t_minus1h  # already past: not pulled forward
+        assert rows[s5]["next_poll_at"] == t_plus5min  # online: untouched
+
+        for station_id in (s1, s2, s3, s4, s5):
+            before_row = before[station_id]
+            after_row = rows[station_id]
+            assert after_row["health_state"] == before_row["health_state"]
+            assert after_row["last_error"] == before_row["last_error"]
+            assert after_row["error_count"] == before_row["error_count"]
+
+        assert any(
+            r.levelno == logging.INFO
+            and r.getMessage()
+            == "sanitize: released 2 current-obs polls parked by a refused key"
+            for r in caplog.records
+        )
+    finally:
+        db.close()
+
+
+def test_up2_removes_only_the_retired_all_1day_wind_hold(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second, still-current wind hold key (`:history_all`) must survive;
+    only the retired `:all_1day` key is deleted.
+
+    Kills: a broader match (e.g. a prefix delete) that would remove every
+    `wind_history_auth_hold:*` row.
+    """
+    caplog.set_level(logging.INFO, logger="wxverify.db.sanitize")
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "CREATE TABLE runtime_state"
+        " (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO runtime_state (key, value) VALUES"
+        " ('wind_history_auth_hold:all_1day', 'retired'),"
+        " ('wind_history_auth_hold:history_all', 'current')"
+    )
+    sanitize_wedge_prone_timestamps(conn)
+    remaining = {r["key"] for r in conn.execute("SELECT key FROM runtime_state")}
+    assert remaining == {"wind_history_auth_hold:history_all"}
+    assert any(
+        r.levelno == logging.INFO
+        and r.getMessage()
+        == "sanitize: removed the retired wind lane hold"
+        " wind_history_auth_hold:all_1day"
+        for r in caplog.records
+    )
+
+
+def test_up3_second_call_changes_nothing_and_logs_no_info(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Nothing from 0.16.13 on writes a `terminal`/`http 401` poll still in
+    the future or the retired wind-hold key, so after the first run neither
+    matches: a second call must change nothing and log nothing at INFO.
+
+    Kills: a release that is not idempotent (e.g. re-stamping `next_poll_at`
+    to `now` again on the second call, which a frozen clock would not even
+    reveal by itself -- the INFO-silence check is what catches it).
+    """
+    caplog.set_level(logging.INFO, logger="wxverify.db.sanitize")
+    monkeypatch.setattr("wxverify.db.sanitize.utc_now", lambda: _UP_NOW)
+    db = Database(str(tmp_path / "up3.db"))
+    try:
+        site_id = _up_site(db._conn)  # noqa: SLF001
+        station_id = _up_station(db._conn, site_id, "KTEST001")  # noqa: SLF001
+        future = isoformat_utc(_UP_NOW + timedelta(hours=20))
+        _up_poll_state(  # noqa: SLF001
+            db._conn,
+            station_id,
+            health_state="terminal",
+            last_error="http 401",
+            next_poll_at=future,
+        )
+        db._conn.execute(  # noqa: SLF001
+            "INSERT INTO runtime_state (key, value) VALUES"
+            " ('wind_history_auth_hold:all_1day', 'retired')"
+        )
+        db._conn.commit()  # noqa: SLF001
+
+        sanitize_wedge_prone_timestamps(db._conn)  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+        now_stamp = isoformat_utc(_UP_NOW)
+        after_first = db._conn.execute(  # noqa: SLF001
+            "SELECT next_poll_at FROM station_poll_state WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        assert after_first["next_poll_at"] == now_stamp
+        wind_rows = {
+            r["key"]
+            for r in db._conn.execute(  # noqa: SLF001
+                "SELECT key FROM runtime_state"
+                " WHERE key = 'wind_history_auth_hold:all_1day'"
+            )
+        }
+        assert wind_rows == set()
+
+        caplog.clear()
+        sanitize_wedge_prone_timestamps(db._conn)  # noqa: SLF001
+        db._conn.commit()  # noqa: SLF001
+
+        after_second = db._conn.execute(  # noqa: SLF001
+            "SELECT next_poll_at FROM station_poll_state WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+        assert after_second["next_poll_at"] == now_stamp
+        assert [r for r in caplog.records if r.levelno == logging.INFO] == []
+    finally:
+        db.close()
+
+
+def test_up4_staged_upload_is_released_before_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_stage_pending_rebuild_state_sanitizes_the_staged_upload`
+    above: `_stage_pending_rebuild_state` runs `sanitize_wedge_prone_timestamps`
+    (which calls `release_key_refused_polls`) on the staged file BEFORE the
+    atomic rename promotes it, so a station parked by a now-expired key
+    refusal is released by construction -- never only by the open-path boot
+    guard running later against the live database.
+
+    Kills: a release wired only into the open path (`Database.__init__`'s
+    own sanitize call), never into the staging path.
+    """
+    close_db()
+    config.db_path = str(tmp_path / "unused.db")
+    config.options_path = str(tmp_path / "missing-options.json")
+    monkeypatch.setattr("wxverify.db.sanitize.utc_now", lambda: _UP_NOW)
+
+    staged_path = tmp_path / "staged.db"
+    staged = Database(str(staged_path))
+    station_id: int
+    try:
+        site_id = _up_site(staged._conn)  # noqa: SLF001
+        station_id = _up_station(staged._conn, site_id, "KTEST001")  # noqa: SLF001
+        future = isoformat_utc(_UP_NOW + timedelta(hours=20))
+        _up_poll_state(  # noqa: SLF001
+            staged._conn,
+            station_id,
+            health_state="terminal",
+            last_error="http 401",
+            next_poll_at=future,
+        )
+        staged._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
+        staged._conn.commit()  # noqa: SLF001
+    finally:
+        staged.close()
+
+    db_transfer._stage_pending_rebuild_state(staged_path)  # noqa: SLF001
+
+    direct = sqlite3.connect(str(staged_path))
+    direct.row_factory = sqlite3.Row
+    try:
+        row = direct.execute(
+            "SELECT next_poll_at FROM station_poll_state WHERE station_id = ?",
+            (station_id,),
+        ).fetchone()
+    finally:
+        direct.close()
+    assert row["next_poll_at"] == isoformat_utc(_UP_NOW), (
+        "the staged file's refused-key poll must already be released at the "
+        "point of promotion, not only once the live database next opens"
+    )

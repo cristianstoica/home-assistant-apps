@@ -37,6 +37,11 @@ from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.settings.keys import get_number_setting
+from wxverify.worker.access_hold import (
+    ACCESS_KIND_LABELS,
+    ACCESS_KINDS,
+    read_access_record,
+)
 
 
 @dataclass(frozen=True)
@@ -211,6 +216,17 @@ class KeyStatusRow:
 
 
 @dataclass(frozen=True)
+class AccessHoldView:
+    """One download kind weather.com refused, as the Key Status panel shows it."""
+
+    #: The ``AccessKind``, e.g. "hourly".
+    kind: str
+    #: The whole line, e.g. "weather.com access refused (HTTP 401): hourly
+    #: readings, since <t>, held until <t>".
+    text: str
+
+
+@dataclass(frozen=True)
 class ObservationHealthRow:
     site_id: int
     site_name: str
@@ -264,7 +280,6 @@ WIND_HOLD_TITLES: Final[dict[str, str]] = {
         "This weather.com key cannot download wind history for past days,"
         " a known limit of the key"
     ),
-    "all_1day": "Wind updates stalled: weather.com refused the key",
 }
 
 WIND_DAY_STATUSES: Final = ("pending", "partial", "fetched", "unavailable", "failed")
@@ -469,6 +484,7 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
             KeyStatusRow(provider=provider, present=present)
             for provider, present in sorted(key_status().items())
         ],
+        "access_holds": load_access_holds(conn),
         "observation_health": load_observation_health(conn),
         "station_trust": load_station_trust(conn),
         "wind_history": load_wind_history(conn),
@@ -742,6 +758,37 @@ def _wind_holds(conn: sqlite3.Connection) -> list[WindHoldView]:
         )
         for endpoint, hold in read_auth_holds(conn).items()
     ]
+
+
+def load_access_holds(conn: sqlite3.Connection) -> list[AccessHoldView]:
+    """One line per download kind with a refused-access row, in kind order.
+
+    Every row is shown however long ago its hold ended (no 24 h cut, unlike
+    the monitor): the row stays until a granted reply of its kind deletes it.
+    Times are the stored UTC stamps. An unreadable row is named
+    ``<label> (unreadable hold)`` and shows no time. Read-only.
+    """
+    now = utc_now()
+    views: list[AccessHoldView] = []
+    for kind in ACCESS_KINDS:
+        record = read_access_record(conn, kind)
+        if record is None:
+            continue
+        head = "weather.com access refused"
+        if record.status is not None:
+            head += f" (HTTP {record.status})"
+        text = f"{head}: {ACCESS_KIND_LABELS[kind]}"
+        if record.until is None:
+            text += " (unreadable hold), waiting for the next try"
+        else:
+            if record.since is not None:
+                text += f", since {record.since}"
+            if parse_utc(record.until) > now:
+                text += f", held until {record.until}"
+            else:
+                text += ", waiting for the next try"
+        views.append(AccessHoldView(kind=kind, text=text))
+    return views
 
 
 def _lane_calls_today(conn: sqlite3.Connection) -> tuple[int | None, int | None]:

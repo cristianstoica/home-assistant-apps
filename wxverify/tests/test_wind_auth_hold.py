@@ -24,10 +24,12 @@ timezone "UTC", coordinates 0.0/0.0, API key
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -40,16 +42,21 @@ from wxverify.collection.wind_quota import (
     WIND_LIVE_CALLS_KEY,
     read_lane_counter,
 )
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.wind_basis import (
-    clear_auth_hold,
     read_auth_hold,
     write_auth_hold,
 )
 from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
 from wxverify.obs.pws_adapter import ProviderDeadlineExceeded
+from wxverify.worker.access_hold import (
+    clear_access_refused,
+    read_access_record,
+    record_access_refused,
+)
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
     clear_domain_backoff,
@@ -58,6 +65,7 @@ from wxverify.worker.domain_backoff import (
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
     run_wind_days,
     wind_days_due,
+    wind_lane_due,
 )
 
 _TZ = "UTC"
@@ -142,6 +150,7 @@ def _freeze(monkeypatch: pytest.MonkeyPatch, when: datetime) -> None:
     monkeypatch.setattr("wxverify.worker.wind_days.utc_now", lambda: when)
     monkeypatch.setattr("wxverify.obs.pws_adapter.utc_now", lambda: when)
     monkeypatch.setattr("wxverify.worker.domain_backoff.utc_now", lambda: when)
+    monkeypatch.setattr("wxverify.worker.access_hold.utc_now", lambda: when)
 
 
 def _run_wind_days(
@@ -257,13 +266,22 @@ def test_t80_401_403_on_history_all_sets_held_without_refund_or_retry(
     assert station["error_count"] == 0
 
 
-def test_t80_401_on_all_1day_sets_held_without_refund_or_retry(
+def test_fm1_401_on_the_5_minute_download_holds_five_minute_not_a_lane(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Plan §13.5 FM1 (replaces the old all_1day-lane-hold T80 case): today's
+    5-minute download answers 401 for the first of two stations. The
+    refusal holds the per-kind ``five_minute`` record (no lane hold exists
+    for ``all_1day`` any more), and the second station's today row is not
+    called in the same chunk (the lane's own suppression, proven by only
+    one call reaching the fake transport)."""
     conn = _init_tmp_db(tmp_path)
     now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, now)
-    site_id, station_id = _seed_due_today_only(conn, now)
+    site_id = _make_site(conn)
+    station_id_1 = _make_station(conn, site_id, "KTEST001")
+    _make_station(conn, site_id, "KTEST002")
+    conn.commit()
 
     call_log: list[str] = []
 
@@ -273,14 +291,121 @@ def test_t80_401_on_all_1day_sets_held_without_refund_or_retry(
 
     _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
 
-    assert len(call_log) == 1
-    assert _budget_calls(conn) == 1
-    day = _day_row(conn, station_id, now.date())
+    assert len(call_log) == 1, (
+        "mutant -> at this assertion: correct = 1 (the second station's"
+        " today row is suppressed in the same chunk after the first"
+        " refusal), mutant (the chunk loop's opened.discard on a 'closed'"
+        " outcome dropped) = 2"
+    )
+    assert _budget_calls(conn) == 1, "the call is spent, not refunded"
+    day = _day_row(conn, station_id_1, now.date())
     assert day["status"] == "pending"
     assert day["attempts"] == 0
-    hold = read_auth_hold(conn, "all_1day")
-    assert hold is not None
-    assert hold.status == "held"
+
+    record = read_access_record(conn, "five_minute")
+    assert record is not None and record.status == 401, (
+        "mutant -> at this assertion: correct = a five_minute record with"
+        " status=401, mutant (the per-kind access-hold write dropped or"
+        " keyed to a different status) = None or a different status"
+    )
+    assert get_runtime_state(conn, "wind_history_auth_hold:all_1day") is None, (
+        "mutant -> at this assertion: correct = None (all_1day no longer"
+        " has a lane hold at all), mutant (a lane-level hold is still"
+        " written for all_1day) = a stored JSON hold value"
+    )
+    assert read_access_record(conn, "current_obs") is None, (
+        "mutant -> at this assertion: correct = None (the refusal holds"
+        " only five_minute), mutant (the refusal recorded under every"
+        " kind, e.g. a `for k in ACCESS_KINDS` loop) = a stored record"
+    )
+    assert read_access_record(conn, "hourly") is None, (
+        "mutant -> at this assertion: correct = None (the refusal holds"
+        " only five_minute), mutant (the refusal recorded under every"
+        " kind) = a stored record"
+    )
+
+    message = conn.execute(
+        "SELECT last_error FROM station_wind_days WHERE station_id=? AND local_date=?",
+        (station_id_1, now.date().isoformat()),
+    ).fetchone()["last_error"]
+    assert message == (
+        f"station=KTEST001 date={now.date().isoformat()}: access refused (HTTP 401)"
+    ), (
+        "mutant -> at this assertion: correct = the literal"
+        f" 'station=KTEST001 date={now.date().isoformat()}: access refused"
+        " (HTTP 401)' text, mutant (the message mentions 'key' or"
+        " 'throttled' instead) = a different message"
+    )
+
+
+def test_fm2_five_minute_hold_lifts_after_until_with_no_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan §13.5 FM2 (check 3 on the 5-minute download): the FM1 state;
+    at ``until`` + 1s, ``wind_lane_due`` is true and the chunk calls
+    ``all_1day`` once with no extra "probe" step (unlike the old
+    ``history_all`` lane hold's ``probing`` status), and a 200 reply
+    deletes the ``five_minute`` row."""
+    conn = _init_tmp_db(tmp_path)
+    t0 = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, t0)
+    site_id = _make_site(conn)
+    _make_station(conn, site_id, "KTEST001")
+    conn.commit()
+
+    def refusing_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, request=request)
+
+    _run_wind_days(site_id, refusing_handler, monkeypatch=monkeypatch)
+    record = read_access_record(conn, "five_minute")
+    assert record is not None and record.until is not None
+    until = parse_utc(record.until)
+
+    # Paired negative, injected via the same frozen clock the positive below
+    # uses: 1s before `until` the hold is still in force and only today's
+    # row exists, so wind_lane_due is False. This does not by itself
+    # diverge from the gap's mutant (reading the row's mere presence
+    # instead of `until`) -- the row still exists here too, so the mutant
+    # also gives False -- it establishes the precondition the positive
+    # depends on: that `until` sits inside this test's frozen day at all,
+    # rather than months away on the real clock.
+    before = until - timedelta(seconds=1)
+    _freeze(monkeypatch, before)
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=before) is False
+
+    after = until + timedelta(seconds=1)
+    _freeze(monkeypatch, after)
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=after) is True, (
+        "mutant -> at this assertion: correct = True (the row becomes due"
+        " again once the hold has lifted), mutant (wind_lane_due still"
+        " reads five_minute_held as True after `until` has passed) = False"
+    )
+
+    call_log: list[str] = []
+
+    def granting_handler(request: httpx.Request) -> httpx.Response:
+        if "/observations/all/1day" in request.url.path:
+            call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _run_wind_days(site_id, granting_handler, monkeypatch=monkeypatch)
+
+    assert len(call_log) == 1, (
+        "mutant -> at this assertion: correct = 1 (the all_1day chunk call"
+        " resumes on the first try with no extra probe), mutant (a"
+        " probe-style gate that needs a separate successful try before a"
+        " full call) = 0"
+    )
+    assert "stationId=KTEST001" in call_log[0], (
+        "mutant -> at this assertion: correct = True (the one logged"
+        " all_1day call is for KTEST001), mutant (the lane queries the"
+        " wrong station) = False"
+    )
+    assert read_access_record(conn, "five_minute") is None, (
+        "mutant -> at this assertion: correct = None (a 2xx reply deletes"
+        " the five_minute row), mutant (clear_access_refused not called on"
+        " today's 2xx) = a stored record"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +479,43 @@ def test_t81_a_held_hold_survives_unrelated_success_and_clear_domain_backoff(
     assert hold.status == "held"
 
 
+def test_fm5_a_five_minute_hold_does_not_stop_a_past_days_history_all_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan §13.5 FM5 (second half): a ``five_minute`` hold in force does
+    not stop a past day's ``history_all`` call (paired with
+    ``test_t81_a_held_endpoint_is_skipped_while_the_other_still_runs``,
+    which proves the opposite direction -- a ``history_all`` hold does not
+    stop today's ``all_1day`` call)."""
+    conn = _init_tmp_db(tmp_path)
+    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+    _freeze(monkeypatch, now)
+    from datetime import timedelta
+
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "KTEST001")
+    yesterday = now.date() - timedelta(days=1)
+    _insert_day(conn, station_id, yesterday, status="pending", attempts=0)
+    conn.commit()
+
+    record_access_refused(conn, "five_minute", 401)
+    conn.commit()
+
+    call_log: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(str(request.url))
+        return httpx.Response(200, json={"observations": []})
+
+    _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+
+    assert call_log, (
+        "mutant -> at this assertion: correct = non-empty (the past day's"
+        " history_all call still runs), mutant (five_minute_held closing"
+        " both endpoints via open_endpoints) = empty"
+    )
+
+
 # ---------------------------------------------------------------------------
 # T82 -- the PUT /api/wind-history/auth-hold route.
 # ---------------------------------------------------------------------------
@@ -392,6 +554,28 @@ def test_t82_confirm_false_is_rejected_with_400(
             headers=headers,
         )
         assert resp.status_code == 400, resp.text
+    close_db()
+
+
+def test_fm3_all_1day_is_rejected_by_the_request_model_with_422(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plan §13.5 FM3: ``PUT /api/wind-history/auth-hold`` with
+    ``endpoint: "all_1day"`` answers 422 (the request model no longer
+    accepts it), paired with the unchanged ``history_all`` acceptance
+    proven by the surrounding T82 cases."""
+    app = _boot(tmp_path, "fm3-all-1day.db", monkeypatch)
+    with TestClient(app) as client:
+        headers = _csrf_headers(client)
+        resp = client.put(
+            _PUT_PATH,
+            json={"endpoint": "all_1day", "confirm": True},
+            headers=headers,
+        )
+        assert resp.status_code == 422, resp.text
+        # mutant -> at this assertion: correct = 422 (the request model's
+        # endpoint field no longer accepts "all_1day"), mutant (the field
+        # still admits Literal["history_all", "all_1day"]) = 200/204
     close_db()
 
 
@@ -687,10 +871,10 @@ def test_t83_no_due_row_makes_no_call() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _healthy_site_no_hold(conn: sqlite3.Connection) -> int:
+def _healthy_site_no_hold(conn: sqlite3.Connection) -> tuple[int, int]:
     """A site that would NOT trip wind_history on its own: a valid tz (skips
     (f)), a station with a today reading (skips (e)) and a fresh
-    ``last_ok_at`` (skips (h))."""
+    ``last_ok_at`` (skips (h)). Returns ``(site_id, station_id)``."""
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "KTEST001")
     today = date(2026, 3, 10)
@@ -707,29 +891,40 @@ def _healthy_site_no_hold(conn: sqlite3.Connection) -> int:
         ),
     )
     conn.commit()
-    return site_id
+    return site_id, station_id
 
 
-def test_t84_monitor_condition_g_needs_an_all_1day_hold() -> None:
+def test_al9_wind_history_no_longer_reads_a_leftover_all_1day_row() -> None:
+    """Plan §13.5 AL9 (rewrite of the old condition-(g) test): a leftover
+    ``wind_history_auth_hold:all_1day`` row is not read and gives no
+    reason; a ``history_all`` hold alone (no missed yesterday row yet)
+    also gives no reason; check (i) fires once a yesterday row actually
+    shows a missed final collection while ``history_all`` is held."""
     now = datetime(2026, 3, 10, 23, 0, 0, tzinfo=UTC)
     conn = _make_db()
-    _healthy_site_no_hold(conn)
+    site_id, station_id = _healthy_site_no_hold(conn)
 
-    tripped_before, _ = _wind_history_trips(conn, now)
-    assert tripped_before == 0, "paired negative: no hold, nothing else wrong -> ok"
+    tripped_before, reason_before = _wind_history_trips(conn, now)
+    assert (tripped_before, reason_before) == (0, None), (
+        "paired negative: no hold, nothing else wrong -> ok"
+    )
 
-    write_auth_hold(
+    # A leftover all_1day row (from before this release) must not be read.
+    set_runtime_state(
         conn,
-        "all_1day",
-        status="held",
-        since="2026-03-09T00:00:00Z",
-        error="refused",
+        "wind_history_auth_hold:all_1day",
+        json.dumps({"status": "held", "since": "2026-03-09T00:00:00Z", "error": "x"}),
     )
     conn.commit()
     tripped1, reason1 = _wind_history_trips(conn, now)
-    assert tripped1 == 1
-    assert reason1 == "wind history paused: weather.com refused the key (all_1day)"
+    assert (tripped1, reason1) == (0, None), (
+        "mutant -> at this assertion: correct = (0, None) (the leftover"
+        " all_1day row is never read -- check (g) is gone), mutant (check"
+        " (g) kept and reads the stale key) = (1, a reason mentioning"
+        " all_1day)"
+    )
 
+    # history_all held alone, but no yesterday row yet -> still no reason.
     write_auth_hold(
         conn,
         "history_all",
@@ -739,25 +934,236 @@ def test_t84_monitor_condition_g_needs_an_all_1day_hold() -> None:
     )
     conn.commit()
     tripped2, reason2 = _wind_history_trips(conn, now)
-    assert tripped2 == 1
-    assert reason2 == "wind history paused: weather.com refused the key (history_all)"
+    assert (tripped2, reason2) == (0, None), (
+        "a history_all hold alone, with no missed-day evidence yet, must"
+        " not itself be the reason (there is no more check (g))"
+    )
 
-    clear_auth_hold(conn, "all_1day")
+    # Now give yesterday a missed final collection: history_all held ->
+    # check (i) fires with the exact missed-collection text.
+    yesterday = date(2026, 3, 9)
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, attempts, record_count, pair_hours,"
+        "  refetched, last_ok_at, updated_at)"
+        " VALUES (?, ?, 'fetched', 0, 10, 24, 0, ?, ?)",
+        (
+            station_id,
+            yesterday.isoformat(),
+            "2026-03-09T00:00:00Z",
+            "2026-03-09T00:00:00Z",
+        ),
+    )
     conn.commit()
     tripped3, reason3 = _wind_history_trips(conn, now)
-    assert (tripped3, reason3) == (0, None), (
-        "mutant -> at this assertion: correct = (0, None) (a history_all hold"
-        " alone adds no (g) reason), mutant (the history_all reason added"
-        " back unconditionally) = (1, the history_all hold text)"
+    assert tripped3 == 1, (
+        "mutant -> at this assertion: correct = 1 (check (i) fires once"
+        " history_all is held and a yesterday row missed its final"
+        " collection), mutant (check (i) removed along with check (g)) = 0"
+    )
+    assert reason3 == (
+        "wind: last collection before midnight missed for 1 of 1 stations (2026-03-09)"
+    ), (
+        "mutant -> at this assertion: correct = the (i) missed-collection"
+        " text above, mutant (a different/garbled count or date) = a"
+        " different string"
     )
 
 
-def test_t84_ops_page_shows_the_stalled_text_and_the_button(
+@pytest.mark.parametrize(
+    "hold_state",
+    ["in_force", "expired_not_cleared"],
+)
+def test_al10_wind_history_during_a_five_minute_refusal(hold_state: str) -> None:
+    """Plan §13.5 AL10: two stations give both check-(h) and check-(i)
+    preconditions at once -- station A has a yesterday row that missed its
+    final collection (precondition for (i), with ``history_all`` held),
+    station B has no today row (precondition for (h)). While a
+    ``five_minute`` access-hold row lists the kind as refused -- whether
+    its hold is still ``in_force`` or merely ``expired_not_cleared`` (the
+    row's ``until`` has passed but the row has not been cleared by a 2xx) --
+    ``wind_history`` stays ok in both cases; once the row is cleared, it
+    trips, and the first reason is check (i)'s missed-collection text."""
+    now = datetime(2026, 3, 10, 23, 0, 0, tzinfo=UTC)
+    conn = _make_db()
+    site_id = _make_site(conn)
+    station_a = _make_station(conn, site_id, "KTEST001")
+    station_b = _make_station(conn, site_id, "KTEST002")
+
+    write_auth_hold(
+        conn, "history_all", status="held", since="2026-03-09T00:00:00Z", error="x"
+    )
+    # Station A: yesterday's final collection was missed (check (i)
+    # precondition), today's reading is healthy (keeps check (e) quiet).
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, attempts, record_count, pair_hours,"
+        "  refetched, last_ok_at, updated_at)"
+        " VALUES (?, '2026-03-09', 'fetched', 0, 10, 24, 0, ?, ?)",
+        (station_a, "2026-03-09T12:00:00Z", "2026-03-09T12:00:00Z"),
+    )
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, attempts, record_count, pair_hours,"
+        "  refetched, last_ok_at, updated_at)"
+        " VALUES (?, '2026-03-10', 'fetched', 0, 10, 24, 0, ?, ?)",
+        (station_a, "2026-03-10T22:50:00Z", "2026-03-10T22:50:00Z"),
+    )
+    # Station B: no today row at all (check (h) precondition: stale "since
+    # midnight"); no yesterday row, so it adds nothing to count_missed_final.
+    conn.commit()
+
+    until = (
+        "2026-03-11T00:00:00Z" if hold_state == "in_force" else "2026-03-10T21:00:00Z"
+    )
+    set_runtime_state(
+        conn,
+        "weathercom_access_hold:five_minute",
+        json.dumps(
+            {
+                "since": "2026-03-10T20:00:00Z",
+                "until": until,
+                "status": 401,
+                "message": "access refused (HTTP 401)",
+            }
+        ),
+    )
+    conn.commit()
+
+    tripped_held, reason_held = _wind_history_trips(conn, now)
+    assert (tripped_held, reason_held) == (0, None), (
+        "mutant -> at this assertion: correct = (0, None) (checks (h) and"
+        " (i) both stay off while five_minute is in refused_kinds, whether"
+        " its hold is still in force or merely expired-but-not-cleared),"
+        " mutant (gating on access_held instead of refused_kinds -- the"
+        " expired_not_cleared case trips because access_held is already"
+        " False) = (1, a reason) for the expired_not_cleared case"
+    )
+
+    clear_access_refused(conn, "five_minute")
+    conn.commit()
+    tripped_clear, reason_clear = _wind_history_trips(conn, now)
+    assert tripped_clear == 1, (
+        "mutant -> at this assertion: correct = 1 (once five_minute is no"
+        " longer listed as refused, the (i)/(h) checks resume), mutant (no"
+        " (h)/(i) gate at all -- would already have tripped above) = 0"
+        " already seen in the held case above"
+    )
+    assert reason_clear is not None and reason_clear.startswith(
+        "wind: last collection before midnight missed for"
+    ), (
+        "mutant -> at this assertion: correct = the (i) missed-collection"
+        " text (evaluated before (h)), mutant (a different/garbled first"
+        " reason) = a different string"
+    )
+    assert station_b  # station B exists only to supply the (h) precondition
+
+
+def test_al10_check_h_alone_is_gated_by_five_minute_refused() -> None:
+    """Plan §13.5 AL10 (isolating check (h) alone): with NO ``history_all``
+    hold and NO missed yesterday row, check (i) can never fire. A today row
+    exists with a healthy record_count so check (e) stays quiet, but its
+    ``last_ok_at`` is older than twice the obs interval, so check (h) alone
+    would trip -- proving check (h)'s own gate specifically. The mutant this
+    test kills ("no (h) gate") would trip "while five_minute is held" where
+    the correct behaviour stays quiet."""
+    now = datetime(2026, 3, 10, 23, 0, 0, tzinfo=UTC)
+    conn = _make_db()
+    site_id = _make_site(conn)
+    station_id = _make_station(conn, site_id, "KTEST001")
+    today = date(2026, 3, 10)
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, attempts, record_count, pair_hours,"
+        "  refetched, last_ok_at, updated_at)"
+        " VALUES (?, ?, 'fetched', 0, 10, 24, 0, ?, ?)",
+        (
+            station_id,
+            today.isoformat(),
+            "2026-03-10T08:00:00Z",
+            "2026-03-10T08:00:00Z",
+        ),
+    )
+    conn.commit()
+    # A today row with record_count > 0 keeps check (e) quiet; its
+    # last_ok_at is older than 2 * obs_interval_minutes, the check (h)
+    # precondition.
+
+    set_runtime_state(
+        conn,
+        "weathercom_access_hold:five_minute",
+        json.dumps(
+            {
+                "since": "2026-03-10T20:00:00Z",
+                "until": "2026-03-11T00:00:00Z",
+                "status": 401,
+                "message": "access refused (HTTP 401)",
+            }
+        ),
+    )
+    conn.commit()
+
+    tripped_held, reason_held = _wind_history_trips(conn, now)
+    assert (tripped_held, reason_held) == (0, None), (
+        "mutant -> at this assertion: correct = (0, None) (check (h) is"
+        " gated off while five_minute is refused), mutant (no (h) gate) ="
+        " (1, 'wind for KTEST001 has not updated since 2026-03-10T08:00:00Z')"
+    )
+
+    clear_access_refused(conn, "five_minute")
+    conn.commit()
+    tripped_clear, reason_clear = _wind_history_trips(conn, now)
+    assert (tripped_clear, reason_clear) == (
+        1,
+        "wind for KTEST001 has not updated since 2026-03-10T08:00:00Z",
+    ), (
+        "mutant -> at this assertion: correct = (1, the exact (h) text"
+        " above), mutant (check (h) never re-enabled, or the wrong text) ="
+        " a different pair"
+    )
+
+
+def test_ms2_ops_page_shows_history_all_only_a_leftover_all_1day_row_is_silent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app = _boot(tmp_path, "t84-ops.db", monkeypatch)
+    """Plan §13.5 MS2 (ops half): a leftover ``wind_history_auth_hold:
+    all_1day`` row produces no block on ``/ops`` (paired negative), while a
+    real ``history_all`` hold still shows its stalled text and button
+    (the original T84 positive, kept)."""
+    app = _boot(tmp_path, "ms2-ops.db", monkeypatch)
     with TestClient(app) as client:
         db = get_db()
+        db.write_sync(
+            lambda conn: set_runtime_state(
+                conn,
+                "wind_history_auth_hold:all_1day",
+                json.dumps(
+                    {"status": "held", "since": "2026-03-09T00:00:00Z", "error": "x"}
+                ),
+            )
+        )
+
+        resp_before = client.get("/ops")
+        assert resp_before.status_code == 200
+        assert 'id="wind-auth-hold-history_all"' not in resp_before.text, (
+            "mutant -> at this assertion: correct = absent (a leftover"
+            " all_1day row is never read by the ops page), mutant (the"
+            " page still renders a block keyed off the stale all_1day"
+            " row) = present"
+        )
+        assert 'id="wind-auth-hold-all_1day"' not in resp_before.text, (
+            "mutant -> at this assertion: correct = absent (the leftover"
+            " all_1day row itself must never render its own block), mutant"
+            " (the page renders a block keyed off the stale all_1day row) ="
+            " present"
+        )
+        assert 'data-endpoint="all_1day"' not in resp_before.text, (
+            "mutant -> at this assertion: correct = absent (the leftover"
+            " all_1day row's endpoint must never appear in a data-endpoint"
+            " attribute), mutant (the page renders the stale all_1day"
+            " endpoint) = present"
+        )
+
         db.write_sync(
             lambda conn: write_auth_hold(
                 conn,
@@ -768,41 +1174,78 @@ def test_t84_ops_page_shows_the_stalled_text_and_the_button(
             )
         )
 
-        resp = client.get("/ops")
-
+        resp_after = client.get("/ops")
         history_title = (
             "This weather.com key cannot download wind history for past days,"
             " a known limit of the key"
         )
-        assert resp.status_code == 200
-        assert history_title in resp.text
-        assert 'id="wind-auth-hold-history_all"' in resp.text
-        assert "Try again</button>" in resp.text
+        assert resp_after.status_code == 200
+        assert history_title in resp_after.text, (
+            "mutant -> at this assertion: correct = present (a real"
+            " history_all hold still surfaces on the ops page), mutant"
+            " (the surface removed along with the all_1day key) = absent"
+        )
+        assert 'id="wind-auth-hold-history_all"' in resp_after.text
+        assert "Try again</button>" in resp_after.text
     close_db()
 
 
-def test_t84_dashboard_shows_the_banner(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("endpoint", "expect_banner"),
+    [("history_all", True), ("all_1day", False)],
+)
+def test_ms2_dashboard_banner_only_for_history_all(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    expect_banner: bool,
 ) -> None:
-    app = _boot(tmp_path, "t84-dash.db", monkeypatch)
+    """Plan §13.5 MS2 (dashboard half): the dashboard banner still fires for
+    a ``history_all`` lane hold, but a leftover ``all_1day`` lane-hold row
+    produces no wind-hold banner block."""
+    app = _boot(tmp_path, f"ms2-dash-{endpoint}.db", monkeypatch)
     with TestClient(app) as client:
         db = get_db()
         db.write_sync(lambda conn: _make_site(conn))
-        db.write_sync(
-            lambda conn: write_auth_hold(
-                conn,
-                "all_1day",
-                status="held",
-                since="2026-03-09T00:00:00Z",
-                error="refused",
+        if endpoint == "history_all":
+            db.write_sync(
+                lambda conn: write_auth_hold(
+                    conn,
+                    "history_all",
+                    status="held",
+                    since="2026-03-09T00:00:00Z",
+                    error="refused",
+                )
             )
-        )
+        else:
+            db.write_sync(
+                lambda conn: set_runtime_state(
+                    conn,
+                    "wind_history_auth_hold:all_1day",
+                    json.dumps(
+                        {
+                            "status": "held",
+                            "since": "2026-03-09T00:00:00Z",
+                            "error": "refused",
+                        }
+                    ),
+                )
+            )
 
         resp = client.get("/dashboard")
 
         assert resp.status_code == 200
-        assert 'id="wind-banner"' in resp.text
-        assert "Wind updates stalled: weather.com refused the key" in resp.text
+        assert ('id="wind-banner"' in resp.text) == expect_banner, (
+            "mutant -> at this assertion: correct = "
+            f"{expect_banner} (banner presence keyed on history_all only),"
+            " mutant (the banner still reads the leftover all_1day row) ="
+            f" {not expect_banner}"
+        )
+        if expect_banner:
+            assert (
+                "This weather.com key cannot download wind history for past"
+                " days, a known limit of the key"
+            ) in resp.text
     close_db()
 
 

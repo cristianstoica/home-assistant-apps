@@ -15,6 +15,7 @@ The classification ordering in ``classify_current_obs`` is load-bearing:
 station terminal), and the 204 / empty-body / empty-``observations`` OFFLINE check
 runs BEFORE ``response.json()`` (a 204 is 2xx, so ``raise_for_status`` won't fire,
 and parsing its empty body would raise and be misread as a transient error).
+401 and 403 are handled by the caller before persisting (refused-access hold).
 """
 
 from __future__ import annotations
@@ -85,6 +86,7 @@ def classify_current_obs(response: httpx.Response) -> PollOutcome:
 
     1. 429 → TRANSIENT (checked FIRST, before any 4xx-terminal branch).
     2. Other non-429 4xx (401/403/404/...) → TERMINAL.
+       401 and 403 are handled by the caller before persisting (refused-access hold).
     3. >=500 → TRANSIENT.
     4. 2xx that is 204 / empty body / empty ``observations`` → OFFLINE (checked
        BEFORE ``response.json()`` so a 204's empty body never raises here); a

@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.13
+
+When weather.com refuses access (HTTP 401 or 403), only the kind of
+download that was refused now waits: the current-conditions poll, the
+hourly readings and the 5-minute readings each wait 1 hour on their
+own, for every station, and then try again by themselves. A refused
+current-conditions poll no longer stops a station's polls for 24 hours,
+and no station is paused or marked failed for it. The hourly readings
+download no longer retries six times an hour while access is refused.
+The 5-minute readings no longer wait for "Try again" on the Ops page
+after a refusal; "Try again" stays for the past-day wind download,
+which this key cannot make. Catch-up and backfill are unchanged: a
+refusal stops them, as before. Rate limits (429) and server errors
+(5xx) are handled as before.
+
+The new health-monitor condition `weathercom_access_refused` (warning)
+names the refused downloads, since when they have been refused and
+until when they wait. The Key Status panel on Ops shows the same.
+Stored error messages now say "access refused (HTTP 401)" or "access
+refused (HTTP 403)", without a reason.
+
+At the first start of this version, stations whose current-conditions
+polls an earlier refusal stopped for 24 hours are polled again at once.
+
+The database schema is unchanged, so going back to 0.16.12 is a
+reinstall of that version. With Home Assistant integration 0.1.8,
+released separately, stations show "unknown", not offline, while
+access is refused.
+
 ## 0.16.12
 
 Open-Meteo and meteoblue give each hour's rain at the end of that

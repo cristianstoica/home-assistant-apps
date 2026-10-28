@@ -32,6 +32,11 @@ from wxverify.verification.record import (
     gap_scan_degraded_sites,
     sites_with_record_gap,
 )
+from wxverify.worker.access_hold import (
+    ACCESS_KIND_LABELS,
+    AccessRecord,
+    refused_kinds,
+)
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -121,10 +126,11 @@ _ELIGIBLE_OBS_WHERE = """
 # of work and a later GENUINE success in the scope is a real recovery. A
 # genuine success is a completed row carrying result='ok', which only
 # _complete_and_continue writes, on a normal dispatch return; the worker's
-# JobCancelled branch (target deleted or disabled, or a feed adapter that
-# cannot be built) completes with result NULL, as did every completion
-# before the marker existed, and none of those rows resolves anything. The
-# chain types (verification_run, backfill_site, timezone_correction,
+# JobCancelled branch (target deleted or disabled, a feed adapter that cannot
+# be built, or an hourly cycle stopped by a refused-access hold) completes
+# with result NULL, as did every completion before the marker existed, and
+# none of those rows resolves anything.
+# The chain types (verification_run, backfill_site, timezone_correction,
 # record_gap_scan, catchup) are deliberately absent: _complete_and_continue
 # completes every finished chunk under the chain's own key, so a later
 # completed row there is a chunk, not a resolution, and those scopes count by
@@ -431,18 +437,18 @@ def _wind_history_trips(
     """``(sites tripped, the first tripped site's first reason)`` for wind_history.
 
     Evaluated per enabled site with at least one enabled station, in site id
-    order, over the checks (c) and (e) to (i) of plan §10, in that order. Read-only.
+    order, over the checks (c), (i), (e) and (h) of plan §10, in that order, or
+    (f) when the site's time zone is unusable. While the ``five_minute`` kind
+    is among ``refused_kinds``, check (h) names no station and check (i) is
+    off. Read-only.
     """
     holds = read_auth_holds(conn)
-    # A history_all hold alone is a known limit of the key: past days are
-    # finished from the records already stored, and check (i) reports a
-    # missed collection before midnight. It is a reason only next to an
-    # all_1day hold.
-    hold_reasons = [
-        f"wind history paused: weather.com refused the key ({endpoint})"
-        for endpoint in holds
-        if endpoint != "history_all" or "all_1day" in holds
-    ]
+    # Read once per call. refused_kinds, not access_held, so the checks also
+    # stay off between a hold's end and the next try, while the stored row
+    # still says the last answer was a refusal.
+    five_minute_refused = any(
+        record.kind == "five_minute" for record in refused_kinds(conn, now)
+    )
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
     tripped = 0
     first: str | None = None
@@ -460,11 +466,10 @@ def _wind_history_trips(
         except (ZoneInfoNotFoundError, ValueError):
             # (f) the can't-tell verdict, surfaced, never passed.
             reasons.append("cannot evaluate")
-            reasons.extend(hold_reasons)
         else:
             reasons.extend(_wind_day_reasons(conn, site_id, today))
             # (i) yesterday's final collection before midnight was missed.
-            if "history_all" in holds and "all_1day" not in holds:
+            if "history_all" in holds and not five_minute_refused:
                 yesterday = today - timedelta(days=1)
                 missed, total = count_missed_final(conn, site_id, yesterday, tz_name)
                 if missed > 0:
@@ -482,10 +487,9 @@ def _wind_history_trips(
                 for row in today_rows
             ):
                 reasons.append("no wind readings today from any station")
-            # (g) weather.com refused the key; see hold_reasons for history_all.
-            reasons.extend(hold_reasons)
-            # (h) one station's today refresh keeps failing.
-            if today_checks:
+            # (h) one station's today refresh keeps failing; skipped while the
+            # five_minute kind is refused, so no station is named for it.
+            if today_checks and not five_minute_refused:
                 reasons.extend(_wind_stale_station_reasons(today_rows, now, interval))
         if reasons:
             tripped += 1
@@ -781,9 +785,9 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # wind_history (plan §10): per enabled site with an enabled station, an
-    # all_1day weather.com auth hold, a failing station-day, a missed collection
-    # before midnight, or a station whose wind stopped updating today.
+    # wind_history (plan §10): per enabled site with an enabled station, a
+    # failing station-day, a missed collection before midnight, or a station
+    # whose wind stopped updating today.
     wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
 
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
@@ -972,6 +976,10 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
 
     key_missing_n = _key_missing_count(conn)
 
+    # weathercom_access_refused: every download kind whose latest answer was a
+    # 401/403, listed until 24 h after its hold ended (``refused_kinds``).
+    refused = refused_kinds(conn, now)
+
     def _c(cid: str, sev: str, n: int, detail: str) -> Condition:
         return Condition(
             id=cid,
@@ -1013,7 +1021,46 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
             key_missing_n,
             "keyed provider exercised without a key",
         ),
+        _c(
+            "weathercom_access_refused",
+            "warning",
+            len(refused),
+            _access_refused_detail(refused, now) if refused else "",
+        ),
     ]
+
+
+def _access_refused_detail(refused: list[AccessRecord], now: datetime) -> str:
+    """One line naming the refused kinds, the HTTP status and the hold's times.
+
+    Labels follow ``refused`` (``ACCESS_KINDS`` order). Distinct readable
+    statuses are joined in ascending order (``401/403``); with none, the
+    status part is left out. An unreadable row (``until`` None) is named
+    ``<label> (unreadable hold)`` and gives no time: ``since`` is the earliest
+    and ``held until`` the latest of the readable rows, and with no readable
+    ``until`` still in the future the line ends ``waiting for the next try``.
+    """
+    statuses = sorted({r.status for r in refused if r.status is not None})
+    head = "weather.com access refused"
+    if statuses:
+        head += " (HTTP " + "/".join(str(s) for s in statuses) + ")"
+    labels = ", ".join(
+        ACCESS_KIND_LABELS[r.kind]
+        if r.until is not None
+        else f"{ACCESS_KIND_LABELS[r.kind]} (unreadable hold)"
+        for r in refused
+    )
+    parts = [f"{head}: {labels}"]
+    sinces = [r.since for r in refused if r.until is not None and r.since is not None]
+    if sinces:
+        parts.append("since " + min(sinces, key=parse_utc))
+    untils = [r.until for r in refused if r.until is not None]
+    latest = max(untils, key=parse_utc) if untils else None
+    if latest is not None and parse_utc(latest) > now:
+        parts.append("held until " + latest)
+    else:
+        parts.append("waiting for the next try")
+    return "; ".join(parts)
 
 
 def _key_missing_count(conn: sqlite3.Connection) -> int:
@@ -1154,6 +1201,7 @@ def build_verdict(
                 ("feed_errors", "warning"),
                 ("costed_noop", "warning"),
                 ("key_missing", "warning"),
+                ("weathercom_access_refused", "warning"),
             )
         )
 

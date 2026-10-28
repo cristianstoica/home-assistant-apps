@@ -14,4 +14,7 @@
       </tbody>
     </table>
   </div>
+  {% for hold in access_holds %}
+    <p class="notice" id="access-hold-{{ hold.kind }}">{{ hold.text }}</p>
+  {% endfor %}
 </section>

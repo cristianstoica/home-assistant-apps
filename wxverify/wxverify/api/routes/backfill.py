@@ -61,7 +61,7 @@ async def catchup(request: Request) -> dict[str, object] | HTMLResponse:
 class WindAuthHoldIn(BaseModel):
     """Payload for the ops "Try again" control on a wind-history auth hold."""
 
-    endpoint: Literal["history_all", "all_1day"]
+    endpoint: Literal["history_all"]
     confirm: bool
 
 

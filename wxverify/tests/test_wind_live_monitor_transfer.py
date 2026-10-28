@@ -44,11 +44,12 @@ from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import Job
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import AuthHoldEndpoint, AuthHoldStatus, write_auth_hold
+from wxverify.db.wind_basis import AuthHoldStatus, write_auth_hold
 from wxverify.monitor import (
     _wind_history_trips,  # noqa: PLC2701 -- private, exercised directly
     build_verdict,
 )
+from wxverify.worker.access_hold import access_hold_key
 from wxverify.worker.catchup import GAP_VARIABLES, _station_has_gap  # noqa: PLC2701
 from wxverify.worker.processor import dispatch
 
@@ -498,41 +499,50 @@ def test_t74e_no_wind_readings_today_trips(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("status", ["held", "probing"])
 @pytest.mark.parametrize(
-    ("endpoints", "expected"),
+    ("seed_leftover_all_1day", "expected"),
     [
-        pytest.param(("history_all",), (0, None), id="history_all-alone"),
-        pytest.param(
-            ("all_1day",),
-            (1, "wind history paused: weather.com refused the key (all_1day)"),
-            id="all_1day-alone",
-        ),
-        pytest.param(
-            ("history_all", "all_1day"),
-            (1, "wind history paused: weather.com refused the key (history_all)"),
-            id="both",
-        ),
+        pytest.param(False, (0, None), id="history_all-alone"),
+        pytest.param(True, (0, None), id="history_all-with-leftover-all_1day-row"),
     ],
 )
 def test_t74g_auth_hold_trips(
     tmp_path: Path,
-    endpoints: tuple[AuthHoldEndpoint, ...],
+    seed_leftover_all_1day: bool,
     expected: tuple[int, str | None],
     status: AuthHoldStatus,
 ) -> None:
-    """(g): an ``all_1day`` hold trips, named by endpoint; a ``history_all``
-    hold trips only next to an ``all_1day`` hold, and its text then comes
-    first. ``held`` and ``probing`` count alike.
+    """(g) no longer exists in 0.16.13: ``all_1day`` has no lane hold at all,
+    so it can no longer be seeded through ``write_auth_hold`` (the endpoint
+    is no longer a valid ``AuthHoldEndpoint``). A ``history_all`` hold --
+    alone, or beside a leftover ``wind_history_auth_hold:all_1day``
+    ``runtime_state`` row left over from before 0.16.13, which
+    ``read_auth_holds`` no longer reads -- trips nothing by itself (unlike
+    the old rule, where a ``history_all`` hold tripped only next to an
+    ``all_1day`` hold). ``held`` and ``probing`` count alike.
     """
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     run_migrations(conn)
     _healthy_site(conn)
-    for endpoint in endpoints:
-        write_auth_hold(
-            conn, endpoint, status=status, since=isoformat_utc(_NOW), error="401"
+    write_auth_hold(
+        conn, "history_all", status=status, since=isoformat_utc(_NOW), error="401"
+    )
+    if seed_leftover_all_1day:
+        set_runtime_state(
+            conn,
+            "wind_history_auth_hold:all_1day",
+            json.dumps(
+                {"status": status, "since": isoformat_utc(_NOW), "error": "401"}
+            ),
         )
     conn.commit()
-    assert _trips(conn) == expected
+    assert _trips(conn) == expected, (
+        "mutant -> at this assertion: correct ="
+        f" {expected} (check (g) is gone -- neither a history_all hold"
+        " alone nor a leftover all_1day row produces a reason), mutant"
+        " (check (g) kept or re-added, reading the leftover row or trip-"
+        "ping on history_all alone) = (1, a hold-text reason)"
+    )
 
 
 def test_t74h_stale_or_missing_today_row_trips(tmp_path: Path) -> None:
@@ -577,11 +587,14 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     it is read before (e)/(g) in ``_wind_history_trips``' per-site branch.
     Case 2 (last): not missed -> no missed text, and a history_all hold
     alone adds no (g) reason, so nothing trips; case 2 runs last. Case 3
-    reuses case 1's missing-coverage data but also holds ``all_1day`` --
-    the ``"all_1day" not in holds`` guard suppresses the missed text even
-    though the underlying data is identical to case 1, proving the
-    suppression is driven by the hold, not by the data (paired negative).
-    With both held, the first reason is the ``history_all`` hold text.
+    reuses case 1's missing-coverage data but also holds the ``five_minute``
+    refused-access kind (0.16.13: the lane's ``all_1day`` download takes a
+    per-kind hold instead of a lane hold) -- the ``refused_kinds`` guard
+    suppresses the missed text even though the underlying data is
+    identical to case 1, proving the suppression is driven by the
+    five_minute refusal, not by the data (paired negative). With
+    five_minute refused and no (g) check left to add the history_all hold
+    text either, nothing trips at all.
     """
 
     def _seed_yesterday(
@@ -619,9 +632,11 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
         " dropped) = no reason (a history_all hold alone adds none)"
     )
 
-    # Case 3: same missing coverage as case 1, but all_1day is ALSO held --
-    # the guard suppresses the missed text entirely (paired negative against
-    # case 1's positive).
+    # Case 3: same missing coverage as case 1, but the five_minute kind is
+    # ALSO refused -- the refused_kinds guard suppresses the missed text
+    # entirely (paired negative against case 1's positive), and with check
+    # (g) gone there is no history_all-hold text left to take its place:
+    # nothing trips.
     conn3 = sqlite3.connect(":memory:")
     conn3.row_factory = sqlite3.Row
     run_migrations(conn3)
@@ -630,24 +645,26 @@ def test_t74i_missed_final_collection_reason(tmp_path: Path) -> None:
     write_auth_hold(
         conn3, "history_all", status="held", since=isoformat_utc(_NOW), error="401"
     )
-    write_auth_hold(
-        conn3, "all_1day", status="held", since=isoformat_utc(_NOW), error="401"
+    set_runtime_state(
+        conn3,
+        access_hold_key("five_minute"),
+        json.dumps(
+            {
+                "since": isoformat_utc(_NOW),
+                "until": isoformat_utc(_NOW + timedelta(hours=1)),
+                "status": 401,
+                "message": "access refused (HTTP 401)",
+            }
+        ),
     )
     conn3.commit()
-    tripped3, first3 = _trips(conn3)
-    assert tripped3 == 1
-    assert first3 is not None
-    assert "missed" not in first3, (
-        "mutant -> at this assertion: correct = no reason contains 'missed'"
-        " (the all_1day-held guard suppresses (i) even though the"
-        " underlying coverage data is identical to case 1's), mutant (the"
-        " `'all_1day' not in holds` clause dropped from the guard) = the"
-        " missed text appears despite all_1day being held"
-    )
-    assert first3 == "wind history paused: weather.com refused the key (history_all)", (
-        "mutant -> at this assertion: correct = the history_all hold text"
-        " first (both endpoints held), mutant (the history_all reason left out"
-        " even when all_1day is held) = the all_1day hold text"
+    assert _trips(conn3) == (0, None), (
+        "mutant -> at this assertion: correct = (0, None) (the five_minute"
+        " refusal's refused_kinds guard suppresses (i) even though the"
+        " underlying coverage data is identical to case 1's, and check (g)"
+        " no longer exists to add a history_all-hold reason in its place),"
+        " mutant (the refused_kinds guard dropped, or check (g) kept) ="
+        " (1, the missed text or the history_all hold text)"
     )
 
     # Case 2 (last): not missed -> no missed text, and a history_all hold
