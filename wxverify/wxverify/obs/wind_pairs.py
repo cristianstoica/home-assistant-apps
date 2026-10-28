@@ -14,7 +14,7 @@ from typing import Final
 
 from wxverify.core.timeutil import floor_hour
 
-MAX_PAIR_GAP_SECONDS: Final = 600
+MAX_PAIR_GAP_SECONDS: Final = 1200
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ def pair_max_by_hour(
     records: Sequence[WindRecord], hours: Collection[datetime]
 ) -> dict[datetime, float]:
     """max_adjacent_pair_mean_wind: for consecutive records (a, b) of ONE
-    station, sorted by obs_at, with 0 < (b - a) <= 600 s, the pair value
+    station, sorted by obs_at, with 0 < (b - a) <= 1200 s, the pair value
     (a.speed + b.speed) / 2 counts in floor_hour(b.obs_at). Returns
     {hour: max pair value} for hours in `hours` only; hours without a
     pair are absent."""

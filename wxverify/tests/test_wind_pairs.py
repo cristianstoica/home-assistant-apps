@@ -80,33 +80,59 @@ def test_pair_max_by_hour_takes_max_not_min_of_competing_pairs() -> None:
 # --- T2 ------------------------------------------------------------------
 
 
-def test_pair_gap_exactly_600s_pairs_601s_does_not() -> None:
-    """A 0 < gap <= 600 s pair counts; a 601 s gap does not pair at all.
+def test_wp1_pair_gap_exactly_1200s_pairs_1201s_does_not() -> None:
+    """WP1 (plan 14.2): a 0 < gap <= 1200 s pair counts; a 1201 s gap does
+    not pair at all (the 20-minute widening, K28, 7.4).
 
-    mutant_lt -> at this assertion: correct = {_hour(3): 12.5} (both pairs
-    present, including the exact-600s one), mutant (`<` for `<=`) drops the
-    exact-600s pair, leaving `_hour(3)` absent from the mutant's result
-    entirely (there is no other pair to fill it) -- the fixture's SOLE
-    candidate pair sits exactly at the boundary.
-    mutant_const_660 -> at the second assertion: correct = {} (the 601s gap
-    never pairs), mutant (a constant 660s cutoff) would pair it, so
+    mutant_const_600 -> at the first assertion: correct = 1200, mutant
+    (``MAX_PAIR_GAP_SECONDS`` left at 600) = 600; the two literals differ at
+    this one read of the constant.
+    mutant_lt -> at the second assertion: correct = {_hour(3): 12.5} (both
+    pairs present, including the exact-1200s one), mutant (`<` for `<=`)
+    drops the exact-1200s pair, leaving `_hour(3)` absent from the mutant's
+    result entirely (there is no other pair to fill it) -- the fixture's
+    SOLE candidate pair sits exactly at the boundary.
+    mutant_const_1260 -> at the third assertion: correct = {} (the 1201s gap
+    never pairs), mutant (a constant 1260s cutoff) would pair it, so
     `_hour(4)` would appear in the mutant's result but is absent from the
     correct one.
     """
+    assert MAX_PAIR_GAP_SECONDS == 1200
     boundary = [
-        WindRecord(obs_at=_dt(2, 50), speed_kmh=15.0),
-        WindRecord(obs_at=_dt(3, 0, 0), speed_kmh=10.0),  # exactly 600s later
+        WindRecord(obs_at=_dt(2, 40), speed_kmh=15.0),
+        WindRecord(obs_at=_dt(3, 0, 0), speed_kmh=10.0),  # exactly 1200s later
     ]
-    assert MAX_PAIR_GAP_SECONDS == 600
     result = pair_max_by_hour(boundary, hours=[_hour(3)])
     assert result == {_hour(3): 12.5}
 
     over = [
-        WindRecord(obs_at=_dt(2, 50, 0), speed_kmh=15.0),
-        WindRecord(obs_at=_dt(3, 0, 1), speed_kmh=10.0),  # 601s later
+        WindRecord(obs_at=_dt(2, 40, 0), speed_kmh=15.0),
+        WindRecord(obs_at=_dt(3, 0, 1), speed_kmh=10.0),  # 1201s later
     ]
     result_over = pair_max_by_hour(over, hours=[_hour(3)])
     assert result_over == {}
+
+
+def test_wp2_fifteen_minute_station_pairs_within_widened_gap() -> None:
+    """WP2 (plan 14.2): D's 15-minute cadence (900 s gaps) pairs under the
+    widened 1200 s rule, where it never paired under 600 s.
+
+    mutant_still_600 -> at this assertion: correct = {_hour(3): 14.0,
+    _hour(4): 18.0} (every 900s-apart neighbour pairs: three pairs inside
+    hour 3, one straddling into hour 4), mutant (the 600s cutoff left in
+    place, M1) = {} (every gap here is 900s > 600s, so nothing pairs at
+    all) -- the fixture's readings are all exactly 900s apart, so the two
+    literals diverge on every pair.
+    """
+    readings = [
+        WindRecord(obs_at=_dt(3, 0), speed_kmh=4.0),
+        WindRecord(obs_at=_dt(3, 15), speed_kmh=8.0),
+        WindRecord(obs_at=_dt(3, 30), speed_kmh=12.0),
+        WindRecord(obs_at=_dt(3, 45), speed_kmh=16.0),
+        WindRecord(obs_at=_dt(4, 0), speed_kmh=20.0),
+    ]
+    result = pair_max_by_hour(readings, hours=[_hour(3), _hour(4)])
+    assert result == {_hour(3): 14.0, _hour(4): 18.0}
 
 
 def test_pair_gap_must_be_strictly_positive() -> None:
