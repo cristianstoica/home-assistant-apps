@@ -1260,9 +1260,16 @@ def test_export_begin_survives_bodyless_chunked_ingress_framing(
 
 
 def test_import_round_trip_rebuilds_derived_tables(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """I1: valid import round-trip + full derived-table rebuild."""
+    """I1: valid import round-trip + full derived-table rebuild.
+
+    This test never sets the daily-close runtime key, so the close is off
+    throughout -- the rebuild's "consensus rebuild kept" INFO line
+    (`db_transfer.py` ``_rebuild_all``) is gated on ``daily_close_on(conn)``
+    and must not appear.
+    """
+    caplog.set_level(logging.INFO, logger="wxverify.api.routes.db_transfer")
     conn = _init_tmp_db(tmp_path)
     _make_site(conn, "Pre Import Site A")
     conn.commit()
@@ -1395,6 +1402,9 @@ def test_import_round_trip_rebuilds_derived_tables(
         assert stamped is not None, "import_rebuild_done_at must be stamped"
     finally:
         direct.close()
+    assert not any(
+        "consensus rebuild kept" in record.getMessage() for record in caplog.records
+    ), "no rebuild INFO line while the daily close is off"
 
 
 def test_import_db_without_wind_tables_creates_them(
@@ -5693,7 +5703,7 @@ def test_import_accepts_canonical_observation_stamps(
 def test_import_rejects_non_table_under_app_table_name(
     kind: str, name: str, tmp_path: Path
 ) -> None:
-    """S10: every one of the other 21 schema table names, held by a view or
+    """S10: every one of the other 25 schema table names, held by a view or
     a virtual table, is refused -- the D6 loop over ``schema_table_names()``
     reaches names none of the pre-0.16.2 checks ever looked at.
     """

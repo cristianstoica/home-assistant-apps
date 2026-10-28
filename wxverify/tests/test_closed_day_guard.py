@@ -845,8 +845,10 @@ def test_gw9_apply_pair_ops_and_split_chunk_refuse_a_closed_days_ops(
     conn = asof_conn()
     site_id = day_close_site(conn)
     feed_id = asof_make_real_feed(conn, "gw9-model")
-    d3_hour, d1_hour_a, d1_hour_b, d1_hour_c = (
+    d3_hour, d3_hour_insert, d3_hour_delete, d1_hour_a, d1_hour_b, d1_hour_c = (
         f"{_d3().isoformat()}T06:00:00Z",
+        f"{_d3().isoformat()}T07:00:00Z",
+        f"{_d3().isoformat()}T08:00:00Z",
         f"{_d1().isoformat()}T06:00:00Z",
         f"{_d1().isoformat()}T07:00:00Z",
         f"{_d1().isoformat()}T08:00:00Z",
@@ -898,6 +900,23 @@ def test_gw9_apply_pair_ops_and_split_chunk_refuse_a_closed_days_ops(
         conn,
         site_id=site_id,
         feed_id=feed_id,
+        valid_at=d3_hour_delete,
+        issued_at=d3_hour_delete,
+        forecast=3.0,
+        observed=4.0,
+        first_known_at=d3_hour_delete,
+    )
+    d3_delete_target = int(
+        conn.execute(
+            "SELECT id FROM forecast_pairs"
+            " WHERE site_id=? AND feed_id=? AND valid_at=?",
+            (site_id, feed_id, d3_hour_delete),
+        ).fetchone()["id"]
+    )
+    asof_insert_pair(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
         valid_at=d1_hour_a,
         issued_at=d1_hour_a,
         forecast=3.0,
@@ -938,14 +957,18 @@ def test_gw9_apply_pair_ops_and_split_chunk_refuse_a_closed_days_ops(
 
     delta = PairDelta((site_id,), (), insert_sql, count=None)
     d3_ops = (
-        InsertOp(site_id=site_id, values=_values(d3_hour, 5.0, 4.0), valid_at=d3_hour),
+        InsertOp(
+            site_id=site_id,
+            values=_values(d3_hour_insert, 5.0, 4.0),
+            valid_at=d3_hour_insert,
+        ),
         ReplaceOp(
             row_id=replace_target,
             site_id=site_id,
             values=_values(d3_hour, 6.0, 4.0),
             valid_at=d3_hour,
         ),
-        DeleteOp(row_id=replace_target, site_id=site_id, valid_at=d3_hour),
+        DeleteOp(row_id=d3_delete_target, site_id=site_id, valid_at=d3_hour_delete),
     )
     d1_ops = (
         InsertOp(
@@ -2184,6 +2207,17 @@ def test_gw18_finish_day_refuses_a_done_day_finishes_the_open_day(
     )
     conn.commit()
     assert finished_d1 is True
+    after_d1_row = dict(
+        conn.execute(
+            "SELECT * FROM station_wind_days WHERE station_id=? AND local_date=?",
+            (station_a, d1.isoformat()),
+        ).fetchone()
+    )
+    # _finish_day's own UPDATE (wind_days.py ~:1502-1519) sets status to
+    # 'fetched' or 'unavailable' depending on the station_wind_records count
+    # it finds -- this fixture plants no such records for D-1, so the row
+    # must flip from the 'pending' this test inserted to 'unavailable'.
+    assert after_d1_row["status"] == "unavailable", after_d1_row
 
 
 # ---------------------------------------------------------------------------
@@ -2267,6 +2301,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
 
     root = Path(wxverify.__file__).parent
     hits: set[tuple[str, str]] = set()
+    hit_targets: dict[tuple[str, str], set[str]] = {}
     stale_module_calls: list[str] = []
     copy_on_calls: list[str] = []
     state_table_modules: set[str] = set()
@@ -2320,7 +2355,9 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                         )
                         or target.startswith("{")
                     ):
-                        hits.add((module, _enclosing(node, tree)))
+                        fn = _enclosing(node, tree)
+                        hits.add((module, fn))
+                        hit_targets.setdefault((module, fn), set()).add(target)
             if isinstance(node, ast.JoinedStr):
                 flat = "".join(
                     "{}" if isinstance(piece, ast.FormattedValue) else piece.value
@@ -2336,7 +2373,9 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                     if target in _STATE_TABLES:
                         state_table_modules.add(module)
                     if target in _DAY_WRITE_TARGETS or target.startswith("{"):
-                        hits.add((module, _enclosing(node, tree)))
+                        fn = _enclosing(node, tree)
+                        hits.add((module, fn))
+                        hit_targets.setdefault((module, fn), set()).add(target)
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -2358,8 +2397,20 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                 stale_module_calls.append(f"{module}.{_enclosing(node, tree)}")
 
     wildcard_modules = {module for module, fn in _GW17_ALLOWLIST if fn == "*"}
+    for module in sorted(wildcard_modules):
+        relative = module.removeprefix("wxverify.").replace(".", "/")
+        module_path = root / f"{relative}.py"
+        assert module_path.exists(), (
+            f"wildcard allowlist entry {module!r} has no module at {module_path}"
+        )
     checked_hits = {
-        (module, fn) for module, fn in hits if module not in wildcard_modules
+        (module, fn)
+        for module, fn in hits
+        if module not in wildcard_modules
+        or (
+            module == "wxverify.db.site_days"
+            and not hit_targets.get((module, fn), set()).issubset(_STATE_TABLES)
+        )
     }
     unreviewed = sorted(checked_hits - _GW17_ALLOWLIST)
     assert not unreviewed, f"unreviewed daily-close table writers: {unreviewed}"

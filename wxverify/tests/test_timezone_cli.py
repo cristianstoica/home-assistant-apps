@@ -321,10 +321,10 @@ def test_do1b_change_without_effective_from_while_the_close_is_off(
     """Plan §13.7 DO1b: while the close is off, ``--effective-from`` stays
     required, but through a custom check with its own message -- not
     argparse's bare ``required=True``, which exits 2 with argparse's own
-    usage text and no such message. Today the flag is still plain
-    ``required=True`` (`__main__.py:193`), so this call raises
-    ``SystemExit(2)`` out of ``main()`` before any of this test's own
-    assertions run -- a meaningful red naming exactly the gap P1 closes."""
+    usage text and no such message. The flag is declared without
+    ``required=True`` (`__main__.py:204`); whether it may or must be given
+    is decided inside ``_timezone_change``'s write transaction, which reads
+    the daily close and raises this ``ValueError`` when it is off."""
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
 
@@ -359,11 +359,9 @@ def test_do2_change_enters_a_zone_change_while_the_close_is_on(
     at D+1 (as DS15c starts it), prints a first full day with no
     changeover date.
 
-    ``wxverify.__main__`` imports no ``utc_now`` today (confirmed by grep),
-    so patching it raises ``AttributeError`` immediately -- a uniform,
-    correct "missing import" red for this whole test, in place of this
-    plan's P6-future site_days row checks (DS15/DS15c), which are out of
-    this test author's scope.
+    ``wxverify.__main__`` imports ``utc_now`` (P1), so this monkeypatch
+    fixes the clock the CLI reads. The ``site_days`` rows the change
+    makes are checked by DS15 and DS15c in ``tests/test_site_days.py``.
     """
     import datetime as _dt
 
@@ -473,6 +471,43 @@ def test_do2_change_enters_a_zone_change_while_the_close_is_on(
     assert rc4 == 0
     assert first_full_day in out4
     assert changeover_date not in out4
+
+
+def test_do2b_change_on_an_unknown_site_while_the_close_is_on(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Plan §13.7 DO2: an unknown site is refused the same way while the
+    close is on. The existence check inside ``enter_zone_change``
+    (`site_days.py:1227`, via ``_require_site_timezone``) runs before any
+    date logic, so the CLI's ``DayStateError`` catch (`__main__.py:567`)
+    reports it with a message instead of a traceback."""
+    from tests.helpers import day_close_site
+
+    _init_tmp_db(tmp_path)
+    get_db().write_sync(
+        lambda c: day_close_site(
+            c, timezone=_START_TZ, close_on=True, with_records=False
+        )
+    )
+
+    rc = main(
+        [
+            "--db",
+            config.db_path,
+            "timezone",
+            "change",
+            "--site-id",
+            "404",
+            "--timezone",
+            "Etc/GMT-1",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert "site 404 does not exist" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
 
 
 def test_site_update_still_cannot_carry_a_timezone() -> None:

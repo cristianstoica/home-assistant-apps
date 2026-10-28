@@ -81,9 +81,8 @@ def _setup_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str) -> ob
         "wxverify.api.routes.stations.lookup_elevation_m", _fake_lookup_elevation_m
     )
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    # P1 adds this import to both modules; patching it before P1 lands raises
-    # AttributeError immediately, which is the "missing import" red every
-    # test in this module relies on.
+    # Both modules import utc_now (P1); patched here so lifecycle-dated
+    # fixtures run against the test's synthetic NOW, not the real clock.
     monkeypatch.setattr("wxverify.api.routes.stations.utc_now", lambda: NOW)
     monkeypatch.setattr("wxverify.api.routes.sites.utc_now", lambda: NOW)
     return create_app(root_path="")
@@ -344,6 +343,14 @@ def test_lr3_readd_a_retired_station_at_the_same_site(
                             "SELECT * FROM observations WHERE site_id = ? "
                             "ORDER BY variable, valid_at",
                             (site_id,),
+                        ).fetchall()
+                    ],
+                    "station_observations": [
+                        dict(r)
+                        for r in conn.execute(
+                            "SELECT * FROM station_observations WHERE station_id = ? "
+                            "ORDER BY variable, valid_at",
+                            (b_id,),
                         ).fetchall()
                     ],
                     "forecast_pairs": [
@@ -667,6 +674,49 @@ def test_lr8_delete_is_a_retire_not_an_erase(
         site_id = site_ids[0]
         b_id = _station_db_id(site_id, _STATION_B)
 
+        # B's readings, wind records and wind days on the open day D-1 (plan
+        # §13.5 LR8): seeded before the delete so the retire-not-erase
+        # comparison actually compares non-empty state, not two empty lists.
+        lr8_station_value = 12.3
+        lr8_obs_value = 999.0
+        lr8_wind_speed = 9.0
+        d_minus_1 = (D - timedelta(days=1)).isoformat()
+        lr8_valid_at = f"{d_minus_1}T12:00:00Z"
+
+        def _seed_lr8(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                """
+                INSERT INTO station_observations
+                    (station_id, variable, valid_at, value, qc_flag, source_raw)
+                VALUES (?, 'temperature', ?, ?, 'ok', 'test_seed')
+                """,
+                (b_id, lr8_valid_at, lr8_station_value),
+            )
+            asof_insert_observation(
+                conn,
+                site_id=site_id,
+                valid_at=lr8_valid_at,
+                value=lr8_obs_value,
+                computed_at=None,
+            )
+            conn.execute(
+                "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
+                " VALUES (?, ?, ?)",
+                (b_id, lr8_valid_at, lr8_wind_speed),
+            )
+            conn.execute(
+                """
+                INSERT INTO station_wind_days
+                    (station_id, local_date, status, record_count, pair_hours,
+                     attempts, next_attempt_at, last_error, last_ok_at, refetch_at,
+                     refetched, updated_at)
+                VALUES (?, ?, 'fetched', 0, 0, 0, NULL, NULL, NULL, NULL, 0, ?)
+                """,
+                (b_id, d_minus_1, isoformat_utc_micro(NOW)),
+            )
+
+        get_db().write_sync(_seed_lr8)
+
         def _station_rows(conn: sqlite3.Connection) -> dict[str, object]:
             return {
                 "obs": [
@@ -685,9 +735,29 @@ def test_lr8_delete_is_a_retire_not_an_erase(
                         (site_id,),
                     ).fetchall()
                 ],
+                "wind_records": [
+                    dict(r)
+                    for r in conn.execute(
+                        "SELECT * FROM station_wind_records WHERE station_id=? "
+                        "ORDER BY obs_at",
+                        (b_id,),
+                    ).fetchall()
+                ],
+                "wind_days": [
+                    dict(r)
+                    for r in conn.execute(
+                        "SELECT * FROM station_wind_days WHERE station_id=? "
+                        "ORDER BY local_date",
+                        (b_id,),
+                    ).fetchall()
+                ],
             }
 
         before = get_db().read_sync(_station_rows)
+        assert before["obs"]
+        assert before["site_obs"]
+        assert before["wind_records"]
+        assert before["wind_days"]
         resp = client.delete(f"/api/sites/{site_id}/stations/{b_id}", headers=headers)
         assert resp.status_code == 200
         assert resp.json() == {"deleted": True}
@@ -699,6 +769,7 @@ def test_lr8_delete_is_a_retire_not_an_erase(
                 "SELECT enabled, retired_at FROM stations WHERE id=?", (b_id,)
             ).fetchone()
         )
+        assert row is not None
         assert bool(row["enabled"]) is False
         assert row["retired_at"] == isoformat_utc_micro(NOW)
 

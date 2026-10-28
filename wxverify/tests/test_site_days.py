@@ -1450,16 +1450,62 @@ def test_ds16_enter_zone_change_refusals_and_acceptance() -> None:
     # current = D (NOW=D 12:00Z is D 00:00 local); day_end_utc = D+1 12:00Z.
     # C = D+1. Etc/GMT-14 = UTC+14; local_day_slots(D+1, GMT-14)[1] =
     # D+1 10:00Z. span = D+1 10:00Z - D+1 12:00Z = -2h <= 0h: refused.
+    before_a = [
+        dict(r)
+        for r in conn_a.execute("SELECT * FROM site_days WHERE site_id = ?", (site_a,))
+    ]
+    zone_rows_before_a = conn_a.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_a,)
+    ).fetchone()[0]
+    tz_before_a = conn_a.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_a,)
+    ).fetchone()[0]
     with pytest.raises(ValueError):
         enter_zone_change(conn_a, site_a, "Etc/GMT-14", now_utc=NOW)  # -2h span
+    after_a = [
+        dict(r)
+        for r in conn_a.execute("SELECT * FROM site_days WHERE site_id = ?", (site_a,))
+    ]
+    zone_rows_after_a = conn_a.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_a,)
+    ).fetchone()[0]
+    tz_after_a = conn_a.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_a,)
+    ).fetchone()[0]
+    assert before_a == after_a
+    assert zone_rows_before_a == zone_rows_after_a
+    assert tz_before_a == tz_after_a
 
     conn_b = asof_conn()
     site_b = day_close_site(conn_b, timezone="Etc/GMT-14")  # UTC+14
     # current = D+1 (NOW=D 12:00Z is D+1 02:00 local); day_end_utc = D+1
     # 10:00Z. C = D+2. Etc/GMT+12 = UTC-12; local_day_slots(D+2, GMT+12)[1]
     # = D+3 12:00Z. span = D+3 12:00Z - D+1 10:00Z = 50h >= 48h: refused.
+    before_b = [
+        dict(r)
+        for r in conn_b.execute("SELECT * FROM site_days WHERE site_id = ?", (site_b,))
+    ]
+    zone_rows_before_b = conn_b.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_b,)
+    ).fetchone()[0]
+    tz_before_b = conn_b.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_b,)
+    ).fetchone()[0]
     with pytest.raises(ValueError):
         enter_zone_change(conn_b, site_b, "Etc/GMT+12", now_utc=NOW)  # 50h span
+    after_b = [
+        dict(r)
+        for r in conn_b.execute("SELECT * FROM site_days WHERE site_id = ?", (site_b,))
+    ]
+    zone_rows_after_b = conn_b.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_b,)
+    ).fetchone()[0]
+    tz_after_b = conn_b.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_b,)
+    ).fetchone()[0]
+    assert before_b == after_b
+    assert zone_rows_before_b == zone_rows_after_b
+    assert tz_before_b == tz_after_b
 
     conn_c = asof_conn()
     site_c = day_close_site(conn_c, timezone="Etc/GMT-12")  # UTC+12
@@ -1467,8 +1513,31 @@ def test_ds16_enter_zone_change_refusals_and_acceptance() -> None:
     # D+1); day_end_utc = D+1 12:00Z. C = D+2. Etc/GMT+12 = UTC-12;
     # local_day_slots(D+2, GMT+12)[1] = D+3 12:00Z. span = D+3 12:00Z -
     # D+1 12:00Z = 48h, the >= 48h boundary: refused.
+    before_c = [
+        dict(r)
+        for r in conn_c.execute("SELECT * FROM site_days WHERE site_id = ?", (site_c,))
+    ]
+    zone_rows_before_c = conn_c.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_c,)
+    ).fetchone()[0]
+    tz_before_c = conn_c.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_c,)
+    ).fetchone()[0]
     with pytest.raises(ValueError):
         enter_zone_change(conn_c, site_c, "Etc/GMT+12", now_utc=NOW)  # 48h span
+    after_c = [
+        dict(r)
+        for r in conn_c.execute("SELECT * FROM site_days WHERE site_id = ?", (site_c,))
+    ]
+    zone_rows_after_c = conn_c.execute(
+        "SELECT COUNT(*) FROM site_zone_changes WHERE site_id = ?", (site_c,)
+    ).fetchone()[0]
+    tz_after_c = conn_c.execute(
+        "SELECT timezone FROM sites WHERE id = ?", (site_c,)
+    ).fetchone()[0]
+    assert before_c == after_c
+    assert zone_rows_before_c == zone_rows_after_c
+    assert tz_before_c == tz_after_c
 
     after = [
         dict(r)
@@ -1574,6 +1643,7 @@ def test_ds17_changeover_day_states() -> None:
     assert row["state"] == "missed"
     assert row["missed_reason"] == "zone_changeover"
 
+    assert day_record(conn, site_id, c + timedelta(days=1)) is not None
     with pytest.raises(DayStateError):
         mark_missed(
             conn,

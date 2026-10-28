@@ -42,7 +42,12 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps, table_exists
-from wxverify.db.site_days import WriteKind, filter_day_writes, writable_pairs_clause
+from wxverify.db.site_days import (
+    WriteKind,
+    daily_close_on,
+    filter_day_writes,
+    writable_pairs_clause,
+)
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -1311,12 +1316,13 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
         for cell in cells
         if str(cell["valid_at"]) in writable[int(cell["site_id"])]
     ]
-    logger.info(
-        "import: consensus rebuild kept %d cells, skipped %d on days that"
-        " take no writes",
-        len(kept),
-        len(cells) - len(kept),
-    )
+    if daily_close_on(conn):
+        logger.info(
+            "import: consensus rebuild kept %d cells, skipped %d on days that"
+            " take no writes",
+            len(kept),
+            len(cells) - len(kept),
+        )
     for cell in kept:
         materialize_consensus(
             conn,
