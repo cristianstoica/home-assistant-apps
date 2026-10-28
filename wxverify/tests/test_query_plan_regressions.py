@@ -1538,3 +1538,47 @@ def test_candidate_pairs_sql_site_scoped_does_not_rowid_seek() -> None:
     plan = _plan(conn, _CANDIDATE_PAIRS_SQL + " AND fs.site_id = ?", (1,))
     fs_line = _fs_row(plan)
     assert fs_line != "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)", plan
+
+
+def test_open_day_clause_seeks_idx_site_days_writable() -> None:
+    """QP1 (daily-close plan §16): ``open_day_clause``'s correlated
+    ``site_days`` lookup must seek the partial index
+    ``idx_site_days_writable``, not scan ``site_days``. No
+    ``WXV_EQP_SHIPPING`` skip -- plan §16 requires this pin in both the
+    7-gate suite and the shipping-sqlite CI job.
+
+    Imported inside the test body, not at module top, so the rest of this
+    file's tests keep collecting while ``wxverify.db.site_days`` does not
+    exist yet.
+    """
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY, open_day_clause
+
+    conn = _fresh_conn()
+    wxverify.db.runtime_state.set_runtime_state(
+        conn, DAILY_CLOSE_ON_KEY, "2024-06-10T00:00:00Z"
+    )
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanOpenDay', 40, -105, 900, 'UTC')"
+        ).lastrowid
+    )
+    conn.execute(
+        "INSERT INTO observations (site_id, variable, valid_at, value,"
+        " n_stations) VALUES (?, 'temperature', '2024-06-10T06:00:00Z', 1.0, 1)",
+        (site_id,),
+    )
+
+    clause = open_day_clause(
+        conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
+    )
+    sql = f"SELECT 1 FROM observations WHERE {clause}"
+    plan = _plan(conn, sql, ())
+    assert any(
+        "site_days" in line and "USING INDEX idx_site_days_writable" in line
+        for line in plan
+    ), plan
+
+    conn.execute("DROP INDEX idx_site_days_writable")
+    with pytest.raises(sqlite3.OperationalError, match="no such index"):
+        conn.execute(sql).fetchone()
