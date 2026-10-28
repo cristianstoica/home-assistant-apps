@@ -9,6 +9,8 @@ import json
 import logging
 import sqlite3
 import sys
+from dataclasses import dataclass
+from datetime import date, timedelta
 from typing import Any, NoReturn, cast
 
 import uvicorn
@@ -21,11 +23,18 @@ from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.options import load_runtime_config
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db, init_db
 from wxverify.db.queue import (
     count_failed_jobs_older_than,
     enqueue_if_absent,
     purge_failed_jobs_older_than,
+)
+from wxverify.db.site_days import (
+    DayStateError,
+    daily_close_on,
+    day_record,
+    enter_zone_change,
 )
 from wxverify.db.tz_generations import (
     apply_prospective_change,
@@ -190,7 +199,9 @@ def _build_parser() -> argparse.ArgumentParser:
     tz_change = timezone_sub.add_parser("change")
     tz_change.add_argument("--site-id", type=int, required=True)
     tz_change.add_argument("--timezone", required=True)
-    tz_change.add_argument("--effective-from", required=True)
+    # Not required here: whether it may or must be given depends on the daily
+    # close, which the command reads in its write transaction.
+    tz_change.add_argument("--effective-from")
     tz_change.add_argument("--json", action="store_true")
     return parser
 
@@ -475,12 +486,55 @@ def _timezone_correct(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclass(frozen=True, slots=True)
+class _ZoneChangeEntered:
+    """A zone change entered while the daily close is on."""
+
+    changeover_date: date | None
+    first_full_day: date
+
+
+def _enter_zone_change(
+    conn: sqlite3.Connection, site_id: int, timezone: str
+) -> _ZoneChangeEntered:
+    """Enter the change from the next full local day, in the caller's txn.
+
+    ``enter_zone_change`` returns C. When C is a changeover day, C+1 is the
+    first full day under the new zone; otherwise C is.
+    """
+    change_date = enter_zone_change(conn, site_id, timezone, now_utc=utc_now())
+    record = day_record(conn, site_id, change_date)
+    if record is None:
+        raise RuntimeError(f"day {change_date.isoformat()} missing after the change")
+    if record.zone_changeover:
+        return _ZoneChangeEntered(
+            changeover_date=change_date,
+            first_full_day=change_date + timedelta(days=1),
+        )
+    return _ZoneChangeEntered(changeover_date=None, first_full_day=change_date)
+
+
 def _timezone_change(args: argparse.Namespace) -> int:
     site_id = int(args.site_id)
     timezone = str(args.timezone)
-    effective_from = str(args.effective_from)
+    effective_from: str | None = (
+        None if args.effective_from is None else str(args.effective_from)
+    )
 
-    def _write(conn: sqlite3.Connection) -> dict[str, object]:
+    def _write(conn: sqlite3.Connection) -> dict[str, object] | _ZoneChangeEntered:
+        # The daily close is read inside this write transaction, so the path
+        # taken and the write it makes see the same state.
+        if daily_close_on(conn):
+            if effective_from is not None:
+                raise ValueError(
+                    "a zone change applies from the next full local day; "
+                    "leave out --effective-from"
+                )
+            return _enter_zone_change(conn, site_id, timezone)
+        if effective_from is None:
+            raise ValueError(
+                "--effective-from is required while the daily close is off"
+            )
         previous_id = ensure_published_generation(conn, site_id)
         previous = conn.execute(
             "SELECT timezone, effective_from FROM timezone_generations WHERE id = ?",
@@ -510,8 +564,30 @@ def _timezone_change(args: argparse.Namespace) -> int:
 
     try:
         result = get_db().write_sync(_write)
-    except ValueError as exc:
+    except (ValueError, DayStateError) as exc:
         return _timezone_error(str(exc), json_output=bool(args.json))
+    if isinstance(result, _ZoneChangeEntered):
+        changeover = (
+            None
+            if result.changeover_date is None
+            else result.changeover_date.isoformat()
+        )
+        first_full_day = result.first_full_day.isoformat()
+        if args.json:
+            _print_json(
+                {
+                    "site_id": site_id,
+                    "timezone": timezone,
+                    "changeover_date": changeover,
+                    "first_full_day": first_full_day,
+                }
+            )
+            return 0
+        print(f"zone change entered site={site_id} timezone={timezone}")
+        if changeover is not None:
+            print(f"  changeover date: {changeover}")
+        print(f"  first full day under the new zone: {first_full_day}")
+        return 0
     if args.json:
         _print_json(result)
         return 0
