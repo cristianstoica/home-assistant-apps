@@ -836,6 +836,34 @@ def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
     raise ApiError(422, f"not a table: {table}")
 
 
+def _guarded_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    """The lowercased column names of guarded ``table``; empty when absent.
+
+    For a check of a column a later release added to an existing table: a
+    file from before that release has the table without the column, and the
+    open migrates it, so there is no value to check. The table is confirmed
+    by ``_guarded_table_present`` first. The names come from the PRAGMA
+    statement ``main.table_xinfo``, never the table-valued form, for the
+    reason ``_guarded_table_present`` gives for ``table_list``; ``table_xinfo``
+    also lists generated columns, which a ``SELECT`` reads like any other.
+    SQLite matches column names ASCII-case-insensitively, so the names are
+    lowercased. ``table`` is always a code-owned name.
+    """
+    if not _guarded_table_present(conn, table):
+        return set()
+    literal = "'" + table.replace("'", "''") + "'"
+    try:
+        cursor = conn.execute(f"PRAGMA main.table_xinfo({literal})")
+        columns = [column[0] for column in cursor.description or ()]
+        if "name" not in columns:
+            # Routed to the same invalid-database refusal as any other error.
+            raise sqlite3.DatabaseError("PRAGMA table_xinfo returned no name")
+        name_at = columns.index("name")
+        return {str(name_row[name_at]).lower() for name_row in cursor}
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+
+
 def _flag_invalid_utf8(raw: bytes) -> object:
     """A text factory that marks undecodable text instead of raising.
 
@@ -898,6 +926,11 @@ def _is_canonical_date(value: object) -> bool:
         return date.fromisoformat(value).isoformat() == value
     except ValueError:
         return False
+
+
+def _is_null_or_canonical_date(value: object) -> bool:
+    """Whether ``value`` is NULL or a canonical ``YYYY-MM-DD`` date."""
+    return value is None or _is_canonical_date(value)
 
 
 def _is_canonical_micro_stamp(value: object) -> bool:
@@ -1062,6 +1095,28 @@ def _validate_upload(tmp: Path) -> None:
                 _is_canonical_micro_stamp,
                 f"invalid timestamp in {table}.{column}: "
                 "expected UTC form YYYY-MM-DDTHH:MM:SS.ffffffZ",
+            )
+        # The raw readings' two nullable columns, checked on their own because
+        # the stamp check above refuses NULL. A file from before 0.16.14 has
+        # the table without them, and the open rebuilds it, so each check is
+        # skipped when its column is absent as well as when the table is.
+        raw_columns = _guarded_column_names(conn, "station_wind_records")
+        if "fetched_at" in raw_columns:
+            _refuse_bad_values(
+                conn,
+                "station_wind_records",
+                "fetched_at",
+                _is_null_or_canonical_stamp,
+                "invalid timestamp in station_wind_records.fetched_at: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+            )
+        if "local_date" in raw_columns:
+            _refuse_bad_values(
+                conn,
+                "station_wind_records",
+                "local_date",
+                _is_null_or_canonical_date,
+                "invalid date in station_wind_records.local_date: expected YYYY-MM-DD",
             )
     finally:
         conn.close()

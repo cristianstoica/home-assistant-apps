@@ -1096,9 +1096,10 @@ def _persist_day(
     )
     conn.executemany(
         """
-        INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)
-        VALUES (?, ?, ?)
-        ON CONFLICT(station_id, obs_at) DO UPDATE SET speed_kmh=excluded.speed_kmh
+        INSERT INTO station_wind_records (station_id, obs_at, source, speed_kmh)
+        VALUES (?, ?, 'five_minute', ?)
+        ON CONFLICT(station_id, obs_at, source)
+            DO UPDATE SET speed_kmh=excluded.speed_kmh
         """,
         [
             (station_id, instant, record.speed_kmh)

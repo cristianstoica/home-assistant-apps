@@ -700,8 +700,8 @@ def test_lr8_delete_is_a_retire_not_an_erase(
                 computed_at=None,
             )
             conn.execute(
-                "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-                " VALUES (?, ?, ?)",
+                "INSERT INTO station_wind_records (station_id, obs_at, source,"
+                " speed_kmh) VALUES (?, ?, 'five_minute', ?)",
                 (b_id, lr8_valid_at, lr8_wind_speed),
             )
             conn.execute(

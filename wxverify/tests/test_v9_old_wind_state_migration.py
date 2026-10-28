@@ -171,9 +171,9 @@ def test_d18_v9_step_drops_legacy_hours_matching_a_fresh_database() -> None:
         assert after_row["updated_at"] == before_row["updated_at"]
 
     row = conn.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == TARGET_USER_VERSION == 11, (
-        "mutant -> at this assertion: correct = user_version 10, mutant"
-        " (TARGET_USER_VERSION left at 9) = user_version 9"
+    assert int(row[0]) == TARGET_USER_VERSION == 12, (
+        "mutant -> at this assertion: correct = user_version 12, mutant"
+        " (TARGET_USER_VERSION left at 11) = user_version 11"
     )
 
     empty = sqlite3.connect(":memory:")
@@ -274,7 +274,7 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
     for key in (*_KEPT_KEYS, *_DECOY_KEYS):
         assert key in after_column_first
     row = column_already_dropped.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 11
+    assert int(row[0]) == 12
 
     caplog.clear()
     keys_already_deleted = _v8_fixture_conn()
@@ -317,6 +317,15 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
         " removed) = a line logged anyway"
     )
     row = both_already_done.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 11
+    assert int(row[0]) == 12
     assert _all_runtime_state(both_already_done) == before_keys
-    assert _wind_days_rows(both_already_done) == before_rows
+    before_columns = before_rows[0].keys()
+    after_rows = _wind_days_rows(both_already_done)
+    before_restricted = [{col: r[col] for col in before_columns} for r in before_rows]
+    after_restricted = [{col: r[col] for col in before_columns} for r in after_rows]
+    assert after_restricted == before_restricted, (
+        "mutant -> at this assertion: correct = every pre-existing column"
+        " unchanged when both halves already ran, mutant (a migration step"
+        " altering an existing station_wind_days value) = a restricted row"
+        " diverges from its before-snapshot"
+    )

@@ -772,8 +772,8 @@ def _make_valid_upload_db(path: Path, *, obs_at: str) -> None:
     site_id = _seed_site(conn)
     station_id = _seed_enabled_station(conn, site_id, "WSTATION01")
     conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, 7.2)",
+        "INSERT INTO station_wind_records (station_id, obs_at, source,"
+        " speed_kmh) VALUES (?, ?, 'five_minute', 7.2)",
         (station_id, obs_at),
     )
     conn.commit()

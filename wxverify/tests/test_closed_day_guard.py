@@ -644,8 +644,8 @@ def test_gw6_derive_days_does_not_rewrite_or_delete_a_done_days_wind_rows(
     # unguarded write would change it.
     write_hour = f"{d2.isoformat()}T15:00:00Z"
     conn.executemany(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, ?)",
+        "INSERT INTO station_wind_records (station_id, obs_at, source,"
+        " speed_kmh) VALUES (?, ?, 'five_minute', ?)",
         [
             (station_a, write_hour, 10.0),
             (station_a, f"{d2.isoformat()}T15:05:00Z", 20.0),

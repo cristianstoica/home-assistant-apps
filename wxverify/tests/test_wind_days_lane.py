@@ -693,8 +693,8 @@ def _t143_insert_records(conn: sqlite3.Connection, station_id: int) -> None:
         rows.append((station_id, isoformat_utc(t), 40.0 if t in hot else 5.0))
         t += timedelta(minutes=5)
     conn.executemany(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, ?)",
+        "INSERT INTO station_wind_records (station_id, obs_at, source,"
+        " speed_kmh) VALUES (?, ?, 'five_minute', ?)",
         rows,
     )
     conn.commit()
@@ -1160,8 +1160,8 @@ def test_persist_day_refetch_partial_response_keeps_stored_record_count() -> Non
     start = datetime(2026, 3, 5, 0, 0, 0, tzinfo=UTC)
     # Pre-seed 280 records already stored from the ORIGINAL fetch.
     conn.executemany(
-        "INSERT OR IGNORE INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO station_wind_records (station_id, obs_at,"
+        " source, speed_kmh) VALUES (?, ?, 'five_minute', ?)",
         [
             (
                 station_id,
@@ -2394,8 +2394,8 @@ def test_finish_gate_is_an_allowlist() -> None:
     conn, site_id, station_id = _setup()
     _insert_day(conn, station_id, yesterday, status="partial")
     conn.execute(
-        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-        " VALUES (?, ?, 5.0)",
+        "INSERT INTO station_wind_records (station_id, obs_at, source,"
+        " speed_kmh) VALUES (?, ?, 'five_minute', 5.0)",
         (station_id, isoformat_utc(start + timedelta(hours=1))),
     )
     conn.commit()
@@ -2855,8 +2855,8 @@ def test_finish_exception_marks_the_row_and_the_step_moves_on(
             record_count=1,
         )
         conn.execute(
-            "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
-            " VALUES (?, ?, 1.0)",
+            "INSERT INTO station_wind_records (station_id, obs_at, source,"
+            " speed_kmh) VALUES (?, ?, 'five_minute', 1.0)",
             (station_id, isoformat_utc(start + timedelta(hours=1))),
         )
         _insert_day(

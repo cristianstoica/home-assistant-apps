@@ -29,7 +29,7 @@ from wxverify.db.tz_generations import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 11
+TARGET_USER_VERSION = 12
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -101,8 +101,19 @@ def create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS station_wind_records (
             station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
             obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
-            speed_kmh REAL NOT NULL CHECK (speed_kmh >= 0),
-            PRIMARY KEY (station_id, obs_at)
+            source TEXT NOT NULL
+                CHECK (source IN ('five_minute','current_obs','hourly')),
+            -- the reading's own local date, YYYY-MM-DD
+            local_date TEXT,
+            speed_kmh REAL CHECK (speed_kmh IS NULL OR speed_kmh >= 0),
+            temp_c REAL,
+            precip_total_mm REAL
+                CHECK (precip_total_mm IS NULL OR precip_total_mm >= 0),
+            -- canonical; NULL for rows from before 0.16.14
+            fetched_at TEXT,
+            CHECK (speed_kmh IS NOT NULL OR temp_c IS NOT NULL
+                   OR precip_total_mm IS NOT NULL),
+            PRIMARY KEY (station_id, obs_at, source)
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS station_wind_days (
@@ -121,6 +132,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             refetch_at TEXT,                 -- reconcile refetch due time
             refetched INTEGER NOT NULL DEFAULT 0 CHECK (refetched IN (0, 1)),
             updated_at TEXT NOT NULL,
+            refused_at TEXT,
             PRIMARY KEY (station_id, local_date)
         );
 
@@ -1328,6 +1340,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 11:
         logger.debug("migrations applying v11 daily-close days")
         migrate_v11_daily_close_days(conn)
+    if current < 12:
+        logger.debug("migrations applying v12 widened raw readings")
+        migrate_v12_widen_raw_readings(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1959,6 +1974,109 @@ def migrate_v11_daily_close_days(conn: sqlite3.Connection) -> None:
             "changed_at": isoformat_utc_micro(utc_now()),
         },
     )
+
+
+def migrate_v12_widen_raw_readings(conn: sqlite3.Connection) -> None:
+    """Widen ``station_wind_records`` and add ``station_wind_days.refused_at``.
+
+    ``station_wind_records`` becomes the one table of raw station readings:
+    wind, temperature and the rain running total, from the 5-minute
+    download, the current-conditions poll and the hourly download. SQLite
+    cannot drop ``speed_kmh``'s ``NOT NULL`` with ``ALTER TABLE``, and
+    ``source`` joins the ``WITHOUT ROWID`` primary key, so the table is
+    rebuilt in :func:`create_tables`' shape. Every existing row is copied
+    with ``source`` ``'five_minute'`` and its speed, the new columns NULL;
+    nothing is backfilled. ``refused_at`` (NULL) is the latest time a
+    5-minute try for the station-day was held or refused.
+
+    Steps, all inside one savepoint, following :func:`migrate_v4`:
+
+    1. the re-run guard: the rebuild is skipped when ``station_wind_records``
+       already has ``source`` -- a fresh file :func:`create_tables` made, or
+       a rebuild already committed. ``run_migrations`` writes ``PRAGMA
+       user_version`` only after this returns, so a crash in between leaves
+       user_version below 12 and the next boot re-enters the ``current < 12``
+       gate;
+    2. the rebuild (:func:`_rebuild_station_wind_records`);
+    3. ``ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT`` when the
+       column is absent. On a fresh file :func:`create_tables` made it, last
+       among the columns, so a fresh and a migrated database agree on column
+       order.
+
+    As in :func:`record_precip_hour_start_boundary`, the savepoint is the
+    whole transaction on the writer, and the in_transaction check covers an
+    error that has already ended it. Any failure, a failed foreign key check
+    included, rolls every step back and is re-raised, so the open fails
+    before the ``user_version`` write and the next open retries. One INFO
+    line is logged only when the table was rebuilt.
+    """
+    started = time.perf_counter()
+    copied: int | None = None
+    conn.execute("SAVEPOINT migrate_v12")
+    try:
+        if "source" not in _table_columns(conn, "station_wind_records"):
+            copied = _rebuild_station_wind_records(conn)
+        if "refused_at" not in _table_columns(conn, "station_wind_days"):
+            conn.execute("ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_v12")
+            conn.execute("RELEASE migrate_v12")
+        raise
+    conn.execute("RELEASE migrate_v12")
+    if copied is not None:
+        logger.info(
+            "station_wind_records rebuilt for version 12: %d rows copied, %d ms",
+            copied,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+
+def _rebuild_station_wind_records(conn: sqlite3.Connection) -> int:
+    """Rebuild ``station_wind_records`` in the widened shape.
+
+    Step 2 of :func:`migrate_v12_widen_raw_readings`, run inside its
+    savepoint. The new table's statement must stay identical to the one in
+    :func:`create_tables` but for the name and ``IF NOT EXISTS``, indentation
+    included, so a rebuilt and a fresh table agree column for column. No
+    table references ``station_wind_records``, so the drop and the rename
+    touch no other table's keys. Raises ``RuntimeError`` when ``PRAGMA
+    foreign_key_check`` then reports any row. Returns the rows copied.
+    """
+    conn.execute(
+        """
+        CREATE TABLE station_wind_records_v12 (
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
+            source TEXT NOT NULL
+                CHECK (source IN ('five_minute','current_obs','hourly')),
+            -- the reading's own local date, YYYY-MM-DD
+            local_date TEXT,
+            speed_kmh REAL CHECK (speed_kmh IS NULL OR speed_kmh >= 0),
+            temp_c REAL,
+            precip_total_mm REAL
+                CHECK (precip_total_mm IS NULL OR precip_total_mm >= 0),
+            -- canonical; NULL for rows from before 0.16.14
+            fetched_at TEXT,
+            CHECK (speed_kmh IS NOT NULL OR temp_c IS NOT NULL
+                   OR precip_total_mm IS NOT NULL),
+            PRIMARY KEY (station_id, obs_at, source)
+        ) WITHOUT ROWID
+        """
+    )
+    copied = conn.execute(
+        "INSERT INTO station_wind_records_v12 (station_id, obs_at, source, speed_kmh)"
+        " SELECT station_id, obs_at, 'five_minute', speed_kmh"
+        " FROM station_wind_records"
+    ).rowcount
+    conn.execute("DROP TABLE station_wind_records")
+    conn.execute("ALTER TABLE station_wind_records_v12 RENAME TO station_wind_records")
+    violation = conn.execute(
+        "PRAGMA foreign_key_check(station_wind_records)"
+    ).fetchone()
+    if violation is not None:
+        raise RuntimeError("station_wind_records rebuild failed its foreign key check")
+    return copied
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
