@@ -656,16 +656,18 @@ def day_close_site(
     timezone: str = "UTC",
     close_on: bool = True,
     with_records: bool = True,
+    station_ids: tuple[str, str] = (_DAY_CLOSE_STATION_A, _DAY_CLOSE_STATION_B),
 ) -> int:
     """Build the daily-close plan's shared fixture site (plan §13.1).
 
-    Makes a site under ``timezone`` with two enabled stations, A
-    (``ISTATION01``) and B (``ISTATION02``), each seeded with an ``added``
-    station_changes row dated D-10 (``reason="test_seed"``). With
-    ``close_on``, sets ``DAILY_CLOSE_ON_KEY``. With ``with_records``, also
-    starts the site at D-3 and fills through its next local date, then moves
-    D-3 to ``closed`` and D-2 to ``missed`` (``never_attempted``), each 30
-    minutes after that day's own ``day_end_utc``.
+    Makes a site under ``timezone`` with two enabled stations, A and B,
+    defaulting to ``ISTATION01`` and ``ISTATION02`` (override with
+    ``station_ids``), each seeded with an ``added`` station_changes row
+    dated D-10 (``reason="test_seed"``). With ``close_on``, sets
+    ``DAILY_CLOSE_ON_KEY``. With ``with_records``, also starts the site at
+    D-3 and fills through its next local date, then moves D-3 to
+    ``closed`` and D-2 to ``missed`` (``never_attempted``), each 30 minutes
+    after that day's own ``day_end_utc``.
     """
     # wxverify.db.site_days arrives in Step 4 piece 2 of the daily-close
     # plan; importing it inside this function body, rather than at module
@@ -688,7 +690,7 @@ def day_close_site(
     seed_changed_at = isoformat_utc_micro(
         datetime(D.year, D.month, D.day, tzinfo=UTC) - timedelta(days=10)
     )
-    for pws_id in (_DAY_CLOSE_STATION_A, _DAY_CLOSE_STATION_B):
+    for pws_id in station_ids:
         cur = conn.execute(
             """
             INSERT INTO stations

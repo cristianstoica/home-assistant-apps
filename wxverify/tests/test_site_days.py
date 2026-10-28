@@ -1657,6 +1657,47 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=False, with_records=False)
     ensure_site_days(conn, site_id, now_utc=NOW)
+
+    for kind in _ALL_KINDS:
+        expected = kind in (
+            WriteKind.READING,
+            WriteKind.HOURLY,
+            WriteKind.TRUTH,
+            WriteKind.PAIRS,
+        )
+        assert (
+            check_day_write(conn, site_id, isoformat_utc(NOW), kind, now_utc=NOW)
+            is expected
+        )
+        assert (
+            check_day_write(conn, site_id, "not-an-instant", kind, now_utc=NOW)
+            is expected
+        )
+        assert check_date_write(conn, site_id, D, kind, now_utc=NOW) is expected
+        assert filter_day_writes(
+            conn,
+            site_id,
+            (isoformat_utc(NOW), "not-an-instant"),
+            kind,
+            now_utc=NOW,
+        ) == (
+            frozenset({isoformat_utc(NOW), "not-an-instant"})
+            if expected
+            else frozenset()
+        )
+
+    assert writable_pairs_clause(conn, site_id, now_utc=NOW) == "1"
+    assert (
+        open_day_clause(
+            conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
+        )
+        == "1"
+    )
+
+    # Asserted last: every call above, including the guard functions, must
+    # have created no record while the close stayed off (M45r: a guard that
+    # runs ``_ensure`` before checking ``daily_close_on`` would have created
+    # them during the loop, not during ``ensure_site_days`` above).
     assert (
         conn.execute(
             "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
@@ -1676,43 +1717,32 @@ def test_ds20_close_off_site_takes_no_write_but_table_tables_stay_empty() -> Non
         == 0
     )
 
-    for kind in _ALL_KINDS:
-        expected = kind in (
-            WriteKind.READING,
-            WriteKind.HOURLY,
-            WriteKind.TRUTH,
-            WriteKind.PAIRS,
-        )
-        assert (
-            check_day_write(conn, site_id, isoformat_utc(NOW), kind, now_utc=NOW)
-            is expected
-        )
-        assert (
-            check_day_write(conn, site_id, "not-an-instant", kind, now_utc=NOW)
-            is expected
-        )
-
-    assert writable_pairs_clause(conn, site_id, now_utc=NOW) == "1"
-    assert (
-        open_day_clause(
-            conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
-        )
-        == "1"
-    )
-
 
 def test_ds21_open_day_clause_per_site_and_validation() -> None:
     conn = asof_conn()
     site_a = day_close_site(conn)
-    site_b_conn = asof_conn()
-    site_b_conn.close()
-    asof_make_site(conn, "second-open-day-site")
-    # second-open-day-site stays close-off; only site_a has records.
+    site_b = day_close_site(conn, station_ids=("ISTATION03", "ISTATION04"))
+    d_minus_1 = D - timedelta(days=1)
+
+    # site_a's D-1: open -> closing (stays there).
+    begin_close(conn, site_a, d_minus_1, now_utc=NOW)
+    # site_b's D-1: open -> closing -> retry_due, so the same local date is
+    # "open" (closing counts, per open_day_clause's docstring) on site_a and
+    # not open on site_b -- a clause that ignores the site, or one that
+    # treats retry_due as open, would select site_b's row too.
+    begin_close(conn, site_b, d_minus_1, now_utc=NOW)
+    fail_close(conn, site_b, d_minus_1, now_utc=NOW, reason="x")
 
     clause = open_day_clause(conn, site_expr="o.site_id", instant_expr="o.valid_at")
     for site_id, local_date, expect_open in (
         (site_a, D - timedelta(days=3), False),  # closed
-        (site_a, D - timedelta(days=1), True),  # open
+        (site_a, D - timedelta(days=2), False),  # missed
+        (site_a, d_minus_1, True),  # closing
+        (site_a, D, True),  # open
+        (site_b, D - timedelta(days=3), False),  # closed
+        (site_b, D - timedelta(days=2), False),  # missed
+        (site_b, d_minus_1, False),  # retry_due
+        (site_b, D, True),  # open
     ):
         instant = isoformat_utc(
             datetime(local_date.year, local_date.month, local_date.day, 6, tzinfo=UTC)

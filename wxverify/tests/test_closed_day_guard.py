@@ -43,6 +43,7 @@ from tests.helpers import (
 )
 from wxverify import config
 from wxverify.api.app import create_app
+from wxverify.api.routes import db_transfer
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import Job
@@ -624,14 +625,37 @@ def test_gw6_derive_days_does_not_rewrite_or_delete_a_done_days_wind_rows(
     _insert_wind_day(conn, station_a, d2, status="fetched")
     _insert_wind_day(conn, station_a, d1, status="partial")
 
-    d2_hour = f"{d2.isoformat()}T12:00:00Z"
-    insert_station_observation(
-        conn,
-        station_id=station_a,
-        variable="wind",
-        valid_at=d2_hour,
-        value=2.5,
-        source_raw="pair-max 9.0 km/h",
+    # Seeded with direct SQL, never through a guarded writer: these rows
+    # simulate data already on the (now closed) day before the close took
+    # effect, which the guard must still protect.
+    #
+    # A D-2 hour with no raw station_wind_records anywhere near it: no pair
+    # can form, so this row is a delete_hours candidate -- the unguarded
+    # per-hour DELETE in _derive_days would remove it.
+    delete_hour = f"{d2.isoformat()}T09:00:00Z"
+    conn.execute(
+        "INSERT INTO station_observations"
+        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
+        " VALUES (?, 'wind', ?, 2.5, 'ok', 'pair-max 9.0 km/h', ?)",
+        (station_a, delete_hour, isoformat_utc(NOW)),
+    )
+    # A D-2 hour whose raw records WOULD pair to 15.0 km/h: a write_hours
+    # candidate. The stored row below is a different value (1.0), so an
+    # unguarded write would change it.
+    write_hour = f"{d2.isoformat()}T15:00:00Z"
+    conn.executemany(
+        "INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)"
+        " VALUES (?, ?, ?)",
+        [
+            (station_a, write_hour, 10.0),
+            (station_a, f"{d2.isoformat()}T15:05:00Z", 20.0),
+        ],
+    )
+    conn.execute(
+        "INSERT INTO station_observations"
+        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
+        " VALUES (?, 'wind', ?, 1.0, 'ok', 'pair-max 1.0 km/h', ?)",
+        (station_a, write_hour, isoformat_utc(NOW)),
     )
     conn.commit()
     before_d2_wind = _rows(
@@ -666,6 +690,13 @@ def test_gw6_derive_days_does_not_rewrite_or_delete_a_done_days_wind_rows(
     assert hits[0]["kind"] == "HOURLY"
     assert hits[0]["site"] == str(site_id)
     assert hits[0]["days"] == d2.isoformat()
+    # _derive_hours for a non-"today" day returns the full local day
+    # (_day_hours over a 24h window; today=D here, so neither D-2 nor D-1
+    # is "today"), and D-2 is 'closed' so table 5.2 refuses every one of
+    # its 24 hours regardless of which fall in write_hours or
+    # delete_hours; D-1's 24 are allowed (it is 'open'), so they are not
+    # counted here.
+    assert hits[0]["count"] == "24"
 
 
 def test_gw7_reconcile_does_not_schedule_a_refetch_for_a_done_day(
@@ -1536,9 +1567,9 @@ def test_gw12_rebuild_mean_for_site_leaves_closed_days_mean_alone(
 def test_gw13_import_of_a_close_on_file_rebuilds_only_the_open_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    conn = _init_tmp_db(tmp_path)
     from tests.helpers import asof_make_site
 
+    conn = _init_tmp_db(tmp_path)
     asof_make_site(conn, "Pre Import Site")
     conn.commit()
 
@@ -1546,36 +1577,198 @@ def test_gw13_import_of_a_close_on_file_rebuilds_only_the_open_day(
     b_db = Database(str(b_path))
     try:
         site_b = day_close_site(b_db._conn)  # noqa: SLF001
+        station_a = _station_id(b_db._conn, site_b, _STATION_A)  # noqa: SLF001
+        station_b = _station_id(b_db._conn, site_b, _STATION_B)  # noqa: SLF001
+        d3, d1 = _d3(), _d1()
+        feed_id = asof_make_real_feed(b_db._conn, "gw13-model")  # noqa: SLF001
+        generation_id = ensure_published_generation(  # noqa: SLF001
+            b_db._conn, site_b
+        )
+        d3_hour = f"{d3.isoformat()}T12:00:00Z"
+        # D-3 (closed): a pair, an observation and a truth row, exactly as a
+        # pre-cutover file would carry them.
+        asof_insert_pair(
+            b_db._conn,  # noqa: SLF001
+            site_id=site_b,
+            feed_id=feed_id,
+            valid_at=d3_hour,
+            issued_at=d3_hour,
+            forecast=5.0,
+            observed=4.0,
+            first_known_at=d3_hour,
+            generation_id=generation_id,
+        )
+        b_db._conn.execute(  # noqa: SLF001
+            "INSERT INTO observations"
+            " (site_id, variable, valid_at, value, n_stations, rejected_stations,"
+            " computed_at)"
+            " VALUES (?, 'temperature', ?, 4.0, 1, 0, ?)",
+            (site_b, d3_hour, d3_hour),
+        )
+        b_db._conn.execute(  # noqa: SLF001
+            """
+            INSERT INTO daily_truth
+                (site_id, local_date, quantity, value, eligible, covered_hours,
+                 expected_slots, day_start_utc, day_end_utc, timezone,
+                 tz_generation_id)
+            VALUES (?, ?, 'temperature_high', 10.0, 1, 24, 24, ?, ?, 'UTC', ?)
+            """,
+            (
+                site_b,
+                d3.isoformat(),
+                f"{d3.isoformat()}T00:00:00Z",
+                f"{(d3 + timedelta(days=1)).isoformat()}T00:00:00Z",
+                generation_id,
+            ),
+        )
+        # D-1 (open): raw station readings the rebuild turns into one
+        # consensus observation.
+        d1_hour = f"{d1.isoformat()}T12:00:00Z"
+        for station_id, value in ((station_a, 10.0), (station_b, 12.0)):
+            b_db._conn.execute(  # noqa: SLF001
+                "INSERT INTO station_observations"
+                " (station_id, variable, valid_at, value, qc_flag, source_raw,"
+                " fetched_at)"
+                " VALUES (?, 'temperature', ?, ?, 'ok', 'synthetic-gw13', ?)",
+                (station_id, d1_hour, value, d1_hour),
+            )
         b_db._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # noqa: SLF001
         b_db._conn.commit()  # noqa: SLF001
     finally:
         b_db.close()
+
+    start, end = _day_bounds(d3)
+    direct_b = sqlite3.connect(str(b_path))
+    direct_b.row_factory = sqlite3.Row
+    try:
+        file_b_pairs = _rows(
+            direct_b,
+            "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at>=?"
+            " AND valid_at<? ORDER BY feed_id, variable, valid_at",
+            (site_b, start, end),
+        )
+        file_b_obs = _rows(
+            direct_b,
+            "SELECT * FROM observations WHERE site_id=? AND valid_at>=?"
+            " AND valid_at<? ORDER BY variable, valid_at",
+            (site_b, start, end),
+        )
+        file_b_truth = _rows(
+            direct_b,
+            "SELECT * FROM daily_truth WHERE site_id=? AND local_date=?"
+            " ORDER BY quantity",
+            (site_b, d3.isoformat()),
+        )
+    finally:
+        direct_b.close()
+    assert file_b_pairs and file_b_obs and file_b_truth  # non-vacuous
     payload = b_path.read_bytes()
 
+    def _assert_rebuilt(db_path: str) -> None:
+        direct = sqlite3.connect(db_path)
+        direct.row_factory = sqlite3.Row
+        try:
+            after_pairs = _rows(
+                direct,
+                "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at>=?"
+                " AND valid_at<? ORDER BY feed_id, variable, valid_at",
+                (site_b, start, end),
+            )
+            after_obs = _rows(
+                direct,
+                "SELECT * FROM observations WHERE site_id=? AND valid_at>=?"
+                " AND valid_at<? ORDER BY variable, valid_at",
+                (site_b, start, end),
+            )
+            after_truth = _rows(
+                direct,
+                "SELECT * FROM daily_truth WHERE site_id=? AND local_date=?"
+                " ORDER BY quantity",
+                (site_b, d3.isoformat()),
+            )
+            assert after_pairs == file_b_pairs, (
+                "D-3's pairs must be exactly file B's, not deleted or rebuilt"
+            )
+            assert after_obs == file_b_obs, "D-3's observations must survive"
+            assert after_truth == file_b_truth, "D-3's truth must survive"
+            d3_row = direct.execute(
+                "SELECT 1 FROM site_days"
+                " WHERE site_id=? AND local_date=? AND state='closed'",
+                (site_b, d3.isoformat()),
+            ).fetchone()
+            assert d3_row is not None, "D-3's close-state record must survive"
+            d1_obs = direct.execute(
+                "SELECT 1 FROM observations WHERE site_id=? AND variable='temperature'"
+                " AND valid_at=?",
+                (site_b, d1_hour),
+            ).fetchone()
+            assert d1_obs is not None, (
+                "D-1 must be rebuilt into a consensus observation"
+            )
+        finally:
+            direct.close()
+
+    # -- direct: the normal import, with its immediate background rebuild. --
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         headers = _csrf_headers(client)
         caplog.set_level(logging.INFO)
         resp = client.post("/api/import/db", content=payload, headers=headers)
         assert resp.status_code == 200
-
-    direct = sqlite3.connect(config.db_path)
-    try:
-        d3_row = direct.execute(
-            "SELECT 1 FROM site_days"
-            " WHERE site_id=? AND local_date=? AND state='closed'",
-            (site_b, _d3().isoformat()),
-        ).fetchone()
-        assert d3_row is not None, "D-3's close-state record must survive the import"
-    finally:
-        direct.close()
     _assert_no_guard_warning(caplog)
-    assert any(
-        record.levelno == logging.INFO
+    info_hits = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO
         and "kept" in record.getMessage()
         and "skipped" in record.getMessage()
-        for record in caplog.records
-    ), "one INFO line naming kept/skipped cell counts must be logged"
+    ]
+    assert len(info_hits) == 1, info_hits
+    counts = re.search(r"kept (\d+) cells, skipped (\d+)", info_hits[0])
+    assert counts is not None, info_hits[0]
+    # One cell on D-1 (both stations' readings collapse to the site's one
+    # temperature hour) is kept; D-3's own hand-planted observations cell is
+    # skipped, not refused -- the file's day states are final.
+    assert (counts.group(1), counts.group(2)) == ("1", "1"), info_hits[0]
+    _assert_rebuilt(config.db_path)
+
+    # -- resume: the same file, imported with its background rebuild
+    # suppressed, then picked up by the next boot (api/app.py's startup
+    # resume), following tests/test_db_transfer.py's
+    # test_boot_resumes_interrupted_import_rebuild. --
+    resume_dir = tmp_path / "resume"
+    resume_dir.mkdir()
+    conn2 = _init_tmp_db(resume_dir)
+    asof_make_site(conn2, "Pre Import Site")
+    conn2.commit()
+
+    async def _rebuild_derived_noop(_backup: Path) -> None:
+        return None
+
+    monkeypatch.setattr(db_transfer, "_rebuild_derived", _rebuild_derived_noop)
+    app1 = _make_app(monkeypatch)
+    with TestClient(app1) as client1:
+        headers1 = _csrf_headers(client1)
+        resp1 = client1.post("/api/import/db", content=payload, headers=headers1)
+        assert resp1.status_code == 200
+
+    direct_pending = sqlite3.connect(config.db_path)
+    try:
+        pending = direct_pending.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
+        ).fetchone()
+    finally:
+        direct_pending.close()
+    assert pending is not None and pending[0] == "pending", (
+        "setup check: the background rebuild must have been suppressed"
+    )
+
+    close_db()
+    app2 = _make_app(monkeypatch)
+    with TestClient(app2):
+        pass  # the lifespan's boot-resume runs the real rebuild here.
+
+    _assert_rebuilt(config.db_path)
 
 
 def test_gw14_import_of_a_close_off_file_rebuilds_exactly_as_today(
