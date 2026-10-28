@@ -20,6 +20,7 @@ import httpx
 
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.obs.config import RECENT_REFRESH_HOURS
+from wxverify.obs.hourly_values import Quantity, Source, StationReading
 from wxverify.obs.wind_pairs import WindRecord
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,8 @@ class CurrentObservation:
     to ``None`` (a NULL column), never a fabricated zero. ``obs_time_utc`` is the
     full-precision ISO-``Z`` instant from ``_obs_instant`` (never hour-floored),
     or ``None`` when the payload's timestamp is missing/unparseable.
+    ``local_date`` is the reading's own local date from ``obsTimeLocal``, or
+    ``None`` when the reply carries none.
     """
 
     obs_time_utc: str | None
@@ -71,6 +74,23 @@ class CurrentObservation:
     precip_total: float | None
     uv: float | None
     neighborhood: str | None
+    local_date: date | None = None
+
+
+@dataclass(frozen=True)
+class ParsedReadings:
+    """The readings of one payload, from ``readings_from_payload``.
+
+    ``readings`` are sorted by ``obs_at``; of two equal instants the first in
+    the payload is kept. ``dropped`` counts the items left out: no instant, no
+    valid value, or a repeat instant. ``unusable`` counts, per quantity, the
+    values present but rejected by ``reading_value`` (``null`` included) over
+    the items that have an instant; every quantity has a key, zero included.
+    """
+
+    readings: tuple[StationReading, ...]
+    dropped: int
+    unusable: dict[Quantity, int]
 
 
 PayloadErrorKind = Literal[
@@ -435,6 +455,33 @@ async def validate_station(
     )
 
 
+async def fetch_hourly_history_payload(
+    station_id: str, api_key: str, *, client: httpx.AsyncClient
+) -> dict[str, object]:
+    """One station's decoded 7-day hourly payload, nothing dropped by age.
+
+    The one request of the 7-day hourly product; ``fetch_hourly_history``
+    applies its age cutoff on top. Raises ``httpx.HTTPStatusError`` on a
+    non-2xx and ``UpstreamPayloadError`` on a 2xx without ``observations`` (a
+    204 included).
+    """
+    response = await _get_with_deadline(
+        client,
+        HOURLY_HISTORY_URL,
+        params={
+            "stationId": station_id,
+            "format": "json",
+            "units": "m",
+            "numericPrecision": "decimal",
+            "apiKey": api_key,
+        },
+        read_seconds=10.0,
+        backfill=False,
+    )
+    response.raise_for_status()
+    return decode_observations_payload(response, station_id=station_id)
+
+
 async def fetch_hourly_history(
     station_id: str,
     api_key: str,
@@ -453,27 +500,11 @@ async def fetch_hourly_history(
                 client=owned_client,
             )
     logger.debug("pws hourly_history request station=%s hours=%s", station_id, hours)
-    response = await _get_with_deadline(
-        client,
-        HOURLY_HISTORY_URL,
-        params={
-            "stationId": station_id,
-            "format": "json",
-            "units": "m",
-            "numericPrecision": "decimal",
-            "apiKey": api_key,
-        },
-        read_seconds=10.0,
-        backfill=False,
-    )
-    response.raise_for_status()
+    payload = await fetch_hourly_history_payload(station_id, api_key, client=client)
     cutoff = utc_now() - timedelta(hours=hours)
     observations = [
         observation
-        for observation in observations_from_payload(
-            decode_observations_payload(response, station_id=station_id),
-            timezone=timezone,
-        )
+        for observation in observations_from_payload(payload, timezone=timezone)
         if parse_utc(observation.valid_at) >= cutoff
     ]
     logger.debug(
@@ -690,6 +721,132 @@ def wind_records_from_payload(payload: dict[str, object]) -> list[WindRecord]:
     return records
 
 
+def reading_value(value: object, quantity: Quantity) -> float | None:
+    """One raw reading value checked on its own, else ``None``.
+
+    Accepts a real number or a numeric string that is finite; for ``precip``
+    and ``wind`` the value must also be at least 0. A bool, ``nan``, an
+    infinity, a non-numeric string, ``None`` or any other type gives ``None``.
+    The one check behind ``readings_from_payload`` and the poll's storage.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if quantity != "temperature" and number < 0:
+        return None
+    return number
+
+
+def _checked_metric(
+    metric: dict[str, object],
+    quantity: Quantity,
+    keys: tuple[str, ...],
+    unusable: dict[Quantity, int],
+) -> float | None:
+    """The first of ``keys`` whose value passes ``reading_value``, else ``None``.
+
+    An absent key is skipped. When no key gives a value but one is present,
+    the quantity's count in ``unusable`` goes up by one.
+    """
+    present = False
+    for key in keys:
+        if key not in metric:
+            continue
+        value = reading_value(metric[key], quantity)
+        if value is not None:
+            return value
+        present = True
+    if present:
+        unusable[quantity] += 1
+    return None
+
+
+def _reading_local_date(row: dict[str, object], *keys: str) -> date | None:
+    """The first valid date in ``keys`` of the item, else ``None``.
+
+    The same date match as ``_local_day_from_payload``; never derived from the
+    UTC instant.
+    """
+    for key in keys:
+        value = row.get(key)
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"(\d{4})-?(\d{2})-?(\d{2})", value)
+        if match is None:
+            continue
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            continue
+    return None
+
+
+def readings_from_payload(payload: object, *, source: Source) -> ParsedReadings:
+    """The raw readings of a decoded observations payload, an allowlist.
+
+    Each item is read on its own; a bad item drops only itself and nothing
+    raises. The instant is ``_wind_record_instant``'s, whole seconds; the
+    local date is ``obsTimeLocal``'s, then ``validTimeLocal``'s, else ``None``.
+    Temperature is ``metric.tempAvg``, then ``metric.temp``, never
+    ``tempHigh`` or ``tempLow``; rain is ``metric.precipTotal``, the running
+    total; wind is ``metric.windspeedAvg``. A present value that
+    ``reading_value`` rejects is ``None`` and counted in ``unusable``; an
+    absent field is ``None`` and not counted. Either leaves the reading's other
+    values; a reading with no valid value is dropped. Sorted and de-duplicated
+    as ``wind_records_from_payload`` is.
+    """
+    unusable: dict[Quantity, int] = {"temperature": 0, "precip": 0, "wind": 0}
+    if not isinstance(payload, dict):
+        return ParsedReadings(readings=(), dropped=0, unusable=unusable)
+    observations_obj = cast(dict[str, object], payload).get("observations")
+    if not isinstance(observations_obj, list):
+        return ParsedReadings(readings=(), dropped=0, unusable=unusable)
+    dropped = 0
+    parsed: list[StationReading] = []
+    for item in cast(list[object], observations_obj):
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        row = cast(dict[str, object], item)
+        obs_at = _wind_record_instant(row)
+        if obs_at is None:
+            dropped += 1
+            continue
+        metric_obj = row.get("metric")
+        metric: dict[str, object] = (
+            cast(dict[str, object], metric_obj) if isinstance(metric_obj, dict) else {}
+        )
+        temp_c = _checked_metric(metric, "temperature", ("tempAvg", "temp"), unusable)
+        precip_total_mm = _checked_metric(metric, "precip", ("precipTotal",), unusable)
+        speed_kmh = _checked_metric(metric, "wind", ("windspeedAvg",), unusable)
+        if temp_c is None and precip_total_mm is None and speed_kmh is None:
+            dropped += 1
+            continue
+        parsed.append(
+            StationReading(
+                obs_at=obs_at,
+                source=source,
+                local_date=_reading_local_date(row, "obsTimeLocal", "validTimeLocal"),
+                temp_c=temp_c,
+                precip_total_mm=precip_total_mm,
+                speed_kmh=speed_kmh,
+            )
+        )
+    parsed.sort(key=lambda reading: reading.obs_at)
+    readings: list[StationReading] = []
+    for reading in parsed:
+        if readings and readings[-1].obs_at == reading.obs_at:
+            dropped += 1
+            continue
+        readings.append(reading)
+    return ParsedReadings(readings=tuple(readings), dropped=dropped, unusable=unusable)
+
+
 def observations_from_payload(
     data: object, *, timezone: str | None = None
 ) -> list[PwsObservation]:
@@ -813,9 +970,10 @@ def _obs_instant(row: dict[str, object]) -> str | None:
 def current_obs_from_payload(data: object) -> CurrentObservation | None:
     """Map ``observations[0]`` of a ``/observations/current`` payload to columns.
 
-    Reads the top-level ``humidity``, ``winddir``, ``uv``, ``obsTimeUtc`` and
-    ``neighborhood`` alongside the ``metric`` sub-object (``temp``, ``windSpeed``,
-    ``windGust``, ``pressure``, ``precipRate``, ``precipTotal``, ``dewpt``). Values
+    Reads the top-level ``humidity``, ``winddir``, ``uv``, ``obsTimeUtc``,
+    ``obsTimeLocal`` (its date only) and ``neighborhood`` alongside the
+    ``metric`` sub-object (``temp``, ``windSpeed``, ``windGust``, ``pressure``,
+    ``precipRate``, ``precipTotal``, ``dewpt``). Values
     are km/h / mm / hPa in the station's native ``units:"m"`` form — this is the
     raw display snapshot table, NOT the SI-normalized scoring path, so no unit
     conversion is applied. Returns ``None`` when the payload has no first
@@ -848,6 +1006,7 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
         precip_total=_number(metric, "precipTotal"),
         uv=_number(row, "uv"),
         neighborhood=neighborhood,
+        local_date=_reading_local_date(row, "obsTimeLocal"),
     )
 
 
