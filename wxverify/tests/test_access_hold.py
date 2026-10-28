@@ -396,3 +396,25 @@ def test_ah5_hold_on_one_kind_never_holds_another(
     assert access_held(conn, "hourly", check_at) is not None, (
         "hourly must still be held after a different kind was cleared"
     )
+
+
+# ---------------------------------------------------------------------------
+# record_access_refused stores whole-second stamps (no microseconds)
+# ---------------------------------------------------------------------------
+
+
+def test_record_access_refused_stores_whole_second_stamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Kills: storing the ``since``/``until`` stamps with microseconds."""
+    conn = _make_conn()
+    now_with_micros = datetime(2026, 10, 28, 12, 0, 0, 654321, tzinfo=UTC)
+    _freeze(monkeypatch, now_with_micros)
+
+    until = record_access_refused(conn, "hourly", 401)
+    assert until == "2026-10-28T13:00:00Z"
+
+    record = read_access_record(conn, "hourly")
+    assert record is not None
+    assert record.since == "2026-10-28T12:00:00Z"
+    assert record.until == "2026-10-28T13:00:00Z"

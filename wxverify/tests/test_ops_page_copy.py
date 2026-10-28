@@ -45,7 +45,7 @@ from wxverify.db.connection import close_db, get_db
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.web import context as context_module
 from wxverify.web.context import TimezoneCorrectionRow
-from wxverify.worker.access_hold import ACCESS_KIND_LABELS, access_hold_key
+from wxverify.worker.access_hold import access_hold_key
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -475,7 +475,7 @@ def test_ms1_access_hold_line_renders_with_no_24h_cutoff_and_flips_tail(
         resp = client.get("/ops")
         assert resp.status_code == 200, resp.text
         html = _norm(resp.text)
-        label = ACCESS_KIND_LABELS["hourly"]
+        label = "hourly readings"
         assert (
             f"weather.com access refused (HTTP 401): {label}, since {since_text}, "
             f"held until {until_text}" in html
@@ -527,7 +527,7 @@ def test_ms1_unreadable_hold_renders_without_times_and_never_as_throttled_or_bad
         resp = client.get("/ops")
     assert resp.status_code == 200, resp.text
     html = _norm(resp.text)
-    label = ACCESS_KIND_LABELS["five_minute"]
+    label = "5-minute readings"
     assert (
         f"weather.com access refused: {label} (unreadable hold), "
         "waiting for the next try" in html

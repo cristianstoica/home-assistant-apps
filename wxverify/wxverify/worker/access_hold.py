@@ -188,7 +188,7 @@ def record_access_refused(
     existing readable row, the first refusal of the current run, else set to
     now. ``status`` and ``message`` come from this refusal.
     """
-    now = utc_now()
+    now = utc_now().replace(microsecond=0)
     until = isoformat_utc(now + timedelta(seconds=ACCESS_HOLD_SECONDS))
     existing = read_access_record(conn, kind)
     since = (

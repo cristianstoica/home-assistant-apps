@@ -1151,6 +1151,18 @@ def test_ms2_ops_page_shows_history_all_only_a_leftover_all_1day_row_is_silent(
             " page still renders a block keyed off the stale all_1day"
             " row) = present"
         )
+        assert 'id="wind-auth-hold-all_1day"' not in resp_before.text, (
+            "mutant -> at this assertion: correct = absent (the leftover"
+            " all_1day row itself must never render its own block), mutant"
+            " (the page renders a block keyed off the stale all_1day row) ="
+            " present"
+        )
+        assert 'data-endpoint="all_1day"' not in resp_before.text, (
+            "mutant -> at this assertion: correct = absent (the leftover"
+            " all_1day row's endpoint must never appear in a data-endpoint"
+            " attribute), mutant (the page renders the stale all_1day"
+            " endpoint) = present"
+        )
 
         db.write_sync(
             lambda conn: write_auth_hold(

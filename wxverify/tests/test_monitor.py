@@ -3479,7 +3479,7 @@ def test_al2_single_future_hold_trips_with_full_detail() -> None:
     cond = _al(conn)
     assert cond["ok"] is False
     assert cond["count"] == 1
-    label = ACCESS_KIND_LABELS["current_obs"]
+    label = "current conditions"
     since_text = isoformat_utc(_AL_N - timedelta(minutes=30))
     until_text = isoformat_utc(_AL_N + timedelta(hours=2))
     assert cond["detail"] == (
@@ -3519,8 +3519,8 @@ def test_al5_current_obs_401_and_five_minute_403_list_both_statuses() -> None:
     cond = _al(conn)
     assert cond["ok"] is False
     assert cond["count"] == 2
-    label_current_obs = ACCESS_KIND_LABELS["current_obs"]
-    label_five_minute = ACCESS_KIND_LABELS["five_minute"]
+    label_current_obs = "current conditions"
+    label_five_minute = "5-minute readings"
     assert cond["detail"] == (
         f"weather.com access refused (HTTP 401/403): "
         f"{label_current_obs}, {label_five_minute}; "
