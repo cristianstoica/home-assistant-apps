@@ -1180,7 +1180,7 @@ def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
                st.enabled, sps.last_obstime AS last_obstime
         FROM stations st
         LEFT JOIN station_poll_state sps ON sps.station_id = st.id
-        WHERE st.site_id = ?
+        WHERE st.site_id = ? AND st.retired_at IS NULL
         ORDER BY st.enabled DESC, st.pws_station_id COLLATE NOCASE
         """,
         (site_id,),

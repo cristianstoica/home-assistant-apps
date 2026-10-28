@@ -154,4 +154,9 @@ def test_t13_station_remove_button_has_hx_confirm_and_hx_disabled_elt(
     assert remove_attrs.get("hx-disabled-elt") == "this"
     confirm_text = remove_attrs.get("hx-confirm", "")
     assert "EXAMPLE1" in confirm_text
-    assert "cannot be undone" in confirm_text
+    assert (
+        'Remove station EXAMPLE1 from Example "Site" <2>? It stops counting '
+        "from today. Its past readings and closed days are kept. Adding it "
+        "again brings it back from the next day."
+    ) in confirm_text
+    assert "stored observations are deleted" not in confirm_text

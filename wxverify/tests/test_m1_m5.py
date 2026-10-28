@@ -3161,7 +3161,15 @@ def test_station_toggle_and_rain_threshold_restore_pairs(
                 (site_id, feed_id),
             ).fetchone()
         )
-        assert temperature_pair["observed"] == pytest.approx(10.0)
+        # The toggle no longer re-materializes or inline-scores (8.3 removes
+        # it), so the pair keeps its pre-toggle consensus value.
+        assert temperature_pair["observed"] == pytest.approx(11.0)
+        station_row = db.read_sync(
+            lambda conn: conn.execute(
+                "SELECT enabled FROM stations WHERE id=?", (station_b,)
+            ).fetchone()
+        )
+        assert station_row["enabled"] == 0
 
         rain_response = client.put(
             f"/api/sites/{site_id}",

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
@@ -18,7 +20,11 @@ from wxverify.api.schemas import (
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import delete_runtime_state
-from wxverify.db.site_days import writable_pairs_clause
+from wxverify.db.site_days import (
+    daily_close_on,
+    start_site_days,
+    writable_pairs_clause,
+)
 from wxverify.db.tz_generations import (
     CorrectionAlreadyBuilding,
     TimezoneSiteNotFound,
@@ -101,6 +107,13 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         # published-pointer row immediately — the same seed migrate_v4
         # applies to pre-existing sites.
         ensure_published_generation(conn, site_id)
+        # While the daily close is on, a new site starts fresh at its next
+        # local date. It has no record yet, so its current local date is
+        # today's date in its own zone.
+        if daily_close_on(conn):
+            now = utc_now()
+            today = now.astimezone(ZoneInfo(str(row["timezone"]))).date()
+            start_site_days(conn, site_id, today + timedelta(days=1), now_utc=now)
         return _site_out(row)
 
     site = await get_db().write(_write)

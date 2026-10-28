@@ -62,7 +62,6 @@ class WriteKind(StrEnum):
     PAIRS = "pairs"
     DAY_SCORES = "day_scores"
     CLOSE_RECORD = "close_record"
-    WORKSHEET = "worksheet"
     RAW_PRUNE = "raw_prune"
     HISTORY_PRUNE = "history_prune"
 
@@ -136,7 +135,6 @@ _STATE_KINDS: Final[dict[str, frozenset[WriteKind]]] = {
             WriteKind.PAIRS,
             WriteKind.DAY_SCORES,
             WriteKind.CLOSE_RECORD,
-            WriteKind.WORKSHEET,
         }
     ),
 }
