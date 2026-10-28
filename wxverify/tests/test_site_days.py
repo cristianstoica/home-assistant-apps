@@ -145,6 +145,17 @@ def _record_day_start(conn: sqlite3.Connection, site_id: int, local_date: date) 
     return str(row[0])
 
 
+def _day_row(
+    conn: sqlite3.Connection, site_id: int, local_date: date
+) -> dict[str, object]:
+    row = conn.execute(
+        "SELECT * FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, local_date.isoformat()),
+    ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
 def _ds8_fixture(
     state: str,
 ) -> tuple[sqlite3.Connection, int, str, date]:
@@ -347,58 +358,360 @@ def test_ds2_ensure_site_days_fills_gap_and_is_idempotent() -> None:
     assert [dict(r) for r in before] == [dict(r) for r in after]
 
 
-def test_ds3_transitions_allowed_moves_and_every_other_raises() -> None:
+def test_ds3_begin_close_open_to_closing_writes_exact_columns() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    before = _day_row(conn, site_id, d_minus_1)
+
+    clock = note_day_clock(NOW + timedelta(minutes=5))
+    attempt = begin_close(conn, site_id, d_minus_1, now_utc=clock)
+    assert attempt == 1
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "closing"
+    assert after["attempts"] == 1
+    assert after["state_changed_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    changed = ("state", "attempts", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_begin_close_too_early_raises_with_other_conditions_satisfied() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    # Close out D-1 too, so every record earlier than D is done and D's
+    # date-order and zone_changeover conditions are already satisfied --
+    # only the day-not-ended check can refuse the call below.
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    finish_close(conn, site_id, d_minus_1, now_utc=NOW)
+    before = _day_row(conn, site_id, D)
+
+    with pytest.raises(DayStateError):
+        begin_close(conn, site_id, D, now_utc=NOW)
+
+    assert _day_row(conn, site_id, D) == before
+
+
+def test_ds3_begin_close_refuses_out_of_order_with_other_conditions_satisfied() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    # D-1 is left open by the fixture. D has ended and is not a changeover
+    # day, so only the date-order check can refuse the call below.
+    after_d_ended = datetime(D.year, D.month, D.day, tzinfo=UTC) + timedelta(days=1)
+    before = _day_row(conn, site_id, D)
+
+    with pytest.raises(DayStateError):
+        begin_close(conn, site_id, D, now_utc=after_d_ended)
+
+    assert _day_row(conn, site_id, D) == before
+
+
+def test_ds3_begin_close_refuses_changeover_day_with_other_conditions_satisfied() -> (
+    None
+):
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    finish_close(conn, site_id, d_minus_1, now_utc=NOW)
+    conn.execute(
+        "UPDATE site_days SET zone_changeover = 1 WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    )
+    after_d_ended = datetime(D.year, D.month, D.day, tzinfo=UTC) + timedelta(days=1)
+    before = _day_row(conn, site_id, D)
+
+    with pytest.raises(DayStateError):
+        begin_close(conn, site_id, D, now_utc=after_d_ended)
+
+    assert _day_row(conn, site_id, D) == before
+
+
+def test_ds3_begin_close_retry_due_to_closing_writes_exact_columns() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
+    retry_at = parse_utc(str(_day_row(conn, site_id, d_minus_1)["retry_at"]))
+
+    before_due = _day_row(conn, site_id, d_minus_1)
+    with pytest.raises(DayStateError):
+        begin_close(conn, site_id, d_minus_1, now_utc=retry_at - timedelta(minutes=1))
+    assert _day_row(conn, site_id, d_minus_1) == before_due
+
+    before = _day_row(conn, site_id, d_minus_1)
+    attempt = begin_close(conn, site_id, d_minus_1, now_utc=retry_at)
+    assert attempt == 2
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "closing"
+    assert after["attempts"] == 2
+    assert after["state_changed_at"] != before["state_changed_at"]
+    changed = ("state", "attempts", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_finish_close_writes_exact_columns() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    before = _day_row(conn, site_id, d_minus_1)
+
+    clock = note_day_clock(NOW + timedelta(minutes=5))
+    finish_close(conn, site_id, d_minus_1, now_utc=clock)
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "closed"
+    assert after["done_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert after["state_changed_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    changed = ("state", "done_at", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_fail_close_attempt1_writes_exact_columns() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    before = _day_row(conn, site_id, d_minus_1)
+
+    clock = note_day_clock(NOW + timedelta(minutes=5))
+    outcome = fail_close(conn, site_id, d_minus_1, now_utc=clock, reason="x")
+    assert outcome == "retry_due"
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "retry_due"
+    assert after["retry_at"] == isoformat_utc(clock + timedelta(hours=1))
+    assert after["last_failure"] == "x"
+    assert after["state_changed_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    changed = ("state", "retry_at", "last_failure", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_fail_close_attempt2_writes_exact_columns_and_returns_missed() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
+    retry_at = parse_utc(str(_day_row(conn, site_id, d_minus_1)["retry_at"]))
+    begin_close(conn, site_id, d_minus_1, now_utc=retry_at)
+    before = _day_row(conn, site_id, d_minus_1)
+
+    clock = note_day_clock(retry_at + timedelta(minutes=5))
+    outcome = fail_close(conn, site_id, d_minus_1, now_utc=clock, reason="y")
+    assert outcome == "missed"
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "missed"
+    assert after["missed_reason"] == "retry_failed"
+    assert after["last_failure"] == "y"
+    assert after["done_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert after["state_changed_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    changed = ("state", "missed_reason", "last_failure", "done_at", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_mark_missed_open_never_attempted_writes_exact_columns() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    before = _day_row(conn, site_id, d_minus_1)
+
+    clock = note_day_clock(NOW + timedelta(minutes=5))
+    mark_missed(conn, site_id, d_minus_1, now_utc=clock, reason="never_attempted")
+
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "missed"
+    assert after["missed_reason"] == "never_attempted"
+    assert after["done_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    assert after["state_changed_at"] == clock.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    changed = ("state", "missed_reason", "done_at", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_mark_missed_too_early_raises_with_other_conditions_satisfied() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    finish_close(conn, site_id, d_minus_1, now_utc=NOW)
+    before = _day_row(conn, site_id, D)
+
+    with pytest.raises(DayStateError):
+        mark_missed(conn, site_id, D, now_utc=NOW, reason="never_attempted")
+
+    assert _day_row(conn, site_id, D) == before
+
+
+def test_ds3_mark_missed_refuses_out_of_order_with_other_conditions_satisfied() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    after_d_ended = datetime(D.year, D.month, D.day, tzinfo=UTC) + timedelta(days=1)
+    before = _day_row(conn, site_id, D)
+
+    with pytest.raises(DayStateError):
+        mark_missed(conn, site_id, D, now_utc=after_d_ended, reason="never_attempted")
+
+    assert _day_row(conn, site_id, D) == before
+
+
+def test_ds3_mark_missed_reason_must_match_changeover_flag() -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    finish_close(conn, site_id, d_minus_1, now_utc=NOW)
+    after_d_ended = datetime(D.year, D.month, D.day, tzinfo=UTC) + timedelta(days=1)
+
+    # D is an ordinary day (zone_changeover = 0): "zone_changeover" does not
+    # fit it -- the negative half of the pair.
+    before = _day_row(conn, site_id, D)
+    with pytest.raises(DayStateError):
+        mark_missed(conn, site_id, D, now_utc=after_d_ended, reason="zone_changeover")
+    assert _day_row(conn, site_id, D) == before
+
+    conn.execute(
+        "UPDATE site_days SET zone_changeover = 1 WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    )
+
+    # Flipped to a changeover day: "never_attempted" no longer fits it...
+    before = _day_row(conn, site_id, D)
+    with pytest.raises(DayStateError):
+        mark_missed(conn, site_id, D, now_utc=after_d_ended, reason="never_attempted")
+    assert _day_row(conn, site_id, D) == before
+
+    # ...but "zone_changeover" does, and writes through -- the positive
+    # half of the pair, which fails if the flag check above is ever wrong
+    # in the other direction.
+    mark_missed(conn, site_id, D, now_utc=after_d_ended, reason="zone_changeover")
+    after = _day_row(conn, site_id, D)
+    assert after["state"] == "missed"
+    assert after["missed_reason"] == "zone_changeover"
+    assert after["done_at"] is not None
+
+
+def test_ds3_mark_missed_retry_due_writes_exact_columns_and_wrong_reason_raises() -> (
+    None
+):
+    conn = asof_conn()
+    site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
+    retry_at = parse_utc(str(_day_row(conn, site_id, d_minus_1)["retry_at"]))
+
+    before = _day_row(conn, site_id, d_minus_1)
+    with pytest.raises(DayStateError):
+        mark_missed(
+            conn, site_id, d_minus_1, now_utc=retry_at, reason="never_attempted"
+        )
+    assert _day_row(conn, site_id, d_minus_1) == before
+
+    mark_missed(conn, site_id, d_minus_1, now_utc=retry_at, reason="retry_not_run")
+    after = _day_row(conn, site_id, d_minus_1)
+    assert after["state"] == "missed"
+    assert after["missed_reason"] == "retry_not_run"
+    assert after["done_at"] is not None
+    assert after["state_changed_at"] != before["state_changed_at"]
+    changed = ("state", "missed_reason", "done_at", "state_changed_at")
+    assert {k: v for k, v in after.items() if k not in changed} == {
+        k: v for k, v in before.items() if k not in changed
+    }
+
+
+def test_ds3_open_and_closing_day_never_listed_moves_raise_unchanged() -> None:
     conn = asof_conn()
     site_id = day_close_site(conn)
     d_minus_1 = D - timedelta(days=1)
 
-    before = dict(
-        conn.execute(
-            "SELECT * FROM site_days WHERE site_id = ? AND local_date = ?",
-            (site_id, d_minus_1.isoformat()),
-        ).fetchone()
-    )
-    # open -> closed directly: never listed, must raise.
+    # open -> closed directly: never listed.
+    before = _day_row(conn, site_id, d_minus_1)
     with pytest.raises(DayStateError):
         finish_close(conn, site_id, d_minus_1, now_utc=NOW)
-    after = dict(
-        conn.execute(
-            "SELECT * FROM site_days WHERE site_id = ? AND local_date = ?",
-            (site_id, d_minus_1.isoformat()),
-        ).fetchone()
-    )
-    assert before == after
+    assert _day_row(conn, site_id, d_minus_1) == before
 
-    # open -> closing: allowed.
+    # open -> retry_due/missed via fail_close: never listed.
+    with pytest.raises(DayStateError):
+        fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
+    assert _day_row(conn, site_id, d_minus_1) == before
+
+    # open -> closing: allowed, used below to reach the next state.
     attempt = begin_close(conn, site_id, d_minus_1, now_utc=NOW)
     assert attempt == 1
-    row = conn.execute(
-        "SELECT state, attempts, state_changed_at FROM site_days"
-        " WHERE site_id = ? AND local_date = ?",
-        (site_id, d_minus_1.isoformat()),
-    ).fetchone()
-    assert row["state"] == "closing"
-    assert row["attempts"] == 1
-    assert row["state_changed_at"] is not None
 
-    # closing -> open: never listed.
+    # closing -> open: never listed (start_site_days refuses a second first
+    # record regardless, but the day itself must stay untouched).
+    before = _day_row(conn, site_id, d_minus_1)
     with pytest.raises(DayStateError):
         start_site_days(conn, site_id, d_minus_1, now_utc=NOW)
+    assert _day_row(conn, site_id, d_minus_1) == before
 
-    # closed day never reopens: D-3 is already closed.
+    # closing -> closing again via begin_close: never listed.
     with pytest.raises(DayStateError):
-        begin_close(conn, site_id, D - timedelta(days=3), now_utc=NOW)
+        begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    assert _day_row(conn, site_id, d_minus_1) == before
+
+    # closing -> missed via mark_missed: never listed.
     with pytest.raises(DayStateError):
-        mark_missed(
-            conn, site_id, D - timedelta(days=3), now_utc=NOW, reason="never_attempted"
-        )
+        mark_missed(conn, site_id, d_minus_1, now_utc=NOW, reason="never_attempted")
+    assert _day_row(conn, site_id, d_minus_1) == before
 
 
-def test_ds3_begin_close_too_early_raises() -> None:
+def test_ds3_retry_due_day_never_listed_moves_raise_unchanged() -> None:
     conn = asof_conn()
     site_id = day_close_site(conn)
+    d_minus_1 = D - timedelta(days=1)
+    begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
+    before = _day_row(conn, site_id, d_minus_1)
+
     with pytest.raises(DayStateError):
-        begin_close(conn, site_id, D, now_utc=NOW - timedelta(hours=1))
+        finish_close(conn, site_id, d_minus_1, now_utc=NOW)
+    assert _day_row(conn, site_id, d_minus_1) == before
+
+    with pytest.raises(DayStateError):
+        fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="y")
+    assert _day_row(conn, site_id, d_minus_1) == before
+
+
+@pytest.mark.parametrize("state_date", [D - timedelta(days=3), D - timedelta(days=2)])
+def test_ds3_done_days_never_reopen(state_date: date) -> None:
+    conn = asof_conn()
+    site_id = day_close_site(conn)  # D-3 closed, D-2 missed
+    before = _day_row(conn, site_id, state_date)
+
+    with pytest.raises(DayStateError):
+        begin_close(conn, site_id, state_date, now_utc=NOW)
+    assert _day_row(conn, site_id, state_date) == before
+
+    with pytest.raises(DayStateError):
+        fail_close(conn, site_id, state_date, now_utc=NOW, reason="x")
+    assert _day_row(conn, site_id, state_date) == before
+
+    with pytest.raises(DayStateError):
+        finish_close(conn, site_id, state_date, now_utc=NOW)
+    assert _day_row(conn, site_id, state_date) == before
+
+    with pytest.raises(DayStateError):
+        mark_missed(conn, site_id, state_date, now_utc=NOW, reason="never_attempted")
+    assert _day_row(conn, site_id, state_date) == before
 
 
 def test_ds3b_finish_close_refuses_stale_truth_then_succeeds() -> None:
@@ -589,15 +902,26 @@ def test_ds7_retry_timing_and_third_attempt_refused() -> None:
     assert row["done_at"] is not None
 
 
-def test_ds7b_restart_does_not_reset_attempts_or_allow_a_third() -> None:
-    conn = asof_conn()
+def _connect_day_close_file(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def test_ds7b_restart_does_not_reset_attempts_or_allow_a_third(tmp_path: Path) -> None:
+    db_path = tmp_path / "ds7b.db"
+    conn = _connect_day_close_file(db_path)
+    run_migrations(conn)
     site_id = day_close_site(conn)
     d_minus_1 = D - timedelta(days=1)
     begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+    conn.commit()
+    conn.close()  # the stop: nothing further runs on this connection
 
-    other_conn = sqlite3.connect(":memory:")  # placeholder closed immediately below
-    other_conn.close()
-    read_back = conn.execute(
+    # A new connection to the same file reads the record back.
+    reopened = _connect_day_close_file(db_path)
+    read_back = reopened.execute(
         "SELECT state, attempts FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_id, d_minus_1.isoformat()),
     ).fetchone()
@@ -605,26 +929,30 @@ def test_ds7b_restart_does_not_reset_attempts_or_allow_a_third() -> None:
     assert read_back["attempts"] == 1
 
     with pytest.raises(DayStateError):
-        begin_close(conn, site_id, d_minus_1, now_utc=NOW)
+        begin_close(reopened, site_id, d_minus_1, now_utc=NOW)
 
-    fail_close(conn, site_id, d_minus_1, now_utc=NOW, reason="x")
-    retry_at_str = conn.execute(
+    fail_close(reopened, site_id, d_minus_1, now_utc=NOW, reason="x")
+    retry_at_str = reopened.execute(
         "SELECT retry_at FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_id, d_minus_1.isoformat()),
     ).fetchone()[0]
-    retry_at = datetime.fromisoformat(retry_at_str.removesuffix("Z")).replace(
-        tzinfo=UTC
-    )
-    attempt = begin_close(conn, site_id, d_minus_1, now_utc=retry_at)
+    retry_at = parse_utc(str(retry_at_str))
+    attempt = begin_close(reopened, site_id, d_minus_1, now_utc=retry_at)
     assert attempt == 2
+    reopened.commit()
+    reopened.close()
 
+    # A third connection to the same file still sees attempts = 2 and still
+    # refuses a third attempt.
+    last = _connect_day_close_file(db_path)
     with pytest.raises(DayStateError):
-        begin_close(conn, site_id, d_minus_1, now_utc=retry_at)
-    attempts = conn.execute(
+        begin_close(last, site_id, d_minus_1, now_utc=retry_at)
+    attempts = last.execute(
         "SELECT attempts FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_id, d_minus_1.isoformat()),
     ).fetchone()[0]
     assert attempts == 2
+    last.close()
 
 
 def test_ds7c_mark_missed_retry_not_run_timing_and_wrong_state() -> None:
