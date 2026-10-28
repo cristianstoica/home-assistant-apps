@@ -44,9 +44,12 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.site_days import WriteKind, filter_day_writes
+from wxverify.db.station_readings import store_readings
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
+from wxverify.obs.hourly_values import StationReading
 from wxverify.obs.pws_adapter import (
+    CurrentObservation,
     PwsObservation,
     fetch_current_observation,
     fetch_hourly_history,
@@ -1124,14 +1127,77 @@ def _persist_poll_result_clearing(
     outcome: PollOutcome,
     status: int,
 ) -> None:
-    """Persist the poll-state and, on a 2xx reply, clear the current_obs hold.
+    """Persist the poll-state, store an online reply's raw reading, and, on a
+    2xx reply, clear the current_obs hold.
 
-    One transaction, so the clear and the persist land together. A granted
-    call clears its own kind only; the other kinds' holds are left as they are.
+    One transaction, so the clear, the persist and the raw reading land
+    together. A granted call clears its own kind only; the other kinds' holds
+    are left as they are. The raw reading is stored only when the poll-state
+    was saved (not for a station deleted, disabled or moved meanwhile), and
+    it cannot fail the poll's own write: its values passed the per-value check
+    when the reply was parsed, and ``store_readings`` drops whatever a CHECK
+    of its table would refuse. An offline reply stores none.
     """
-    persist_poll_result(conn, site_id, station_id, outcome)
+    saved = persist_poll_result(conn, site_id, station_id, outcome)
+    if saved and outcome.health is Health.ONLINE and outcome.obs is not None:
+        _store_current_obs_reading(conn, station_id, outcome.obs)
     if 200 <= status < 300:
         clear_access_refused(conn, "current_obs")
+
+
+def _store_current_obs_reading(
+    conn: sqlite3.Connection, station_id: int, obs: CurrentObservation
+) -> None:
+    """Store one online poll reply as a raw reading, source ``current_obs``.
+
+    The instant is ``obsTimeUtc`` in whole seconds and the local date
+    ``obsTimeLocal``'s, or none. The values are ``obs``' ``reading_*`` fields:
+    the reply's own ``metric.temp``, ``metric.precipTotal`` and
+    ``metric.windSpeed`` checked by ``reading_value`` in
+    ``current_obs_from_payload``. A rejected value is stored NULL and counted
+    in a DEBUG line. A reply with no valid value, or whose instant does not
+    parse, stores nothing. A poll repeating the stored reading adds no row
+    (``store_readings``' upsert on the instant).
+    """
+    if obs.obs_time_utc is None:
+        return
+    try:
+        obs_at = parse_utc(obs.obs_time_utc).replace(microsecond=0)
+    except ValueError:
+        return
+    if obs.reading_unusable:
+        logger.debug(
+            "current_obs reading values unusable station=%s"
+            " temperature=%d precip=%d wind=%d",
+            station_id,
+            *(
+                int(quantity in obs.reading_unusable)
+                for quantity in ("temperature", "precip", "wind")
+            ),
+        )
+    temp_c = obs.reading_temp_c
+    precip_total_mm = obs.reading_precip_total_mm
+    speed_kmh = obs.reading_speed_kmh
+    if temp_c is None and precip_total_mm is None and speed_kmh is None:
+        return
+    now = utc_now()
+    store_readings(
+        conn,
+        station_id=station_id,
+        source="current_obs",
+        readings=[
+            StationReading(
+                obs_at=obs_at,
+                source="current_obs",
+                local_date=obs.local_date,
+                temp_c=temp_c,
+                precip_total_mm=precip_total_mm,
+                speed_kmh=speed_kmh,
+            )
+        ],
+        fetched_at=now,
+        now_utc=now,
+    )
 
 
 def _persist_poll_result_and_refund(

@@ -59,8 +59,13 @@ from wxverify.db.site_days import (
     WriteKind,
     check_date_write,
     check_day_write,
+    current_day,
+    daily_close_on,
+    day_record,
+    ensure_site_days,
     filter_day_writes,
 )
+from wxverify.db.station_readings import store_readings
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
     PAIR_MAX_WIND_SQL,
@@ -75,6 +80,7 @@ from wxverify.db.wind_basis import (
     write_auth_hold,
 )
 from wxverify.forecast.wind_blend import TRAINING_DAYS
+from wxverify.obs.hourly_values import StationReading
 from wxverify.obs.pws_adapter import (
     UpstreamPayloadError,
     fetch_all_1day,
@@ -687,14 +693,16 @@ async def _run_row(
             exempt,
             probe,
         )
+        records: Sequence[WindRecord | StationReading]
         try:
             if row.local_date == chunk.today:
-                records = await fetch_all_1day(
+                parsed = await fetch_all_1day(
                     row.pws_station_id,
                     key,
                     client=chunk.client,
                     backfill=not exempt,
                 )
+                records = parsed.readings
             else:
                 records = await fetch_history_all(
                     row.pws_station_id,
@@ -958,7 +966,8 @@ def _day_hours(start: datetime, end: datetime) -> list[datetime]:
 
 def _latest_record(conn: sqlite3.Connection, station_id: int) -> datetime | None:
     row = conn.execute(
-        "SELECT MAX(obs_at) AS latest FROM station_wind_records WHERE station_id = ?",
+        "SELECT MAX(obs_at) AS latest FROM station_wind_records WHERE station_id = ?"
+        " AND source = 'five_minute' AND speed_kmh IS NOT NULL",
         (station_id,),
     ).fetchone()
     if row is None or row["latest"] is None:
@@ -994,6 +1003,7 @@ def _read_records(
         """
         SELECT obs_at, speed_kmh FROM station_wind_records
         WHERE station_id = ? AND obs_at >= ? AND obs_at < ?
+          AND source = 'five_minute' AND speed_kmh IS NOT NULL
         ORDER BY obs_at
         """,
         (station_id, isoformat_utc(low), isoformat_utc(high)),
@@ -1054,6 +1064,57 @@ def _read_day(
     return row
 
 
+def _as_reading(record: WindRecord | StationReading) -> StationReading:
+    """``record`` as a ``five_minute`` reading for ``store_readings``.
+
+    A ``WindRecord`` (the dated download's wind-only parse) becomes a reading
+    with its wind and no local date, temperature or rain total.
+    """
+    if isinstance(record, StationReading):
+        return record
+    return StationReading(
+        obs_at=record.obs_at,
+        source="five_minute",
+        local_date=None,
+        temp_c=None,
+        precip_total_mm=None,
+        speed_kmh=record.speed_kmh,
+    )
+
+
+def _today_window(
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    today: date,
+    tz_name: str,
+    now: datetime,
+) -> tuple[datetime, datetime] | None:
+    """The bounds of today's row's window: yesterday's start to today's end
+    (4.1). ``_persist_day`` caps the upper end at now plus ``_FUTURE_SLACK``.
+
+    While the close is off, today and yesterday are local dates in the site's
+    zone ``tz_name`` (``sites.timezone``), bounded by ``local_day_slots``.
+    While it is on, they are P1's record holding ``now`` and the site's record
+    dated the day before it, by their stored bounds, after creating the
+    site's missing records as the guard would; with no record the day before,
+    today's bounds alone. ``None`` while the close is on and no record holds
+    ``now`` (the site has no current day, 4.2): nothing is kept.
+    """
+    if not daily_close_on(conn):
+        return (
+            local_day_slots(today - _ONE_DAY, tz_name)[0],
+            local_day_slots(today, tz_name)[1],
+        )
+    ensure_site_days(conn, site_id, now_utc=now)
+    current = current_day(conn, site_id, now_utc=now)
+    if current is None:
+        return None
+    previous = day_record(conn, site_id, current.local_date - _ONE_DAY)
+    low = current.day_start_utc if previous is None else previous.day_start_utc
+    return low, current.day_end_utc
+
+
 def _persist_day(
     conn: sqlite3.Connection,
     *,
@@ -1062,50 +1123,53 @@ def _persist_day(
     local_date: date,
     tz_name: str,
     today: date,
-    records: Sequence[WindRecord],
+    records: Sequence[WindRecord | StationReading],
     probe: AuthHoldEndpoint | None,
 ) -> None:
     """Store one fetched station-day, derive its pair-max station rows, and
     advance its row.
 
-    The closed-day guard (``READING``) cuts the stored records at their
-    ``obs_at`` before the upsert; a refused record is not stored.
+    ``records`` are the download's readings: ``StationReading``s with every
+    quantity, or ``WindRecord``s (wind only, no local date). Those inside the
+    stored window go through ``store_readings`` with source ``five_minute``,
+    which asks the closed-day guard (``READING``) at each ``obs_at``; a
+    refused reading is not stored. Today's row keeps only readings inside
+    yesterday's and today's bounds (``_today_window``); a past row keeps
+    ``_STORE_MARGIN`` either side of its day. Both are capped at now plus
+    ``_FUTURE_SLACK``, so a station clock running ahead stores nothing in the
+    future.
     """
     now = utc_now()
     yesterday = today - _ONE_DAY
     start, end, _ = local_day_slots(local_date, tz_name)
-    low = start - _STORE_MARGIN
-    high = min(end + _STORE_MARGIN, now + _FUTURE_SLACK)
-    kept = [record for record in records if low <= record.obs_at < high]
-    if len(kept) != len(records):
+    window: tuple[datetime, datetime] | None
+    if local_date == today:
+        bounds = _today_window(conn, site_id, today=today, tz_name=tz_name, now=now)
+        window = (
+            None if bounds is None else (bounds[0], min(bounds[1], now + _FUTURE_SLACK))
+        )
+    else:
+        window = (start - _STORE_MARGIN, min(end + _STORE_MARGIN, now + _FUTURE_SLACK))
+    readings = [_as_reading(record) for record in records]
+    kept = (
+        []
+        if window is None
+        else [r for r in readings if window[0] <= r.obs_at < window[1]]
+    )
+    if len(kept) != len(readings):
         logger.debug(
             "wind records outside the stored window dropped station=%s date=%s n=%s",
             station_id,
             local_date,
-            len(records) - len(kept),
+            len(readings) - len(kept),
         )
-    instants = [isoformat_utc(record.obs_at) for record in kept]
-    allowed = filter_day_writes(conn, site_id, instants, WriteKind.READING, now_utc=now)
-    warn_refused_instants(
-        logger,
+    store_readings(
         conn,
-        WriteKind.READING,
-        writer="_persist_day",
-        site_id=site_id,
-        instants=[instant for instant in instants if instant not in allowed],
-    )
-    conn.executemany(
-        """
-        INSERT INTO station_wind_records (station_id, obs_at, source, speed_kmh)
-        VALUES (?, ?, 'five_minute', ?)
-        ON CONFLICT(station_id, obs_at, source)
-            DO UPDATE SET speed_kmh=excluded.speed_kmh
-        """,
-        [
-            (station_id, instant, record.speed_kmh)
-            for record, instant in zip(kept, instants, strict=True)
-            if instant in allowed
-        ],
+        station_id=station_id,
+        source="five_minute",
+        readings=kept,
+        fetched_at=now,
+        now_utc=now,
     )
     _derive_days(
         conn,
@@ -1128,7 +1192,8 @@ def _persist_day(
     refetch = _is_refetch(row)
     count_row = conn.execute(
         "SELECT COUNT(*) AS n FROM station_wind_records"
-        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?",
+        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
+        " AND source = 'five_minute' AND speed_kmh IS NOT NULL",
         (station_id, isoformat_utc(start), isoformat_utc(end)),
     ).fetchone()
     record_count = int(count_row["n"])
@@ -1497,7 +1562,8 @@ def _finish_day(
     start, end, _ = local_day_slots(local_date, tz_name)
     count_row = conn.execute(
         "SELECT COUNT(*) AS n FROM station_wind_records"
-        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?",
+        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
+        " AND source = 'five_minute' AND speed_kmh IS NOT NULL",
         (station_id, isoformat_utc(start), isoformat_utc(end)),
     ).fetchone()
     conn.execute(

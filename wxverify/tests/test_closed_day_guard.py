@@ -2259,9 +2259,10 @@ _STATE_TABLES: Final = frozenset(
 # these tables, each with the reason the plan names for it.
 _GW17_ALLOWLIST: Final = frozenset(
     {
+        # P2's raw-reading writer, through P1's guard (plan 6.4).
+        ("wxverify.db.station_readings", "store_readings"),
         ("wxverify.scoring.consensus", "write_station_observation"),  # 7.3 backstop
         ("wxverify.scoring.consensus", "materialize_consensus"),  # 7.3
-        ("wxverify.worker.wind_days", "_persist_day"),  # 7.3 W4
         ("wxverify.worker.wind_days", "_derive_days"),  # 7.3 W3
         ("wxverify.worker.wind_days", "_reconcile"),  # 7.3 W2
         ("wxverify.worker.wind_days", "_finish_day"),  # 7.3 W16

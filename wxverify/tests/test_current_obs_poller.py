@@ -738,6 +738,7 @@ _ALLOWED_CURRENT_OBS_TABLES = frozenset(
     {
         "station_current_obs",
         "station_poll_state",
+        "station_wind_records",
         "api_budget",
         "domain_backoffs",
         "jobs",

@@ -60,6 +60,13 @@ class CurrentObservation:
     or ``None`` when the payload's timestamp is missing/unparseable.
     ``local_date`` is the reading's own local date from ``obsTimeLocal``, or
     ``None`` when the reply carries none.
+
+    The ``reading_*`` fields are the raw store's values (plan 5.5), read from
+    the reply's own ``metric.temp``, ``metric.precipTotal`` and
+    ``metric.windSpeed`` through ``reading_value``: ``None`` when absent or
+    rejected. ``reading_unusable`` names the quantities whose value was
+    present but rejected (``null`` included). The snapshot fields above are
+    unaffected by them.
     """
 
     obs_time_utc: str | None
@@ -75,6 +82,10 @@ class CurrentObservation:
     uv: float | None
     neighborhood: str | None
     local_date: date | None = None
+    reading_temp_c: float | None = None
+    reading_precip_total_mm: float | None = None
+    reading_speed_kmh: float | None = None
+    reading_unusable: tuple[Quantity, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -620,9 +631,10 @@ async def fetch_all_1day(
     *,
     client: httpx.AsyncClient,
     backfill: bool,
-) -> list[WindRecord]:
-    """Today's raw records since the station's local midnight, from
-    ``/v2/pws/observations/all/1day``.
+) -> ParsedReadings:
+    """Today's raw readings since the station's local midnight, from
+    ``/v2/pws/observations/all/1day``, parsed by ``readings_from_payload``
+    with source ``five_minute``: every quantity, not only wind.
 
     Raises as ``fetch_history_all`` does.
     """
@@ -641,13 +653,16 @@ async def fetch_all_1day(
         backfill=backfill,
     )
     response.raise_for_status()
-    records = wind_records_from_payload(
-        decode_observations_payload(response, station_id=station_id)
+    parsed = readings_from_payload(
+        decode_observations_payload(response, station_id=station_id),
+        source="five_minute",
     )
     logger.debug(
-        "pws all_1day response station=%s records=%s", station_id, len(records)
+        "pws all_1day response station=%s records=%s",
+        station_id,
+        len(parsed.readings),
     )
-    return records
+    return parsed
 
 
 def _wind_record_instant(row: dict[str, object]) -> datetime | None:
@@ -978,6 +993,9 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
     raw display snapshot table, NOT the SI-normalized scoring path, so no unit
     conversion is applied. Returns ``None`` when the payload has no first
     observation row (the caller treats that as OFFLINE). Missing fields → ``None``.
+    The raw store's ``reading_*`` values pass ``reading_value`` on the same
+    three raw ``metric`` values (a bool, ``nan`` or a negative rain or wind is
+    ``None`` there), leaving the snapshot fields as they are.
     """
     if not isinstance(data, dict):
         return None
@@ -993,6 +1011,10 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
     metric = cast(dict[str, object], metric_obj) if isinstance(metric_obj, dict) else {}
     neighborhood_obj = row.get("neighborhood")
     neighborhood = str(neighborhood_obj) if isinstance(neighborhood_obj, str) else None
+    unusable: dict[Quantity, int] = {"temperature": 0, "precip": 0, "wind": 0}
+    reading_temp_c = _checked_metric(metric, "temperature", ("temp",), unusable)
+    reading_precip = _checked_metric(metric, "precip", ("precipTotal",), unusable)
+    reading_speed = _checked_metric(metric, "wind", ("windSpeed",), unusable)
     return CurrentObservation(
         obs_time_utc=_obs_instant(row),
         temp=_number(metric, "temp"),
@@ -1007,6 +1029,12 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
         uv=_number(row, "uv"),
         neighborhood=neighborhood,
         local_date=_reading_local_date(row, "obsTimeLocal"),
+        reading_temp_c=reading_temp_c,
+        reading_precip_total_mm=reading_precip,
+        reading_speed_kmh=reading_speed,
+        reading_unusable=tuple(
+            quantity for quantity, count in unusable.items() if count
+        ),
     )
 
 

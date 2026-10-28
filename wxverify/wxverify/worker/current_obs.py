@@ -188,7 +188,7 @@ def persist_poll_result(
     site_id: int,
     station_id: int,
     outcome: PollOutcome,
-) -> None:
+) -> bool:
     """Persist one poll's classification to the poll-state (and obs) tables.
 
     All writes are UPSERTs against ``station_poll_state`` (never a bare UPDATE — an
@@ -196,6 +196,9 @@ def persist_poll_result(
     loop). ``station_current_obs`` is written ONLY on ONLINE (last-good retention
     on every other state). Diagnostics land on ``station_poll_state``'s own
     columns; ``stations`` is never touched here.
+
+    Returns whether it wrote: ``False`` when the station was deleted, disabled
+    or moved to another site, and nothing was saved. Callers may ignore it.
     """
     # Station may have been deleted/disabled between enqueue and run.
     row = conn.execute(
@@ -203,7 +206,7 @@ def persist_poll_result(
         (station_id, site_id),
     ).fetchone()
     if row is None:
-        return
+        return False
 
     now = utc_now()
     now_iso = isoformat_utc(now)
@@ -240,7 +243,7 @@ def persist_poll_result(
             next_poll_at=next_poll_at,
             now_iso=now_iso,
         )
-        return
+        return True
 
     if outcome.health is Health.OFFLINE:
         health = "offline"
@@ -260,6 +263,7 @@ def persist_poll_result(
         error=outcome.error,
         now_iso=now_iso,
     )
+    return True
 
 
 def _upsert_current_obs(
