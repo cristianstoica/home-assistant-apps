@@ -27,6 +27,7 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
+from wxverify.db.day_guard_log import warn_refused_instants
 from wxverify.db.queue import (
     FailDisposition,
     Job,
@@ -42,6 +43,7 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
+from wxverify.db.site_days import WriteKind, filter_day_writes
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
 from wxverify.obs.pws_adapter import (
@@ -1382,8 +1384,27 @@ def _persist_station_observations(
     newest_valid_at = max(
         (o.valid_at for o in observations if o.valid_at <= now_stamp), default=None
     )
+    # The closed-day guard cuts the batch before the loop: rows on a day that
+    # takes no hourly writes are dropped, with one WARNING for the call.
+    allowed = filter_day_writes(
+        conn,
+        site_id,
+        [o.valid_at for o in observations],
+        WriteKind.HOURLY,
+        now_utc=now,
+    )
+    warn_refused_instants(
+        logger,
+        conn,
+        WriteKind.HOURLY,
+        writer="_persist_station_observations",
+        site_id=site_id,
+        instants=[o.valid_at for o in observations if o.valid_at not in allowed],
+    )
     changed = False
     for observation in observations:
+        if observation.valid_at not in allowed:
+            continue
         changed = (
             insert_station_observation(
                 conn,
@@ -1392,6 +1413,7 @@ def _persist_station_observations(
                 valid_at=observation.valid_at,
                 value=observation.value,
                 source_raw=observation.source_raw,
+                now_utc=now,
             )
             or changed
         )

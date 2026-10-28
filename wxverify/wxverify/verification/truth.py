@@ -44,8 +44,10 @@ from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from wxverify.core.error_sanitize import sanitized_exception
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import StaleGenerationError
+from wxverify.db.day_guard_log import warn_refused_dates
+from wxverify.db.site_days import WriteKind, check_date_write
 from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_clause,
@@ -202,8 +204,23 @@ def _write_day(
     day's rows and regenerating them both produce rows that are, by
     construction, current with the observations just read.
 
+    The closed-day guard runs first, at the day's local date: a day that
+    does not take ``TRUTH`` is left as it is and the refusal is logged.
+
     Must run on a write connection inside the caller's transaction.
     """
+    if not check_date_write(
+        conn, site_id, ev.bounds.local_date, WriteKind.TRUTH, now_utc=utc_now()
+    ):
+        warn_refused_dates(
+            logger,
+            WriteKind.TRUTH,
+            writer="_write_day",
+            site_id=site_id,
+            days=[ev.bounds.local_date],
+            count=1,
+        )
+        return
     existing = conn.execute(
         """
         SELECT admission_basis
@@ -288,7 +305,8 @@ def materialize_daily_truth(
 
     Ungated by construction — it writes whatever :func:`_evaluate_day`
     found. Passing no ``admission_basis`` makes every rewrite through this
-    entry point PRESERVE the basis already on the day's rows.
+    entry point PRESERVE the basis already on the day's rows. A day the
+    closed-day guard refuses is left as it is (:func:`_write_day`).
     """
     generation_id = (
         ensure_published_generation(conn, site_id)

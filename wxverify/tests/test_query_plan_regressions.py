@@ -1296,7 +1296,7 @@ def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
     either -- the same shape the winrate query pins above.
     """
     conn = _fresh_conn()
-    plan = _plan(conn, existing_mean_rows_sql(site_scoped=True), (1, 1))
+    plan = _plan(conn, existing_mean_rows_sql(site_scoped=True, day_clause="1"), (1, 1))
     assert any(
         "SEARCH forecast_pairs" in line and "site_id=?" in line for line in plan
     ), plan
@@ -1307,7 +1307,9 @@ def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
     # Negative control: the site-unscoped form has no equality predicate to
     # seek forecast_pairs on, so it degrades to a bare scan -- proving the
     # healthy assertion above is discriminating, not vacuously true.
-    degraded_plan = _plan(conn, existing_mean_rows_sql(site_scoped=False), (1,))
+    degraded_plan = _plan(
+        conn, existing_mean_rows_sql(site_scoped=False, day_clause="1"), (1,)
+    )
     assert any("SCAN forecast_pairs" in line for line in degraded_plan), degraded_plan
 
 

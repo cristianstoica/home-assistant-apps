@@ -15,8 +15,10 @@ from wxverify.api.schemas import (
     SiteUpdate,
     TimezoneCorrectionIn,
 )
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import delete_runtime_state
+from wxverify.db.site_days import writable_pairs_clause
 from wxverify.db.tz_generations import (
     CorrectionAlreadyBuilding,
     TimezoneSiteNotFound,
@@ -152,11 +154,15 @@ async def update_site(
             # multimodel-mean lane recomputes). They stay stale until the
             # next threshold edit's published-scoped delete-and-recreate
             # here, or a consensus mutation of those specific hours.
+            # While the daily close is on, done days keep their pairs and
+            # the threshold they were scored with (writable_pairs_clause).
+            day_clause = writable_pairs_clause(conn, site_id, now_utc=utc_now())
             conn.execute(
                 f"""
                 DELETE FROM forecast_pairs
                 WHERE site_id=? AND variable='precip'
                   AND {published_generation_clause("forecast_pairs")}
+                  AND {day_clause}
                 """,
                 (site_id,),
             )

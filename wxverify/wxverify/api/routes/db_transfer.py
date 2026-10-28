@@ -11,8 +11,9 @@ import sqlite3
 import time
 import uuid
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -24,7 +25,13 @@ from starlette.responses import JSONResponse
 from wxverify import config
 from wxverify.api.errors import ApiError
 from wxverify.core.error_sanitize import safe_detail, sanitized_exception
-from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, utc_now
+from wxverify.core.timeutil import (
+    is_canonical_utc_stamp,
+    isoformat_utc,
+    isoformat_utc_micro,
+    parse_utc,
+    utc_now,
+)
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION, schema_table_names
 from wxverify.db.queue import reclaim_all_stale
@@ -35,6 +42,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps, table_exists
+from wxverify.db.site_days import WriteKind, filter_day_writes, writable_pairs_clause
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -93,6 +101,24 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("station_observations", "valid_at"),
     ("observations", "valid_at"),
     ("station_wind_records", "obs_at"),
+    # A day record's bounds: the guard parses them and `open_day_clause`
+    # compares them with julianday, so one bad stamp breaks or hides a day.
+    ("site_days", "day_start_utc"),
+    ("site_days", "day_end_utc"),
+)
+# The daily-close tables' dates, checked by VALUE at import: each is a key
+# (a day record, a station-list or zone change's first day) compared as text,
+# so only the canonical `YYYY-MM-DD` spelling may come in.
+_CANONICAL_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("site_days", "local_date"),
+    ("station_changes", "effective_date"),
+    ("site_zone_changes", "effective_date"),
+)
+# The daily-close tables' change stamps, which the station-list and zone
+# rules order as text, so only the fixed-width microsecond form may come in.
+_MICRO_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("station_changes", "changed_at"),
+    ("site_zone_changes", "entered_at"),
 )
 # What `_flag_invalid_utf8` returns in place of text that is not valid UTF-8.
 # A bare object equals no value a row can hold, so a row test finds only it.
@@ -854,6 +880,59 @@ def _refuse_invalid_text(conn: sqlite3.Connection, table: str, sql: str) -> None
         conn.text_factory = str
 
 
+def _is_null_or_canonical_stamp(value: object) -> bool:
+    """Whether ``value`` is NULL or ``isoformat_utc``'s own UTC stamp."""
+    return value is None or is_canonical_utc_stamp(value)
+
+
+def _is_canonical_date(value: object) -> bool:
+    """Whether ``value`` is a ``str`` in the canonical ``YYYY-MM-DD`` form."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def _is_canonical_micro_stamp(value: object) -> bool:
+    """Whether ``value`` is ``isoformat_utc_micro``'s own UTC stamp."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return isoformat_utc_micro(parse_utc(value)) == value
+    except ValueError:
+        return False
+
+
+def _refuse_bad_values(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    is_valid: Callable[[object], bool],
+    message: str,
+) -> None:
+    """Refuse the upload with ``message`` if any ``table.column`` value fails.
+
+    Skipped when ``table`` is absent (``_guarded_table_present``). Both names
+    are code-owned. Distinct values are compared byte for byte, so every
+    spelling is checked.
+    """
+    if not _guarded_table_present(conn, table):
+        return
+    try:
+        bad = any(
+            not is_valid(value_row[0])
+            for value_row in conn.execute(
+                f"SELECT DISTINCT {column} COLLATE BINARY FROM {table}"
+            )
+        )
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+    if bad:
+        raise ApiError(422, message)
+
+
 def _validate_upload(tmp: Path) -> None:
     """Validate the upload via a read-only open, without touching the live DB."""
     try:
@@ -952,6 +1031,33 @@ def _validate_upload(tmp: Path) -> None:
                     f"invalid timestamp in {table}.{column}: "
                     "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
                 )
+        # The daily-close tables (10.6). `retry_at` is checked on its own
+        # because the stamp check above refuses NULL, which it may hold.
+        _refuse_bad_values(
+            conn,
+            "site_days",
+            "retry_at",
+            _is_null_or_canonical_stamp,
+            "invalid timestamp in site_days.retry_at: "
+            "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+        )
+        for table, column in _CANONICAL_DATE_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_canonical_date,
+                f"invalid date in {table}.{column}: expected YYYY-MM-DD",
+            )
+        for table, column in _MICRO_STAMP_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_canonical_micro_stamp,
+                f"invalid timestamp in {table}.{column}: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SS.ffffffZ",
+            )
     finally:
         conn.close()
 
@@ -1157,14 +1263,24 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
     One write transaction, honoring the convergence invariant
     (worker/processor.py): observation-changing work runs the MONOLITHIC
     ``pair_and_score`` inline — never enqueued.
+
+    While the imported file's daily close is on, only days that still take
+    writes are rebuilt (7.5): done days keep their pairs and consensus, and
+    their cells are skipped, not refused. With the close off every pair and
+    cell is rebuilt.
     """
+    now = utc_now()
     # From-scratch clear: per-cell dependent invalidation only reaches cells
     # present in station_observations or observations, so a forecast_pairs
     # row whose anchor observation is absent from BOTH tables would survive
-    # stale. The unconditional delete guarantees none does — by construction.
-    # score_cache needs no separate delete: the monolithic pair_and_score
-    # clears the whole table itself.
-    conn.execute("DELETE FROM forecast_pairs")
+    # stale. The delete guarantees none does — by construction — on every
+    # day that takes pairs (writable_pairs_clause; every day with the close
+    # off). score_cache needs no separate delete: the monolithic
+    # pair_and_score clears the whole table itself.
+    conn.execute(
+        "DELETE FROM forecast_pairs"
+        f" WHERE {writable_pairs_clause(conn, None, now_utc=now)}"
+    )
     # UNION of both tables: an observations row whose cell has no surviving
     # station rows is an orphan, and materializing its cell deletes it.
     # Per-cell calls are mandatory — they honor the load-bearing invalidation
@@ -1179,12 +1295,35 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
         SELECT site_id, variable, valid_at FROM observations
         """
     ).fetchall()
+    instants_by_site: dict[int, set[str]] = {}
     for cell in cells:
+        instants_by_site.setdefault(int(cell["site_id"]), set()).add(
+            str(cell["valid_at"])
+        )
+    writable = {
+        site_id: filter_day_writes(
+            conn, site_id, sorted(instants), WriteKind.HOURLY, now_utc=now
+        )
+        for site_id, instants in instants_by_site.items()
+    }
+    kept = [
+        cell
+        for cell in cells
+        if str(cell["valid_at"]) in writable[int(cell["site_id"])]
+    ]
+    logger.info(
+        "import: consensus rebuild kept %d cells, skipped %d on days that"
+        " take no writes",
+        len(kept),
+        len(cells) - len(kept),
+    )
+    for cell in kept:
         materialize_consensus(
             conn,
             site_id=int(cell["site_id"]),
             variable=str(cell["variable"]),
             valid_at=str(cell["valid_at"]),
+            now_utc=now,
         )
     pair_and_score(conn, site_id=None)
     set_runtime_state_now(conn, "import_rebuild_done_at")

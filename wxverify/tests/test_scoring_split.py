@@ -91,20 +91,23 @@ from wxverify.worker.score_batches import run_batched_scoring, run_split_pair_ph
 
 
 def test_chunk_ops_preserves_order_across_chunks() -> None:
-    ops = tuple(InsertOp(1, (i,)) for i in range(5))
+    ops = tuple(InsertOp(1, (i,), valid_at="2035-01-01T00:00:00Z") for i in range(5))
     chunks = list(chunk_ops(ops, cap=2))
     flattened = tuple(op for chunk in chunks for op in chunk)
     assert flattened == ops
 
 
 def test_chunk_ops_never_splits_a_replace_across_chunks() -> None:
-    i, r = InsertOp(1, (1,)), ReplaceOp(1, 1, (2,))
+    i, r = (
+        InsertOp(1, (1,), valid_at="2035-01-01T00:00:00Z"),
+        ReplaceOp(1, 1, (2,), valid_at="2035-01-01T00:00:00Z"),
+    )
     ops = (i, i, r)
     assert list(chunk_ops(ops, cap=3)) == [(i, i), (r,)]
 
 
 def test_chunk_ops_cap_check_runs_only_when_iterated() -> None:
-    ops = (InsertOp(1, (1,)),)
+    ops = (InsertOp(1, (1,), valid_at="2035-01-01T00:00:00Z"),)
     generator = chunk_ops(ops, cap=1)  # raises nothing: it's a generator
     with pytest.raises(ValueError, match="chunk cap must be >= 2"):
         list(generator)
@@ -182,7 +185,7 @@ def test_apply_delta_op_shapes() -> None:
     replaced = apply_pair_ops(
         conn,
         delta,
-        (ReplaceOp(old_id, site, replace_values),),
+        (ReplaceOp(old_id, site, replace_values, valid_at="2035-01-01T06:00:00Z"),),
         resolver,
     )
     assert replaced == 1
@@ -200,7 +203,12 @@ def test_apply_delta_op_shapes() -> None:
     del after["created_at"]
     assert after == before
 
-    deleted = apply_pair_ops(conn, delta, (DeleteOp(new_id),), resolver)
+    deleted = apply_pair_ops(
+        conn,
+        delta,
+        (DeleteOp(new_id, site_id=site, valid_at="2035-01-01T06:00:00Z"),),
+        resolver,
+    )
     assert deleted == 0
     assert (
         conn.execute("SELECT id FROM forecast_pairs WHERE id=?", (new_id,)).fetchone()
@@ -232,11 +240,21 @@ def test_apply_pair_ops_vanished_row_raises() -> None:
     )
 
     with pytest.raises(RuntimeError, match="vanished before apply"):
-        apply_pair_ops(conn, dummy_delta, (DeleteOp(999_999),), resolver)
+        apply_pair_ops(
+            conn,
+            dummy_delta,
+            (DeleteOp(999_999, site_id=site, valid_at="2035-01-01T00:00:00Z"),),
+            resolver,
+        )
     assert conn.execute("SELECT count(*) FROM forecast_pairs").fetchone()[0] == before
 
     with pytest.raises(RuntimeError, match="vanished before apply"):
-        apply_pair_ops(conn, dummy_delta, (ReplaceOp(999_999, site, (1,)),), resolver)
+        apply_pair_ops(
+            conn,
+            dummy_delta,
+            (ReplaceOp(999_999, site, (1,), valid_at="2035-01-01T00:00:00Z"),),
+            resolver,
+        )
     assert conn.execute("SELECT count(*) FROM forecast_pairs").fetchone()[0] == before
 
 
@@ -271,7 +289,7 @@ def test_apply_delta_rolls_back_valid_insert_before_a_vanished_delete() -> None:
 
     delta = PairDelta(
         template.seed_sites,
-        (*template.ops, DeleteOp(999_999)),
+        (*template.ops, DeleteOp(999_999, site_id=site, valid_at=_MM_VALID_AT)),
         template.insert_sql,
         count=None,
     )
@@ -344,7 +362,10 @@ def test_apply_delta_rolls_back_valid_insert_before_a_colliding_insert() -> None
     rows_before = _mean_rows(conn)
     delta = PairDelta(
         template.seed_sites,
-        (valid_insert, InsertOp(site, colliding_values)),
+        (
+            valid_insert,
+            InsertOp(site, colliding_values, valid_at=existing_row["valid_at"]),
+        ),
         template.insert_sql,
         count=None,
     )
@@ -585,7 +606,7 @@ def test_mm4_leftover_row_yields_delete(  # MX-leftover
         ).fetchone()["id"]
     )
     delta = compute_multimodel_mean(left, site)
-    assert delta.ops == (DeleteOp(mean_id),)
+    assert delta.ops == (DeleteOp(mean_id, site_id=site, valid_at=_MM_VALID_AT),)
     assert delta.count == 0
 
     assert apply_delta(left, delta) == materialize_multimodel_mean_0164(right, site)
@@ -787,7 +808,10 @@ def test_mm9_mean_insert_no_longer_ignores_conflicts() -> None:  # MX-mean-ignor
     )
     template = compute_multimodel_mean(conn, site)
     duplicate_delta = PairDelta(
-        (site,), (InsertOp(site, values),), template.insert_sql, count=None
+        (site,),
+        (InsertOp(site, values, valid_at=mean_row["valid_at"]),),
+        template.insert_sql,
+        count=None,
     )
     with pytest.raises(sqlite3.IntegrityError):
         apply_delta(conn, duplicate_delta)
@@ -1077,7 +1101,9 @@ def _make_site(conn: sqlite3.Connection, name: str, *, enabled: int = 1) -> int:
 
 def _probe_compute(conn: sqlite3.Connection, site_id: int | None) -> PairDelta:
     """A 3-op insert-only delta into a private ``_probe`` table."""
-    ops = tuple(InsertOp(site_id, (i,)) for i in range(3))
+    ops = tuple(
+        InsertOp(site_id, (i,), valid_at="2035-01-01T00:00:00Z") for i in range(3)
+    )
     return PairDelta(
         seed_sites=(site_id,) if site_id is not None else (),
         ops=ops,
@@ -1198,7 +1224,10 @@ def test_split_pair_attempt_ops_log_counts_ops_not_insert_rowcount_m20(
         ensure_published_generation(conn, site)
 
         def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
-            ops = tuple(InsertOp(site_id, (i % 2000,)) for i in range(2500))
+            ops = tuple(
+                InsertOp(site_id, (i % 2000,), valid_at="2035-01-01T00:00:00Z")
+                for i in range(2500)
+            )
             return PairDelta(
                 seed_sites=(site_id,) if site_id is not None else (),
                 ops=ops,
@@ -1547,9 +1576,12 @@ def test_run_catchup_reports_and_skips_a_site_whose_chunk_raises_integrity_error
 
         def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
             if site_id == site_a:
-                ops = (InsertOp(site_id, (1,)), InsertOp(site_id, (1,)))
+                ops = (
+                    InsertOp(site_id, (1,), valid_at="2035-01-01T00:00:00Z"),
+                    InsertOp(site_id, (1,), valid_at="2035-01-01T00:00:00Z"),
+                )
             else:
-                ops = (InsertOp(site_id, (2,)),)
+                ops = (InsertOp(site_id, (2,), valid_at="2035-01-01T00:00:00Z"),)
             return PairDelta(
                 seed_sites=(site_id,) if site_id is not None else (),
                 ops=ops,
@@ -1679,7 +1711,9 @@ def test_split_pair_attempt_releases_payload_before_next_compute(
                 calls_a += 1
                 if calls_a == 2:
                     seen_a.extend(alive_after_wait(refs[0]))
-                ops = tuple(_RefInsert(site_id, (i,)) for i in range(3))
+                ops = tuple(
+                    _RefInsert(site_id, (i,), "2035-01-01T00:00:00Z") for i in range(3)
+                )
                 delta = _delta(ops)
                 refs.append([weakref.ref(delta), *(weakref.ref(op) for op in ops)])
                 return delta
@@ -1689,7 +1723,7 @@ def test_split_pair_attempt_releases_payload_before_next_compute(
                 calls_b += 1
                 if calls_b == 1:
                     seen_b.extend(alive_after_wait(refs[1]))
-                ops = (_RefInsert(site_id, (99,)),)
+                ops = (_RefInsert(site_id, (99,), "2035-01-01T00:00:00Z"),)
                 delta = _delta(ops)
                 refs.append([weakref.ref(delta), *(weakref.ref(op) for op in ops)])
                 return delta

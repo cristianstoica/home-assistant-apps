@@ -25,7 +25,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo
 
-from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc
+from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc, utc_now
+from wxverify.db.site_days import open_day_clause
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, PairValues, apply_delta
@@ -58,7 +59,9 @@ def materialize_persistence(
     conn: sqlite3.Connection, site_id: int | None = None
 ) -> int:
     """Insert the missing persistence pairs; return the number inserted."""
-    return apply_delta(conn, compute_persistence_pairs(conn, site_id))
+    return apply_delta(
+        conn, compute_persistence_pairs(conn, site_id), now_utc=utc_now()
+    )
 
 
 def compute_persistence_pairs(
@@ -68,7 +71,9 @@ def compute_persistence_pairs(
 
     The seed sites are every observation group's site, in group order,
     whether or not the group yields a pair. No persistence feed or no
-    observations gives an empty delta with no seed sites.
+    observations gives an empty delta with no seed sites. While the daily
+    close is on, only observations on days that take pairs are targets
+    (``open_day_clause``); every observation stays a source.
     """
     feed = conn.execute(
         """
@@ -83,10 +88,14 @@ def compute_persistence_pairs(
     max_lead = int(feed["max_lead_hours"])
     where = "" if site_id is None else "WHERE site_id = ?"
     params: tuple[object, ...] = () if site_id is None else (site_id,)
+    target_open = open_day_clause(
+        conn, site_expr="o.site_id", instant_expr="o.valid_at"
+    )
     observations = conn.execute(
         f"""
         SELECT o.site_id, o.variable, o.valid_at, o.value, o.computed_at,
-               s.timezone, s.rain_threshold_mm
+               s.timezone, s.rain_threshold_mm,
+               {target_open} AS target_open
         FROM observations o
         JOIN sites s ON s.id = o.site_id
         {where}
@@ -160,7 +169,8 @@ def _group_observations(
             )
             groups[key] = group
         epoch = int(dt.timestamp())
-        group.targets.append((epoch, valid_at, float(obs["value"]), canonical))
+        if obs["target_open"] == 1:  # a day that takes pairs (7.3)
+            group.targets.append((epoch, valid_at, float(obs["value"]), canonical))
         if canonical:
             computed_at = (
                 None if obs["computed_at"] is None else str(obs["computed_at"])
@@ -246,6 +256,7 @@ def _group_ops(
                         rain_threshold=rain_threshold,
                         first_known_at=source_computed_at,
                     ),
+                    valid_at,
                 )
             )
 
@@ -299,6 +310,7 @@ def _fallback_ops(
                         else str(lagged["computed_at"])
                     ),
                 ),
+                valid_at,
             )
         )
 

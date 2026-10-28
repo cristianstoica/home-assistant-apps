@@ -996,7 +996,7 @@ def test_reconcile_sets_refetch_when_short_of_the_median() -> None:
     _insert_day(conn, station_id, yesterday, status="fetched", record_count=200)
     _seed_reconcile_pool(conn, station_id, yesterday, [280, 280, 280])
 
-    _reconcile(conn, station_id, yesterday, _TZ, record_count=200)
+    _reconcile(conn, site_id, station_id, yesterday, _TZ, record_count=200)
 
     row = _day_row(conn, station_id, yesterday)
     assert row["refetch_at"] is not None, (
@@ -1019,7 +1019,7 @@ def test_reconcile_no_refetch_when_pool_too_small() -> None:
     _insert_day(conn, station_id, yesterday, status="fetched", record_count=1)
     _seed_reconcile_pool(conn, station_id, yesterday, [280, 280])  # only 2 < min 3
 
-    _reconcile(conn, station_id, yesterday, _TZ, record_count=1)
+    _reconcile(conn, site_id, station_id, yesterday, _TZ, record_count=1)
 
     row = _day_row(conn, station_id, yesterday)
     assert row["refetch_at"] is None, (
@@ -1037,7 +1037,7 @@ def test_reconcile_no_refetch_when_count_meets_the_ratio() -> None:
     _insert_day(conn, station_id, yesterday, status="fetched", record_count=260)
     _seed_reconcile_pool(conn, station_id, yesterday, [280, 280, 280])
 
-    _reconcile(conn, station_id, yesterday, _TZ, record_count=260)  # >= 252
+    _reconcile(conn, site_id, station_id, yesterday, _TZ, record_count=260)  # >= 252
 
     row = _day_row(conn, station_id, yesterday)
     assert row["refetch_at"] is None
@@ -1076,7 +1076,7 @@ def test_reconcile_median_pool_excludes_unavailable_rows() -> None:
             record_count=count,
         )
 
-    _reconcile(conn, station_id, yesterday, _TZ, record_count=200)
+    _reconcile(conn, site_id, station_id, yesterday, _TZ, record_count=200)
 
     row = _day_row(conn, station_id, yesterday)
     assert row["refetch_at"] is not None, (

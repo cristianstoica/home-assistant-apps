@@ -8,7 +8,8 @@ from collections.abc import Sequence
 from typing import Final
 
 from wxverify.collection.precip_labels import precip_label_eligible_sql
-from wxverify.core.timeutil import day_ahead
+from wxverify.core.timeutil import day_ahead, utc_now
+from wxverify.db.site_days import open_day_clause
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
@@ -59,7 +60,7 @@ _PAIR_INSERT_SQL: Final = """
 
 def pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) -> int:
     """Insert the missing real-model pairs; return the number inserted."""
-    return apply_delta(conn, compute_real_model_pairs(conn, site_id))
+    return apply_delta(conn, compute_real_model_pairs(conn, site_id), now_utc=utc_now())
 
 
 def compute_real_model_pairs(
@@ -70,14 +71,19 @@ def compute_real_model_pairs(
     Every candidate sample (a matching observation, a lead in range, no
     published pair yet) that passes the day-ahead bucket filter becomes one
     ``InsertOp``; the seed sites are those rows' sites, in first-row order.
+    While the daily close is on, only samples on days that take pairs are
+    candidates (``open_day_clause``, built at call time).
     """
+    day_clause = open_day_clause(
+        conn, site_expr="fs.site_id", instant_expr="fs.valid_at"
+    )
     sql: str
     params: tuple[object, ...]
     if site_id is None:
-        sql = _CANDIDATE_PAIRS_SQL
+        sql = _CANDIDATE_PAIRS_SQL + f" AND {day_clause}"
         params = ()
     else:
-        sql = _CANDIDATE_PAIRS_SQL + " AND fs.site_id = ?"
+        sql = _CANDIDATE_PAIRS_SQL + f" AND fs.site_id = ? AND {day_clause}"
         params = (site_id,)
     rows = conn.execute(sql, params)
     seeds: dict[int, None] = {}
@@ -101,6 +107,7 @@ def compute_real_model_pairs(
         # time. NULL fetched_at stays NULL — never invented; downstream as-of
         # reads exclude NULL-availability pairs with a recorded reason.
         first_known_at = None if row["fetched_at"] is None else str(row["fetched_at"])
+        valid_at = str(row["valid_at"])
         ops.append(
             InsertOp(
                 row_site_id,
@@ -109,7 +116,7 @@ def compute_real_model_pairs(
                     int(row["feed_id"]),
                     variable,
                     str(row["issued_at"]),
-                    str(row["valid_at"]),
+                    valid_at,
                     int(row["lead_hours"]),
                     bucket,
                     forecast,
@@ -124,6 +131,7 @@ def compute_real_model_pairs(
                     rain_threshold,
                     first_known_at,
                 ),
+                valid_at,
             )
         )
     return PairDelta(tuple(seeds), tuple(ops), _PAIR_INSERT_SQL, count=None)

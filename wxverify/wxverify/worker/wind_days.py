@@ -53,7 +53,14 @@ from wxverify.core.timeutil import (
 )
 from wxverify.core.units import kmh_to_ms
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
+from wxverify.db.day_guard_log import warn_refused_dates, warn_refused_instants
 from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.site_days import (
+    WriteKind,
+    check_date_write,
+    check_day_write,
+    filter_day_writes,
+)
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
     PAIR_MAX_WIND_SQL,
@@ -1059,7 +1066,11 @@ def _persist_day(
     probe: AuthHoldEndpoint | None,
 ) -> None:
     """Store one fetched station-day, derive its pair-max station rows, and
-    advance its row."""
+    advance its row.
+
+    The closed-day guard (``READING``) cuts the stored records at their
+    ``obs_at`` before the upsert; a refused record is not stored.
+    """
     now = utc_now()
     yesterday = today - _ONE_DAY
     start, end, _ = local_day_slots(local_date, tz_name)
@@ -1073,13 +1084,27 @@ def _persist_day(
             local_date,
             len(records) - len(kept),
         )
+    instants = [isoformat_utc(record.obs_at) for record in kept]
+    allowed = filter_day_writes(conn, site_id, instants, WriteKind.READING, now_utc=now)
+    warn_refused_instants(
+        logger,
+        conn,
+        WriteKind.READING,
+        writer="_persist_day",
+        site_id=site_id,
+        instants=[instant for instant in instants if instant not in allowed],
+    )
     conn.executemany(
         """
         INSERT INTO station_wind_records (station_id, obs_at, speed_kmh)
         VALUES (?, ?, ?)
         ON CONFLICT(station_id, obs_at) DO UPDATE SET speed_kmh=excluded.speed_kmh
         """,
-        [(station_id, isoformat_utc(r.obs_at), r.speed_kmh) for r in kept],
+        [
+            (station_id, instant, record.speed_kmh)
+            for record, instant in zip(kept, instants, strict=True)
+            if instant in allowed
+        ],
     )
     _derive_days(
         conn,
@@ -1088,6 +1113,7 @@ def _persist_day(
         local_date=local_date,
         tz_name=tz_name,
         today=today,
+        now_utc=now,
     )
     row = _read_day(conn, station_id, local_date)
     if row is None:
@@ -1139,7 +1165,9 @@ def _persist_day(
         ),
     )
     if local_date == yesterday and status in ("fetched", "unavailable") and not refetch:
-        _reconcile(conn, station_id, local_date, tz_name, record_count)
+        _reconcile(
+            conn, site_id, station_id, local_date, tz_name, record_count, now_utc=now
+        )
     clear_domain_backoff(conn, source_domain("weathercom"))
     if local_date == today:
         # A 2xx on today's 5-minute download: the five_minute kind is granted.
@@ -1156,9 +1184,17 @@ def _derive_days(
     local_date: date,
     tz_name: str,
     today: date,
+    now_utc: datetime | None = None,
 ) -> None:
     """Pair hours for d and its fetched/partial neighbours, and write, delete
-    and materialize the station rows."""
+    and materialize the station rows.
+
+    The closed-day guard (``HOURLY``) cuts the write hours and the delete
+    hours in one pass before either loop, with one WARNING for both; a
+    refused hour's row is neither written nor deleted. ``now_utc`` defaults
+    to ``utc_now()``.
+    """
+    now = utc_now() if now_utc is None else now_utc
     days = [local_date]
     neighbours = conn.execute(
         """
@@ -1191,30 +1227,49 @@ def _derive_days(
             max(all_hours) + _ONE_HOUR,
         )
     pairs = pair_max_by_hour(records, all_hours)
+    write_hours = sorted(pairs)
+    delete_hours = sorted(set(all_hours) - set(pairs))
+    instants = [isoformat_utc(hour) for hour in (*write_hours, *delete_hours)]
+    allowed = filter_day_writes(conn, site_id, instants, WriteKind.HOURLY, now_utc=now)
+    warn_refused_instants(
+        logger,
+        conn,
+        WriteKind.HOURLY,
+        writer="_derive_days",
+        site_id=site_id,
+        instants=[instant for instant in instants if instant not in allowed],
+    )
     changed: set[datetime] = set()
-    for hour in sorted(pairs):
+    for hour in write_hours:
+        valid_at = isoformat_utc(hour)
+        if valid_at not in allowed:
+            continue
         speed = pairs[hour]
         if write_station_observation(
             conn,
             station_id=station_id,
             variable="wind",
-            valid_at=isoformat_utc(hour),
+            valid_at=valid_at,
             value=kmh_to_ms(speed),
             source_raw=f"pair-max {round(speed, 2)} km/h",
+            now_utc=now,
         ):
             changed.add(hour)
-    for hour in sorted(set(all_hours) - set(pairs)):
+    for hour in delete_hours:
+        valid_at = isoformat_utc(hour)
+        if valid_at not in allowed:
+            continue
         deleted = conn.execute(
             "DELETE FROM station_observations WHERE id IN ("
             " SELECT so.id FROM station_observations so"
             " WHERE so.station_id = ? AND so.variable = 'wind'"
             f" AND so.valid_at = ? AND {PAIR_MAX_WIND_SQL})",
-            (station_id, isoformat_utc(hour)),
+            (station_id, valid_at),
         ).rowcount
         if deleted:
             changed.add(hour)
     for hour in sorted(changed):
-        _materialize(conn, site_id, isoformat_utc(hour))
+        _materialize(conn, site_id, isoformat_utc(hour), now_utc=now)
     if changed:
         enqueue_if_absent(
             conn, "pair_and_score", site_id, "score", {"site_id": site_id}
@@ -1233,12 +1288,21 @@ def _derive_days(
 
 def _reconcile(
     conn: sqlite3.Connection,
+    site_id: int,
     station_id: int,
     local_date: date,
     tz_name: str,
     record_count: int,
+    *,
+    now_utc: datetime | None = None,
 ) -> None:
-    """Schedule one refetch of a short yesterday (plan §8.14)."""
+    """Schedule one refetch of a short yesterday (plan §8.14).
+
+    The closed-day guard (``READING``, at ``local_date``) is asked before
+    the update: a day that takes no readings gets no refetch. It sits behind
+    ``_persist_day``'s cut, so a refusal is logged at DEBUG only.
+    ``now_utc`` defaults to ``utc_now()``.
+    """
     pool = [
         int(row["record_count"])
         for row in conn.execute(
@@ -1253,6 +1317,14 @@ def _reconcile(
     if len(pool) < _RECONCILE_MIN:
         return
     if record_count >= _RECONCILE_RATIO * statistics.median(pool):
+        return
+    if not check_date_write(
+        conn,
+        site_id,
+        local_date,
+        WriteKind.READING,
+        now_utc=utc_now() if now_utc is None else now_utc,
+    ):
         return
     refetch_start = local_day_slots(local_date + timedelta(days=2), tz_name)[0]
     conn.execute(
@@ -1379,6 +1451,10 @@ def _finish_day(
     fetched or unavailable and is derived as a past day. ``attempts``,
     ``last_ok_at``, ``last_error``, the records and the hold are left as they
     are.
+
+    The closed-day guard (``HOURLY``, at ``local_date``) is asked before the
+    first write: a refused day returns False, as a gated row does, with the
+    refusal WARNING.
     """
     hold = read_auth_hold(conn, "history_all")
     if hold is None or hold.status != "held":
@@ -1397,7 +1473,18 @@ def _finish_day(
     ).fetchone()
     if finishable is None:
         return False
-    stamp = isoformat_utc(utc_now())
+    now = utc_now()
+    if not check_date_write(conn, site_id, local_date, WriteKind.HOURLY, now_utc=now):
+        warn_refused_dates(
+            logger,
+            WriteKind.HOURLY,
+            writer="_finish_day",
+            site_id=site_id,
+            days=[local_date],
+            count=1,
+        )
+        return False
+    stamp = isoformat_utc(now)
     row = _read_day(conn, station_id, local_date)
     if row is not None and _is_refetch(row):
         conn.execute(
@@ -1437,6 +1524,7 @@ def _finish_day(
         local_date=local_date,
         tz_name=tz_name,
         today=today,
+        now_utc=now,
     )
     return True
 
@@ -1494,29 +1582,64 @@ def _row_failure(
         )
 
 
-def _materialize(conn: sqlite3.Connection, site_id: int, valid_at: str) -> None:
+def _materialize(
+    conn: sqlite3.Connection,
+    site_id: int,
+    valid_at: str,
+    *,
+    now_utc: datetime | None = None,
+) -> None:
     """``materialize_consensus`` for one wind hour.
 
     A string that will not parse (an imported row) cannot go through
     ``materialize_consensus`` when the persistence feed exists, because that
     parses it. Such a string takes the same invalidation steps directly and
     then deletes the observation, with a WARNING, so one such hour cannot
-    stop ``_derive_days``.
+    stop ``_derive_days``. ``now_utc`` is the closed-day guard's clock.
     """
     try:
         parse_utc(valid_at)
     except ValueError:
-        _invalidate_unparseable(conn, site_id, valid_at)
+        _invalidate_unparseable(conn, site_id, valid_at, now_utc=now_utc)
         return
     try:
-        materialize_consensus(conn, site_id=site_id, variable="wind", valid_at=valid_at)
+        materialize_consensus(
+            conn, site_id=site_id, variable="wind", valid_at=valid_at, now_utc=now_utc
+        )
     except OverflowError:
-        _invalidate_unparseable(conn, site_id, valid_at)
+        _invalidate_unparseable(conn, site_id, valid_at, now_utc=now_utc)
 
 
 def _invalidate_unparseable(
-    conn: sqlite3.Connection, site_id: int, valid_at: str
+    conn: sqlite3.Connection,
+    site_id: int,
+    valid_at: str,
+    *,
+    now_utc: datetime | None = None,
 ) -> None:
+    """Invalidate one wind hour whose time is unusable, without parsing it.
+
+    The closed-day guard (``HOURLY``, at ``valid_at``) is asked first. An
+    instant that does not parse belongs to no day, so with the close on it
+    is always refused: nothing is deleted and the refusal WARNING names no
+    date. ``now_utc`` defaults to ``utc_now()``.
+    """
+    if not check_day_write(
+        conn,
+        site_id,
+        valid_at,
+        WriteKind.HOURLY,
+        now_utc=utc_now() if now_utc is None else now_utc,
+    ):
+        warn_refused_instants(
+            logger,
+            conn,
+            WriteKind.HOURLY,
+            writer="_invalidate_unparseable",
+            site_id=site_id,
+            instants=[valid_at],
+        )
+        return
     logger.warning(
         "wind hour with an unusable time invalidated directly site=%s", site_id
     )

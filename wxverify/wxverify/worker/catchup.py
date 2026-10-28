@@ -509,6 +509,8 @@ def _persist_station_observations(
     if row is None:
         raise JobCancelled()
     changed = False
+    # The closed-day guard's clock; the per-row backstop logs at DEBUG only.
+    now = utc_now()
     for observation in observations:
         changed = (
             insert_station_observation(
@@ -518,6 +520,7 @@ def _persist_station_observations(
                 valid_at=observation.valid_at,
                 value=observation.value,
                 source_raw=observation.source_raw,
+                now_utc=now,
             )
             or changed
         )
