@@ -264,7 +264,6 @@ WIND_HOLD_TITLES: Final[dict[str, str]] = {
         "This weather.com key cannot download wind history for past days,"
         " a known limit of the key"
     ),
-    "all_1day": "Wind updates stalled: weather.com refused the key",
 }
 
 WIND_DAY_STATUSES: Final = ("pending", "partial", "fetched", "unavailable", "failed")

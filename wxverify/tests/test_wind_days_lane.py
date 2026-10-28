@@ -50,6 +50,7 @@ from wxverify.monitor import (  # noqa: PLC2701 -- private, exercised directly
 )
 from wxverify.obs.wind_pairs import WindRecord
 from wxverify.verification.truth import materialize_daily_truth
+from wxverify.worker.access_hold import read_access_record
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import dispatch
 from wxverify.worker.scheduler import (
@@ -342,24 +343,46 @@ def test_open_endpoints_held_hidden_probing_visible_only_when_asked() -> None:
     from wxverify.db.wind_basis import AuthHold
 
     held = AuthHold(endpoint="history_all", status="held", since="x", error=None)
-    probing = AuthHold(endpoint="all_1day", status="probing", since="x", error=None)
+    probing = AuthHold(endpoint="history_all", status="probing", since="x", error=None)
+
+    opened_held = open_endpoints(
+        {"history_all": held}, probing_open=False, five_minute_held=False
+    )
+    assert opened_held == frozenset({"all_1day"}), (
+        "mutant -> at this assertion: correct = {'all_1day'} (a held"
+        " history_all hold closes history_all; all_1day has no lane hold"
+        " of its own and stays open), mutant (all_1day gated on the"
+        " history_all hold too) = frozenset()"
+    )
 
     opened_default = open_endpoints(
-        {"history_all": held, "all_1day": probing}, probing_open=False
+        {"history_all": probing}, probing_open=False, five_minute_held=False
     )
-    assert opened_default == frozenset(), (
-        "mutant -> at this assertion: correct = frozenset() (a probing hold"
-        " is NOT open when probing_open=False), mutant (probing_open check"
-        " dropped) = frozenset({'all_1day'})"
+    assert opened_default == frozenset({"all_1day"}), (
+        "mutant -> at this assertion: correct = {'all_1day'} (a probing"
+        " hold is NOT open when probing_open=False), mutant (probing_open"
+        " check dropped) = frozenset({'history_all', 'all_1day'})"
     )
 
     opened_probing = open_endpoints(
-        {"history_all": held, "all_1day": probing}, probing_open=True
+        {"history_all": probing}, probing_open=True, five_minute_held=False
     )
-    assert opened_probing == frozenset({"all_1day"}), (
-        "mutant -> at this assertion: correct = {'all_1day'} (held stays"
-        " closed even when probing is asked for), mutant (status=='held'"
-        " also treated as probing-eligible) = {'history_all', 'all_1day'}"
+    assert opened_probing == frozenset({"history_all", "all_1day"}), (
+        "mutant -> at this assertion: correct = {'history_all', 'all_1day'}"
+        " (asking for probing_open opens a probing history_all hold too),"
+        " mutant (status=='held' also treated as probing-eligible, or"
+        " probing_open ignored) = frozenset({'all_1day'})"
+    )
+
+    opened_five_minute_held = open_endpoints(
+        {}, probing_open=False, five_minute_held=True
+    )
+    assert opened_five_minute_held == frozenset({"history_all"}), (
+        "mutant -> at this assertion: correct = {'history_all'} (a"
+        " five_minute refused-access hold closes all_1day only; history_all"
+        " stays open with no lane hold of its own), mutant"
+        " (five_minute_held also closes history_all, or is ignored) ="
+        " frozenset() or frozenset({'history_all', 'all_1day'})"
     )
 
 
@@ -2095,11 +2118,12 @@ def test_final_call_refused_keeps_hold_behaviour(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Plan item 5 (S5). A 401/403 on the final call is unchanged
-    behaviour: it sets the all_1day hold and leaves the row's own status
-    and next_attempt_at exactly as seeded; afterwards the finish step
-    still closes D with no "missed" WARNING (the hold already explains
-    it), and the lane is no longer due."""
+    """Plan item 5 (S5), adapted for 0.16.13: a 401/403 on the final call
+    holds the ``five_minute`` kind (not an ``all_1day`` lane hold, which no
+    longer exists) and leaves the row's own status and next_attempt_at
+    exactly as seeded; afterwards the finish step still closes D with no
+    "missed" WARNING (the five_minute refusal already explains it), and
+    the lane is no longer due."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
@@ -2137,21 +2161,22 @@ def test_final_call_refused_keeps_hold_behaviour(
         " dispatched, non-refunded call), mutant (the reservation refunded"
         " on auth refusal) = unchanged"
     )
-    hold = read_auth_hold(conn, "all_1day")
-    assert hold is not None and hold.status == "held", (
-        "mutant -> at this assertion: correct = held (unchanged auth-hold"
-        " behaviour), mutant (the hold write dropped for a final call) ="
-        " None or a different status"
+    record = read_access_record(conn, "five_minute")
+    assert record is not None and record.status == status, (
+        "mutant -> at this assertion: correct = a five_minute record with"
+        f" status={status} (the final call's refusal holds the five_minute"
+        " kind, not a lane hold), mutant (the access-hold write dropped for"
+        " a final call) = None or a different status"
     )
     row = _day_row(conn, station_id, D)
     assert row["status"] == seeded_status, (
         "mutant -> at this assertion: correct = unchanged ("
-        f"{seeded_status!r}), mutant (_auth_refused mistakenly touches"
+        f"{seeded_status!r}), mutant (_fetch_failed mistakenly touches"
         f" status) = {row['status']!r}"
     )
     assert row["next_attempt_at"] == seeded_next_attempt, (
         "mutant -> at this assertion: correct = unchanged"
-        f" ({seeded_next_attempt!r}), mutant (_auth_refused mistakenly"
+        f" ({seeded_next_attempt!r}), mutant (_fetch_failed mistakenly"
         f" touches next_attempt_at) = {row['next_attempt_at']!r}"
     )
 
@@ -2160,25 +2185,25 @@ def test_final_call_refused_keeps_hold_behaviour(
         _t97_freeze(monkeypatch, end + timedelta(minutes=5))
         _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
     assert call_log == [], (
-        f"a held all_1day endpoint must not be called again, got {call_log}"
+        f"a held five_minute endpoint must not be called again, got {call_log}"
     )
     row = _day_row(conn, station_id, D)
     assert row["status"] == "unavailable", (
         "mutant -> at this assertion: correct = unavailable (D's refused"
         " final call stored no records, so the finish step still closes"
-        " the day as unavailable), mutant (the all_1day hold mistakenly"
+        " the day as unavailable), mutant (the five_minute hold mistakenly"
         " blocks the finish step too) = partial (unchanged)"
     )
     assert row["next_attempt_at"] is None, (
         "mutant -> at this assertion: correct = None (the finish step"
-        " clears next_attempt_at), mutant (the all_1day hold mistakenly"
+        " clears next_attempt_at), mutant (the five_minute hold mistakenly"
         " blocks the finish step too) ="
         f" {seeded_next_attempt!r} (unchanged)"
     )
     assert not any("missed" in rec.message for rec in caplog.records), (
         "mutant -> at this assertion: correct = no missed-final WARNING"
-        " (the all_1day hold already explains the gap, plan's"
-        ' "all_1day" not in holds guard), mutant (the guard dropped) ='
+        " (the five_minute refusal already explains the gap, plan's"
+        " refused_kinds guard), mutant (the guard dropped) ="
         f" a missed WARNING, logged = {[rec.message for rec in caplog.records]}"
     )
 

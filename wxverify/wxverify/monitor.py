@@ -32,6 +32,7 @@ from wxverify.verification.record import (
     gap_scan_degraded_sites,
     sites_with_record_gap,
 )
+from wxverify.worker.access_hold import refused_kinds
 
 # --- Hardcoded thresholds (standalone's proven defaults) ---------------------
 FEED_STALE_HOURS = 12
@@ -432,18 +433,18 @@ def _wind_history_trips(
     """``(sites tripped, the first tripped site's first reason)`` for wind_history.
 
     Evaluated per enabled site with at least one enabled station, in site id
-    order, over the checks (c) and (e) to (i) of plan §10, in that order. Read-only.
+    order, over the checks (c), (i), (e) and (h) of plan §10, in that order, or
+    (f) when the site's time zone is unusable. While the ``five_minute`` kind
+    is among ``refused_kinds``, check (h) names no station and check (i) is
+    off. Read-only.
     """
     holds = read_auth_holds(conn)
-    # A history_all hold alone is a known limit of the key: past days are
-    # finished from the records already stored, and check (i) reports a
-    # missed collection before midnight. It is a reason only next to an
-    # all_1day hold.
-    hold_reasons = [
-        f"wind history paused: weather.com refused the key ({endpoint})"
-        for endpoint in holds
-        if endpoint != "history_all" or "all_1day" in holds
-    ]
+    # Read once per call. refused_kinds, not access_held, so the checks also
+    # stay off between a hold's end and the next try, while the stored row
+    # still says the last answer was a refusal.
+    five_minute_refused = any(
+        record.kind == "five_minute" for record in refused_kinds(conn, now)
+    )
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
     tripped = 0
     first: str | None = None
@@ -461,11 +462,10 @@ def _wind_history_trips(
         except (ZoneInfoNotFoundError, ValueError):
             # (f) the can't-tell verdict, surfaced, never passed.
             reasons.append("cannot evaluate")
-            reasons.extend(hold_reasons)
         else:
             reasons.extend(_wind_day_reasons(conn, site_id, today))
             # (i) yesterday's final collection before midnight was missed.
-            if "history_all" in holds and "all_1day" not in holds:
+            if "history_all" in holds and not five_minute_refused:
                 yesterday = today - timedelta(days=1)
                 missed, total = count_missed_final(conn, site_id, yesterday, tz_name)
                 if missed > 0:
@@ -483,10 +483,9 @@ def _wind_history_trips(
                 for row in today_rows
             ):
                 reasons.append("no wind readings today from any station")
-            # (g) weather.com refused the key; see hold_reasons for history_all.
-            reasons.extend(hold_reasons)
-            # (h) one station's today refresh keeps failing.
-            if today_checks:
+            # (h) one station's today refresh keeps failing; skipped while the
+            # five_minute kind is refused, so no station is named for it.
+            if today_checks and not five_minute_refused:
                 reasons.extend(_wind_stale_station_reasons(today_rows, now, interval))
         if reasons:
             tripped += 1
@@ -782,9 +781,9 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # wind_history (plan §10): per enabled site with an enabled station, an
-    # all_1day weather.com auth hold, a failing station-day, a missed collection
-    # before midnight, or a station whose wind stopped updating today.
+    # wind_history (plan §10): per enabled site with an enabled station, a
+    # failing station-day, a missed collection before midnight, or a station
+    # whose wind stopped updating today.
     wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
 
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:

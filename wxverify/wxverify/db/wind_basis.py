@@ -30,8 +30,11 @@ PAIR_MAX_SOURCE_PREFIX: Final = "pair-max "
 #: A NULL ``source_raw`` evaluates to NULL here and is excluded.
 PAIR_MAX_WIND_SQL: Final[LiteralString] = "(substr(so.source_raw, 1, 9) = 'pair-max ')"
 
-AUTH_HOLD_ENDPOINTS: Final = ("history_all", "all_1day")
-AuthHoldEndpoint = Literal["history_all", "all_1day"]
+AUTH_HOLD_ENDPOINTS: Final = ("history_all",)
+AuthHoldEndpoint = Literal["history_all"]
+#: The lane's two requests: ``history_all`` for a past day, ``all_1day`` for
+#: today. Only ``history_all`` has a lane hold (``AuthHoldEndpoint``).
+WindEndpoint = Literal["history_all", "all_1day"]
 AuthHoldStatus = Literal["held", "probing"]
 
 
@@ -109,7 +112,7 @@ def clear_auth_hold(conn: sqlite3.Connection, endpoint: AuthHoldEndpoint) -> Non
 
 def read_auth_holds(conn: sqlite3.Connection) -> dict[AuthHoldEndpoint, AuthHold]:
     holds: dict[AuthHoldEndpoint, AuthHold] = {}
-    for endpoint in ("history_all", "all_1day"):
+    for endpoint in ("history_all",):
         hold = read_auth_hold(conn, endpoint)
         if hold is not None:
             holds[endpoint] = hold
