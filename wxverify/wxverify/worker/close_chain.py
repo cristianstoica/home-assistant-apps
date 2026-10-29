@@ -5,7 +5,9 @@ stages 2 to 6, ``day_publish`` stages 7 and 8) under the hand-off rule
 (plan 8.1-8.3), entered through ``run_day_close`` and ``run_day_publish``;
 the failure writes ``fail_attempt`` and ``fail_publication`` (9.1, 9.4) and
 the hooks ``_fail_job`` calls for them; ``run_close_retention`` (8.4);
-``publication_record``; ``record_collection_try``, the writer of the
+``publication_record``; ``close_status``, ``stage_log``,
+``collection_tries`` and ``publication_state``, the read-only interface for
+P5 and P6 (14.2); ``record_collection_try``, the writer of the
 collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
 (8.5): stage 1, the missed days, the repair and the publication retry; and
 ``settle_interrupted_closes``, which settles the closes and publications a
@@ -31,6 +33,7 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Final, Literal
 
+from wxverify.core import timeutil
 from wxverify.core.timeutil import (
     isoformat_utc,
     isoformat_utc_micro,
@@ -271,6 +274,308 @@ def publication_record(
         finished_at=_instant_or_none(row[5]),
         publication_id=None if row[6] is None else str(row[6]),
         last_failure=None if row[7] is None else str(row[7]),
+    )
+
+
+# --- the read-only interface for P5 and P6 (14.2) ---------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptRecord:
+    """One ``close_attempts`` row: one close attempt of a site-day (11.3).
+
+    ``outcome`` is ``running``, ``closed`` or ``failed``. ``last_stage`` is
+    the last stage saved as complete (1 when the attempt starts), and
+    ``last_progress_at`` when. ``ended_at`` is set when the attempt ends,
+    ``failed_stage`` and ``failure_reason`` when it fails, and
+    ``truth_version`` once stage 4 has saved it.
+    """
+
+    attempt: int
+    started_at: datetime
+    last_stage: int
+    last_progress_at: datetime
+    outcome: str
+    failed_stage: int | None
+    failure_reason: str | None
+    ended_at: datetime | None
+    truth_version: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StationDayRecord:
+    """One ``close_station_days`` row: a station's presence on a day (11.3).
+
+    The readings in the day's bounds per source after the gap fill; whether
+    a 5-minute try of the station-day was answered; whether the day was
+    lost to refused access; whether the station was paused for the day. A
+    paused station is never one whose values were thrown away (5.6, 14.2).
+    """
+
+    station_id: int
+    five_minute: int
+    current_obs: int
+    hourly: int
+    answered: bool
+    refused_lost: bool
+    paused: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StageRun:
+    """One ``close_stage_log`` row: one run of a stage (11.1).
+
+    ``attempt`` is the close attempt for stages 1 to 6 and the publication
+    attempt for stages 7 and 8, whose rows are dated by the publication's
+    cutoff. ``job_id`` is None for stage 1 only. ``outcome`` is
+    ``completed``, ``failed``, ``superseded`` or ``skipped``; ``detail`` is
+    the stored JSON object text.
+    """
+
+    stage: int
+    attempt: int
+    job_id: int | None
+    enqueued_at: datetime
+    started_at: datetime
+    ended_at: datetime
+    queue_wait_s: float
+    duration_s: float
+    outcome: str
+    reason: str | None
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class CollectionTry:
+    """One ``close_try_log`` row: one weather.com collection try (11.2).
+
+    ``slot`` is an evening slot as local ``HH:MM``, ``daytime`` or
+    ``gap_fill``; ``close_attempt`` is set for a gap fill only. A held or
+    refused try is an outage of access, never a station offline (14.2).
+    """
+
+    station_id: int
+    kind: str
+    slot: str
+    close_attempt: int | None
+    tried_at: datetime
+    outcome: str
+    reason: str | None
+    detail: str | None
+    readings_kept: int
+    readings_refused: int
+
+
+@dataclass(frozen=True, slots=True)
+class CloseStatus:
+    """Everything about the close of one site-day, from stored rows (14.2).
+
+    ``state`` to ``done_at`` are P1's ``site_days`` columns as stored.
+    ``blocking_stage`` is derived (``_blocking_stage``). ``attempt_records``
+    are the day's attempts in attempt order; ``stations`` its presence
+    records in station order (after stage 2 of an attempt); ``publication``
+    the publication whose cutoff is this day (a ``closed`` day only).
+    """
+
+    state: DayState
+    attempts: int
+    retry_at: datetime | None
+    last_failure: str | None
+    missed_reason: MissedReason | None
+    done_at: datetime | None
+    blocking_stage: int | None
+    attempt_records: tuple[AttemptRecord, ...]
+    stations: tuple[StationDayRecord, ...]
+    publication: PublicationRecord | None
+
+
+def _attempt_records(
+    conn: sqlite3.Connection, site_id: int, local_date: date
+) -> tuple[AttemptRecord, ...]:
+    rows = conn.execute(
+        "SELECT attempt, started_at, last_stage, last_progress_at, outcome,"
+        " failed_stage, failure_reason, ended_at, truth_version"
+        " FROM close_attempts WHERE site_id = ? AND local_date = ?"
+        " ORDER BY attempt",
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    return tuple(
+        AttemptRecord(
+            attempt=int(row[0]),
+            started_at=parse_utc(str(row[1])),
+            last_stage=int(row[2]),
+            last_progress_at=parse_utc(str(row[3])),
+            outcome=str(row[4]),
+            failed_stage=None if row[5] is None else int(row[5]),
+            failure_reason=None if row[6] is None else str(row[6]),
+            ended_at=_instant_or_none(row[7]),
+            truth_version=None if row[8] is None else str(row[8]),
+        )
+        for row in rows
+    )
+
+
+def _station_records(
+    conn: sqlite3.Connection, site_id: int, local_date: date
+) -> tuple[StationDayRecord, ...]:
+    rows = conn.execute(
+        "SELECT station_id, five_minute, current_obs, hourly, answered,"
+        " refused_lost, paused FROM close_station_days"
+        " WHERE site_id = ? AND local_date = ? ORDER BY station_id",
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    return tuple(
+        StationDayRecord(
+            station_id=int(row[0]),
+            five_minute=int(row[1]),
+            current_obs=int(row[2]),
+            hourly=int(row[3]),
+            answered=bool(row[4]),
+            refused_lost=bool(row[5]),
+            paused=bool(row[6]),
+        )
+        for row in rows
+    )
+
+
+def _blocking_stage(
+    record: DayRecord, attempts: tuple[AttemptRecord, ...]
+) -> int | None:
+    """The stage the day waits on, or None (14.2).
+
+    ``open`` from its ``day_end_utc`` on: 1, the wait for the round; only
+    here is the clock read, through ``timeutil.utc_now``. ``closing``: the
+    current attempt's ``last_stage`` + 1. ``retry_due`` and ``missed``
+    (``retry_failed``): the failed attempt's ``failed_stage``. The current
+    or failed attempt is the one numbered ``attempts``, P1's count. None in
+    every other case, and when that attempt has no record.
+    """
+    if record.state == "open":
+        return 1 if timeutil.utc_now() >= record.day_end_utc else None
+    current = next((row for row in attempts if row.attempt == record.attempts), None)
+    if current is None:
+        return None
+    if record.state == "closing":
+        return current.last_stage + 1
+    if record.state == "retry_due" or (
+        record.state == "missed" and record.missed_reason == "retry_failed"
+    ):
+        return current.failed_stage
+    return None
+
+
+def close_status(
+    conn: sqlite3.Connection, *, site_id: int, local_date: date
+) -> CloseStatus | None:
+    """Everything about the close of ``site_id``'s day ``local_date`` (14.2).
+
+    None when the site has no P1 record dated ``local_date`` (before its
+    first record, or with the close off). Each field is present or None as
+    the stored rows hold it; nothing is cached. Read-only: runs in the
+    caller's transaction and never commits, so a caller that needs its
+    four SELECTs in one snapshot holds one around the call. Reads the clock
+    (``timeutil.utc_now``) only for an ``open`` day, to tell whether the
+    day has ended.
+    """
+    record = day_record(conn, site_id, local_date)
+    if record is None:
+        return None
+    attempts = _attempt_records(conn, site_id, local_date)
+    return CloseStatus(
+        state=record.state,
+        attempts=record.attempts,
+        retry_at=record.retry_at,
+        last_failure=record.last_failure,
+        missed_reason=record.missed_reason,
+        done_at=_instant_or_none(record.done_at),
+        blocking_stage=_blocking_stage(record, attempts),
+        attempt_records=attempts,
+        stations=_station_records(conn, site_id, local_date),
+        publication=publication_record(conn, site_id=site_id, cutoff=local_date),
+    )
+
+
+def stage_log(
+    conn: sqlite3.Connection, *, site_id: int, local_date: date
+) -> list[StageRun]:
+    """The stage-log rows of ``site_id`` dated ``local_date`` (11.1, 14.2).
+
+    Stages 1 to 6 of the day's close attempts and, for a ``closed`` day,
+    stages 7 and 8 of the publication whose cutoff it is, in the order the
+    rows were written. Rows older than ``CLOSE_LOG_KEEP_DAYS`` are gone.
+    Read-only; runs in the caller's transaction.
+    """
+    rows = conn.execute(
+        "SELECT stage, attempt, job_id, enqueued_at, started_at, ended_at,"
+        " queue_wait_s, duration_s, outcome, reason, detail FROM close_stage_log"
+        " WHERE site_id = ? AND local_date = ? ORDER BY id",
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    return [
+        StageRun(
+            stage=int(row[0]),
+            attempt=int(row[1]),
+            job_id=None if row[2] is None else int(row[2]),
+            enqueued_at=parse_utc(str(row[3])),
+            started_at=parse_utc(str(row[4])),
+            ended_at=parse_utc(str(row[5])),
+            queue_wait_s=float(row[6]),
+            duration_s=float(row[7]),
+            outcome=str(row[8]),
+            reason=None if row[9] is None else str(row[9]),
+            detail=str(row[10]),
+        )
+        for row in rows
+    ]
+
+
+def collection_tries(
+    conn: sqlite3.Connection, *, site_id: int, local_date: date
+) -> list[CollectionTry]:
+    """The collection try-log rows of ``site_id`` dated ``local_date`` (11.2, 14.2).
+
+    Every station's 5-minute tries and gap-fill calls of the day, whatever
+    its state, in the order the rows were written. Rows older than
+    ``CLOSE_LOG_KEEP_DAYS`` are gone. Read-only; runs in the caller's
+    transaction.
+    """
+    rows = conn.execute(
+        "SELECT station_id, kind, slot, close_attempt, tried_at, outcome, reason,"
+        " detail, readings_kept, readings_refused FROM close_try_log"
+        " WHERE site_id = ? AND local_date = ? ORDER BY id",
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    return [
+        CollectionTry(
+            station_id=int(row[0]),
+            kind=str(row[1]),
+            slot=str(row[2]),
+            close_attempt=None if row[3] is None else int(row[3]),
+            tried_at=parse_utc(str(row[4])),
+            outcome=str(row[5]),
+            reason=None if row[6] is None else str(row[6]),
+            detail=None if row[7] is None else str(row[7]),
+            readings_kept=int(row[8]),
+            readings_refused=int(row[9]),
+        )
+        for row in rows
+    ]
+
+
+def publication_state(
+    conn: sqlite3.Connection, *, site_id: int
+) -> PublicationRecord | None:
+    """The site's publication record with the latest cutoff, or None (11.5, 14.2).
+
+    Whatever its state. Read-only; runs in the caller's transaction.
+    """
+    row = conn.execute(
+        "SELECT MAX(cutoff) FROM close_publications WHERE site_id = ?", (site_id,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return publication_record(
+        conn, site_id=site_id, cutoff=date.fromisoformat(str(row[0]))
     )
 
 

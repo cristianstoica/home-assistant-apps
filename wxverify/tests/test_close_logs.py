@@ -52,6 +52,7 @@ from tests.helpers import (
     disable_other_enqueuers,
     install_p4_standins,
     install_round_state_standin,
+    note_day_clock,
     patch_close_clock,
     run_due_jobs,
     standard_night,
@@ -947,12 +948,14 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     "exists in" column says; ``blocking_stage`` 1, 3, the failed stage,
     None; the publication item only on ``closed`` (14.2).
 
-    M63 -> at the retry_due assertion below: correct = ``blocking_stage``
-    equals the failed attempt's OWN ``failed_stage`` (4), mutant M63
-    (``close_status.blocking_stage`` taken as ``last_stage`` in
-    ``closing``) = the attempt's ``last_stage`` instead (3) -- a different,
-    discriminating literal, since this attempt's ``last_stage`` (3) and
-    ``failed_stage`` (4) are deliberately set one apart.
+    M63 -> at the first ``closing`` assertion below: correct =
+    ``blocking_stage`` equals the current attempt's own ``last_stage`` + 1
+    (3), mutant M63 (``close_status.blocking_stage`` taken as
+    ``last_stage`` in ``closing``) = the attempt's bare ``last_stage``
+    instead (2) -- a different, discriminating literal. Caught again at
+    the attempt-2 ``closing`` assertion (correct 6, mutant 5). The
+    ``retry_due`` path reads the failed attempt's ``failed_stage``, never
+    ``last_stage``, so M63 never reaches it.
 
     Imports ``close_chain.close_status`` inline: at ``a4a919c`` that raises
     ``ImportError`` at once.
@@ -960,7 +963,26 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     from wxverify.worker.close_chain import close_status  # noqa: PLC0415
 
     conn = asof_conn()
+
+    def _close_d_minus_1(target_site_id: int) -> None:
+        """Close D - 1 so a later ``begin_close``/``mark_missed`` on D does
+        not trip ``_has_earlier_undone`` (db/site_days.py:757, 887): each
+        fresh ``day_close_site`` fixture leaves D - 1 ``open`` (D - 3 is
+        closed and D - 2 is marked ``missed``, both already done -- only
+        D - 1 is not)."""
+        d_minus_1 = D - timedelta(days=1)
+        row = conn.execute(
+            "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+            (target_site_id, d_minus_1.isoformat()),
+        ).fetchone()
+        assert row is not None
+        day_end_d1 = datetime.fromisoformat(row["day_end_utc"].replace("Z", "+00:00"))
+        t_close = note_day_clock(day_end_d1 + timedelta(minutes=30))
+        begin_close(conn, target_site_id, d_minus_1, now_utc=t_close)
+        finish_close(conn, target_site_id, d_minus_1, now_utc=t_close)
+
     site_id = day_close_site(conn, close_on=True, with_records=True)
+    _close_d_minus_1(site_id)
     d_end_row = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_id, D.isoformat()),
@@ -977,7 +999,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         "an open day before its own end has no blocking_stage at all (14.2)"
     )
 
-    clock_after = day_end + timedelta(minutes=5)
+    clock_after = note_day_clock(day_end + timedelta(minutes=5))
     monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: clock_after)
     status_after_end = close_status(conn, site_id=site_id, local_date=D)
     assert status_after_end is not None
@@ -1003,10 +1025,11 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_closing.state == "closing"
     assert status_closing.blocking_stage == 3, (
         "in closing, blocking_stage is the current attempt's last_stage + 1"
-        " (14.2): last_stage 2 here must give 3"
+        " (14.2): last_stage 2 here must give 3. M63 -> at this assertion:"
+        " correct = 3, mutant M63 = 2."
     )
 
-    fail_time = clock_after + timedelta(minutes=10)
+    fail_time = note_day_clock(clock_after + timedelta(minutes=10))
     fail_close(conn, site_id, D, now_utc=fail_time, reason="network")
     conn.execute(
         "UPDATE close_attempts SET outcome = 'failed', failed_stage = 4,"
@@ -1021,13 +1044,11 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     assert status_retry_due.retry_at is not None
     assert status_retry_due.last_failure is not None
     assert status_retry_due.blocking_stage == 4, (
-        "M63 -> at this assertion: correct = 4 (the failed attempt's own"
-        " failed_stage), mutant M63 (blocking_stage taken as last_stage in"
-        " closing) = 3 instead (this attempt's last_stage, deliberately one"
-        " apart from its failed_stage so the two literals discriminate)"
+        "in retry_due, blocking_stage is the failed attempt's own"
+        " failed_stage (14.2), not last_stage: failed_stage 4 here"
     )
 
-    retry_due_at = fail_time + timedelta(hours=1)
+    retry_due_at = note_day_clock(fail_time + timedelta(hours=1))
     begin_close(conn, site_id, D, now_utc=retry_due_at)
     _insert_attempt_row(
         conn,
@@ -1069,12 +1090,13 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     site_closed = day_close_site(
         conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
+    _close_d_minus_1(site_closed)
     d_end_row2 = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_closed, D.isoformat()),
     ).fetchone()
     day_end2 = datetime.fromisoformat(d_end_row2["day_end_utc"].replace("Z", "+00:00"))
-    close_time = day_end2 + timedelta(minutes=20)
+    close_time = note_day_clock(day_end2 + timedelta(minutes=20))
     begin_close(conn, site_closed, D, now_utc=close_time)
     finish_close(conn, site_closed, D, now_utc=close_time)
     _insert_attempt_row(
@@ -1119,6 +1141,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     site_never_attempted = day_close_site(
         conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
+    _close_d_minus_1(site_never_attempted)
     na_end_row = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_never_attempted, D.isoformat()),
@@ -1126,7 +1149,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     na_day_end = datetime.fromisoformat(
         na_end_row["day_end_utc"].replace("Z", "+00:00")
     )
-    na_now = na_day_end + timedelta(minutes=5)
+    na_now = note_day_clock(na_day_end + timedelta(minutes=5))
     mark_missed(conn, site_never_attempted, D, now_utc=na_now, reason="never_attempted")
     conn.commit()
     status_never_attempted = close_status(
@@ -1159,6 +1182,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     site_changeover = day_close_site(
         conn, close_on=True, with_records=True, station_ids=("ISTATION03", "ISTATION04")
     )
+    _close_d_minus_1(site_changeover)
     conn.execute(
         "UPDATE site_days SET zone_changeover = 1 WHERE site_id = ? AND local_date = ?",
         (site_changeover, D.isoformat()),
@@ -1170,7 +1194,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     co_day_end = datetime.fromisoformat(
         co_end_row["day_end_utc"].replace("Z", "+00:00")
     )
-    co_now = co_day_end + timedelta(minutes=5)
+    co_now = note_day_clock(co_day_end + timedelta(minutes=5))
     mark_missed(conn, site_changeover, D, now_utc=co_now, reason="zone_changeover")
     conn.commit()
     status_changeover = close_status(conn, site_id=site_changeover, local_date=D)
@@ -1201,13 +1225,14 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     site_missed = day_close_site(
         conn, close_on=True, with_records=True, station_ids=("ISTATION05", "ISTATION06")
     )
+    _close_d_minus_1(site_missed)
     d_end_row3 = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_missed, D.isoformat()),
     ).fetchone()
     day_end3 = datetime.fromisoformat(d_end_row3["day_end_utc"].replace("Z", "+00:00"))
-    t1 = day_end3 + timedelta(minutes=5)
-    t2 = t1 + timedelta(hours=1, minutes=5)
+    t1 = note_day_clock(day_end3 + timedelta(minutes=5))
+    t2 = note_day_clock(t1 + timedelta(hours=1, minutes=5))
     begin_close(conn, site_missed, D, now_utc=t1)
     fail_close(conn, site_missed, D, now_utc=t1, reason="network")
     _insert_attempt_row(
@@ -1254,6 +1279,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     site_retry_not_run = day_close_site(
         conn, close_on=True, with_records=True, station_ids=("ISTATION05", "ISTATION06")
     )
+    _close_d_minus_1(site_retry_not_run)
     rnr_end_row = conn.execute(
         "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
         (site_retry_not_run, D.isoformat()),
@@ -1261,7 +1287,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     rnr_day_end = datetime.fromisoformat(
         rnr_end_row["day_end_utc"].replace("Z", "+00:00")
     )
-    rnr_t1 = rnr_day_end + timedelta(minutes=5)
+    rnr_t1 = note_day_clock(rnr_day_end + timedelta(minutes=5))
     begin_close(conn, site_retry_not_run, D, now_utc=rnr_t1)
     fail_close(conn, site_retry_not_run, D, now_utc=rnr_t1, reason="network")
     _insert_attempt_row(
@@ -1275,7 +1301,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         failure_reason="network",
         started_at=isoformat_utc(rnr_t1),
     )
-    rnr_t2 = rnr_t1 + timedelta(hours=1, minutes=5)
+    rnr_t2 = note_day_clock(rnr_t1 + timedelta(hours=1, minutes=5))
     mark_missed(conn, site_retry_not_run, D, now_utc=rnr_t2, reason="retry_not_run")
     conn.commit()
     status_retry_not_run = close_status(conn, site_id=site_retry_not_run, local_date=D)
