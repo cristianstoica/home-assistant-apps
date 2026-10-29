@@ -40,10 +40,10 @@ from tests.helpers import (
     STANDARD_NIGHT_ROUND_BOUND,
     D,
     MovingClock,
-    Stop,
     clear_close_chain_log_map,
     day_close_site,
     disable_other_enqueuers,
+    install_p4_standins,
     install_round_state_standin,
     note_day_clock,
     parse_utc,
@@ -54,7 +54,7 @@ from tests.helpers import (
     stub_wind_days,
     tick,
 )
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
 
@@ -180,9 +180,10 @@ def test_tl1_attempt_starts_only_once_the_round_settles(
             "stage 1's started_at must be D's own day_end_utc (4.1: the round"
             " starts just after D's end)"
         )
-        assert stage1["ended_at"] == isoformat_utc(_r_at(0, 20)), (
+        assert stage1["ended_at"] == isoformat_utc_micro(_r_at(0, 20)), (
             "stage 1's ended_at must be the instant it actually settled, not"
-            " the bound or some other time"
+            " the bound or some other time (plan 12.3: every stamp P3 writes"
+            " uses isoformat_utc_micro)"
         )
 
         keys = await _day_close_job_keys(db, site_id)
@@ -260,6 +261,7 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+        install_p4_standins(monkeypatch)
         wind_calls = stub_wind_days(monkeypatch)
 
         clock.set(BOUND)
@@ -275,7 +277,11 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
             " wind-lane job check removed) = ('closing', 1)"
         )
 
-        claims = await run_due_jobs(db, clock)
+        # The row says only that the attempt STARTS at the next tick (5.1),
+        # not that it runs to completion -- stop once stage 2's job is
+        # pending, so this test never reaches stage 5's close_p4.score_day
+        # (install_p4_standins above is the safety net if it ever did).
+        claims = await run_due_jobs(db, clock, stop_before=("day_close", 2))
         types_keys = [(t, k) for t, k, _outcome in claims]
         assert ("fetch_obs", "wind-days") in types_keys, (
             "the due wind-lane job must be claimed before the attempt starts"
@@ -299,13 +305,16 @@ def test_tl3_close_waits_behind_a_due_wind_lane_job(
 def test_tl4_days_are_attempted_oldest_first(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TL4: D - 1 still ``retry_due`` at R 00:40Z, its retry now due. No
-    attempt for D until D - 1 is done (P1 §4.5).
+    """TL4: D - 1 still ``retry_due`` at R 00:40Z (``BOUND``), its retry
+    now due within ``CLOSE_LATE_LIMIT`` (1h) of the tick, so the "running
+    when due" rule of 5.2 does not itself fire here. No attempt for D
+    until D - 1 is done (P1 §4.5).
 
     M16 -> at the assertion below: correct = D - 1 moves to ``closing``
     (attempt 2) at this tick, its retry now due and D - 1 being the
     site's oldest not-done day, while D stays ``open`` at 0 attempts
-    (blocked behind D - 1), mutant M16 (the tick takes the site's newest
+    (D has ended by ``BOUND`` and is blocked only because D - 1 is not
+    done, P1 §4.5), mutant M16 (the tick takes the site's newest
     not-done day instead of its oldest, so ``begin_close`` is tried on D
     instead and refused) = D - 1 stays ``retry_due`` at attempt 1, its
     retry never attempted, while D is unchanged too.
@@ -321,8 +330,12 @@ def test_tl4_days_are_attempted_oldest_first(
 
         d_minus_1 = D - timedelta(days=1)
         # Undo standard_night's D-1 closure: put it back to closing/attempt 1,
-        # then fail it so it lands retry_due with its retry due well before
-        # R 00:40Z (NOW + 1h, vs. a tick roughly 12.7h after NOW).
+        # then fail it 1h30m before BOUND, so its retry_at (failure +
+        # RETRY_DELAY, 1h) lands 30 minutes before BOUND -- inside the hour
+        # the "running when due" rule (5.2) allows. standard_night's
+        # worker_started_at is NOW (D 12:00Z), before retry_at, so the
+        # add-on counts as running.
+        failed_at = note_day_clock(BOUND - timedelta(minutes=90))
         await db.write(
             lambda c: c.execute(
                 "UPDATE site_days SET state = 'closing', attempts = 1, done_at = NULL"
@@ -331,13 +344,19 @@ def test_tl4_days_are_attempted_oldest_first(
             )
         )
         await db.write(
-            lambda c: fail_close(c, site_id, d_minus_1, now_utc=NOW, reason="network")
+            lambda c: fail_close(
+                c, site_id, d_minus_1, now_utc=failed_at, reason="network"
+            )
         )
         before = await _state(db, site_id, d_minus_1)
         assert (before.state, before.attempts) == ("retry_due", 1), (
             "D-1 must start this test retry_due at attempt 1"
         )
 
+        # Tick at R's bound (plan 5.1): D-1's retry_at is BOUND - 30m, within
+        # CLOSE_LATE_LIMIT (1h) of this tick, so the "running when due" rule
+        # (5.2) lets the retry be attempted -- it is this case's oldest
+        # not-done day.
         await tick(db, clock, BOUND)
 
         d1_after = await _state(db, site_id, d_minus_1)
@@ -368,17 +387,25 @@ def test_tl5_sites_are_enqueued_in_due_instant_order(
     are due, S1's job is created first when its due instant is earlier
     (4.5, 8.5).
 
-    Built so the GMT-14 site (whose due instant is 14 hours EARLIER in
-    UTC) gets the HIGHER site id, deliberately opposite of its due-
-    instant order -- the only arrangement where "ordered by due instant"
-    and "ordered by site id" disagree, so M17 can only pass against the
-    correct rule and must fail against its own.
+    S1's own round bound is set a few minutes earlier than S2's (the
+    round date's bound is whatever ``round_state``'s stand-in answers,
+    independent of either site's real timezone math), the smallest gap
+    that still orders S1 before S2 -- any larger gap risks ticking more
+    than ``CLOSE_LATE_LIMIT`` (1h) after S1's own due instant, which
+    would itself trip the "running when due" rule of 5.2 and strand S1
+    unattempted instead of testing the ordering this case is about.
+
+    Built so the GMT-14 site gets the HIGHER site id, deliberately
+    opposite of its due-instant order -- the only arrangement where
+    "ordered by due instant" and "ordered by site id" disagree, so M17
+    can only pass against the correct rule and must fail against its
+    own.
 
     M17 -> at the ordering assertion below: correct = the GMT-14 site's
     ``day_close`` job created before the UTC site's (its due instant is
-    14 hours earlier), mutant M17 (sites ordered by site id only) = the
-    UTC site's job created first instead, since the UTC site has the
-    LOWER id here.
+    earlier), mutant M17 (sites ordered by site id only) = the UTC
+    site's job created first instead, since the UTC site has the LOWER
+    id here.
     """
 
     async def _run() -> None:
@@ -403,7 +430,7 @@ def test_tl5_sites_are_enqueued_in_due_instant_order(
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
 
-        bound_gmt14 = BOUND - timedelta(hours=14)
+        bound_gmt14 = BOUND - timedelta(minutes=10)
         round_state.set_answer(site_gmt14, R, settled=True, bound_utc=bound_gmt14)
         round_state.set_answer(site_utc, R, settled=True, bound_utc=BOUND)
 
@@ -457,6 +484,13 @@ def test_tl6_a_changeover_day_is_missed_not_scored(
         disable_other_enqueuers(monkeypatch)
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
+        # The tick's due-instant read (_site_due_instant, plan 4.5/8.5) asks
+        # close_p4.round_state for the round's bound even for a changeover
+        # day -- without a stand-in the real, unimplemented round_state
+        # raises, the per-site savepoint rolls the whole tick back, and D
+        # never moves (plan 173, 219).
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
         await db.write(
             lambda c: c.execute(
@@ -491,43 +525,122 @@ def test_tl6_a_changeover_day_is_missed_not_scored(
 # ---------------------------------------------------------------------------
 
 
+def _seed_r_record_sample(conn, site_id, local_date) -> None:  # type: ignore[no-untyped-def]
+    """One feed, one full day of hourly temperature samples for ``local_date``
+    (copied and trimmed to a single variable from
+    ``tests/test_forecast_record.py``'s ``_make_feed``/``_insert_temp_day``):
+    the 07:00 record needs an actual candidate on hand to write a saved row,
+    not just a published generation -- an empty day writes zero rows
+    (``tests/test_record_oracles.py::test_zero_sample_day_writes_no_rows``).
+    """
+    cur = conn.execute(
+        "INSERT INTO feeds (source, model, default_subscribed,"
+        " fetch_interval_minutes, max_lead_hours)"
+        " VALUES ('example-src', 'tl7-model', 1, 360, 192)"
+    )
+    assert cur.lastrowid is not None
+    feed_id = int(cur.lastrowid)
+    issued = datetime(local_date.year, local_date.month, local_date.day, 6, tzinfo=UTC)
+    issued_at = isoformat_utc(issued)
+    fetched_at = isoformat_utc(issued + timedelta(minutes=5))
+    for hour in range(24):
+        valid = datetime(
+            local_date.year, local_date.month, local_date.day, hour, tzinfo=UTC
+        )
+        lead = max(1, int((valid - issued).total_seconds() // 3600))
+        conn.execute(
+            "INSERT INTO forecast_samples"
+            " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
+            " value, source_raw, model_run_id, fetched_at)"
+            " VALUES (?, ?, 'temperature', ?, ?, ?, 10.0, '{}', 'run-tl7', ?)",
+            (site_id, feed_id, issued_at, isoformat_utc(valid), lead, fetched_at),
+        )
+
+
+async def _forecast_record_status(db, site_id, local_date):  # type: ignore[no-untyped-def]
+    # Keyed to R's own job (production key "record:{local_date.isoformat()}",
+    # written by _enqueue_due_forecast_records in wxverify/worker/scheduler.py)
+    # -- a bare first-row read would pick up any forecast_record job for the
+    # site, not R's. At most one row is expected for this key (the due-check
+    # is suppressed by its own success/failure cooldown once a row exists);
+    # asserting that keeps the read honest rather than silently picking one.
+    job_key = f"record:{local_date.isoformat()}"
+    rows = await db.read(
+        lambda c: c.execute(
+            "SELECT status FROM jobs"
+            " WHERE type = 'forecast_record' AND site_id = ? AND job_key = ?",
+            (site_id, job_key),
+        ).fetchall()
+    )
+    assert len(rows) <= 1, f"expected at most one forecast_record job keyed {job_key!r}"
+    return None if not rows else str(rows[0]["status"])
+
+
 def test_tl7_the_0700_record_runs_independently_of_a_blocked_chain(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """TL7: the chain blocked at stage 2 (the stand-in for ``fill_gaps``
-    waits); tick at R 07:00Z. The 07:00 record is enqueued and runs
-    (8.7, Q5). Plan section 16.2 names no mutant for TL7.
+    """TL7: the chain blocked at stage 2 (``run_due_jobs`` stops before
+    claiming it); tick at R 07:00Z. Right after the tick, D is still
+    ``closing`` and R's ``forecast_record`` job is ``pending`` (M101: it
+    must not be skipped for a site with a ``closing`` day). After
+    ``run_due_jobs`` runs the queue to empty, that job is ``completed`` and
+    R's record row is saved. The stage-2 job, older in tier 0, is claimed
+    first and fails the attempt as ``stalled`` (8.3, ``CLOSE_LATE_LIMIT`` of
+    1 hour against the 7 h gap to 07:00) before ever reaching ``fill_gaps``
+    -- expected, and not asserted beyond D leaving ``closing`` (8.7, Q5).
     """
 
     async def _run() -> None:
         db, _writer, site_id, _stations = standard_night(tmp_path)
         disable_other_enqueuers(monkeypatch, keep=("_enqueue_due_forecast_records",))
+        await db.write(lambda c: _seed_r_record_sample(c, site_id, R))
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
-        async def _blocked_fill_gaps(*args: object, **kwargs: object) -> object:
-            raise Stop("stage 2 held open for TL7")
-
-        monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _blocked_fill_gaps)
-
+        clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 2))
         record = await _state(db, site_id)
         assert record.state == "closing", "the attempt must have reached stage 2"
 
         await tick(db, clock, _r_at(7, 0))
-        record_row = await db.read(
+        record = await _state(db, site_id)
+        assert record.state == "closing", (
+            "D must still be mid-attempt right after the tick -- the stage-2"
+            " job is only held open by the clock gap to stage 2's claim, not"
+            " claimed and resolved by this tick"
+        )
+        status = await _forecast_record_status(db, site_id, R)
+        assert status == "pending", (
+            "M101 -> at this assertion: correct = 'pending' (the 07:00"
+            " record is enqueued for R even though D's day_close is"
+            " 'closing'), mutant M101 (skips a site while one of its days is"
+            " 'closing') = None (no forecast_record job enqueued at all)"
+        )
+
+        await run_due_jobs(db, clock)
+        status = await _forecast_record_status(db, site_id, R)
+        assert status == "completed", (
+            "the 07:00 record job must run to completion once it is claimed,"
+            " independently of the still-unresolved close chain"
+        )
+        record_rows = await db.read(
             lambda c: c.execute(
-                "SELECT 1 FROM jobs WHERE type = 'forecast_record' AND site_id = ?"
-                " AND status IN ('pending', 'running', 'completed')",
-                (site_id,),
+                "SELECT COUNT(*) AS n FROM forecast_of_record"
+                " WHERE site_id = ? AND snapshot_local_date = ?",
+                (site_id, R.isoformat()),
             ).fetchone()
         )
-        assert record_row is not None, (
-            "the 07:00 record must be enqueued at R 07:00Z even though the"
-            " close chain is still stuck at stage 2 (8.7, Q5): the record"
-            " never waits for the chain"
+        assert record_rows is not None and int(record_rows["n"]) > 0, (
+            "R's forecast-of-record row must be saved by persist_forecast_record"
+            " once the job completes"
+        )
+        record = await _state(db, site_id)
+        assert record.state != "closing", (
+            "D must leave 'closing' once its stage-2 job is claimed and found"
+            " stalled (8.3); not asserted beyond that it leaves 'closing'"
+            " (8.7, Q5)"
         )
 
     asyncio.run(_run())
@@ -568,6 +681,7 @@ def test_tl8_close_kinds_claim_ahead_of_an_older_tier1_job(
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+        install_p4_standins(monkeypatch)
         fetch_feed_calls = stub_fetch_feed(monkeypatch)
 
         feed_row = await db.read(
@@ -656,16 +770,23 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         disable_other_enqueuers(monkeypatch)
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
+        # D's own due instant still needs P4's bound even on this AT4-style
+        # start (plan 173, 219): without a round_state stand-in the real,
+        # unimplemented round_state raises, the per-site savepoint rolls
+        # the tick back, and D never moves.
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
-        # worker_started_at D 12:00Z (standard_night's NOW), bound R 00:40Z.
-        # Starting the first tick well after the bound means the first
-        # attempt fell due while the add-on was not running (AT4/5.2): D is
-        # missed, never_attempted, with no gap-fill call at all.
+        # AT4's start: worker_started_at AFTER the bound (standard_night's
+        # own worker_started_at, NOW, is before the bound, so it must be
+        # overridden here) -- the first attempt's due instant (the bound)
+        # falls while the add-on is not yet started (5.2): D is missed,
+        # never_attempted, with no gap-fill call at all.
         late_start = BOUND + timedelta(minutes=61)
         await db.write(
             lambda c: c.execute(
                 "INSERT INTO runtime_state (key, value) VALUES"
-                " ('worker_last_loop_at', ?)"
+                " ('worker_started_at', ?)"
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (isoformat_utc(late_start),),
             )

@@ -590,6 +590,11 @@ def test_ho5_a_pending_day_close_job_blocks_a_second_one(
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
+        # The clock starts at NOW, well before D's own day_end_utc -- move
+        # it to the round's bound first (the pattern of TL3/TL8 in
+        # tests/test_close_timeline.py), or the first attempt is never due
+        # and no day_close job is ever created.
+        clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 2))
         before = await db.read(
             lambda c: c.execute(

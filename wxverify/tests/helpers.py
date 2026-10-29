@@ -874,6 +874,20 @@ _CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
     "wxverify.worker.scheduler",
     "wxverify.worker.processor",
     "wxverify.worker.close_chain",
+    # wxverify.db.queue imports utc_now BY NAME too (queue.py:13) and uses it
+    # in the success/failure cooldowns, fail()'s retry stamp and the claim
+    # cutoff -- without this entry those reads hit the real 2026 clock
+    # against a close-chain test's 2024 job stamps, so a success cooldown
+    # never applies and a completed job is claimed again every tick
+    # (TL7's record job claimed 500 times before this was added).
+    "wxverify.db.queue",
+    # wxverify.verification.record imports utc_now BY NAME too (record.py:31)
+    # and uses it in compute_forecast_record's `at = now or utc_now()` default
+    # -- without this entry a build reads the real 2026 clock against a
+    # close-chain test's 2024 snapshot, so `at` lands far past
+    # snapshot_utc + LATE_WRITE_WINDOW_HOURS and the build raises
+    # JobCancelled on every record job.
+    "wxverify.verification.record",
 )
 
 

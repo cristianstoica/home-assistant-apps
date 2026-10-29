@@ -452,10 +452,10 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
             (site_id, D.isoformat()),
         ).fetchone()
         assert row is not None
-        mismatched_end = isoformat_utc(
-            datetime.fromisoformat(row["day_end_utc"].replace("Z", "+00:00"))
-            + timedelta(hours=1)
-        )
+        mismatched_end_dt = datetime.fromisoformat(
+            row["day_end_utc"].replace("Z", "+00:00")
+        ) + timedelta(hours=1)
+        mismatched_end = isoformat_utc(mismatched_end_dt)
         conn.execute(
             "UPDATE site_days SET day_end_utc = ? WHERE site_id = ? AND local_date = ?",
             (mismatched_end, site_id, D.isoformat()),
@@ -469,7 +469,12 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
         install_p4_standins(monkeypatch)
 
-        clock.set(BOUND)
+        # D's day_end_utc was pushed an hour past its real value above, so
+        # the attempt cannot begin at the round's own bound (BOUND is still
+        # before the mismatched day_end_utc): the clock must reach the
+        # record's (mismatched) day_end_utc for D to be eligible to close at
+        # all, per plan line 192 condition 1 ("now_utc >= day_end_utc").
+        clock.set(mismatched_end_dt)
         await run_due_jobs(db, clock)
 
         record = await db.read(lambda c: day_record(c, site_id, D))
@@ -538,7 +543,8 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
                 row[0]
                 for row in c.execute(
                     "SELECT rain_threshold_mm FROM daily_truth"
-                    " WHERE site_id = ? AND local_date = ?",
+                    " WHERE site_id = ? AND local_date = ?"
+                    " AND quantity LIKE 'precip%'",
                     (site_id, D.isoformat()),
                 ).fetchall()
             }

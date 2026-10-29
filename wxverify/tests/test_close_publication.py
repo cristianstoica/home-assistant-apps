@@ -121,31 +121,30 @@ async def _job_row(db, job_id):  # type: ignore[no-untyped-def]
 def _seed_closed_site_day(
     conn: sqlite3.Connection, site_id: int, local_date, *, timezone: str = "UTC"
 ) -> None:
-    """Insert a ``closed`` ``site_days`` row directly, dated ``local_date``
-    (PB4's second cutoff), satisfying its own CHECKs (``attempts=1``,
+    """Make ``site_days``'s row of ``local_date`` (PB4's second cutoff)
+    ``closed`` directly, satisfying its own CHECKs (``attempts=1``,
     ``done_at`` set, ``retry_at`` NULL). A precondition from P1's own table,
     not from the close chain under test: PB4 exercises stage 7's own "a
     newer open record exists" check, which never reads ``site_days`` at
     all, so this only needs to satisfy ``close_publications``'s own foreign
     key to ``site_days(site_id, local_date)``.
+
+    ``standard_night``'s own ``ensure_site_days`` call (P1 4.6, "through
+    its next local date") already creates D + 1's row, ``open`` -- an
+    INSERT here collides with it (UNIQUE site_id, local_date), so this
+    UPDATEs the existing row to ``closed`` instead of inserting a new one.
     """
-    start = datetime(local_date.year, local_date.month, local_date.day, tzinfo=UTC)
-    end = start + timedelta(days=1)
-    stamp = isoformat_utc(start)
-    conn.execute(
-        "INSERT INTO site_days (site_id, local_date, state, day_start_utc,"
-        " day_end_utc, timezone, attempts, done_at, created_at, state_changed_at)"
-        " VALUES (?, ?, 'closed', ?, ?, ?, 1, ?, ?, ?)",
-        (
-            site_id,
-            local_date.isoformat(),
-            isoformat_utc(start),
-            isoformat_utc(end),
-            timezone,
-            stamp,
-            stamp,
-            stamp,
-        ),
+    stamp = isoformat_utc(
+        datetime(local_date.year, local_date.month, local_date.day, tzinfo=UTC)
+    )
+    updated = conn.execute(
+        "UPDATE site_days SET state = 'closed', attempts = 1, done_at = ?,"
+        " state_changed_at = ?, timezone = ? WHERE site_id = ? AND local_date = ?",
+        (stamp, stamp, timezone, site_id, local_date.isoformat()),
+    ).rowcount
+    assert updated == 1, (
+        f"expected an existing site_days row for {local_date.isoformat()}"
+        " (standard_night's own ensure_site_days fills through D + 1)"
     )
 
 
@@ -461,10 +460,17 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
     ends ``superseded`` with no call to P4; one call, for the newer (8.6).
 
     Builds the precondition directly: two ``pending`` ``close_publications``
-    rows (D, then D + 1, in that creation order) and their two stage-7 jobs
-    (D's created first), then claims and runs each stage-7 job in FIFO
-    order -- D's job first, exactly as the real queue would, since D's job
-    is the older of the two. Only the state of ``close_publications`` (not
+    rows (D, then D + 1), and D's stage-7 job -- not D + 1's own yet. Both
+    jobs share the one ``day_publish`` job key ``publish:{site_id}:7``
+    (``_enqueue_publish_stage``, ``close_chain.py:294-305`` -- it is not
+    keyed by cutoff), and the ``jobs`` table's partial unique index only
+    forbids a second PENDING/RUNNING row of that key (`migrations.py:771-
+    772`), so D + 1's own job cannot be seeded until D's has run to
+    completion -- exactly the real sequence (plan 8.6: the repair step,
+    8.5 item 4, enqueues the newer cutoff's stage 7 only once the older
+    job is no longer pending). D's job is claimed and run first, below;
+    D + 1's job is seeded only afterward, once D's row is no longer
+    pending/running. Only the state of ``close_publications`` (not
     ``site_days``) decides stage 7's own body, so D + 1's ``site_days`` row
     is seeded directly as already ``closed`` (P1's own table, not the code
     under test), rather than driving two full nights through a FIFO race
@@ -504,15 +510,10 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
         job_d = await db.write(
             lambda c: _seed_publish_job(c, site_id, 7, D, 1, created_at=opened_d)
         )
-        job_d1 = await db.write(
-            lambda c: _seed_publish_job(
-                c, site_id, 7, D_PLUS_1, 1, created_at=opened_d1
-            )
-        )
 
         first = await db.write(claim_next_job)
         assert first is not None and first.id == job_d, (
-            "D's stage-7 job, created first, must be the one FIFO claims"
+            "D's stage-7 job, the only one seeded so far, must be the one claimed"
         )
         await run_claimed_job(db, first, lane="main")
 
@@ -525,6 +526,16 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
         )
         assert standins["publish"].calls == [], (
             "publish must not be called for the superseded cutoff D"
+        )
+
+        # D's job is no longer pending/running, so the shared job key
+        # (publish:{site_id}:7) is free again (migrations.py:771-772) and
+        # D + 1's own stage-7 job can now be seeded, as the repair step
+        # (plan 8.5 item 4) would enqueue it on the next tick.
+        job_d1 = await db.write(
+            lambda c: _seed_publish_job(
+                c, site_id, 7, D_PLUS_1, 1, created_at=opened_d1
+            )
         )
 
         second = await db.write(claim_next_job)
@@ -900,6 +911,20 @@ def test_pb8_a_failed_cleanup_counts_until_a_real_recovery_clears_it(
             " allowlist) = 0"
         )
 
+        # job1's own run above already called clean_worksheets once (it
+        # raised, which is how job1 failed) -- count calls BEFORE job2
+        # runs, so this only checks that job2 adds none, rather than
+        # wrongly expecting the stand-in's call list to still be empty.
+        calls_before_job2 = len(standins["clean_worksheets"].calls)
+        stage_log_count_before_job2 = (
+            await db.read(
+                lambda c: c.execute(
+                    "SELECT COUNT(*) FROM close_stage_log"
+                    " WHERE site_id = ? AND stage = 8",
+                    (site_id,),
+                ).fetchone()
+            )
+        )[0]
         job2_id = await db.write(
             lambda c: (
                 enqueue_if_absent(
@@ -924,7 +949,7 @@ def test_pb8_a_failed_cleanup_counts_until_a_real_recovery_clears_it(
             " marker), mutant M86 (stage 8's early return returns normally)"
             " = ('completed', 'ok')"
         )
-        assert standins["clean_worksheets"].calls == [], (
+        assert len(standins["clean_worksheets"].calls) == calls_before_job2, (
             "the mismatched-attempt job must never call clean_worksheets"
         )
         stage_log_count = await db.read(
@@ -933,7 +958,13 @@ def test_pb8_a_failed_cleanup_counts_until_a_real_recovery_clears_it(
                 (site_id,),
             ).fetchone()
         )
-        assert stage_log_count[0] == 0, "no stage-log row may be added by this job"
+        assert stage_log_count[0] == stage_log_count_before_job2, (
+            # job1's own failure already wrote one stage-8 row (its
+            # 'failed' outcome, 11.1); this only checks that job2 (ended
+            # by JobCancelled before any write) added none, rather than
+            # wrongly expecting zero stage-8 rows for the whole site.
+            "no stage-log row may be added by this job"
+        )
 
         count2 = await db.read(lambda c: failed_scope_count(c, now_utc=later))
         assert count2 == 1, (

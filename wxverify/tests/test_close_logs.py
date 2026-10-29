@@ -61,6 +61,7 @@ from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.site_days import begin_close, fail_close, finish_close, mark_missed
+from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.day_values import GapFillResult, StationFill
 from wxverify.worker.processor import run_claimed_job
 
@@ -236,7 +237,13 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = {"scored": {"temperature_high": 1}, "absent": {}}
+        # score_day must return a ScoreSummary, not a plain dict: stage 5
+        # reads summary.scored/summary.absent as attributes, and a dict
+        # raises AttributeError there, failing the attempt at stage 5 and
+        # stopping the chain before it ever reaches day_publish.
+        standins["score_day"].result = ScoreSummary(
+            scored={"temperature_high": 1}, absent={}
+        )
         standins["publish"].result = f"pub-{D.isoformat()}"
         standins["clean_worksheets"].result = 0
 
@@ -347,6 +354,10 @@ def test_lg1b_queue_wait_uses_the_claim_time_not_the_enqueue_time(
         round_state = install_round_state_standin(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
+        # The clock starts at NOW, well before D's own day_end_utc/bound --
+        # move it to the bound first (the pattern of TL3/TL8/HO1), or no
+        # attempt is ever due and stage 2's job is never created.
+        clock.set(BOUND)
         claims = await run_due_jobs(db, clock, stop_before=("day_close", 2))
         assert claims == [], "the standard night's stage 1 needs no job claim"
 
@@ -469,6 +480,10 @@ def test_lg2_the_gap_fill_try_rows_carry_the_station_fills_own_counts(
 
         monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _standin)
 
+        # The clock starts at NOW, well before D's own day_end_utc/bound --
+        # move it to the bound first (the pattern of TL3/TL8/HO1), or no
+        # attempt is ever due and the gap fill is never reached.
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         conn = db._conn  # noqa: SLF001
 

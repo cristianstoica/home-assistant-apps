@@ -15,8 +15,10 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     enqueue_if_absent_with_cooldown,
 )
+from wxverify.db.site_days import daily_close_on
 from wxverify.settings.keys import get_number_setting, get_setting
 from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
+from wxverify.worker.close_chain import enqueue_due_close_work
 from wxverify.worker.wind_days import (
     WIND_DAYS_JOB_KEY,
     WIND_DAYS_SPACING,
@@ -81,8 +83,13 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     _enqueue_due_obs(conn)
     _enqueue_due_wind_days(conn)
     _enqueue_due_forecast_records(conn)
-    _enqueue_due_verification_runs(conn)
-    _enqueue_due_score_refresh(conn)
+    # With the daily close on, the close's chain replaces the nightly replay
+    # and the score backstop: scores are written only by its stage 5.
+    if daily_close_on(conn):
+        enqueue_due_close_work(conn, now_utc=utc_now())
+    else:
+        _enqueue_due_verification_runs(conn)
+        _enqueue_due_score_refresh(conn)
 
 
 # Site-local wall-clock time at/after which the nightly verification trigger

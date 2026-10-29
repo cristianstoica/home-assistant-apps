@@ -248,6 +248,7 @@ def test_at1_each_stage_fails_the_attempt_once(
         p4 = install_p4_standins(monkeypatch)
         _patch_stage_fault(monkeypatch, stage, p4)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=None)
 
         record = await _state(db, site_id)
@@ -347,6 +348,7 @@ def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
         p4 = install_p4_standins(monkeypatch)
         _fail_hourly_values_once(monkeypatch, "synthetic stage 3 failure")
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1), (
@@ -363,6 +365,7 @@ def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
             " taken as now_utc + 59 minutes) = ('closing', 2) instead"
         )
 
+        clock.set(retry_at)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closed", 2), (
@@ -430,6 +433,7 @@ def test_at3_both_attempts_failing_misses_the_day_and_runs_retention(
             _counting_prune,
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1), (
@@ -626,6 +630,7 @@ def test_at6_a_retry_not_run_while_the_add_on_was_down_is_missed(
 
         monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _raise_fill)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1)
@@ -769,6 +774,7 @@ def test_at7_an_outage_spanning_several_nights_misses_each_in_date_order(
             )
         assert transport_calls == [], "no gap-fill call for any missed day"
 
+        clock.set(_bound_for(d_plus_2 + timedelta(days=1)))
         await run_due_jobs(db, clock)
         record = await _state(db, site_id, d_plus_2)
         assert record.state == "closed", "D + 2 must close the next night as usual"
@@ -849,6 +855,7 @@ def test_at8_a_hold_or_refused_access_or_no_readings_does_not_fail_the_attempt(
             "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closed", 1), (
@@ -921,6 +928,7 @@ def test_at9_a_technical_gap_fill_failure_fails_the_attempt(
             "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1), (
@@ -983,6 +991,7 @@ def test_at10_a_thin_day_closes_with_ineligible_values_not_a_failure(
         patch_weathercom_transport(monkeypatch, _handler)
         disable_station_pacing(monkeypatch)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closed", 1), (
@@ -1046,6 +1055,7 @@ def test_at11_a_stalled_claim_fails_the_attempt_before_doing_any_work(
 
         monkeypatch.setattr("wxverify.worker.close_chain.write_hourly_values", _spy)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 3))
         clock.advance(timedelta(minutes=61))
         job = await db.write(claim_next_job)
@@ -1109,6 +1119,7 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
         install_p4_standins(monkeypatch)
         _fail_hourly_values_once(monkeypatch, "synthetic stage 3 failure")
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1)
@@ -1147,7 +1158,13 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
         # attempt 2, not the stale job's attempt 1, so nothing else changes.
         monkeypatch.setattr("wxverify.worker.close_chain.day_record", _flaky_day_record)
 
-        stamp = isoformat_utc(clock.now())
+        # Backdated by one second so claim_next_job's tier-0 FIFO
+        # (created_at, id) picks this stale job ahead of attempt 2's own
+        # pending stage-4 job, which the earlier run_due_jobs call just
+        # enqueued at this same clock instant (db/queue.py's
+        # _CLAIM_ORDER_BY) -- one second is far under CLOSE_LATE_LIMIT (1
+        # hour, 8.3), so it does not make the job read as stalled.
+        stamp = isoformat_utc(clock.now() - timedelta(seconds=1))
         await db.write(
             lambda c: c.execute(
                 "INSERT INTO jobs (type, site_id, job_key, status, payload,"
@@ -1239,6 +1256,7 @@ def test_at13_a_recovered_close_reports_no_failed_scope(
         install_p4_standins(monkeypatch)
         _fail_hourly_values_once(monkeypatch, "synthetic stage 3 failure")
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1)
@@ -1304,6 +1322,7 @@ def test_at14_a_missed_day_from_a_failed_stage_reports_no_failed_scope(
             ),
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1)
@@ -1378,6 +1397,7 @@ def test_at15_an_outcome_that_does_not_fail_the_attempt_closes_the_day(
             "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closed", 1), (
@@ -1435,6 +1455,7 @@ def test_at16i_a_missing_key_fails_both_attempts_when_there_are_hours_to_fill(
         patch_weathercom_transport(monkeypatch, _handler)
         disable_station_pacing(monkeypatch)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1), (
@@ -1496,6 +1517,7 @@ def test_at16ii_a_missing_key_does_not_matter_with_nothing_to_fill(
         patch_weathercom_transport(monkeypatch, _handler)
         disable_station_pacing(monkeypatch)
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("closed", 1), (
@@ -1579,6 +1601,7 @@ def test_at17_an_unlisted_outcome_or_reason_fails_the_attempt(
             "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
+        clock.set(BOUND)
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
         assert (record.state, record.attempts) == ("retry_due", 1), (
