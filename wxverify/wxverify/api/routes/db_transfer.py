@@ -657,6 +657,7 @@ async def import_db(request: Request) -> JSONResponse:
             _validate_upload(tmp)
             _stage_pending_rebuild_state(tmp)
             _neutralize_imported_verification_chains(tmp)
+            _settle_imported_closes(tmp)
             backup = _new_backup_path(db_dir)
             # COMMIT POINT: past a successful replace_from the live DB has
             # been overwritten, so the success response must go out
@@ -1239,6 +1240,48 @@ def _neutralize_imported_verification_chains(tmp: Path) -> None:
                     verification_state_key(site_id),
                     verification_heartbeat_key(site_id),
                 )
+        except BaseException:
+            conn.rollback()
+            raise
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
+_CLOSE_TABLES = (
+    "close_attempts",
+    "close_station_days",
+    "close_publications",
+    "close_stage_log",
+    "close_try_log",
+)
+
+
+def _settle_imported_closes(tmp: Path) -> None:
+    """Settle the staged upload's interrupted closes before promotion (12.6).
+
+    Acts only when the staged file has the daily close's five tables and its
+    close is on (``daily_close_on``); then ``settle_interrupted_closes`` runs
+    with the import's time, so a ``closing`` day is failed as of the
+    exporting add-on's last known run, its ``day_close`` jobs are completed
+    without running and a ``building`` publication record is settled (plan
+    5.5, 9.4). One ``BEGIN IMMEDIATE`` transaction on its own connection,
+    rolled back and re-raised on any exception, so the import aborts before
+    the swap and the live database is untouched; committed and checkpointed
+    as ``_stage_pending_rebuild_state`` does. Runs after
+    ``_stage_pending_rebuild_state``, which ensures ``runtime_state``.
+    """
+    from wxverify.worker.close_chain import settle_interrupted_closes
+
+    conn = sqlite3.connect(str(tmp))
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            has_tables = all(table_exists(conn, table) for table in _CLOSE_TABLES)
+            if has_tables and daily_close_on(conn):
+                settle_interrupted_closes(conn, now_utc=utc_now())
         except BaseException:
             conn.rollback()
             raise

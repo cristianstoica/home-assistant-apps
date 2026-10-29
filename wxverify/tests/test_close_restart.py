@@ -53,6 +53,7 @@ from tests.helpers import (
     disable_other_enqueuers,
     install_p4_standins,
     install_round_state_standin,
+    note_day_clock,
     patch_close_clock,
     patch_weathercom_transport,
     run_due_jobs,
@@ -279,7 +280,9 @@ def test_rs1_a_stop_mid_stage_is_settled_as_a_failed_attempt(
 
         progress_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 52, tzinfo=UTC)
         last_loop_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 50, tzinfo=UTC)
-        start = datetime(BOUND.year, BOUND.month, BOUND.day, 1, 0, tzinfo=UTC)
+        start = note_day_clock(
+            datetime(BOUND.year, BOUND.month, BOUND.day, 1, 0, tzinfo=UTC)
+        )
 
         job_id = await db.write(
             lambda c: _seed_running_stage_job(c, site_id, D, stage, 1)
@@ -363,7 +366,9 @@ def test_rs2_a_retry_that_fell_due_while_down_is_missed(
         await db.write(lambda c: begin_close(c, site_id, D, now_utc=BOUND))
         progress_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 52, tzinfo=UTC)
         last_loop_at = datetime(BOUND.year, BOUND.month, BOUND.day, 0, 50, tzinfo=UTC)
-        start = datetime(BOUND.year, BOUND.month, BOUND.day, 2, 0, tzinfo=UTC)
+        start = note_day_clock(
+            datetime(BOUND.year, BOUND.month, BOUND.day, 2, 0, tzinfo=UTC)
+        )
 
         await db.write(lambda c: _seed_running_stage_job(c, site_id, D, 3, 1))
         await db.write(
@@ -426,12 +431,12 @@ def test_rs3_a_stop_during_attempt_2_is_missed_never_a_third_attempt(
         await db.write(
             lambda c: fail_close(c, site_id, D, now_utc=BOUND, reason="network")
         )
-        retry_time = BOUND + timedelta(hours=1)
+        retry_time = note_day_clock(BOUND + timedelta(hours=1))
         await db.write(lambda c: begin_close(c, site_id, D, now_utc=retry_time))
 
         progress_at = retry_time + timedelta(minutes=12)
         last_loop_at = retry_time + timedelta(minutes=10)
-        start = retry_time + timedelta(minutes=20)
+        start = note_day_clock(retry_time + timedelta(minutes=20))
 
         await db.write(lambda c: _seed_running_stage_job(c, site_id, D, 3, 2))
         await db.write(
@@ -492,7 +497,7 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         patch_close_clock(monkeypatch, clock)
 
         await db.write(lambda c: begin_close(c, site_id, D, now_utc=BOUND))
-        closed_at = BOUND + timedelta(minutes=5)
+        closed_at = note_day_clock(BOUND + timedelta(minutes=5))
         await db.write(lambda c: finish_close(c, site_id, D, now_utc=closed_at))
         await db.write(
             lambda c: _seed_attempt_record(
@@ -519,7 +524,7 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         await db.write(lambda c: _seed_running_stage_job(c, site_id, D, 6, 1))
 
         last_loop_at = closed_at + timedelta(minutes=1)
-        start = closed_at + timedelta(minutes=10)
+        start = note_day_clock(closed_at + timedelta(minutes=10))
         await db.write(
             lambda c: set_runtime_state(
                 c, "worker_last_loop_at", isoformat_utc(last_loop_at)

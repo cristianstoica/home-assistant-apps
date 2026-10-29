@@ -7,8 +7,9 @@ the failure writes ``fail_attempt`` and ``fail_publication`` (9.1, 9.4) and
 the hooks ``_fail_job`` calls for them; ``run_close_retention`` (8.4);
 ``publication_record``; ``record_collection_try``, the writer of the
 collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
-(8.5): stage 1, the missed days, the repair and the publication retry.
-``settle_interrupted_closes`` comes in a later piece.
+(8.5): stage 1, the missed days, the repair and the publication retry; and
+``settle_interrupted_closes``, which settles the closes and publications a
+stop cut short, at each start and on an imported file (5.5, 9.4, 12.6).
 
 P4's four call points are always called through ``close_p4``, never
 imported by name, so P4 binds them in that one module.
@@ -1301,7 +1302,8 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
 
 @dataclass(slots=True)
 class _SiteStep:
-    """The step of plan 8.5 a site's part of the tick is in (1 to 5)."""
+    """The step of plan 8.5 a site's part of the tick is in (1 to 5), or of
+    5.5 a day or publication record being settled is in (1 to 4)."""
 
     number: int = 1
 
@@ -1677,3 +1679,202 @@ def enqueue_due_close_work(conn: sqlite3.Connection, *, now_utc: datetime) -> No
             moved = True
     if moved:
         run_close_retention(conn, now_utc=now_utc)
+
+
+# --- a stop or restart: settle_interrupted_closes ----------------------------
+
+
+def _in_settle_savepoint(
+    conn: sqlite3.Connection,
+    what: str,
+    site_id: int,
+    local_date: str,
+    settle: Callable[[_SiteStep], None],
+) -> None:
+    """Run one day's or one record's settling under ``SAVEPOINT close_settle``.
+
+    The catch of plan 8.5, as 5.5 copies it: an exception is re-raised when
+    the transaction is gone or it is a ``sqlite3.OperationalError``; any
+    other is rolled back to the savepoint with one ERROR line naming the
+    site, the date and the step, and the day or record is left as it was.
+    """
+    step = _SiteStep()
+    conn.execute("SAVEPOINT close_settle")
+    try:
+        settle(step)
+    except Exception as exc:
+        if not conn.in_transaction or isinstance(exc, sqlite3.OperationalError):
+            raise
+        conn.execute("ROLLBACK TO close_settle")
+        conn.execute("RELEASE close_settle")
+        logger.error(
+            "daily close: settling the %s %s of site %s failed at step %s (%s);"
+            " it is left as it was",
+            what,
+            local_date,
+            site_id,
+            step.number,
+            type(exc).__name__,
+        )
+        return
+    conn.execute("RELEASE close_settle")
+
+
+def _settle_day(
+    conn: sqlite3.Connection,
+    site_id: int,
+    day_text: str,
+    last_loop_at: str | None,
+    now_utc: datetime,
+    step: _SiteStep,
+) -> None:
+    """Steps 1 to 4 of plan 5.5 for one ``closing`` day.
+
+    1. L, the stop's time: the later of ``worker_last_loop_at`` and the
+       attempt record's ``last_progress_at``. A day with no attempt record
+       (a P1 record only) has the day's ``state_changed_at``, when
+       ``begin_close`` ran, in place of ``last_progress_at``.
+    2. ``fail_close`` at L with reason "stopped during stage N", N the stage
+       after the attempt's ``last_stage``; the attempt record is closed with
+       N, the reason and L (11.3). No stage-log row: a stage cut short by a
+       stop writes none (11.1).
+    3. After attempt 1, a ``retry_at`` this start is later than was not
+       covered by a running add-on (5.2): ``mark_missed`` ``retry_not_run``.
+    4. Every ``pending`` or ``running`` ``day_close`` job of the day is
+       completed without running (``complete``, no success marker).
+    """
+    local_date = date.fromisoformat(day_text)
+    key = (site_id, local_date.isoformat())
+    row = conn.execute(
+        "SELECT d.attempts, d.state_changed_at, a.last_stage, a.last_progress_at"
+        " FROM site_days d LEFT JOIN close_attempts a ON a.site_id = d.site_id"
+        " AND a.local_date = d.local_date AND a.attempt = d.attempts"
+        " WHERE d.site_id = ? AND d.local_date = ?",
+        key,
+    ).fetchone()
+    attempt = int(row[0])
+    progress_at = row[1] if row[3] is None else row[3]
+    known = [parse_utc(str(progress_at))]
+    if last_loop_at is not None:
+        known.append(parse_utc(last_loop_at))
+    stop_at = max(known)
+    step.number = 2
+    stage = None if row[2] is None else int(row[2]) + 1
+    reason = (
+        "stopped during the attempt"
+        if stage is None
+        else f"stopped during stage {stage}"
+    )
+    state = fail_close(conn, site_id, local_date, now_utc=stop_at, reason=reason)
+    conn.execute(
+        "UPDATE close_attempts SET outcome = 'failed', failed_stage = ?,"
+        " failure_reason = ?, ended_at = ?"
+        " WHERE site_id = ? AND local_date = ? AND attempt = ?",
+        (stage, reason, isoformat_utc_micro(stop_at), *key, attempt),
+    )
+    if state == "retry_due":
+        step.number = 3
+        record = day_record(conn, site_id, local_date)
+        if record is None or record.retry_at is None:
+            raise RuntimeError("the failed attempt left no retry time")
+        if now_utc > record.retry_at:
+            mark_missed(
+                conn, site_id, local_date, now_utc=now_utc, reason="retry_not_run"
+            )
+    step.number = 4
+    jobs = conn.execute(
+        "SELECT id FROM jobs WHERE type = 'day_close' AND site_id = ?"
+        " AND status IN ('pending', 'running') AND job_key LIKE ?",
+        (site_id, f"close:{site_id}:{local_date.isoformat()}:%"),
+    ).fetchall()
+    for job in jobs:
+        complete(conn, int(job[0]))
+
+
+def _settle_publication(
+    conn: sqlite3.Connection,
+    site_id: int,
+    cutoff_text: str,
+    last_loop_at: str | None,
+    now_utc: datetime,
+    step: _SiteStep,
+) -> None:
+    """Plan 9.4's stop during stage 7: a ``building`` record failed at L.
+
+    1. L: the later of ``worker_last_loop_at`` and the record's
+       ``started_at``, stage 7's saved start (its ``opened_at`` if none).
+    2. After attempt 1, ``retry_due`` with ``retry_at`` = L + ``RETRY_DELAY``;
+       after attempt 2, ``failed``. Reason "stopped during stage 7"; no
+       stage-log row (11.1).
+    3. A ``retry_at`` this start is later than was not covered by a running
+       add-on (5.2): ``failed`` with reason ``retry_not_run``, as the tick's
+       publication retry writes it (8.5 step 5).
+    """
+    cutoff = date.fromisoformat(cutoff_text)
+    record = publication_record(conn, site_id=site_id, cutoff=cutoff)
+    if record is None or record.state != "building":
+        raise RuntimeError("the publication record is no longer building")
+    known = [record.started_at or record.opened_at]
+    if last_loop_at is not None:
+        known.append(parse_utc(last_loop_at))
+    stop_at = max(known)
+    step.number = 2
+    key = (site_id, cutoff.isoformat())
+    reason = "stopped during stage 7"
+    if record.attempt != 1:
+        conn.execute(
+            "UPDATE close_publications SET state = 'failed', finished_at = ?,"
+            " last_failure = ? WHERE site_id = ? AND cutoff = ?",
+            (isoformat_utc_micro(stop_at), reason, *key),
+        )
+        return
+    retry_at = stop_at + RETRY_DELAY
+    conn.execute(
+        "UPDATE close_publications SET state = 'retry_due', retry_at = ?,"
+        " last_failure = ? WHERE site_id = ? AND cutoff = ?",
+        (isoformat_utc_micro(retry_at), reason, *key),
+    )
+    step.number = 3
+    if now_utc > retry_at:
+        conn.execute(
+            "UPDATE close_publications SET state = 'failed', finished_at = ?,"
+            " last_failure = 'retry_not_run' WHERE site_id = ? AND cutoff = ?",
+            (isoformat_utc_micro(now_utc), *key),
+        )
+
+
+def settle_interrupted_closes(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
+    """Settle the close work a stop cut short, in the caller's transaction.
+
+    Plan 5.5 and 9.4. Does nothing while the close is off (13.1). ``lifespan``
+    calls it at each start, after ``reclaim_all_stale`` and before the
+    ``worker_started_at`` write; ``import_db`` calls it on the staged file
+    before the swap (12.6), so ``now_utc`` is the start or the import's
+    time. Each ``closing`` day, oldest first, then each ``building``
+    publication record, oldest cutoff first, is settled under its own
+    ``SAVEPOINT close_settle`` (``_settle_day``, ``_settle_publication``);
+    one that raises is left as it was, with one ERROR line, and the next
+    goes on. Then raw retention runs once (8.4). Never commits.
+    """
+    if not daily_close_on(conn):
+        return
+    last_loop_at = get_runtime_state(conn, "worker_last_loop_at")
+    days = conn.execute(
+        "SELECT site_id, local_date FROM site_days WHERE state = 'closing'"
+        " ORDER BY local_date, site_id"
+    ).fetchall()
+    for row in days:
+        site_id, day_text = int(row[0]), str(row[1])
+        settle = partial(_settle_day, conn, site_id, day_text, last_loop_at, now_utc)
+        _in_settle_savepoint(conn, "day", site_id, day_text, settle)
+    records = conn.execute(
+        "SELECT site_id, cutoff FROM close_publications WHERE state = 'building'"
+        " ORDER BY cutoff, site_id"
+    ).fetchall()
+    for row in records:
+        site_id, cutoff_text = int(row[0]), str(row[1])
+        settle = partial(
+            _settle_publication, conn, site_id, cutoff_text, last_loop_at, now_utc
+        )
+        _in_settle_savepoint(conn, "publication", site_id, cutoff_text, settle)
+    run_close_retention(conn, now_utc=now_utc)

@@ -36,6 +36,7 @@ from wxverify.api.routes import (
 )
 from wxverify.collection.budget import effective_daily_call_limit, set_source_cap
 from wxverify.core.options import load_runtime_options
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import Database, init_db
 from wxverify.db.queue import reclaim_all_stale
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state_now
@@ -43,6 +44,7 @@ from wxverify.settings.service import apply_plain_settings, set_rolling_window_d
 from wxverify.verification.read_cache import warm_read_cache
 from wxverify.web.render import static_dir
 from wxverify.web.routes import router as web_router
+from wxverify.worker.close_chain import settle_interrupted_closes
 from wxverify.worker.processor import run_worker
 
 StopProcess = Callable[[], None]
@@ -119,6 +121,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
     db = init_db(config.db_path)
     options = load_runtime_options()
     await db.write(reclaim_all_stale)
+    # Close work a stop cut short is settled before the workers start and
+    # before this start's `worker_started_at`; only while the daily close is
+    # on, which the function reads itself (plan 5.5).
+    await db.write(lambda conn: settle_interrupted_closes(conn, now_utc=utc_now()))
     try:
         await asyncio.to_thread(
             db_transfer.sweep_bak_files, Path(config.db_path).parent
