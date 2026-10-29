@@ -1136,10 +1136,10 @@ def test_e4_run_migrations_lands_on_target_user_version() -> None:
     """e4 -> at ``_user_version(conn) == 11``: correct = 11 (the literal),
     mutant = a different literal if ``TARGET_USER_VERSION`` is bumped
     without also bumping the literal every caller of this suite expects."""
-    assert TARGET_USER_VERSION == 12
+    assert TARGET_USER_VERSION == 13
     conn = _bare_db(user_version=4)
     run_migrations(conn)
-    assert _user_version(conn) == 12
+    assert _user_version(conn) == 13
 
 
 # ---------------------------------------------------------------------------

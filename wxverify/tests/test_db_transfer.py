@@ -1631,7 +1631,7 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
         }
         assert "legacy_hours" not in live_cols
         live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 12
+        assert int(live_version[0]) == 13
     finally:
         direct.close()
 
@@ -5175,6 +5175,11 @@ _CHECKED_TODAY_TABLES: tuple[str, ...] = (
 )
 _OTHER_APP_TABLES: tuple[str, ...] = (
     "api_budget",
+    "close_attempts",
+    "close_publications",
+    "close_stage_log",
+    "close_station_days",
+    "close_try_log",
     "daily_truth",
     "domain_backoffs",
     "feeds",
@@ -5703,7 +5708,7 @@ def test_import_accepts_canonical_observation_stamps(
 def test_import_rejects_non_table_under_app_table_name(
     kind: str, name: str, tmp_path: Path
 ) -> None:
-    """S10: every one of the other 25 schema table names, held by a view or
+    """S10: every one of the other 30 schema table names, held by a view or
     a virtual table, is refused -- the D6 loop over ``schema_table_names()``
     reaches names none of the pre-0.16.2 checks ever looked at.
     """
@@ -5762,7 +5767,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 33
+    assert len(schema_table_names()) == 38
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(

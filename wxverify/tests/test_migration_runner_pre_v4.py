@@ -992,7 +992,7 @@ def test_o2_pre_v4_inputs_converge_to_one_schema() -> None:
 
     assert versions == [TARGET_USER_VERSION] * 3
     assert masters[0] == masters[1] == masters[2]
-    assert len(masters[0]) == 54
+    assert len(masters[0]) == 63
 
 
 @pytest.mark.parametrize(
@@ -1103,7 +1103,7 @@ def test_o1_split_is_a_partition_of_the_composite() -> None:
     table_rows = conn.execute(
         "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    assert len(table_rows) == 33
+    assert len(table_rows) == 38
     assert all(row["type"] == "table" for row in table_rows)
 
     create_indexes(conn)
@@ -1111,7 +1111,13 @@ def test_o1_split_is_a_partition_of_the_composite() -> None:
         "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
     index_rows = [row for row in all_rows if row["type"] == "index"]
-    assert len(index_rows) == 18
+    # The query's `NOT LIKE 'sqlite_%'` filter drops SQLite's automatic
+    # indexes too (`sqlite_autoindex_...` matches the pattern, since `_` is
+    # a single-char LIKE wildcard), so the three composite-primary-key
+    # autoindexes close_attempts, close_station_days and close_publications
+    # pick up (12.6) are never counted here -- only the four explicit
+    # CREATE INDEX statements of 12.4 move this number.
+    assert len(index_rows) == 22
 
     split_master = _master(conn)
 
@@ -1351,4 +1357,4 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     }
 
     assert fresh_names == composite_names | _TRIGGERS
-    assert len(fresh_names) == 54
+    assert len(fresh_names) == 63

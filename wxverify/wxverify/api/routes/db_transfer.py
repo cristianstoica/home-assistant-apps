@@ -118,6 +118,10 @@ _CANONICAL_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("site_days", "local_date"),
     ("station_changes", "effective_date"),
     ("site_zone_changes", "effective_date"),
+    # The close's two logs. Its three records are not listed: each has a
+    # foreign key to `site_days`, so the foreign key check refuses their dates.
+    ("close_stage_log", "local_date"),
+    ("close_try_log", "local_date"),
 )
 # The daily-close tables' change stamps, which the station-list and zone
 # rules order as text, so only the fixed-width microsecond form may come in.

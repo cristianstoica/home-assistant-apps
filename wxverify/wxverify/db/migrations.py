@@ -29,7 +29,7 @@ from wxverify.db.tz_generations import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 12
+TARGET_USER_VERSION = 13
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -370,7 +370,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
                     type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                              'pair_and_score','backfill_site',
                              'forecast_record','record_gap_scan',
-                             'verification_run','timezone_correction')
+                             'verification_run','timezone_correction',
+                             'day_close','day_publish')
                     AND site_id IS NOT NULL
                 )
             )
@@ -613,6 +614,99 @@ def create_tables(conn: sqlite3.Connection) -> None:
             effective_date TEXT NOT NULL,
             entered_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS close_attempts (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK(attempt IN (1,2)),
+            started_at TEXT NOT NULL,
+            last_stage INTEGER NOT NULL DEFAULT 1 CHECK(last_stage BETWEEN 1 AND 6),
+            last_progress_at TEXT NOT NULL,
+            outcome TEXT NOT NULL DEFAULT 'running'
+                CHECK(outcome IN ('running','closed','failed')),
+            failed_stage INTEGER CHECK(failed_stage BETWEEN 2 AND 6),
+            failure_reason TEXT,
+            ended_at TEXT,
+            truth_version TEXT,
+            PRIMARY KEY (site_id, local_date, attempt),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE,
+            CHECK((outcome = 'running') = (ended_at IS NULL)),
+            CHECK((outcome = 'failed') = (failed_stage IS NOT NULL)),
+            CHECK(outcome <> 'closed' OR (last_stage = 6 AND truth_version IS NOT NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_station_days (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            five_minute INTEGER NOT NULL CHECK(five_minute >= 0),
+            current_obs INTEGER NOT NULL CHECK(current_obs >= 0),
+            hourly INTEGER NOT NULL CHECK(hourly >= 0),
+            answered INTEGER NOT NULL CHECK(answered IN (0,1)),
+            refused_lost INTEGER NOT NULL CHECK(refused_lost IN (0,1)),
+            paused INTEGER NOT NULL CHECK(paused IN (0,1)),
+            PRIMARY KEY (site_id, local_date, station_id),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS close_publications (
+            site_id INTEGER NOT NULL,
+            cutoff TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt IN (1,2)),
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
+                ('pending','building','published','retry_due','failed','superseded')),
+            opened_at TEXT NOT NULL,
+            started_at TEXT,
+            retry_at TEXT,
+            finished_at TEXT,
+            publication_id TEXT,
+            last_failure TEXT,
+            PRIMARY KEY (site_id, cutoff),
+            FOREIGN KEY (site_id, cutoff)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE,
+            CHECK((state = 'published') = (publication_id IS NOT NULL)),
+            CHECK((state = 'retry_due') = (retry_at IS NOT NULL AND attempt = 1
+                                           AND finished_at IS NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_stage_log (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK(attempt IN (1,2)),
+            stage INTEGER NOT NULL CHECK(stage BETWEEN 1 AND 8),
+            job_id INTEGER,
+            enqueued_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            queue_wait_s REAL NOT NULL,
+            duration_s REAL NOT NULL,
+            outcome TEXT NOT NULL
+                CHECK(outcome IN ('completed','failed','superseded','skipped')),
+            reason TEXT,
+            detail TEXT NOT NULL DEFAULT '{}',
+            CHECK((stage = 1) = (job_id IS NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_try_log (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('five_minute','hourly')),
+            slot TEXT NOT NULL,
+            close_attempt INTEGER CHECK(close_attempt IN (1,2)),
+            tried_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            detail TEXT,
+            readings_kept INTEGER NOT NULL CHECK(readings_kept >= 0),
+            readings_refused INTEGER NOT NULL CHECK(readings_refused >= 0),
+            CHECK((slot = 'gap_fill') = (kind = 'hourly')),
+            CHECK((slot = 'gap_fill') = (close_attempt IS NOT NULL))
+        );
         """,
     )
 
@@ -698,6 +792,15 @@ def create_indexes(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_site_days_writable
             ON site_days(site_id, local_date)
             WHERE state IN ('open','closing');
+
+        CREATE INDEX IF NOT EXISTS idx_close_stage_log_day
+            ON close_stage_log(site_id, local_date, stage);
+        CREATE INDEX IF NOT EXISTS idx_close_stage_log_ended
+            ON close_stage_log(ended_at);
+        CREATE INDEX IF NOT EXISTS idx_close_try_log_day
+            ON close_try_log(site_id, local_date, station_id);
+        CREATE INDEX IF NOT EXISTS idx_close_try_log_tried
+            ON close_try_log(tried_at);
         """,
     )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
@@ -1343,6 +1446,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 12:
         logger.debug("migrations applying v12 widened raw readings")
         migrate_v12_widen_raw_readings(conn)
+    if current < 13:
+        logger.debug("migrations applying v13 daily-close job kinds")
+        migrate_v13_close_jobs(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1465,7 +1571,8 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
                         type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                                  'pair_and_score','backfill_site',
                                  'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction')
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
                         AND site_id IS NOT NULL
                     )
                 )
@@ -1579,7 +1686,8 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
                         type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                                  'pair_and_score','backfill_site',
                                  'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction')
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
                         AND site_id IS NOT NULL
                     )
                 )
@@ -2077,6 +2185,97 @@ def _rebuild_station_wind_records(conn: sqlite3.Connection) -> int:
     if violation is not None:
         raise RuntimeError("station_wind_records rebuild failed its foreign key check")
     return copied
+
+
+def migrate_v13_close_jobs(conn: sqlite3.Connection) -> None:
+    """Widen the ``jobs`` type CHECK for ``day_close`` and ``day_publish``.
+
+    The daily close's two job kinds must pass the CHECK, and
+    :func:`create_tables` leaves an existing ``jobs`` table as it is, so a
+    file at version 12 keeps the narrow CHECK until this rebuild widens it.
+    The new table's column list and CHECK must stay identical to
+    :func:`create_tables`' and to the ``jobs_new`` of :func:`migrate_v3` and
+    :func:`migrate_v4`. The rebuild copies :func:`migrate_v4`'s: every row is
+    copied as it is, retired kinds included, and the two ``jobs`` indexes
+    are made again here; every other index comes back from
+    :func:`create_indexes`. The five daily-close tables come from
+    :func:`create_tables`, so this step does not name them.
+
+    The re-run guard returns at once when the ``jobs`` statement already
+    holds ``'day_publish'``: a fresh file, whose ``jobs`` :func:`migrate_v3`
+    rebuilt from its own widened text, or a rebuild already committed.
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a stop in between leaves user_version below 13 and the next
+    open re-enters the ``current < 13`` gate and returns here.
+
+    As in :func:`migrate_v12_widen_raw_readings`, one savepoint holds the
+    rebuild, and the in_transaction check covers an error that has already
+    ended it. Any failure rolls the rebuild back, leaving the old ``jobs``
+    and no ``jobs_new``, and is re-raised, so the open fails before the
+    ``user_version`` write and the next open runs the step again.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()
+    if row is not None and "'day_publish'" in str(row[0]):
+        return
+    conn.execute("SAVEPOINT migrate_v13")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE jobs_new (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+                job_key TEXT,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','running','completed','failed')),
+                next_attempt_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT,
+                result TEXT,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (
+                    (type = 'catchup' AND site_id IS NULL)
+                    OR (
+                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
+                                 'pair_and_score','backfill_site',
+                                 'forecast_record','record_gap_scan',
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
+                        AND site_id IS NOT NULL
+                    )
+                )
+            )
+            """
+        )
+        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
+                ON jobs(type, COALESCE(site_id, -1), job_key)
+                WHERE status IN ('pending','running') AND job_key IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+                ON jobs(type, job_key, site_id, id)
+            """
+        )
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_v13")
+            conn.execute("RELEASE migrate_v13")
+        raise
+    conn.execute("RELEASE migrate_v13")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
