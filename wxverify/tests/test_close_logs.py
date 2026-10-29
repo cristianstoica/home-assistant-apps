@@ -467,7 +467,7 @@ def test_lg2_the_gap_fill_try_rows_carry_the_station_fills_own_counts(
         ):
             return result
 
-        monkeypatch.setattr("wxverify.worker.day_values.fill_gaps", _standin)
+        monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _standin)
 
         await run_due_jobs(db, clock)
         conn = db._conn  # noqa: SLF001

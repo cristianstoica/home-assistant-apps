@@ -59,6 +59,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.queue import claim_next_job, enqueue_if_absent
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.site_days import day_record
+from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 
 
@@ -248,7 +249,7 @@ def test_pb1_a_missed_day_opens_no_publication(
         round_state.set_answer(
             site_id, D_PLUS_2, settled=False, bound_utc=_bound_for(D_PLUS_2)
         )
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["publish"].result = "pub-D"
         standins["clean_worksheets"].result = 0
 
@@ -315,7 +316,7 @@ def test_pb2_a_failed_publish_retries_once_an_hour_later(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB2")
 
@@ -397,7 +398,7 @@ def test_pb3_a_failed_publication_does_not_block_the_next_cutoff(
         round_state.set_answer(
             site_id, D_PLUS_2, settled=True, bound_utc=_bound_for(D_PLUS_2)
         )
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB3")
 
@@ -742,7 +743,7 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB7")
 
@@ -1006,7 +1007,7 @@ def test_pb9_both_failed_stage7_jobs_report_no_failed_scope(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB9")
 

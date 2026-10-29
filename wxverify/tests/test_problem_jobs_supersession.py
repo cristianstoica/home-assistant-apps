@@ -563,6 +563,22 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
             True,
             id="forecast_record",
         ),
+        pytest.param(
+            "day_close",
+            True,
+            "close:1:2026-07-06:3",
+            0,
+            True,
+            id="day_close",
+        ),
+        pytest.param(
+            "day_publish",
+            True,
+            "publish:1:8",
+            0,
+            True,
+            id="day_publish",
+        ),
     ],
 )
 def test_chain_types_do_not_supersede_single_row_types_do(

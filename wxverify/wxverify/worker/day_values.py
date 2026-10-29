@@ -131,6 +131,8 @@ class StationFill:
     stored an hourly reading of that quantity for; ``hours_left`` the hours
     still to fill after it. ``next_allowed_at`` is when a held or deferred
     try may call again, None when no hold or back-off is known.
+    ``readings_kept`` and ``readings_refused`` are the store's own counts for
+    this call's readings, 0 when nothing was stored (plan 11.2).
     """
 
     outcome: FillOutcome
@@ -139,6 +141,8 @@ class StationFill:
     hours_filled: dict[Quantity, tuple[datetime, ...]]
     hours_left: tuple[datetime, ...]
     next_allowed_at: datetime | None
+    readings_kept: int
+    readings_refused: int
 
 
 @dataclass(frozen=True)
@@ -522,6 +526,8 @@ class _Fill:
                     hours_filled=_no_hours(),
                     hours_left=left,
                     next_allowed_at=decision.next_allowed_at,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             reservation = decision.reservation
             self.calls += 1
@@ -547,6 +553,8 @@ class _Fill:
                         hours_filled=_no_hours(),
                         hours_left=left,
                         next_allowed_at=None,
+                        readings_kept=0,
+                        readings_refused=0,
                     )
                 return StationFill(
                     outcome="failed",
@@ -555,6 +563,8 @@ class _Fill:
                     hours_filled=_no_hours(),
                     hours_left=left,
                     next_allowed_at=None,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             except (httpx.TransportError, TimeoutError) as exc:
                 if is_refundable_transport_error(exc):
@@ -571,6 +581,8 @@ class _Fill:
                     hours_filled=_no_hours(),
                     hours_left=left,
                     next_allowed_at=None,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             return await self._store(plan, payload, reservation)
 
@@ -597,6 +609,8 @@ class _Fill:
                 hours_filled=_no_hours(),
                 hours_left=left,
                 next_allowed_at=_stamp_or_none(until),
+                readings_kept=0,
+                readings_refused=0,
             )
         wake: str | None = None
         if status == 429 or status >= 500:
@@ -613,6 +627,8 @@ class _Fill:
             hours_filled=_no_hours(),
             hours_left=left,
             next_allowed_at=_stamp_or_none(wake),
+            readings_kept=0,
+            readings_refused=0,
         )
 
     async def _store(
@@ -675,6 +691,8 @@ class _Fill:
             hours_filled=_hours_with(kept) if outcome == "filled" else _no_hours(),
             hours_left=left,
             next_allowed_at=None,
+            readings_kept=stored.kept,
+            readings_refused=stored.refused,
         )
 
 
@@ -723,6 +741,8 @@ async def fill_gaps(
                     hours_filled=_no_hours(),
                     hours_left=plan.to_fill,
                     next_allowed_at=None,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             elif refusal is not None:
                 fill = StationFill(
@@ -732,6 +752,8 @@ async def fill_gaps(
                     hours_filled=_no_hours(),
                     hours_left=plan.to_fill,
                     next_allowed_at=None,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             elif not plan.to_fill:
                 fill = StationFill(
@@ -741,6 +763,8 @@ async def fill_gaps(
                     hours_filled=_no_hours(),
                     hours_left=(),
                     next_allowed_at=None,
+                    readings_kept=0,
+                    readings_refused=0,
                 )
             else:
                 fill = await run.station(plan)

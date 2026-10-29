@@ -70,6 +70,12 @@ from wxverify.worker.access_hold import (
 )
 from wxverify.worker.backfill import run_backfill_site
 from wxverify.worker.catchup import run_catchup
+from wxverify.worker.close_chain import (
+    fail_day_close_job,
+    fail_day_publish_job,
+    run_day_close,
+    run_day_publish,
+)
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.current_obs import (
     Health,
@@ -556,7 +562,17 @@ def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition
     """Record the failure; on a TERMINAL disposition of a chain job, mark
     the chain's carrier failed in the same transaction (§14: a mid-chain
     chunk failure fails the run under the existing retry rules).
+
+    A ``day_close`` or ``day_publish`` job records its failure in the same
+    transaction too, but before ``fail()``: its stage-log row copies the job
+    row's claim stamp, ``updated_at``, which ``fail()`` overwrites. Both
+    kinds are enqueued with ``max_retries`` 0, so every failure of theirs is
+    terminal (daily-close P3 9.1, 9.4).
     """
+    if job.type == "day_close":
+        fail_day_close_job(conn, job, error, now_utc=utc_now())
+    elif job.type == "day_publish":
+        fail_day_publish_job(conn, job, error, now_utc=utc_now())
     disposition = fail(
         conn,
         job.id,
@@ -775,6 +791,12 @@ async def dispatch(
         # timezone_correction); the simulate/baseline days and the bootstrap
         # run their heavy work outside any write transaction.
         return await run_verification_chunk(db, writer, site_id, job.payload)
+    if job.type == "day_close":
+        await run_day_close(db, writer, job)
+        return None
+    if job.type == "day_publish":
+        await run_day_publish(db, writer, job)
+        return None
     raise RuntimeError(f"unknown job type {job.type}")
 
 

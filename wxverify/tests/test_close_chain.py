@@ -53,6 +53,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import DayStateError, day_record, finish_close
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
+from wxverify.worker.close_p4 import ScoreSummary
 
 
 @pytest.fixture(autouse=True)
@@ -132,7 +133,7 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["publish"].result = "pub-D"
         standins["clean_worksheets"].result = 0
 
@@ -239,7 +240,7 @@ def test_ho2_a_lost_handoff_is_repaired_once_a_published_record_never(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["publish"].result = "pub-D"
         standins["clean_worksheets"].result = 0
 
@@ -350,7 +351,7 @@ def test_ho3_a_repeated_stage_job_is_skipped_not_rerun(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["publish"].result = "pub-D"
         standins["clean_worksheets"].result = 0
 
@@ -494,7 +495,7 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["publish"].result = "pub-D"
         standins["clean_worksheets"].result = 0
 
@@ -678,7 +679,7 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)

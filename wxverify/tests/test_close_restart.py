@@ -66,6 +66,7 @@ from wxverify.db.connection import close_db, init_db
 from wxverify.db.queue import enqueue_if_absent, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
+from wxverify.worker.close_p4 import ScoreSummary
 
 
 @pytest.fixture(autouse=True)
@@ -617,7 +618,7 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = object()
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
         standins["clean_worksheets"].result = 0
         standins["publish"].raises = Stop(
             "synthetic stop for RS5, after publish recorded its call"
@@ -716,9 +717,8 @@ def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         monkeypatch.setattr(
-            "wxverify.db.station_readings.prune_raw_readings",
+            "wxverify.worker.close_chain.prune_raw_readings",
             _raising_prune,
-            raising=False,
         )
 
         await db.write(lambda c: begin_close(c, site_id, D, now_utc=BOUND))
@@ -748,9 +748,8 @@ def test_rs6_a_retention_failure_does_not_undo_a_closure_or_a_start(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         monkeypatch.setattr(
-            "wxverify.db.station_readings.prune_raw_readings",
+            "wxverify.worker.close_chain.prune_raw_readings",
             _raising_prune,
-            raising=False,
         )
 
         await db.write(lambda c: begin_close(c, site_id, D, now_utc=BOUND))

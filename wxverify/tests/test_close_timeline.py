@@ -510,7 +510,7 @@ def test_tl7_the_0700_record_runs_independently_of_a_blocked_chain(
         async def _blocked_fill_gaps(*args: object, **kwargs: object) -> object:
             raise Stop("stage 2 held open for TL7")
 
-        monkeypatch.setattr("wxverify.worker.day_values.fill_gaps", _blocked_fill_gaps)
+        monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _blocked_fill_gaps)
 
         await run_due_jobs(db, clock, stop_before=("day_close", 2))
         record = await _state(db, site_id)
@@ -674,15 +674,12 @@ def test_tl9_a_retention_failure_does_not_undo_the_ticks_moves(
         def _raising_prune(conn: object, *, now_utc: object) -> None:
             raise RuntimeError("synthetic prune failure for TL9")
 
-        # Patched at its defining module (db/station_readings.py). Once
-        # close_chain.py exists and imports prune_raw_readings BY NAME (14.4:
-        # "P3 calls ... prune_raw_readings"), the patch target may need to
-        # move to wxverify.worker.close_chain.prune_raw_readings instead --
-        # see the hand-back message.
+        # close_chain.py imports prune_raw_readings BY NAME (14.4: "P3 calls
+        # ... prune_raw_readings"), so the patch targets close_chain's own
+        # name.
         monkeypatch.setattr(
-            "wxverify.db.station_readings.prune_raw_readings",
+            "wxverify.worker.close_chain.prune_raw_readings",
             _raising_prune,
-            raising=False,
         )
 
         caplog.set_level("ERROR", logger="wxverify.worker.close_chain")

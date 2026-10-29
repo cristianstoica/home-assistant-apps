@@ -134,15 +134,30 @@ _ELIGIBLE_OBS_WHERE = """
 # record_gap_scan, catchup) are deliberately absent: _complete_and_continue
 # completes every finished chunk under the chain's own key, so a later
 # completed row there is a chunk, not a resolution, and those scopes count by
-# age alone. A new job type stays OFF this list until it is classified. The
+# age alone.
+# The daily close's two kinds are classified apart (daily-close P3 9.6). A
+# failed day_close stage is left out of the arm: the day's state and attempt
+# record report it, and its scope (close:{site_id}:{local_date}:{stage}) is
+# the same for both attempts, so a later completion says nothing about the
+# day. A failed day_publish stage 7 (key publish:{site_id}:7) is left out
+# too: a failure fail_publication records moves the publication record,
+# whose state reports it, and a stale job's failure has its WARNING line.
+# day_publish is on the allowlist for its stage 8 (publish:{site_id}:8),
+# reported here alone: the site's next stage 8 that completes with
+# result='ok' deletes what the failed one left, a real recovery (stage 8's
+# early return ends with JobCancelled, so it clears nothing).
+# A new job type stays OFF this list until it is classified. The
 # rule is explained where it is used, in _pipeline_conditions. Module-level so
 # the query-plan regression suite plans the statement that ships, not a copy.
 FAILED_SCOPES_SQL = """
     SELECT COUNT(*) FROM (
         SELECT 1 FROM jobs AS j
         WHERE j.status = 'failed' AND j.updated_at <= ?
+          AND NOT (j.type = 'day_publish'
+                   AND j.job_key IS ('publish:' || j.site_id || ':7'))
+          AND j.type != 'day_close'
           AND (j.type NOT IN ('fetch_feed', 'fetch_obs', 'fetch_current_obs',
-                              'pair_and_score', 'forecast_record')
+                              'pair_and_score', 'forecast_record', 'day_publish')
                OR NOT EXISTS (
                    SELECT 1 FROM jobs AS k
                    WHERE k.type = j.type
@@ -682,6 +697,12 @@ def _pipeline_conditions(
     # For the chain types every finished chunk leaves a marked completed row
     # under the chain's key (_complete_and_continue), so a chunk's completion
     # proves nothing about the chain and those types count by age alone. The
+    # daily close's failed day_close stages and failed day_publish stage 7
+    # (key publish:{site_id}:7) are left out of the arm: the day's state and
+    # attempt record, or the publication record's state, report them, and a
+    # stale job's failure its WARNING line. Its stage 8 (publish:{site_id}:8)
+    # is a single-row scope: a later stage 8 of the site that completes with
+    # result='ok' has deleted what the failed one left. The
     # failed rows themselves stay until purge_failed_jobs_older_than removes
     # them, so retention is unchanged and the count cannot be cleared by
     # anything but a real success. "Later" is id order, matched NULL-safely

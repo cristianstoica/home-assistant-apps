@@ -189,18 +189,18 @@ def _patch_stage_fault(monkeypatch: pytest.MonkeyPatch, stage: int, p4: dict | N
         async def _raise_fill(*a: object, **kw: object) -> GapFillResult:
             raise RuntimeError(message)
 
-        monkeypatch.setattr("wxverify.worker.day_values.fill_gaps", _raise_fill)
+        monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _raise_fill)
     elif stage == 3:
 
         def _raise_write(*a: object, **kw: object) -> object:
             raise RuntimeError(message)
 
         monkeypatch.setattr(
-            "wxverify.worker.day_values.write_hourly_values", _raise_write
+            "wxverify.worker.close_chain.write_hourly_values", _raise_write
         )
     elif stage == 4:
         monkeypatch.setattr(
-            "wxverify.verification.truth.write_close_truth",
+            "wxverify.worker.close_chain.write_close_truth",
             lambda *a, **kw: (_ for _ in ()).throw(RuntimeError(message)),
         )
     elif stage == 5:
@@ -212,7 +212,7 @@ def _patch_stage_fault(monkeypatch: pytest.MonkeyPatch, stage: int, p4: dict | N
         def _raise_finish(*a: object, **kw: object) -> object:
             raise RuntimeError(message)
 
-        monkeypatch.setattr("wxverify.db.site_days.finish_close", _raise_finish)
+        monkeypatch.setattr("wxverify.worker.close_chain.finish_close", _raise_finish)
 
 
 @pytest.mark.parametrize("stage", [2, 3, 4, 5, 6])
@@ -308,7 +308,7 @@ def _fail_hourly_values_once(monkeypatch: pytest.MonkeyPatch, message: str) -> N
             raise RuntimeError(message)
         return real(*a, **kw)
 
-    monkeypatch.setattr("wxverify.worker.day_values.write_hourly_values", _standin)
+    monkeypatch.setattr("wxverify.worker.close_chain.write_hourly_values", _standin)
 
 
 def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
@@ -418,7 +418,7 @@ def test_at3_both_attempts_failing_misses_the_day_and_runs_retention(
             raise RuntimeError("synthetic stage 3 failure, attempt N")
 
         monkeypatch.setattr(
-            "wxverify.worker.day_values.write_hourly_values", _raise_write
+            "wxverify.worker.close_chain.write_hourly_values", _raise_write
         )
 
         def _counting_prune(conn: object, *, now_utc: object) -> int:
@@ -426,9 +426,8 @@ def test_at3_both_attempts_failing_misses_the_day_and_runs_retention(
             return 0
 
         monkeypatch.setattr(
-            "wxverify.db.station_readings.prune_raw_readings",
+            "wxverify.worker.close_chain.prune_raw_readings",
             _counting_prune,
-            raising=False,
         )
 
         await run_due_jobs(db, clock)
@@ -625,7 +624,7 @@ def test_at6_a_retry_not_run_while_the_add_on_was_down_is_missed(
         async def _raise_fill(*a: object, **kw: object) -> GapFillResult:
             raise RuntimeError("synthetic stage 2 failure")
 
-        monkeypatch.setattr("wxverify.worker.day_values.fill_gaps", _raise_fill)
+        monkeypatch.setattr("wxverify.worker.close_chain.fill_gaps", _raise_fill)
 
         await run_due_jobs(db, clock)
         record = await _state(db, site_id)
@@ -793,6 +792,8 @@ def _station_fill(outcome, hours_left=()):  # type: ignore[no-untyped-def]
         hours_filled=hours_filled,
         hours_left=left,
         next_allowed_at=None,
+        readings_kept=0,
+        readings_refused=0,
     )
 
 
@@ -845,7 +846,7 @@ def test_at8_a_hold_or_refused_access_or_no_readings_does_not_fail_the_attempt(
             },
         )
         monkeypatch.setattr(
-            "wxverify.worker.day_values.fill_gaps", _fixed_fill_gaps(result)
+            "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
         await run_due_jobs(db, clock)
@@ -906,6 +907,8 @@ def test_at9_a_technical_gap_fill_failure_fails_the_attempt(
             hours_filled={},
             hours_left=(datetime(D.year, D.month, D.day, 21, tzinfo=UTC),),
             next_allowed_at=None,
+            readings_kept=0,
+            readings_refused=0,
         )
         result = GapFillResult(
             ended=True,
@@ -915,7 +918,7 @@ def test_at9_a_technical_gap_fill_failure_fails_the_attempt(
             },
         )
         monkeypatch.setattr(
-            "wxverify.worker.day_values.fill_gaps", _fixed_fill_gaps(result)
+            "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
         await run_due_jobs(db, clock)
@@ -1041,7 +1044,7 @@ def test_at11_a_stalled_claim_fails_the_attempt_before_doing_any_work(
             write_calls.append((a, kw))
             return real_write(*a, **kw)
 
-        monkeypatch.setattr("wxverify.worker.day_values.write_hourly_values", _spy)
+        monkeypatch.setattr("wxverify.worker.close_chain.write_hourly_values", _spy)
 
         await run_due_jobs(db, clock, stop_before=("day_close", 3))
         clock.advance(timedelta(minutes=61))
@@ -1136,13 +1139,13 @@ def test_at12_a_stale_jobs_exception_does_not_touch_the_current_attempt(
                 raise RuntimeError("synthetic transient read failure")
             return real_day_record(*a, **kw)
 
-        # Patched at its defining module (db/site_days.py), by the same
-        # convention tests/test_close_timeline.py's TL9 already uses for
-        # prune_raw_readings. If close_chain imports day_record BY NAME
-        # instead of calling it module-qualified, this target may need to
-        # move to wxverify.worker.close_chain.day_record -- see the
-        # hand-back message.
-        monkeypatch.setattr("wxverify.db.site_days.day_record", _flaky_day_record)
+        # close_chain imports day_record BY NAME, so the patch targets
+        # wxverify.worker.close_chain.day_record: the first call (the gate
+        # check in _current, inside _open_stage) raises; the stale job's
+        # exception then reaches fail_day_close_job's own call, the second,
+        # which runs the real day_record and finds D is still closing in
+        # attempt 2, not the stale job's attempt 1, so nothing else changes.
+        monkeypatch.setattr("wxverify.worker.close_chain.day_record", _flaky_day_record)
 
         stamp = isoformat_utc(clock.now())
         await db.write(
@@ -1295,7 +1298,7 @@ def test_at14_a_missed_day_from_a_failed_stage_reports_no_failed_scope(
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
         install_p4_standins(monkeypatch)
         monkeypatch.setattr(
-            "wxverify.verification.truth.write_close_truth",
+            "wxverify.worker.close_chain.write_close_truth",
             lambda *a, **kw: (_ for _ in ()).throw(
                 RuntimeError("synthetic stage 4 failure")
             ),
@@ -1372,7 +1375,7 @@ def test_at15_an_outcome_that_does_not_fail_the_attempt_closes_the_day(
             },
         )
         monkeypatch.setattr(
-            "wxverify.worker.day_values.fill_gaps", _fixed_fill_gaps(result)
+            "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
         await run_due_jobs(db, clock)
@@ -1565,13 +1568,15 @@ def test_at17_an_unlisted_outcome_or_reason_fails_the_attempt(
             hours_filled={},
             hours_left=(datetime(D.year, D.month, D.day, 21, tzinfo=UTC),),
             next_allowed_at=None,
+            readings_kept=0,
+            readings_refused=0,
         )
         result = GapFillResult(
             ended=True,
             stations={station_a: a_fill, station_b: _station_fill("filled")},
         )
         monkeypatch.setattr(
-            "wxverify.worker.day_values.fill_gaps", _fixed_fill_gaps(result)
+            "wxverify.worker.close_chain.fill_gaps", _fixed_fill_gaps(result)
         )
 
         await run_due_jobs(db, clock)

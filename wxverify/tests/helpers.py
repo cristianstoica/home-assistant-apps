@@ -41,6 +41,7 @@ from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
     OCCURRENCE_BASELINES,
 )
+from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 from wxverify.worker.scheduler import scheduler_tick
 
@@ -1001,6 +1002,12 @@ def _job_outcome(conn: sqlite3.Connection, job_id: int) -> str:
     return str(row[0])
 
 
+# Guards tests/helpers.py's run_due_jobs against a job that keeps coming
+# due at the same (unmoved) clock instant, which would loop forever; far
+# above any real night's job count (checked against every test caller).
+_MAX_CLAIMS_PER_TICK = 500
+
+
 async def run_due_jobs(
     db: Database,
     clock: MovingClock,
@@ -1021,6 +1028,11 @@ async def run_due_jobs(
     stamped on the clock -- a test that then wants to run one job alone
     claims it itself with ``claim_next_job``/``run_claimed_job``, with no
     further tick.
+
+    Raises ``AssertionError`` if one call makes more than
+    ``_MAX_CLAIMS_PER_TICK`` claims without reaching ``stop_before`` or an
+    empty queue, instead of looping forever on a job that keeps re-queuing
+    itself at the clock's unmoved instant.
     """
     claims: list[tuple[str, str | None, str]] = []
     stop_type, stop_stage = stop_before if stop_before is not None else (None, None)
@@ -1044,6 +1056,13 @@ async def run_due_jobs(
 
         outcome = await db.read(_read_outcome)
         claims.append((job.type, job.job_key, outcome))
+        if len(claims) > _MAX_CLAIMS_PER_TICK:
+            raise AssertionError(
+                f"run_due_jobs made {_MAX_CLAIMS_PER_TICK} claims at one "
+                "clock time without reaching its stop_before "
+                f"({stop_before!r}) or an empty queue; last claims "
+                f"(type, job_key, outcome): {claims[-5:]!r}"
+            )
 
 
 class RoundStateStandIn:
@@ -1141,6 +1160,7 @@ def install_p4_standins(
     ``ModuleNotFoundError`` until piece 3 adds ``close_p4.py``.
     """
     score_day = RecordingStandIn()
+    score_day.result = ScoreSummary(scored={}, absent={})
     publish = AsyncRecordingStandIn()
     clean_worksheets = AsyncRecordingStandIn()
     monkeypatch.setattr("wxverify.worker.close_p4.score_day", score_day, raising=False)
