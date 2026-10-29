@@ -180,14 +180,13 @@ def _seed_wind_only_raw_rows(path: Path, station_id: int, local_date) -> None:  
     carrying only ``speed_kmh`` (``temp_c``/``precip_total_mm`` NULL), the
     shape P2's migration copies forward from before P2's collection
     (CL5). ``speed_kmh`` is 36.0 (10.0 m/s) -- deliberately NOT the 5.0 m/s
-    ``_seed_observations_full_day`` already seeded for "wind" -- harmless
-    and disjoint from the refusal this seeds for: a COMMITTED rebuild
-    would show this value in the new file's wind observations, but CL5's
-    rebuild never commits (a genuine refusal skips stage 3 entirely, and
-    M84's escape still fails at a later stage and rolls the whole close
-    back), so the observations-equality check never sees 36.0 either way;
-    CL5 distinguishes the two by what the command prints, not by this
-    value."""
+    ``_seed_observations_full_day`` already seeded for "wind": a genuine
+    refusal comes before the stage loop (``__main__.py:796-799``), so stage
+    3 never runs and the wind observation stays 5.0. Under mutant M84 the
+    refusal is skipped and stage 3 does run and commit (``_run_offline_close``
+    commits each stage in its own write), yet in this fixture it leaves
+    ``observations`` and ``station_observations`` unchanged, so these values
+    do not tell M84 apart; CL5's stage-log assertion does."""
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys=ON")
     for hour in range(24):
@@ -202,6 +201,41 @@ def _seed_wind_only_raw_rows(path: Path, station_id: int, local_date) -> None:  
             " VALUES (?, ?, 'hourly', ?, 36.0, ?)",
             (station_id, obs_at, local_date.isoformat(), obs_at),
         )
+    conn.commit()
+    conn.close()
+
+
+def _seed_station_observations_full_day(
+    path: Path, station_ids: tuple[int, int], local_date
+) -> None:  # type: ignore[no-untyped-def]
+    """Seed one hourly ``station_observations`` row per station for
+    ``temperature`` and ``precip`` (CL5), equal to the values
+    ``_seed_observations_full_day`` already seeded at the site level --
+    "the site observations built from them". These rows exist so a raw
+    rebuild that erroneously ran would have something real at the station
+    level to read; they do not by themselves make the observations-
+    equality check distinguish M84 (the stage-log assertion below is
+    M84's direct kill)."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    for hour in range(24):
+        valid_at = isoformat_utc(
+            datetime(
+                local_date.year, local_date.month, local_date.day, hour, tzinfo=UTC
+            )
+        )
+        for station_id in station_ids:
+            for variable, value in (
+                ("temperature", 10.0 + hour * 0.1),
+                ("precip", 0.0),
+            ):
+                conn.execute(
+                    "INSERT INTO station_observations"
+                    " (station_id, variable, valid_at, value, qc_flag,"
+                    " source_raw, fetched_at)"
+                    " VALUES (?, ?, ?, ?, 'ok', 'synthetic-cl5', ?)",
+                    (station_id, variable, valid_at, value, valid_at),
+                )
     conn.commit()
     conn.close()
 
@@ -228,6 +262,30 @@ def _seed_existing_site_day(path: Path, site_id: int, local_date) -> None:  # ty
             stamp,
         ),
     )
+    conn.commit()
+    conn.close()
+
+
+def _seed_raw_temperature_day(path: Path, station_id: int, local_date) -> None:  # type: ignore[no-untyped-def]
+    """Seed ``station_wind_records`` rows for every hour of ``local_date``
+    carrying ``temp_c`` (CL4's case (ii): a file where the raw-temperature
+    check would itself pass, so that path can never be the reason an exit
+    1 is seen there -- only ``open_day_on_copy``'s own ``DayStateError``
+    can)."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("PRAGMA foreign_keys=ON")
+    for hour in range(24):
+        obs_at = isoformat_utc(
+            datetime(
+                local_date.year, local_date.month, local_date.day, hour, tzinfo=UTC
+            )
+        )
+        conn.execute(
+            "INSERT INTO station_wind_records"
+            " (station_id, obs_at, source, local_date, temp_c, fetched_at)"
+            " VALUES (?, ?, 'hourly', ?, 10.0, ?)",
+            (station_id, obs_at, local_date.isoformat(), obs_at),
+        )
     conn.commit()
     conn.close()
 
@@ -382,14 +440,13 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
     this only checks the new file's name and the word "stage" appear in
     it, rather than pinning an exact format.
 
-    M71/M72 -> at the transport/truth-value assertions below: correct = no
-    gap-fill request and a temperature-high value read from the seeded
-    hourly ``observations`` (stage 2/3 never ran, since there are no raw
-    readings to call or rebuild from), mutant M71 (close-day runs stage 2)
-    = a gap-fill request is made (the transport's handler raises),
-    mutant M72 (``--hours stored`` runs stage 3) = ``write_hourly_values``
-    finds no raw readings for the day and the truth value differs (or the
-    attempt fails and D never closes).
+    M71 -> at the transport assertion below: correct = no gap-fill request
+    (stage 2 never runs), mutant M71 (close-day runs stage 2) = a gap-fill
+    request is made (the transport's handler raises). The truth-value
+    assertion cannot tell M72 apart from correct code on its own: with no
+    raw readings seeded, ``write_hourly_values`` writes nothing either
+    way, so the 12.3 value is unchanged under M72 too -- see the
+    ``ran_stages`` assertion below for M72's own kill.
 
     M73 -> at the source-file and new-file-exists assertions: correct =
     the source file byte-for-byte unchanged and exactly one new file
@@ -475,11 +532,12 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
             (site_id, D.isoformat()),
         ).fetchone()
         assert high is not None and high["value"] == pytest.approx(12.3), (
-            "M71/M72 -> at this assertion: correct = the truth value read"
-            " from the 24 seeded hourly observations (12.3, the day's max),"
-            " mutant M72 (--hours stored runs stage 3) = a different value"
-            " or no row at all, since there are no raw readings to rebuild"
-            " hours from"
+            "the truth value must be read from the 24 seeded hourly"
+            " observations (12.3, the day's max); with no raw readings"
+            " seeded, mutant M72 (--hours stored also runs stage 3) writes"
+            " nothing here either, so this assertion alone cannot tell M72"
+            " apart from the intended behaviour (see the ran_stages"
+            " assertion below for the check that does)"
         )
 
         publications = new_conn.execute(
@@ -519,7 +577,7 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
 
 
 def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """CL4: the same with ``--hours raw``; then a source file whose site
     already has a record. Exit 1, "no raw reading of that day has a
@@ -531,9 +589,15 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
     reading of any kind, none can have a temperature. Second case: a fresh
     file whose site already has a ``site_days`` record for D, seeded
     directly (P1's own table, the precondition ``open_day_on_copy`` itself
-    refuses on).
+    refuses on). D itself is seeded with a full day of raw temperature
+    readings (``_seed_raw_temperature_day``), so the raw-temperature check
+    would itself PASS if ``_run_offline_close`` were ever reached -- only
+    ``open_day_on_copy``'s own ``DayStateError`` (``__main__.py:858``,
+    which runs before ``_run_offline_close`` is ever called) can produce
+    case (ii)'s exit 1, never ``_NO_RAW_TEMPERATURE``.
     """
     from tests.helpers import patch_weathercom_transport
+    from wxverify.__main__ import _NO_RAW_TEMPERATURE
 
     def _handler(request: object) -> object:
         raise AssertionError("no gap-fill request may be made by the offline close")
@@ -560,13 +624,21 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
         ]
     )
     assert rc_i == 1, "no raw reading of the day has a temperature -- must refuse"
+    out_i = capsys.readouterr().out
+    assert _NO_RAW_TEMPERATURE in out_i, (
+        "case (i) must print the no-raw-temperature refusal"
+    )
     after_bytes_i, after_version_i = _file_bytes_and_version(path_i)
     assert (after_bytes_i, after_version_i) == (before_bytes_i, before_version_i)
 
-    # Case (ii): the site already has a site_days record.
+    # Case (ii): the site already has a site_days record. D is seeded with
+    # a full day of raw temperature readings, so the raw-temperature check
+    # would itself pass if it were ever reached -- only the DayStateError
+    # path can produce this case's exit 1.
     path_ii = tmp_path / "already_has_record.db"
-    site_ii, _stations_ii = _build_v12_file(path_ii, site_name="TestsiteAlready")
+    site_ii, stations_ii = _build_v12_file(path_ii, site_name="TestsiteAlready")
     _seed_existing_site_day(path_ii, site_ii, D - timedelta(days=5))
+    _seed_raw_temperature_day(path_ii, stations_ii["ISTATION01"], D)
     before_bytes_ii, before_version_ii = _file_bytes_and_version(path_ii)
 
     rc_ii = main(
@@ -584,6 +656,16 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
     )
     assert rc_ii == 1, (
         "a site that already has a day record must refuse (DayStateError)"
+    )
+    out_ii = capsys.readouterr().out
+    assert f"error site {site_ii} already has day records" in out_ii, (
+        "case (ii) must print P1's own DayStateError message"
+        " (db/site_days.py's open_day_on_copy refusal)"
+    )
+    assert _NO_RAW_TEMPERATURE not in out_ii, (
+        "case (ii)'s exit 1 must never come from the raw-temperature"
+        " refusal -- D has a full day of raw temperature readings, so"
+        " that check would pass if it were ever reached"
     )
     after_bytes_ii, after_version_ii = _file_bytes_and_version(path_ii)
     assert (after_bytes_ii, after_version_ii) == (before_bytes_ii, before_version_ii)
@@ -605,17 +687,21 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
     source's, row for row, and D is not ``closed``; the source file
     unchanged (8.8).
 
-    M84 -> at the printed-refusal assertion below: correct = the printout
-    contains ``_NO_RAW_TEMPERATURE`` and no "error stage" line, mutant M84
-    (``close-day --hours raw`` refuses only when the day has NO raw
-    reading at all, of any quantity) = the printout instead shows
-    "error stage 5 failed: score_day is bound by the daily close's P4" --
-    a later stage raising and rolling the copy back, which the
-    observations-equality and exit-code checks alone cannot distinguish
-    from the intended refusal (a failed close is rolled back, so the
-    rebuild's wind-only values never reach the new file's observations
-    either way; the printed-refusal check is the only one of these
-    assertions M84 cannot also satisfy).
+    M84 -> at the stage-log assertion below (checked right after ``rc``,
+    before the printed-refusal check): correct = no stage has run for D
+    (the refusal at ``__main__.py:796-798`` comes after
+    ``begin_offline_close`` has committed but before the stage loop at
+    ``__main__.py:799`` ever starts), mutant M84 (``close-day --hours
+    raw`` refuses only when the day has NO raw reading at all, of any
+    quantity) = stage 3 and stage 4 both run and commit (each stage
+    commits in its own write, ``__main__.py:797``) before stage 5 raises
+    "error stage 5 failed: score_day is bound by the daily close's P4".
+    The observations-equality check later in this test is a guard, not a
+    kill: it asserts the refusal changes no observation data, but under
+    M84 in this fixture stage 3's rebuild leaves both ``observations``
+    and ``station_observations`` byte-for-byte equal to the seeded
+    values anyway, so it does not by itself tell M84 apart from a
+    genuine refusal.
     """
     from tests.helpers import patch_weathercom_transport
 
@@ -627,6 +713,9 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
     _seed_observations_full_day(path, site_id, D)
     _seed_wind_only_raw_rows(path, stations["ISTATION01"], D)
     _seed_wind_only_raw_rows(path, stations["ISTATION02"], D)
+    _seed_station_observations_full_day(
+        path, (stations["ISTATION01"], stations["ISTATION02"]), D
+    )
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
     patch_weathercom_transport(monkeypatch, _handler)  # type: ignore[arg-type]
 
@@ -664,6 +753,30 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
 
     assert rc == 1, "no raw reading of the day has a temperature -- must refuse"
 
+    after_names = sorted(p.name for p in tmp_path.iterdir())
+    new_names = [name for name in after_names if name not in before_names]
+    assert len(new_names) == 1, "a copy must still be made before the refusal (8.8)"
+    new_path = tmp_path / new_names[0]
+
+    from wxverify.worker.close_chain import stage_log
+
+    stage_conn = sqlite3.connect(f"file:{new_path}?mode=ro", uri=True)
+    try:
+        ran_stages = [
+            run.stage for run in stage_log(stage_conn, site_id=site_id, local_date=D)
+        ]
+    finally:
+        stage_conn.close()
+    assert ran_stages == [], (
+        "M84 -> at this assertion: correct = [] (the refusal at"
+        " __main__.py:796-798 comes after begin_offline_close has"
+        " committed but before the stage loop at __main__.py:799 ever"
+        " starts, so no stage can have logged a run for D), mutant M84"
+        " (refuses only when the day has no raw reading at all) = [3, 4]"
+        " (stage 3's rebuild and stage 4 both run and commit before stage"
+        " 5 raises)"
+    )
+
     from wxverify.__main__ import _NO_RAW_TEMPERATURE
 
     out = capsys.readouterr().out
@@ -684,11 +797,6 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
         "the source file must be byte-for-byte and user_version unchanged"
     )
 
-    after_names = sorted(p.name for p in tmp_path.iterdir())
-    new_names = [name for name in after_names if name not in before_names]
-    assert len(new_names) == 1, "a copy must still be made before the refusal (8.8)"
-    new_path = tmp_path / new_names[0]
-
     new_conn = sqlite3.connect(f"file:{new_path}?mode=ro", uri=True)
     new_conn.row_factory = sqlite3.Row
     try:
@@ -701,13 +809,14 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
             )
         ]
         assert new_observations == source_observations, (
-            "a genuine refusal leaves the copy's observations untouched"
-            " (stage 3 never ran); under M84 a committed rebuild would"
-            " show this too, but M84 never reaches a committed rebuild"
-            " here -- stage 5 then raises and the whole close is rolled"
-            " back, so this assertion alone cannot tell M84 apart from"
-            " the intended refusal (see the printed-refusal assertion"
-            " above for the check that does)"
+            "guard: the copy's observations must equal the source"
+            " row-for-row regardless of outcome -- a genuine refusal"
+            " skips stage 3 entirely, so this must hold whenever the"
+            " refusal fires. This check alone does not distinguish M84"
+            " in this fixture: under M84, stage 3's rebuild leaves"
+            " observations (and station_observations) unchanged from"
+            " the seeded values here, so the stage-log assertion above"
+            " is M84's direct kill"
         )
         day = new_conn.execute(
             "SELECT state FROM site_days WHERE site_id = ? AND local_date = ?",

@@ -821,6 +821,26 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
         "a day whose high is 1.0 higher must get a different truth version"
     )
 
+    def _read_high(path) -> float:  # type: ignore[no-untyped-def]
+        conn = sqlite3.connect(path)
+        row = conn.execute(
+            "SELECT value FROM daily_truth WHERE local_date = ?"
+            " AND quantity = 'temperature_high'",
+            (D.isoformat(),),
+        ).fetchone()
+        conn.close()
+        assert row is not None, "file c must have a temperature_high truth row"
+        return float(row[0])
+
+    high_a = _read_high(new_files["a"])
+    high_c = _read_high(new_files["c"])
+    assert high_c == pytest.approx(high_a + 1.0), (
+        "the claim this test's own docstring makes -- file c's high is"
+        " exactly 1.0 higher than file a's -- was never checked by the"
+        " version_c != version_a assertion alone (a different hash only"
+        " proves SOME difference, not this specific one)"
+    )
+
 
 # ---------------------------------------------------------------------------
 # LG5
@@ -1000,8 +1020,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     conn.commit()
 
     clock_before = day_end - timedelta(hours=1)
-    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: clock_before)
-    status_before_end = close_status(conn, site_id=site_id, local_date=D)
+    status_before_end = close_status(
+        conn, site_id=site_id, local_date=D, now_utc=clock_before
+    )
     assert status_before_end is not None
     assert status_before_end.state == "open"
     assert status_before_end.blocking_stage is None, (
@@ -1009,8 +1030,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     )
 
     clock_after = note_day_clock(day_end + timedelta(minutes=5))
-    monkeypatch.setattr("wxverify.core.timeutil.utc_now", lambda: clock_after)
-    status_after_end = close_status(conn, site_id=site_id, local_date=D)
+    status_after_end = close_status(
+        conn, site_id=site_id, local_date=D, now_utc=clock_after
+    )
     assert status_after_end is not None
     assert status_after_end.state == "open"
     assert status_after_end.blocking_stage == 1, (
@@ -1029,7 +1051,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         started_at=isoformat_utc(clock_after),
     )
     conn.commit()
-    status_closing = close_status(conn, site_id=site_id, local_date=D)
+    status_closing = close_status(
+        conn, site_id=site_id, local_date=D, now_utc=clock_after
+    )
     assert status_closing is not None
     assert status_closing.state == "closing"
     assert status_closing.blocking_stage == 3, (
@@ -1047,7 +1071,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         (isoformat_utc(fail_time), site_id, D.isoformat()),
     )
     conn.commit()
-    status_retry_due = close_status(conn, site_id=site_id, local_date=D)
+    status_retry_due = close_status(
+        conn, site_id=site_id, local_date=D, now_utc=fail_time
+    )
     assert status_retry_due is not None
     assert status_retry_due.state == "retry_due"
     assert status_retry_due.retry_at is not None
@@ -1069,7 +1095,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         started_at=isoformat_utc(retry_due_at),
     )
     conn.commit()
-    status_closing2 = close_status(conn, site_id=site_id, local_date=D)
+    status_closing2 = close_status(
+        conn, site_id=site_id, local_date=D, now_utc=retry_due_at
+    )
     assert status_closing2 is not None
     assert status_closing2.state == "closing"
     assert status_closing2.attempts == 2
@@ -1131,7 +1159,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         ),
     )
     conn.commit()
-    status_closed = close_status(conn, site_id=site_closed, local_date=D)
+    status_closed = close_status(
+        conn, site_id=site_closed, local_date=D, now_utc=close_time
+    )
     assert status_closed is not None
     assert status_closed.state == "closed"
     assert status_closed.blocking_stage is None, (
@@ -1162,7 +1192,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     mark_missed(conn, site_never_attempted, D, now_utc=na_now, reason="never_attempted")
     conn.commit()
     status_never_attempted = close_status(
-        conn, site_id=site_never_attempted, local_date=D
+        conn, site_id=site_never_attempted, local_date=D, now_utc=na_now
     )
     assert status_never_attempted is not None
     assert status_never_attempted.state == "missed"
@@ -1206,7 +1236,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     co_now = note_day_clock(co_day_end + timedelta(minutes=5))
     mark_missed(conn, site_changeover, D, now_utc=co_now, reason="zone_changeover")
     conn.commit()
-    status_changeover = close_status(conn, site_id=site_changeover, local_date=D)
+    status_changeover = close_status(
+        conn, site_id=site_changeover, local_date=D, now_utc=co_now
+    )
     assert status_changeover is not None
     assert status_changeover.state == "missed"
     assert status_changeover.missed_reason == "zone_changeover"
@@ -1269,7 +1301,7 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
         started_at=isoformat_utc(t2),
     )
     conn.commit()
-    status_missed = close_status(conn, site_id=site_missed, local_date=D)
+    status_missed = close_status(conn, site_id=site_missed, local_date=D, now_utc=t2)
     assert status_missed is not None
     assert status_missed.state == "missed"
     assert status_missed.missed_reason == "retry_failed"
@@ -1313,7 +1345,9 @@ def test_lg6_close_status_fills_every_field_14_2_promises(
     rnr_t2 = note_day_clock(rnr_t1 + timedelta(hours=1, minutes=5))
     mark_missed(conn, site_retry_not_run, D, now_utc=rnr_t2, reason="retry_not_run")
     conn.commit()
-    status_retry_not_run = close_status(conn, site_id=site_retry_not_run, local_date=D)
+    status_retry_not_run = close_status(
+        conn, site_id=site_retry_not_run, local_date=D, now_utc=rnr_t2
+    )
     assert status_retry_not_run is not None
     assert status_retry_not_run.state == "missed"
     assert status_retry_not_run.missed_reason == "retry_not_run"

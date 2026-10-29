@@ -63,11 +63,17 @@ from tests.helpers import (
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.api.routes import db_transfer
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.queue import Job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
+from wxverify.db.site_days import (
+    RETRY_DELAY,
+    begin_close,
+    day_record,
+    fail_close,
+    finish_close,
+)
 from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 
@@ -608,6 +614,18 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
             " state check) = a 'skipped' row written for a day that is no"
             " longer closing"
         )
+        reclaimed_job_row = await db.read(
+            lambda c: c.execute(
+                "SELECT status FROM jobs WHERE id = ?", (reclaimed_job.id,)
+            ).fetchone()
+        )
+        assert reclaimed_job_row["status"] == "completed", (
+            "paired positive: the reclaimed stage-6 job's own row must still"
+            " end 'completed' (run_claimed_job always completes the job"
+            " after dispatch returns with no exception, 8.2) -- otherwise"
+            " the no-new-stage-log-row check above would also pass on a"
+            " job that never ran to any disposition at all"
+        )
 
         publish_jobs = await db.read(
             lambda c: c.execute(
@@ -720,6 +738,13 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
             " M41 (stage 7 does not save 'building' before calling P4) ="
             " the record stays whatever it was before stage 7 ran, never"
             " 'retry_due'"
+        )
+        assert publication["retry_at"] == isoformat_utc_micro(stop_at + RETRY_DELAY), (
+            "M23b -> at this assertion: correct = the stop instant L"
+            " (worker_last_loop_at, set to stop_at above) + RETRY_DELAY, in"
+            " isoformat_utc_micro form (close_chain.py:2276's own stamp),"
+            " mutant M23b (retry_at computed one minute short of L +"
+            " RETRY_DELAY) = a retry_at one minute earlier"
         )
 
         standins["publish"].raises = None
@@ -1052,6 +1077,11 @@ def test_rs7_an_imported_closing_day_is_settled_before_use(
         " sort, so D is left exactly as the uploaded file carried it"
         " ('closing'), which is the right reason for this assertion to"
         " fail first"
+    )
+    assert len(close_jobs) == 1, (
+        "exactly one day_close job of D was ever seeded (the pending"
+        " stage-4 job above) -- without this, the all() below would also"
+        " pass vacuously on an empty list"
     )
     assert all(
         (row["status"], row["result"]) == ("completed", None) for row in close_jobs

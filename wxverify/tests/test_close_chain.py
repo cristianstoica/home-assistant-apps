@@ -561,6 +561,13 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
             "failed",
             6,
         ), "the attempt record must show failed_stage 6 (9.1)"
+        assert attempt_row["failure_reason"] == (
+            f"site {site_id} day {D.isoformat()} (closing): the day's truth is stale"
+        ), (
+            "attempt 1's failure_reason must be the stale-truth DayStateError"
+            " text itself (db/site_days.py's own _refuse message), not a"
+            " generic or swallowed reason"
+        )
 
         clock.advance(timedelta(hours=1, minutes=5))
         await run_due_jobs(db, clock)

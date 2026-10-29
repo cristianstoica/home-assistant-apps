@@ -561,6 +561,106 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
 
 
 # ---------------------------------------------------------------------------
+# PB4b
+# ---------------------------------------------------------------------------
+
+
+def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PB4b (F2): ``_newer_open_publication`` (close_chain.py:1190) must
+    also count a later cutoff's record that is already ``published``, not
+    only ``pending``/``building`` -- today's code checks only
+    ``state IN ('pending', 'building')``, so an older cutoff's own retry
+    would publish a second time over an already-published later cutoff.
+
+    Cutoff C1 (D) starts ``retry_due``; C2 (D + 1) is already
+    ``published``. PB7 already proves the ``retry_due`` -> ``pending``
+    attempt-2 transition (plan 8.5 step 5), so this test builds that
+    transition directly (PB4's own build-the-precondition-directly rule,
+    since the code under test here is stage 7's own
+    ``_newer_open_publication`` check, not the retry repair step), then
+    seeds and runs C1's own retry job (attempt 2).
+
+    F2 -> at the two assertions below: correct = 'superseded' and publish
+    not called (C1's retry sees C2's already-published record as newer),
+    today's code (only pending/building count as newer) = C1 published
+    after C2.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        standins = install_p4_standins(monkeypatch)
+        standins["publish"].result = "pub-D-retry"
+
+        opened_c1 = NOW
+        opened_c2 = NOW + timedelta(minutes=1)
+        failed_at = NOW
+        retry_at = failed_at + timedelta(hours=1)
+
+        await db.write(lambda c: _seed_closed_site_day(c, site_id, D_PLUS_1))
+
+        def _seed_c1_retry_due(c: sqlite3.Connection) -> None:
+            c.execute(
+                "INSERT INTO close_publications (site_id, cutoff, attempt,"
+                " state, opened_at, retry_at)"
+                " VALUES (?, ?, 1, 'retry_due', ?, ?)",
+                (
+                    site_id,
+                    D.isoformat(),
+                    isoformat_utc(opened_c1),
+                    isoformat_utc(retry_at),
+                ),
+            )
+
+        await db.write(_seed_c1_retry_due)
+        await db.write(
+            lambda c: _seed_publication(
+                c,
+                site_id,
+                D_PLUS_1,
+                state="published",
+                opened_at=opened_c2,
+                started_at=opened_c2,
+                finished_at=opened_c2,
+                publication_id="pub-D+1",
+            )
+        )
+
+        # PB7 already proves the retry_due -> pending, attempt-2 transition
+        # (8.5 step 5); build it directly here (the file's own
+        # build-the-precondition-directly rule).
+        await db.write(
+            lambda c: c.execute(
+                "UPDATE close_publications SET state = 'pending', attempt = 2,"
+                " retry_at = NULL WHERE site_id = ? AND cutoff = ?",
+                (site_id, D.isoformat()),
+            )
+        )
+        job_c1 = await db.write(
+            lambda c: _seed_publish_job(c, site_id, 7, D, 2, created_at=retry_at)
+        )
+
+        job = await db.write(claim_next_job)
+        assert job is not None and job.id == job_c1
+        await run_claimed_job(db, job, lane="main")
+
+        c1_row = await _publication_row(db, site_id, D)
+        message = (
+            "F2 -> at this assertion: correct = 'superseded' and publish"
+            " not called (C1's retry sees C2's already-published record as"
+            " newer), today's code (only pending/building count as newer)"
+            " = C1 published after C2"
+        )
+        assert c1_row is not None and c1_row["state"] == "superseded", message
+        assert standins["publish"].calls == [], message
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # PB5
 # ---------------------------------------------------------------------------
 
@@ -633,30 +733,64 @@ def test_pb5_a_failed_cleanup_does_not_undo_the_publication(
 # ---------------------------------------------------------------------------
 
 
-def test_pb6_a_stale_job_exception_never_touches_a_published_record(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("seeded_state", ["published", "pending", "none"])
+def test_pb6_a_stale_job_exception_never_touches_a_non_building_record(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    seeded_state: str,
 ) -> None:
-    """PB6: the record ``published`` for cutoff D, attempt 1; a stage-7
-    job for D, attempt 1, inserted and run, whose first read of the record
-    (``publication_record`` as ``close_chain`` calls it, 8.2) raises once.
-    The job row ``failed``; the record unchanged, still ``published`` with
-    ``pub-D``; one WARNING line (9.4).
+    """PB6: a stage-7 job for D, attempt 1, inserted and run, whose first
+    read of the record (``publication_record`` as ``close_chain`` calls
+    it, 8.2) raises once. The job row ``failed``; the record is
+    ``fail_publication``'s own "any other record" case, so it is never
+    touched: one WARNING line and no stage-log row (9.4).
+
+    ``seeded_state`` ``published`` is the original PB6 case: every write
+    ``fail_publication``'s own ``retry_due`` branch could make to a
+    ``published`` record breaks ``close_publications``'s own
+    ``(state = 'published') = (publication_id IS NOT NULL)`` CHECK (the
+    mutated write would leave ``publication_id`` set while moving the
+    state away from ``published``), so SQLite's own CHECK kills mutant
+    M77 there, not this test's own assertion.
+
+    ``seeded_state`` ``pending`` is M77's real kill: a ``pending`` record
+    has no ``publication_id`` set, so the same mutated write satisfies
+    every CHECK (``retry_due`` with ``retry_at`` set, ``attempt`` 1,
+    ``finished_at`` NULL) and commits silently, moving a record
+    ``fail_publication`` must never have touched.
+
+    ``seeded_state`` ``none`` is the no-record case, paired with the other
+    two (a positive precondition each): no ``close_publications`` row at
+    all for D, so M77's own UPDATE (unguarded) matches zero rows and the
+    record stays absent either way -- the record-state check cannot tell
+    this case apart from correct code. The no-stage-log-row check below
+    does: M77 removes the whole guard, so it falls through to an
+    unconditional ``_write_stage_row`` call regardless of whether any
+    record existed, where correct code's early return (``record is
+    None``) writes no row at all.
 
     Imports ``publication_record`` from ``close_chain`` inline (an
     ``ImportError`` today, the name does not exist until piece 3/4), wraps
     it to raise only on its first call -- stage 7's own predicate read
     (8.2 step 1) -- and call through to the real function afterward, so
     the SECOND read, inside the real ``fail_publication``, finds the
-    record genuinely ``published`` (not ``building``) and declines to
-    touch it, logging the WARNING 9.4 names for "any other record".
+    record genuinely as seeded (never ``building``) and declines to touch
+    it, logging the WARNING 9.4 names for "any other record".
 
-    M77 -> at the state assertion below: correct = still 'published' with
-    'pub-D' (``fail_publication`` acts only on a 'building' record of the
-    job's own attempt; a 'published' record is "any other record", changed
-    only by the WARNING path), mutant M77 (``fail_publication`` acts on a
-    record that is not 'building' in the job's attempt) = the published
-    record is moved to 'retry_due' by a stale job that never should have
-    touched it.
+    M77 -> at the ``pending`` state assertion below: correct = still
+    'pending' (``fail_publication`` acts only on a 'building' record of
+    the job's own attempt; a 'pending' record is "any other record",
+    changed only by the WARNING path), mutant M77 (``fail_publication``
+    acts on a record that is not 'building' in the job's attempt) =
+    'retry_due', a transition the CHECK does not forbid for a record with
+    no ``publication_id``.
+
+    M77 -> at the no-stage-log-row assertion below, for ``seeded_state``
+    ``none``: correct = the stage-7 row count is unchanged (the guard's
+    early return writes nothing), mutant M77 (the guard removed) = one
+    new stage-7 row is written for a cutoff with no publication record at
+    all.
     """
 
     async def _run() -> None:
@@ -668,18 +802,27 @@ def test_pb6_a_stale_job_exception_never_touches_a_published_record(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
 
-        await db.write(
-            lambda c: _seed_publication(
-                c,
-                site_id,
-                D,
-                state="published",
-                opened_at=NOW,
-                started_at=NOW,
-                finished_at=NOW,
-                publication_id="pub-D",
+        if seeded_state == "published":
+            await db.write(
+                lambda c: _seed_publication(
+                    c,
+                    site_id,
+                    D,
+                    state="published",
+                    opened_at=NOW,
+                    started_at=NOW,
+                    finished_at=NOW,
+                    publication_id="pub-D",
+                )
             )
-        )
+        elif seeded_state == "pending":
+            await db.write(
+                lambda c: _seed_publication(
+                    c, site_id, D, state="pending", opened_at=NOW
+                )
+            )
+        # "none": no close_publications row is seeded for D at all.
+
         job_id = await db.write(
             lambda c: _seed_publish_job(c, site_id, 7, D, 1, created_at=NOW)
         )
@@ -697,6 +840,16 @@ def test_pb6_a_stale_job_exception_never_touches_a_published_record(
         )
 
         caplog.set_level("WARNING", logger="wxverify.worker.close_chain")
+        stage_log_before = (
+            await db.read(
+                lambda c: c.execute(
+                    "SELECT COUNT(*) FROM close_stage_log WHERE site_id = ?"
+                    " AND local_date = ? AND stage = 7",
+                    (site_id, D.isoformat()),
+                ).fetchone()
+            )
+        )[0]
+
         job = await db.write(claim_next_job)
         assert job is not None and job.id == job_id
         await run_claimed_job(db, job, lane="main")
@@ -705,17 +858,52 @@ def test_pb6_a_stale_job_exception_never_touches_a_published_record(
         assert job_row["status"] == "failed", "the stale job's own row must fail"
 
         record = await _publication_row(db, site_id, D)
-        assert (record["state"], record["publication_id"]) == (
-            "published",
-            "pub-D",
-        ), (
-            "M77 -> at this assertion: correct = ('published', 'pub-D'),"
-            " mutant M77 (fail_publication acts on a record that is not"
-            " 'building' in the job's attempt) = ('retry_due', 'pub-D')"
-        )
+        if seeded_state == "published":
+            assert record is not None and (
+                record["state"],
+                record["publication_id"],
+            ) == (
+                "published",
+                "pub-D",
+            ), (
+                "M77 -> at this assertion: correct = ('published', 'pub-D'),"
+                " mutant M77 (fail_publication acts on a record that is not"
+                " 'building' in the job's attempt) = ('retry_due', 'pub-D'),"
+                " a write the close_publications CHECK refuses here"
+            )
+        elif seeded_state == "pending":
+            assert record is not None and record["state"] == "pending", (
+                "M77 -> at this assertion: correct = 'pending' (fail_publication"
+                " acts only on a 'building' record of the job's own attempt;"
+                " 'pending' is 'any other record', changed only by the"
+                " WARNING path), mutant M77 (fail_publication acts on a"
+                " record that is not 'building' in the job's attempt) ="
+                " 'retry_due', which the CHECK does not forbid here"
+            )
+        else:
+            assert record is None, (
+                "a stale job with no publication record must not create one"
+            )
 
         warnings = [rec for rec in caplog.records if rec.levelname == "WARNING"]
         assert len(warnings) == 1, "exactly one WARNING line must be written (9.4)"
+
+        stage_log_after = (
+            await db.read(
+                lambda c: c.execute(
+                    "SELECT COUNT(*) FROM close_stage_log WHERE site_id = ?"
+                    " AND local_date = ? AND stage = 7",
+                    (site_id, D.isoformat()),
+                ).fetchone()
+            )
+        )[0]
+        assert stage_log_after == stage_log_before, (
+            "M77 -> at this assertion (seeded_state="
+            f"{seeded_state!r}): correct = the stage-7 row count unchanged"
+            " (the WARNING path's early return writes nothing), mutant M77"
+            " (the guard removed) = one new stage-7 row written regardless"
+            " of the record's own state"
+        )
 
     asyncio.run(_run())
 

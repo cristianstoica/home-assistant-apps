@@ -35,7 +35,6 @@ from datetime import UTC, date, datetime, timedelta
 from functools import partial
 from typing import Final, Literal, cast
 
-from wxverify.core import timeutil
 from wxverify.core.timeutil import (
     isoformat_utc,
     isoformat_utc_micro,
@@ -60,6 +59,7 @@ from wxverify.db.site_days import (
     mark_missed,
 )
 from wxverify.db.station_readings import prune_raw_readings
+from wxverify.db.tz_generations import published_generation_id
 from wxverify.verification.completeness import close_admission_basis
 from wxverify.verification.coverage import DayBounds, local_day_bounds
 from wxverify.verification.truth import evaluate_day_window, write_close_truth
@@ -107,12 +107,14 @@ _GAP_FILL_GOES_ON: Final[frozenset[tuple[str, str | None]]] = frozenset(
     }
 )
 
-#: The 13 ``daily_truth`` columns of the truth version, per row (plan 11.4).
+#: The 13 ``daily_truth`` columns of the truth version, per row (plan 11.4),
+#: of the one generation stage 4 writes under: the site's published one.
 _TRUTH_VERSION_SQL: Final = (
     "SELECT quantity, value, eligible, exclusion_reason, covered_hours,"
     " expected_slots, peak_window_ok, wet_hours, dry_hours, rain_threshold_mm,"
     " day_start_utc, day_end_utc, timezone FROM daily_truth"
-    " WHERE site_id = ? AND local_date = ? ORDER BY quantity"
+    " WHERE site_id = ? AND local_date = ? AND tz_generation_id = ?"
+    " ORDER BY quantity"
 )
 _TRUTH_VERSION_FIELDS: Final = (
     "quantity",
@@ -150,7 +152,7 @@ class PublicationRecord:
 
     The states move ``pending`` -> ``building`` -> ``published``, or on a
     failure to ``retry_due`` and then ``failed``; an older cutoff passed by
-    a newer open one ends ``superseded`` (plan 8.6, 9.4, 11.5).
+    a newer open or published one ends ``superseded`` (plan 8.6, 9.4, 11.5).
     """
 
     site_id: int
@@ -441,19 +443,19 @@ def _station_records(
 
 
 def _blocking_stage(
-    record: DayRecord, attempts: tuple[AttemptRecord, ...]
+    record: DayRecord, attempts: tuple[AttemptRecord, ...], now_utc: datetime
 ) -> int | None:
     """The stage the day waits on, or None (14.2).
 
     ``open`` from its ``day_end_utc`` on: 1, the wait for the round; only
-    here is the clock read, through ``timeutil.utc_now``. ``closing``: the
+    here is ``now_utc``, the caller's clock, used. ``closing``: the
     current attempt's ``last_stage`` + 1. ``retry_due`` and ``missed``
     (``retry_failed``): the failed attempt's ``failed_stage``. The current
     or failed attempt is the one numbered ``attempts``, P1's count. None in
     every other case, and when that attempt has no record.
     """
     if record.state == "open":
-        return 1 if timeutil.utc_now() >= record.day_end_utc else None
+        return 1 if now_utc >= record.day_end_utc else None
     current = next((row for row in attempts if row.attempt == record.attempts), None)
     if current is None:
         return None
@@ -467,7 +469,7 @@ def _blocking_stage(
 
 
 def close_status(
-    conn: sqlite3.Connection, *, site_id: int, local_date: date
+    conn: sqlite3.Connection, *, site_id: int, local_date: date, now_utc: datetime
 ) -> CloseStatus | None:
     """Everything about the close of ``site_id``'s day ``local_date`` (14.2).
 
@@ -475,9 +477,9 @@ def close_status(
     first record, or with the close off). Each field is present or None as
     the stored rows hold it; nothing is cached. Read-only: runs in the
     caller's transaction and never commits, so a caller that needs its
-    four SELECTs in one snapshot holds one around the call. Reads the clock
-    (``timeutil.utc_now``) only for an ``open`` day, to tell whether the
-    day has ended.
+    four SELECTs in one snapshot holds one around the call. Reads no
+    clock: ``now_utc``, the caller's clock, is used only for an ``open``
+    day, to tell whether the day has ended.
     """
     record = day_record(conn, site_id, local_date)
     if record is None:
@@ -490,7 +492,7 @@ def close_status(
         last_failure=record.last_failure,
         missed_reason=record.missed_reason,
         done_at=_instant_or_none(record.done_at),
-        blocking_stage=_blocking_stage(record, attempts),
+        blocking_stage=_blocking_stage(record, attempts, now_utc),
         attempt_records=attempts,
         stations=_station_records(conn, site_id, local_date),
         publication=publication_record(conn, site_id=site_id, cutoff=local_date),
@@ -846,7 +848,14 @@ def _complete_stage(
     now_utc: datetime,
     detail: dict[str, object] | None = None,
 ) -> None:
-    """Step 4 for stages 2 to 5: save the completion, enqueue the next (8.2)."""
+    """Step 4 for stages 2 to 5: save the completion, enqueue the next (8.2).
+
+    ``now_utc`` is the stage's end: the caller reads the clock after the
+    stage's work, inside the completing write, so the stage-log row's
+    ``ended_at`` and ``duration_s`` and the attempt record's
+    ``last_progress_at`` include that work. The next stage is enqueued
+    after them.
+    """
     _write_stage_row(
         conn, job, stamps, now_utc=now_utc, outcome="completed", detail=detail
     )
@@ -1032,7 +1041,7 @@ async def _gap_fill_stage(
             ]
         }
         stamps = _job_stamps(conn, job.job_id, now)
-        _complete_stage(conn, job, stamps, now_utc=now, detail=detail)
+        _complete_stage(conn, job, stamps, now_utc=utc_now(), detail=detail)
 
     await writer.write(finish)
 
@@ -1052,16 +1061,25 @@ def _hourly_values_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> 
     if result.outcome == "refused":
         _fail_stage(conn, job, "hourly values refused by the closed-day guard", now)
         return
-    _complete_stage(conn, job, running.stamps, now_utc=now)
+    _complete_stage(conn, job, running.stamps, now_utc=utc_now())
 
 
 def _truth_version(conn: sqlite3.Connection, site_id: int, local_date: date) -> str:
     """SHA-256 of the day's ``daily_truth`` rows as JSON (plan 11.4).
 
-    One JSON array of the rows in ``quantity`` order, each an object of the
-    13 columns, with sorted keys and no spaces.
+    The rows as stage 4 wrote them: those of the site's published
+    generation, read through ``published_generation_id`` as
+    ``write_close_truth`` reads it, so another generation's rows of the
+    same date never enter the version. One JSON array of the rows in
+    ``quantity`` order, each an object of the 13 columns, with sorted keys
+    and no spaces.
     """
-    rows = conn.execute(_TRUTH_VERSION_SQL, (site_id, local_date.isoformat()))
+    generation_id = published_generation_id(conn, site_id)
+    if generation_id is None:
+        raise RuntimeError("the site has no published timezone generation")
+    rows = conn.execute(
+        _TRUTH_VERSION_SQL, (site_id, local_date.isoformat(), generation_id)
+    )
     payload = [dict(zip(_TRUTH_VERSION_FIELDS, row, strict=True)) for row in rows]
     blob = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode()).hexdigest()
@@ -1112,7 +1130,7 @@ def _truth_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
             job.attempt,
         ),
     )
-    _complete_stage(conn, job, running.stamps, now_utc=now)
+    _complete_stage(conn, job, running.stamps, now_utc=utc_now())
 
 
 def _score_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
@@ -1134,7 +1152,7 @@ def _score_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
         "scored": dict(summary.scored),
         "absent": dict(summary.absent),
     }
-    _complete_stage(conn, job, running.stamps, now_utc=now, detail=detail)
+    _complete_stage(conn, job, running.stamps, now_utc=utc_now(), detail=detail)
 
 
 # --- stage 6: the closure ----------------------------------------------------
@@ -1149,21 +1167,25 @@ def _closure(
     record of cutoff ``closed_through`` opened and stage 7 enqueued all
     commit together or not at all. True when the day was closed. With
     ``publish`` False (the offline close, 8.8) no publication record is
-    opened and no stage 7 is enqueued.
+    opened and no stage 7 is enqueued. ``finish_close`` runs at the write's
+    start time; the attempt's ``last_progress_at`` and ``ended_at``, the
+    stage-log row's ``ended_at`` and the publication record's ``opened_at``
+    take the clock read after it, before stage 7 is enqueued.
     """
     now = utc_now()
     running = _open_stage(conn, raw, job, now)
     if running is None:
         return False
     finish_close(conn, job.site_id, job.local_date, now_utc=now)
-    stamp = isoformat_utc_micro(now)
+    ended = utc_now()
+    stamp = isoformat_utc_micro(ended)
     conn.execute(
         "UPDATE close_attempts SET outcome = 'closed', last_stage = 6,"
         " last_progress_at = ?, ended_at = ?"
         " WHERE site_id = ? AND local_date = ? AND attempt = ?",
         (stamp, stamp, job.site_id, job.local_date.isoformat(), job.attempt),
     )
-    _write_stage_row(conn, job, running.stamps, now_utc=now, outcome="completed")
+    _write_stage_row(conn, job, running.stamps, now_utc=ended, outcome="completed")
     if not publish:
         return True
     cutoff = closed_through(conn, job.site_id)
@@ -1187,11 +1209,16 @@ async def _closure_stage(writer: FencedWriter, raw: Job, job: _StageJob) -> None
 # --- stages 7 and 8: the publication -----------------------------------------
 
 
-def _newer_open_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
-    """Whether a later cutoff of the site has an open record (plan 8.6)."""
+def _newer_publication(conn: sqlite3.Connection, job: _StageJob) -> bool:
+    """Whether a later cutoff of the site is open or published (plan 8.6).
+
+    Open is ``pending`` or ``building``. A ``published`` later cutoff
+    counts too, so an older cutoff's retry, or its repaired stage 7, never
+    publishes after a newer cutoff has.
+    """
     row = conn.execute(
         "SELECT 1 FROM close_publications WHERE site_id = ? AND cutoff > ?"
-        " AND state IN ('pending', 'building') LIMIT 1",
+        " AND state IN ('pending', 'building', 'published') LIMIT 1",
         (job.site_id, job.local_date.isoformat()),
     ).fetchone()
     return row is not None
@@ -1202,8 +1229,8 @@ def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bo
 
     False, with nothing written, when the job's record is not open (its
     cutoff, its attempt, ``pending`` or ``building``). An older cutoff with
-    a newer open record ends ``superseded``, with no call to P4. A job
-    claimed too late fails the publication as ``stalled`` (8.3).
+    a newer open or published record ends ``superseded``, with no call to
+    P4. A job claimed too late fails the publication as ``stalled`` (8.3).
     """
     now = utc_now()
     _require_close_on(conn, raw)
@@ -1216,7 +1243,7 @@ def _begin_publication(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bo
         return False
     stamps = _job_stamps(conn, job.job_id, now)
     stamp = isoformat_utc_micro(now)
-    if _newer_open_publication(conn, job):
+    if _newer_publication(conn, job):
         conn.execute(
             "UPDATE close_publications SET state = 'superseded', finished_at = ?"
             " WHERE site_id = ? AND cutoff = ?",
@@ -1558,7 +1585,7 @@ def fail_publication(
             "UPDATE close_publications SET state = 'retry_due', retry_at = ?,"
             " last_failure = ? WHERE site_id = ? AND cutoff = ?",
             (
-                isoformat_utc(now_utc + RETRY_DELAY),
+                isoformat_utc_micro(now_utc + RETRY_DELAY),
                 reason,
                 site_id,
                 cutoff.isoformat(),
@@ -1664,6 +1691,20 @@ def fail_day_publish_job(
 # --- raw retention -----------------------------------------------------------
 
 
+def _database_failing(exc: Exception) -> bool:
+    """Whether ``exc`` must fail the caller's write (plan 8.4, 8.5).
+
+    Every ``sqlite3.DatabaseError`` but ``sqlite3.IntegrityError``: the
+    database is locked or failing (``OperationalError``), or the file is
+    corrupt or not a database (a plain ``DatabaseError``). A constraint
+    refusal (``IntegrityError``) is rolled back with its savepoint like any
+    other exception. Shared by the three savepoint catches.
+    """
+    return isinstance(exc, sqlite3.DatabaseError) and not isinstance(
+        exc, sqlite3.IntegrityError
+    )
+
+
 def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     """Prune raw readings and trim the close's two logs (plan 8.4, 11.6).
 
@@ -1671,8 +1712,9 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     rows older than ``CLOSE_LOG_KEEP_DAYS``, inside ``SAVEPOINT
     close_retention`` in the caller's transaction, for every site. An
     exception is re-raised when the transaction is gone or it is a
-    ``sqlite3.OperationalError``; any other is rolled back to the savepoint
-    with one ERROR line naming its type, so the caller's writes commit.
+    database error (``_database_failing``); any other is rolled back to the
+    savepoint with one ERROR line naming its type, so the caller's writes
+    commit.
     """
     conn.execute("SAVEPOINT close_retention")
     try:
@@ -1681,7 +1723,7 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
         conn.execute("DELETE FROM close_stage_log WHERE ended_at < ?", (cutoff,))
         conn.execute("DELETE FROM close_try_log WHERE tried_at < ?", (cutoff,))
     except Exception as exc:
-        if not conn.in_transaction or isinstance(exc, sqlite3.OperationalError):
+        if not conn.in_transaction or _database_failing(exc):
             raise
         conn.execute("ROLLBACK TO close_retention")
         conn.execute("RELEASE close_retention")
@@ -1727,16 +1769,16 @@ def _in_site_savepoint[T](
     """Run one site's ``steps`` under ``SAVEPOINT close_site`` (plan 8.5).
 
     ``steps`` sets the step number as it goes. An exception is re-raised
-    when the transaction is gone or it is a ``sqlite3.OperationalError``;
-    any other is rolled back to the savepoint, logged by
-    ``_log_site_error`` and gives None, so the other sites go on.
+    when the transaction is gone or it is a database error
+    (``_database_failing``); any other is rolled back to the savepoint,
+    logged by ``_log_site_error`` and gives None, so the other sites go on.
     """
     step = _SiteStep()
     conn.execute("SAVEPOINT close_site")
     try:
         result = steps(step)
     except Exception as exc:
-        if not conn.in_transaction or isinstance(exc, sqlite3.OperationalError):
+        if not conn.in_transaction or _database_failing(exc):
             raise
         conn.execute("ROLLBACK TO close_site")
         conn.execute("RELEASE close_site")
@@ -1943,10 +1985,20 @@ def _close_due_days(
 
 
 def _has_live_job(conn: sqlite3.Connection, job_type: str, site_id: int) -> bool:
-    """Whether the site has a ``pending`` or ``running`` job of the type."""
+    """Whether the site has a ``pending`` or ``running`` keyed job of the type.
+
+    Every stage job has a key (8.1). The status and key terms repeat
+    ``idx_jobs_active_dedupe``'s partial-index predicate word for word, and
+    the site term uses that index's ``COALESCE(site_id, -1)`` expression,
+    so the read can probe the live jobs on that index rather than walk every
+    stored job of the type; it runs on each tick. The bound site id is
+    never NULL, so the COALESCE does not change the result.
+    """
+    # COALESCE(site_id, -1) matches idx_jobs_active_dedupe's key expression;
+    # a bare ``site_id = ?`` lets the planner pick idx_jobs_type_key_site.
     row = conn.execute(
-        "SELECT 1 FROM jobs WHERE type = ? AND site_id = ?"
-        " AND status IN ('pending', 'running') LIMIT 1",
+        "SELECT 1 FROM jobs WHERE type = ? AND COALESCE(site_id, -1) = ?"
+        " AND status IN ('pending','running') AND job_key IS NOT NULL LIMIT 1",
         (job_type, site_id),
     ).fetchone()
     return row is not None
@@ -2090,16 +2142,17 @@ def _in_settle_savepoint(
     """Run one day's or one record's settling under ``SAVEPOINT close_settle``.
 
     The catch of plan 8.5, as 5.5 copies it: an exception is re-raised when
-    the transaction is gone or it is a ``sqlite3.OperationalError``; any
-    other is rolled back to the savepoint with one ERROR line naming the
-    site, the date and the step, and the day or record is left as it was.
+    the transaction is gone or it is a database error
+    (``_database_failing``); any other is rolled back to the savepoint with
+    one ERROR line naming the site, the date and the step, and the day or
+    record is left as it was.
     """
     step = _SiteStep()
     conn.execute("SAVEPOINT close_settle")
     try:
         settle(step)
     except Exception as exc:
-        if not conn.in_transaction or isinstance(exc, sqlite3.OperationalError):
+        if not conn.in_transaction or _database_failing(exc):
             raise
         conn.execute("ROLLBACK TO close_settle")
         conn.execute("RELEASE close_settle")

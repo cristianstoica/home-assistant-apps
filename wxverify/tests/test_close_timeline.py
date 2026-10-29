@@ -58,6 +58,7 @@ from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.queue import claim_next_job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
 from wxverify.verification.coverage import local_day_bounds
+from wxverify.worker.close_p4 import ScoreSummary
 
 
 @pytest.fixture(autouse=True)
@@ -869,17 +870,32 @@ def test_tl8_reclaim_all_stale_leaves_close_kinds_next_attempt_at_alone(
 
         rows = await db.read(
             lambda c: c.execute(
-                "SELECT type, next_attempt_at FROM jobs WHERE type IN"
+                "SELECT type, status, next_attempt_at FROM jobs WHERE type IN"
                 " ('day_close', 'day_publish') ORDER BY type"
             ).fetchall()
         )
-        by_type = {row["type"]: row["next_attempt_at"] for row in rows}
-        assert by_type["day_close"] is None, (
+        by_type = {row["type"]: (row["status"], row["next_attempt_at"]) for row in rows}
+        # Paired positive: both rows must actually have been reclaimed
+        # (status 'running' -> 'pending') -- otherwise the next_attempt_at
+        # IS NULL checks below would also pass on a reclaim that never
+        # touched these rows at all, an ambient coincidence rather than a
+        # real check of _CHAIN_TYPES_SQL's own exclusion.
+        assert by_type["day_close"][0] == "pending", (
+            "reclaim_all_stale must still re-pend a stuck day_close job"
+            " (it is a stuck 'running' job like any other, just not a"
+            " chain type) -- otherwise the next_attempt_at IS NULL check"
+            " below would hold vacuously"
+        )
+        assert by_type["day_publish"][0] == "pending", (
+            "reclaim_all_stale must still re-pend a stuck day_publish job,"
+            " for the same reason"
+        )
+        assert by_type["day_close"][1] is None, (
             "M20 -> at this assertion: correct = None (day_close is not a"
             " chain type, db/queue.py:264), mutant M20 (day_close added to"
             " _CHAIN_TYPES_SQL) = the reclaim's 'now' stamp"
         )
-        assert by_type["day_publish"] is None, (
+        assert by_type["day_publish"][1] is None, (
             "M20b -> at this assertion: correct = None, mutant M20b"
             " (day_publish added to _CHAIN_TYPES_SQL) = the reclaim's"
             " 'now' stamp"
@@ -1153,6 +1169,64 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
             " the second loop) = S2 is also left ('open', 0), since the"
             f" whole tick's write rolls back together with S1's (tick"
             f" raised={raised})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F1
+# ---------------------------------------------------------------------------
+
+
+def test_f1_stage5_duration_is_read_after_score_day_not_before(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1: stage 5's ``close_stage_log.duration_s`` must be stamped from a
+    fresh clock read taken AFTER ``close_p4.score_day`` runs, not from the
+    stamp read before the stage's write began -- today's code reads
+    ``now`` once, before calling ``score_day``, so ``duration_s`` always
+    comes out 0 no matter how long the work actually took.
+
+    The ``score_day`` stand-in itself advances this test's own
+    ``MovingClock`` by 30 seconds before returning, standing in for stage
+    5's own work taking 30 seconds.
+
+    F1 -> at the duration_s assertion below: correct = 30.0 (the end
+    stamp is a fresh read taken after score_day's 30-second advance),
+    today's code (end stamp read before the work) = 0.0.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        standins = install_p4_standins(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+
+        def _score_and_advance_clock(*args, **kwargs):  # type: ignore[no-untyped-def]
+            clock.advance(timedelta(seconds=30))
+            return ScoreSummary(scored={}, absent={})
+
+        standins["score_day"].result = _score_and_advance_clock
+        standins["publish"].result = "pub-D"
+        standins["clean_worksheets"].result = 0
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock, stop_before=("day_close", 6))
+
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT duration_s FROM close_stage_log WHERE site_id = ?"
+                " AND local_date = ? AND stage = 5",
+                (site_id, D.isoformat()),
+            ).fetchone()
+        )
+        assert row is not None, "stage 5's own stage-log row was never written"
+        assert row["duration_s"] == 30.0, (
+            "F1 -> at this assertion: correct = 30.0 (the end stamp is a"
+            " fresh read taken after score_day's 30-second advance),"
+            " today's code (end stamp read before the work) = 0.0"
         )
 
     asyncio.run(_run())

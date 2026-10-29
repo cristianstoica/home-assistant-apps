@@ -766,12 +766,36 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_vd9_the_split_reproduces_todays_evaluation_exactly() -> None:
-    """VD9: ``_evaluate_day`` for a closed-off day before and after the
-    split -- identical ``DayEvaluation`` (6.1). Plan 16.2 names no mutant
-    for VD9 (its own catch is the refactor itself changing today's
-    evaluation); the comparison is against the CURRENT, pre-split
-    ``_evaluate_day`` on a full, five-quantity day.
+def test_vd9_the_split_matches_a_hand_computed_evaluation() -> None:
+    """VD9: ``evaluate_day_window`` on a full, five-quantity day, checked
+    against outcomes worked out BY HAND from the seed below -- not
+    against ``_evaluate_day``. Since the split landed, ``_evaluate_day``
+    is itself defined as a thin wrapper that calls ``evaluate_day_window``
+    and ``replace``s in ``generation_id`` (verification/truth.py:229-234),
+    so comparing the two would only compare the split against itself.
+
+    Seed: temperature ``10.0 + h``, wind ``5.0 + h``, precip ``0.1 * h``,
+    for every UTC hour ``h`` in 0..23 (the zone is UTC, so local hours
+    equal UTC hours, 24 expected slots, no DST); the site's rain
+    threshold is 0.2 mm, P1's own column DEFAULT (migrations.py:62),
+    never set explicitly by ``day_close_site``/``asof_make_site``.
+
+    Hand-worked expectations:
+    - temperature_high: 24 covered hours (>= 18, the minimum), the
+      afternoon window [12, 18) local fully covered, so eligible; the
+      day's maximum is at h=23, value 33.0.
+    - temperature_low: same 24 covered hours, the overnight window
+      [3, 9) local fully covered, so eligible; the day's minimum is at
+      h=0, value 10.0.
+    - wind_max: 24 >= 23 (expected_slots - 1), eligible; the maximum is
+      at h=23, value 28.0.
+    - precip_total: 24 >= 23, eligible; wet hours are those >= the 0.2 mm
+      threshold -- h=2 (0.2) through h=23 (2.3), 22 hours; dry hours are
+      h=0 (0.0) and h=1 (0.1), 2 hours. The value itself (the sum of
+      ``0.1 * h`` for h in 0..23) is computed the same way below rather
+      than hand-typed as a decimal, so a float-rounding difference can
+      never cause a false mismatch.
+    - precip_occurrence: at least one wet hour, so value 1.0, eligible.
     """
     from wxverify.verification.truth import evaluate_day_window  # noqa: PLC0415
 
@@ -783,20 +807,48 @@ def test_vd9_the_split_reproduces_todays_evaluation_exactly() -> None:
     _seed_hours(conn, site_id, "precip", range(24), lambda h: 0.1 * h)
     conn.commit()
 
-    gen_id = published_generation_id(conn, site_id)
-    assert gen_id is not None
-    old = _evaluate_day(
-        conn, site_id=site_id, local_date=D.isoformat(), tz_generation_id=gen_id
-    )
     new = evaluate_day_window(
         conn, site_id=site_id, local_date=D, timezone="UTC", bounds=bounds
     )
 
-    assert new.threshold == old.threshold, "the split must read the same threshold"
-    assert new.outcomes == old.outcomes, (
-        "the split's outcomes must be IDENTICAL to the pre-split"
-        " _evaluate_day's, quantity for quantity, field for field"
+    assert new.threshold == 0.2, (
+        "the site's rain_threshold_mm (migrations.py's DEFAULT)"
     )
+
+    high = new.outcomes["temperature_high"]
+    assert (high.value, high.eligible, high.exclusion_reason) == (33.0, True, None)
+    assert (high.covered_hours, high.expected_slots, high.peak_window_ok) == (
+        24,
+        24,
+        True,
+    )
+
+    low = new.outcomes["temperature_low"]
+    assert (low.value, low.eligible, low.exclusion_reason) == (10.0, True, None)
+    assert (low.covered_hours, low.expected_slots, low.peak_window_ok) == (
+        24,
+        24,
+        True,
+    )
+
+    wind = new.outcomes["wind_max"]
+    assert (wind.value, wind.eligible, wind.exclusion_reason) == (28.0, True, None)
+    assert (wind.covered_hours, wind.expected_slots) == (24, 24)
+
+    expected_precip_total = sum(0.1 * h for h in range(24))
+    total = new.outcomes["precip_total"]
+    assert total.value == pytest.approx(expected_precip_total)
+    assert (total.eligible, total.exclusion_reason) == (True, None)
+    assert (total.covered_hours, total.expected_slots) == (24, 24)
+    assert (total.wet_hours, total.dry_hours) == (22, 2)
+
+    occurrence = new.outcomes["precip_occurrence"]
+    assert (occurrence.value, occurrence.eligible, occurrence.exclusion_reason) == (
+        1.0,
+        True,
+        None,
+    )
+    assert (occurrence.wet_hours, occurrence.dry_hours) == (22, 2)
 
 
 # ---------------------------------------------------------------------------

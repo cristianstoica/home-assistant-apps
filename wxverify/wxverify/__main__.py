@@ -38,6 +38,7 @@ from wxverify.db.site_days import (
     DayStateError,
     daily_close_on,
     day_record,
+    day_station_ids,
     enter_zone_change,
     open_day_on_copy,
 )
@@ -700,25 +701,26 @@ def _day_has_raw_temperature(
 ) -> bool:
     """Whether a raw reading of the day has a temperature (plan 8.8).
 
-    A ``station_wind_records`` row of one of the site's stations, with
-    ``obs_at`` inside the day record's bounds (as stage 3 reads them) and
-    ``temp_c`` set.
+    A ``station_wind_records`` row of a station on the day's saved list
+    (``day_station_ids``, the stations stage 3 rebuilds), with ``obs_at``
+    inside the day record's bounds (as stage 3 reads them) and ``temp_c``
+    set. One primary-key range read per station, stopping at the first hit.
     """
     record = day_record(conn, site_id, local_date)
     if record is None:
         return False
-    row = conn.execute(
-        "SELECT 1 FROM station_wind_records AS r"
-        " JOIN stations AS s ON s.id = r.station_id"
-        " WHERE s.site_id = ? AND r.obs_at >= ? AND r.obs_at < ?"
-        " AND r.temp_c IS NOT NULL LIMIT 1",
-        (
-            site_id,
-            isoformat_utc(record.day_start_utc),
-            isoformat_utc(record.day_end_utc),
-        ),
-    ).fetchone()
-    return row is not None
+    start = isoformat_utc(record.day_start_utc)
+    end = isoformat_utc(record.day_end_utc)
+    for station_id in sorted(day_station_ids(conn, site_id, local_date)):
+        row = conn.execute(
+            "SELECT 1 FROM station_wind_records"
+            " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
+            " AND temp_c IS NOT NULL LIMIT 1",
+            (station_id, start, end),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
 
 
 def _print_offline_close(
@@ -730,7 +732,9 @@ def _print_offline_close(
     forecasts scored and absent (stage 5's detail) and each stage's
     duration from the stage log (11.1).
     """
-    status = close_status(conn, site_id=site_id, local_date=local_date)
+    status = close_status(
+        conn, site_id=site_id, local_date=local_date, now_utc=utc_now()
+    )
     if status is None:
         print(f"error site {site_id} has no record dated {local_date.isoformat()}")
         return 1
