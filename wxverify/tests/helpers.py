@@ -6,19 +6,33 @@ modules belong here. Anything used by a single file stays local to it.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import json
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
+from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo
 
+import httpx
+import pytest
+
+from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, parse_utc
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.connection import _READ_POOL_SIZE, Database  # noqa: SLF001
+from wxverify.db.connection import (  # noqa: SLF001
+    _READ_POOL_SIZE,
+    Database,
+    FencedWriter,
+    close_db,
+    init_db,
+)
 from wxverify.db.migrations import run_migrations
+from wxverify.db.queue import claim_next_job
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
@@ -27,6 +41,8 @@ from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
     OCCURRENCE_BASELINES,
 )
+from wxverify.worker.processor import run_claimed_job
+from wxverify.worker.scheduler import scheduler_tick
 
 
 def occurrence_baseline_set(
@@ -819,3 +835,552 @@ def check_day_close_records() -> None:
     finally:
         _day_close_conns.clear()
         _day_close_latest_clock = NOW
+
+
+# ---------------------------------------------------------------------------
+# P3 close-chain test helpers and fixtures (plan 2026-10-21-daily-close-
+# close-job.md §15.1). Shared by every file under tests/test_close_*.py that
+# exercises the night chain itself (test_close_timeline.py onward).
+#
+# None of P3's own names (close_chain.enqueue_due_close_work,
+# close_chain.settle_interrupted_closes, every close_p4 name) are imported
+# at this module's top level: they do not exist yet, and every test module
+# importing this file -- including the whole pre-close-chain suite -- must
+# keep collecting. Each helper below that needs one of them imports it
+# inside its own body instead.
+# ---------------------------------------------------------------------------
+
+
+def _job_stamp(when: datetime) -> str:
+    """``jobs.created_at``/``updated_at``'s own DEFAULT form, from a clock
+    instant: ``%Y-%m-%dT%H:%M:%S.mmmZ`` (milliseconds, 3 digits; plan
+    §15.1's "job stamps follow the clock"), matching SQLite's
+    ``strftime('%Y-%m-%dT%H:%M:%fZ','now')`` (``db/migrations.py:1564-1567``).
+    """
+    dt = when.astimezone(UTC)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+
+# Every module whose own code a close-chain test runs and that imports
+# ``utc_now`` BY NAME (plan §15.1). ``wxverify.core.timeutil`` itself is
+# included so every other reader of the real name sees the same clock.
+# P1's and P2's modules take ``now_utc`` as an explicit parameter instead
+# (confirmed: neither ``db/site_days.py`` nor ``worker/day_values.py``
+# imports ``utc_now``), so they are not listed; a test passes
+# ``clock.now()`` through their ``now_utc=`` parameter directly.
+_CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
+    "wxverify.core.timeutil",
+    "wxverify.worker.scheduler",
+    "wxverify.worker.processor",
+    "wxverify.worker.close_chain",
+)
+
+
+class MovingClock:
+    """One clock object for a close-chain test (plan §15.1's "a moving
+    clock"), plus the bookkeeping :func:`patch_close_clock` and
+    :func:`tick`/:func:`run_due_jobs` need for the job-stamp rule: every
+    ``jobs`` row a tick or a job run inserts (id above the highest id this
+    clock has already stamped) gets ``created_at``/``updated_at`` set to
+    the clock's current instant, in :func:`_job_stamp`'s form, instead of
+    SQLite's real-time DEFAULT.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self._now = start
+        self._high_water: int | None = None
+        note_day_clock(start)
+
+    def now(self) -> datetime:
+        return self._now
+
+    def set(self, when: datetime) -> datetime:
+        """Move the clock to ``when`` and raise
+        :func:`check_day_close_records`'s bound to match (every clock
+        move must, or a later ``ensure_site_days`` that catches up to it
+        fails that autouse check instead of a real assertion)."""
+        self._now = when
+        return note_day_clock(when)
+
+    def advance(self, delta: timedelta) -> datetime:
+        return self.set(self._now + delta)
+
+    def prime(self, conn: sqlite3.Connection) -> None:
+        """Fix the high-water mark at the jobs table's current max id, so
+        every row inserted from this point on is this clock's to stamp,
+        instead of keeping SQLite's real-time DEFAULT. Idempotent and
+        monotonic (a later call only raises the mark), so a test may
+        prime explicitly before seeding a job of its own -- so that seed
+        gets stamped on the next call too -- and :func:`tick` /
+        :func:`run_due_jobs` may still prime again, harmlessly, right
+        before their own insert.
+        """
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM jobs").fetchone()
+        floor = int(row[0])
+        if self._high_water is None or floor > self._high_water:
+            self._high_water = floor
+
+    def stamp_new_jobs(self, conn: sqlite3.Connection) -> None:
+        """Stamp every ``jobs`` row inserted since the high-water mark
+        (primed by :meth:`prime`, called by the caller BEFORE the insert
+        this stamps -- never here, which would raise the mark past the
+        very rows it is meant to catch) with ``created_at``/``updated_at``
+        = now, in :func:`_job_stamp`'s form, instead of SQLite's
+        real-time DEFAULT. Falls back to priming now only on a clock
+        that has never primed at all.
+        """
+        if self._high_water is None:
+            self.prime(conn)
+        stamp = _job_stamp(self._now)
+        conn.execute(
+            "UPDATE jobs SET created_at = ?, updated_at = ? WHERE id > ?",
+            (stamp, stamp, self._high_water),
+        )
+        row = conn.execute("SELECT MAX(id) FROM jobs").fetchone()
+        new_max = row[0]
+        if new_max is not None and int(new_max) > self._high_water:
+            self._high_water = int(new_max)
+
+
+def patch_close_clock(monkeypatch: pytest.MonkeyPatch, clock: MovingClock) -> None:
+    """Replace ``utc_now`` with ``clock.now`` in ``core.timeutil`` and every
+    module of :data:`_CLOSE_CLOCK_MODULES` that imports it by name, as
+    ``tests/test_claim_promotion.py:108``'s ``frozen_now`` does for one
+    module (plan §15.1). ``close_chain`` does not import ``utc_now`` by
+    name yet (it holds only ``record_collection_try`` today), so that one
+    patch is inert until piece 3/4 add the import -- ``raising=False``
+    tolerates that rather than failing every test that patches the clock.
+    """
+    for module in _CLOSE_CLOCK_MODULES:
+        monkeypatch.setattr(f"{module}.utc_now", clock.now, raising=False)
+
+
+class Stop(BaseException):
+    """Raised by a stand-in to simulate a stop mid-stage (plan §15.1): a
+    ``BaseException`` subclass, deliberately NOT an ``Exception``, so it
+    passes through every ``except Exception`` in the dispatch path the way
+    a real process kill would, instead of being caught and turned into a
+    failed attempt.
+    """
+
+
+async def tick(db: Database, clock: MovingClock, at: datetime | None = None) -> None:
+    """One ``scheduler_tick``, optionally moving ``clock`` to ``at`` first,
+    with the job-stamp rule applied to any row it inserted (plan §15.1).
+
+    Primes ``clock`` right BEFORE ``scheduler_tick``'s own insert, not
+    after: priming after would raise the high-water mark past the very
+    rows this tick is meant to stamp, and they would keep SQLite's
+    real-time DEFAULT instead.
+    """
+    if at is not None:
+        clock.set(at)
+    await db.write(clock.prime)
+    await db.write(scheduler_tick)
+    await db.write(clock.stamp_new_jobs)
+
+
+def _pending_stage_job_exists(
+    conn: sqlite3.Connection, job_type: str, stage: int
+) -> bool:
+    """Whether a ``pending`` job of ``job_type`` keyed to end in
+    ``:{stage}`` exists (every ``day_close``/``day_publish`` key ends in
+    its stage, plan §8.1) -- :func:`run_due_jobs`'s ``stop_before`` check.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM jobs WHERE type = ? AND status = 'pending'"
+        " AND job_key LIKE '%' || ? LIMIT 1",
+        (job_type, f":{stage}"),
+    ).fetchone()
+    return row is not None
+
+
+def _job_outcome(conn: sqlite3.Connection, job_id: int) -> str:
+    row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    assert row is not None, f"job {job_id} vanished"
+    return str(row[0])
+
+
+async def run_due_jobs(
+    db: Database,
+    clock: MovingClock,
+    *,
+    stop_before: tuple[str, int] | None = None,
+) -> list[tuple[str, str | None, str]]:
+    """Tick and claim until nothing is due at the clock's current time
+    (plan §15.1), each job run with ``claim_next_job``/``run_claimed_job``
+    as production does (the pattern of
+    ``tests/test_verification_day_pipeline.py:1020``). Returns each
+    claim's ``(type, job_key, outcome)`` in claim order, ``outcome`` being
+    the job row's ``status`` after it ran (``completed`` or ``failed``).
+
+    ``stop_before`` is a ``(job_type, stage)`` pair: after each tick and
+    its stamping, and before each claim, the helper returns without
+    claiming if a ``pending`` job of that type whose key ends in
+    ``:{stage}`` exists. That job and every other due job stay ``pending``,
+    stamped on the clock -- a test that then wants to run one job alone
+    claims it itself with ``claim_next_job``/``run_claimed_job``, with no
+    further tick.
+    """
+    claims: list[tuple[str, str | None, str]] = []
+    stop_type, stop_stage = stop_before if stop_before is not None else (None, None)
+
+    def _stage_pending(c: sqlite3.Connection) -> bool:
+        assert stop_type is not None and stop_stage is not None
+        return _pending_stage_job_exists(c, stop_type, stop_stage)
+
+    while True:
+        await tick(db, clock)
+        if stop_before is not None and await db.read(_stage_pending):
+            return claims
+        job = await db.write(claim_next_job)
+        if job is None:
+            return claims
+        await run_claimed_job(db, job, lane="main")
+        await db.write(clock.stamp_new_jobs)
+
+        def _read_outcome(c: sqlite3.Connection, job_id: int = job.id) -> str:
+            return _job_outcome(c, job_id)
+
+        outcome = await db.read(_read_outcome)
+        claims.append((job.type, job.job_key, outcome))
+
+
+class RoundStateStandIn:
+    """``close_p4.round_state`` stand-in (plan §14.1, stage 1 only; §15.1
+    "P4."). Answers per ``(site_id, round_date)``, programmed with
+    :meth:`set_answer`; :meth:`raise_for_site` makes every call for one
+    site raise instead (TL10's per-site fault), leaving other sites
+    unaffected. Every call is recorded in :attr:`calls`, in call order.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, date]] = []
+        self._answers: dict[tuple[int, date], tuple[bool, datetime]] = {}
+        self._site_raises: dict[int, BaseException | type[BaseException]] = {}
+
+    def set_answer(
+        self, site_id: int, round_date: date, *, settled: bool, bound_utc: datetime
+    ) -> None:
+        self._answers[(site_id, round_date)] = (settled, bound_utc)
+
+    def raise_for_site(
+        self, site_id: int, exc: BaseException | type[BaseException]
+    ) -> None:
+        self._site_raises[site_id] = exc
+
+    def __call__(
+        self, conn: sqlite3.Connection, *, site_id: int, round_date: date
+    ) -> object:
+        self.calls.append((site_id, round_date))
+        if site_id in self._site_raises:
+            raise self._site_raises[site_id]
+        settled, bound_utc = self._answers[(site_id, round_date)]
+        from wxverify.worker.close_p4 import RoundState  # P3 name, §14.1
+
+        return RoundState(settled=settled, bound_utc=bound_utc)
+
+
+def install_round_state_standin(monkeypatch: pytest.MonkeyPatch) -> RoundStateStandIn:
+    """Patch ``close_p4.round_state`` with a fresh :class:`RoundStateStandIn`
+    (plan §15.1 "P4."). ``close_p4.py`` does not exist until piece 3, so
+    this raises ``ModuleNotFoundError`` until then -- the right failure for
+    any TL test that calls it before that piece lands.
+    """
+    standin = RoundStateStandIn()
+    monkeypatch.setattr("wxverify.worker.close_p4.round_state", standin, raising=False)
+    return standin
+
+
+class RecordingStandIn:
+    """Generic recorder for a sync P4 call point (plan §14.1's
+    ``score_day``; §15.1 "P4."). Records every call's ``kwargs`` in
+    :attr:`calls`; returns :attr:`result` (calling it first if it is a
+    plain callable) or raises :attr:`raises` when the test sets one.
+    Deliberately ignorant of P4's own return types -- the test that
+    configures ``result`` builds those itself, from ``close_p4`` directly.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.result: object = None
+        self.raises: BaseException | type[BaseException] | None = None
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        result = self.result
+        if callable(result) and not isinstance(result, type):
+            return result(*args, **kwargs)
+        return result
+
+
+class AsyncRecordingStandIn(RecordingStandIn):
+    """:class:`RecordingStandIn` for an async P4 call point (``publish``,
+    ``clean_worksheets``, plan §14.1)."""
+
+    async def __call__(self, *args: object, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
+        result = self.result
+        if callable(result) and not isinstance(result, type):
+            return result(*args, **kwargs)
+        return result
+
+
+def install_p4_standins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, RecordingStandIn]:
+    """Patch ``close_p4``'s other three call points -- ``score_day``,
+    ``publish``, ``clean_worksheets`` -- with generic recorders (plan
+    §15.1 "P4."; stage 1's ``round_state`` has its own
+    :func:`install_round_state_standin`, since its answer is keyed by
+    round date and may need to fault one site only). Raises
+    ``ModuleNotFoundError`` until piece 3 adds ``close_p4.py``.
+    """
+    score_day = RecordingStandIn()
+    publish = AsyncRecordingStandIn()
+    clean_worksheets = AsyncRecordingStandIn()
+    monkeypatch.setattr("wxverify.worker.close_p4.score_day", score_day, raising=False)
+    monkeypatch.setattr("wxverify.worker.close_p4.publish", publish, raising=False)
+    monkeypatch.setattr(
+        "wxverify.worker.close_p4.clean_worksheets", clean_worksheets, raising=False
+    )
+    return {
+        "score_day": score_day,
+        "publish": publish,
+        "clean_worksheets": clean_worksheets,
+    }
+
+
+def clear_close_chain_log_map() -> None:
+    """Clear ``close_chain``'s per-``(site, step)`` last-ERROR-instant map
+    (plan §8.5's flood guard; §15.1 "The log map.") before the test, so no
+    test inherits another's. A plain function, not a fixture (the whole
+    suite must stay untouched by a P3 fixture) -- each P3 test file wires
+    this into its own autouse fixture to request it explicitly.
+    Tolerates the map (or the module attribute) not existing yet: that is
+    the expected state before piece 4 lands.
+    """
+    with contextlib.suppress(ModuleNotFoundError, AttributeError):
+        from wxverify.worker import close_chain
+
+        close_chain._LAST_SITE_STEP_ERROR.clear()  # type: ignore[attr-defined] # noqa: SLF001
+
+
+def patch_weathercom_transport(
+    monkeypatch: pytest.MonkeyPatch, handler: Callable[[httpx.Request], httpx.Response]
+) -> None:
+    """Patch the gap fill's HTTP client onto an ``httpx.MockTransport``
+    wrapping ``handler`` (plan §15.1 "The provider."; the pattern of
+    ``tests/test_gap_fill.py:394-397``, since ``_Fill.client()`` builds a
+    bare ``httpx.AsyncClient()``, ``worker/day_values.py:487-491``).
+    """
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        "wxverify.worker.day_values.httpx.AsyncClient",
+        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # noqa: ARG005
+    )
+
+
+def write_weathercom_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    key: str | None = "ci-placeholder",
+) -> Path:
+    """Write an ``options.json`` holding (``key`` given) or omitting
+    (``key=None``, AT16) a ``weathercom_key``, and point
+    ``config.options_path`` at it (plan §15.1 "The weather.com key."; the
+    pattern of ``tests/test_gap_fill.py:93-103``).
+    """
+    options_path = tmp_path / "options.json"
+    body: dict[str, object] = {} if key is None else {"weathercom_key": key}
+    options_path.write_text(json.dumps(body), encoding="utf-8")
+    monkeypatch.setattr(config, "options_path", str(options_path))
+    return options_path
+
+
+def disable_station_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No-op the gap fill's between-call pacing sleep (plan §15.1 "No
+    pacing sleep."; the real ``pace_station_call`` sleeps between a fill's
+    calls, ``worker/station_pacing.py:71-74``, imported by name at
+    ``worker/day_values.py:81``).
+    """
+
+    async def _no_pace(site_id: int, station_id: int, ordinal: int) -> None:
+        return None
+
+    monkeypatch.setattr("wxverify.worker.day_values.pace_station_call", _no_pace)
+
+
+_NON_CLOSE_ENQUEUERS: Final[tuple[str, ...]] = (
+    "_enqueue_due_feeds",
+    "_enqueue_due_obs",
+    "_enqueue_due_wind_days",
+    "_enqueue_due_forecast_records",
+    "_enqueue_due_verification_runs",
+    "_enqueue_due_score_refresh",
+)
+
+
+def disable_other_enqueuers(
+    monkeypatch: pytest.MonkeyPatch, *, keep: Sequence[str] = ()
+) -> None:
+    """No-op every one of ``scheduler_tick``'s non-close enqueuers except
+    those named in ``keep`` (plan §15.1 "Other job kinds."; DO1/DO2 keep
+    ``_enqueue_due_verification_runs``/``_enqueue_due_score_refresh``,
+    TL7 keeps ``_enqueue_due_forecast_records``). Without this, the first
+    tick of a standard night would also queue a ``fetch_feed`` job per
+    seeded open-meteo feed and a ``fetch_obs`` ``obs`` job for the site,
+    which ``run_due_jobs`` would then claim.
+    """
+    for name in _NON_CLOSE_ENQUEUERS:
+        if name in keep:
+            continue
+        monkeypatch.setattr(f"wxverify.worker.scheduler.{name}", lambda conn: None)
+
+
+def stub_fetch_feed(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Replace ``dispatch``'s real ``fetch_feed`` handler
+    (``worker/processor.py:720``) with a stub recording ``(site_id,
+    feed_id)`` and returning ``None`` (plan §15.1 "Other job kinds.",
+    TL8). Without this a seeded ``fetch_feed`` job would run through its
+    real handler and trip the autouse network guard.
+    """
+    calls: list[tuple[int, int]] = []
+
+    async def _stub(
+        db: Database, writer: FencedWriter, site_id: int, feed_id: int
+    ) -> None:
+        calls.append((site_id, feed_id))
+
+    monkeypatch.setattr("wxverify.worker.processor._fetch_feed", _stub)
+    return calls
+
+
+def stub_wind_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Replace ``dispatch``'s real wind-lane handler
+    (``worker/processor.py:700``) with a stub recording ``site_id`` and
+    returning ``None`` (plan §15.1 "Other job kinds.", TL3).
+    """
+    calls: list[int] = []
+
+    async def _stub(db: Database, writer: FencedWriter, site_id: int) -> None:
+        calls.append(site_id)
+
+    monkeypatch.setattr("wxverify.worker.processor.run_wind_days", _stub)
+    return calls
+
+
+def failed_scope_count(conn: sqlite3.Connection, *, now_utc: datetime) -> int:
+    """AT13/AT14/PB8/PB9's failed-scope count (plan §15.1 "The
+    failed-scope count."): the health check's failed arm alone
+    (``FAILED_SCOPES_SQL``, run with the same cutoff
+    ``_pipeline_conditions`` uses, ``monitor.py:720,723``), never
+    ``build_verdict``'s in-flight arm, which would also count a job a
+    tick left ``pending``, stamped on the test clock, as overdue at a read
+    hours or days later.
+    """
+    from wxverify.monitor import FAILED_JOB_AGE_HOURS, FAILED_SCOPES_SQL, _count
+
+    cutoff = isoformat_utc(now_utc - timedelta(hours=FAILED_JOB_AGE_HOURS))
+    return _count(conn, FAILED_SCOPES_SQL, (cutoff,))
+
+
+def _seed_five_minute_day(
+    conn: sqlite3.Connection, station_id: int, local_date: date
+) -> None:
+    """Every hour of ``local_date`` paired at minutes 0 and 5 with
+    ``five_minute`` readings (the full-day shape of
+    ``tests/test_gap_fill.py``'s ``_seed_full_day``): no gaps, nothing for
+    the gap fill to call.
+    """
+    for hour in range(24):
+        for minute, speed in ((0, 5.0), (5, 5.5)):
+            when = datetime(
+                local_date.year,
+                local_date.month,
+                local_date.day,
+                hour,
+                minute,
+                tzinfo=UTC,
+            )
+            conn.execute(
+                "INSERT INTO station_wind_records"
+                " (station_id, obs_at, source, local_date, speed_kmh, temp_c,"
+                "  precip_total_mm, fetched_at)"
+                " VALUES (?, ?, 'five_minute', ?, ?, 10.0, 0.0, ?)",
+                (
+                    station_id,
+                    isoformat_utc(when),
+                    local_date.isoformat(),
+                    speed,
+                    isoformat_utc(when),
+                ),
+            )
+
+
+#: R, the round date of :data:`D` (plan §4.1: "R = D + 1"), and the
+#: standard night's round bound, R 00:40Z (plan §15.1 "Standard night").
+STANDARD_NIGHT_R: Final = D + timedelta(days=1)
+STANDARD_NIGHT_ROUND_BOUND: Final = datetime(
+    STANDARD_NIGHT_R.year,
+    STANDARD_NIGHT_R.month,
+    STANDARD_NIGHT_R.day,
+    0,
+    40,
+    tzinfo=UTC,
+)
+
+
+def standard_night(
+    tmp_path: Path,
+) -> tuple[Database, FencedWriter, int, dict[str, int]]:
+    """Plan §15.1's standard night: site S in ``UTC``, day ``D`` ``open``,
+    ``D - 1`` ``closed``, ``R = D + 1``, ``worker_started_at`` ``D``
+    12:00Z (:data:`NOW`), stations A and B on ``D``'s list with full
+    5-minute readings on ``D`` (so the gap fill, once reached, finds
+    nothing to fill for either and never needs the weather.com key or a
+    transport). Returns ``(db, writer, site_id, {pws_id: station_id})``.
+
+    A fresh real SQLite file under ``tmp_path`` (``init_db``, real
+    migrations), closing any process-global ``Database`` first, exactly
+    as ``tests/test_gap_fill.py``'s own tmp-path harness does.
+    """
+    from wxverify.db.site_days import begin_close, finish_close
+
+    close_db()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    db_path = tmp_path / "wxverify.db"
+    config.db_path = str(db_path)
+    db = init_db(str(db_path))
+    conn = db._conn  # noqa: SLF001 -- tests build the fixture on the real writer conn
+
+    site_id = day_close_site(conn, timezone="UTC", close_on=True, with_records=True)
+    stations = {
+        str(row["pws_station_id"]): int(row["id"])
+        for row in conn.execute(
+            "SELECT id, pws_station_id FROM stations WHERE site_id = ? ORDER BY id",
+            (site_id,),
+        )
+    }
+
+    d_minus_1 = D - timedelta(days=1)
+    row = conn.execute(
+        "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, d_minus_1.isoformat()),
+    ).fetchone()
+    assert row is not None
+    t1 = parse_utc(row["day_end_utc"]) + timedelta(minutes=30)
+    begin_close(conn, site_id, d_minus_1, now_utc=note_day_clock(t1))
+    finish_close(conn, site_id, d_minus_1, now_utc=t1)
+
+    for station_id in stations.values():
+        _seed_five_minute_day(conn, station_id, D)
+
+    set_runtime_state(conn, "worker_started_at", isoformat_utc(NOW))
+    conn.commit()
+    return db, FencedWriter(db, db.generation), site_id, stations

@@ -1,25 +1,387 @@
-"""Landing dormant: DO5 only (plan 2026-10-21-daily-close-close-job.md
+"""Landing dormant: DO1 to DO5 (plan 2026-10-21-daily-close-close-job.md
 section 15.2). DO1-DO4 need ``enqueue_due_close_work`` and
-``settle_interrupted_closes``, which land with later pieces of this plan.
+``settle_interrupted_closes``, which land with later pieces of this plan,
+and are written before they exist.
 
-Written before ``wxverify/worker/close_chain.py`` exists and fails first for
-that reason: the inline import of ``record_collection_try`` below raises
-``ImportError``. Section 16.2 of the plan names the mutant this test ID
-must kill; that mapping is also given inline on the assertion, in the
-file's own style.
+DO1/DO2 drive ``scheduler_tick`` directly (a plain sync call on a real
+connection, as ``worker/scheduler.py:78`` is itself sync) and fail on a
+plain assertion that needs P3's ``daily_close_on`` branch in
+``scheduler_tick`` (4.2): that branch does not exist yet, so the old
+triggers keep firing even with the close on (DO2), which is exactly the
+assertion DO2 needs to go red on. DO3 claims and runs a stray ``day_close``/
+``day_publish`` job through the real queue and ``dispatch``
+(``worker/processor.py:601``); ``dispatch`` has no route for either kind
+yet, so each job dies on ``RuntimeError(f"unknown job type {job.type}")``
+(``:775``) instead of ending ``completed`` with one WARNING -- the right
+present-day failure, not a fixture bug. DO4 imports
+``enqueue_due_close_work``/``settle_interrupted_closes`` from
+``wxverify.worker.close_chain`` inline, which raises ``ImportError`` at
+once (that module holds only ``record_collection_try`` today). DO5 is
+unchanged from the prior batch.
+
+Section 16.2 of the plan names the mutant each test ID kills; that mapping
+is given inline on the assertion, in the file's own style.
 
 Real SQLite only (``tests.helpers.asof_conn``/``day_close_site``, real
-``run_migrations``). Station ids are synthetic (``ISTATION01``,
-``ISTATION02``), zone ``UTC``, and the date is the fixed synthetic
-``tests.helpers.D``.
+``run_migrations``; DO3 additionally uses a real ``Database``/
+``FencedWriter`` on a ``tmp_path`` file, since it must claim and run a job
+through the real queue). Station ids are synthetic (``ISTATION01``,
+``ISTATION02``), zone ``UTC``, and every date is the fixed synthetic
+``tests.helpers.D``. No live id, coordinate, site name or real zone name
+appears.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import asyncio
+from datetime import UTC, datetime, timedelta
 
-from tests.helpers import D, asof_conn, day_close_site
-from wxverify.core.timeutil import isoformat_utc_micro
+import pytest
+
+from tests.helpers import D, MovingClock, asof_conn, day_close_site, patch_close_clock
+from wxverify import config
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
+from wxverify.db.connection import close_db, init_db
+from wxverify.db.queue import claim_next_job
+from wxverify.verification.coverage import local_day_bounds
+from wxverify.worker.processor import run_claimed_job
+from wxverify.worker.scheduler import scheduler_tick
+
+_CLOSE_TABLES: tuple[str, ...] = (
+    "close_attempts",
+    "close_station_days",
+    "close_publications",
+    "close_stage_log",
+    "close_try_log",
+)
+
+
+def _close_table_counts(conn) -> dict[str, int]:  # type: ignore[no-untyped-def]
+    """Row counts of the five new tables (plan 12.3), for a before/after
+    "nothing written" oracle shared by DO3 and DO4."""
+    return {
+        table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
+        for table in _CLOSE_TABLES
+    }
+
+
+# ---------------------------------------------------------------------------
+# DO1
+# ---------------------------------------------------------------------------
+
+
+def test_do1_the_old_triggers_still_fire_with_the_close_off() -> None:
+    """DO1: close off, no records; ``scheduler_tick`` at D 04:59Z and
+    05:00Z. As today: one ``verification_run`` at 05:00Z and the score
+    backstop's ``pair_and_score`` when due; no ``day_close`` or
+    ``day_publish``; the five tables empty; no ``site_days`` row (13.1).
+
+    M3 -> at the "no close tables" assertion below: correct = every one of
+    the five tables stays at 0 rows and no ``day_close``/``day_publish``
+    job exists (``enqueue_due_close_work`` is never reached with the close
+    off), mutant M3 (``enqueue_due_close_work`` called with the close off)
+    = a non-zero count or a close-kind job, since the mutant's call would
+    run the chain's real work against this unclosed, unstarted day.
+    """
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=False, with_records=False)
+
+    t_459 = datetime(D.year, D.month, D.day, 4, 59, tzinfo=UTC)
+    t_500 = datetime(D.year, D.month, D.day, 5, 0, tzinfo=UTC)
+    stale_score_at = isoformat_utc_micro(t_459 - timedelta(hours=6, minutes=1))
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at,"
+        " created_at) VALUES ('pair_and_score', ?, 'score', '{}', 'completed', ?, ?)",
+        (site_id, stale_score_at, stale_score_at),
+    )
+    conn.commit()
+
+    clock = MovingClock(t_459)
+    with pytest.MonkeyPatch.context() as mp:
+        patch_close_clock(mp, clock)
+        scheduler_tick(conn)
+        vr_before = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE type = 'verification_run' AND site_id = ?",
+            (site_id,),
+        ).fetchone()[0]
+        assert vr_before == 0, (
+            "no verification_run job may exist a minute before the 05:00 trigger"
+        )
+
+        clock.set(t_500)
+        scheduler_tick(conn)
+
+    vr_after = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE type = 'verification_run' AND site_id = ?",
+        (site_id,),
+    ).fetchone()[0]
+    assert vr_after == 1, (
+        "the nightly verification_run job must still be enqueued at 05:00Z"
+        " with the close off, exactly as today (4.2)"
+    )
+    score_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE type = 'pair_and_score' AND site_id = ?"
+        " AND status = 'pending'",
+        (site_id,),
+    ).fetchone()[0]
+    assert score_jobs == 1, (
+        "the score backstop must still queue a refresh for the stale"
+        " pair_and_score job, exactly as today (4.2)"
+    )
+
+    close_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE type IN ('day_close', 'day_publish')"
+    ).fetchone()[0]
+    assert close_jobs == 0, (
+        "M3 -> at this assertion: correct = 0 day_close/day_publish jobs"
+        " (enqueue_due_close_work is never reached with the close off),"
+        " mutant M3 (enqueue_due_close_work called with the close off) ="
+        " at least one such job exists"
+    )
+    assert _close_table_counts(conn) == dict.fromkeys(_CLOSE_TABLES, 0), (
+        "M3 -> at this assertion: correct = every one of the five tables at"
+        " 0 rows, mutant M3 = a non-zero count, since the mutant's call"
+        " would run the chain's real work"
+    )
+    site_days_row = conn.execute(
+        "SELECT 1 FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchone()
+    assert site_days_row is None, (
+        "no site_days row may exist for D: with_records=False and the close"
+        " off, nothing creates one (13.1)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DO2
+# ---------------------------------------------------------------------------
+
+
+def test_do2_the_old_triggers_are_suppressed_with_the_close_on() -> None:
+    """DO2: close on; ticks at D 05:00Z and with the score backstop due.
+    No ``verification_run``, no ``pair_and_score`` from the backstop
+    (4.2).
+
+    M1 -> at the verification_run assertion below: correct = 0 (the close
+    on suppresses ``_enqueue_due_verification_runs``), mutant M1
+    (``scheduler_tick`` still calls ``_enqueue_due_verification_runs`` with
+    the close on) = 1, since at ``a4a919c`` ``scheduler_tick`` has no
+    ``daily_close_on`` branch yet and so calls it unconditionally -- the
+    present-day state this test must find wrong.
+
+    M2 -> at the pair_and_score assertion below: correct = 0 (the close on
+    suppresses ``_enqueue_due_score_refresh``), mutant M2 (``scheduler_tick``
+    still calls ``_enqueue_due_score_refresh`` with the close on) = 1, for
+    the same present-day reason.
+    """
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=True, with_records=False)
+
+    t_500 = datetime(D.year, D.month, D.day, 5, 0, tzinfo=UTC)
+    stale_score_at = isoformat_utc_micro(t_500 - timedelta(hours=6, minutes=1))
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at,"
+        " created_at) VALUES ('pair_and_score', ?, 'score', '{}', 'completed', ?, ?)",
+        (site_id, stale_score_at, stale_score_at),
+    )
+    conn.commit()
+
+    clock = MovingClock(t_500)
+    with pytest.MonkeyPatch.context() as mp:
+        patch_close_clock(mp, clock)
+        scheduler_tick(conn)
+
+    vr_count = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE type = 'verification_run' AND site_id = ?",
+        (site_id,),
+    ).fetchone()[0]
+    assert vr_count == 0, (
+        "M1 -> at this assertion: correct = 0 (the close on suppresses the"
+        " 05:00 trigger), mutant M1 (scheduler_tick still calls"
+        " _enqueue_due_verification_runs with the close on) = 1"
+    )
+    score_jobs = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE type = 'pair_and_score' AND site_id = ?"
+        " AND status = 'pending'",
+        (site_id,),
+    ).fetchone()[0]
+    assert score_jobs == 0, (
+        "M2 -> at this assertion: correct = 0 (the close on suppresses the"
+        " score backstop), mutant M2 (scheduler_tick still calls"
+        " _enqueue_due_score_refresh with the close on) = 1"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DO3
+# ---------------------------------------------------------------------------
+
+
+def test_do3_a_stray_close_job_is_cancelled_not_run(
+    tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """DO3: close off; a stray ``day_close`` and ``day_publish`` job
+    inserted and run. Each ends ``JobCancelled`` with one WARNING; every
+    table unchanged apart from the job rows (13.1).
+
+    M4 -> at the per-job outcome assertion below: correct = each job row
+    ``completed`` with ``result`` NULL (the ``JobCancelled`` contract) and
+    one WARNING logged, mutant M4 (a stage body without its predicate
+    check) = the body does real work instead of refusing. At ``a4a919c``
+    neither kind is routed by ``dispatch`` at all (``worker/processor.py``
+    has no ``day_close``/``day_publish`` branch), so each job actually
+    dies on ``RuntimeError('unknown job type ...')`` and ends ``failed``
+    with no WARNING -- the right present-day failure, not a fixture bug.
+    """
+
+    async def _run() -> None:
+        close_db()
+        tmp_path.mkdir(parents=True, exist_ok=True)
+        db_path = tmp_path / "wxverify.db"
+        config.db_path = str(db_path)
+        db = init_db(str(db_path))
+        conn = db._conn  # noqa: SLF001
+
+        site_id = day_close_site(conn, close_on=False, with_records=False)
+        conn.execute(
+            "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+            " max_retries) VALUES ('day_close', ?, ?, ?, 'pending', 0)",
+            (site_id, f"close:{site_id}:{D.isoformat()}:2", '{"attempt": 1}'),
+        )
+        conn.execute(
+            "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+            " max_retries) VALUES ('day_publish', ?, ?, ?, 'pending', 0)",
+            (
+                site_id,
+                f"publish:{site_id}:7",
+                '{"cutoff": "' + D.isoformat() + '", "attempt": 1}',
+            ),
+        )
+        conn.commit()
+
+        before = _close_table_counts(conn)
+        site_days_before = conn.execute(
+            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
+        ).fetchone()[0]
+
+        caplog.set_level("WARNING", logger="wxverify.worker.close_chain")
+        outcomes: list[tuple[str, str | None]] = []
+        for _ in range(2):
+            job = await db.write(claim_next_job)
+            assert job is not None, "both stray jobs must be claimable"
+            await run_claimed_job(db, job, lane="main")
+
+            def _row(c, job_id: int = job.id):  # type: ignore[no-untyped-def]
+                return c.execute(
+                    "SELECT status, result FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()
+
+            outcomes.append(tuple(await db.read(_row)))
+
+        for outcome in outcomes:
+            assert outcome == ("completed", None), (
+                "M4 -> at this assertion: correct = ('completed', None) per"
+                " job (the JobCancelled contract: the predicate is read and"
+                " refuses, writing nothing), mutant M4 (a stage body without"
+                " its predicate check) = the job does real work instead;"
+                f" present-day actual = {outcome!r} (an uncaught"
+                " RuntimeError, since dispatch has no route for either kind"
+                " yet)"
+            )
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 2, (
+            "one WARNING line per stray job (13.1): a stale/off-cutover job"
+            " must log exactly one, not zero and not an unhandled exception"
+        )
+
+        after = _close_table_counts(conn)
+        site_days_after = conn.execute(
+            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
+        ).fetchone()[0]
+        assert after == before and site_days_after == site_days_before, (
+            "every table besides jobs must be unchanged by the stray"
+            " close-kind jobs (13.1)"
+        )
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# DO4
+# ---------------------------------------------------------------------------
+
+
+def test_do4_direct_calls_write_nothing_with_the_close_off() -> None:
+    """DO4: close off; ``enqueue_due_close_work`` and
+    ``settle_interrupted_closes`` called directly, with a P1 record in
+    ``closing`` seeded. Nothing written (13.1).
+
+    M3 -> at the final snapshot assertion below: correct = no change at
+    all (both functions read the close-off predicate first and return),
+    mutant M3 (``enqueue_due_close_work`` called with the close off --
+    i.e. its own off-check removed) = the seeded ``closing`` day is
+    repaired/acted on.
+
+    M5 -> at the same assertion: correct = no change, mutant M5
+    (``settle_interrupted_closes`` without its predicate check) = the
+    seeded ``closing`` day is settled (moved to ``retry_due``/``missed``)
+    even though the close is off.
+
+    Imports ``enqueue_due_close_work``/``settle_interrupted_closes`` from
+    ``wxverify.worker.close_chain`` inline: at ``a4a919c`` that module
+    holds only ``record_collection_try``, so this raises ``ImportError``
+    at once -- the right present-day failure.
+    """
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=False, with_records=False)
+
+    bounds = local_day_bounds(D, "UTC")
+    now = datetime(D.year, D.month, D.day, 23, 0, tzinfo=UTC)
+    conn.execute(
+        "INSERT INTO site_days (site_id, local_date, state, day_start_utc,"
+        " day_end_utc, timezone, attempts, created_at, state_changed_at)"
+        " VALUES (?, ?, 'closing', ?, ?, 'UTC', 1, ?, ?)",
+        (
+            site_id,
+            D.isoformat(),
+            isoformat_utc(bounds.start_utc),
+            isoformat_utc(bounds.end_utc),
+            isoformat_utc(now),
+            isoformat_utc(now),
+        ),
+    )
+    conn.commit()
+
+    before_site_day = dict(
+        conn.execute(
+            "SELECT * FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, D.isoformat()),
+        ).fetchone()
+    )
+    before_tables = _close_table_counts(conn)
+
+    from wxverify.worker.close_chain import (  # noqa: PLC0415
+        enqueue_due_close_work,
+        settle_interrupted_closes,
+    )
+
+    enqueue_due_close_work(conn, now_utc=now)
+    settle_interrupted_closes(conn, now_utc=now)
+
+    after_site_day = dict(
+        conn.execute(
+            "SELECT * FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, D.isoformat()),
+        ).fetchone()
+    )
+    after_tables = _close_table_counts(conn)
+    assert after_site_day == before_site_day and after_tables == before_tables, (
+        "M3/M5 -> at this assertion: correct = no change at all (both"
+        " functions' own close-off predicate check returns at once),"
+        " mutant M3/M5 (either without its predicate check) = the seeded"
+        " closing day gets acted on (repaired or settled)"
+    )
 
 
 def test_do5_record_collection_try_writes_its_row_with_the_close_off() -> None:
