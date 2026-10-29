@@ -568,7 +568,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
 def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """PB4b (F2): ``_newer_open_publication`` (close_chain.py:1190) must
+    """PB4b (F2): ``_newer_publication`` (close_chain.py:1212) must
     also count a later cutoff's record that is already ``published``, not
     only ``pending``/``building`` -- today's code checks only
     ``state IN ('pending', 'building')``, so an older cutoff's own retry
@@ -579,7 +579,7 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
     attempt-2 transition (plan 8.5 step 5), so this test builds that
     transition directly (PB4's own build-the-precondition-directly rule,
     since the code under test here is stage 7's own
-    ``_newer_open_publication`` check, not the retry repair step), then
+    ``_newer_publication`` check, not the retry repair step), then
     seeds and runs C1's own retry job (attempt 2).
 
     F2 -> at the two assertions below: correct = 'superseded' and publish

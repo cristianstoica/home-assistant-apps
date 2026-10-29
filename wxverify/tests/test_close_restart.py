@@ -742,7 +742,7 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         assert publication["retry_at"] == isoformat_utc_micro(stop_at + RETRY_DELAY), (
             "M23b -> at this assertion: correct = the stop instant L"
             " (worker_last_loop_at, set to stop_at above) + RETRY_DELAY, in"
-            " isoformat_utc_micro form (close_chain.py:2276's own stamp),"
+            " isoformat_utc_micro form (close_chain.py:2280-2284's own stamp),"
             " mutant M23b (retry_at computed one minute short of L +"
             " RETRY_DELAY) = a retry_at one minute earlier"
         )

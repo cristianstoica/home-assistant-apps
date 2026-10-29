@@ -694,7 +694,7 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
     ``__main__.py:799`` ever starts), mutant M84 (``close-day --hours
     raw`` refuses only when the day has NO raw reading at all, of any
     quantity) = stage 3 and stage 4 both run and commit (each stage
-    commits in its own write, ``__main__.py:797``) before stage 5 raises
+    commits in its own write, ``__main__.py:801``) before stage 5 raises
     "error stage 5 failed: score_day is bound by the daily close's P4".
     The observations-equality check later in this test is a guard, not a
     kill: it asserts the refusal changes no observation data, but under

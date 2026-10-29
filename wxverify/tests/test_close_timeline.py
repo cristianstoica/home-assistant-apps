@@ -30,6 +30,8 @@ name appears.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -58,7 +60,9 @@ from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.queue import claim_next_job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
 from wxverify.verification.coverage import local_day_bounds
+from wxverify.verification.truth import write_close_truth
 from wxverify.worker.close_p4 import ScoreSummary
+from wxverify.worker.day_values import write_hourly_values
 
 
 @pytest.fixture(autouse=True)
@@ -1171,6 +1175,120 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
             f" raised={raised})"
         )
 
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# L5
+# ---------------------------------------------------------------------------
+
+
+def test_l5_a_database_error_from_enqueue_due_close_work_raises(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L5: a ``sqlite3.DatabaseError`` raised from inside one site's step
+    of ``enqueue_due_close_work`` (here, S1's ``round_state`` call, step 3
+    of the first loop, 8.5) is NOT a fault the per-site savepoint
+    swallows -- ``_database_failing`` excludes every ``DatabaseError`` but
+    ``IntegrityError`` from the per-site catch (``close_chain.py`` around
+    :1694), so it must re-raise out of ``_in_site_savepoint`` and out of
+    the tick itself.
+
+    L5 -> at the ``pytest.raises`` below: correct = raises, old rule
+    (OperationalError only) = swallowed per site. A bare
+    ``sqlite3.DatabaseError`` is neither ``OperationalError`` nor
+    ``IntegrityError``, so an old, narrower rule that special-cased only
+    ``OperationalError`` would swallow it here instead of letting it
+    propagate.
+    """
+
+    async def _run() -> None:
+        db, _writer, site1, _st1 = standard_night(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        site2 = day_close_site(
+            conn,
+            timezone="UTC",
+            close_on=True,
+            with_records=True,
+            station_ids=("ISTATION03", "ISTATION04"),
+        )
+        _close_earlier_day(conn, site2, D - timedelta(days=1))
+        conn.commit()
+
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site2, R, settled=True, bound_utc=BOUND)
+        round_state.raise_for_site(
+            site1, sqlite3.DatabaseError("database disk image is malformed")
+        )
+
+        with pytest.raises(sqlite3.DatabaseError):
+            await tick(db, clock, BOUND)
+
+    asyncio.run(_run())
+
+
+def test_l5_b_integrity_error_is_contained_per_site(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L5: a ``sqlite3.IntegrityError`` from the same call point is the
+    one ``DatabaseError`` subtype ``_database_failing`` still treats as an
+    ordinary per-site fault (a constraint refusal, not a corrupt or
+    failing database) -- rolled back to S1's own savepoint, logged, and
+    contained: S2's attempt still begins at the same tick.
+
+    L5 -> at the per-site-isolation assertion below: correct = contained
+    (S2's attempt begins despite S1's IntegrityError), a rule that
+    re-raises every DatabaseError including IntegrityError = S2 is also
+    left ('open', 0), since the whole tick's write fails and rolls back
+    together with S1's.
+    """
+
+    async def _run() -> None:
+        db, _writer, site1, _st1 = standard_night(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        site2 = day_close_site(
+            conn,
+            timezone="UTC",
+            close_on=True,
+            with_records=True,
+            station_ids=("ISTATION03", "ISTATION04"),
+        )
+        _close_earlier_day(conn, site2, D - timedelta(days=1))
+        conn.commit()
+
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site2, R, settled=True, bound_utc=BOUND)
+        round_state.raise_for_site(
+            site1, sqlite3.IntegrityError("UNIQUE constraint failed: synthetic")
+        )
+
+        before_s1 = await _state(db, site1)
+
+        await tick(db, clock, BOUND)
+
+        record2 = await _state(db, site2)
+        assert (record2.state, record2.attempts) == ("closing", 1), (
+            "L5 -> at this assertion: correct = contained (S2's attempt"
+            " begins despite S1's IntegrityError, rolled back to S1's own"
+            " savepoint), a rule that re-raises IntegrityError too = S2 is"
+            " also left ('open', 0), since the whole tick's write fails"
+            " and rolls back together with S1's"
+        )
+
+        after_s1 = await _state(db, site1)
+        assert (after_s1.state, after_s1.attempts) == (
+            before_s1.state,
+            before_s1.attempts,
+        ), "S1's own day record must be unchanged by its own fault"
+
+    asyncio.run(_run())
+
 
 # ---------------------------------------------------------------------------
 # F1
@@ -1227,6 +1345,178 @@ def test_f1_stage5_duration_is_read_after_score_day_not_before(
             "F1 -> at this assertion: correct = 30.0 (the end stamp is a"
             " fresh read taken after score_day's 30-second advance),"
             " today's code (end stamp read before the work) = 0.0"
+        )
+
+    asyncio.run(_run())
+
+
+def _advance_clock_after(
+    real: Callable[..., object], clock: MovingClock
+) -> Callable[..., object]:
+    """F1's siblings for stages 3, 4 and 6: wrap ``real`` (the stage's own
+    production call, looked up through ``close_chain`` by name) so it runs
+    FIRST, unchanged, and only then moves ``clock`` on 30 seconds -- the
+    same shape as F1's own ``score_day`` stand-in above, except the real
+    function runs for real instead of being replaced outright."""
+
+    def _wrapped(*args: object, **kwargs: object) -> object:
+        result = real(*args, **kwargs)
+        clock.advance(timedelta(seconds=30))
+        return result
+
+    return _wrapped
+
+
+def test_f1_stage3_duration_is_read_after_write_hourly_values_not_before(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 (stage 3): the same bug, pinned at stage 3's own work,
+    ``close_chain.write_hourly_values`` (``close_chain.py`` around :1058,
+    looked up through the ``close_chain`` module at call time since it is
+    imported there by name, ``close_chain.py:68-72``) -- ``duration_s``
+    must be a fresh clock read taken AFTER it runs, not the stamp read
+    before stage 3's write began.
+
+    F1 -> at the duration_s assertion below: correct = 30.0, end stamp
+    read before the work = 0.0.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+        monkeypatch.setattr(
+            "wxverify.worker.close_chain.write_hourly_values",
+            _advance_clock_after(write_hourly_values, clock),
+        )
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock, stop_before=("day_close", 4))
+
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT duration_s FROM close_stage_log WHERE site_id = ?"
+                " AND local_date = ? AND stage = 3",
+                (site_id, D.isoformat()),
+            ).fetchone()
+        )
+        assert row is not None, "stage 3's own stage-log row was never written"
+        assert row["duration_s"] == 30.0, (
+            "F1 -> at this assertion: correct = 30.0, end stamp read"
+            " before the work = 0.0"
+        )
+
+    asyncio.run(_run())
+
+
+def test_f1_stage4_duration_is_read_after_write_close_truth_not_before(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 (stage 4): the same bug, pinned at stage 4's own work,
+    ``close_chain.write_close_truth`` (``close_chain.py`` around :1116,
+    looked up through the ``close_chain`` module at call time since it is
+    imported there by name, ``close_chain.py:65``) -- ``duration_s`` must
+    be a fresh clock read taken AFTER it runs, not the stamp read before
+    stage 4's write began.
+
+    F1 -> at the duration_s assertion below: correct = 30.0, end stamp
+    read before the work = 0.0.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+        monkeypatch.setattr(
+            "wxverify.worker.close_chain.write_close_truth",
+            _advance_clock_after(write_close_truth, clock),
+        )
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock, stop_before=("day_close", 5))
+
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT duration_s FROM close_stage_log WHERE site_id = ?"
+                " AND local_date = ? AND stage = 4",
+                (site_id, D.isoformat()),
+            ).fetchone()
+        )
+        assert row is not None, "stage 4's own stage-log row was never written"
+        assert row["duration_s"] == 30.0, (
+            "F1 -> at this assertion: correct = 30.0, end stamp read"
+            " before the work = 0.0"
+        )
+
+    asyncio.run(_run())
+
+
+def test_f1_stage6_duration_is_read_after_finish_close_not_before(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 (stage 6): the same bug, pinned at stage 6's own work,
+    ``close_chain.finish_close`` (``close_chain.py`` around :1179, looked
+    up through the ``close_chain`` module at call time since it is
+    imported there by name, ``close_chain.py:47-61``) -- ``duration_s``
+    must be a fresh clock read taken AFTER it runs, not the stamp read
+    before stage 6's write began. Stage 6 also opens the publication
+    record at that same fresh read (``close_chain.py:1179-1197``), so its
+    ``opened_at`` must equal stage 6's own stage-log ``ended_at``.
+
+    F1 -> at the duration_s assertion below: correct = 30.0, end stamp
+    read before the work = 0.0.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        standins = install_p4_standins(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+        standins["score_day"].result = ScoreSummary(scored={}, absent={})
+        standins["publish"].result = "pub-D"
+        standins["clean_worksheets"].result = 0
+        monkeypatch.setattr(
+            "wxverify.worker.close_chain.finish_close",
+            _advance_clock_after(finish_close, clock),
+        )
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock, stop_before=("day_publish", 7))
+
+        row = await db.read(
+            lambda c: c.execute(
+                "SELECT duration_s, ended_at FROM close_stage_log"
+                " WHERE site_id = ? AND local_date = ? AND stage = 6",
+                (site_id, D.isoformat()),
+            ).fetchone()
+        )
+        assert row is not None, "stage 6's own stage-log row was never written"
+        assert row["duration_s"] == 30.0, (
+            "F1 -> at this assertion: correct = 30.0, end stamp read"
+            " before the work = 0.0"
+        )
+
+        publication = await db.read(
+            lambda c: c.execute(
+                "SELECT opened_at FROM close_publications"
+                " WHERE site_id = ? AND cutoff = ?",
+                (site_id, D.isoformat()),
+            ).fetchone()
+        )
+        assert publication is not None, "stage 6's publication record was never opened"
+        assert publication["opened_at"] == row["ended_at"], (
+            "the publication record's opened_at must equal stage 6's own"
+            " stage-log ended_at -- both are the same post-finish_close"
+            " clock read (close_chain.py:1179-1197)"
         )
 
     asyncio.run(_run())

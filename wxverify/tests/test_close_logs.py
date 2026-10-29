@@ -843,6 +843,97 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
 
 
 # ---------------------------------------------------------------------------
+# L2
+# ---------------------------------------------------------------------------
+
+
+def test_l2_another_generations_daily_truth_row_never_changes_the_version(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """L2: the standard night through stage 4 only, so D's ``daily_truth``
+    rows and ``close_attempts.truth_version`` exist under the site's one
+    published ``timezone_generations`` row. A second, unpublished
+    generation is then inserted for the same site, and one ``daily_truth``
+    row of D is inserted under it (same site, same date, a DIFFERENT
+    ``tz_generation_id`` -- the UNIQUE constraint on ``(site_id, quantity,
+    local_date, tz_generation_id)`` allows it alongside the published
+    generation's five rows). ``close_chain._truth_version`` is then called
+    again directly: ``_TRUTH_VERSION_SQL`` filters by
+    ``tz_generation_id = published_generation_id(...)`` (``close_chain.py``
+    around :1067-1085), so the extra row of the OTHER generation must never
+    enter the hash.
+
+    L2 -> at the version-unchanged assertion below: correct = unchanged,
+    unfiltered hash = changed. The fixture's new row carries a
+    ``temperature_high`` ``value`` of 999.0 that exists nowhere in the
+    published generation's rows, so an unfiltered hash (every row of the
+    date regardless of generation) is forced to differ from the one this
+    test computed before the insert.
+    """
+    from wxverify.worker import close_chain  # noqa: PLC0415
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock, stop_before=("day_close", 5))
+
+        conn = db._conn  # noqa: SLF001
+        before_row = conn.execute(
+            "SELECT truth_version FROM close_attempts"
+            " WHERE site_id = ? AND local_date = ? AND attempt = 1",
+            (site_id, D.isoformat()),
+        ).fetchone()
+        assert before_row is not None, "stage 4 must have saved a truth_version"
+        version_before = str(before_row["truth_version"])
+        assert version_before == close_chain._truth_version(  # noqa: SLF001
+            conn, site_id, D
+        ), "the saved truth_version must match a fresh computation before the insert"
+
+        other_generation = conn.execute(
+            "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
+            " VALUES (?, 'UTC', 'retrospective_correction', 'retired')",
+            (site_id,),
+        ).lastrowid
+        assert other_generation is not None
+        day_row = conn.execute(
+            "SELECT day_start_utc, day_end_utc, timezone FROM site_days"
+            " WHERE site_id = ? AND local_date = ?",
+            (site_id, D.isoformat()),
+        ).fetchone()
+        assert day_row is not None
+        conn.execute(
+            "INSERT INTO daily_truth (site_id, local_date, quantity, value,"
+            " eligible, exclusion_reason, covered_hours, expected_slots,"
+            " peak_window_ok, wet_hours, dry_hours, rain_threshold_mm,"
+            " day_start_utc, day_end_utc, timezone, tz_generation_id)"
+            " VALUES (?, ?, 'temperature_high', 999.0, 1, NULL, 24, 24,"
+            " NULL, NULL, NULL, NULL, ?, ?, ?, ?)",
+            (
+                site_id,
+                D.isoformat(),
+                day_row["day_start_utc"],
+                day_row["day_end_utc"],
+                day_row["timezone"],
+                other_generation,
+            ),
+        )
+        conn.commit()
+
+        version_after = close_chain._truth_version(conn, site_id, D)  # noqa: SLF001
+        assert version_after == version_before, (
+            "L2 -> at this assertion: correct = unchanged, unfiltered hash = changed"
+        )
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
 # LG5
 # ---------------------------------------------------------------------------
 
