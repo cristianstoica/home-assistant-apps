@@ -61,6 +61,7 @@ from tests.helpers import (
     disable_other_enqueuers,
     install_p4_standins,
     install_round_state_standin,
+    note_day_clock,
     patch_close_clock,
     run_due_jobs,
     standard_night,
@@ -72,6 +73,7 @@ from wxverify.db.site_days import (
     day_record,
     fail_close,
     finish_close,
+    mark_missed,
 )
 from wxverify.db.tz_generations import published_generation_id
 from wxverify.verification.coverage import local_day_bounds
@@ -563,11 +565,12 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
     ``write_close_truth``'s own state check: P1's guard alone takes
     ``TRUTH`` for an ``open`` day (``db/site_days.py:126-129``).
 
-    M49 -> at the ``open``-case assertion below: correct = ``DayStateError``
-    raised, no row, mutant M49 (``write_close_truth`` without its guard
-    call) = a row written anyway.
+    M49 (``write_close_truth`` without its guard call) is equivalent here:
+    ``write_close_truth`` checks for ``closing`` first, and P1's guard
+    always allows ``TRUTH`` for a ``closing`` day (``db/site_days.py:126-139``),
+    so removing the guard call changes nothing any test can see.
 
-    M49b -> at the SAME ``open``-case assertion: correct = ``DayStateError``
+    M49b -> at the ``open``-case assertion below: correct = ``DayStateError``
     raised (``write_close_truth``'s OWN state check refuses an ``open``
     day, since P1's guard alone would accept it), mutant M49b
     (``write_close_truth`` without its ``closing`` state check) = no
@@ -580,6 +583,13 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
     )
 
     bounds = _bounds()
+    # D's own day_end_utc (UTC zone, midnight-to-midnight): the earliest
+    # instant begin_close/mark_missed will accept for D, and well after
+    # D-1's end too, so one clock covers every state move below.
+    after_d_end = note_day_clock(
+        datetime(D.year, D.month, D.day, tzinfo=UTC) + timedelta(days=1)
+    )
+    d_minus_1 = D - timedelta(days=1)
 
     def _truth_count(conn, site_id: int) -> int:  # type: ignore[no-untyped-def]
         return conn.execute(
@@ -594,11 +604,16 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
 
     # Each case gets its OWN connection/site (pws_station_id is globally
     # UNIQUE, and the project's synthetic ids stay within ISTATION01-06),
-    # not four sites sharing one conn.
+    # not four sites sharing one conn. ``with_records=True`` gives every
+    # site a real ``site_days`` row for D (``day_close_site`` fills records
+    # through D via its own ``ensure_site_days(..., now_utc=NOW)`` call),
+    # so D starts ``open`` in every case below instead of having no record
+    # at all.
 
-    # open
+    # open -- no state move: D is left exactly as day_close_site makes it,
+    # open, past its own end (after_d_end).
     conn_open = asof_conn()
-    site_open = day_close_site(conn_open, close_on=True, with_records=False)
+    site_open = day_close_site(conn_open, close_on=True, with_records=True)
     _seed_hours(conn_open, site_open, "temperature", range(24), lambda h: 10.0 + h)
     conn_open.commit()
     with pytest.raises(DayStateError):
@@ -607,61 +622,94 @@ def test_vd8_write_close_truth_only_accepts_a_closing_day() -> None:
             _build_eval(conn_open, site_open),
             site_id=site_open,
             admission_basis="complete",
-            now_utc=NOW,
+            now_utc=after_d_end,
         )
     assert _truth_count(conn_open, site_open) == 0, (
-        "M49/M49b -> at this assertion: correct = 0 rows (refused on an"
-        " open day), mutant M49/M49b (either guard dropped) = a row written"
+        "M49b -> at this assertion: correct = 0 (write_close_truth's"
+        " OWN closing-state check refuses an open day before the guard is"
+        " even asked), mutant M49b (write_close_truth without its closing"
+        " state check) = 5 (P1's guard alone takes TRUTH for an open day"
+        " too, so the write proceeds and five rows land)"
     )
 
     # retry_due
     conn_retry = asof_conn()
-    site_retry = day_close_site(conn_retry, close_on=True, with_records=False)
+    site_retry = day_close_site(conn_retry, close_on=True, with_records=True)
     _seed_hours(conn_retry, site_retry, "temperature", range(24), lambda h: 10.0 + h)
     conn_retry.commit()
-    begin_close(conn_retry, site_retry, D, now_utc=NOW)
-    fail_close(conn_retry, site_retry, D, now_utc=NOW, reason="network")
+    mark_missed(
+        conn_retry, site_retry, d_minus_1, now_utc=after_d_end, reason="never_attempted"
+    )
+    begin_close(conn_retry, site_retry, D, now_utc=after_d_end)
+    fail_close(conn_retry, site_retry, D, now_utc=after_d_end, reason="network")
     with pytest.raises(DayStateError):
         write_close_truth(
             conn_retry,
             _build_eval(conn_retry, site_retry),
             site_id=site_retry,
             admission_basis="complete",
-            now_utc=NOW,
+            now_utc=after_d_end,
         )
     assert _truth_count(conn_retry, site_retry) == 0
 
-    # closed
+    # closed -- reached via finish_close, which itself needs D's
+    # daily_truth rows written first while D is still closing; that write
+    # is a precondition from an earlier step, done with write_close_truth
+    # itself (allowed, since D is closing at that point).
     conn_closed = asof_conn()
-    site_closed = day_close_site(conn_closed, close_on=True, with_records=False)
+    site_closed = day_close_site(conn_closed, close_on=True, with_records=True)
     _seed_hours(conn_closed, site_closed, "temperature", range(24), lambda h: 10.0 + h)
     conn_closed.commit()
-    begin_close(conn_closed, site_closed, D, now_utc=NOW)
-    finish_close(conn_closed, site_closed, D, now_utc=NOW)
+    mark_missed(
+        conn_closed,
+        site_closed,
+        d_minus_1,
+        now_utc=after_d_end,
+        reason="never_attempted",
+    )
+    begin_close(conn_closed, site_closed, D, now_utc=after_d_end)
+    write_close_truth(
+        conn_closed,
+        _build_eval(conn_closed, site_closed),
+        site_id=site_closed,
+        admission_basis="complete",
+        now_utc=after_d_end,
+    )
+    finish_close(conn_closed, site_closed, D, now_utc=after_d_end)
     with pytest.raises(DayStateError):
         write_close_truth(
             conn_closed,
             _build_eval(conn_closed, site_closed),
             site_id=site_closed,
             admission_basis="complete",
-            now_utc=NOW,
+            now_utc=after_d_end,
         )
-    assert _truth_count(conn_closed, site_closed) == 0
+    assert _truth_count(conn_closed, site_closed) == 5, (
+        "a closed day must refuse the second write and leave the five rows"
+        " from the first (closing-day) write_close_truth call unchanged"
+    )
 
     # closing -- allowed
     conn_closing = asof_conn()
-    site_closing = day_close_site(conn_closing, close_on=True, with_records=False)
+    site_closing = day_close_site(conn_closing, close_on=True, with_records=True)
     _seed_hours(
         conn_closing, site_closing, "temperature", range(24), lambda h: 10.0 + h
     )
     conn_closing.commit()
-    begin_close(conn_closing, site_closing, D, now_utc=NOW)
+    mark_missed(
+        conn_closing,
+        site_closing,
+        d_minus_1,
+        now_utc=after_d_end,
+        reason="never_attempted",
+    )
+    begin_close(conn_closing, site_closing, D, now_utc=after_d_end)
     write_close_truth(
         conn_closing,
         _build_eval(conn_closing, site_closing),
         site_id=site_closing,
         admission_basis="complete",
-        now_utc=NOW,
+        now_utc=after_d_end,
     )
     assert _truth_count(conn_closing, site_closing) == 5, (
         "a closing day must accept the write: one row per quantity (6.1)"

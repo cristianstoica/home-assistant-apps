@@ -30,6 +30,11 @@ writing through :func:`materialize_daily_truth`: admission rules on whether
 a day's content has finished ARRIVING, and re-asking that of a rewrite
 would strand a ``stale = 1`` row that nothing would ever rebuild.
 
+With the daily close on, a day's rows are written by the close's stage 4
+instead, through :func:`write_close_truth`: only for a ``closing`` day,
+from :func:`evaluate_day_window` over the day record's zone and bounds,
+under the basis of ``completeness.close_admission_basis``.
+
 Reads are generation-bound through the shared
 ``published_generation_clause`` accessor — a partially built correction
 generation is never read.
@@ -39,7 +44,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -47,10 +52,16 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import StaleGenerationError
 from wxverify.db.day_guard_log import warn_refused_dates
-from wxverify.db.site_days import WriteKind, check_date_write
+from wxverify.db.site_days import (
+    DayStateError,
+    WriteKind,
+    check_date_write,
+    day_record,
+)
 from wxverify.db.tz_generations import (
     ensure_published_generation,
     published_generation_clause,
+    published_generation_id,
 )
 from wxverify.verification.completeness import AdmissionDecision, decide_admission
 from wxverify.verification.coverage import (
@@ -79,62 +90,62 @@ def _generation_timezone(conn: sqlite3.Connection, generation_id: int) -> str:
 
 
 @dataclass(frozen=True)
-class _DayEvaluation:
-    """One (site, local day, generation)'s evaluated truth, before any write.
+class DayEvaluation:
+    """One (site, local day)'s evaluated truth, before any write.
 
-    The seam between :func:`_evaluate_day`, which only reads, and
-    :func:`_write_day`, which only writes: everything the INSERT needs is
-    carried here as data, so a caller can evaluate a day WITHOUT
-    materializing it.
+    The seam between the evaluation (:func:`evaluate_day_window`, and
+    :func:`_evaluate_day` around it), which only reads, and the writers
+    (:func:`_write_day`, :func:`write_close_truth`), which only write:
+    everything the INSERT needs is carried here as data, so a caller can
+    evaluate a day WITHOUT materializing it.
 
     ``local_date`` is the CANONICAL extended-format spelling of the date the
     caller passed, and ``max_computed_at`` is the newest
     ``observations.computed_at`` behind the day as its stored timestamp
     string — None when no observation in the day carries one.
+
+    ``generation_id`` is set only by :func:`_evaluate_day`, for
+    :func:`_write_day`'s key; :func:`evaluate_day_window` leaves it None,
+    and :func:`write_close_truth` keys its rows by the site's published
+    generation instead.
     """
 
-    generation_id: int
     timezone: str
     local_date: str
     bounds: DayBounds
     threshold: float
     outcomes: dict[str, QuantityOutcome]
     max_computed_at: str | None
+    generation_id: int | None = None
 
 
-def _evaluate_day(
+def evaluate_day_window(
     conn: sqlite3.Connection,
     *,
     site_id: int,
-    local_date: str,
-    tz_generation_id: int,
-) -> _DayEvaluation:
-    """Evaluate one (site, local day) against the CURRENT observations.
+    local_date: date,
+    timezone: str,
+    bounds: DayBounds,
+) -> DayEvaluation:
+    """Evaluate one (site, local day) in the zone and bounds the caller gives.
 
-    READ-ONLY by construction, and that property is load-bearing: every
-    statement here is a SELECT, and the generation is an ARGUMENT rather
-    than something resolved in the body, so this function can never reach
-    ``ensure_published_generation`` — whose seeding branch writes a
-    generation row and the published pointer. A caller may therefore
-    evaluate a day without taking on a write.
+    The rules :func:`_evaluate_day` applies, which calls this with its
+    generation's zone and ``local_day_bounds`` of the date; the close's
+    stage 4 calls it with the zone and bounds of the day's record (plan
+    6.1). Reads the site's rain threshold and the site's observations in
+    ``[bounds.start_utc, bounds.end_utc)``, nothing else.
 
-    Raises ``ValueError`` for a missing site, a missing timezone generation,
-    or a value in the day's rows that will not coerce — the whole failure
-    vocabulary one day's data can produce.
+    READ-ONLY by construction: every statement here is a SELECT and no
+    generation is involved, so the result's ``generation_id`` is None.
+
+    Raises ``ValueError`` for a missing site or a value in the day's rows
+    that will not coerce.
     """
     site = conn.execute(
         "SELECT rain_threshold_mm FROM sites WHERE id = ?", (site_id,)
     ).fetchone()
     if site is None:
         raise ValueError(f"site {site_id} does not exist")
-    timezone = _generation_timezone(conn, tz_generation_id)
-    day = date.fromisoformat(local_date)
-    # Bind the CANONICAL extended-format date, never the caller's raw
-    # string: Python 3.11's date.fromisoformat accepts basic-format input
-    # ("20260610"), which would defeat the UNIQUE(site, quantity,
-    # local_date, generation) dedup and `_write_day`'s DELETE.
-    local_date = day.isoformat()
-    bounds = local_day_bounds(day, timezone)
     start = isoformat_utc(bounds.start_utc)
     end = isoformat_utc(bounds.end_utc)
     rows = conn.execute(
@@ -169,14 +180,13 @@ def _evaluate_day(
             variable,
             by_variable[variable],
             timezone=timezone,
-            local_date=day,
+            local_date=local_date,
             rain_threshold_mm=threshold,
         ):
             outcomes[outcome.quantity] = outcome
-    return _DayEvaluation(
-        generation_id=tz_generation_id,
+    return DayEvaluation(
         timezone=timezone,
-        local_date=local_date,
+        local_date=local_date.isoformat(),
         bounds=bounds,
         threshold=threshold,
         outcomes=outcomes,
@@ -184,9 +194,49 @@ def _evaluate_day(
     )
 
 
+def _evaluate_day(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: str,
+    tz_generation_id: int,
+) -> DayEvaluation:
+    """Evaluate one (site, local day) against the CURRENT observations.
+
+    READ-ONLY by construction, and that property is load-bearing: every
+    statement here is a SELECT, and the generation is an ARGUMENT rather
+    than something resolved in the body, so this function can never reach
+    ``ensure_published_generation`` — whose seeding branch writes a
+    generation row and the published pointer. A caller may therefore
+    evaluate a day without taking on a write.
+
+    The zone (the generation's) and the bounds (``local_day_bounds`` of the
+    date) are this function's own; the rules are
+    :func:`evaluate_day_window`'s, and the result carries
+    ``tz_generation_id`` as its ``generation_id``.
+
+    Raises ``ValueError`` for a missing site, a missing timezone generation,
+    or a value in the day's rows that will not coerce — the whole failure
+    vocabulary one day's data can produce.
+    """
+    timezone = _generation_timezone(conn, tz_generation_id)
+    day = date.fromisoformat(local_date)
+    # The core binds the CANONICAL extended-format date (`day.isoformat()`),
+    # never the caller's raw string: Python 3.11's date.fromisoformat accepts
+    # basic-format input ("20260610"), which would defeat the UNIQUE(site,
+    # quantity, local_date, generation) dedup and `_write_day`'s DELETE.
+    bounds = local_day_bounds(day, timezone)
+    return replace(
+        evaluate_day_window(
+            conn, site_id=site_id, local_date=day, timezone=timezone, bounds=bounds
+        ),
+        generation_id=tz_generation_id,
+    )
+
+
 def _write_day(
     conn: sqlite3.Connection,
-    ev: _DayEvaluation,
+    ev: DayEvaluation,
     *,
     site_id: int,
     admission_basis: str | None,
@@ -282,6 +332,100 @@ def _write_day(
                 basis,
             )
             for outcome in ev.outcomes.values()
+        ],
+    )
+
+
+def write_close_truth(
+    conn: sqlite3.Connection,
+    evaluation: DayEvaluation,
+    *,
+    site_id: int,
+    admission_basis: str,
+    now_utc: datetime,
+) -> None:
+    """Delete-and-recreate one closing day's five truth rows (plan 6.1).
+
+    The close's stage 4 writer. Two checks run first, in this order, and
+    either refusal raises ``DayStateError`` with nothing written: the day's
+    record must exist and be ``closing`` (P1's guard alone would not do,
+    since it takes ``TRUTH`` for an ``open`` day too); only then is P1's
+    guard asked, and its refusal fails the attempt as well (plan 5.3).
+
+    The rows take :func:`_write_day`'s shape, through this function's own
+    statements: ``stale`` 0, the evaluation's threshold in
+    ``rain_threshold_mm`` (a threshold changed later never reaches the
+    day), the record's bounds and zone, and ``admission_basis`` as given —
+    ``completeness.close_admission_basis`` (plan 7.1); nothing on disk is
+    preserved. They are keyed by the site's published generation, read
+    here, never by ``evaluation.generation_id``, which
+    :func:`evaluate_day_window` leaves None. A rerun replaces the rows.
+    ``generated_at`` is ``now_utc``, the close's clock.
+
+    Raises ``ValueError`` when the site has no published generation. Must
+    run on a write connection inside the caller's transaction.
+    """
+    local_date = evaluation.local_date
+    day = date.fromisoformat(local_date)
+    record = day_record(conn, site_id, day)
+    if record is None or record.state != "closing":
+        state = "no record" if record is None else record.state
+        raise DayStateError(
+            f"site {site_id} day {local_date} ({state}): close truth is"
+            " written only for a closing day"
+        )
+    if not check_date_write(conn, site_id, day, WriteKind.TRUTH, now_utc=now_utc):
+        raise DayStateError(
+            f"site {site_id} day {local_date}: the guard refused the close truth"
+        )
+    generation_id = published_generation_id(conn, site_id)
+    if generation_id is None:
+        raise ValueError(f"site {site_id} has no published timezone generation")
+    conn.execute(
+        """
+        DELETE FROM daily_truth
+        WHERE site_id = ? AND local_date = ? AND tz_generation_id = ?
+        """,
+        (site_id, local_date, generation_id),
+    )
+    generated_at = isoformat_utc(now_utc)
+    start = isoformat_utc(record.day_start_utc)
+    end = isoformat_utc(record.day_end_utc)
+    conn.executemany(
+        """
+        INSERT INTO daily_truth
+            (site_id, local_date, quantity, value, eligible, exclusion_reason,
+             covered_hours, expected_slots, peak_window_ok, wet_hours,
+             dry_hours, rain_threshold_mm, day_start_utc, day_end_utc,
+             timezone, source_max_computed_at, stale, generated_at,
+             tz_generation_id, admission_basis)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """,
+        [
+            (
+                site_id,
+                local_date,
+                outcome.quantity,
+                outcome.value,
+                1 if outcome.eligible else 0,
+                outcome.exclusion_reason,
+                outcome.covered_hours,
+                outcome.expected_slots,
+                None
+                if outcome.peak_window_ok is None
+                else (1 if outcome.peak_window_ok else 0),
+                outcome.wet_hours,
+                outcome.dry_hours,
+                evaluation.threshold if outcome.quantity.startswith("precip") else None,
+                start,
+                end,
+                record.timezone,
+                evaluation.max_computed_at,
+                generated_at,
+                generation_id,
+                admission_basis,
+            )
+            for outcome in evaluation.outcomes.values()
         ],
     )
 

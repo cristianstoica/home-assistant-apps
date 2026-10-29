@@ -2272,6 +2272,8 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.worker.wind_days", "_finish_day"),  # 7.3 W16
         ("wxverify.worker.wind_days", "_invalidate_unparseable"),  # 7.3 W9
         ("wxverify.verification.truth", "_write_day"),  # 7.3 W11
+        # P1 7.3 row: P3's writers, TRUTH.
+        ("wxverify.verification.truth", "write_close_truth"),
         ("wxverify.api.routes.sites", "update_site"),  # 7.3 W12
         ("wxverify.provider_ops", "_invalidate_mean_for_site"),  # 7.3 W13
         ("wxverify.api.routes.db_transfer", "_rebuild_all"),  # 7.5 W14

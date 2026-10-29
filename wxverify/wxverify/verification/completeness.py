@@ -95,7 +95,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    # Type-only: ``verification.truth`` imports this module at load time.
+    from wxverify.verification.truth import DayEvaluation
 
 # The only two values ``daily_truth.admission_basis`` may hold. The migration
 # DDL's CHECK constraint names the same pair; the two must not drift.
@@ -185,3 +189,19 @@ def decide_admission(
     if not complete:
         return AdmissionDecision(admit=False, basis=None, reason="incomplete_coverage")
     return AdmissionDecision(admit=False, basis=None, reason="awaiting_quiescence")
+
+
+def close_admission_basis(evaluation: DayEvaluation) -> str:
+    """The ``admission_basis`` the daily close stores with a day's rows (7.1).
+
+    :data:`ADMISSION_COMPLETE` when every evaluated quantity's covered hours
+    equal its expected slots — C1 above, with the same fail-closed stance on
+    an empty set — else :data:`ADMISSION_DEADLINE`. No C2 and no C3: the
+    close decides WHEN a day is written, so the basis says only whether all
+    hours were present when the day closed, never whether it may be written.
+    """
+    complete = bool(evaluation.outcomes) and all(
+        outcome.covered_hours == outcome.expected_slots
+        for outcome in evaluation.outcomes.values()
+    )
+    return ADMISSION_COMPLETE if complete else ADMISSION_DEADLINE
