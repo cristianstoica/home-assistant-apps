@@ -195,7 +195,7 @@ def _seed_abc_site(tmp_path, monkeypatch: pytest.MonkeyPatch):  # type: ignore[n
     }
     assert stations[_STATION_C] == c_station_id
 
-    set_runtime_state(conn, "worker_last_loop_at", isoformat_utc(NOW))
+    set_runtime_state(conn, "worker_started_at", isoformat_utc(NOW))
     conn.commit()
     return db, FencedWriter(db, db.generation), site_id, stations
 
@@ -311,7 +311,18 @@ def test_sp1_a_station_with_nothing_for_two_days_is_paused(
         standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
+        d_minus_2 = D - timedelta(days=2)
         d_minus_1 = D - timedelta(days=1)
+        _close_day(conn, site_id, d_minus_2)
+        for pws_id in ("ISTATION01", "ISTATION02", _STATION_C):
+            _seed_close_station_day(
+                conn,
+                site_id,
+                d_minus_2,
+                stations[pws_id],
+                five_minute=12,
+                answered=True,
+            )
         _close_day(conn, site_id, d_minus_1)
         _seed_close_station_day(
             conn,
@@ -388,7 +399,18 @@ def test_sp2_a_returning_station_is_not_paused(
         standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
+        d_minus_2 = D - timedelta(days=2)
         d_minus_1 = D - timedelta(days=1)
+        _close_day(conn, site_id, d_minus_2)
+        for pws_id in ("ISTATION01", "ISTATION02", _STATION_C):
+            _seed_close_station_day(
+                conn,
+                site_id,
+                d_minus_2,
+                stations[pws_id],
+                five_minute=12,
+                answered=True,
+            )
         _close_day(conn, site_id, d_minus_1)
         _seed_close_station_day(
             conn,
@@ -475,7 +497,7 @@ def test_sp3_a_day_lost_to_refused_access_does_not_pause(
         )
         for station_id in (stations["ISTATION01"], stations["ISTATION02"]):
             _seed_five_minute_day(conn, station_id, D)
-        _seed_five_minute_day(conn, stations[_STATION_C], D)
+        # C: nothing on D either, so the pause check actually walks back.
         conn.commit()
 
         clock.set(BOUND)
@@ -545,8 +567,8 @@ def test_sp4_a_missed_day_is_skipped_the_earlier_day_decides(
         _miss_day(conn, site_id, d_minus_1, reason="never_attempted")
         for station_id in (stations["ISTATION01"], stations["ISTATION02"]):
             _seed_five_minute_day(conn, station_id, D)
-        if d_minus_2_has_readings:
-            _seed_five_minute_day(conn, stations[_STATION_C], D)
+        # C: nothing on D either, in both cases, so the pause check walks
+        # back past the missed D-1 regardless.
         conn.commit()
 
         clock.set(BOUND)
@@ -604,7 +626,18 @@ def test_sp5_current_conditions_readings_count_as_something(
         standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
+        d_minus_2 = D - timedelta(days=2)
         d_minus_1 = D - timedelta(days=1)
+        _close_day(conn, site_id, d_minus_2)
+        for pws_id in ("ISTATION01", "ISTATION02", _STATION_C):
+            _seed_close_station_day(
+                conn,
+                site_id,
+                d_minus_2,
+                stations[pws_id],
+                five_minute=12,
+                answered=True,
+            )
         _close_day(conn, site_id, d_minus_1)
         _seed_close_station_day(
             conn,
@@ -618,7 +651,7 @@ def test_sp5_current_conditions_readings_count_as_something(
         )
         for station_id in (stations["ISTATION01"], stations["ISTATION02"]):
             _seed_five_minute_day(conn, station_id, D)
-        _seed_five_minute_day(conn, stations[_STATION_C], D)
+        # C: nothing on D either, so the pause check actually walks back.
         conn.commit()
 
         clock.set(BOUND)
@@ -681,7 +714,15 @@ def test_sp6_the_counted_day_is_the_latest_one_listing_the_station(
             hourly=0,
             answered=False,
         )
-        # D-1 never listed C: no close_station_days row for it there.
+        # C was added effective D-10 (_add_station_c), so P1 wrote it onto
+        # D-1's saved station list when D-1 opened (site_days.py :355-409).
+        # Strip it directly, as stage 2's own data would never do this
+        # listing: D-1 must not list C.
+        conn.execute(
+            "DELETE FROM site_day_stations WHERE site_id = ? AND local_date = ?"
+            " AND station_id = ?",
+            (site_id, d_minus_1.isoformat(), stations[_STATION_C]),
+        )
         _close_day(conn, site_id, d_minus_1)
         for station_id in (stations["ISTATION01"], stations["ISTATION02"]):
             _seed_five_minute_day(conn, station_id, D)

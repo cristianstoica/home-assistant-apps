@@ -74,6 +74,9 @@ logger = logging.getLogger(__name__)
 CLOSE_LATE_LIMIT: Final = timedelta(hours=1)
 #: How long the stage log and the try log keep a row (plan 11.6).
 CLOSE_LOG_KEEP_DAYS: Final = 90
+#: How many counted days with nothing from any source pause a station's
+#: nightly gap fill (plan 5.6, :137; the owner's value).
+CLOSE_PAUSE_DAYS: Final = 1
 
 #: The tick's per-site ERROR line is written at most once per site and step
 #: in this span of ``now_utc`` (plan 8.5).
@@ -561,10 +564,47 @@ def _paused_station_ids(
 ) -> frozenset[int]:
     """The stations paused for the day's gap fill (plan 5.6).
 
-    The nightly gap-fill pause is a later piece of P3; until it lands, no
-    station is paused.
+    A station on the day's list is paused when P2's ``day_presence`` counts
+    no ``five_minute`` and no ``current_obs`` reading for it inside the
+    day's bounds, and its latest ``CLOSE_PAUSE_DAYS`` counted days before
+    the day each had nothing from any source on their presence record
+    (11.3). A counted day is a ``closed`` day whose saved station list holds
+    the station (P1 §6.2) and that was not lost to refused access
+    (``refused_lost``); missed days and days lost to refused access are
+    passed over. A ``closed`` day that lists the station but has no presence
+    record for it (one closed before the records were kept) ends the walk
+    with the station not paused: no stored fact says it had nothing.
+
+    Read-only, in the caller's transaction; reads no clock. At most one walk
+    back per station, and only for a station with nothing on the day.
     """
-    return frozenset()
+    day = local_date.isoformat()
+    paused: set[int] = set()
+    presence = day_presence(conn, site_id=site_id, local_date=local_date)
+    for station_id, station in presence.items():
+        if station.readings["five_minute"] or station.readings["current_obs"]:
+            continue
+        # CROSS JOIN keeps site_days in the outer loop: the closed days are
+        # walked back from the day on idx_site_days_state, newest first, and
+        # the list and the presence record are point reads on their keys. A
+        # day with no presence record gives NULL counts, which end the walk.
+        rows = conn.execute(
+            "SELECT p.five_minute, p.current_obs, p.hourly"
+            " FROM site_days AS d INDEXED BY idx_site_days_state"
+            " CROSS JOIN site_day_stations AS l"
+            " LEFT JOIN close_station_days AS p ON p.site_id = d.site_id"
+            " AND p.local_date = d.local_date AND p.station_id = l.station_id"
+            " WHERE d.site_id = ? AND d.state = 'closed' AND d.local_date < ?"
+            " AND l.site_id = d.site_id AND l.local_date = d.local_date"
+            " AND l.station_id = ? AND p.refused_lost IS NOT 1"
+            " ORDER BY d.local_date DESC LIMIT ?",
+            (site_id, day, station_id, CLOSE_PAUSE_DAYS),
+        ).fetchall()
+        if len(rows) == CLOSE_PAUSE_DAYS and all(
+            tuple(row) == (0, 0, 0) for row in rows
+        ):
+            paused.add(station_id)
+    return frozenset(paused)
 
 
 def _fill_label(fill: StationFill) -> str:
