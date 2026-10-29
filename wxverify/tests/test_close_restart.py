@@ -35,6 +35,7 @@ appears.
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -64,10 +65,11 @@ from wxverify.api.app import create_app
 from wxverify.api.routes import db_transfer
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.queue import enqueue_if_absent, reclaim_all_stale
+from wxverify.db.queue import Job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
 from wxverify.worker.close_p4 import ScoreSummary
+from wxverify.worker.processor import run_claimed_job
 
 
 @pytest.fixture(autouse=True)
@@ -521,7 +523,9 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         stage7_job_id = await db.write(
             lambda c: _seed_publish_job(c, site_id, 7, D, 1, status="pending")
         )
-        await db.write(lambda c: _seed_running_stage_job(c, site_id, D, 6, 1))
+        stage6_job_id = await db.write(
+            lambda c: _seed_running_stage_job(c, site_id, D, 6, 1)
+        )
 
         last_loop_at = closed_at + timedelta(minutes=1)
         start = note_day_clock(closed_at + timedelta(minutes=10))
@@ -558,6 +562,51 @@ def test_rs4_a_stop_after_stage_6_leaves_the_closure_and_publishes_once(
         assert stage_log_after[0] == stage_log_before[0], (
             "settle_interrupted_closes must add no stage-log row for an"
             " already-closed day"
+        )
+
+        # The reclaimed stage-6 job is now pending, run it as the worker
+        # would, to reach _open_stage's own disposition of a stale job on
+        # an already-closed day (plan 16.2 names no mutant for RS4 itself,
+        # but M89 lives exactly in this path, in close_chain.py's
+        # _open_stage). Claimed directly by id, not through
+        # claim_next_job's own FIFO: the stage-7 day_publish job was
+        # enqueued (pending) BEFORE this stage-6 job was even seeded, so a
+        # plain claim_next_job would claim stage 7 first -- and nothing in
+        # this test installs close_p4.publish's stand-in to run it safely.
+        def _claim_stage6(c: sqlite3.Connection) -> Job:
+            row = c.execute(
+                "UPDATE jobs SET status = 'running', updated_at = ?"
+                " WHERE id = ? AND status = 'pending'"
+                " RETURNING id, type, site_id, job_key, payload, status,"
+                " retry_count, max_retries",
+                (isoformat_utc(start), stage6_job_id),
+            ).fetchone()
+            assert row is not None, "the reclaimed stage-6 job must still be pending"
+            return Job(
+                id=int(row[0]),
+                type=str(row[1]),
+                site_id=None if row[2] is None else int(row[2]),
+                job_key=None if row[3] is None else str(row[3]),
+                payload=json.loads(str(row[4])) if row[4] else {},
+                status=str(row[5]),
+                retry_count=int(row[6]),
+                max_retries=int(row[7]),
+            )
+
+        reclaimed_job = await db.write(_claim_stage6)
+        await run_claimed_job(db, reclaimed_job, lane="main")
+
+        stage_log_after_claim = await db.read(
+            lambda c: c.execute("SELECT COUNT(*) FROM close_stage_log").fetchone()
+        )
+        assert stage_log_after_claim[0] == stage_log_before[0], (
+            "M89 -> at this assertion: correct = no new close_stage_log row"
+            " (the day is 'closed', not 'closing', so _open_stage's own"
+            " day-state check (_current) must refuse the reclaimed stage-6"
+            " job before any write at all), mutant M89 (_open_stage checks"
+            " completion -- last_stage >= job.stage -- before the day's"
+            " state check) = a 'skipped' row written for a day that is no"
+            " longer closing"
         )
 
         publish_jobs = await db.read(
@@ -819,17 +868,27 @@ def _rs7_make_live_app(monkeypatch: pytest.MonkeyPatch):  # type: ignore[no-unty
     return create_app(root_path="")
 
 
-def _rs7_init_live_db(tmp_path: Path) -> None:
+def _rs7_init_live_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The import TARGET: a fresh, minimal, fully migrated database at a
     path distinct from the uploaded source file (the pattern of
-    ``tests/test_db_transfer.py``'s own ``_init_tmp_db``)."""
+    ``tests/test_db_transfer.py``'s own ``_init_tmp_db``).
+
+    ``config.db_path``/``config.options_path`` are set through
+    ``monkeypatch``, not by plain attribute assignment: a bare
+    ``config.options_path = ...`` is never undone when the test ends, so it
+    leaks forward as the next test's own ``config.options_path`` -- an
+    EXISTING, key-less ``options.json`` that makes ``resolve_secret`` raise
+    "weathercom key is not configured" instead of going on to build a real
+    ``httpx`` request, masking a later P3 test's own missing network
+    isolation (VD6 in ``tests/test_close_verdict.py``, which this file
+    happened to run immediately before)."""
     close_db()
     tmp_path.mkdir(parents=True, exist_ok=True)
     db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
+    monkeypatch.setattr(config, "db_path", str(db_path))
     options_path = tmp_path / "options.json"
     options_path.write_text("{}", encoding="utf-8")
-    config.options_path = str(options_path)
+    monkeypatch.setattr(config, "options_path", str(options_path))
     init_db(str(db_path))
 
 
@@ -926,7 +985,7 @@ def test_rs7_an_imported_closing_day_is_settled_before_use(
         close_db()
         payload = (source_dir / "wxverify.db").read_bytes()
 
-        _rs7_init_live_db(tmp_path / f"live_{suffix}")
+        _rs7_init_live_db(tmp_path / f"live_{suffix}", monkeypatch)
         clock = MovingClock(import_time)
         patch_close_clock(monkeypatch, clock)
         monkeypatch.setattr(db_transfer, "utc_now", clock.now)

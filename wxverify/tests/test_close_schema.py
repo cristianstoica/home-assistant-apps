@@ -333,6 +333,108 @@ def test_sc1_migrate_v4_copy_of_the_check_admits_both_kinds_alone() -> None:
     _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7b")
 
 
+# --- SC1 (extension): the re-run guard checks 'day_publish', not 'day_close' -
+#
+# The three call points that ever write this CHECK (create_tables,
+# migrate_v3, migrate_v4) always add 'day_close' and 'day_publish' together,
+# so on every reachable real-world schema the two literals co-occur and
+# migrate_v13_close_jobs's own re-run guard cannot be told, by any test that
+# only drives those three functions, whether it tests for 'day_close' or for
+# 'day_publish' (M9: the guard tests for 'day_close' only). This test builds
+# the one state no production code path can reach but a future historical
+# migration could -- a jobs CHECK naming 'day_close' alone -- so the two
+# literals finally diverge.
+
+
+def test_sc1_the_rebuild_guard_checks_for_day_publish_not_day_close(
+    tmp_path: Path,
+) -> None:
+    """SC1 extension: a ``jobs`` CHECK naming ``'day_close'`` but not
+    ``'day_publish'`` (a state no real migration leaves behind today, but
+    the guard must still tell the two literals apart rather than relying
+    on them always co-occurring).
+
+    M9 -> at the day_publish-insert assertion below: correct = the insert
+    is accepted (``'day_publish'`` is absent, so the real guard's
+    ``"'day_publish'" in str(row[0])`` is False and the rebuild runs,
+    widening the CHECK for both kinds), mutant M9 (the guard reads
+    ``"'day_close'" in str(row[0])`` instead, ``db/migrations.py:2220``)
+    = ``sqlite3.IntegrityError`` (``'day_close'`` is present, so the
+    mutant's guard returns at once and the CHECK is never widened for
+    ``day_publish``).
+    """
+    from wxverify.db.migrations import migrate_v13_close_jobs
+
+    _ASYMMETRIC_JOBS_DDL = """
+        CREATE TABLE jobs_asym (
+            id INTEGER PRIMARY KEY,
+            type TEXT NOT NULL,
+            site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+            job_key TEXT,
+            payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','running','completed','failed')),
+            next_attempt_at TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 5,
+            last_error TEXT,
+            result TEXT,
+            created_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            updated_at TEXT NOT NULL
+                DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            CHECK (
+                (type = 'catchup' AND site_id IS NULL)
+                OR (
+                    type IN ('fetch_feed','fetch_obs','fetch_current_obs',
+                             'pair_and_score','backfill_site',
+                             'forecast_record','record_gap_scan',
+                             'verification_run','timezone_correction',
+                             'day_close')
+                    AND site_id IS NOT NULL
+                )
+            )
+        );
+    """
+
+    v12_path = _build_v12_file(tmp_path / "v12.db")
+    conn = sqlite3.connect(str(v12_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("SAVEPOINT make_asymmetric")
+    conn.execute(_ASYMMETRIC_JOBS_DDL)
+    conn.execute("INSERT INTO jobs_asym SELECT * FROM jobs")
+    conn.execute("DROP TABLE jobs")
+    conn.execute("ALTER TABLE jobs_asym RENAME TO jobs")
+    conn.execute("RELEASE make_asymmetric")
+    site_id = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone) VALUES ('Testsite', 0.0, 0.0, 0.0, 'UTC')"
+    ).lastrowid
+    before = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()[0]
+    assert "'day_close'" in before and "'day_publish'" not in before, (
+        "fixture bug: the asymmetric jobs table must name day_close without"
+        " day_publish before the guard runs"
+    )
+    conn.commit()
+
+    migrate_v13_close_jobs(conn)
+
+    # M9 -> at this insert: correct = accepted, no exception ('day_publish'
+    # was absent before the call, so the real guard ran the rebuild and
+    # widened the CHECK for both kinds), mutant M9 (the guard checks
+    # "'day_close'" instead, which was already present) = sqlite3.
+    # IntegrityError (the rebuild never ran; day_publish is still refused).
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, job_key, status)"
+        " VALUES ('day_publish', ?, 'publish:1:7', 'pending')",
+        (site_id,),
+    )
+    conn.commit()
+
+
 # --- SC2 --------------------------------------------------------------------
 
 
@@ -420,6 +522,22 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
     ``sqlite3.IntegrityError``. Catches a missing CHECK (M10a-M10k and
     beyond): with the targeted CHECK dropped, exactly that insert would
     succeed while the others still protect the row.
+
+    The real defect this guards against: ``day_close_site``'s site,
+    station and ``site_days`` rows are built on this same connection but
+    never committed. ``_bad()``'s own ``conn.rollback()`` therefore rolls
+    back not just the one failed insert but the WHOLE uncommitted
+    transaction -- the fixture included -- the first time it runs. Every
+    ``_bad()`` call after the first one then references a ``site_days``
+    row (for ``close_attempts``/``close_station_days``/
+    ``close_publications``) or a ``sites``/``stations`` row that no
+    longer exists, so it is refused by a FOREIGN KEY violation
+    regardless of whether the CHECK it targets is present or missing --
+    a false pass for every CHECK but the very first one tried
+    (``attempt IN (1,2)``, M10 at ``db/migrations.py:621``). ``_good()``
+    below pins each table's baseline row as accepted (the paired
+    positive), and committing the fixture up front keeps it in place
+    across every later ``_bad()`` rollback.
     """
     conn = asof_conn()
     site_id = day_close_site(conn)
@@ -429,17 +547,45 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
     ).fetchone()[0]
     local_date = D.isoformat()
     stamp = "2026-07-06T00:00:00.000000Z"
+    # Locks the fixture (site, station, site_days rows) in so that a later
+    # _bad() call's conn.rollback() can never discard it -- see the
+    # docstring above.
+    conn.commit()
 
     def _bad(sql: str, params: tuple[object, ...]) -> None:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(sql, params)
         conn.rollback()
 
+    def _good(sql: str, params: tuple[object, ...], *, table: str) -> None:
+        """A row with every field valid must be ACCEPTED -- the paired
+        positive proving the refusals below come from the one targeted
+        CHECK and not from an FK, a NOT NULL, or the stale-rollback
+        defect this test now avoids. Deleted by rowid right after (never
+        rolled back), so it cannot collide with a later _bad() row that
+        shares its primary key.
+        """
+        cur = conn.execute(sql, params)
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE rowid = ?",
+            (cur.lastrowid,),  # noqa: S608
+        ).fetchone()
+        assert row is not None, (
+            f"the {table} baseline row (every field valid) must be accepted"
+        )
+        conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (cur.lastrowid,))  # noqa: S608
+        conn.commit()
+
     # --- close_attempts: 7 CHECKs -----------------------------------------
     attempts_sql = (
         "INSERT INTO close_attempts (site_id, local_date, attempt,"
         " started_at, last_stage, last_progress_at, outcome, failed_stage,"
         " ended_at, truth_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    _good(
+        attempts_sql,
+        (site_id, local_date, 1, stamp, 1, stamp, "running", None, None, None),
+        table="close_attempts",
     )
     # attempt IN (1,2)
     _bad(
@@ -484,6 +630,11 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
         " five_minute, current_obs, hourly, answered, refused_lost, paused)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
+    _good(
+        station_days_sql,
+        (site_id, local_date, station_id, 0, 0, 0, 0, 0, 0),
+        table="close_station_days",
+    )
     _bad(station_days_sql, (site_id, local_date, station_id, -1, 0, 0, 0, 0, 0))
     _bad(station_days_sql, (site_id, local_date, station_id, 0, -1, 0, 0, 0, 0))
     _bad(station_days_sql, (site_id, local_date, station_id, 0, 0, -1, 0, 0, 0))
@@ -496,6 +647,11 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
         "INSERT INTO close_publications (site_id, cutoff, attempt, state,"
         " opened_at, retry_at, finished_at, publication_id)"
         " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    _good(
+        publications_sql,
+        (site_id, local_date, 1, "pending", stamp, None, None, None),
+        table="close_publications",
     )
     # attempt IN (1,2)
     _bad(
@@ -526,6 +682,11 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
         " duration_s, outcome, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
         " ?, '{}')"
     )
+    _good(
+        stage_log_sql,
+        (site_id, local_date, 1, 2, 10, stamp, stamp, stamp, 0.0, 0.0, "completed"),
+        table="close_stage_log",
+    )
     # attempt IN (1,2)
     _bad(
         stage_log_sql,
@@ -552,6 +713,22 @@ def test_sc3_every_check_of_the_five_tables_refuses_its_bad_row() -> None:
         "INSERT INTO close_try_log (site_id, local_date, station_id, kind,"
         " slot, close_attempt, tried_at, outcome, readings_kept,"
         " readings_refused) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    _good(
+        try_log_sql,
+        (
+            site_id,
+            local_date,
+            station_id,
+            "five_minute",
+            "daytime",
+            None,
+            stamp,
+            "stored",
+            0,
+            0,
+        ),
+        table="close_try_log",
     )
     # kind IN ('five_minute','hourly')
     _bad(

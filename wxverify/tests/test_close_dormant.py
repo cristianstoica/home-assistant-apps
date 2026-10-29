@@ -384,6 +384,84 @@ def test_do4_direct_calls_write_nothing_with_the_close_off() -> None:
     )
 
 
+def test_do4_enqueue_due_close_work_checks_its_own_predicate_directly() -> None:
+    """DO4 extension: a second, more exacting drive of
+    ``enqueue_due_close_work`` alone, with the close off, where the
+    ``closing`` day's own ``close_attempts`` row is present so step 4's
+    repair (8.2) can run to completion instead of raising before any
+    write.
+
+    The DO4 test above seeds a ``closing`` ``site_days`` row with NO
+    matching ``close_attempts`` row; with M3p in place (the function's own
+    ``if not daily_close_on(conn): return`` removed), the per-site loop
+    still runs, but step 4's ``_repair`` then raises
+    ``RuntimeError("the closing attempt has no attempt record")`` before
+    any write, in EVERY build mutant included -- caught by the per-site
+    savepoint and logged, leaving nothing written either way. That
+    fixture cannot tell M3p's own-predicate removal from the real guard:
+    both end with nothing written, for different reasons. This fixture
+    gives ``_repair`` a real attempt record to act on, so the mutant's
+    write becomes observable.
+
+    M3p -> at the day_close job assertion below: correct = no day_close
+    job exists (``enqueue_due_close_work``'s own close-off predicate,
+    ``close_chain.py:2055-2056``, returns before the per-site loop ever
+    runs), mutant M3p (that predicate removed) = a pending day_close job
+    keyed ``close:{site}:{D}:4`` exists, because ``_repair`` finds the
+    ``closing`` day's ``last_stage`` (3) and enqueues the next stage.
+
+    (Separately, the plan's own M3 -- an extra call of
+    ``enqueue_due_close_work`` added to ``scheduler_tick``'s close-off
+    branch, ``worker/scheduler.py`` about :90 -- is equivalent as built:
+    ``enqueue_due_close_work`` itself still carries its own close-off
+    guard there, so the extra call is a no-op in every observable state.
+    Not retested here; M3p above targets the guard itself.)
+    """
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=False, with_records=False)
+
+    bounds = local_day_bounds(D, "UTC")
+    now = datetime(D.year, D.month, D.day, 23, 0, tzinfo=UTC)
+    stamp = isoformat_utc_micro(now)
+    conn.execute(
+        "INSERT INTO site_days (site_id, local_date, state, day_start_utc,"
+        " day_end_utc, timezone, attempts, created_at, state_changed_at)"
+        " VALUES (?, ?, 'closing', ?, ?, 'UTC', 1, ?, ?)",
+        (
+            site_id,
+            D.isoformat(),
+            isoformat_utc(bounds.start_utc),
+            isoformat_utc(bounds.end_utc),
+            isoformat_utc(now),
+            isoformat_utc(now),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO close_attempts (site_id, local_date, attempt,"
+        " started_at, last_stage, last_progress_at, outcome)"
+        " VALUES (?, ?, 1, ?, 3, ?, 'running')",
+        (site_id, D.isoformat(), stamp, stamp),
+    )
+    conn.commit()
+
+    from wxverify.worker.close_chain import enqueue_due_close_work  # noqa: PLC0415
+
+    enqueue_due_close_work(conn, now_utc=now)
+
+    job = conn.execute(
+        "SELECT 1 FROM jobs WHERE type = 'day_close' AND site_id = ? AND job_key = ?",
+        (site_id, f"close:{site_id}:{D.isoformat()}:4"),
+    ).fetchone()
+    assert job is None, (
+        "M3p -> at this assertion: correct = None (enqueue_due_close_work's"
+        " own close-off predicate, close_chain.py:2055-2056, returns before"
+        " the per-site loop runs, so step 4's repair never sees this"
+        " closing day), mutant M3p (that predicate removed) = a row"
+        " exists (the repair enqueues close:{site}:{D}:4 from the attempt"
+        " record's last_stage of 3)"
+    )
+
+
 def test_do5_record_collection_try_writes_its_row_with_the_close_off() -> None:
     """DO5: with the close off, ``record_collection_try`` still inserts one
     ``close_try_log`` row carrying exactly the given values -- the writer

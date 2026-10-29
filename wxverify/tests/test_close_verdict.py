@@ -59,12 +59,15 @@ from tests.helpers import (
     clear_close_chain_log_map,
     day_close_site,
     disable_other_enqueuers,
+    disable_station_pacing,
     install_p4_standins,
     install_round_state_standin,
     note_day_clock,
     patch_close_clock,
+    patch_weathercom_transport,
     run_due_jobs,
     standard_night,
+    write_weathercom_key,
 )
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.site_days import (
@@ -442,9 +445,30 @@ def test_vd6_a_record_bounds_mismatch_fails_the_attempt_at_stage_4(
     Reaches ``install_round_state_standin`` before anything else needing
     P3's behaviour -- a ``ModuleNotFoundError`` today, since
     ``wxverify.worker.close_p4`` does not exist.
+
+    Isolation fault fixed here: pushing D's ``day_end_utc`` an hour past
+    ``standard_night``'s own full 5-minute day (D's exact 24 hours) opens a
+    real one-hour gap the stage-2 gap fill tries to fill for both stations
+    -- unlike every sibling VD/AD test in this file, which never shifts the
+    window and so never needs a key or a transport. Without
+    ``write_weathercom_key``/``patch_weathercom_transport``/
+    ``disable_station_pacing`` (as every OTHER P3 test file that reaches a
+    real gap-fill call installs, e.g. ``tests/test_close_pause.py``'s
+    ``_prepare_chain``), the fill tries a REAL ``httpx.AsyncClient()``
+    request to api.weather.com, which the suite's network guard denies (or,
+    run alone/after some other file, actually resolves the host).
     """
 
+    def _handler(request: object) -> object:
+        import httpx  # noqa: PLC0415
+
+        return httpx.Response(200, json={"observations": []})
+
     async def _run() -> None:
+        write_weathercom_key(monkeypatch, tmp_path)
+        patch_weathercom_transport(monkeypatch, _handler)  # type: ignore[arg-type]
+        disable_station_pacing(monkeypatch)
+
         db, _writer, site_id, _stations = standard_night(tmp_path)
         conn = db._conn  # noqa: SLF001
         row = conn.execute(
@@ -509,9 +533,16 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
 
     M50 -> at the stored-threshold assertion below: correct = D's
     ``daily_truth`` rows still carry the OLD threshold (0.2) after the
-    site's rain threshold is changed post-close, mutant M50 (the threshold
-    read again at stage 6 and written over the rows) = the rows carry the
-    NEW threshold (0.9) instead.
+    site's rain threshold is changed between stage 4 and stage 6, mutant
+    M50 (the threshold read again at stage 6 and written over the rows) =
+    the rows carry the NEW threshold (0.9) instead.
+
+    The threshold change is timed with ``stop_before=("day_close", 6)``,
+    between stage 4's completion and stage 6's own run -- changing it only
+    AFTER the whole night (stage 6 included) had already finished would
+    make M50 a no-op: its re-read/UPDATE runs synchronously inside stage
+    6's own write, at a moment when the threshold was still 0.2 either
+    way, so a later external change could never reach it.
 
     Reaches ``install_round_state_standin`` before anything else needing
     P3's behaviour -- a ``ModuleNotFoundError`` today.
@@ -527,16 +558,24 @@ def test_vd7_a_threshold_change_after_stage_4_never_reaches_a_closed_day(
         install_p4_standins(monkeypatch)
 
         clock.set(BOUND)
-        await run_due_jobs(db, clock)
+        await run_due_jobs(db, clock, stop_before=("day_close", 6))
 
         record = await db.read(lambda c: day_record(c, site_id, D))
-        assert record.state == "closed", "the standard night must close D first"
+        assert record.state == "closing", (
+            "stage 4 must have completed and stage 6 must still be pending"
+            " -- VD7's own 'after stage 4' timing for the threshold change"
+        )
 
         await db.write(
             lambda c: c.execute(
                 "UPDATE sites SET rain_threshold_mm = 0.9 WHERE id = ?", (site_id,)
             )
         )
+
+        await run_due_jobs(db, clock)
+
+        record = await db.read(lambda c: day_record(c, site_id, D))
+        assert record.state == "closed", "the standard night must close D"
 
         thresholds = await db.read(
             lambda c: {

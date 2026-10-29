@@ -179,7 +179,15 @@ def _seed_wind_only_raw_rows(path: Path, station_id: int, local_date) -> None:  
     """Seed ``station_wind_records`` rows for every hour of ``local_date``
     carrying only ``speed_kmh`` (``temp_c``/``precip_total_mm`` NULL), the
     shape P2's migration copies forward from before P2's collection
-    (CL5)."""
+    (CL5). ``speed_kmh`` is 36.0 (10.0 m/s) -- deliberately NOT the 5.0 m/s
+    ``_seed_observations_full_day`` already seeded for "wind" -- harmless
+    and disjoint from the refusal this seeds for: a COMMITTED rebuild
+    would show this value in the new file's wind observations, but CL5's
+    rebuild never commits (a genuine refusal skips stage 3 entirely, and
+    M84's escape still fails at a later stage and rolls the whole close
+    back), so the observations-equality check never sees 36.0 either way;
+    CL5 distinguishes the two by what the command prints, not by this
+    value."""
     conn = sqlite3.connect(str(path))
     conn.execute("PRAGMA foreign_keys=ON")
     for hour in range(24):
@@ -191,7 +199,7 @@ def _seed_wind_only_raw_rows(path: Path, station_id: int, local_date) -> None:  
         conn.execute(
             "INSERT INTO station_wind_records"
             " (station_id, obs_at, source, local_date, speed_kmh, fetched_at)"
-            " VALUES (?, ?, 'hourly', ?, 5.0, ?)",
+            " VALUES (?, ?, 'hourly', ?, 36.0, ?)",
             (station_id, obs_at, local_date.isoformat(), obs_at),
         )
     conn.commit()
@@ -479,6 +487,18 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
             (site_id, D.isoformat()),
         ).fetchone()
         assert publications[0] == 0, "the offline close must open no publication"
+
+        from wxverify.worker.close_chain import stage_log
+
+        ran_stages = [
+            run.stage for run in stage_log(new_conn, site_id=site_id, local_date=D)
+        ]
+        assert ran_stages == [4, 5, 6], (
+            "M72 -> at this assertion: correct = [4, 5, 6] (--hours stored"
+            " never runs stage 3's raw rebuild, since there are no raw"
+            " readings to disagree with), mutant M72 (--hours stored also"
+            " starts at stage 3) = [3, 4, 5, 6], an extra stage-3 run"
+        )
     finally:
         new_conn.close()
 
@@ -575,7 +595,7 @@ def test_cl4_refuses_raw_rebuild_with_no_temperature_and_an_existing_record(
 
 
 def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """CL5: a file with D's ``observations`` (temperature, rain and wind)
     and, as D's only raw readings, wind rows of stations A and B with
@@ -585,13 +605,17 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
     source's, row for row, and D is not ``closed``; the source file
     unchanged (8.8).
 
-    M84 -> at the observations-equality assertion below: correct = the new
-    file's ``observations`` rows for D equal the source's, row for row,
-    and D is not closed (the refusal happens before stage 3 writes anything,
-    8.8), mutant M84 (``close-day --hours raw`` refuses only when the day
-    has NO raw reading at all, of any quantity) = the rebuild goes on
-    using the wind-only rows, overwriting D's temperature and rain
-    observations with a day that has none.
+    M84 -> at the printed-refusal assertion below: correct = the printout
+    contains ``_NO_RAW_TEMPERATURE`` and no "error stage" line, mutant M84
+    (``close-day --hours raw`` refuses only when the day has NO raw
+    reading at all, of any quantity) = the printout instead shows
+    "error stage 5 failed: score_day is bound by the daily close's P4" --
+    a later stage raising and rolling the copy back, which the
+    observations-equality and exit-code checks alone cannot distinguish
+    from the intended refusal (a failed close is rolled back, so the
+    rebuild's wind-only values never reach the new file's observations
+    either way; the printed-refusal check is the only one of these
+    assertions M84 cannot also satisfy).
     """
     from tests.helpers import patch_weathercom_transport
 
@@ -639,6 +663,22 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
     )
 
     assert rc == 1, "no raw reading of the day has a temperature -- must refuse"
+
+    from wxverify.__main__ import _NO_RAW_TEMPERATURE
+
+    out = capsys.readouterr().out
+    assert _NO_RAW_TEMPERATURE in out, (
+        "M84 -> at this assertion: correct = the refusal line"
+        " containing _NO_RAW_TEMPERATURE ('no raw reading of that day has"
+        " a temperature'), mutant M84 (refuses only when the day has no"
+        " raw reading at all) = 'error stage 5 failed: score_day is bound"
+        " by the daily close's P4'"
+    )
+    assert "error stage" not in out, (
+        "a genuine --hours raw refusal must print the temperature-refusal"
+        " line, not a later stage failing and rolling the copy back"
+    )
+
     after_bytes, after_version = _file_bytes_and_version(path)
     assert (after_bytes, after_version) == (before_bytes, before_version), (
         "the source file must be byte-for-byte and user_version unchanged"
@@ -661,13 +701,13 @@ def test_cl5_refuses_a_raw_rebuild_from_copied_wind_history_alone(
             )
         ]
         assert new_observations == source_observations, (
-            "M84 -> at this assertion: correct = the new file's"
-            " observations rows for D equal the source's row for row"
-            " (the refusal happens before stage 3 writes anything), mutant"
-            " M84 (close-day --hours raw refuses only when the day has NO"
-            " raw reading at all) = the rebuild runs from the wind-only"
-            " rows and D's temperature/rain observations are overwritten"
-            " or removed"
+            "a genuine refusal leaves the copy's observations untouched"
+            " (stage 3 never ran); under M84 a committed rebuild would"
+            " show this too, but M84 never reaches a committed rebuild"
+            " here -- stage 5 then raises and the whole close is rolled"
+            " back, so this assertion alone cannot tell M84 apart from"
+            " the intended refusal (see the printed-refusal assertion"
+            " above for the check that does)"
         )
         day = new_conn.execute(
             "SELECT state FROM site_days WHERE site_id = ? AND local_date = ?",

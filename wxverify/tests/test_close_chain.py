@@ -85,8 +85,9 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
 async def _attempt_row(db, site_id, local_date, attempt):  # type: ignore[no-untyped-def]
     return await db.read(
         lambda c: c.execute(
-            "SELECT outcome, last_stage, failed_stage, failure_reason"
-            " FROM close_attempts WHERE site_id = ? AND local_date = ? AND attempt = ?",
+            "SELECT outcome, last_stage, last_progress_at, failed_stage,"
+            " failure_reason FROM close_attempts"
+            " WHERE site_id = ? AND local_date = ? AND attempt = ?",
             (site_id, local_date.isoformat(), attempt),
         ).fetchone()
     )
@@ -431,10 +432,22 @@ def test_ho3_a_repeated_stage_job_is_skipped_not_rerun(
         )
 
         after_attempt = await _attempt_row(db, site_id, D, 1)
-        assert (after_attempt["last_stage"], after_attempt["outcome"]) == (
+        assert (
+            after_attempt["last_stage"],
+            after_attempt["last_progress_at"],
+            after_attempt["outcome"],
+        ) == (
             before_attempt["last_stage"],
+            before_attempt["last_progress_at"],
             before_attempt["outcome"],
-        ), "the attempt record must be untouched by the repeated job"
+        ), (
+            "M90 -> at this assertion: correct = last_progress_at UNCHANGED"
+            " (a repeated/skipped stage job writes only its stage-log row,"
+            " 8.2 -- _open_stage's completion branch must not touch"
+            " close_attempts at all), mutant M90 (the skipped path also"
+            " runs the completing write's close_attempts UPDATE) = a NEW"
+            " last_progress_at, stamped at the repeated job's own run time"
+        )
 
         pending_day_close = await db.read(
             lambda c: c.execute(

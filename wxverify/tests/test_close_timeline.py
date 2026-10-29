@@ -55,8 +55,9 @@ from tests.helpers import (
     tick,
 )
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.queue import claim_next_job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
+from wxverify.verification.coverage import local_day_bounds
 
 
 @pytest.fixture(autouse=True)
@@ -742,6 +743,151 @@ def test_tl8_close_kinds_claim_ahead_of_an_older_tier1_job(
     asyncio.run(_run())
 
 
+def test_tl8_day_close_and_day_publish_claim_ahead_of_an_older_job_directly(
+    tmp_path,
+) -> None:
+    """TL8 extension: a direct, minimal claim-order check against
+    ``claim_next_job`` alone, isolated from the chain's own machinery.
+    TL8 above drives the full chain through ``run_due_jobs``, with many
+    moving parts (round-state stand-ins, gap-fill, repeated ticks); the
+    main thread's actual run of that test against M19/M19b showed it
+    does not reliably kill them. Here, two jobs only: an OLDER
+    ``fetch_feed`` row and a NEWER ``day_close`` row (then, separately,
+    ``day_publish``) -- real tier-0 membership must win over FIFO age
+    regardless of anything else in the chain.
+
+    M19 -> at the first claim assertion below: correct = "day_close"
+    (tier 0 beats a FIFO-older tier-1 job), mutant M19 (day_close left
+    out of the tier-0 CASE, ``db/queue.py:277``) = "fetch_feed" (day_close
+    falls to tier 1 and loses the FIFO race to the older row).
+
+    M19b -> at the second claim assertion below: correct = "day_publish",
+    mutant M19b (day_publish left out of the tier-0 CASE) = "fetch_feed".
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+
+        feed_row = await db.read(
+            lambda c: c.execute("SELECT id FROM feeds ORDER BY id LIMIT 1").fetchone()
+        )
+        assert feed_row is not None, "run_migrations must have seeded at least one feed"
+        feed_id = int(feed_row[0])
+
+        older = isoformat_utc_micro(NOW)
+        newer = isoformat_utc_micro(NOW + timedelta(minutes=10))
+
+        def _seed_close(c):  # type: ignore[no-untyped-def]
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, status, created_at,"
+                " updated_at) VALUES ('fetch_feed', ?, ?, 'pending', ?, ?)",
+                (site_id, f"feed:{feed_id}", older, older),
+            )
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+                " max_retries, created_at, updated_at) VALUES ('day_close', ?,"
+                " ?, '{}', 'pending', 0, ?, ?)",
+                (site_id, f"close:{site_id}:{D.isoformat()}:2", newer, newer),
+            )
+
+        await db.write(_seed_close)
+        job = await db.write(claim_next_job)
+        assert job is not None and job.type == "day_close", (
+            "M19 -> at this assertion: correct = 'day_close' (tier 0 beats"
+            " the FIFO-older fetch_feed row), mutant M19 (day_close left"
+            " out of the tier-0 CASE) = 'fetch_feed'"
+        )
+
+        await db.write(lambda c: c.execute("DELETE FROM jobs"))
+
+        def _seed_publish(c):  # type: ignore[no-untyped-def]
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, status, created_at,"
+                " updated_at) VALUES ('fetch_feed', ?, ?, 'pending', ?, ?)",
+                (site_id, f"feed:{feed_id}", older, older),
+            )
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+                " max_retries, created_at, updated_at) VALUES ('day_publish',"
+                " ?, ?, '{}', 'pending', 0, ?, ?)",
+                (site_id, f"publish:{site_id}:7", newer, newer),
+            )
+
+        await db.write(_seed_publish)
+        job2 = await db.write(claim_next_job)
+        assert job2 is not None and job2.type == "day_publish", (
+            "M19b -> at this assertion: correct = 'day_publish', mutant"
+            " M19b (day_publish left out of the tier-0 CASE) = 'fetch_feed'"
+        )
+
+    asyncio.run(_run())
+
+
+def test_tl8_reclaim_all_stale_leaves_close_kinds_next_attempt_at_alone(
+    tmp_path,
+) -> None:
+    """TL8 extension: ``reclaim_all_stale`` must never touch a stuck
+    ``day_close``/``day_publish`` job's ``next_attempt_at`` -- they are
+    not chain types (4.3), so a kill left behind by a restart simply
+    re-pends with its stamp untouched, never promoted into tier 2's
+    stale-chain handling. TL8's own end-of-run "no stale tier-2 row"
+    read is explicit that it cannot tell this apart from the real code,
+    since nothing in that run actually goes stale; this test reclaims a
+    job left ``running`` directly.
+
+    M20 -> at the day_close assertion below: correct = ``next_attempt_at
+    IS NULL`` (day_close is not in ``_CHAIN_TYPES_SQL``,
+    ``db/queue.py:264``, so ``reclaim_all_stale``'s CASE leaves it
+    alone), mutant M20 (day_close added to ``_CHAIN_TYPES_SQL``) =
+    ``next_attempt_at`` is set to the reclaim's "now" stamp.
+
+    M20b -> at the day_publish assertion below: correct = ``next_attempt_at
+    IS NULL``, mutant M20b (day_publish added to ``_CHAIN_TYPES_SQL``) =
+    set.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        stamp = isoformat_utc_micro(NOW)
+
+        def _seed(c):  # type: ignore[no-untyped-def]
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+                " max_retries, created_at, updated_at) VALUES ('day_close', ?,"
+                " ?, '{}', 'running', 0, ?, ?)",
+                (site_id, f"close:{site_id}:{D.isoformat()}:4", stamp, stamp),
+            )
+            c.execute(
+                "INSERT INTO jobs (type, site_id, job_key, payload, status,"
+                " max_retries, created_at, updated_at) VALUES ('day_publish',"
+                " ?, ?, '{}', 'running', 0, ?, ?)",
+                (site_id, f"publish:{site_id}:7", stamp, stamp),
+            )
+
+        await db.write(_seed)
+        await db.write(reclaim_all_stale)
+
+        rows = await db.read(
+            lambda c: c.execute(
+                "SELECT type, next_attempt_at FROM jobs WHERE type IN"
+                " ('day_close', 'day_publish') ORDER BY type"
+            ).fetchall()
+        )
+        by_type = {row["type"]: row["next_attempt_at"] for row in rows}
+        assert by_type["day_close"] is None, (
+            "M20 -> at this assertion: correct = None (day_close is not a"
+            " chain type, db/queue.py:264), mutant M20 (day_close added to"
+            " _CHAIN_TYPES_SQL) = the reclaim's 'now' stamp"
+        )
+        assert by_type["day_publish"] is None, (
+            "M20b -> at this assertion: correct = None, mutant M20b"
+            " (day_publish added to _CHAIN_TYPES_SQL) = the reclaim's"
+            " 'now' stamp"
+        )
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # TL9
 # ---------------------------------------------------------------------------
@@ -923,6 +1069,90 @@ def test_tl10_one_sites_fault_does_not_stop_the_others(
         assert error_lines_after_second == [], (
             "the flood guard (8.5's log map) must suppress a second ERROR"
             " line for the same site and step inside the same hour"
+        )
+
+    asyncio.run(_run())
+
+
+def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """TL10 extension: TL10 above puts S1's fault in ``round_state``,
+    which ``_site_due_instant`` reaches in ``enqueue_due_close_work``'s
+    FIRST per-site loop (8.5) -- a loop M74 never touches (M74 drops the
+    savepoint only from the SECOND loop, ``close_chain.py:2074``, where
+    ``_site_steps`` runs). S1 is excluded from the ``order`` list already
+    in that first, still-protected loop, so its fault never reaches the
+    loop M74 breaks, and the mutant survives TL10 as written.
+
+    This test puts the fault in the second loop instead: S1 gets a
+    ``closing`` ``site_days`` row with NO matching ``close_attempts``
+    row, so step 4's repair (``_repair``, plan 8.2) raises
+    ``RuntimeError("the closing attempt has no attempt record")`` from
+    inside ``_site_steps``. ``_site_due_instant`` never touches
+    ``close_attempts`` for a ``closing`` day (its only branches are
+    ``open``/``retry_due``), so S1 still clears the first loop cleanly
+    and reaches the second, where M74's missing savepoint matters.
+
+    M74 -> at the per-site-isolation assertion below: correct = S2's
+    attempt still begins despite S1's repair exception, mutant M74
+    (``enqueue_due_close_work`` without its per-site savepoint in the
+    SECOND loop) = the exception propagates out of the tick (``_conn``'s
+    ``_run_immediate`` rolls back the whole transaction on any
+    uncaught exception) and S2 is left ('open', 0) too.
+    """
+
+    async def _run() -> None:
+        db, _writer, site2, _st2 = standard_night(tmp_path)
+        conn = db._conn  # noqa: SLF001
+        site1 = day_close_site(
+            conn,
+            timezone="UTC",
+            close_on=True,
+            with_records=False,
+            station_ids=("ISTATION03", "ISTATION04"),
+        )
+        bounds = local_day_bounds(D, "UTC")
+        now = datetime(D.year, D.month, D.day, 23, 0, tzinfo=UTC)
+        conn.execute(
+            "INSERT INTO site_days (site_id, local_date, state, day_start_utc,"
+            " day_end_utc, timezone, attempts, created_at, state_changed_at)"
+            " VALUES (?, ?, 'closing', ?, ?, 'UTC', 1, ?, ?)",
+            (
+                site1,
+                D.isoformat(),
+                isoformat_utc(bounds.start_utc),
+                isoformat_utc(bounds.end_utc),
+                isoformat_utc(now),
+                isoformat_utc(now),
+            ),
+        )
+        conn.commit()
+
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site2, R, settled=True, bound_utc=BOUND)
+
+        before_s2 = await _state(db, site2)
+        assert (before_s2.state, before_s2.attempts) == ("open", 0)
+
+        caplog.set_level("ERROR", logger="wxverify.worker.close_chain")
+        raised = False
+        try:
+            await tick(db, clock, BOUND)
+        except RuntimeError:
+            raised = True
+
+        record2 = await _state(db, site2)
+        assert (record2.state, record2.attempts) == ("closing", 1), (
+            "M74 -> at this assertion: correct = S2's attempt begins at"
+            " this tick despite S1's repair exception, mutant M74"
+            " (enqueue_due_close_work without its per-site savepoint in"
+            " the second loop) = S2 is also left ('open', 0), since the"
+            f" whole tick's write rolls back together with S1's (tick"
+            f" raised={raised})"
         )
 
     asyncio.run(_run())

@@ -388,6 +388,65 @@ def test_at2_the_retry_runs_at_its_own_due_instant_and_closes(
     asyncio.run(_run())
 
 
+def test_at2_the_retry_does_not_re_check_the_round(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AT2 extension: M24 adds a round-settled re-check to the
+    ``retry_due`` branch of ``_close_due_days`` (``close_chain.py``,
+    around :1921-1926). AT2 above cannot tell this apart from the real
+    code because its ``round_state`` stand-in is left ``settled=True``
+    for the whole test (set once, before attempt 1, and never changed):
+    M24's extra check is then always satisfied too, so it never actually
+    blocks anything there and the mutant survives AT2 as written.
+
+    This test drives attempt 1 past an UNSETTLED round instead (as TL2
+    does for M14), so the round stays unsettled right through the retry:
+    the real retry ignores ``round_state`` entirely and still reaches
+    ``closed``, while M24's retry re-reads it, finds it unsettled, and
+    gets stuck.
+
+    M24 -> at the retry-closed assertion below: correct = ('closed', 2)
+    (the retry_due branch has no round check of its own), mutant M24
+    (the retry re-runs stage 1's round check and waits for the next
+    round) = ('retry_due', 1), stuck, since round_state never becomes
+    settled in this test.
+    """
+
+    async def _run() -> None:
+        db, _writer, site_id, _stations = standard_night(tmp_path)
+        disable_other_enqueuers(monkeypatch)
+        clock = MovingClock(NOW)
+        patch_close_clock(monkeypatch, clock)
+        round_state = install_round_state_standin(monkeypatch)
+        round_state.set_answer(site_id, R, settled=False, bound_utc=BOUND)
+        install_p4_standins(monkeypatch)
+        _fail_hourly_values_once(monkeypatch, "synthetic stage 3 failure")
+
+        clock.set(BOUND)
+        await run_due_jobs(db, clock)
+        record = await _state(db, site_id)
+        assert (record.state, record.attempts) == ("retry_due", 1), (
+            "attempt 1 must start on the bound alone (the round never"
+            " settles, as TL2/M14 establish) and fail at stage 3, leaving"
+            " D retry_due"
+        )
+        retry_at = record.retry_at
+        assert retry_at is not None
+
+        clock.set(retry_at)
+        await run_due_jobs(db, clock)
+        record = await _state(db, site_id)
+        assert (record.state, record.attempts) == ("closed", 2), (
+            "M24 -> at this assertion: correct = ('closed', 2) (the retry"
+            " ignores round_state entirely), mutant M24 (the retry"
+            " re-checks the round in close_chain.py's retry_due branch) ="
+            " ('retry_due', 1), stuck, since round_state never becomes"
+            " settled in this test"
+        )
+
+    asyncio.run(_run())
+
+
 # ---------------------------------------------------------------------------
 # AT3
 # ---------------------------------------------------------------------------
