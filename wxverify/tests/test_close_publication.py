@@ -462,7 +462,7 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
     Builds the precondition directly: two ``pending`` ``close_publications``
     rows (D, then D + 1), and D's stage-7 job -- not D + 1's own yet. Both
     jobs share the one ``day_publish`` job key ``publish:{site_id}:7``
-    (``_enqueue_publish_stage``, ``close_chain.py:294-305`` -- it is not
+    (``_enqueue_publish_stage``, ``close_chain.py:607-618`` -- it is not
     keyed by cutoff), and the ``jobs`` table's partial unique index only
     forbids a second PENDING/RUNNING row of that key (`migrations.py:771-
     772`), so D + 1's own job cannot be seeded until D's has run to
@@ -570,7 +570,7 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
 ) -> None:
     """PB4b (F2): ``_newer_publication`` (close_chain.py:1212) must
     also count a later cutoff's record that is already ``published``, not
-    only ``pending``/``building`` -- today's code checks only
+    only ``pending``/``building`` -- the old code (``e70b81f``) checks only
     ``state IN ('pending', 'building')``, so an older cutoff's own retry
     would publish a second time over an already-published later cutoff.
 
@@ -584,8 +584,8 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
 
     F2 -> at the two assertions below: correct = 'superseded' and publish
     not called (C1's retry sees C2's already-published record as newer),
-    today's code (only pending/building count as newer) = C1 published
-    after C2.
+    the old code (``e70b81f``) (only pending/building count as newer) = C1
+    published after C2.
     """
 
     async def _run() -> None:
@@ -651,8 +651,8 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
         message = (
             "F2 -> at this assertion: correct = 'superseded' and publish"
             " not called (C1's retry sees C2's already-published record as"
-            " newer), today's code (only pending/building count as newer)"
-            " = C1 published after C2"
+            " newer), the old code (e70b81f) (only pending/building count"
+            " as newer) = C1 published after C2"
         )
         assert c1_row is not None and c1_row["state"] == "superseded", message
         assert standins["publish"].calls == [], message

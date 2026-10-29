@@ -1100,7 +1100,7 @@ def test_tl10_a_second_loop_fault_does_not_fail_the_whole_tick(
     """TL10 extension: TL10 above puts S1's fault in ``round_state``,
     which ``_site_due_instant`` reaches in ``enqueue_due_close_work``'s
     FIRST per-site loop (8.5) -- a loop M74 never touches (M74 drops the
-    savepoint only from the SECOND loop, ``close_chain.py:2074``, where
+    savepoint only from the SECOND loop, ``close_chain.py:2126``, where
     ``_site_steps`` runs). S1 is excluded from the ``order`` list already
     in that first, still-protected loop, so its fault never reaches the
     loop M74 breaks, and the mutant survives TL10 as written.
@@ -1224,7 +1224,7 @@ def test_l5_a_database_error_from_enqueue_due_close_work_raises(
             site1, sqlite3.DatabaseError("database disk image is malformed")
         )
 
-        with pytest.raises(sqlite3.DatabaseError):
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
             await tick(db, clock, BOUND)
 
     asyncio.run(_run())
@@ -1270,7 +1270,11 @@ def test_l5_b_integrity_error_is_contained_per_site(
 
         before_s1 = await _state(db, site1)
 
-        await tick(db, clock, BOUND)
+        raised = False
+        try:
+            await tick(db, clock, BOUND)
+        except sqlite3.IntegrityError:
+            raised = True
 
         record2 = await _state(db, site2)
         assert (record2.state, record2.attempts) == ("closing", 1), (
@@ -1278,7 +1282,7 @@ def test_l5_b_integrity_error_is_contained_per_site(
             " begins despite S1's IntegrityError, rolled back to S1's own"
             " savepoint), a rule that re-raises IntegrityError too = S2 is"
             " also left ('open', 0), since the whole tick's write fails"
-            " and rolls back together with S1's"
+            f" and rolls back together with S1's (tick raised={raised})"
         )
 
         after_s1 = await _state(db, site1)
@@ -1300,9 +1304,9 @@ def test_f1_stage5_duration_is_read_after_score_day_not_before(
 ) -> None:
     """F1: stage 5's ``close_stage_log.duration_s`` must be stamped from a
     fresh clock read taken AFTER ``close_p4.score_day`` runs, not from the
-    stamp read before the stage's write began -- today's code reads
-    ``now`` once, before calling ``score_day``, so ``duration_s`` always
-    comes out 0 no matter how long the work actually took.
+    stamp read before the stage's write began -- the old code (``e70b81f``)
+    reads ``now`` once, before calling ``score_day``, so ``duration_s``
+    always comes out 0 no matter how long the work actually took.
 
     The ``score_day`` stand-in itself advances this test's own
     ``MovingClock`` by 30 seconds before returning, standing in for stage
@@ -1310,7 +1314,7 @@ def test_f1_stage5_duration_is_read_after_score_day_not_before(
 
     F1 -> at the duration_s assertion below: correct = 30.0 (the end
     stamp is a fresh read taken after score_day's 30-second advance),
-    today's code (end stamp read before the work) = 0.0.
+    the old code (``e70b81f``) (end stamp read before the work) = 0.0.
     """
 
     async def _run() -> None:
@@ -1344,7 +1348,7 @@ def test_f1_stage5_duration_is_read_after_score_day_not_before(
         assert row["duration_s"] == 30.0, (
             "F1 -> at this assertion: correct = 30.0 (the end stamp is a"
             " fresh read taken after score_day's 30-second advance),"
-            " today's code (end stamp read before the work) = 0.0"
+            " the old code (e70b81f) (end stamp read before the work) = 0.0"
         )
 
     asyncio.run(_run())
