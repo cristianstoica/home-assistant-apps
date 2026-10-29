@@ -263,10 +263,15 @@ CHAIN_PROMOTION_AGE: Final = timedelta(minutes=5)
 #: The resumable chain types: the claim's tier-2 rule and the reclaim stamp.
 _CHAIN_TYPES_SQL: Final = "('verification_run','timezone_correction')"
 
+# Tier 0 also holds the wind lane's job (``fetch_obs`` keyed ``wind-days``,
+# daily-close P2 4.6), so an evening slot is claimed before any waiting
+# tier-1 job. The key is written out: worker/wind_days.py (its
+# WIND_DAYS_JOB_KEY) imports this module, so this module cannot import it.
 _CLAIM_ORDER_BY: Final = f"""
     ORDER BY
         CASE
-            WHEN type IN ('forecast_record','record_gap_scan') THEN 0
+            WHEN type IN ('forecast_record','record_gap_scan')
+                 OR (type = 'fetch_obs' AND job_key = 'wind-days') THEN 0
             WHEN type IN {_CHAIN_TYPES_SQL}
                  AND COALESCE(next_attempt_at, updated_at) > ? THEN 2
             ELSE 1
@@ -303,7 +308,8 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
 
     Ordering is a type-priority tier, then FIFO by ``created_at, id`` within
     the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). ``forecast_record`` /
-    ``record_gap_scan`` (tier 0) still claim ahead of everything. A resumable
+    ``record_gap_scan`` and the wind lane's ``fetch_obs`` job keyed
+    ``wind-days`` (tier 0) still claim ahead of everything. A resumable
     chain chunk (``verification_run`` / ``timezone_correction``) claims after
     all other work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in
     tier 1, FIFO by ``created_at`` with the rest. Its age runs from

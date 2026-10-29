@@ -43,7 +43,7 @@ from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.queue import Job, claim_next_job
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import WIND_FINAL_LEAD, read_auth_hold, write_auth_hold
+from wxverify.db.wind_basis import read_auth_hold, write_auth_hold
 from wxverify.forecast.wind_blend import TRAINING_DAYS
 from wxverify.monitor import (  # noqa: PLC2701 -- private, exercised directly
     _wind_history_trips,
@@ -57,7 +57,6 @@ from wxverify.worker.scheduler import (
     _enqueue_due_wind_days,  # noqa: PLC2701 -- private, exercised directly (T47)
 )
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
-    _FINAL_RETRY_LEAD,
     _FINISHABLE_SQL,
     WIND_DAYS_JOB_KEY,
     _derive_days,
@@ -340,14 +339,16 @@ def test_ensure_wind_days_deletes_unparseable_local_date(
 
 
 def test_open_endpoints_held_hidden_probing_visible_only_when_asked() -> None:
+    """P2 4.4 (14.7's last paragraph): ``open_endpoints`` no longer takes a
+    ``five_minute_held`` argument at all -- ``all_1day`` is always open,
+    with the ``five_minute`` hold now checked per row inside the
+    reservation (AH1-AH4), never at the due-selector/endpoint level."""
     from wxverify.db.wind_basis import AuthHold
 
     held = AuthHold(endpoint="history_all", status="held", since="x", error=None)
     probing = AuthHold(endpoint="history_all", status="probing", since="x", error=None)
 
-    opened_held = open_endpoints(
-        {"history_all": held}, probing_open=False, five_minute_held=False
-    )
+    opened_held = open_endpoints({"history_all": held}, probing_open=False)
     assert opened_held == frozenset({"all_1day"}), (
         "mutant -> at this assertion: correct = {'all_1day'} (a held"
         " history_all hold closes history_all; all_1day has no lane hold"
@@ -355,18 +356,14 @@ def test_open_endpoints_held_hidden_probing_visible_only_when_asked() -> None:
         " history_all hold too) = frozenset()"
     )
 
-    opened_default = open_endpoints(
-        {"history_all": probing}, probing_open=False, five_minute_held=False
-    )
+    opened_default = open_endpoints({"history_all": probing}, probing_open=False)
     assert opened_default == frozenset({"all_1day"}), (
         "mutant -> at this assertion: correct = {'all_1day'} (a probing"
         " hold is NOT open when probing_open=False), mutant (probing_open"
         " check dropped) = frozenset({'history_all', 'all_1day'})"
     )
 
-    opened_probing = open_endpoints(
-        {"history_all": probing}, probing_open=True, five_minute_held=False
-    )
+    opened_probing = open_endpoints({"history_all": probing}, probing_open=True)
     assert opened_probing == frozenset({"history_all", "all_1day"}), (
         "mutant -> at this assertion: correct = {'history_all', 'all_1day'}"
         " (asking for probing_open opens a probing history_all hold too),"
@@ -374,15 +371,14 @@ def test_open_endpoints_held_hidden_probing_visible_only_when_asked() -> None:
         " probing_open ignored) = frozenset({'all_1day'})"
     )
 
-    opened_five_minute_held = open_endpoints(
-        {}, probing_open=False, five_minute_held=True
-    )
-    assert opened_five_minute_held == frozenset({"history_all"}), (
-        "mutant -> at this assertion: correct = {'history_all'} (a"
-        " five_minute refused-access hold closes all_1day only; history_all"
-        " stays open with no lane hold of its own), mutant"
-        " (five_minute_held also closes history_all, or is ignored) ="
-        " frozenset() or frozenset({'history_all', 'all_1day'})"
+    opened_no_holds = open_endpoints({}, probing_open=False)
+    assert opened_no_holds == frozenset({"history_all", "all_1day"}), (
+        "mutant -> at this assertion: correct = {'history_all', 'all_1day'}"
+        " (P2 4.4: all_1day is always open, with no five_minute_held"
+        " argument gating it any more; history_all has always been open"
+        " with no hold in force, unchanged, FM5), mutant (a leftover"
+        " five_minute_held-style parameter or default still closes"
+        f" all_1day, or history_all treated as held with no hold) = {opened_no_holds!r}"
     )
 
 
@@ -574,22 +570,27 @@ def test_persist_day_older_than_yesterday_204_is_unavailable_at_once() -> None:
 
 
 def test_today_next_attempt_near_midnight_rolls_to_tomorrow_plus_an_hour() -> None:
+    """4.2: the daytime cadence is capped at end - 1h (23:00 local), not the
+    old end - 35 min; a try at or after the cap clamps there too (the
+    evening window, not this function, owns the midnight rollover)."""
     conn = _make_db()
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
+    cap = end - timedelta(hours=1)
 
     normal = _today_next_attempt(conn, end - timedelta(hours=5), end, failed=False)
-    assert normal < end.isoformat().replace("+00:00", "Z"), (
+    assert normal < isoformat_utc(cap), (
         "mutant -> at this assertion: correct = now+interval (well before"
-        " midnight), mutant (always rolls to end+1h) = end+1h regardless"
+        " the 23:00 cap), mutant (the old 23:25 cap, or always rolls to"
+        " the cap) = a time at or after 23:00"
     )
 
-    near_midnight = _today_next_attempt(
-        conn, end - timedelta(minutes=5), end, failed=False
-    )
-    assert near_midnight == "2026-03-11T01:00:00Z", (
-        "mutant -> at this assertion: correct = start(d+1)+1h"
-        " ('2026-03-11T01:00:00Z'), mutant (the >= end rollover check"
-        " dropped) = a time before midnight"
+    at_cap = _today_next_attempt(conn, cap, end, failed=False)
+    assert at_cap == isoformat_utc(cap), (
+        "mutant -> at this assertion: correct = the cap itself"
+        " ('2026-03-10T23:00:00Z'; min(now+interval, cap) clamps once now"
+        " has reached the cap), mutant (the old end - 35 min cap, or a"
+        " jump to tomorrow + 1h kept here instead of in the evening"
+        " window) = a different value"
     )
 
 
@@ -1726,9 +1727,16 @@ def test_wind_days_lane_quiescence_leaves_a_claim_window_for_verification_run(
 
 # =============================================================================
 # 2026-10-23 wind pre-midnight fetch (plan §9) -- S1-S6, items 1-8, 10, 11.
-# D = the local day under test; start, end = local_day_slots(D, tz)[:2];
-# F = end - WIND_FINAL_LEAD; R = end - _FINAL_RETRY_LEAD. Every expected
-# value below is derived from these, never written as a bare literal.
+# D = the local day under test; start, end = local_day_slots(D, tz)[:2].
+# 2026-10-21 P2 4.2 replaces the old one-call-plus-one-retry final window
+# with the 15-slot evening window (23:00-23:59). F is now the always-run
+# 23:56 slot (end - 4 min) where S1/S2/S5's single final try lands and, on
+# success, closes the day exactly as the old F did; S4/S6's chains instead
+# start at the daytime cap (end - 1h = 23:00) and run their next tick late,
+# at 23:56 or 23:59 (an overrun: "the slots it overran are skipped", 4.2),
+# to reach the same two-failures-then-done shape with no WIND_FINAL_LEAD or
+# _FINAL_RETRY_LEAD involved. Every expected value below is derived from
+# `end`, never written as a bare literal.
 # =============================================================================
 
 _TZ_DENVER = "America/Denver"  # fall-back zone, see test_daily_truth_completeness.py:78
@@ -1769,17 +1777,19 @@ def _five_minute_marks(start: datetime, through: datetime) -> list[datetime]:
 def test_all_1day_only_day_finishes_with_eligible_wind_truth(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Plan item 1 (S1-S3). Today's final call lands at F and caps there;
-    the finish step closes D after midnight without any history/all call,
-    leaving record_count/attempts/last_ok_at/the raw-record count from the
-    F call unchanged; the resulting day publishes eligible wind_max truth
+    """Plan item 1 (S1-S3). Today's final call lands at F, the always-run
+    23:56 evening slot (4.2); a success there closes D for the day (next
+    attempt at midnight + 1h) with no later evening slot run; the finish
+    step closes D after midnight without any history/all call, leaving
+    record_count/attempts/last_ok_at/the raw-record count from the F call
+    unchanged; the resulting day publishes eligible wind_max truth
     covering 24/24 hours."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
-    final = end - WIND_FINAL_LEAD
+    final = end - timedelta(minutes=4)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -1814,10 +1824,10 @@ def test_all_1day_only_day_finishes_with_eligible_wind_truth(
     assert responses == [], "fixture bug: D's seeded response must be consumed"
     row = _day_row(conn, station_id, D)
     assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
-        "mutant -> at this assertion: correct = end + 1h (now == F is not"
-        " < final, and failed=False skips the retry branch), mutant (the"
-        " now < final cap left open, or the retry branch taken despite"
-        " failed=False) = F or R"
+        "mutant -> at this assertion: correct = end + 1h (a success at or"
+        " after 23:56 closes today's row for the day, 4.2), mutant (23:56"
+        " treated like any other evening slot, scheduling a further try"
+        " at 23:57) = a different value"
     )
     assert row["last_ok_at"] == isoformat_utc(final), (
         "mutant -> at this assertion: correct = F (the successful call's own"
@@ -1919,7 +1929,7 @@ def test_fall_back_day_final_call_covers_25_hours(
     assert end - start == timedelta(hours=25), (
         "fixture bug: 2026-11-01 must be the America/Denver fall-back day"
     )
-    final = end - WIND_FINAL_LEAD
+    final = end - timedelta(minutes=4)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -1964,71 +1974,59 @@ def test_fall_back_day_final_call_covers_25_hours(
 
 
 def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
-    """Plan item 3. A unit table at the default 180-minute cadence, over
-    both ``failed`` values, at six ``now`` points spanning well-before-F,
-    just-before-F, exactly F, between F and R, exactly R, and
-    well-after-R."""
+    """Plan item 3, rewritten for 4.2's evening window (14.12): the daytime
+    cadence is ``min(now + interval, cap)`` with the cap at end - 1h
+    (23:00), for a successful or a failed try alike -- 4.2 drops the old
+    one-retry-near-midnight window (the 15 evening slots, tested in
+    ``test_evening_window.py``, own every retry at or after the cap)."""
     conn = _make_db()
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
-    final = end - WIND_FINAL_LEAD
-    retry = end - _FINAL_RETRY_LEAD
+    cap = end - timedelta(hours=1)
 
     now_points = [
         end - timedelta(hours=5),
-        end - timedelta(minutes=36),
-        final,
-        end - timedelta(minutes=25),
-        retry,
-        end - timedelta(minutes=5),
+        end - timedelta(minutes=61),
+        cap,
     ]
-    expected_not_failed = [
+    expected = [
         isoformat_utc(end - timedelta(hours=2)),
-        isoformat_utc(final),
-        isoformat_utc(end + timedelta(hours=1)),
-        isoformat_utc(end + timedelta(hours=1)),
-        isoformat_utc(end + timedelta(hours=1)),
-        isoformat_utc(end + timedelta(hours=1)),
-    ]
-    expected_failed = [
-        isoformat_utc(end - timedelta(hours=2)),
-        isoformat_utc(final),
-        isoformat_utc(retry),
-        isoformat_utc(retry),
-        isoformat_utc(end + timedelta(hours=1)),
-        isoformat_utc(end + timedelta(hours=1)),
+        isoformat_utc(cap),
+        isoformat_utc(cap),
     ]
 
-    for now, want in zip(now_points, expected_not_failed, strict=True):
-        got = _today_next_attempt(conn, now, end, failed=False)
-        assert got == want, (
-            f"failed=False at now={now.isoformat()}:"
-            " mutant -> at this assertion: correct ="
-            f" {want}, mutant = {got}"
-        )
-    for now, want in zip(now_points, expected_failed, strict=True):
-        got = _today_next_attempt(conn, now, end, failed=True)
-        assert got == want, (
-            f"failed=True at now={now.isoformat()}:"
-            " mutant -> at this assertion: correct ="
-            f" {want}, mutant = {got}"
-        )
+    for failed in (False, True):
+        for now, want in zip(now_points, expected, strict=True):
+            got = _today_next_attempt(conn, now, end, failed=failed)
+            assert got == want, (
+                f"failed={failed} at now={now.isoformat()}:"
+                " mutant -> at this assertion: correct ="
+                f" {want} (the cap is 23:00 either way, 4.2), mutant ="
+                f" {got}"
+            )
 
 
 def test_missed_final_call_is_reported_and_the_day_still_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Plan item 4 (S4). A 200 well before the final window, then a 404 at
-    F and a 404 at R, leave D's own last_ok_at stale from that single
-    successful call -- well outside [F, end) -- so the finish step still
-    closes D (from that call's stored records) but reports exactly one
-    missed-final-collection WARNING, and the monitor reports it too."""
+    """Plan item 4 (S4), rewritten for 4.2's evening window (14.12): a 200
+    well before the window caps the row at the daytime cap (23:00); a late
+    run (an overrun -- the add-on was busy, skipping every slot it ran
+    past, 4.2) lands its next try at the always-run 23:56 slot, which
+    fails, moving the row to 23:57; a second late run lands at the last
+    slot, 23:59, which also fails, so the row is done for the day there
+    (4.2) regardless of the outcome. D's own last_ok_at stays stale from
+    the first, successful call -- well outside the window -- so the finish
+    step still closes D (from that call's stored records) but reports
+    exactly one missed-final-collection WARNING, and the monitor reports
+    it too."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
-    final = end - WIND_FINAL_LEAD
-    retry = end - _FINAL_RETRY_LEAD
+    cap = end - timedelta(hours=1)
+    late_slot = end - timedelta(minutes=4)
+    last_slot = end - timedelta(minutes=1)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -2055,29 +2053,31 @@ def test_missed_final_call_is_reported_and_the_day_still_finishes(
     _t97_freeze(monkeypatch, seed_at)
     _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
     row = _day_row(conn, station_id, D)
-    assert row["next_attempt_at"] == isoformat_utc(final), (
-        "mutant -> at this assertion: correct = F (a 200 well before F"
-        " caps the obs-cadence call at F), mutant (the now < final cap"
-        " dropped) = a different value"
+    assert row["next_attempt_at"] == isoformat_utc(cap), (
+        "mutant -> at this assertion: correct = the daytime cap, 23:00 (a"
+        " 200 well before the cap caps the obs-cadence call there), mutant"
+        " (the now < cap check dropped) = a different value"
     )
 
-    _t97_freeze(monkeypatch, final)
+    _t97_freeze(monkeypatch, late_slot)
     _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
     row = _day_row(conn, station_id, D)
-    assert row["next_attempt_at"] == isoformat_utc(retry), (
-        "mutant -> at this assertion: correct = R (a 404 at F falls"
-        " through to the ordinary row-failure path, retrying once at R),"
-        " mutant (a 404 mistakenly dispatched like a 4xx-auth or 5xx"
-        " branch) = a different value"
+    assert row["next_attempt_at"] == isoformat_utc(late_slot + timedelta(minutes=1)), (
+        "mutant -> at this assertion: correct = 23:57 (a 404 at the"
+        " always-run 23:56 slot moves to the first evening slot after"
+        " it), mutant (a 404 mistakenly dispatched like a 4xx-auth or"
+        " 5xx branch, or the overrun landing on the wrong slot) = a"
+        " different value"
     )
 
-    _t97_freeze(monkeypatch, retry)
+    _t97_freeze(monkeypatch, last_slot)
     _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
     row = _day_row(conn, station_id, D)
     assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
-        "mutant -> at this assertion: correct = end + 1h (the one retry is"
-        " exhausted), mutant (the retry-exhaustion boundary dropped,"
-        " retrying forever) = R again"
+        "mutant -> at this assertion: correct = end + 1h (after a try at"
+        " the last slot, 23:59, today's row is done for the day whatever"
+        " its outcome, 4.2), mutant (the day left open for a further"
+        " retry past 23:59) = a different value"
     )
     assert responses == [], "fixture bug: all three seeded responses must be consumed"
 
@@ -2118,10 +2118,12 @@ def test_final_call_refused_keeps_hold_behaviour(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Plan item 5 (S5), adapted for 0.16.13: a 401/403 on the final call
-    holds the ``five_minute`` kind (not an ``all_1day`` lane hold, which no
-    longer exists) and leaves the row's own status and next_attempt_at
-    exactly as seeded; afterwards the finish step still closes D with no
+    """Plan item 5 (S5), adapted for P2 4.4 (14.12, 14.7 AH3): a 401/403 on
+    the final call (now the always-run 23:56 evening slot) holds the
+    ``five_minute`` kind (not an ``all_1day`` lane hold) and leaves the
+    row's own status as seeded, but -- unlike 0.16.13 -- moves the row to
+    its next try (the first evening slot after 23:56, i.e. 23:57) and sets
+    ``refused_at`` (4.4); afterwards the finish step still closes D with no
     "missed" WARNING (the five_minute refusal already explains it), and
     the lane is no longer due."""
     conn = _t97_init_tmp_db(tmp_path)
@@ -2129,7 +2131,7 @@ def test_final_call_refused_keeps_hold_behaviour(
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
-    final = end - WIND_FINAL_LEAD
+    final = end - timedelta(minutes=4)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -2174,10 +2176,17 @@ def test_final_call_refused_keeps_hold_behaviour(
         f"{seeded_status!r}), mutant (_fetch_failed mistakenly touches"
         f" status) = {row['status']!r}"
     )
-    assert row["next_attempt_at"] == seeded_next_attempt, (
-        "mutant -> at this assertion: correct = unchanged"
-        f" ({seeded_next_attempt!r}), mutant (_fetch_failed mistakenly"
-        f" touches next_attempt_at) = {row['next_attempt_at']!r}"
+    assert row["next_attempt_at"] == isoformat_utc(final + timedelta(minutes=1)), (
+        "mutant -> at this assertion: correct = 23:57 (4.4: a 401/403 on"
+        " today's row moves it to its next try, the first evening slot"
+        " after the refused 23:56 try), mutant (the row left at its seeded"
+        " next_attempt_at, 0.16.13's lane-hold behaviour) ="
+        f" {row['next_attempt_at']!r}"
+    )
+    assert row["refused_at"] is not None, (
+        "mutant -> at this assertion: correct = a stamp (4.4/11.2: a held"
+        " or refused try sets refused_at), mutant (refused_at never"
+        " written on a 401/403) = None"
     )
 
     call_log.clear()
@@ -2221,17 +2230,20 @@ def test_final_call_refused_keeps_hold_behaviour(
 def test_budget_exhausted_final_call_defers_and_the_day_still_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Plan item 6 (S6). A daily_call_limit of 0 defers the final call
-    itself with JobDeferred before any request and before the row
-    changes; after midnight the finish step still closes D (it reserves
-    no budget) and reports the missed-final WARNING, even though the
-    same run's own fetch attempt for the new today row also defers."""
+    """Plan item 6 (S6), rewritten for P2 4.4 (14.12): a daily_call_limit of
+    0 defers the final call (the always-run 23:56 slot); unlike 0.16.13,
+    4.4 now catches that reservation ``JobDeferred`` for today's row
+    instead of letting it end the job, and moves the row -- with no
+    evening slot left at or after the billing boundary, the row is done
+    for the day there and then (4.2); after midnight the finish step still
+    closes D (it reserves no budget) and reports the missed-final
+    WARNING."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
-    final = end - WIND_FINAL_LEAD
+    final = end - timedelta(minutes=4)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -2249,8 +2261,7 @@ def test_budget_exhausted_final_call_defers_and_the_day_still_finishes(
         return httpx.Response(200, json={"observations": []})
 
     _t97_freeze(monkeypatch, final)
-    with pytest.raises(JobDeferred):
-        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+    _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
     assert call_log == [], (
         "mutant -> at this assertion: correct = no call (the budget"
         " reservation is checked before any request), mutant (the"
@@ -2258,13 +2269,24 @@ def test_budget_exhausted_final_call_defers_and_the_day_still_finishes(
         f" happened, got {call_log}"
     )
     row = _day_row(conn, station_id, D)
-    assert row["status"] == "partial"
-    assert row["next_attempt_at"] == seeded_next_attempt
+    assert row["status"] == "partial", (
+        "mutant -> at this assertion: correct = unchanged ('partial'; a"
+        " reservation deferral never touches status, only the row's next"
+        " try, 4.4), mutant (the deferral mistakenly marks the row"
+        f" failed/fetched) = {row['status']!r}"
+    )
+    assert row["next_attempt_at"] == isoformat_utc(end + timedelta(hours=1)), (
+        "mutant -> at this assertion: correct = end + 1h (4.4: a"
+        " reservation JobDeferred is caught for today's row and moves it;"
+        " 4.2: with no evening slot left at or after the call-limit"
+        " boundary, the row is done for the day there), mutant (the"
+        " JobDeferred escapes _run_row uncaught, as in 0.16.13, leaving"
+        f" the row at its seeded next_attempt_at) = {row['next_attempt_at']!r}"
+    )
 
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.wind_days"):
         _t97_freeze(monkeypatch, end + timedelta(minutes=5))
-        with pytest.raises(JobDeferred):
-            _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
+        _t97_run_wind_days(site_id, handler, monkeypatch=monkeypatch)
 
     row = _day_row(conn, station_id, D)
     assert row["status"] == "unavailable", (
@@ -2744,18 +2766,21 @@ def test_d22_finish_step_ignores_a_leftover_wind_basis_key(
 def test_final_call_429_leaves_row_due_until_the_backoff_ends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan item 10. A 429 on the final call raises JobDeferred carrying
-    the domain backoff's own F + 60s (the default initial delay, no
-    Retry-After header), while the row's own next_attempt_at stays at F
-    -- the two times must be asserted separately. Once the backoff
-    clears, the next run makes the call and finishes the obs-cadence
-    schedule normally."""
+    """Plan item 10, adapted for 4.2's window-deferral rule (14.12): a 429
+    on the final call (now the always-run 23:56 slot) raises JobDeferred
+    carrying the domain backoff's own F + 60s (the default initial delay,
+    no Retry-After header), while the row's own next_attempt_at moves --
+    unlike 0.16.13's unconditional 15-minute defer -- to the first evening
+    slot at or after that backoff end (4.2's "Deferrals inside the
+    window"), here 23:57 -- the two times must be asserted separately.
+    Once the backoff clears, the next run makes the call and finishes the
+    evening window normally."""
     conn = _t97_init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_id = _make_station(conn, site_id, "WSTATION01")
     D = date(2026, 3, 10)
     start, end, _ = local_day_slots(D, _TZ)
-    final = end - WIND_FINAL_LEAD
+    final = end - timedelta(minutes=4)
     write_auth_hold(
         conn, "history_all", status="held", since=isoformat_utc(start), error="401"
     )
@@ -2795,10 +2820,12 @@ def test_final_call_429_leaves_row_due_until_the_backoff_ends(
         " row itself), mutant (the row mistakenly marked failed/fetched"
         " on a 429) = a different status"
     )
-    assert row["next_attempt_at"] == seeded_next_attempt, (
-        "mutant -> at this assertion: correct = unchanged (F, the row's"
-        " own column), mutant (the row's next_attempt_at mistakenly"
-        " overwritten with the domain-backoff time) = F + 60s"
+    assert row["next_attempt_at"] == isoformat_utc(final + timedelta(minutes=1)), (
+        "mutant -> at this assertion: correct = 23:57 (4.2: in the window,"
+        " a 429 back-off moves the row to the first evening slot at or"
+        " after the deferral's end, F + 60s = 23:57:00), mutant (the row"
+        " left unchanged at F, 0.16.13's behaviour, or jumped 15 minutes"
+        f" ahead) = {seeded_next_attempt!r} or a different value"
     )
     assert row["last_error"] is not None
     assert _budget_calls(conn) == before_budget + 1, (

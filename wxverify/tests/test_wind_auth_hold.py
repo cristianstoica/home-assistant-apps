@@ -341,16 +341,23 @@ def test_fm1_401_on_the_5_minute_download_holds_five_minute_not_a_lane(
 def test_fm2_five_minute_hold_lifts_after_until_with_no_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Plan §13.5 FM2 (check 3 on the 5-minute download): the FM1 state;
-    at ``until`` + 1s, ``wind_lane_due`` is true and the chunk calls
-    ``all_1day`` once with no extra "probe" step (unlike the old
-    ``history_all`` lane hold's ``probing`` status), and a 200 reply
-    deletes the ``five_minute`` row."""
+    """Plan §13.5 FM2, rewritten for P2 4.4/14.7's AH1-AH2 rule (the
+    existing "today's rows are not due while five_minute is held" pin):
+    the FM1 state. Under 0.16.13, ``wind_lane_due`` reads the hold's own
+    ``until`` directly, so the row is due again the instant it lifts --
+    AH1/AH2 remove that read entirely, moving the held row to its own next
+    scheduled try instead (AH1), so ``wind_lane_due`` is governed only by
+    that schedule, not by ``until``. Here the row's next try after the
+    noon refusal is 15:00 (the daytime cadence, 4.2): one second before it
+    the row is not due, even though the hold's ``until`` (13:00) has long
+    since passed, and at 15:00 it is due -- a positive/negative pair
+    against the SAME frozen clock mechanism FM1 used, now keyed to the
+    row's schedule rather than to the hold."""
     conn = _init_tmp_db(tmp_path)
     t0 = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, t0)
     site_id = _make_site(conn)
-    _make_station(conn, site_id, "KTEST001")
+    station_id = _make_station(conn, site_id, "KTEST001")
     conn.commit()
 
     def refusing_handler(request: httpx.Request) -> httpx.Response:
@@ -360,25 +367,37 @@ def test_fm2_five_minute_hold_lifts_after_until_with_no_probe(
     record = read_access_record(conn, "five_minute")
     assert record is not None and record.until is not None
     until = parse_utc(record.until)
+    next_attempt_at = conn.execute(
+        "SELECT next_attempt_at FROM station_wind_days"
+        " WHERE station_id = ? AND local_date = ?",
+        (station_id, t0.date().isoformat()),
+    ).fetchone()["next_attempt_at"]
+    assert next_attempt_at is not None
+    next_attempt = parse_utc(str(next_attempt_at))
+    assert next_attempt > until, (
+        "fixture bug: this test needs the row's own next try to fall AFTER"
+        " the hold's until, so the two checks below can tell them apart"
+    )
 
-    # Paired negative, injected via the same frozen clock the positive below
-    # uses: 1s before `until` the hold is still in force and only today's
-    # row exists, so wind_lane_due is False. This does not by itself
-    # diverge from the gap's mutant (reading the row's mere presence
-    # instead of `until`) -- the row still exists here too, so the mutant
-    # also gives False -- it establishes the precondition the positive
-    # depends on: that `until` sits inside this test's frozen day at all,
-    # rather than months away on the real clock.
-    before = until - timedelta(seconds=1)
+    # Negative: one second before the row's own next scheduled try, even
+    # though the hold's `until` has long since passed, the row is still
+    # not due -- AH1/AH2's rule, not the hold.
+    before = next_attempt - timedelta(seconds=1)
     _freeze(monkeypatch, before)
-    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=before) is False
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=before) is False, (
+        "mutant -> at this assertion: correct = False (AH1/AH2: a held"
+        " row's due-ness comes from its own next_attempt_at, not from the"
+        " hold's until, which has already passed here), mutant"
+        " (wind_lane_due still reads the five_minute hold's until) = True"
+    )
 
-    after = until + timedelta(seconds=1)
-    _freeze(monkeypatch, after)
-    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=after) is True, (
+    # Positive, same frozen-clock mechanism: at the row's own scheduled
+    # time it is due.
+    _freeze(monkeypatch, next_attempt)
+    assert wind_lane_due(conn, site_id, ZoneInfo(_TZ), now=next_attempt) is True, (
         "mutant -> at this assertion: correct = True (the row becomes due"
-        " again once the hold has lifted), mutant (wind_lane_due still"
-        " reads five_minute_held as True after `until` has passed) = False"
+        " at its own next scheduled try), mutant (wind_lane_due still"
+        " gates all_1day on the five_minute hold) = False"
     )
 
     call_log: list[str] = []

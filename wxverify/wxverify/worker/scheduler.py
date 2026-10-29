@@ -20,6 +20,7 @@ from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_
 from wxverify.worker.wind_days import (
     WIND_DAYS_JOB_KEY,
     WIND_DAYS_SPACING,
+    wind_evening_due,
     wind_lane_due,
 )
 
@@ -380,9 +381,11 @@ def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
     """Enqueue the wind-history lane for each site with work (plan §8.13).
 
     One ``fetch_obs`` job with the ``wind-days`` key per enabled site with an
-    enabled station, spaced by ``WIND_DAYS_SPACING`` after a success. An
-    unreadable success stamp fails open here: the wrapper's success cooldown
-    fails closed on it, which would stop the lane for good.
+    enabled station, spaced by ``WIND_DAYS_SPACING`` after a success, except
+    while a today row of the site is due in the evening window (plan 4.2),
+    where the spacing would block the 23:57 to 23:59 slots. An unreadable
+    success stamp fails open here: the wrapper's success cooldown fails
+    closed on it, which would stop the lane for good.
     """
     now = utc_now()
     rows = conn.execute(
@@ -409,6 +412,8 @@ def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
         if not wind_lane_due(conn, site_id, tz, now=now):
             continue
         success_cooldown: timedelta | None = WIND_DAYS_SPACING
+        if wind_evening_due(conn, site_id, tz, now=now):
+            success_cooldown = None
         latest = conn.execute(
             LATEST_JOB_SQL, ("fetch_obs", WIND_DAYS_JOB_KEY, site_id)
         ).fetchone()

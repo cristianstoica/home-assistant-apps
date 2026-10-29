@@ -9,6 +9,9 @@ wind, and when the download that last wrote it returned.
 ``store_readings`` is the table's one writer apart from the retention delete
 and the migration. It runs in the caller's transaction and never commits;
 the clock is read only through its ``now_utc`` argument.
+
+``next_five_minute_try`` reads the 5-minute download's schedule, which the
+wind lane keeps in ``station_wind_days.next_attempt_at``.
 """
 
 from __future__ import annotations
@@ -20,10 +23,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.day_guard_log import warn_refused_instants
-from wxverify.db.site_days import WriteKind, filter_day_writes
+from wxverify.db.site_days import (
+    WriteKind,
+    current_day,
+    daily_close_on,
+    filter_day_writes,
+)
 from wxverify.obs.hourly_values import Quantity, Source, StationReading
 
 logger = logging.getLogger(__name__)
@@ -226,3 +235,92 @@ def store_readings(
         dropped=dropped,
         kept_by_quantity=kept_by_quantity,
     )
+
+
+# One second in Julian days: the margin of the SQL prefetch of the first
+# record after an instant; the exact comparison is made on parsed instants.
+_JULIAN_SECOND: Final = 1.0 / 86400.0
+
+
+def _first_day_start_after(
+    conn: sqlite3.Connection, site_id: int, now_utc: datetime
+) -> datetime | None:
+    """The ``day_start_utc`` of the site's first day record after ``now_utc``."""
+    rows = conn.execute(
+        "SELECT day_start_utc FROM site_days WHERE site_id = ?"
+        " AND julianday(day_start_utc) >= julianday(?) - ?"
+        " ORDER BY local_date LIMIT 3",
+        (site_id, isoformat_utc(now_utc), _JULIAN_SECOND),
+    ).fetchall()
+    for row in rows:
+        start = parse_utc(str(row[0]))
+        if start > now_utc:
+            return start
+    return None
+
+
+def next_five_minute_try(
+    conn: sqlite3.Connection, *, site_id: int, now_utc: datetime
+) -> datetime | None:
+    """When the site's next 5-minute download is scheduled (plan 12.2).
+
+    The earliest ``next_attempt_at`` among the site's enabled stations' rows
+    for the current day that lies before the day's end; a retryable row
+    whose stamp is NULL or unreadable is due now and gives ``now_utc``. When
+    no row has one (every row is done for the day), the day's end. The
+    current day is ``now_utc``'s local date in ``sites.timezone`` while the
+    close is off, P1's record holding ``now_utc`` while it is on; with the
+    close on and no record holding ``now_utc``, the ``day_start_utc`` of the
+    site's first record after it (None when there is none). None when the
+    site has no enabled station, or does not exist or has an unusable zone.
+    Read-only.
+    """
+    if (
+        conn.execute(
+            "SELECT 1 FROM stations WHERE site_id = ? AND enabled = 1 LIMIT 1",
+            (site_id,),
+        ).fetchone()
+        is None
+    ):
+        return None
+    if daily_close_on(conn):
+        record = current_day(conn, site_id, now_utc=now_utc)
+        if record is None:
+            return _first_day_start_after(conn, site_id, now_utc)
+        local_date, day_end = record.local_date, record.day_end_utc
+    else:
+        site = conn.execute(
+            "SELECT timezone FROM sites WHERE id = ?", (site_id,)
+        ).fetchone()
+        if site is None:
+            return None
+        tz_name = str(site[0])
+        try:
+            local_date = now_utc.astimezone(ZoneInfo(tz_name)).date()
+        except (ZoneInfoNotFoundError, ValueError):
+            return None
+        day_end = local_day_slots(local_date, tz_name)[1]
+    rows = conn.execute(
+        """
+        SELECT d.next_attempt_at
+        FROM station_wind_days d JOIN stations st ON st.id = d.station_id
+        WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date = ?
+          AND (d.status IN ('pending','partial')
+               OR (d.status = 'failed' AND d.attempts < 3))
+        """,
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    earliest: datetime | None = None
+    for row in rows:
+        raw: object = row[0]
+        due: datetime | None = None
+        if isinstance(raw, str):
+            try:
+                due = parse_utc(raw)
+            except ValueError:
+                due = None
+        if due is None:
+            due = now_utc
+        if due < day_end and (earliest is None or due < earliest):
+            earliest = due
+    return day_end if earliest is None else earliest

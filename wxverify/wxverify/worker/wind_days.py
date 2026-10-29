@@ -3,13 +3,16 @@
 One ``fetch_obs`` job with the job key ``wind-days`` runs one bounded chunk
 for one site. It fetches each station-day's raw 5-minute records and derives
 the pair-max hourly station wind (``max_adjacent_pair_mean_wind``). It keeps
-today and yesterday current, with a final call shortly before local midnight,
-and while the ``history_all`` hold is held it finishes past days with the
-records they have.
+today and yesterday current, today's row on the daytime cadence and the
+evening window's slots (``EVENING_SLOTS``), and while the ``history_all`` hold
+is held it finishes past days with the records they have.
 
 Today's 5-minute download takes the refused-access hold
-(:mod:`wxverify.worker.access_hold`); only ``history_all`` keeps the lane's own
-hold.
+(:mod:`wxverify.worker.access_hold`), checked per row inside the reservation;
+only ``history_all`` keeps the lane's own hold. Every try of today's row is
+logged to the collection try log
+(:func:`wxverify.worker.close_chain.record_collection_try`) and in one INFO
+line.
 
 The lane's share of the weather.com budget is in
 :mod:`wxverify.collection.wind_quota`.
@@ -47,6 +50,7 @@ from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import (
     floor_hour,
     isoformat_utc,
+    isoformat_utc_micro,
     local_day_slots,
     parse_utc,
     utc_now,
@@ -56,6 +60,7 @@ from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.day_guard_log import warn_refused_dates, warn_refused_instants
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import (
+    DayRecord,
     WriteKind,
     check_date_write,
     check_day_write,
@@ -64,12 +69,12 @@ from wxverify.db.site_days import (
     day_record,
     ensure_site_days,
     filter_day_writes,
+    local_clock_utc,
 )
-from wxverify.db.station_readings import store_readings
+from wxverify.db.station_readings import StoreResult, store_readings
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
     PAIR_MAX_WIND_SQL,
-    WIND_FINAL_LEAD,
     AuthHold,
     AuthHoldEndpoint,
     WindEndpoint,
@@ -93,11 +98,13 @@ from wxverify.scoring.consensus import materialize_consensus, write_station_obse
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.truth import mark_daily_truth_stale
 from wxverify.worker.access_hold import (
-    access_held,
+    AccessHeld,
+    check_access_hold,
     clear_access_refused,
     record_access_refused,
     refused_kinds,
 )
+from wxverify.worker.close_chain import record_collection_try
 from wxverify.worker.control import JobCancelled, JobControl, JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -113,11 +120,32 @@ WIND_DAYS_JOB_KEY: Final = "wind-days"
 #: The scheduler's success cooldown between two lane jobs of one site.
 WIND_DAYS_SPACING: Final = timedelta(minutes=5)
 
+#: The evening window's slots, local (hour, minute), in order (plan 4.2):
+#: 23:00; ten retries 23:06 to 23:51; 23:56; three retries 23:57 to 23:59.
+EVENING_SLOTS: Final[tuple[tuple[int, int], ...]] = (
+    (23, 0),
+    (23, 6),
+    (23, 11),
+    (23, 16),
+    (23, 21),
+    (23, 26),
+    (23, 31),
+    (23, 36),
+    (23, 41),
+    (23, 46),
+    (23, 51),
+    (23, 56),
+    (23, 57),
+    (23, 58),
+    (23, 59),
+)
+#: The slot that always runs, even after a good download (plan 4.2).
+_LATE_SLOT: Final = (23, 56)
+
 _CHUNK_CALLS: Final = 6
 _CHUNK_ROWS: Final = 24
 _MAX_ATTEMPTS: Final = 3
 _TRANSPORT_DEFER: Final = timedelta(minutes=15)
-_FINAL_RETRY_LEAD: Final = timedelta(minutes=20)
 _HEADROOM_RETRY: Final = timedelta(hours=1)
 _STORE_MARGIN: Final = timedelta(hours=24)
 _FUTURE_SLACK: Final = timedelta(minutes=5)
@@ -187,10 +215,78 @@ LIMIT :limit
 
 _RowOutcome = Literal["skipped", "fetched", "closed"]
 _FailureOutcome = Literal["fetched", "closed", "reraise"]
+DeferralReason = Literal["backoff", "call_limit"]
 
 
 class WindHeadroomExhausted(Exception):
     """The backfill headroom is below one call. Nothing has been written."""
+
+
+class ReservationDeferred(JobDeferred):
+    """A reservation met the domain back-off or the call limit (plan 4.4).
+
+    ``reason`` is ``backoff`` (``check_domain_backoff``) or ``call_limit``
+    (``reserve_budget``); ``next_attempt_at`` is the deferral's end. A
+    subclass of ``JobDeferred``, so a past row's deferral still defers the
+    job; ``_run_row`` catches it for today's row.
+    """
+
+    def __init__(self, reason: DeferralReason, next_attempt_at: str) -> None:
+        super().__init__(next_attempt_at)
+        self.reason: DeferralReason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class _DayClock:
+    """One site-day's evening slots and end, for today's row (plan 4.2).
+
+    ``slots`` are the UTC instants of ``EVENING_SLOTS`` that fall inside the
+    day, in order, each once; ``labels`` their local ``HH:MM``. ``late`` is
+    the 23:56 slot (the first kept slot at or after it), or None.
+    """
+
+    slots: tuple[datetime, ...]
+    labels: tuple[str, ...]
+    late: datetime | None
+    end: datetime
+
+    @property
+    def cap(self) -> datetime:
+        """The daytime cap: the 23:00 slot, or the day's end with no slot."""
+        return self.slots[0] if self.slots else self.end
+
+    @property
+    def done(self) -> datetime:
+        """Where a row done for the day waits: the day's end plus one hour."""
+        return self.end + _ONE_HOUR
+
+
+@dataclass(frozen=True, slots=True)
+class _TodayTry:
+    """One try of today's row, read before the try's outcome is written."""
+
+    site_id: int
+    station_id: int
+    local_date: date
+    tried: datetime
+    clock: _DayClock | None
+    slot: str
+
+
+@dataclass(frozen=True, slots=True)
+class _TryLog:
+    """A logged try of today's row, for its INFO line after the commit."""
+
+    site_id: int
+    station_id: int
+    local_date: date
+    slot: str
+    outcome: str
+    reason: str | None
+    readings: int
+    #: The try ran at or after the daytime cap (the evening window).
+    in_window: bool
+    cap: datetime | None
 
 
 @dataclass(frozen=True)
@@ -215,21 +311,18 @@ def open_endpoints(
     holds: Mapping[AuthHoldEndpoint, AuthHold],
     *,
     probing_open: bool,
-    five_minute_held: bool,
 ) -> frozenset[WindEndpoint]:
     """The endpoints the lane may call now.
 
     ``history_all`` is open with no lane hold, or with a ``probing`` one when
-    asked. ``all_1day`` has no lane hold: it is open only while the
-    ``five_minute`` refused-access hold is not in force (``five_minute_held``
-    False).
+    asked. ``all_1day`` has no lane hold and is always open: the
+    ``five_minute`` refused-access hold is checked per row inside the
+    reservation (``_reserve_wind_day_call``, plan 4.4), not here.
     """
-    opened: set[WindEndpoint] = set()
+    opened: set[WindEndpoint] = {"all_1day"}
     history = holds.get("history_all")
     if history is None or (probing_open and history.status == "probing"):
         opened.add("history_all")
-    if not five_minute_held:
-        opened.add("all_1day")
     return frozenset(opened)
 
 
@@ -374,18 +467,140 @@ def _missing_today_row(conn: sqlite3.Connection, site_id: int, today: date) -> b
     return row is not None
 
 
+def _lane_today(
+    conn: sqlite3.Connection,
+    site_id: int,
+    tz: ZoneInfo,
+    now: datetime,
+    *,
+    ensure: bool,
+) -> tuple[date, bool]:
+    """The lane's today, and whether today's row may be tried (plan 4.2).
+
+    While the close is off, today is ``now``'s local date in the site's zone
+    ``tz``, always open. While it is on, today is the date of P1's record
+    that holds ``now`` (with ``ensure``, after creating the site's missing
+    records). With no such record the site has no current day: today's row
+    is closed, and today stays ``now``'s date in ``tz`` for the past-day
+    paths only, as before the close.
+    """
+    if not daily_close_on(conn):
+        return now.astimezone(tz).date(), True
+    if ensure:
+        ensure_site_days(conn, site_id, now_utc=now)
+    record = current_day(conn, site_id, now_utc=now)
+    if record is None:
+        return now.astimezone(tz).date(), False
+    return record.local_date, True
+
+
+def _clock_from_record(record: DayRecord) -> _DayClock:
+    """The evening slots of a day record, by P1's ``local_clock_utc`` rule.
+
+    A slot that lies outside the day is left out; one that maps onto an
+    instant already kept (a wall time the clocks skipped) is kept once.
+    """
+    slots: list[datetime] = []
+    labels: list[str] = []
+    late: datetime | None = None
+    for hour, minute in EVENING_SLOTS:
+        try:
+            instant = local_clock_utc(record, hour, minute)
+        except ValueError:
+            continue
+        if slots and instant <= slots[-1]:
+            continue
+        slots.append(instant)
+        labels.append(f"{hour:02d}:{minute:02d}")
+        if late is None and (hour, minute) >= _LATE_SLOT:
+            late = instant
+    return _DayClock(
+        slots=tuple(slots), labels=tuple(labels), late=late, end=record.day_end_utc
+    )
+
+
+def _close_off_record(local_date: date, tz_name: str) -> DayRecord:
+    """A stand-in day record for a close-off day: ``local_day_slots``' bounds
+    in ``tz_name``, so P1's ``local_clock_utc`` converts its times."""
+    start, end, _ = local_day_slots(local_date, tz_name)
+    return DayRecord(
+        site_id=0,
+        local_date=local_date,
+        state="open",
+        day_start_utc=start,
+        day_end_utc=end,
+        timezone=tz_name,
+        zone_changeover=False,
+        attempts=0,
+        retry_at=None,
+        last_failure=None,
+        missed_reason=None,
+        done_at=None,
+    )
+
+
+def evening_slot_instants(local_date: date, tz_name: str) -> tuple[datetime, ...]:
+    """The UTC instants of the evening slots of ``local_date`` in ``tz_name``.
+
+    The close-off conversion (plan 4.2): each ``EVENING_SLOTS`` wall time on
+    the date in the zone, by P1's ``local_clock_utc`` rule (a skipped wall
+    time takes the instant the clocks jump, a repeated one the earlier
+    instant), in order and each once. Pure.
+    """
+    return _clock_from_record(_close_off_record(local_date, tz_name)).slots
+
+
+def _day_clock(
+    conn: sqlite3.Connection, site_id: int, local_date: date, tz_name: str
+) -> _DayClock | None:
+    """The clock of today's row dated ``local_date`` (plan 4.2).
+
+    While the close is on, from P1's record of that date, in the zone saved
+    on it; None when the site has no such record (no slot is computed and
+    nothing falls back to ``sites.timezone``). While it is off, the date in
+    ``tz_name`` (``sites.timezone``).
+    """
+    if daily_close_on(conn):
+        record = day_record(conn, site_id, local_date)
+        return None if record is None else _clock_from_record(record)
+    return _clock_from_record(_close_off_record(local_date, tz_name))
+
+
+def wind_evening_due(
+    conn: sqlite3.Connection, site_id: int, tz: ZoneInfo, *, now: datetime
+) -> bool:
+    """True while one of the site's today rows is due in the evening window.
+
+    The scheduler passes no success spacing then (plan 4.2), so the 5-minute
+    spacing after the 23:56 job cannot block 23:57 to 23:59. Read-only.
+    """
+    today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
+    if not today_open:
+        return False
+    clock = _day_clock(conn, site_id, today, tz.key)
+    if clock is None or not clock.cap <= now < clock.end:
+        return False
+    return bool(
+        wind_days_due(
+            conn, site_id, today=today, now=now, open_endpoints=("all_1day",), limit=1
+        )
+    )
+
+
 def wind_lane_due(
     conn: sqlite3.Connection, site_id: int, tz: ZoneInfo, *, now: datetime
 ) -> bool:
-    """True when the site's lane has work: the scheduler's due test (plan §8.13)."""
-    today = now.astimezone(tz).date()
+    """True when the site's lane has work: the scheduler's due test (plan §8.13).
+
+    Today's rows are due on their own schedule only; the ``five_minute``
+    hold is not read here (plan 4.4). While the close is on and no record
+    holds ``now``, no today row is due (4.2).
+    """
+    today, today_open = _lane_today(conn, site_id, tz, now, ensure=False)
     holds = read_auth_holds(conn)
-    # While the five_minute hold is in force, today's rows are not due.
-    opened = open_endpoints(
-        holds,
-        probing_open=True,
-        five_minute_held=access_held(conn, "five_minute", now) is not None,
-    )
+    opened = set(open_endpoints(holds, probing_open=True))
+    if not today_open:
+        opened.discard("all_1day")
     if wind_days_due(
         conn, site_id, today=today, now=now, open_endpoints=opened, limit=1
     ):
@@ -418,6 +633,9 @@ def wind_lane_due(
 class _JobStart:
     tz_name: str
     holds: dict[AuthHoldEndpoint, AuthHold]
+    today: date
+    #: False while the close is on and no record holds the start time.
+    today_open: bool
 
 
 def _start_job(conn: sqlite3.Connection, site_id: int) -> _JobStart:
@@ -432,9 +650,10 @@ def _start_job(conn: sqlite3.Connection, site_id: int) -> _JobStart:
     except (ZoneInfoNotFoundError, ValueError):
         logger.warning("wind lane cancelled: unusable time zone site=%s", site_id)
         raise JobCancelled() from None
-    ensure_wind_days(conn, site_id, tz, utc_now().astimezone(tz).date())
+    today, today_open = _lane_today(conn, site_id, tz, utc_now(), ensure=True)
+    ensure_wind_days(conn, site_id, tz, today)
     holds = read_auth_holds(conn)
-    return _JobStart(tz_name=tz_name, holds=holds)
+    return _JobStart(tz_name=tz_name, holds=holds, today=today, today_open=today_open)
 
 
 async def run_wind_days(
@@ -487,7 +706,7 @@ async def _run_fetch_chunk(
     client: httpx.AsyncClient,
 ) -> None:
     now = utc_now()
-    today = now.astimezone(ZoneInfo(start.tz_name)).date()
+    today = start.today
     chunk = _Chunk(
         db=db,
         writer=writer,
@@ -514,15 +733,11 @@ async def _run_fetch_chunk(
         if outcome != "skipped":
             chunk.calls += 1
     # A probing endpoint gets its one probe per chunk; its other rows wait.
-    holds, five_minute_held = await db.read(
-        lambda conn: (
-            read_auth_holds(conn),
-            access_held(conn, "five_minute", now) is not None,
-        )
-    )
-    opened = set(
-        open_endpoints(holds, probing_open=False, five_minute_held=five_minute_held)
-    )
+    holds = await db.read(read_auth_holds)
+    opened = set(open_endpoints(holds, probing_open=False))
+    if not start.today_open:
+        # The close is on and no record holds now: no today try (4.2).
+        opened.discard("all_1day")
     rows = await db.read(
         lambda conn: wind_days_due(
             conn,
@@ -632,14 +847,21 @@ def _headroom_wake(
 
 
 def _reserve_wind_day_call(
-    conn: sqlite3.Connection, site_id: int, station_id: int, *, exempt: bool
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    *,
+    exempt: bool,
+    todays_row: bool = False,
 ) -> Reservation | None:
     """Reserve one weather.com call for a station-day, in one transaction.
 
     Site disabled -> ``JobCancelled``; station disabled or moved -> None (skip
-    the row); then domain backoff, the backfill headroom (non-exempt only,
-    ``WindHeadroomExhausted`` below one call), the budget, and the lane
-    counter that the reservation belongs to.
+    the row); then domain backoff (``ReservationDeferred`` ``backoff``), for
+    today's row the ``five_minute`` refused-access hold (``AccessHeld``, plan
+    4.4), the backfill headroom (non-exempt only, ``WindHeadroomExhausted``
+    below one call), the budget (``ReservationDeferred`` ``call_limit``), and
+    the lane counter that the reservation belongs to.
     """
     site = conn.execute(
         "SELECT 1 FROM sites WHERE id = ? AND enabled = 1", (site_id,)
@@ -652,12 +874,20 @@ def _reserve_wind_day_call(
     ).fetchone()
     if station is None:
         return None
-    check_domain_backoff(conn, source_domain("weathercom"))
+    try:
+        check_domain_backoff(conn, source_domain("weathercom"))
+    except JobDeferred as exc:
+        raise ReservationDeferred("backoff", exc.next_attempt_at) from exc
+    if todays_row:
+        check_access_hold(conn, "five_minute")
     if not exempt:
         headroom = backfill_headroom(conn, now=utc_now())
         if headroom is None or headroom < 1:
             raise WindHeadroomExhausted()
-    reservation = reserve_budget(conn, "weathercom", 1)
+    try:
+        reservation = reserve_budget(conn, "weathercom", 1)
+    except JobDeferred as exc:
+        raise ReservationDeferred("call_limit", exc.next_attempt_at) from exc
     add_lane_calls(conn, lane_counter_key(exempt=exempt), reservation.billing_day, 1)
     return reservation
 
@@ -671,18 +901,65 @@ async def _run_row(
     position: int,
     total: int,
 ) -> _RowOutcome:
-    """Reserve, call and persist one station-day; the error table of §8.7."""
+    """Reserve, call and persist one station-day; the error table of §8.7.
+
+    For today's row a try that meets the ``five_minute`` hold (``AccessHeld``)
+    or a reservation deferral (``ReservationDeferred``) sends nothing: one
+    write moves the row and logs the try (plan 4.4, 4.5), and the row is
+    ``"skipped"``, not counted as a call. A past row's deferral propagates.
+    """
     key = chunk.key()
     await pace_station_call(chunk.site_id, row.station_id, chunk.calls)
     if not exempt:
         await wait_for_backfill_slot()
     site_id = chunk.site_id
+    tz_name = chunk.tz_name
+    todays_row = row.local_date == chunk.today
     async with weathercom_call_lock():
-        reservation = await chunk.writer.write(
-            lambda conn: _reserve_wind_day_call(
-                conn, site_id, row.station_id, exempt=exempt
+        try:
+            reservation = await chunk.writer.write(
+                lambda conn: _reserve_wind_day_call(
+                    conn,
+                    site_id,
+                    row.station_id,
+                    exempt=exempt,
+                    todays_row=todays_row,
+                )
             )
-        )
+        except AccessHeld as held:
+            if not todays_row:
+                raise
+            until = held.until
+            entry = await chunk.writer.write(
+                lambda conn: _record_held_try(
+                    conn,
+                    site_id=site_id,
+                    station_id=row.station_id,
+                    local_date=row.local_date,
+                    tz_name=tz_name,
+                    until=until,
+                )
+            )
+            _log_try(entry)
+            return "skipped"
+        except ReservationDeferred as deferred:
+            if not todays_row:
+                raise
+            reason = deferred.reason
+            deferral_end = deferred.next_attempt_at
+            entry = await chunk.writer.write(
+                lambda conn: _record_deferred_try(
+                    conn,
+                    site_id=site_id,
+                    station_id=row.station_id,
+                    local_date=row.local_date,
+                    tz_name=tz_name,
+                    reason=reason,
+                    deferral_end=deferral_end,
+                )
+            )
+            _log_try(entry)
+            return "skipped"
         if reservation is None:
             return "skipped"
         logger.debug(
@@ -694,6 +971,7 @@ async def _run_row(
             probe,
         )
         records: Sequence[WindRecord | StationReading]
+        no_content = False
         try:
             if row.local_date == chunk.today:
                 parsed = await fetch_all_1day(
@@ -727,8 +1005,9 @@ async def _run_row(
                     raise
                 return outcome
             records = []
+            no_content = True
         try:
-            await write_after_reservation(
+            entry = await write_after_reservation(
                 chunk.db,
                 chunk.writer,
                 lambda conn: _persist_day(
@@ -740,6 +1019,7 @@ async def _run_row(
                     today=chunk.today,
                     records=records,
                     probe=probe,
+                    no_content=no_content,
                 ),
                 reservation,
             )
@@ -752,6 +1032,7 @@ async def _run_row(
                 chunk.writer,
                 lambda conn: _row_failure(
                     conn,
+                    site_id=site_id,
                     station_id=row.station_id,
                     local_date=row.local_date,
                     tz_name=chunk.tz_name,
@@ -764,6 +1045,7 @@ async def _run_row(
                 f"station={row.pws_station_id} progress={position + 1}/{total}"
             )
             raise
+    _log_try(entry)
     return "fetched"
 
 
@@ -783,20 +1065,67 @@ async def _fetch_failed(
     *,
     exempt: bool,
 ) -> _FailureOutcome:
-    """Record a failed call (not a probe). Raises ``JobDeferred`` where §8.7 says."""
+    """Record a failed call (not a probe). Raises ``JobDeferred`` where §8.7 says.
+
+    For today's row the write that records the outcome also moves the row to
+    its next try and logs the try (plan 4.2, 4.5). A 401/403 there returns
+    ``"fetched"``, so the run's other today rows meet the new hold in their
+    reservation. A 429 or 5xx defers the job to the back-off's end, in the
+    evening window as in the daytime; in the window a transport error
+    returns ``"fetched"`` instead of raising, so the run goes on. In the
+    daytime a deferral (429, 5xx, transport) moves today's row to
+    ``min(deferral end, 23:00)``, and the raised wake is capped the same way.
+    """
     station_id = row.station_id
     local_date = row.local_date
     tz_name = chunk.tz_name
     today = chunk.today
+    site_id = chunk.site_id
+    todays_row = local_date == today
 
-    def failure(conn: sqlite3.Connection) -> None:
+    def begin(conn: sqlite3.Connection) -> _TodayTry | None:
+        # Read before any write of the outcome: the slot is the one the row
+        # held when the try started (4.2).
+        if not todays_row:
+            return None
+        current = _read_day(conn, station_id, local_date)
+        if current is None:
+            return None
+        return _today_try(
+            conn,
+            current,
+            site_id=site_id,
+            station_id=station_id,
+            local_date=local_date,
+            tz_name=tz_name,
+            tried=utc_now(),
+        )
+
+    def failure(
+        conn: sqlite3.Connection,
+        *,
+        daytime_until: datetime | None = None,
+        not_before: datetime | None = None,
+    ) -> None:
         _row_failure(
             conn,
+            site_id=site_id,
             station_id=station_id,
             local_date=local_date,
             tz_name=tz_name,
             today=today,
             message=message,
+            daytime_until=daytime_until,
+            not_before=not_before,
+        )
+
+    def failed_try(
+        conn: sqlite3.Connection, attempt: _TodayTry | None, reason: str, detail: str
+    ) -> _TryLog | None:
+        if attempt is None:
+            return None
+        return _log_today_try(
+            conn, attempt, outcome="failed", reason=reason, detail=detail
         )
 
     if isinstance(exc, httpx.HTTPStatusError):
@@ -807,20 +1136,49 @@ async def _fetch_failed(
             if endpoint == "all_1day":
                 # Today's 5-minute download was refused: hold the five_minute
                 # kind for every station. The call was made, so nothing is
-                # refunded; the row keeps its next_attempt_at.
+                # refunded; the row keeps its status and moves to its next try.
                 refused = (
                     f"station={row.pws_station_id} date={local_date.isoformat()}: "
                     f"access refused (HTTP {status})"
                 )
 
-                def record_refusal(conn: sqlite3.Connection) -> None:
+                def record_refusal(conn: sqlite3.Connection) -> _TryLog | None:
+                    attempt = begin(conn)
                     record_access_refused(conn, "five_minute", status)
-                    _set_last_error(conn, station_id, local_date, refused)
+                    stamp = isoformat_utc(utc_now())
+                    moved = (
+                        None
+                        if attempt is None
+                        else _next_try_at(conn, attempt, success=False)
+                    )
+                    conn.execute(
+                        "UPDATE station_wind_days SET last_error = ?, refused_at = ?,"
+                        " next_attempt_at = COALESCE(?, next_attempt_at),"
+                        " updated_at = ? WHERE station_id = ? AND local_date = ?",
+                        (
+                            refused,
+                            stamp,
+                            moved,
+                            stamp,
+                            station_id,
+                            local_date.isoformat(),
+                        ),
+                    )
+                    if attempt is None:
+                        return None
+                    return _log_today_try(
+                        conn,
+                        attempt,
+                        outcome="refused",
+                        reason="refused_access",
+                        detail=f"http {status}",
+                    )
 
-                await write_after_reservation(
+                entry = await write_after_reservation(
                     chunk.db, chunk.writer, record_refusal, reservation
                 )
-                return "closed"
+                _log_try(entry)
+                return "fetched"
             await write_after_reservation(
                 chunk.db,
                 chunk.writer,
@@ -835,46 +1193,102 @@ async def _fetch_failed(
             return "closed"
         if status == 429:
 
-            def rate_limited(conn: sqlite3.Connection) -> str | None:
-                next_at = record_http_backoff(conn, response)
+            def rate_limited(
+                conn: sqlite3.Connection,
+            ) -> tuple[str, _TryLog | None]:
+                attempt = begin(conn)
+                wake = record_http_backoff(conn, response) or _transport_wake()
                 _set_last_error(conn, station_id, local_date, message)
-                return next_at
+                if attempt is None:
+                    return wake, None
+                end = _parse_due(wake)
+                moved = _next_try_at(
+                    conn, attempt, success=False, daytime_until=end, not_before=end
+                )
+                conn.execute(
+                    "UPDATE station_wind_days"
+                    " SET next_attempt_at = COALESCE(?, next_attempt_at)"
+                    " WHERE station_id = ? AND local_date = ?",
+                    (moved, station_id, local_date.isoformat()),
+                )
+                return wake, failed_try(conn, attempt, "provider", "http 429")
 
-            next_at = await write_after_reservation(
+            wake, entry = await write_after_reservation(
                 chunk.db, chunk.writer, rate_limited, reservation
             )
-            raise JobDeferred(next_at or _transport_wake()) from exc
+            _log_try(entry)
+            raise JobDeferred(_capped_wake(wake, entry)) from exc
         if status >= 500:
 
-            def server_error(conn: sqlite3.Connection) -> str | None:
-                next_at = record_http_backoff(conn, response)
-                failure(conn)
-                return next_at
+            def server_error(
+                conn: sqlite3.Connection,
+            ) -> tuple[str, _TryLog | None]:
+                attempt = begin(conn)
+                wake = record_http_backoff(conn, response) or _transport_wake()
+                end = _parse_due(wake)
+                failure(conn, daytime_until=end, not_before=end)
+                return wake, failed_try(conn, attempt, "provider", f"http {status}")
 
-            next_at = await write_after_reservation(
+            # In the window as in the daytime (4.2): the job waits for the
+            # back-off's end, so the run's other today rows keep their slot.
+            wake, entry = await write_after_reservation(
                 chunk.db, chunk.writer, server_error, reservation
             )
-            raise JobDeferred(next_at or _transport_wake()) from exc
-        await write_after_reservation(chunk.db, chunk.writer, failure, reservation)
+            _log_try(entry)
+            raise JobDeferred(_capped_wake(wake, entry)) from exc
+
+        def http_failure(conn: sqlite3.Connection) -> _TryLog | None:
+            attempt = begin(conn)
+            failure(conn)
+            return failed_try(conn, attempt, "provider", f"http {status}")
+
+        _log_try(
+            await write_after_reservation(
+                chunk.db, chunk.writer, http_failure, reservation
+            )
+        )
         return "fetched"
     if (
         isinstance(exc, UpstreamPayloadError)
         and exc.diagnostics.kind in _PAYLOAD_ROW_FAULTS
     ):
-        await write_after_reservation(chunk.db, chunk.writer, failure, reservation)
+        fault = str(exc.diagnostics.kind)
+
+        def payload_failure(conn: sqlite3.Connection) -> _TryLog | None:
+            attempt = begin(conn)
+            failure(conn)
+            return failed_try(conn, attempt, "provider", fault)
+
+        _log_try(
+            await write_after_reservation(
+                chunk.db, chunk.writer, payload_failure, reservation
+            )
+        )
         return "fetched"
     if isinstance(exc, (httpx.TransportError, TimeoutError)):
         refund = is_refundable_transport_error(exc)
 
-        def transport_failure(conn: sqlite3.Connection) -> None:
+        def transport_failure(
+            conn: sqlite3.Connection,
+        ) -> tuple[str, _TryLog | None]:
+            attempt = begin(conn)
+            wake = _transport_wake()
             if refund:
                 _refund(conn, reservation, exempt=exempt)
-            failure(conn)
+            # A daytime deferral moves today's row to min(try + 15 min,
+            # 23:00); in the window it goes to its next slot (4.2).
+            failure(conn, daytime_until=_parse_due(wake))
+            return wake, failed_try(conn, attempt, "network", "network")
 
-        await write_after_reservation(
+        wake, entry = await write_after_reservation(
             chunk.db, chunk.writer, transport_failure, reservation
         )
-        raise JobDeferred(_transport_wake()) from exc
+        _log_try(entry)
+        if entry is not None and entry.in_window:
+            # 4.2: in the window the row is at its next slot and the run goes
+            # on to its other today rows instead of deferring 15 minutes.
+            return "fetched"
+        raise JobDeferred(_capped_wake(wake, entry)) from exc
     await write_after_reservation(chunk.db, chunk.writer, failure, reservation)
     return "reraise"
 
@@ -913,6 +1327,34 @@ async def _probe_failed(
 
 def _transport_wake() -> str:
     return isoformat_utc(utc_now() + _TRANSPORT_DEFER)
+
+
+def _capped_wake(wake: str, entry: _TryLog | None) -> str:
+    """``wake``, capped at the day's 23:00 slot for a daytime try of today's
+    row (4.2: a daytime deferral is still capped at 23:00)."""
+    if entry is None or entry.in_window or entry.cap is None:
+        return wake
+    at = _parse_due(wake)
+    if at is None or at <= entry.cap:
+        return wake
+    return isoformat_utc(entry.cap)
+
+
+def _log_try(entry: _TryLog | None) -> None:
+    """The try's INFO line (plan 4.5), once its write has committed."""
+    if entry is None:
+        return
+    logger.info(
+        "five-minute try site=%s station=%s date=%s slot=%s outcome=%s"
+        " reason=%s readings=%s",
+        entry.site_id,
+        entry.station_id,
+        entry.local_date.isoformat(),
+        entry.slot,
+        entry.outcome,
+        "-" if entry.reason is None else entry.reason,
+        entry.readings,
+    )
 
 
 def _refund(
@@ -1027,20 +1469,266 @@ def _read_records(
 
 
 def _today_next_attempt(
-    conn: sqlite3.Connection, now: datetime, end: datetime, *, failed: bool
+    conn: sqlite3.Connection,
+    now: datetime,
+    end: datetime,
+    *,
+    failed: bool,
+    cap: datetime | None = None,
 ) -> str:
-    """Next today call: the obs cadence capped at the final call (end - 35 min,
-    before the one-day product resets); one retry at end - 20 min after a
-    failed final call; otherwise end + 1 h."""
+    """The next daytime try after one at ``now`` (plan 4.2).
+
+    ``min(now + obs_interval_minutes, cap)``, whatever the try's outcome, so
+    ``failed`` changes nothing. ``cap`` is the day's 23:00 slot; when not
+    given it is ``end`` (the day's end) minus one hour. Every try at or after
+    the cap belongs to the evening window (``_window_next``).
+    """
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
-    final = end - WIND_FINAL_LEAD
-    if now < final:
-        next_at = min(now + timedelta(minutes=interval), final)
-    elif failed and now < end - _FINAL_RETRY_LEAD:
-        next_at = end - _FINAL_RETRY_LEAD
-    else:
-        next_at = end + _ONE_HOUR
-    return isoformat_utc(next_at)
+    limit = end - _ONE_HOUR if cap is None else cap
+    return isoformat_utc(min(now + timedelta(minutes=interval), limit))
+
+
+def _parse_due(value: object) -> datetime | None:
+    """A stored stamp as an instant; None for NULL or an unreadable value."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_utc(value)
+    except ValueError:
+        return None
+
+
+def _slot_label(clock: _DayClock | None, due: datetime | None, tried: datetime) -> str:
+    """The try log's slot for a try of today's row (plan 4.5).
+
+    The slot the row held when the try started (``due``; the try time when
+    the row held none): ``daytime`` before the 23:00 slot, else the latest
+    evening slot at or before it as local ``HH:MM``. A late try is still
+    that slot's try (4.2).
+    """
+    at = tried if due is None else due
+    if clock is None or not clock.slots or at < clock.slots[0]:
+        return "daytime"
+    label = clock.labels[0]
+    for slot, name in zip(clock.slots, clock.labels, strict=True):
+        if slot > at:
+            break
+        label = name
+    return label
+
+
+def _today_try(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    tz_name: str,
+    tried: datetime,
+) -> _TodayTry:
+    """A try of today's row, from its row as read before the outcome write."""
+    clock = _day_clock(conn, site_id, local_date, tz_name)
+    return _TodayTry(
+        site_id=site_id,
+        station_id=station_id,
+        local_date=local_date,
+        tried=tried,
+        clock=clock,
+        slot=_slot_label(clock, _parse_due(row["next_attempt_at"]), tried),
+    )
+
+
+def _window_next(
+    clock: _DayClock,
+    tried: datetime,
+    *,
+    success: bool,
+    not_before: datetime | None,
+) -> datetime:
+    """The next try after one at or after the 23:00 slot (plan 4.2).
+
+    A success before the 23:56 slot moves to it; a success at or after it is
+    done for the day. Otherwise the first slot after ``tried`` (and, for a
+    deferral, at or after its end ``not_before``); with none left, done for
+    the day (the day's end plus one hour).
+    """
+    if success:
+        if clock.late is not None and tried < clock.late:
+            return clock.late
+        return clock.done
+    for slot in clock.slots:
+        if slot > tried and (not_before is None or slot >= not_before):
+            return slot
+    return clock.done
+
+
+def _next_try_at(
+    conn: sqlite3.Connection,
+    attempt: _TodayTry,
+    *,
+    success: bool,
+    daytime_until: datetime | None = None,
+    not_before: datetime | None = None,
+) -> str | None:
+    """The stamp today's row moves to after ``attempt`` (plan 4.2, 4.4).
+
+    In the daytime ``min(tried + interval, 23:00)``, whatever the outcome,
+    except a deferral: given its end ``daytime_until`` (a 429's or 5xx's
+    back-off end, a transport error's try + 15 min, a reservation
+    deferral's end), ``min(daytime_until, 23:00)``. In the evening window
+    ``_window_next``, with ``not_before`` (a back-off's or reservation
+    deferral's end) when given. None when the row has no clock (the close is
+    on and its date has no record): the row keeps its stamp.
+    """
+    clock = attempt.clock
+    if clock is None:
+        return None
+    tried = attempt.tried
+    if tried < clock.cap:
+        if daytime_until is not None:
+            return isoformat_utc(min(daytime_until, clock.cap))
+        return _today_next_attempt(
+            conn, tried, clock.end, failed=not success, cap=clock.cap
+        )
+    return isoformat_utc(
+        _window_next(clock, tried, success=success, not_before=not_before)
+    )
+
+
+def _log_today_try(
+    conn: sqlite3.Connection,
+    attempt: _TodayTry,
+    *,
+    outcome: str,
+    reason: str | None,
+    detail: str | None,
+    kept: int = 0,
+    refused: int = 0,
+) -> _TryLog:
+    """Write the try's ``close_try_log`` row in the caller's transaction."""
+    record_collection_try(
+        conn,
+        site_id=attempt.site_id,
+        station_id=attempt.station_id,
+        local_date=attempt.local_date.isoformat(),
+        kind="five_minute",
+        slot=attempt.slot,
+        close_attempt=None,
+        tried_at=isoformat_utc_micro(attempt.tried),
+        outcome=outcome,
+        reason=reason,
+        detail=detail,
+        readings_kept=kept,
+        readings_refused=refused,
+    )
+    clock = attempt.clock
+    return _TryLog(
+        site_id=attempt.site_id,
+        station_id=attempt.station_id,
+        local_date=attempt.local_date,
+        slot=attempt.slot,
+        outcome=outcome,
+        reason=reason,
+        readings=kept,
+        in_window=clock is not None and attempt.tried >= clock.cap,
+        cap=None if clock is None else clock.cap,
+    )
+
+
+def _record_held_try(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    tz_name: str,
+    until: str,
+) -> _TryLog | None:
+    """A try of today's row that met the ``five_minute`` hold (plan 4.4).
+
+    Moves the row to its next try as a try that did not succeed, sets its
+    ``refused_at`` and logs outcome ``held``. Writes nothing to the hold.
+    """
+    row = _read_day(conn, station_id, local_date)
+    if row is None:
+        return None
+    attempt = _today_try(
+        conn,
+        row,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=local_date,
+        tz_name=tz_name,
+        tried=utc_now(),
+    )
+    stamp = isoformat_utc(attempt.tried)
+    conn.execute(
+        "UPDATE station_wind_days SET next_attempt_at = COALESCE(?, next_attempt_at),"
+        " refused_at = ?, updated_at = ? WHERE station_id = ? AND local_date = ?",
+        (
+            _next_try_at(conn, attempt, success=False),
+            stamp,
+            stamp,
+            station_id,
+            local_date.isoformat(),
+        ),
+    )
+    return _log_today_try(
+        conn, attempt, outcome="held", reason="refused_access", detail=until
+    )
+
+
+def _record_deferred_try(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    tz_name: str,
+    reason: DeferralReason,
+    deferral_end: str,
+) -> _TryLog | None:
+    """A try of today's row whose reservation was deferred (plan 4.4).
+
+    Moves the row: in the daytime to ``min(deferral end, 23:00)``, in the
+    window to the first slot at or after the deferral's end, else done for
+    the day. Logs outcome ``failed`` with ``reason`` as reason and detail.
+    The row's status is left as it is.
+    """
+    row = _read_day(conn, station_id, local_date)
+    if row is None:
+        return None
+    attempt = _today_try(
+        conn,
+        row,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=local_date,
+        tz_name=tz_name,
+        tried=utc_now(),
+    )
+    end = _parse_due(deferral_end)
+    moved = _next_try_at(
+        conn, attempt, success=False, daytime_until=end, not_before=end
+    )
+    conn.execute(
+        "UPDATE station_wind_days SET next_attempt_at = COALESCE(?, next_attempt_at),"
+        " updated_at = ? WHERE station_id = ? AND local_date = ?",
+        (moved, isoformat_utc(attempt.tried), station_id, local_date.isoformat()),
+    )
+    return _log_today_try(conn, attempt, outcome="failed", reason=reason, detail=reason)
+
+
+def _stored_detail(result: StoreResult) -> str:
+    """The ``stored`` outcome's detail (plan 4.5): the readings kept per
+    quantity, those already stored, and those P1's guard refused."""
+    per = result.kept_by_quantity
+    return (
+        f"temperature={per['temperature']} precip={per['precip']}"
+        f" wind={per['wind']} already_stored={result.already_stored}"
+        f" refused={result.refused}"
+    )
 
 
 def _is_refetch(row: sqlite3.Row) -> bool:
@@ -1056,7 +1744,8 @@ def _read_day(
 ) -> sqlite3.Row | None:
     row: sqlite3.Row | None = conn.execute(
         """
-        SELECT status, attempts, refetch_at, refetched FROM station_wind_days
+        SELECT status, attempts, refetch_at, refetched, next_attempt_at
+        FROM station_wind_days
         WHERE station_id = ? AND local_date = ?
         """,
         (station_id, local_date.isoformat()),
@@ -1125,9 +1814,16 @@ def _persist_day(
     today: date,
     records: Sequence[WindRecord | StationReading],
     probe: AuthHoldEndpoint | None,
-) -> None:
+    no_content: bool = False,
+) -> _TryLog | None:
     """Store one fetched station-day, derive its pair-max station rows, and
     advance its row.
+
+    Today's row is a successful try (plan 4.2): it stays ``partial``, moves
+    to its next try, and its try is logged in this transaction (4.5) with
+    outcome ``stored``, or ``no_readings`` (``no_content`` for a 204, set by
+    the caller, ``empty`` for an empty list); the log entry is returned for
+    the INFO line. A past row returns None.
 
     ``records`` are the download's readings: ``StationReading``s with every
     quantity, or ``WindRecord``s (wind only, no local date). Those inside the
@@ -1163,7 +1859,7 @@ def _persist_day(
             local_date,
             len(readings) - len(kept),
         )
-    store_readings(
+    stored = store_readings(
         conn,
         station_id=station_id,
         source="five_minute",
@@ -1187,7 +1883,7 @@ def _persist_day(
             station_id,
             local_date,
         )
-        return
+        return None
     attempts = int(row["attempts"])
     refetch = _is_refetch(row)
     count_row = conn.execute(
@@ -1198,9 +1894,28 @@ def _persist_day(
     ).fetchone()
     record_count = int(count_row["n"])
     next_attempt_at: str | None = None
+    attempt: _TodayTry | None = None
     if local_date == today:
         status = "partial"
-        next_attempt_at = _today_next_attempt(conn, now, end, failed=False)
+        attempt = _today_try(
+            conn,
+            row,
+            site_id=site_id,
+            station_id=station_id,
+            local_date=local_date,
+            tz_name=tz_name,
+            tried=now,
+        )
+        moved = _next_try_at(conn, attempt, success=True)
+        # No clock (close on, no record of the date): the row keeps its stamp.
+        kept_stamp = row["next_attempt_at"]
+        next_attempt_at = (
+            moved
+            if moved is not None
+            else None
+            if kept_stamp is None
+            else str(kept_stamp)
+        )
     elif record_count > 0:
         status = "fetched"
     elif local_date == yesterday and attempts < _MAX_ATTEMPTS:
@@ -1240,6 +1955,23 @@ def _persist_day(
         clear_access_refused(conn, "five_minute")
     if probe is not None:
         clear_auth_hold(conn, probe)
+    if attempt is None:
+        return None
+    if no_content:
+        outcome, detail = "no_readings", "no_content"
+    elif not records:
+        outcome, detail = "no_readings", "empty"
+    else:
+        outcome, detail = "stored", _stored_detail(stored)
+    return _log_today_try(
+        conn,
+        attempt,
+        outcome=outcome,
+        reason=None,
+        detail=detail,
+        kept=stored.kept,
+        refused=stored.refused,
+    )
 
 
 def _derive_days(
@@ -1462,6 +2194,7 @@ async def _finish_waiting_days(chunk: _Chunk, start: _JobStart) -> None:
             await chunk.writer.write(
                 lambda conn, sid=station_id, day=local_date, text=message: _row_failure(
                     conn,
+                    site_id=site_id,
                     station_id=sid,
                     local_date=day,
                     tz_name=tz_name,
@@ -1599,13 +2332,23 @@ def _finish_day(
 def _row_failure(
     conn: sqlite3.Connection,
     *,
+    site_id: int,
     station_id: int,
     local_date: date,
     tz_name: str,
     today: date,
     message: str,
+    daytime_until: datetime | None = None,
+    not_before: datetime | None = None,
 ) -> None:
-    """The row-failure rule (plan §8.7): refetch, today, then a past date."""
+    """The row-failure rule (plan §8.7): refetch, today, then a past date.
+
+    Today's row stays ``partial`` and moves to its next try as a try that
+    did not succeed (plan 4.2): in the daytime a deferral's end
+    ``daytime_until`` moves it to ``min(that end, 23:00)``; in the evening
+    window ``not_before``, a back-off's end, moves it to the first slot at
+    or after that end.
+    """
     row = _read_day(conn, station_id, local_date)
     if row is None:
         return
@@ -1619,12 +2362,27 @@ def _row_failure(
         )
         return
     if local_date == today:
-        end = local_day_slots(local_date, tz_name)[1]
+        attempt = _today_try(
+            conn,
+            row,
+            site_id=site_id,
+            station_id=station_id,
+            local_date=local_date,
+            tz_name=tz_name,
+            tried=now,
+        )
         conn.execute(
-            "UPDATE station_wind_days SET status = 'partial', next_attempt_at = ?,"
-            " last_error = ?, updated_at = ? WHERE station_id = ? AND local_date = ?",
+            "UPDATE station_wind_days SET status = 'partial',"
+            " next_attempt_at = COALESCE(?, next_attempt_at), last_error = ?,"
+            " updated_at = ? WHERE station_id = ? AND local_date = ?",
             (
-                _today_next_attempt(conn, now, end, failed=True),
+                _next_try_at(
+                    conn,
+                    attempt,
+                    success=False,
+                    daytime_until=daytime_until,
+                    not_before=not_before,
+                ),
                 message,
                 stamp,
                 station_id,
