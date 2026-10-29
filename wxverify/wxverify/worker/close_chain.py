@@ -11,7 +11,9 @@ P5 and P6 (14.2); ``record_collection_try``, the writer of the
 collection try log (11.2); and ``enqueue_due_close_work``, the tick's part
 (8.5): stage 1, the missed days, the repair and the publication retry; and
 ``settle_interrupted_closes``, which settles the closes and publications a
-stop cut short, at each start and on an imported file (5.5, 9.4, 12.6).
+stop cut short, at each start and on an imported file (5.5, 9.4, 12.6);
+and ``begin_offline_close`` and ``run_offline_stage``, with which the
+``close-day`` command closes one past day on a database copy (8.8).
 
 P4's four call points are always called through ``close_p4``, never
 imported by name, so P4 binds them in that one module.
@@ -31,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from functools import partial
-from typing import Final, Literal
+from typing import Final, Literal, cast
 
 from wxverify.core import timeutil
 from wxverify.core.timeutil import (
@@ -1138,12 +1140,16 @@ def _score_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
 # --- stage 6: the closure ----------------------------------------------------
 
 
-def _closure(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bool:
+def _closure(
+    conn: sqlite3.Connection, raw: Job, job: _StageJob, *, publish: bool = True
+) -> bool:
     """Stage 6's one write: the closure, its publication, stage 7 (8.1, 8.6).
 
     ``finish_close``, the attempt closed, the stage-log row, the publication
     record of cutoff ``closed_through`` opened and stage 7 enqueued all
-    commit together or not at all. True when the day was closed.
+    commit together or not at all. True when the day was closed. With
+    ``publish`` False (the offline close, 8.8) no publication record is
+    opened and no stage 7 is enqueued.
     """
     now = utc_now()
     running = _open_stage(conn, raw, job, now)
@@ -1158,6 +1164,8 @@ def _closure(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> bool:
         (stamp, stamp, job.site_id, job.local_date.isoformat(), job.attempt),
     )
     _write_stage_row(conn, job, running.stamps, now_utc=now, outcome="completed")
+    if not publish:
+        return True
     cutoff = closed_through(conn, job.site_id)
     if cutoff is None:
         raise RuntimeError("no closed day after finish_close")
@@ -1370,6 +1378,89 @@ async def run_day_publish(db: Database, writer: FencedWriter, job: Job) -> None:
         await _publish_stage(db, writer, job, stage_job)
     else:
         await _cleanup_stage(db, writer, job, stage_job)
+
+
+# --- the offline close of one past day (8.8) ---------------------------------
+
+
+def begin_offline_close(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: date,
+    first_stage: int,
+    now_utc: datetime,
+) -> None:
+    """Start the offline close's attempt, in the caller's transaction (8.8).
+
+    ``begin_close`` and the attempt record (``last_stage`` 1), as the tick
+    starts an attempt (``_start_attempt``), but with no stage-1 row and no
+    stage 2: ``first_stage`` is enqueued instead, 3 to rebuild the day's
+    hours from the raw readings or 4 to keep its stored ``observations``.
+    Raises ``DayStateError`` as ``begin_close`` does. Never commits.
+    """
+    if first_stage not in (3, 4):
+        raise ValueError(f"the offline close starts at stage 3 or 4, not {first_stage}")
+    attempt = begin_close(conn, site_id, local_date, now_utc=now_utc)
+    stamp = isoformat_utc_micro(now_utc)
+    conn.execute(
+        "INSERT INTO close_attempts (site_id, local_date, attempt, started_at,"
+        " last_progress_at) VALUES (?, ?, ?, ?, ?)",
+        (site_id, local_date.isoformat(), attempt, stamp, stamp),
+    )
+    _enqueue_close_stage(conn, site_id, local_date, first_stage, attempt)
+
+
+def run_offline_stage(
+    conn: sqlite3.Connection, *, site_id: int, local_date: date, stage: int
+) -> bool:
+    """Run one stage, 3 to 6, of the offline close, in the caller's transaction.
+
+    Plan 8.8. Claims the site-day's ``pending`` ``day_close`` job of
+    ``stage`` as the queue's claim does (``status`` ``running``,
+    ``updated_at`` the claim time), runs that stage's body as
+    ``run_day_close`` would and completes the job row with the success
+    marker. Stages 3 to 5 enqueue the next stage as they do in the add-on;
+    stage 6 saves the closure with no publication record and no stage 7,
+    and no raw retention follows. Returns False, with nothing written, when
+    no such job is pending: an earlier stage failed the attempt. Never
+    commits.
+    """
+    if stage not in (3, 4, 5, 6):
+        raise ValueError(f"the offline close runs stages 3 to 6, not {stage}")
+    key = _close_key(site_id, local_date, stage)
+    row = conn.execute(
+        "UPDATE jobs SET status = 'running', updated_at = ?"
+        " WHERE type = 'day_close' AND site_id = ? AND job_key = ?"
+        " AND status = 'pending' RETURNING id, payload, retry_count, max_retries",
+        (isoformat_utc(utc_now()), site_id, key),
+    ).fetchone()
+    if row is None:
+        return False
+    payload: object = json.loads(str(row[1]))
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"day_close job {row[0]} has no object payload")
+    raw = Job(
+        id=int(row[0]),
+        type="day_close",
+        site_id=site_id,
+        job_key=key,
+        payload=cast(dict[str, object], payload),
+        status="running",
+        retry_count=int(row[2]),
+        max_retries=int(row[3]),
+    )
+    stage_job = _parse_or_cancel(raw, "day_close")
+    if stage == 3:
+        _hourly_values_stage(conn, raw, stage_job)
+    elif stage == 4:
+        _truth_stage(conn, raw, stage_job)
+    elif stage == 5:
+        _score_stage(conn, raw, stage_job)
+    else:
+        _closure(conn, raw, stage_job, publish=False)
+    complete(conn, raw.id, result="ok")
+    return True
 
 
 # --- failures ----------------------------------------------------------------

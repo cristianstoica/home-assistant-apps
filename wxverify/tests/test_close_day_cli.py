@@ -41,6 +41,7 @@ from wxverify import config
 from wxverify.__main__ import main
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
+from wxverify.db.tz_generations import ensure_published_generation
 
 _CLOSE_TABLES = (
     "close_attempts",
@@ -124,6 +125,12 @@ def _build_v12_file(
         (site_name,),
     ).lastrowid
     assert site_id is not None
+    # Every real site has a published timezone generation -- a new site
+    # gets it at creation (wxverify/api/routes/sites.py), and migrate_v4
+    # seeds it for pre-existing sites. Seeding it here matches both paths;
+    # it is never set by a migration on this file, because the site is
+    # inserted after run_migrations already ran.
+    ensure_published_generation(conn, int(site_id))
     stations: dict[str, int] = {}
     for pws_id in ("ISTATION01", "ISTATION02"):
         station_id = conn.execute(
@@ -381,7 +388,8 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
     beside it, mutant M73 (close-day runs on PATH itself instead of a copy
     it makes) = the source file modified and no new file created.
     """
-    from tests.helpers import patch_weathercom_transport
+    from tests.helpers import install_p4_standins, patch_weathercom_transport
+    from wxverify.worker.close_p4 import ScoreSummary
 
     path = tmp_path / "wxverify.db"
     site_id, _stations = _build_v12_file(path)
@@ -392,6 +400,8 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
         raise AssertionError("no gap-fill request may be made by the offline close")
 
     patch_weathercom_transport(monkeypatch, _handler)  # type: ignore[arg-type]
+    standins = install_p4_standins(monkeypatch)
+    standins["score_day"].result = ScoreSummary(scored={}, absent={})
 
     before_names = sorted(p.name for p in tmp_path.iterdir())
     before_bytes, before_version = _file_bytes_and_version(path)
@@ -471,6 +481,10 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
         assert publications[0] == 0, "the offline close must open no publication"
     finally:
         new_conn.close()
+
+    assert standins["publish"].calls == [], (
+        "the offline close never runs stage 7 -- close_p4.publish must not be called"
+    )
 
     out = capsys.readouterr().out
     assert new_names[0] in out, "the printout must name the new file"

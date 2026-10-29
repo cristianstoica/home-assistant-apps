@@ -62,6 +62,7 @@ from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.site_days import begin_close, fail_close, finish_close, mark_missed
+from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.day_values import GapFillResult, StationFill
 from wxverify.worker.processor import run_claimed_job
@@ -652,6 +653,12 @@ def _build_v12_file(
         (site_name,),
     ).lastrowid
     assert site_id is not None
+    # Every real site has a published timezone generation -- a new site
+    # gets it at creation (wxverify/api/routes/sites.py), and migrate_v4
+    # seeds it for pre-existing sites. Seeding it here matches both paths;
+    # it is never set by a migration on this file, because the site is
+    # inserted after run_migrations already ran.
+    ensure_published_generation(conn, int(site_id))
     stations: dict[str, int] = {}
     for pws_id in ("ISTATION01", "ISTATION02"):
         station_id = conn.execute(
@@ -756,6 +763,8 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
     src2, site2 = _build_lg4_source(tmp_path / "b")
     src3, site3 = _build_lg4_source(tmp_path / "c", high_bump=1.0)
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
+    standins = install_p4_standins(monkeypatch)
+    standins["score_day"].result = ScoreSummary(scored={}, absent={})
 
     new_files: dict[str, object] = {}
     for label, src, site_id in (

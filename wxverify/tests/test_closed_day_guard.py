@@ -2310,7 +2310,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
     hits: set[tuple[str, str]] = set()
     hit_targets: dict[tuple[str, str], set[str]] = {}
     stale_module_calls: list[str] = []
-    copy_on_calls: list[str] = []
+    copy_on_calls: list[tuple[str, str]] = []
     state_table_modules: set[str] = set()
 
     for py_file in sorted(root.rglob("*.py")):
@@ -2387,9 +2387,8 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
                 and node.func.id == "open_day_on_copy"
-                and module != "wxverify.__main__"
             ):
-                copy_on_calls.append(module)
+                copy_on_calls.append((module, _enclosing(node, tree)))
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -2430,7 +2429,7 @@ def test_gw17_writer_source_scan_matches_the_allowlist() -> None:
         "wxverify.scoring.consensus.materialize_consensus",
         "wxverify.worker.wind_days._invalidate_unparseable",
     ]
-    assert copy_on_calls == []
+    assert copy_on_calls == [("wxverify.__main__", "_close_day")], copy_on_calls
 
     offending_state_modules = sorted(
         state_table_modules - {"wxverify.db.migrations", "wxverify.db.site_days"}
