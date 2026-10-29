@@ -161,12 +161,18 @@ def test_sc1_v11_file_rebuilds_to_the_fresh_shape_with_rows_kept() -> None:
 def test_sc2_rerun_guard_skips_the_rebuild_when_source_already_present() -> None:
     """SC2 (14.11): the rebuild already committed but ``user_version`` was
     left at 11 (a crash between the two) -- re-entry opens straight to
-    ``TARGET_USER_VERSION`` with no error and no duplicate rows.
+    ``TARGET_USER_VERSION`` with no error and both rows unchanged, column for
+    column: one ``five_minute`` row and, at another instant, a
+    ``current_obs`` row with speed, temperature, rain total, local date and
+    fetch time.
 
-    M67 -> at the ``len(rows)`` assertion: correct = 1 (the re-run guard
-    skips the ``INSERT ... SELECT`` when the column already exists), mutant
-    (the re-run guard dropped) = 2, the copy running a second time against
-    the already-widened table.
+    M67 -> at the ``after_rows == before_rows`` assertion: correct = True
+    (the re-run guard skips the ``INSERT ... SELECT`` when the column
+    already exists, so neither row changes); mutant (the re-run guard
+    dropped) = False, the ``current_obs`` row comes back with ``source``
+    overwritten to ``'five_minute'`` and its ``local_date``, ``temp_c``,
+    ``precip_total_mm`` and ``fetched_at`` all NULL, the copy running a
+    second time against the already-widened table.
     """
     conn = _migrated_conn()
     station_id = _make_station(conn)
@@ -175,21 +181,41 @@ def test_sc2_rerun_guard_skips_the_rebuild_when_source_already_present() -> None
         " speed_kmh) VALUES (?, '2026-10-27T10:00:00Z', 'five_minute', 7.0)",
         (station_id,),
     )
+    conn.execute(
+        "INSERT INTO station_wind_records (station_id, obs_at, source,"
+        " speed_kmh, temp_c, precip_total_mm, local_date, fetched_at)"
+        " VALUES (?, '2026-10-27T10:05:00Z', 'current_obs', 5.0, 12.3, 0.4,"
+        " '2026-10-27', '2026-10-27T10:06:00Z')",
+        (station_id,),
+    )
     # The crash: the rebuild (step 2) already committed, but the version
     # PRAGMA (written only at the end of run_migrations) was not.
     conn.execute("PRAGMA user_version = 11")
     conn.commit()
+
+    before_rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT station_id, obs_at, source, local_date, speed_kmh,"
+            " temp_c, precip_total_mm, fetched_at FROM station_wind_records"
+            " ORDER BY obs_at, source"
+        )
+    ]
 
     run_migrations(conn)
 
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     assert version == TARGET_USER_VERSION
 
-    rows = conn.execute(
-        "SELECT station_id, source, speed_kmh FROM station_wind_records"
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["speed_kmh"] == 7.0
+    after_rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT station_id, obs_at, source, local_date, speed_kmh,"
+            " temp_c, precip_total_mm, fetched_at FROM station_wind_records"
+            " ORDER BY obs_at, source"
+        )
+    ]
+    assert after_rows == before_rows
 
     # Calling the migration directly on a connection whose table already
     # carries `source` (the guard's own condition) must change nothing: the

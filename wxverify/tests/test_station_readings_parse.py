@@ -46,13 +46,19 @@ def _payload(*observations: dict[str, object]) -> dict[str, object]:
 
 def test_pr1_tempavg_preferred_over_high_low_and_temp_not_required() -> None:
     """PR1 (14.3): ``tempAvg`` is read over ``tempHigh``/``tempLow``; a
-    reading with no ``temp`` field still gets a temperature from it.
+    reading with no ``temp`` field still gets a temperature from it. A
+    second item has both ``tempAvg`` and ``temp`` present, to pin that
+    ``tempAvg`` is read before ``temp``.
 
     mutant_high_low -> at the ``temp_c`` assertion: correct = 11.0 (the
     ``tempAvg`` value), mutant (falling back to ``tempHigh``/``tempLow``
     when ``tempAvg`` is present) = 12.0 or 10.0 -- the fixture's three
     temperature fields are deliberately distinct so the three literals
     diverge.
+
+    M4 -> at the second item's ``temp_c`` assertion: correct = 11.0 (the
+    ``tempAvg`` value), mutant (reading ``temp`` before ``tempAvg``) =
+    15.0.
     """
     item = {
         "valid_time_gmt": _epoch(10, 4),
@@ -65,12 +71,24 @@ def test_pr1_tempavg_preferred_over_high_low_and_temp_not_required() -> None:
             "windspeedAvg": 7.0,
         },
     }
-    result = readings_from_payload(_payload(item), source="five_minute")
-    assert len(result.readings) == 1
+    item_with_temp = {
+        "valid_time_gmt": _epoch(10, 9),
+        "obsTimeLocal": "2026-10-27 10:09:00",
+        "metric": {
+            "tempAvg": 11.0,
+            "temp": 15.0,
+            "precipTotal": 1.2,
+            "windspeedAvg": 7.0,
+        },
+    }
+    result = readings_from_payload(_payload(item, item_with_temp), source="five_minute")
+    assert len(result.readings) == 2
     reading = result.readings[0]
     assert reading.temp_c == 11.0
     assert reading.precip_total_mm == 1.2
     assert reading.speed_kmh == 7.0
+    second_reading = result.readings[1]
+    assert second_reading.temp_c == 11.0
 
 
 # --- PR2 --------------------------------------------------------------
