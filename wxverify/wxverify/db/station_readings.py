@@ -7,11 +7,14 @@ holds the reading's own local date, temperature, rain running total and
 wind, and when the download that last wrote it returned.
 
 ``store_readings`` is the table's one writer apart from the retention delete
-and the migration. It runs in the caller's transaction and never commits;
-the clock is read only through its ``now_utc`` argument.
+(``prune_raw_readings``) and the migration. Both writers run in the caller's
+transaction and never commit; the clock is read only through their
+``now_utc`` arguments.
 
 ``next_five_minute_try`` reads the 5-minute download's schedule, which the
-wind lane keeps in ``station_wind_days.next_attempt_at``.
+wind lane keeps in ``station_wind_days.next_attempt_at``. ``reading_times``,
+``last_five_minute_store`` and ``raw_readings`` read the stored readings;
+like ``next_five_minute_try`` they write nothing.
 """
 
 from __future__ import annotations
@@ -21,14 +24,16 @@ import math
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.day_guard_log import warn_refused_instants
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.site_days import (
     WriteKind,
+    check_date_write,
     current_day,
     daily_close_on,
     filter_day_writes,
@@ -324,3 +329,299 @@ def next_five_minute_try(
         if due < day_end and (earliest is None or due < earliest):
             earliest = due
     return day_end if earliest is None else earliest
+
+
+# --- the reads (plan 12.2, 12.3) -------------------------------------------
+
+_SOURCES: Final[dict[str, Source]] = {
+    "five_minute": "five_minute",
+    "current_obs": "current_obs",
+    "hourly": "hourly",
+}
+
+
+@dataclass(frozen=True)
+class RawReading:
+    """One stored raw reading, as ``raw_readings`` returns it (plan 12.3).
+
+    Each field is the row's column of that name: ``obs_at`` and
+    ``fetched_at`` as UTC instants, ``local_date`` as a date, and a NULL
+    column as None.
+    """
+
+    obs_at: datetime
+    source: Source
+    local_date: date | None
+    temp_c: float | None
+    precip_total_mm: float | None
+    speed_kmh: float | None
+    fetched_at: datetime | None
+
+
+def _bound_stamp(value: datetime) -> str:
+    """``value`` as a canonical stamp for a range bound on ``obs_at``.
+
+    ``obs_at`` holds whole seconds, so a bound with a fraction of a second
+    is rounded up to the next whole second, which selects the same readings
+    both as an included start and as an excluded end.
+    """
+    if value.microsecond:
+        value = value.replace(microsecond=0) + timedelta(seconds=1)
+    return isoformat_utc(value)
+
+
+def _stored_value(raw: object) -> float | None:
+    """A stored value as a float; ``ValueError`` when it is not a number."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        raise ValueError("not a number")
+    value = float(raw)
+    if not math.isfinite(value):
+        raise ValueError("not finite")
+    return value
+
+
+def _instant_and_source(row: sqlite3.Row) -> tuple[datetime, Source]:
+    """A row's ``obs_at`` and ``source``; ``ValueError`` when unreadable."""
+    raw_at: object = row[0]
+    raw_source: object = row[1]
+    if not isinstance(raw_at, str) or not isinstance(raw_source, str):
+        raise ValueError("unreadable stamp or source")
+    source = _SOURCES.get(raw_source)
+    if source is None:
+        raise ValueError("unknown source")
+    return parse_utc(raw_at), source
+
+
+def _raw_reading_from_row(row: sqlite3.Row) -> RawReading:
+    """One row of ``raw_readings``' query; ``ValueError`` when unreadable."""
+    obs_at, source = _instant_and_source(row)
+    raw_date: object = row[2]
+    raw_fetched: object = row[6]
+    if raw_date is None:
+        local_date = None
+    elif isinstance(raw_date, str):
+        local_date = date.fromisoformat(raw_date)
+    else:
+        raise ValueError("unreadable local date")
+    if raw_fetched is None:
+        fetched_at = None
+    elif isinstance(raw_fetched, str):
+        fetched_at = parse_utc(raw_fetched)
+    else:
+        raise ValueError("unreadable fetched_at")
+    return RawReading(
+        obs_at=obs_at,
+        source=source,
+        local_date=local_date,
+        temp_c=_stored_value(row[3]),
+        precip_total_mm=_stored_value(row[4]),
+        speed_kmh=_stored_value(row[5]),
+        fetched_at=fetched_at,
+    )
+
+
+def _warn_unreadable(station_id: int, count: int) -> None:
+    if count:
+        logger.warning(
+            "unreadable raw readings skipped station=%s count=%d", station_id, count
+        )
+
+
+def reading_times(
+    conn: sqlite3.Connection,
+    *,
+    station_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+    source: Source | None = None,
+) -> list[tuple[datetime, Source]]:
+    """The station's reading instants and sources in a range (plan 12.2).
+
+    ``start_utc`` is included and ``end_utc`` excluded; with ``source``, only
+    that source's readings. In time order, and by source name at one
+    instant. A row with an unreadable stamp or source is left out; the call
+    logs them once at WARNING. Read-only.
+    """
+    rows = conn.execute(
+        "SELECT obs_at, source FROM station_wind_records"
+        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
+        " AND (? IS NULL OR source = ?)"
+        " ORDER BY obs_at, source",
+        (station_id, _bound_stamp(start_utc), _bound_stamp(end_utc), source, source),
+    ).fetchall()
+    times: list[tuple[datetime, Source]] = []
+    unreadable = 0
+    for row in rows:
+        try:
+            obs_at, row_source = _instant_and_source(row)
+        except ValueError:
+            unreadable += 1
+            continue
+        if start_utc <= obs_at < end_utc:
+            times.append((obs_at, row_source))
+    _warn_unreadable(station_id, unreadable)
+    return times
+
+
+def last_five_minute_store(
+    conn: sqlite3.Connection, *, site_id: int
+) -> datetime | None:
+    """The latest ``fetched_at`` of a ``five_minute`` row of the site (plan 12.2).
+
+    Every station of the site counts, switched off ones included; rows of
+    other sources and rows with no ``fetched_at`` do not. None when the site
+    has no such row. The latest is picked on parsed instants. Read-only.
+    """
+    row = conn.execute(
+        "SELECT r.fetched_at FROM station_wind_records r"
+        " JOIN stations st ON st.id = r.station_id"
+        " WHERE st.site_id = ? AND r.source = 'five_minute'"
+        " AND julianday(r.fetched_at) IS NOT NULL"
+        " ORDER BY julianday(r.fetched_at) DESC LIMIT 1",
+        (site_id,),
+    ).fetchone()
+    return None if row is None else parse_utc(str(row[0]))
+
+
+def raw_readings(
+    conn: sqlite3.Connection,
+    *,
+    station_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> list[RawReading]:
+    """The station's stored readings in a range, every column (plan 12.3).
+
+    ``start_utc`` is included and ``end_utc`` excluded. In time order, and
+    by source name at one instant. A row with an unreadable field is left
+    out; the call logs them once at WARNING. Read-only.
+    """
+    rows = conn.execute(
+        "SELECT obs_at, source, local_date, temp_c, precip_total_mm, speed_kmh,"
+        " fetched_at FROM station_wind_records"
+        " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?"
+        " ORDER BY obs_at, source",
+        (station_id, _bound_stamp(start_utc), _bound_stamp(end_utc)),
+    ).fetchall()
+    readings: list[RawReading] = []
+    unreadable = 0
+    for row in rows:
+        try:
+            reading = _raw_reading_from_row(row)
+        except ValueError:
+            unreadable += 1
+            continue
+        if start_utc <= reading.obs_at < end_utc:
+            readings.append(reading)
+    _warn_unreadable(station_id, unreadable)
+    return readings
+
+
+# --- retention (plan 10.3) -------------------------------------------------
+
+#: The ``runtime_state`` key prefix of each site's last pruned site-day; the
+#: site id follows it, the value is a local date, ``YYYY-MM-DD``.
+_PRUNED_THROUGH_PREFIX: Final = "raw_readings_pruned_through:"
+
+
+def _pruned_through(conn: sqlite3.Connection, site_id: int) -> date | None:
+    """The site's last pruned site-day; None when none is recorded.
+
+    A value that does not parse counts as none, logged at WARNING: the walk
+    then starts again at the site's first record, and a day already pruned
+    deletes nothing a second time.
+    """
+    raw = get_runtime_state(conn, f"{_PRUNED_THROUGH_PREFIX}{site_id}")
+    if raw is None:
+        return None
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        logger.warning(
+            "raw readings prune marker unreadable site=%s; walking from the first day",
+            site_id,
+        )
+        return None
+
+
+def _days_after(
+    conn: sqlite3.Connection, site_id: int, after: date | None
+) -> list[tuple[date, datetime, datetime]]:
+    """The site's records after ``after``, oldest first, with their bounds."""
+    rows = conn.execute(
+        "SELECT local_date, day_start_utc, day_end_utc FROM site_days"
+        " WHERE site_id = ? AND local_date > ? ORDER BY local_date",
+        (site_id, "" if after is None else after.isoformat()),
+    ).fetchall()
+    return [
+        (
+            date.fromisoformat(str(row[0])),
+            parse_utc(str(row[1])),
+            parse_utc(str(row[2])),
+        )
+        for row in rows
+    ]
+
+
+def prune_raw_readings(conn: sqlite3.Connection, *, now_utc: datetime) -> int:
+    """Delete the raw readings of site-days past retention (plan 10.1, 10.3).
+
+    For each site, walks its site-days after the last one pruned (the
+    ``runtime_state`` key ``raw_readings_pruned_through:<site_id>``), oldest
+    first, and asks the closed-day guard about each with ``RAW_PRUNE``. A day
+    it accepts loses every reading inside its bounds, every source, for each
+    station of the site (switched off ones included), and becomes the site's
+    last pruned day. The walk stops at the first day the guard refuses, which
+    is the normal end, and leaves that day and every later one alone.
+    Readings no tracked site-day holds are never touched.
+
+    Returns the number of rows deleted. Runs in the caller's transaction: no
+    BEGIN, no commit. Safe to repeat.
+    """
+    deleted = 0
+    site_ids = [
+        int(row[0])
+        for row in conn.execute("SELECT id FROM sites ORDER BY id").fetchall()
+    ]
+    for site_id in site_ids:
+        station_ids = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT id FROM stations WHERE site_id = ? ORDER BY id", (site_id,)
+            ).fetchall()
+        ]
+        site_rows = 0
+        days = 0
+        stopped_at: date | None = None
+        for local_date, day_start, day_end in _days_after(
+            conn, site_id, _pruned_through(conn, site_id)
+        ):
+            if not check_date_write(
+                conn, site_id, local_date, WriteKind.RAW_PRUNE, now_utc=now_utc
+            ):
+                stopped_at = local_date
+                break
+            start, end = _bound_stamp(day_start), _bound_stamp(day_end)
+            for station_id in station_ids:
+                cur = conn.execute(
+                    "DELETE FROM station_wind_records"
+                    " WHERE station_id = ? AND obs_at >= ? AND obs_at < ?",
+                    (station_id, start, end),
+                )
+                site_rows += cur.rowcount
+            set_runtime_state(
+                conn, f"{_PRUNED_THROUGH_PREFIX}{site_id}", local_date.isoformat()
+            )
+            days += 1
+        if days or stopped_at is not None:
+            logger.debug(
+                "raw readings pruned site=%s days=%d rows=%d stopped_at=%s",
+                site_id,
+                days,
+                site_rows,
+                "none" if stopped_at is None else stopped_at.isoformat(),
+            )
+        deleted += site_rows
+    return deleted

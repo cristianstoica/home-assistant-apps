@@ -2265,6 +2265,8 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.scoring.consensus", "materialize_consensus"),  # 7.3
         # Daily-close plan 7.7: P3's close, stage 3.
         ("wxverify.worker.day_values", "write_hourly_values"),
+        # Daily-close plan 10.3: P3's run_close_retention.
+        ("wxverify.db.station_readings", "prune_raw_readings"),
         ("wxverify.worker.wind_days", "_derive_days"),  # 7.3 W3
         ("wxverify.worker.wind_days", "_reconcile"),  # 7.3 W2
         ("wxverify.worker.wind_days", "_finish_day"),  # 7.3 W16
