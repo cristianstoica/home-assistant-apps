@@ -2263,6 +2263,8 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.db.station_readings", "store_readings"),
         ("wxverify.scoring.consensus", "write_station_observation"),  # 7.3 backstop
         ("wxverify.scoring.consensus", "materialize_consensus"),  # 7.3
+        # Daily-close plan 7.7: P3's close, stage 3.
+        ("wxverify.worker.day_values", "write_hourly_values"),
         ("wxverify.worker.wind_days", "_derive_days"),  # 7.3 W3
         ("wxverify.worker.wind_days", "_reconcile"),  # 7.3 W2
         ("wxverify.worker.wind_days", "_finish_day"),  # 7.3 W16

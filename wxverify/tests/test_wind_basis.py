@@ -555,12 +555,13 @@ class _WriteStationObservationCallFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def test_write_station_observation_called_only_from_the_two_allowed_sites() -> None:
+def test_write_station_observation_called_only_from_the_allowed_sites() -> None:
     """mutant_new_caller -> at this assertion: correct = every call site is
-    inside ``scoring/consensus.py`` (``insert_station_observation``) or
-    ``worker/wind_days.py``; mutant (a third module calls it directly,
-    bypassing the guard) adds a file this assertion does not allow."""
-    allowed_files = {"consensus.py", "wind_days.py"}
+    inside ``scoring/consensus.py`` (``insert_station_observation``),
+    ``worker/wind_days.py``, or ``worker/day_values.py``; mutant (a
+    fourth module calls it directly, bypassing the guard) adds a file
+    this assertion does not allow."""
+    allowed_files = {"consensus.py", "wind_days.py", "day_values.py"}
     violations: list[str] = []
     for path in sorted(_WXVERIFY_SRC.rglob("*.py")):
         if path.name == "consensus.py":
