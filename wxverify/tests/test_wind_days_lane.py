@@ -577,14 +577,14 @@ def test_today_next_attempt_near_midnight_rolls_to_tomorrow_plus_an_hour() -> No
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
     cap = end - timedelta(hours=1)
 
-    normal = _today_next_attempt(conn, end - timedelta(hours=5), end, failed=False)
+    normal = _today_next_attempt(conn, end - timedelta(hours=5), cap=cap)
     assert normal < isoformat_utc(cap), (
         "mutant -> at this assertion: correct = now+interval (well before"
         " the 23:00 cap), mutant (the old 23:25 cap, or always rolls to"
         " the cap) = a time at or after 23:00"
     )
 
-    at_cap = _today_next_attempt(conn, cap, end, failed=False)
+    at_cap = _today_next_attempt(conn, cap, cap=cap)
     assert at_cap == isoformat_utc(cap), (
         "mutant -> at this assertion: correct = the cap itself"
         " ('2026-03-10T23:00:00Z'; min(now+interval, cap) clamps once now"
@@ -1974,11 +1974,14 @@ def test_fall_back_day_final_call_covers_25_hours(
 
 
 def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
-    """Plan item 3, rewritten for 4.2's evening window (14.12): the daytime
-    cadence is ``min(now + interval, cap)`` with the cap at end - 1h
-    (23:00), for a successful or a failed try alike -- 4.2 drops the old
-    one-retry-near-midnight window (the 15 evening slots, tested in
-    ``test_evening_window.py``, own every retry at or after the cap)."""
+    """Plan item 3, rewritten for 4.2's evening window (14.12) and again for
+    0.16.14's signature change (``cap`` required, ``failed`` dropped -- it
+    never changed the result, so the old outer ``for failed in (False,
+    True)`` loop ran the identical call twice and is dropped here along
+    with the kwarg itself): the daytime cadence is ``min(now + interval,
+    cap)`` -- 4.2 drops the old one-retry-near-midnight window (the 15
+    evening slots, tested in ``test_evening_window.py``, own every retry at
+    or after the cap)."""
     conn = _make_db()
     end = datetime(2026, 3, 11, 0, 0, 0, tzinfo=UTC)
     cap = end - timedelta(hours=1)
@@ -1994,15 +1997,14 @@ def test_today_next_attempt_caps_at_final_and_retries_once() -> None:
         isoformat_utc(cap),
     ]
 
-    for failed in (False, True):
-        for now, want in zip(now_points, expected, strict=True):
-            got = _today_next_attempt(conn, now, end, failed=failed)
-            assert got == want, (
-                f"failed={failed} at now={now.isoformat()}:"
-                " mutant -> at this assertion: correct ="
-                f" {want} (the cap is 23:00 either way, 4.2), mutant ="
-                f" {got}"
-            )
+    for now, want in zip(now_points, expected, strict=True):
+        got = _today_next_attempt(conn, now, cap=cap)
+        assert got == want, (
+            f"at now={now.isoformat()}:"
+            " mutant -> at this assertion: correct ="
+            f" {want} (the cap is 23:00, 4.2), mutant ="
+            f" {got}"
+        )
 
 
 def test_missed_final_call_is_reported_and_the_day_still_finishes(

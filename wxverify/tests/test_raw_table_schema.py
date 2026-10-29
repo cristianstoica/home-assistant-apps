@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -242,16 +243,50 @@ def test_sc2_rerun_guard_skips_the_rebuild_when_source_already_present() -> None
 # --- SC3 ----------------------------------------------------------------
 
 
-def test_sc3_checks_and_key_reject_every_bad_row() -> None:
+def _fresh_station_conn() -> tuple[sqlite3.Connection, int]:
+    """SC3's first builder: a fresh ``create_tables``-shaped table."""
+    conn = _migrated_conn()
+    return conn, _make_station(conn)
+
+
+def _v11_rebuilt_station_conn() -> tuple[sqlite3.Connection, int]:
+    """SC3's second builder: a version-11 file rebuilt via ``run_migrations``,
+    as SC1 does -- the version-12 rebuild's own copy of the CREATE
+    statement (``_rebuild_station_wind_records``), not the one
+    ``create_tables`` runs on a fresh file.
+    """
+    conn, station_id = _v11_fixture_conn()
+    run_migrations(conn)
+    return conn, station_id
+
+
+@pytest.mark.parametrize(
+    "build_conn",
+    [_fresh_station_conn, _v11_rebuilt_station_conn],
+    ids=["fresh_create_tables", "v11_file_rebuilt"],
+)
+def test_sc3_checks_and_key_reject_every_bad_row(
+    build_conn: Callable[[], tuple[sqlite3.Connection, int]],
+) -> None:
     """SC3 (14.11): each CHECK and the PRIMARY KEY refuses its bad row with
     ``sqlite3.IntegrityError``.
+
+    Run on BOTH of ``station_wind_records``'s two builders: a fresh
+    ``create_tables``-built table, and one rebuilt from a version-11 file
+    through ``run_migrations`` (SC1's own ``_v11_fixture_conn`` plus
+    ``run_migrations``, the version-12 migration's own copy of the CREATE
+    statement, ``_rebuild_station_wind_records``). SC1 compares only
+    ``table_xinfo``, which carries no CHECKs, so without this parametrize
+    the rebuild's own CREATE-statement copy had no CHECK/key coverage of
+    its own -- a CHECK present on the fresh table but dropped from the
+    rebuild's copy would pass this test on the ``fresh_create_tables`` case
+    alone.
 
     M68 -> at the rain-``CHECK`` insert below: correct = raises
     ``sqlite3.IntegrityError`` (``precip_total_mm >= 0``), mutant (the rain
     CHECK dropped) = the insert succeeds.
     """
-    conn = _migrated_conn()
-    station_id = _make_station(conn)
+    conn, station_id = build_conn()
 
     def _bad_insert(sql: str, params: tuple[object, ...]) -> None:
         with pytest.raises(sqlite3.IntegrityError):

@@ -1471,21 +1471,17 @@ def _read_records(
 def _today_next_attempt(
     conn: sqlite3.Connection,
     now: datetime,
-    end: datetime,
     *,
-    failed: bool,
-    cap: datetime | None = None,
+    cap: datetime,
 ) -> str:
     """The next daytime try after one at ``now`` (plan 4.2).
 
-    ``min(now + obs_interval_minutes, cap)``, whatever the try's outcome, so
-    ``failed`` changes nothing. ``cap`` is the day's 23:00 slot; when not
-    given it is ``end`` (the day's end) minus one hour. Every try at or after
-    the cap belongs to the evening window (``_window_next``).
+    ``min(now + obs_interval_minutes, cap)``, whatever the try's outcome.
+    ``cap`` is the day's 23:00 slot; every try at or after it belongs to the
+    evening window (``_window_next``).
     """
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
-    limit = end - _ONE_HOUR if cap is None else cap
-    return isoformat_utc(min(now + timedelta(minutes=interval), limit))
+    return isoformat_utc(min(now + timedelta(minutes=interval), cap))
 
 
 def _parse_due(value: object) -> datetime | None:
@@ -1588,9 +1584,7 @@ def _next_try_at(
     if tried < clock.cap:
         if daytime_until is not None:
             return isoformat_utc(min(daytime_until, clock.cap))
-        return _today_next_attempt(
-            conn, tried, clock.end, failed=not success, cap=clock.cap
-        )
+        return _today_next_attempt(conn, tried, cap=clock.cap)
     return isoformat_utc(
         _window_next(clock, tried, success=success, not_before=not_before)
     )

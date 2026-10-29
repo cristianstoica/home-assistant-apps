@@ -678,6 +678,98 @@ def test_rd2_last_five_minute_store_by_source_and_site(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# RD4
+# ---------------------------------------------------------------------------
+
+
+def test_rd4_last_five_minute_store_skips_an_unreadable_fetched_at(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RD4 (0.16.14): ``last_five_minute_store`` walks the site's
+    ``five_minute`` rows by ``julianday(fetched_at)`` descending, and
+    returns the first ``fetched_at`` that ``parse_utc`` accepts -- a row
+    whose ``fetched_at`` is a bare Julian-day-number string
+    (``'2460900.5'``) is LATER by ``julianday()`` than any ordinary
+    canonical 2024 stamp (sqlite3's ``julianday()`` treats a bare numeric
+    string as a Julian day number directly, per
+    https://www.sqlite.org/lang_datefunc.html), yet
+    ``wxverify.core.timeutil.parse_utc`` requires an ISO-8601 stamp and
+    raises ``ValueError`` on it -- so the walk must skip past it to an
+    older, canonical row, logging one WARNING naming the skipped count.
+    With only the unreadable row, it returns None.
+
+    Today's code (``ORDER BY julianday(r.fetched_at) DESC LIMIT 1`` then a
+    bare ``parse_utc`` of the one picked row) picks the unreadable row as
+    the top ``julianday`` and raises ``ValueError`` straight out of
+    ``last_five_minute_store``; that is expected to fail until the
+    walk-and-skip behaviour lands.
+    """
+    import logging
+
+    from wxverify.db.station_readings import last_five_minute_store
+
+    db = _init_tmp_db(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    site_id = asof_make_site(conn, "rd4-site")
+    station_b = _make_station(conn, site_id, "ISTATION04")
+
+    valid_fetched = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
+    _insert_raw_reading(
+        conn,
+        station_b,
+        valid_fetched,
+        "five_minute",
+        fetched_at=valid_fetched,
+        speed_kmh=5.0,
+    )
+
+    bad_at = datetime(D.year, D.month, D.day, 10, 0, tzinfo=UTC)
+    conn.execute(
+        "INSERT INTO station_wind_records"
+        " (station_id, obs_at, source, speed_kmh, fetched_at)"
+        " VALUES (?, ?, 'five_minute', 5.0, '2460900.5')",
+        (station_b, isoformat_utc(bad_at)),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        result = last_five_minute_store(conn, site_id=site_id)
+
+    assert result == valid_fetched, (
+        "M96 -> at this assertion: correct = 09:00 (the valid older stamp;"
+        " the unreadable row, latest by julianday, is skipped), mutant"
+        " (today's code: the SQL's own ORDER BY ... LIMIT 1 picks the"
+        " unreadable row and parse_utc is called on it directly) = raises"
+        " ValueError instead of returning"
+    )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, (
+        "M96 -> at this assertion: correct = exactly one WARNING for the"
+        " one skipped row, mutant (no warning logged for a skipped"
+        " unreadable row) = zero"
+    )
+
+    caplog.clear()
+    only_bad_site_id = asof_make_site(conn, "rd4-only-bad-site")
+    only_bad_station = _make_station(conn, only_bad_site_id, "ISTATION05")
+    conn.execute(
+        "INSERT INTO station_wind_records"
+        " (station_id, obs_at, source, speed_kmh, fetched_at)"
+        " VALUES (?, ?, 'five_minute', 5.0, '2460900.5')",
+        (only_bad_station, isoformat_utc(bad_at)),
+    )
+    with caplog.at_level(logging.WARNING):
+        caplog.clear()
+        only_bad_result = last_five_minute_store(conn, site_id=only_bad_site_id)
+    assert only_bad_result is None, (
+        "M96 -> at this assertion: correct = None (every five_minute row of"
+        " the site is unreadable, so none parse), mutant (the walk stops at"
+        " the first row regardless of readability) = raises ValueError"
+        " instead of returning None"
+    )
+
+
+# ---------------------------------------------------------------------------
 # RD3
 # ---------------------------------------------------------------------------
 

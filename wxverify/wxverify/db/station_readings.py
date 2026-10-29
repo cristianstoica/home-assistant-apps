@@ -472,17 +472,41 @@ def last_five_minute_store(
 
     Every station of the site counts, switched off ones included; rows of
     other sources and rows with no ``fetched_at`` do not. None when the site
-    has no such row. The latest is picked on parsed instants. Read-only.
+    has no such row. The latest is picked on parsed instants. A
+    ``fetched_at`` that SQLite reads as an instant but ``parse_utc`` does
+    not (a bare number, say) is skipped, and the next latest is tried; the
+    call logs the skipped rows once at WARNING. None when no row parses.
+    Read-only.
     """
-    row = conn.execute(
+    cursor = conn.execute(
         "SELECT r.fetched_at FROM station_wind_records r"
         " JOIN stations st ON st.id = r.station_id"
         " WHERE st.site_id = ? AND r.source = 'five_minute'"
         " AND julianday(r.fetched_at) IS NOT NULL"
-        " ORDER BY julianday(r.fetched_at) DESC LIMIT 1",
+        " ORDER BY julianday(r.fetched_at) DESC",
         (site_id,),
-    ).fetchone()
-    return None if row is None else parse_utc(str(row[0]))
+    )
+    latest: datetime | None = None
+    unreadable = 0
+    try:
+        for row in cursor:
+            raw: object = row[0]
+            if not isinstance(raw, str):
+                unreadable += 1
+                continue
+            try:
+                latest = parse_utc(raw)
+            except ValueError:
+                unreadable += 1
+                continue
+            break
+    finally:
+        cursor.close()
+    if unreadable:
+        logger.warning(
+            "unreadable raw readings skipped site=%s count=%d", site_id, unreadable
+        )
+    return latest
 
 
 def raw_readings(

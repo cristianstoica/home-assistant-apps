@@ -869,6 +869,15 @@ def write_hourly_values(
         )
     start = isoformat_utc(record.day_start_utc)
     end = isoformat_utc(record.day_end_utc)
+    # Text bounds on ``valid_at`` so the stale-row read can range-scan the
+    # index on (station_id, variable, valid_at); the julianday conditions
+    # stay the exact check. Dates only, widened by one day each side: a
+    # stored stamp's own date is at most a day from its UTC date (an offset
+    # such as -05:00), and any stamp that starts with a date inside the
+    # window sorts between the bounds whatever follows the date (a space for
+    # the T, +00:00, fractional seconds).
+    low_date = isoformat_utc(record.day_start_utc - timedelta(days=1))[:10]
+    high_date = isoformat_utc(record.day_end_utc + timedelta(days=2))[:10]
     rows_written = 0
     rows_removed = 0
     changed: set[tuple[str, str]] = set()
@@ -888,9 +897,10 @@ def write_hourly_values(
             "SELECT variable, valid_at FROM station_observations"
             " WHERE station_id = ?"
             " AND variable IN ('temperature', 'precip', 'wind')"
+            " AND valid_at >= ? AND valid_at < ?"
             " AND julianday(valid_at) >= julianday(?)"
             " AND julianday(valid_at) < julianday(?)",
-            (station_id, start, end),
+            (station_id, low_date, high_date, start, end),
         ).fetchall()
         stale = sorted(
             (str(row[0]), str(row[1]))

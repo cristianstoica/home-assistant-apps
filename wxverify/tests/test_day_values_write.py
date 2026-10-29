@@ -20,6 +20,7 @@ produce them is out of this file's scope.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from wxverify.core.units import kmh_to_ms
 from wxverify.db.connection import Database, close_db, init_db
 from wxverify.db.site_days import (
     begin_close,
+    day_station_ids,
     ensure_site_days,
     finish_close,
     mark_missed,
@@ -382,6 +384,198 @@ def test_dv2_removes_a_stale_row_at_an_hour_with_no_value(tmp_path: Path) -> Non
         (site_id, hour15),
     ).fetchone()
     assert site_row is None
+
+
+# ---------------------------------------------------------------------------
+# DV7
+# ---------------------------------------------------------------------------
+
+
+def test_dv7_stale_text_prefilter_widened_bounds_catches_an_offset_valid_at(
+    tmp_path: Path,
+) -> None:
+    """DV7 (0.16.14): the stale-row SELECT's new text prefilter on
+    ``valid_at`` (lower bound ``day_start_utc - 1 day`` as ``YYYY-MM-DD``,
+    upper bound ``day_end_utc + 2 days`` as ``YYYY-MM-DD``, widened a day
+    each side of the exact ``julianday`` check that stays the exact gate)
+    must still catch a stale row stored with a NON-canonical, offset
+    ``valid_at`` whose local-date TEXT is the day BEFORE the UTC date --
+    the exact case a prefilter bounded on the canonical day-start stamp
+    text (``YYYY-MM-DDT00:00:00Z``) would miss, since a plain string
+    comparison against that narrower bound excludes an offset-form stamp
+    whose leading date digits read one day earlier.
+
+    A paired row stored at an hour just OUTSIDE the day, in canonical form,
+    must stay: it proves the exact ``julianday`` check still gates the
+    delete even though the widened text prefilter's date-only bounds would
+    admit it as a candidate too.
+    """
+    db = _init_tmp_db(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    site_id, stations = _build_site(conn, pws_ids=STATION_PWS_IDS[1:3])
+    b_id = stations[STATION_PWS_IDS[1]]
+
+    for hour in range(24):
+        if hour == 0:
+            continue
+        _insert_reading(
+            conn,
+            b_id,
+            datetime(
+                WRITE_DAY.year, WRITE_DAY.month, WRITE_DAY.day, hour, 0, tzinfo=UTC
+            ),
+            "five_minute",
+            temp_c=10.0,
+            speed_kmh=5.0,
+            precip_total_mm=0.0,
+        )
+
+    day_start = _hour_at(0)
+    day_before = WRITE_DAY - timedelta(days=1)
+    offset_valid_at = f"{day_before.isoformat()}T19:00:00-05:00"
+    assert parse_utc(offset_valid_at) == day_start, (
+        "fixture bug: the offset stamp must denote the day's first hour"
+    )
+    assert offset_valid_at[:10] == day_before.isoformat(), (
+        "fixture bug: the stamp's own date text must read the day before"
+        " the UTC date, or it does not exercise the widened bound"
+    )
+    conn.execute(
+        "INSERT INTO station_observations"
+        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
+        " VALUES (?, 'temperature', ?, 99.0, 'ok', 'stale-offset-row', ?)",
+        (b_id, offset_valid_at, offset_valid_at),
+    )
+
+    outside_valid_at = isoformat_utc(day_start - timedelta(hours=1))
+    conn.execute(
+        "INSERT INTO station_observations"
+        " (station_id, variable, valid_at, value, qc_flag, source_raw, fetched_at)"
+        " VALUES (?, 'temperature', ?, 77.0, 'ok', 'outside-the-day', ?)",
+        (b_id, outside_valid_at, outside_valid_at),
+    )
+
+    result = write_hourly_values(
+        conn, site_id=site_id, local_date=WRITE_DAY, now_utc=NOW
+    )
+    assert result.outcome == "written"
+    assert result.rows_removed == 1, (
+        "M97/M99 -> at this assertion: correct = 1 (only the offset row,"
+        " inside the day, is stale), mutant M97 (the widened text prefilter"
+        " bounded on the canonical day-start/day-end stamps instead of"
+        " DATE-only bounds a day wider each side) = 0, the offset row's"
+        " text sorts before the canonical lower bound and is never"
+        " selected; mutant M99 (the exact `julianday` conditions dropped,"
+        " the text prefilter alone gates the delete) = 2, the outside row"
+        " is wrongly removed as well"
+    )
+
+    inside_row = conn.execute(
+        "SELECT 1 FROM station_observations"
+        " WHERE station_id=? AND variable='temperature' AND valid_at=?",
+        (b_id, offset_valid_at),
+    ).fetchone()
+    assert inside_row is None, (
+        "M97 -> at this assertion: correct = None (the offset stamp's"
+        " instant IS hour 0, inside the day and not in `wanted`, so it is"
+        " removed), mutant (the text prefilter bounded on the canonical"
+        " day-start stamp) = the row (its offset text sorts before that"
+        " narrower bound, never selected for deletion) still present"
+    )
+
+    outside_row = conn.execute(
+        "SELECT 1 FROM station_observations"
+        " WHERE station_id=? AND variable='temperature' AND valid_at=?",
+        (b_id, outside_valid_at),
+    ).fetchone()
+    assert outside_row is not None, (
+        "M99 -> at this assertion: correct = the row present (the exact"
+        " `julianday` check still excludes an hour before the day even"
+        " though the widened text prefilter's date-only bounds admit it),"
+        " mutant (the exact `julianday` check dropped, the text prefilter"
+        " alone gates the delete) = None, the row wrongly removed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DV8 -- the stale-row SELECT *production actually runs* still SEEKs the
+# unique index with a range on valid_at (query-plan convention per
+# tests/test_query_plan_regressions.py: a relationship via EXPLAIN QUERY
+# PLAN, never a hardcoded DDL string, paired with an empirically degrading
+# negative control), captured off write_hourly_values itself rather than a
+# copy of the SQL text.
+# ---------------------------------------------------------------------------
+
+
+def test_dv8_stale_row_read_seeks_the_unique_index_with_a_valid_at_range(
+    tmp_path: Path,
+) -> None:
+    """DV8 (0.16.14): the actual statement ``write_hourly_values`` runs to
+    find stale rows -- captured via ``set_trace_callback``, not a copy of
+    the SQL text -- SEARCHes ``station_observations``' UNIQUE
+    ``(station_id, variable, valid_at)`` autoindex with a range bound on
+    ``valid_at``. If production ever dropped the text prefilter, this
+    assertion would still pass against a hand-written copy of the old SQL,
+    so it reads the statement production itself sent to SQLite.
+    """
+    db = _init_tmp_db(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    site_id, stations = _build_site(conn, pws_ids=STATION_PWS_IDS[1:3])
+    b_id = stations[STATION_PWS_IDS[1]]
+
+    _insert_reading(
+        conn,
+        b_id,
+        _hour_at(0),
+        "five_minute",
+        temp_c=10.0,
+        speed_kmh=5.0,
+        precip_total_mm=0.0,
+    )
+
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+        result = write_hourly_values(
+            conn, site_id=site_id, local_date=WRITE_DAY, now_utc=NOW
+        )
+    finally:
+        conn.set_trace_callback(None)
+    assert result.outcome == "written"
+
+    matches = [
+        s
+        for s in statements
+        if s.startswith("SELECT variable, valid_at FROM station_observations")
+    ]
+    station_ids = sorted(day_station_ids(conn, site_id, WRITE_DAY))
+    assert len(matches) == len(station_ids), matches
+    statement = matches[0]
+    assert "?" not in statement, statement
+
+    plan = [
+        str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + statement)
+    ]
+    assert any(
+        "SEARCH station_observations" in line
+        and "sqlite_autoindex_station_observations_1" in line
+        and "valid_at>" in line
+        for line in plan
+    ), plan
+
+    # Negative control: the exact julianday clauses alone (today's code, no
+    # text prefilter) cannot bind valid_at as a seek column at all -- it
+    # only ever appears wrapped in julianday(), never as a plain column
+    # reference -- so dropping the captured statement's plain-column
+    # valid_at bounds loses the valid_at range from the plan entirely.
+    match = re.search(r" AND valid_at >= '[^']*' AND valid_at < '[^']*'", statement)
+    assert match is not None, statement
+    degraded = statement.replace(match.group(0), "")
+    assert degraded != statement, "prefilter text drifted"
+    degraded_plan = [
+        str(row["detail"]) for row in conn.execute("EXPLAIN QUERY PLAN " + degraded)
+    ]
+    assert not any("valid_at>" in line for line in degraded_plan), degraded_plan
 
 
 # ---------------------------------------------------------------------------
