@@ -12,6 +12,7 @@ import json
 import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
@@ -35,6 +36,7 @@ from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.feeds.seam import CostEstimate, FetchResult, NormalizedSample
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
 from wxverify.verification.decision import ContinuousLead, OccurrenceLead
 from wxverify.verification.methodology import (
@@ -1418,3 +1420,520 @@ def standard_night(
     set_runtime_state(conn, "worker_started_at", isoformat_utc(NOW))
     conn.commit()
     return db, FencedWriter(db, db.generation), site_id, stations
+
+
+# ---------------------------------------------------------------------------
+# P4 §18.1: fixtures for the scored round and daytime downloads
+# (`tests/test_round_schedule.py`). Built on P3's fixtures above --
+# `standard_night`, `MovingClock`/`patch_close_clock`, `run_due_jobs`,
+# `tick`, `Stop` -- which this section reuses, never copies.
+# ---------------------------------------------------------------------------
+
+#: P4 §18.1's real feeds X, Y, Z (360-minute interval) and G (720-minute),
+#: each its own synthetic ``source``/``model`` pair (so `UNIQUE(source,
+#: model)` never collides with a seeded real feed). Not meteoblue: that
+#: source's package mechanics (4.2, 4.4) are hardcoded to the literal
+#: `source='meteoblue'` in today's code (`worker/scheduler.py:285`,
+#: `db/migrations.py:1950-1951`), so the test's package stand-in ("P") has
+#: to be the real seeded `meteoblue`/`multimodel` row instead
+#: (`meteoblue_package_feed_id`), not a synthetic row of its own.
+_ROUND_SCHEDULE_FEED_SPECS: Final[dict[str, tuple[str, int]]] = {
+    "X": ("synthetic-round-x", 360),
+    "Y": ("synthetic-round-y", 360),
+    "Z": ("synthetic-round-z", 360),
+    "G": ("synthetic-round-g", 720),
+}
+
+#: ``{"X": "synthetic-round-x", ...}`` -- each feed's own ``source`` string,
+#: for a test that needs to program :class:`ProviderStandIn` or read
+#: :attr:`ProviderStandIn.calls` by name instead of spelling the source out.
+ROUND_SCHEDULE_SOURCES: Final[dict[str, str]] = {
+    name: source for name, (source, _interval) in _ROUND_SCHEDULE_FEED_SPECS.items()
+}
+
+
+def seed_round_schedule_feeds(
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    subscribe: Sequence[str] = ("X", "Y", "Z", "G"),
+) -> dict[str, int]:
+    """Insert P4 §18.1's feeds X, Y, Z and G: real feeds (``is_virtual=0``),
+    each its own synthetic ``source``/``model`` pair, each with its own
+    ``sources`` row (a 10000 call/day cap, matching open-meteo's, plan
+    §3.2) so :func:`wxverify.collection.budget.reserve_budget` accepts it
+    without a test having to seed one by hand. Subscribes every name in
+    ``subscribe`` at ``site_id`` through ``site_feed_state`` (plain
+    INSERT, plan §18.1's "seed helpers by plain INSERT"). Returns
+    ``{"X": feed_id, "Y": feed_id, "Z": feed_id, "G": feed_id}``.
+    """
+    ids: dict[str, int] = {}
+    for name, (source, interval) in _ROUND_SCHEDULE_FEED_SPECS.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO sources"
+            " (source, daily_call_limit, daily_credit_limit, billing_tz)"
+            " VALUES (?, 10000, NULL, 'UTC')",
+            (source,),
+        )
+        feed_id = int(
+            conn.execute(
+                "INSERT INTO feeds"
+                " (source, model, enabled, default_subscribed,"
+                "  fetch_interval_minutes, max_lead_hours, is_virtual)"
+                " VALUES (?, ?, 1, 0, ?, 168, 0)",
+                (source, source, interval),
+            ).lastrowid
+        )
+        ids[name] = feed_id
+        if name in subscribe:
+            conn.execute(
+                "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
+                " VALUES (?, ?, 1, 0)",
+                (site_id, feed_id),
+            )
+    return ids
+
+
+def meteoblue_package_feed_id(conn: sqlite3.Connection) -> int:
+    """P4 §18.1's package ``P``: the id of the real seeded
+    ``meteoblue``/``multimodel`` feed row (``config.FEED_SEEDS``). Its
+    members ``P1``/``P2`` are not pre-seeded rows -- each is created the
+    first time a reply's samples carry its model name
+    (``_feed_id_for_sample``, ``collection/forecast_fetcher.py:273-285``);
+    build such a sample with :func:`meteoblue_member_sample`.
+    """
+    row = conn.execute(
+        "SELECT id FROM feeds WHERE source = 'meteoblue' AND model = 'multimodel'"
+    ).fetchone()
+    assert row is not None, "meteoblue/multimodel feed is not seeded"
+    return int(row["id"])
+
+
+def subscribe_meteoblue_package(conn: sqlite3.Connection, site_id: int) -> int:
+    """Subscribe ``site_id`` to the real meteoblue package feed (P4
+    §18.1's "P"), by plain INSERT. Returns its feed id."""
+    feed_id = meteoblue_package_feed_id(conn)
+    conn.execute(
+        "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
+        " VALUES (?, ?, 1, 0)",
+        (site_id, feed_id),
+    )
+    return feed_id
+
+
+def meteoblue_member_sample(
+    model: str,
+    variable: str,
+    issued_at: str,
+    valid_at: str,
+    lead_hours: int,
+    value: float,
+) -> NormalizedSample:
+    """One meteoblue package member's sample (P4 §18.1's "P1"/"P2"): its
+    ``model`` differs from the package row's ``multimodel``, so
+    ``_feed_id_for_sample`` registers it under a new feed row the first
+    time it is persisted (``collection/forecast_fetcher.py:273-285``).
+    """
+    return NormalizedSample(
+        model=model,
+        variable=variable,
+        issued_at=issued_at,
+        valid_at=valid_at,
+        lead_hours=lead_hours,
+        value=value,
+        source_raw=f"meteoblue:{model}",
+        model_run_id=issued_at,
+    )
+
+
+def round_schedule_sample(
+    model: str,
+    variable: str,
+    issued_at: str,
+    valid_at: str,
+    lead_hours: int,
+    value: float,
+) -> NormalizedSample:
+    """One sample for a non-package feed (X, Y, Z or G): ``model`` equal to
+    the fetched feed's own model, so ``_feed_id_for_sample`` keeps it on
+    that feed's own row (``collection/forecast_fetcher.py:273-285``).
+    """
+    return NormalizedSample(
+        model=model,
+        variable=variable,
+        issued_at=issued_at,
+        valid_at=valid_at,
+        lead_hours=lead_hours,
+        value=value,
+        source_raw=f"{model}:raw",
+        model_run_id=issued_at,
+    )
+
+
+# -- The provider stand-in (P4 §18.1's "the provider") ----------------------
+
+
+@dataclass(frozen=True)
+class ProviderReply:
+    """A stand-in adapter call's successful outcome: usable samples (P4
+    §18.1's "a reply with given run labels and values")."""
+
+    samples: tuple[NormalizedSample, ...]
+
+
+@dataclass(frozen=True)
+class ProviderEmpty:
+    """An HTTP 200 with no usable sample (P4 §18.1's "an empty reply")."""
+
+
+@dataclass(frozen=True)
+class ProviderHttpError:
+    """An HTTP failure status (P4 §18.1's "an HTTP 404", "500" or "a 429
+    with Retry-After")."""
+
+    status: int
+    retry_after: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderConnectError:
+    """A transport failure (P4 §18.1's "a ConnectError")."""
+
+
+ProviderOutcome = (
+    ProviderReply | ProviderEmpty | ProviderHttpError | ProviderConnectError
+)
+
+
+class _StandInAdapter:
+    """One ``ForecastAdapter`` for one ``source``, answering from
+    :class:`ProviderStandIn`'s queue for that source (P4 §18.1)."""
+
+    supports_historical = False
+
+    def __init__(self, standin: ProviderStandIn, source: str) -> None:
+        self._standin = standin
+        self._source = source
+
+    def estimate_cost(self, req: object) -> CostEstimate:
+        return CostEstimate(calls=1)
+
+    async def fetch_forecast(self, req: object) -> FetchResult:
+        outcome = self._standin._consume(self._source)  # noqa: SLF001
+        if isinstance(outcome, ProviderReply):
+            return FetchResult(samples=list(outcome.samples), grid=None)
+        if isinstance(outcome, ProviderEmpty):
+            return FetchResult(samples=[], grid=None)
+        if isinstance(outcome, ProviderHttpError):
+            request = httpx.Request(
+                "GET", f"https://{self._source}.example.invalid/forecast"
+            )
+            headers = (
+                {"Retry-After": outcome.retry_after}
+                if outcome.retry_after is not None
+                else {}
+            )
+            response = httpx.Response(outcome.status, headers=headers, request=request)
+            raise httpx.HTTPStatusError(
+                str(outcome.status), request=request, response=response
+            )
+        if isinstance(outcome, ProviderConnectError):
+            raise httpx.ConnectError("synthetic connect error")
+        raise AssertionError(f"ProviderStandIn: unknown outcome {outcome!r}")
+
+    async def fetch_historical(
+        self, req: object, *, window_start: str, window_end: str
+    ) -> FetchResult | None:
+        return None
+
+    def estimate_historical_cost(
+        self, req: object, *, window_start: str, window_end: str
+    ) -> CostEstimate:
+        return CostEstimate(calls=1)
+
+
+class ProviderStandIn:
+    """P4 §18.1's "the provider": one adapter stand-in, shared across every
+    source, answering per ``(source, call)`` from a per-source programmed
+    queue, and counting calls per source in :attr:`calls`. Install with
+    :func:`install_provider_standin`.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[str, list[ProviderOutcome]] = {}
+        self.calls: dict[str, int] = {}
+
+    def program(self, source: str, *outcomes: ProviderOutcome) -> None:
+        """Append ``outcomes`` to ``source``'s queue, consumed in order,
+        one per adapter call for that source. A call made with the queue
+        empty raises ``AssertionError`` naming the source and the call
+        number, instead of answering with a guessed default -- a test
+        that reaches this has under-programmed its own scenario.
+        """
+        self._queues.setdefault(source, []).extend(outcomes)
+
+    def build(self, source: str, client: httpx.AsyncClient) -> _StandInAdapter:
+        return _StandInAdapter(self, source)
+
+    def _consume(self, source: str) -> ProviderOutcome:
+        count = self.calls.get(source, 0) + 1
+        self.calls[source] = count
+        queue = self._queues.get(source)
+        if not queue:
+            raise AssertionError(
+                f"ProviderStandIn: no programmed outcome for source={source!r}"
+                f" (call {count})"
+            )
+        return queue.pop(0)
+
+
+def install_provider_standin(monkeypatch: pytest.MonkeyPatch) -> ProviderStandIn:
+    """Patch the real dispatch path's adapter builder
+    (``worker/processor.py``'s module-level ``build_adapter``, imported by
+    name at ``worker/processor.py:48`` and called from ``_fetch_feed`` at
+    ``:1270``) with a fresh :class:`ProviderStandIn` (P4 §18.1's "the
+    provider, registered through `adapter_builder`"). Every ``fetch_feed``
+    job -- round, daytime or unscheduled -- then calls the stand-in
+    instead of a real provider; nothing opens a socket.
+
+    Also installs :func:`install_test_source_domains`, since every caller
+    of this stand-in drives a real download through the job pipeline for
+    one of P4 §18.1's synthetic feed sources, and without that mapping
+    ``source_domain`` raises a bare ``KeyError`` before any call is made.
+    """
+    standin = ProviderStandIn()
+    monkeypatch.setattr("wxverify.worker.processor.build_adapter", standin.build)
+    install_test_source_domains(monkeypatch)
+    return standin
+
+
+def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Map P4 §18.1's synthetic feed sources (X/Y/Z/G,
+    :data:`ROUND_SCHEDULE_SOURCES`) onto themselves in
+    ``worker.domain_backoff.SOURCE_DOMAINS`` (today keyed by real provider
+    names only -- ``open-meteo``, ``meteoblue``, etc.). Without this, a
+    real download run through the job pipeline for one of these feeds
+    hits a bare ``KeyError`` in ``source_domain``, called unconditionally
+    by ``_reserve_feed_call``/``_persist_fetch_success`` on every attempt
+    (success or failure) -- not the production behaviour under test. The
+    real ``meteoblue`` source already has an entry and needs no patch.
+    """
+    from wxverify.worker.domain_backoff import SOURCE_DOMAINS
+
+    for source in ROUND_SCHEDULE_SOURCES.values():
+        monkeypatch.setitem(SOURCE_DOMAINS, source, source)
+
+
+# ---------------------------------------------------------------------------
+# P4 §18.1
+#
+# Shared fixtures for the daily-close P4 round-B tests: WC7 (the replay
+# chain's publish -> cleanup transition, tests/test_worksheet_cleanup.py)
+# and PD4's cleanup-after-a-replay-publish half, and PD1's record half
+# (tests/test_p4_dormant.py). Append-only: nothing above this line changes.
+# ---------------------------------------------------------------------------
+
+_REPLAY_PERIOD_DAYS = [
+    "2026-07-01",
+    "2026-07-02",
+    "2026-07-03",
+    "2026-07-04",
+    "2026-07-05",
+]
+_REPLAY_QUANTITY_VALUES = {
+    "temperature_high": 21.0,
+    "temperature_low": 9.0,
+    "wind_max": 6.0,
+    "precip_total": 0.0,
+    "precip_occurrence": 0.0,
+}
+
+
+def build_verification_replay_site(conn: sqlite3.Connection) -> tuple[int, list[int]]:
+    """A small real verification site for driving the REAL sync chain
+    (``wxverify.worker.verification_run.advance_verification``) to and past
+    its ``publish`` phase -- the fixture WC7 (the replay chain's
+    publish -> cleanup transition) and PD4's cleanup-after-a-replay-publish
+    half share. Mirrors ``tests/test_verification_no_change_oracles.py``'s
+    own ``_make_site`` (a 5-day truth period, two real feeds, hourly
+    samples out to 13 days), trimmed and duplicated here rather than
+    imported, since that file belongs to another agent's batch and this
+    fixture is needed by two files in this one. Synthetic data only: site
+    name ``Replay Town``, model names ``model-p4-x``/``model-p4-y``, zone
+    UTC. Returns ``(site_id, [feed_x, feed_y])``.
+    """
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
+        " VALUES ('Replay Town', 40.0, -105.0, 900.0, 'UTC')"
+    )
+    assert cur.lastrowid is not None
+    site_id = int(cur.lastrowid)
+    feeds = [
+        asof_make_real_feed(conn, "model-p4-x"),
+        asof_make_real_feed(conn, "model-p4-y"),
+    ]
+    generation_id = ensure_published_generation(conn, site_id)
+    for day in _REPLAY_PERIOD_DAYS:
+        for quantity, value in _REPLAY_QUANTITY_VALUES.items():
+            is_precip = quantity.startswith("precip")
+            conn.execute(
+                "INSERT INTO daily_truth"
+                " (site_id, local_date, quantity, value, eligible,"
+                "  covered_hours, expected_slots, wet_hours, dry_hours,"
+                "  rain_threshold_mm, day_start_utc, day_end_utc, timezone,"
+                "  tz_generation_id)"
+                " VALUES (?, ?, ?, ?, 1, 24, 24, ?, ?, 0.2, ?, ?, 'UTC', ?)",
+                (
+                    site_id,
+                    day,
+                    quantity,
+                    value,
+                    0 if is_precip else None,
+                    24 if is_precip else None,
+                    f"{day}T00:00:00Z",
+                    f"{day}T23:59:59Z",
+                    generation_id,
+                ),
+            )
+    values = {"temperature": 15.0, "wind": 5.0, "precip": 0.0}
+    issued = "2026-06-30T05:00:00Z"
+    for feed_index, feed_id in enumerate(feeds):
+        for variable, base in values.items():
+            for day_offset in range(len(_REPLAY_PERIOD_DAYS) + 8):
+                for hour in range(24):
+                    total_hours = day_offset * 24 + hour
+                    valid = (
+                        datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=total_hours)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    conn.execute(
+                        "INSERT INTO forecast_samples"
+                        " (site_id, feed_id, variable, issued_at, valid_at,"
+                        "  lead_hours, value, source_raw, model_run_id,"
+                        "  fetched_at)"
+                        " VALUES (?, ?, ?, ?, ?, 6, ?, '{}', 'run-p4-replay', ?)",
+                        (
+                            site_id,
+                            feed_id,
+                            variable,
+                            issued,
+                            valid,
+                            base + 0.5 * feed_index,
+                            issued,
+                        ),
+                    )
+    conn.commit()
+    return site_id, feeds
+
+
+def drive_verification_chain(
+    conn: sqlite3.Connection,
+    site_id: int,
+    payload: dict[str, object],
+    *,
+    resamples: int = 40,
+    max_steps: int = 300,
+) -> None:
+    """Drive the REAL sync verification chain
+    (``wxverify.worker.verification_run.advance_verification``) to
+    completion, emulating the ``bootstrap`` phase the same way the async
+    orchestrator's two calls do (duplicated from
+    ``tests/test_verification_no_change_oracles.py``'s own ``_drive_chain``
+    -- that file is another agent's and is left untouched)."""
+    from wxverify.verification.engine import prepare_bootstrap_inputs
+    from wxverify.verification.runs import run_config_from_row
+    from wxverify.worker.verification_run import (
+        _compute_verdicts,  # noqa: SLF001
+        _load_state,  # noqa: SLF001
+        _persist_verdicts,  # noqa: SLF001
+        advance_verification,
+    )
+
+    for _ in range(max_steps):
+        blob = _load_state(conn, site_id)
+        if blob is not None and blob.get("phase") == "bootstrap":
+            run_id = blob["run_id"]
+            assert isinstance(run_id, int)
+            cfg = run_config_from_row(conn, run_id)
+            inputs = prepare_bootstrap_inputs(conn, cfg)
+            verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
+            _persist_verdicts(conn, site_id, cfg, verdicts)
+            continue
+        if not advance_verification(conn, site_id, payload):
+            return
+    raise AssertionError("verification chain did not terminate")
+
+
+def drive_verification_chain_until_phase(
+    conn: sqlite3.Connection,
+    site_id: int,
+    payload: dict[str, object],
+    phase: str,
+    *,
+    resamples: int = 40,
+    max_steps: int = 300,
+) -> None:
+    """As :func:`drive_verification_chain`, but STOPS once the chain's
+    saved phase equals ``phase`` -- BEFORE that phase's own chunk runs.
+    WC7 needs this to observe the ``publish`` phase's own transition (to
+    ``cleanup``), not just the chain's end state."""
+    from wxverify.verification.engine import prepare_bootstrap_inputs
+    from wxverify.verification.runs import run_config_from_row
+    from wxverify.worker.verification_run import (
+        _compute_verdicts,  # noqa: SLF001
+        _load_state,  # noqa: SLF001
+        _persist_verdicts,  # noqa: SLF001
+        advance_verification,
+    )
+
+    for _ in range(max_steps):
+        blob = _load_state(conn, site_id)
+        if blob is not None and blob.get("phase") == phase:
+            return
+        if blob is not None and blob.get("phase") == "bootstrap":
+            run_id = blob["run_id"]
+            assert isinstance(run_id, int)
+            cfg = run_config_from_row(conn, run_id)
+            inputs = prepare_bootstrap_inputs(conn, cfg)
+            verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
+            _persist_verdicts(conn, site_id, cfg, verdicts)
+            continue
+        assert advance_verification(conn, site_id, payload)
+    raise AssertionError(f"verification chain never reached phase {phase!r}")
+
+
+def build_record_site_with_sample(
+    conn: sqlite3.Connection, *, close_on: bool
+) -> tuple[int, int]:
+    """A site with one subscribed feed and one usable temperature sample
+    valid at D 06:00Z (day ahead 0 from D) -- for driving
+    ``build_forecast_record`` directly. Copied from
+    ``tests/test_record_publication.py``'s own ``_build_site_with_sample``
+    (that file is another agent's and is left untouched), since PD1's
+    record half (``tests/test_p4_dormant.py``) needs the identical shape
+    with the close off. Returns ``(site_id, feed_id)``.
+    """
+    site_id = day_close_site(conn, close_on=close_on, with_records=False)
+    cur = conn.execute(
+        "INSERT INTO feeds"
+        " (source, model, enabled, default_subscribed,"
+        "  fetch_interval_minutes, max_lead_hours, is_virtual)"
+        " VALUES ('synthetic-pd1-record', 'synthetic-pd1-record', 1, 0, 360, 168, 0)"
+    )
+    assert cur.lastrowid is not None
+    feed_id = int(cur.lastrowid)
+    conn.execute(
+        "INSERT INTO site_feed_state (site_id, feed_id, enabled, error_count)"
+        " VALUES (?, ?, 1, 0)",
+        (site_id, feed_id),
+    )
+    issued_at = f"{D.isoformat()}T00:00:00Z"
+    valid_at = f"{D.isoformat()}T06:00:00Z"
+    conn.execute(
+        "INSERT INTO forecast_samples"
+        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours, value,"
+        "  source_raw, model_run_id, fetched_at)"
+        " VALUES (?, ?, 'temperature', ?, ?, 6, 12.0, 'synthetic', ?, ?)",
+        (site_id, feed_id, issued_at, valid_at, issued_at, issued_at),
+    )
+    conn.commit()
+    return site_id, feed_id
