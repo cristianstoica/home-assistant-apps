@@ -1262,7 +1262,8 @@ def disable_station_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 _NON_CLOSE_ENQUEUERS: Final[tuple[str, ...]] = (
-    "_enqueue_due_feeds",
+    "enqueue_due_round_tries",
+    "enqueue_due_daytime_downloads",
     "_enqueue_due_obs",
     "_enqueue_due_wind_days",
     "_enqueue_due_forecast_records",
@@ -1285,7 +1286,10 @@ def disable_other_enqueuers(
     for name in _NON_CLOSE_ENQUEUERS:
         if name in keep:
             continue
-        monkeypatch.setattr(f"wxverify.worker.scheduler.{name}", lambda conn: None)
+        monkeypatch.setattr(
+            f"wxverify.worker.scheduler.{name}",
+            lambda *_args, **_kwargs: None,
+        )
 
 
 def stub_fetch_feed(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:

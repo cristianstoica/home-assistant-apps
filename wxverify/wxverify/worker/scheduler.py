@@ -17,8 +17,11 @@ from wxverify.db.queue import (
 )
 from wxverify.db.site_days import daily_close_on
 from wxverify.settings.keys import get_number_setting, get_setting
-from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
 from wxverify.worker.close_chain import enqueue_due_close_work
+from wxverify.worker.round import (
+    enqueue_due_daytime_downloads,
+    enqueue_due_round_tries,
+)
 from wxverify.worker.wind_days import (
     WIND_DAYS_JOB_KEY,
     WIND_DAYS_SPACING,
@@ -79,7 +82,11 @@ def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
-    _enqueue_due_feeds(conn)
+    # The forward downloads: the scored round and the fixed daytime slots
+    # (daily-close P4 4.4, 5.1), live with the close on or off.
+    now = utc_now()
+    enqueue_due_round_tries(conn, now_utc=now)
+    enqueue_due_daytime_downloads(conn, now_utc=now)
     _enqueue_due_obs(conn)
     _enqueue_due_wind_days(conn)
     _enqueue_due_forecast_records(conn)
@@ -270,73 +277,6 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
             )
 
 
-def _enqueue_due_feeds(conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT s.id AS site_id, f.id AS feed_id, f.fetch_interval_minutes,
-               sfs.last_run_at
-        FROM sites s
-        JOIN feeds f
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = s.id AND sfs.feed_id = f.id
-        WHERE s.enabled = 1
-          AND f.enabled = 1
-          AND f.is_virtual = 0
-          AND NOT (f.source='meteoblue' AND f.model != 'multimodel')
-          AND COALESCE(sfs.enabled, f.default_subscribed) = 1
-        """
-    ).fetchall()
-    now = utc_now()
-    for row in rows:
-        site_id = int(row["site_id"])
-        feed_id = int(row["feed_id"])
-        interval = parse_fetch_interval_minutes(
-            row["fetch_interval_minutes"],
-            context=f"scheduler site={site_id} feed={feed_id}",
-        )
-        if interval is None:
-            # Foreign/corrupt or out-of-range cadence: fail closed (skip
-            # this feed for this tick) BEFORE any due decision -- a
-            # never-run feed would otherwise be due unconditionally and get
-            # paid provider calls on an invented schedule. Every other feed
-            # still runs.
-            continue
-        last_run_at = row["last_run_at"]
-        due = last_run_at is None
-        if last_run_at is not None:
-            try:
-                last_run_dt = parse_utc(str(last_run_at))
-            except ValueError:
-                # Foreign/corrupt last_run_at: fail open (treat as due) so a
-                # single unreadable row cannot kill the tick. Self-healing --
-                # the next successful run rewrites this column.
-                logger.warning(
-                    "scheduler: unreadable last_run_at site=%s feed=%s;"
-                    " treating feed as due",
-                    site_id,
-                    feed_id,
-                )
-                due = True
-            else:
-                minutes = (now - last_run_dt).total_seconds() / 60
-                due = minutes >= effective_due_minutes(interval)
-        if due:
-            logger.debug(
-                "scheduler due feed site=%s feed=%s",
-                int(row["site_id"]),
-                int(row["feed_id"]),
-            )
-            enqueue_if_absent_with_cooldown(
-                conn,
-                "fetch_feed",
-                int(row["site_id"]),
-                f"fetch:{int(row['feed_id'])}",
-                {"feed_id": int(row["feed_id"])},
-                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-                max_retries=3,
-            )
-
-
 def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
     interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
     jitter_cap = get_number_setting(conn, "obs_jitter_minutes", 20, minimum=0)
@@ -359,8 +299,8 @@ def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
             try:
                 last_dt = parse_utc(str(last))
             except ValueError:
-                # Foreign/corrupt last_obs_cycle_at: fail open (treat as due),
-                # same rationale as the due-feed loop's last_run_at guard above.
+                # Foreign/corrupt last_obs_cycle_at: fail open (treat as due)
+                # so a single unreadable row cannot kill the tick.
                 logger.warning(
                     "scheduler: unreadable last_obs_cycle_at site=%s; "
                     "treating obs as due",

@@ -103,6 +103,7 @@ from wxverify.worker.feed_fetch import (
     mark_feed_unavailable,
     record_download_try,
 )
+from wxverify.worker.round import round_try_stale
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import (
     SCORING_CAS_ATTEMPTS,
@@ -1287,17 +1288,44 @@ async def _fetch_feed(
     (``fetch_feed_once``); ``budget``, ``backoff``, ``ineligible`` and
     ``unavailable`` are written here before the job is deferred or
     cancelled, and ``failed`` by ``_fail_job`` for a raised error.
+
+    A round try (P4 plan 4.4) is cancelled before any call, with no row, at
+    or after its round's bound or once the feed has a ``stored`` round row
+    for the date. Its ``budget`` or ``backoff`` row is followed by
+    ``JobCancelled``, not ``JobDeferred``: a deferred try would run again
+    later, past the bound.
     """
     logger.debug("fetch_feed dispatch site=%s feed=%s", site_id, feed_id)
     slot = _download_slot(payload, started_at=utc_now())
+    round_date = slot.round_date if slot.slot == "round" else None
+    if round_date is not None and await db.read(
+        lambda conn: round_try_stale(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            round_date=round_date,
+            now_utc=slot.started_at,
+        )
+    ):
+        logger.info(
+            "fetch_feed round try cancelled site=%s feed=%s round_date=%s",
+            site_id,
+            feed_id,
+            round_date.isoformat(),
+        )
+        raise JobCancelled()
     outcome = await fetch_feed_once(
         db, site_id, feed_id, writer=writer, adapter_builder=build_adapter, slot=slot
     )
     if isinstance(outcome, BudgetExhausted):
         await _record_fetch_try(writer, site_id, feed_id, slot, "budget")
+        if round_date is not None:
+            raise JobCancelled()
         raise JobDeferred(outcome.next_window)
     if isinstance(outcome, BackoffActive):
         await _record_fetch_try(writer, site_id, feed_id, slot, "backoff")
+        if round_date is not None:
+            raise JobCancelled()
         raise JobDeferred(outcome.next_attempt)
     if isinstance(outcome, Ineligible):
         await _record_fetch_try(writer, site_id, feed_id, slot, "ineligible")

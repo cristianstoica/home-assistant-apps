@@ -146,6 +146,18 @@ _ELIGIBLE_OBS_WHERE = """
 # reported here alone: the site's next stage 8 that completes with
 # result='ok' deletes what the failed one left, a real recovery (stage 8's
 # early return ends with JobCancelled, so it clears nothing).
+# A feed's two download keys are one scope (daily-close P4 4.4). A round try
+# (key round:{feed_id}) has max_retries 0, so a try that raises ends failed,
+# while the feed's daytime downloads complete under fetch:{feed_id}; resolved
+# only by a later ok row of its own key, a failed round try would count from
+# FAILED_JOB_AGE_HOURS until the purge even after the feed's next download
+# stored. So a failed fetch_feed row keyed with either prefix is resolved
+# also by a later completed result='ok' row keyed with the other (both
+# prefixes are six characters, so substr(job_key, 7) is the feed id; the
+# lookup r probes idx_jobs_type_key_site), and a round: key groups as
+# fetch:, so a feed counts once. A failed round try thus stops counting once
+# any later download of the feed completes ok, round try or daytime, and a
+# feed whose downloads keep failing counts once.
 # A new job type stays OFF this list until it is classified. The
 # rule is explained where it is used, in _pipeline_conditions. Module-level so
 # the query-plan regression suite plans the statement that ships, not a copy.
@@ -166,7 +178,21 @@ FAILED_SCOPES_SQL = """
                      AND k.status = 'completed'
                      AND k.result = 'ok'
                      AND k.id > j.id))
-        GROUP BY j.type, j.site_id, j.job_key
+          AND NOT (j.type = 'fetch_feed'
+                   AND substr(j.job_key, 1, 6) IN ('fetch:', 'round:')
+                   AND EXISTS (
+                       SELECT 1 FROM jobs AS r
+                       WHERE r.type = 'fetch_feed'
+                         AND r.site_id IS j.site_id
+                         AND r.job_key = (CASE substr(j.job_key, 1, 6)
+                                          WHEN 'round:' THEN 'fetch:' ELSE 'round:' END)
+                                         || substr(j.job_key, 7)
+                         AND r.status = 'completed'
+                         AND r.result = 'ok'
+                         AND r.id > j.id))
+        GROUP BY j.type, j.site_id,
+                 CASE WHEN j.type = 'fetch_feed' AND substr(j.job_key, 1, 6) = 'round:'
+                      THEN 'fetch:' || substr(j.job_key, 7) ELSE j.job_key END
     )
 """
 

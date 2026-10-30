@@ -4354,7 +4354,7 @@ def test_operator_backfill_retry_ignores_recent_terminal_failure_cooldown(
 ) -> None:
     """POST /api/sites/<id>/backfill must never be suppressed by a cooldown.
 
-    _enqueue_due_feeds/_enqueue_due_obs/enqueue_due_current_obs opt into
+    enqueue_due_daytime_downloads/_enqueue_due_obs/enqueue_due_current_obs opt into
     enqueue_if_absent_with_cooldown for scheduler-driven retries; an
     operator-initiated retry through this route must keep using
     enqueue_if_absent directly, so a job that failed seconds ago can still

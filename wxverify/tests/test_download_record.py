@@ -75,24 +75,41 @@ S = R  # the generic "day S" most rows are written against
 # ---------------------------------------------------------------------------
 
 
+def _exclude_seeded_feeds_from_the_round(conn: sqlite3.Connection) -> None:
+    """Take every seeded real feed besides X, Y, Z, G and the meteoblue
+    package out of the round/daytime schedule (same reason and fix as
+    ``tests/test_round_schedule.py``'s helper of the same name): the
+    open-meteo feeds ``config.FEED_SEEDS`` installs at boot are
+    ``default_subscribed=1``, and ``_schedule_feeds``
+    (``worker/round.py``) falls back to that column when no
+    ``site_feed_state`` row exists.
+    """
+    conn.execute("UPDATE feeds SET default_subscribed=0 WHERE source='open-meteo'")
+
+
 def _setup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     subscribe: tuple[str, ...] = ("X",),
     clock_start: datetime | None = None,
+    keep: tuple[str, ...] = (),
 ):
     """P3's standard night plus P4's round-schedule feeds, the provider
     stand-in and the synthetic-source domain-backoff patch installed, and
-    a :class:`MovingClock` patched over every close-chain module. Returns
-    ``(db, conn, site_id, feed_ids, standin, clock)``.
+    a :class:`MovingClock` patched over every close-chain module. ``keep``
+    is passed to ``disable_other_enqueuers`` (DL17 is the only row here
+    that ticks the schedule rather than enqueuing jobs directly, so it is
+    the only caller that needs ``enqueue_due_daytime_downloads`` live).
+    Returns ``(db, conn, site_id, feed_ids, standin, clock)``.
     """
     db, _writer, site_id, _stations = standard_night(tmp_path)
     conn = db._conn  # noqa: SLF001 -- tests read the real writer conn directly
     feed_ids = seed_round_schedule_feeds(conn, site_id, subscribe=subscribe)
+    _exclude_seeded_feeds_from_the_round(conn)
     conn.commit()
     standin = install_provider_standin(monkeypatch)
-    disable_other_enqueuers(monkeypatch)
+    disable_other_enqueuers(monkeypatch, keep=keep)
     start = clock_start or datetime(D.year, D.month, D.day, 17, 0, tzinfo=UTC)
     clock = MovingClock(start)
     patch_close_clock(monkeypatch, clock)
@@ -105,6 +122,16 @@ def _downloads(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row]:
         conn.execute(
             "SELECT * FROM forecast_downloads WHERE feed_id=? ORDER BY id",
             (feed_id,),
+        )
+    )
+
+
+def _job_for_key(conn: sqlite3.Connection, job_key: str) -> list[sqlite3.Row]:
+    """Every ``fetch_feed`` job keyed ``job_key``, in id order (DL17)."""
+    return list(
+        conn.execute(
+            "SELECT * FROM jobs WHERE type='fetch_feed' AND job_key=? ORDER BY id",
+            (job_key,),
         )
     )
 
@@ -664,6 +691,7 @@ def test_dl17_enable_time_fetch_runs_unscheduled_and_covers_the_next_slot(
         monkeypatch,
         subscribe=(),
         clock_start=datetime(R.year, R.month, R.day, 12, 20, tzinfo=UTC),
+        keep=("enqueue_due_daytime_downloads",),
     )
     _patch_dl17_clock(monkeypatch, clock)
     feed_id = feed_ids["X"]
@@ -706,6 +734,27 @@ def test_dl17_enable_time_fetch_runs_unscheduled_and_covers_the_next_slot(
     assert rows[0]["slot"] == "unscheduled", (
         f"M129 -> at this assertion: correct = 'unscheduled',"
         f" mutant = {rows[0]['slot']!r}"
+    )
+    assert rows[0]["outcome"] == "stored", (
+        f"M129 -> at this assertion: correct = 'stored',"
+        f" mutant = {rows[0]['outcome']!r}"
+    )
+    assert all(row["slot"] != "12:10" for row in rows), (
+        "DL17: no forecast_downloads row may have slot '12:10' -- got"
+        f" {[row['slot'] for row in rows]!r}"
+    )
+    # An enable-time job's payload carries no "slot" key at all (by design
+    # it runs unscheduled, M129); only a round or daytime job's payload
+    # has one, so read it with .get and skip jobs that have none, rather
+    # than indexing straight into a key that is not always there.
+    daytime_slots = sorted(
+        slot
+        for r in _job_for_key(conn, f"fetch:{feed_id}")
+        if (slot := json.loads(r["payload"]).get("slot")) is not None
+    )
+    assert "12:10" not in daytime_slots, (
+        "DL17: the enable-time unscheduled fetch (12:20Z) must cover the"
+        f" 12:10 daytime slot -- no such job may be enqueued, got {daytime_slots!r}"
     )
     assert standin.calls.get("synthetic-round-x", 0) == 1, (
         f"M129 -> at this assertion: correct = 1 call, mutant ="

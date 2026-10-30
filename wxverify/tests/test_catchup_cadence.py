@@ -8,7 +8,7 @@ picked up.
 Also covers ``worker.cadence.effective_due_minutes`` itself (the 690-720
 lead band), its pin against ``monitor.FEED_STALE_HOURS``, and the shared
 cadence rule's parity between the two sites that call it --
-``catchup._due_open_meteo_targets`` and ``scheduler._enqueue_due_feeds`` --
+``catchup._due_open_meteo_targets`` and ``scheduler.enqueue_due_daytime_downloads`` --
 for the cases where each site keeps its own (sometimes opposite) handling.
 
 All fixture data is synthetic -- this is a PUBLIC repo.
@@ -28,7 +28,7 @@ from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, init_db
 from wxverify.worker.cadence import FEED_STALE_LIMIT_MINUTES, effective_due_minutes
 from wxverify.worker.catchup import CatchupSite, _due_open_meteo_targets
-from wxverify.worker.scheduler import _enqueue_due_feeds  # noqa: SLF001
+from wxverify.worker.round import enqueue_due_daytime_downloads
 
 
 def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
@@ -407,16 +407,20 @@ def _fetch_feed_jobs(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row
 
 
 def test_t20_scheduler_null_last_run_at_is_due(tmp_path: Path) -> None:
-    """Scheduler-side half of T20's NULL last_run_at case: a never-run feed
-    is due unconditionally, same direction as the catchup side pinned by
-    test_valid_interval_and_null_last_run_at_are_due.
+    """Scheduler-side half of T20's NULL last_run_at case, rewritten to the
+    slot rule (plan §5.1): a feed with no try at all is due once its first
+    daytime slot (the round's default local 00:10 plus one 360-minute
+    interval, 06:10) has passed, same "never run is due" direction as the
+    catchup side pinned by test_valid_interval_and_null_last_run_at_are_due.
     """
     conn = _init_tmp_db(tmp_path)
     _insert_site(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    # No site_feed_state row -> last_run_at is NULL via the LEFT JOIN.
+    # No site_feed_state row and no forecast_downloads row -> no try of
+    # this feed exists at all.
 
-    _enqueue_due_feeds(conn)
+    slot_instant = datetime(2026, 1, 1, 6, 10, tzinfo=UTC)
+    enqueue_due_daytime_downloads(conn, now_utc=slot_instant)
 
     assert len(_fetch_feed_jobs(conn, feed_id)) == 1
 
@@ -424,51 +428,55 @@ def test_t20_scheduler_null_last_run_at_is_due(tmp_path: Path) -> None:
 def test_t20_scheduler_hostile_fetch_interval_skips_only_that_feed(
     tmp_path: Path,
 ) -> None:
-    """Scheduler-side half of T20's unreadable-interval case: fails CLOSED
-    (skip, via `continue`) before any due decision, same direction as the
-    catchup side pinned by
-    test_hostile_fetch_interval_minutes_skips_only_that_feed.
+    """Scheduler-side half of T20's unreadable-interval case, rewritten to
+    the slot rule (plan §5.1, "the same `parse_fetch_interval_minutes`
+    fail-closed rule"): the bad feed is skipped (via `continue`) before any
+    slot-due decision, same direction as the catchup side pinned by
+    test_hostile_fetch_interval_minutes_skips_only_that_feed, while a
+    healthy sibling feed at its own due slot is unaffected.
     """
     conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
+    _insert_site(conn)
     control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     bad_feed_id = _feed_id(conn, "open-meteo", "gfs_global")
-    far_past = isoformat_utc(utc_now() - timedelta(days=30))
-    _subscribe(conn, site_id, control_feed_id, last_run_at=far_past)
-    _subscribe(conn, site_id, bad_feed_id, last_run_at=far_past)
     conn.execute(
         "UPDATE feeds SET fetch_interval_minutes = 9e999 WHERE id = ?",
         (bad_feed_id,),
     )
 
-    _enqueue_due_feeds(conn)
+    slot_instant = datetime(2026, 1, 1, 6, 10, tzinfo=UTC)
+    enqueue_due_daytime_downloads(conn, now_utc=slot_instant)
 
     assert len(_fetch_feed_jobs(conn, control_feed_id)) == 1
     assert _fetch_feed_jobs(conn, bad_feed_id) == []
 
 
-def test_t20_scheduler_unreadable_last_run_at_fails_open_and_is_due(
+def test_t20_scheduler_unreadable_last_run_at_is_ignored_and_due(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Scheduler-side half of T20's unreadable-last_run_at case: fails OPEN
-    (due) -- the OPPOSITE direction from catchup's fail-CLOSED handling
-    pinned by test_unparseable_last_run_at_skips_only_that_feed. Each site
-    keeps its own direction for this case; a merged rule could only pick
-    one direction and would fail either this test or that one.
+    """Rewritten to the slot rule (plan §5.1, plan §18.14): the slot rule
+    never reads ``last_run_at`` at all, so a garbage
+    ``site_feed_state.last_run_at`` no longer stops the feed's daytime
+    download, and a stored forward download is what rewrites the column
+    (catchup's fail-closed skip heals). Same seed as before (site zone
+    ``UTC``, ``open-meteo``/``ecmwf_ifs`` subscribed, ``last_run_at``
+    ``"not-a-timestamp"``). Expected: one ``fetch:{feed_id}`` job, the
+    same count ``test_t20_scheduler_null_last_run_at_is_due`` gets for the
+    same feed and instant with no ``site_feed_state`` row, and no
+    captured record mentioning ``last_run_at``.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _subscribe(conn, site_id, feed_id, last_run_at="not-a-timestamp")
 
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
-        _enqueue_due_feeds(conn)
+    with caplog.at_level(logging.WARNING):
+        enqueue_due_daytime_downloads(
+            conn, now_utc=datetime(2026, 1, 1, 6, 10, tzinfo=UTC)
+        )
 
     assert len(_fetch_feed_jobs(conn, feed_id)) == 1
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert len(warnings) == 1
-    assert "unreadable last_run_at" in warnings[0].getMessage()
-    assert f"feed={feed_id}" in warnings[0].getMessage()
+    assert not any("last_run_at" in record.getMessage() for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------
