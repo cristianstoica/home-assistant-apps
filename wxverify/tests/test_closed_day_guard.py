@@ -2297,6 +2297,8 @@ _GW17_ALLOWLIST: Final = frozenset(
         # The replay's persist_day_evidence; P6 keeps it, uncalled (N7).
         ("wxverify.verification.simulate", "_EVIDENCE_INSERT_SQL"),  # not a day write
         ("wxverify.verification.truth", "mark_daily_truth_stale"),  # 7.3 notes
+        # worksheet cleanup, not a day write (P1 5.4)
+        ("wxverify.verification.cleanup", "_DELETE_SLICE_SQL"),
     }
 )
 

@@ -106,8 +106,8 @@ def _seed_run(conn, site_id: int, *, evidence_rows: int, publish: bool) -> int:
         "  quantity, entity_type, entity_key, predicted, forecast_eligible,"
         "  truth_value, truth_eligible, abs_error)"
         " VALUES (?, '2026-05-01', '2026-05-02', 1, 'temperature',"
-        "         'temperature_high', 'depth', '3', 15.0, 1, 14.5, 1, 0.5)",
-        [(run_id,)] * evidence_rows,
+        "         'temperature_high', 'depth', ?, 15.0, 1, 14.5, 1, 0.5)",
+        [(run_id, str(i)) for i in range(evidence_rows)],
     )
     if publish:
         publish_run(conn, site_id, run_id)
@@ -341,7 +341,11 @@ def test_wc2_stop_leaves_consistent_state_rerun_finishes(
         )
 
     finished = asyncio.run(_run_rerun())
-    assert finished == 3
+    assert finished == 2, (
+        "the stop falls after save 5: run 1 (saves 1-3) finished in the"
+        " stopped call, and run 2 had two of its three saves, so the rerun"
+        " finishes runs 2 and 3, not WC1's 3"
+    )
     for run_id in run_ids[:3]:
         assert _evidence_count(conn, run_id) == 0
         assert _worksheet_kept(conn, run_id) == 0
@@ -529,7 +533,6 @@ def test_wc6_read_cache_returns_deleted_marker_without_deriving(
     """
     monkeypatch.setattr("wxverify.verification.cleanup.CLEANUP_SLICE_ROWS", _SLICE_ROWS)
     from wxverify.verification.cleanup import clean_worksheets
-
     from wxverify.verification.read_cache import cached_daily_rank_conclusions
 
     db = _init_tmp_db(tmp_path)
@@ -720,7 +723,6 @@ def test_wc9_published_pointer_moved_back_cleans_only_the_older_run(
     """
     monkeypatch.setattr("wxverify.verification.cleanup.CLEANUP_SLICE_ROWS", _SLICE_ROWS)
     from wxverify.verification.cleanup import clean_worksheets
-
     from wxverify.verification.runs import published_run_key
 
     db = _init_tmp_db(tmp_path)

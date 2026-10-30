@@ -31,7 +31,9 @@ prepared on a read connection, the CPU-bound bootstrap runs in
 persists the verdicts) → ``pairwise`` (§9: below-floor rows gain their
 comparison against the RECOMMENDED blend, one chunk, after the verdicts
 exist) → ``publish`` (integrity check + atomic pointer
-flip + blob cleanup).
+flip; the blob is cleared here when no older worksheet is left) →
+``cleanup`` (daily-close plan 14.4: one ``clean_worksheet_slice`` save per
+chunk deletes older runs' evidence, then the blob is cleared).
 """
 
 from __future__ import annotations
@@ -55,6 +57,7 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.snapshot import read_snapshot
+from wxverify.verification.cleanup import clean_worksheet_slice, cleanup_pending
 from wxverify.verification.decision import VariableInputs, Verdict, decide_variable
 from wxverify.verification.engine import (
     aggregate_run,
@@ -219,14 +222,16 @@ async def run_verification_chunk(
     if blob is not None and phase in _DAY_PHASES:
         return await _run_day_chunk(db, writer, site_id, payload, phase)
     more = await writer.write(lambda conn: advance_verification(conn, site_id, payload))
-    if more:
+    if more and phase != "publish":
         return _continuation(site_id, payload)
-    # Terminal chunk: `publish` has just moved the published-run pointer, so
-    # the page would otherwise serve the new run with no cache entry. This is
-    # a read and runs AFTER the write returned, never inside the transaction;
-    # `warm_read_cache` never raises `Exception`, so it cannot fail the run.
+    # The `publish` chunk (which goes on to the `cleanup` phase when older
+    # worksheets are left, plan 14.4) and the terminal chunk: `publish` has
+    # just moved the published-run pointer, so the page would otherwise serve
+    # the new run with no cache entry. This is a read and runs AFTER the write
+    # returned, never inside the transaction; `warm_read_cache` never raises
+    # `Exception`, so it cannot fail the run.
     await warm_read_cache(db)
-    return None
+    return _continuation(site_id, payload) if more else None
 
 
 def _compute_verdicts(
@@ -470,8 +475,23 @@ def advance_verification(
     if phase == "publish":
         cfg = _blob_config(conn, blob)
         publish_verified_run(conn, cfg)
-        _clear_state(conn, site_id)
         logger.info("verification run=%s published for site=%s", cfg.run_id, site_id)
+        # Plan 14.4: older runs' worksheets go in a `cleanup` phase, one save
+        # per chunk, after this publish has committed. With none left the
+        # chain ends here, as before the cleanup existed.
+        if cleanup_pending(conn, site_id=site_id):
+            blob["phase"] = "cleanup"
+            _save_state(conn, site_id, blob)
+            _heartbeat(conn, site_id)
+            return True
+        _clear_state(conn, site_id)
+        return False
+    if phase == "cleanup":
+        step = clean_worksheet_slice(conn, site_id=site_id)
+        if step.runs_left:
+            _heartbeat(conn, site_id)
+            return True
+        _clear_state(conn, site_id)
         return False
     if phase == "bootstrap":
         # The async orchestrator owns this phase; reaching the sync path

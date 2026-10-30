@@ -281,6 +281,13 @@ def test_late_station_data_regenerates_truth_and_reruns() -> None:
     assert marked == 2
     conn.commit()
 
+    _drive_until_phase(conn, site_id, {"trigger_date": "2026-06-08"}, "publish")
+
+    # Start wipe only, nothing published yet: run 1's evidence survives the
+    # new run's start wipe, and run 1 is still the published run.
+    assert len(_evidence_dump(conn, run1)) == run1_evidence
+    assert published_run_id(conn, site_id) == run1
+
     _drive_chain(conn, site_id, {"trigger_date": "2026-06-08"})
 
     run2 = published_run_id(conn, site_id)
@@ -316,8 +323,12 @@ def test_late_station_data_regenerates_truth_and_reruns() -> None:
     assert float(low["value"]) == pytest.approx(10.0)
     assert int(low["stale"]) == 0
 
-    # The OLD published run's evidence survives the new run's start wipe.
-    assert len(_evidence_dump(conn, run1)) == run1_evidence
+    # 14.4's outcome after the chain finishes (cleanup runs once run 2 is
+    # published): run 1's worksheet is deleted, its run row stays.
+    assert _evidence_dump(conn, run1) == []
+    assert int(_run_row(conn, run1)["worksheet_kept"]) == 0
+    assert _evidence_dump(conn, run2) != []
+    assert int(_run_row(conn, run2)["worksheet_kept"]) == 1
 
 
 # ---------------------------------------------------------------------------

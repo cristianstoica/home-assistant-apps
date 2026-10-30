@@ -3,8 +3,11 @@
 ``daily_rank_conclusions`` (W7) and ``observed_wet_precip_mae`` (W13) are
 derived on every request by both verification surfaces, and W7 costs seconds
 at production cardinality. Their inputs cannot change: a published run's row
-is never rewritten and its evidence is never deleted, so the same run id in
-the same database always yields the same conclusion.
+is never rewritten and its evidence is deleted only by the worksheet cleanup
+(``verification.cleanup``), so the same run id in the same database always
+yields the same conclusion. A run whose worksheet the cleanup deleted
+(``worksheet_kept`` 0) answers the deleted marker instead, never computed and
+never cached (daily-close plan 14.3).
 
 **Invalidation contract.** The key is ``(generation, derivation_name,
 run_id)`` — one entry per run, per derivation, per database generation, so
@@ -33,7 +36,7 @@ import sqlite3
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from typing import Literal, TypeIs, cast
 
 from wxverify.core.error_sanitize import safe_detail
 from wxverify.core.timeutil import isoformat_utc, utc_now
@@ -46,6 +49,11 @@ logger = logging.getLogger(__name__)
 
 #: ``(generation, derivation_name, run_id)``.
 type _Key = tuple[int, str, int]
+
+#: The deleted marker, ``{"details_deleted": True}``: what a reader answers,
+#: in place of a derivation, for a run whose worksheet the cleanup deleted
+#: (``worksheet_kept`` 0; daily-close plan 14.3).
+type DetailsDeleted = dict[str, bool]
 
 _W7_NAME = "daily_rank_conclusions"
 _W13_NAME = "observed_wet_precip_mae"
@@ -111,6 +119,29 @@ _TARGETS_SQL = """
     WHERE s.enabled = 1
     ORDER BY s.id
 """
+
+
+def details_deleted() -> DetailsDeleted:
+    """A fresh deleted marker, ``{"details_deleted": True}`` (plan 14.3)."""
+    return {"details_deleted": True}
+
+
+def is_details_deleted(value: object) -> TypeIs[DetailsDeleted]:
+    """Whether ``value`` is the deleted marker :func:`details_deleted` builds."""
+    return value == details_deleted()
+
+
+def _worksheet_deleted(conn: sqlite3.Connection, run_id: int) -> bool:
+    """Whether the cleanup deleted ``run_id``'s worksheet (``worksheet_kept`` 0).
+
+    Not cached, like ``_is_published``: the flag moves from 1 to 0 once, and
+    the statement is a rowid lookup. A run that does not exist is not
+    deleted; its derivation answers as it did before the cleanup existed.
+    """
+    row = conn.execute(
+        "SELECT worksheet_kept FROM verification_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    return row is not None and int(row[0]) == 0
 
 
 def _is_published(conn: sqlite3.Connection, run_id: int) -> bool:
@@ -248,13 +279,20 @@ def _cached[T](
     compute: Callable[[sqlite3.Connection, int], T],
     *,
     staged: dict[_Key, object] | None = None,
-) -> T:
+) -> T | DetailsDeleted:
     """The one population sequence: the only path that fills this cache.
 
     Both the request path and the warm path call this, so the published gate,
     the copy-before-insert ordering, the sweep, the eviction and the
     single-flight are each implemented once and tested once.
     """
+    # Step 0 (plan 14.3): a run whose worksheet the cleanup deleted answers
+    # the deleted marker, read first -- never computed from the evidence it
+    # no longer has, never cached, and never served from an entry stored
+    # before the cleanup.
+    if _worksheet_deleted(conn, run_id):
+        return details_deleted()
+
     # Step 1: the published gate, ahead of the key AND the lookup. A run in
     # any other state is derived and returned uncached, and is never served
     # from an existing entry -- a published pointer is not a verified state.
@@ -297,20 +335,25 @@ def _cached[T](
 
 def cached_daily_rank_conclusions(
     conn: sqlite3.Connection, run_id: int
-) -> dict[str, dict[str, object]]:
+) -> dict[str, dict[str, object]] | DetailsDeleted:
     """Cached W7: per-variable ``ranking_redesign_indicated`` for one run.
 
     Exposes no ``leads`` parameter, so a non-default span is unrepresentable
     at the cached surface; the raw ``daily_rank_conclusions`` keeps its
-    keyword-only ``leads`` for callers that need one.
+    keyword-only ``leads`` for callers that need one. A run whose worksheet
+    the cleanup deleted answers the deleted marker (:func:`details_deleted`).
     """
     return _cached(conn, run_id, _W7_NAME, daily_rank_conclusions)
 
 
 def cached_observed_wet_precip_mae(
     conn: sqlite3.Connection, run_id: int
-) -> dict[str, object]:
-    """Cached W13: mean precip-total error for the run's incumbent depth."""
+) -> dict[str, object] | DetailsDeleted:
+    """Cached W13: mean precip-total error for the run's incumbent depth.
+
+    A run whose worksheet the cleanup deleted answers the deleted marker
+    (:func:`details_deleted`).
+    """
     return _cached(conn, run_id, _W13_NAME, observed_wet_precip_mae)
 
 
