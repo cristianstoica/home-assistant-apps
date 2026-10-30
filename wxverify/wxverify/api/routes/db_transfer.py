@@ -90,6 +90,14 @@ _BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "variable"),
     ("forecast_pairs", "variable"),
     ("score_cache", "variable"),
+    # The daily-close scores and publications (P4); each `variable` is in
+    # its table's primary key.
+    ("forecast_value_changes", "variable"),
+    ("close_pairs", "variable"),
+    ("day_scores", "variable"),
+    ("starting_scores", "variable"),
+    ("publication_rankings", "variable"),
+    ("publication_coverage", "variable"),
 )
 # The forecast identity stamps, checked by VALUE at import. Downstream they
 # are string keys (the UNIQUE constraint, the pairing join, the latest-run
@@ -110,6 +118,23 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     # compares them with julianday, so one bad stamp breaks or hides a day.
     ("site_days", "day_start_utc"),
     ("site_days", "day_end_utc"),
+    # The daily-close scores and publications (P4): a download's order, a
+    # pair's hour, and the instants a close and a publication were made,
+    # which readers compare as text. The four `fetched_at` columns are not
+    # listed: they copy `persist_fetch_result`'s stamp, which keeps its
+    # microseconds, as `forecast_samples.fetched_at` does.
+    ("forecast_downloads", "started_at"),
+    ("forecast_downloads", "ended_at"),
+    ("close_pairs", "valid_at"),
+    ("close_records", "scored_at"),
+    ("publications", "build_started_at"),
+    ("publications", "published_at"),
+)
+# Nullable stamps of the same tables, checked apart because the check above
+# refuses NULL.
+_NULLABLE_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("forecast_value_changes", "first_changed_valid_at"),
+    ("close_pairs", "issued_at"),
 )
 # The daily-close tables' dates, checked by VALUE at import: each is a key
 # (a day record, a station-list or zone change's first day) compared as text,
@@ -122,6 +147,28 @@ _CANONICAL_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
     # foreign key to `site_days`, so the foreign key check refuses their dates.
     ("close_stage_log", "local_date"),
     ("close_try_log", "local_date"),
+    # The daily-close scores and publications (P4). None has a foreign key
+    # to `site_days`, so every date of theirs is listed here or, when it may
+    # be NULL, in `_NULLABLE_DATE_COLUMNS`.
+    ("forecast_downloads", "local_date"),
+    ("close_pairs", "local_date"),
+    ("day_scores", "local_date"),
+    ("close_records", "local_date"),
+    ("close_record_downloads", "local_date"),
+    ("starting_scores", "local_date"),
+    ("starting_wind_days", "local_date"),
+    ("publications", "cutoff"),
+    ("publications", "first_record_date"),
+    ("publications", "window_start_date"),
+    ("publications", "wind_start_date"),
+)
+# Nullable dates of the same tables, checked apart because the check above
+# refuses NULL.
+_NULLABLE_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("forecast_downloads", "round_date"),
+    ("close_pairs", "download_date"),
+    ("day_scores", "download_date"),
+    ("close_record_downloads", "download_date"),
 )
 # The daily-close tables' change stamps, which the station-list and zone
 # rules order as text, so only the fixed-width microsecond form may come in.
@@ -1084,12 +1131,29 @@ def _validate_upload(tmp: Path) -> None:
             "invalid timestamp in site_days.retry_at: "
             "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
         )
+        for table, column in _NULLABLE_STAMP_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_null_or_canonical_stamp,
+                f"invalid timestamp in {table}.{column}: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+            )
         for table, column in _CANONICAL_DATE_COLUMNS:
             _refuse_bad_values(
                 conn,
                 table,
                 column,
                 _is_canonical_date,
+                f"invalid date in {table}.{column}: expected YYYY-MM-DD",
+            )
+        for table, column in _NULLABLE_DATE_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_null_or_canonical_date,
                 f"invalid date in {table}.{column}: expected YYYY-MM-DD",
             )
         for table, column in _MICRO_STAMP_COLUMNS:

@@ -1631,7 +1631,7 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
         }
         assert "legacy_hours" not in live_cols
         live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 13
+        assert int(live_version[0]) == 14
     finally:
         direct.close()
 
@@ -5176,15 +5176,25 @@ _CHECKED_TODAY_TABLES: tuple[str, ...] = (
 _OTHER_APP_TABLES: tuple[str, ...] = (
     "api_budget",
     "close_attempts",
+    "close_pairs",
     "close_publications",
+    "close_record_downloads",
+    "close_records",
     "close_stage_log",
     "close_station_days",
     "close_try_log",
     "daily_truth",
+    "day_scores",
     "domain_backoffs",
     "feeds",
+    "forecast_downloads",
     "forecast_of_record",
+    "forecast_value_changes",
     "jobs",
+    "publication_coverage",
+    "publication_rankings",
+    "publication_wind_weights",
+    "publications",
     "runtime_state",
     "settings",
     "site_day_stations",
@@ -5192,6 +5202,8 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "site_feed_state",
     "site_zone_changes",
     "sources",
+    "starting_scores",
+    "starting_wind_days",
     "station_changes",
     "station_current_obs",
     "station_poll_state",
@@ -5767,7 +5779,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 38
+    assert len(schema_table_names()) == 50
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(

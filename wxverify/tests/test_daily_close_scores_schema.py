@@ -590,11 +590,10 @@ def test_sz3_the_remaining_tables_declare_the_same_delete_rules(table: str) -> N
         )
 
     if "feed_id" in by_column:
-        assert by_column["feed_id"]["on_delete"] == "NO ACTION", (
-            f"M118 -> at this assertion: correct = NO ACTION (sqlite's"
-            " PRAGMA spelling for an unqualified RESTRICT-by-default"
-            f" reference; {table}.feed_id references feeds(id) ON DELETE"
-            " RESTRICT, 15.2), mutant M118 (ON DELETE CASCADE given to"
+        assert by_column["feed_id"]["on_delete"] == "RESTRICT", (
+            f"M118 -> at this assertion: correct = RESTRICT ({table}.feed_id"
+            " references feeds(id) ON DELETE RESTRICT, 15.2, as"
+            " score_cache does), mutant M118 (ON DELETE CASCADE given to"
             f" feed_id instead) = {by_column['feed_id']['on_delete']}"
         )
 

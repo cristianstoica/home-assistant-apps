@@ -14,12 +14,14 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from tests.helpers import build_synthetic_verification_site, evidence_digest
 from wxverify import config
+from wxverify.db import migrations
 from wxverify.db.connection import Database, FencedWriter, close_db, get_db, init_db
 from wxverify.db.runtime_state import get_runtime_state
 from wxverify.forecast.data import forecast_ranking
@@ -31,6 +33,21 @@ from wxverify.worker.verification_run import (
     run_verification_chunk,
     verification_state_key,
 )
+
+_MIGRATION_NOW = datetime(2026, 1, 26, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _pin_migration_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin migrate_v14_daily_close_scores's download_record_since stamp.
+
+    migrate_v14_daily_close_scores writes download_record_since with the
+    migration module's own utc_now; MASK masks only runtime_state.updated_at,
+    and runtime_state.value also holds the replay chain's state blob that T4
+    compares, so an unpinned clock makes every arm's fresh database diverge
+    on a column neither P7 nor T4 is meant to catch.
+    """
+    monkeypatch.setattr(migrations, "utc_now", lambda: _MIGRATION_NOW)
 
 
 def _init_tmp_db(tmp_path: Path, name: str) -> sqlite3.Connection:

@@ -29,7 +29,7 @@ from wxverify.db.tz_generations import (
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 13
+TARGET_USER_VERSION = 14
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -319,6 +319,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
             leaderboard_status TEXT,
             created_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            -- the publication the record used: plain values with no foreign key
+            publication_id INTEGER,
+            publication_cutoff TEXT,
+            publication_age_days INTEGER,
             CHECK(
                 (status = 'missed'
                  AND missed_reason IS NOT NULL AND write_path IS NULL)
@@ -399,7 +403,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             published_at TEXT,
-            result_basis_fingerprint TEXT
+            result_basis_fingerprint TEXT,
+            worksheet_kept INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS verification_evidence (
@@ -707,6 +712,214 @@ def create_tables(conn: sqlite3.Connection) -> None:
             CHECK((slot = 'gap_fill') = (kind = 'hourly')),
             CHECK((slot = 'gap_fill') = (close_attempt IS NOT NULL))
         );
+
+        -- Daily-close scores and publications (P4). Dates are YYYY-MM-DD,
+        -- stamps canonical UTC ...Z text. No table here has a foreign key to
+        -- site_days, and none carries a tz_generation_id.
+
+        CREATE TABLE IF NOT EXISTS forecast_downloads (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            local_date TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            round_date TEXT,
+            round_try INTEGER,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            fetched_at TEXT,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            usable INTEGER NOT NULL,
+            inserted INTEGER NOT NULL,
+            labels TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_value_changes (
+            download_id INTEGER NOT NULL
+                REFERENCES forecast_downloads(id) ON DELETE CASCADE,
+            previous_download_id INTEGER,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            hours_compared INTEGER NOT NULL,
+            hours_changed INTEGER NOT NULL,
+            max_abs_change REAL,
+            first_changed_valid_at TEXT,
+            labels_changed INTEGER NOT NULL,
+            PRIMARY KEY (download_id, feed_id, variable)
+        );
+
+        CREATE TABLE IF NOT EXISTS close_pairs (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            valid_at TEXT NOT NULL,
+            lead_hours INTEGER NOT NULL,
+            forecast REAL NOT NULL,
+            observed REAL NOT NULL,
+            error REAL,
+            abs_error REAL,
+            sq_error REAL,
+            cat_hit INTEGER,
+            cat_false INTEGER,
+            cat_miss INTEGER,
+            cat_correct_neg INTEGER,
+            rain_threshold_mm REAL,
+            ref_sq_error REAL,
+            download_id INTEGER,
+            download_date TEXT,
+            issued_at TEXT,
+            fetched_at TEXT,
+            contributors INTEGER,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead,
+                         valid_at, lead_hours)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS day_scores (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            status TEXT NOT NULL,
+            download_id INTEGER,
+            download_date TEXT,
+            fetched_at TEXT,
+            n INTEGER NOT NULL,
+            err_n INTEGER NOT NULL,
+            err_sum REAL,
+            abs_sum REAL,
+            sq_sum REAL,
+            hits INTEGER,
+            false_alarms INTEGER,
+            misses INTEGER,
+            correct_negs INTEGER,
+            skill_n INTEGER,
+            skill_sq_sum REAL,
+            skill_ref_sq_sum REAL,
+            wind_fc_high REAL,
+            wind_fc_hours INTEGER,
+            wind_obs_high REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS close_records (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            truth_version TEXT NOT NULL,
+            scoring_rule TEXT NOT NULL,
+            scored_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, local_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS close_record_downloads (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            download_id INTEGER,
+            download_source TEXT,
+            download_date TEXT,
+            fetched_at TEXT,
+            labels TEXT,
+            PRIMARY KEY (site_id, local_date, feed_id, day_ahead)
+        );
+
+        CREATE TABLE IF NOT EXISTS starting_scores (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            n INTEGER NOT NULL,
+            err_n INTEGER NOT NULL,
+            err_sum REAL,
+            abs_sum REAL,
+            sq_sum REAL,
+            hits INTEGER,
+            false_alarms INTEGER,
+            misses INTEGER,
+            correct_negs INTEGER,
+            skill_n INTEGER,
+            skill_sq_sum REAL,
+            skill_ref_sq_sum REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS starting_wind_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            forecast_high REAL,
+            observed_high REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, day_ahead)
+        );
+
+        CREATE TABLE IF NOT EXISTS publications (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            cutoff TEXT NOT NULL,
+            first_record_date TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            window_start_date TEXT NOT NULL,
+            wind_start_date TEXT NOT NULL,
+            settings TEXT NOT NULL,
+            methodology_version INTEGER NOT NULL,
+            scoring_rule TEXT NOT NULL,
+            wind_method TEXT NOT NULL,
+            wind_constants TEXT NOT NULL,
+            build_started_at TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(site_id, cutoff)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_rankings (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            window_key TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            n INTEGER NOT NULL,
+            bias REAL,
+            mae REAL,
+            rmse REAL,
+            pod REAL,
+            far REAL,
+            csi REAL,
+            ets REAL,
+            hss REAL,
+            skill_score REAL,
+            PRIMARY KEY (publication_id, variable, day_ahead, window_key, feed_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_wind_weights (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            mae_ms REAL NOT NULL,
+            days INTEGER NOT NULL,
+            weight REAL NOT NULL,
+            PRIMARY KEY (publication_id, day_ahead, feed_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_coverage (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            window_key TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            scored INTEGER NOT NULL,
+            expected INTEGER NOT NULL,
+            starting_days INTEGER NOT NULL,
+            PRIMARY KEY (publication_id, variable, window_key, day_ahead, feed_id)
+        );
         """,
     )
 
@@ -801,6 +1014,9 @@ def create_indexes(conn: sqlite3.Connection) -> None:
             ON close_try_log(site_id, local_date, station_id);
         CREATE INDEX IF NOT EXISTS idx_close_try_log_tried
             ON close_try_log(tried_at);
+
+        CREATE INDEX IF NOT EXISTS idx_forecast_downloads_day
+            ON forecast_downloads(site_id, feed_id, local_date, ended_at, id);
         """,
     )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
@@ -1449,6 +1665,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 13:
         logger.debug("migrations applying v13 daily-close job kinds")
         migrate_v13_close_jobs(conn)
+    if current < 14:
+        logger.debug("migrations applying v14 daily-close scores")
+        migrate_v14_daily_close_scores(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -2276,6 +2495,58 @@ def migrate_v13_close_jobs(conn: sqlite3.Connection) -> None:
             conn.execute("RELEASE migrate_v13")
         raise
     conn.execute("RELEASE migrate_v13")
+
+
+# Value: when the download record (``forecast_downloads``) starts, a
+# canonical whole-second UTC ``...Z`` stamp. Downloads before it are
+# inferred from ``forecast_samples`` and the job rows instead.
+DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
+
+
+def migrate_v14_daily_close_scores(conn: sqlite3.Connection) -> None:
+    """Add the four P4 columns and start the download record.
+
+    :func:`create_tables` makes P4's twelve tables before the gates and
+    :func:`create_indexes` the ``forecast_downloads`` index after them, so
+    this step only adds ``verification_runs.worksheet_kept`` (1 for every
+    existing run) and ``forecast_of_record``'s ``publication_id``,
+    ``publication_cutoff`` and ``publication_age_days`` (NULL for every
+    existing record), then writes :data:`DOWNLOAD_RECORD_SINCE_KEY` with
+    the migration's time when the key is absent. It changes no existing row
+    beyond the new columns.
+
+    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a stop in between leaves user_version below 14 and the next
+    open re-enters the ``current < 14`` gate. Each column probe skips a
+    column already there -- on a fresh database :func:`create_tables` made
+    it, last in its table, so a fresh and a migrated database agree on
+    column order -- and the key is written only when absent, so a re-entry
+    keeps the first time. The clock is read through this module's
+    ``utc_now``, truncated to whole seconds.
+    """
+    if "worksheet_kept" not in _table_columns(conn, "verification_runs"):
+        conn.execute(
+            "ALTER TABLE verification_runs"
+            " ADD COLUMN worksheet_kept INTEGER NOT NULL DEFAULT 1"
+        )
+    record_columns = _table_columns(conn, "forecast_of_record")
+    if "publication_id" not in record_columns:
+        conn.execute("ALTER TABLE forecast_of_record ADD COLUMN publication_id INTEGER")
+    if "publication_cutoff" not in record_columns:
+        conn.execute(
+            "ALTER TABLE forecast_of_record ADD COLUMN publication_cutoff TEXT"
+        )
+    if "publication_age_days" not in record_columns:
+        conn.execute(
+            "ALTER TABLE forecast_of_record ADD COLUMN publication_age_days INTEGER"
+        )
+    if get_runtime_state(conn, DOWNLOAD_RECORD_SINCE_KEY) is None:
+        set_runtime_state(
+            conn,
+            DOWNLOAD_RECORD_SINCE_KEY,
+            isoformat_utc(utc_now().replace(microsecond=0)),
+        )
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
