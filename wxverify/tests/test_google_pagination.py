@@ -35,7 +35,7 @@ import pytest
 
 import wxverify.feeds.google as google_feed
 from wxverify import config
-from wxverify.core.timeutil import isoformat_utc
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, init_db
 from wxverify.feeds.google import (
     GOOGLE_MAX_HOURS,
@@ -45,7 +45,7 @@ from wxverify.feeds.google import (
     _expected_pages,
 )
 from wxverify.feeds.seam import ForecastRequest
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 # ---------------------------------------------------------------------------
 # Shared constants and fixtures
@@ -205,7 +205,18 @@ async def _drive_fetch_feed_once(db, site_id: int, feed_id: int, handler):
         def _build(source: str, client: httpx.AsyncClient) -> GoogleAdapter:
             return GoogleAdapter("synthetic-api-key", mock_client)
 
-        return await fetch_feed_once(db, site_id, feed_id, adapter_builder=_build)
+        return await fetch_feed_once(
+            db,
+            site_id,
+            feed_id,
+            adapter_builder=_build,
+            slot=DownloadSlot(
+                slot="unscheduled",
+                round_date=None,
+                round_try=None,
+                started_at=utc_now(),
+            ),
+        )
     finally:
         await mock_client.aclose()
 

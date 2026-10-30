@@ -32,6 +32,7 @@ import wxverify.feeds.meteosource as ms_feed
 import wxverify.feeds.visualcrossing as vc_feed
 from wxverify import config
 from wxverify.core.options import load_runtime_options
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import close_db, init_db
 from wxverify.feeds import parse_cap_probe as pcp
 from wxverify.feeds.meteoblue import MeteoblueAdapter
@@ -39,7 +40,7 @@ from wxverify.feeds.meteosource import MeteosourceAdapter
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import ForecastRequest, NormalizedSample
 from wxverify.feeds.visualcrossing import VisualCrossingAdapter
-from wxverify.worker.feed_fetch import FetchFeedSuccess, fetch_feed_once
+from wxverify.worker.feed_fetch import DownloadSlot, FetchFeedSuccess, fetch_feed_once
 
 _PROBE_LOGGER = "wxverify.feeds.parse_cap_probe"
 
@@ -1182,7 +1183,18 @@ def test_pt12_probe_does_not_change_persisted_state(
 
         try:
             outcome = asyncio.run(
-                fetch_feed_once(db, site_id, feed_id, adapter_builder=_build)
+                fetch_feed_once(
+                    db,
+                    site_id,
+                    feed_id,
+                    adapter_builder=_build,
+                    slot=DownloadSlot(
+                        slot="unscheduled",
+                        round_date=None,
+                        round_try=None,
+                        started_at=utc_now(),
+                    ),
+                )
             )
         finally:
             asyncio.run(mock_client.aclose())

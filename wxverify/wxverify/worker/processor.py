@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
 from math import ceil
 from typing import Final, Literal, NoReturn
@@ -93,11 +94,14 @@ from wxverify.worker.domain_backoff import (
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
+    DownloadOutcome,
+    DownloadSlot,
     Ineligible,
     Unavailable,
     fetch_feed_once,
     fetch_feed_retry_floor_seconds,
     mark_feed_unavailable,
+    record_download_try,
 )
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import (
@@ -568,11 +572,17 @@ def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition
     row's claim stamp, ``updated_at``, which ``fail()`` overwrites. Both
     kinds are enqueued with ``max_retries`` 0, so every failure of theirs is
     terminal (daily-close P3 9.1, 9.4).
+
+    A ``fetch_feed`` job writes its try's ``failed`` download row there too,
+    before ``fail()`` overwrites the claim stamp it takes as the try's start
+    (daily-close P4 4.2).
     """
     if job.type == "day_close":
         fail_day_close_job(conn, job, error, now_utc=utc_now())
     elif job.type == "day_publish":
         fail_day_publish_job(conn, job, error, now_utc=utc_now())
+    elif job.type == "fetch_feed":
+        _record_failed_fetch(conn, job, error)
     disposition = fail(
         conn,
         job.id,
@@ -733,7 +743,7 @@ async def dispatch(
         feed_id = _payload_int(job.payload, "feed_id")
         if feed_id is None:
             raise JobCancelled()
-        await _fetch_feed(db, writer, site_id, feed_id)
+        await _fetch_feed(db, writer, site_id, feed_id, payload=job.payload)
         return None
     if job.type == "backfill_site":
         site_id = job.site_id
@@ -1263,17 +1273,34 @@ def _pws_station_id(
 
 
 async def _fetch_feed(
-    db: Database, writer: FencedWriter, site_id: int, feed_id: int
+    db: Database,
+    writer: FencedWriter,
+    site_id: int,
+    feed_id: int,
+    *,
+    payload: dict[str, object],
 ) -> None:
+    """Run one ``fetch_feed`` try and record its download row (P4 plan 4.2).
+
+    The slot comes from ``payload``; a payload with no ``slot`` runs
+    ``unscheduled``. A persisted reply's row is written with its samples
+    (``fetch_feed_once``); ``budget``, ``backoff``, ``ineligible`` and
+    ``unavailable`` are written here before the job is deferred or
+    cancelled, and ``failed`` by ``_fail_job`` for a raised error.
+    """
     logger.debug("fetch_feed dispatch site=%s feed=%s", site_id, feed_id)
+    slot = _download_slot(payload, started_at=utc_now())
     outcome = await fetch_feed_once(
-        db, site_id, feed_id, writer=writer, adapter_builder=build_adapter
+        db, site_id, feed_id, writer=writer, adapter_builder=build_adapter, slot=slot
     )
     if isinstance(outcome, BudgetExhausted):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "budget")
         raise JobDeferred(outcome.next_window)
     if isinstance(outcome, BackoffActive):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "backoff")
         raise JobDeferred(outcome.next_attempt)
     if isinstance(outcome, Ineligible):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "ineligible")
         raise JobCancelled()
     if isinstance(outcome, Unavailable):
         logger.warning(
@@ -1284,14 +1311,149 @@ async def _fetch_feed(
             outcome.error,
         )
         await writer.write(
-            lambda conn, result=outcome: mark_feed_unavailable(
-                conn, result.target, result.error
+            lambda conn, result=outcome: _mark_feed_unavailable_and_record(
+                conn, result, slot
             )
         )
         # Complete through the cancelled branch, without the success marker:
         # the adapter could not be built, so no fetch ran and nothing about
         # an earlier failure of this scope has been resolved.
         raise JobCancelled()
+
+
+# A daytime slot in a fetch_feed payload: local "HH:MM" (P4 plan 5.1).
+_DAYTIME_SLOT_RE: Final = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
+
+
+def _download_slot(payload: dict[str, object], *, started_at: datetime) -> DownloadSlot:
+    """The try's slot from a ``fetch_feed`` payload (P4 plan 4.2, 4.4, 5.1).
+
+    No ``slot`` key gives ``unscheduled``: the enable-time and command-line
+    fetches, and any job queued before the upgrade. ``"round"`` needs a
+    ``round_date`` (``YYYY-MM-DD``) and a ``round_try``; a daytime slot is
+    local ``"HH:MM"``. A slot that does not read is logged and recorded as
+    ``unscheduled``, so the try still has its row.
+    """
+    value = payload.get("slot")
+    if value is None or value == "unscheduled":
+        return DownloadSlot(
+            slot="unscheduled", round_date=None, round_try=None, started_at=started_at
+        )
+    if value == "round":
+        round_date = _payload_date(payload, "round_date")
+        round_try = _payload_int(payload, "round_try")
+        if round_date is not None and round_try is not None:
+            return DownloadSlot(
+                slot="round",
+                round_date=round_date,
+                round_try=round_try,
+                started_at=started_at,
+            )
+    elif isinstance(value, str) and _DAYTIME_SLOT_RE.fullmatch(value):
+        return DownloadSlot(
+            slot=value, round_date=None, round_try=None, started_at=started_at
+        )
+    logger.warning(
+        "fetch_feed payload slot does not read; the try is recorded as unscheduled"
+    )
+    return DownloadSlot(
+        slot="unscheduled", round_date=None, round_try=None, started_at=started_at
+    )
+
+
+def _payload_date(payload: dict[str, object], key: str) -> date | None:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
+
+
+async def _record_fetch_try(
+    writer: FencedWriter,
+    site_id: int,
+    feed_id: int,
+    slot: DownloadSlot,
+    outcome: DownloadOutcome,
+) -> None:
+    """Write the download row of a try that ended without a reply (4.2)."""
+    await writer.write(
+        lambda conn: record_download_try(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            slot=slot,
+            outcome=outcome,
+            ended_at=utc_now(),
+        )
+    )
+
+
+def _mark_feed_unavailable_and_record(
+    conn: sqlite3.Connection, result: Unavailable, slot: DownloadSlot
+) -> None:
+    """Stamp the unavailable feed's state and write the try's row, in one
+    transaction."""
+    mark_feed_unavailable(conn, result.target, result.error)
+    record_download_try(
+        conn,
+        site_id=result.target.site_id,
+        feed_id=result.target.feed_id,
+        slot=slot,
+        outcome="unavailable",
+        ended_at=utc_now(),
+    )
+
+
+def _record_failed_fetch(conn: sqlite3.Connection, job: Job, error: str) -> None:
+    """``_fail_job``'s ``fetch_feed`` branch: the try's ``failed`` download
+    row, with ``error`` (already sanitized) as its reason (P4 plan 4.2).
+
+    The try started when the job was claimed: the row's ``updated_at`` holds
+    the claim stamp until ``fail()`` overwrites it, so this runs first.
+    """
+    site_id = job.site_id
+    feed_id = _payload_int(job.payload, "feed_id")
+    if site_id is None or feed_id is None:
+        return
+    try:
+        record_download_try(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            slot=_download_slot(job.payload, started_at=_claim_instant(conn, job.id)),
+            outcome="failed",
+            ended_at=utc_now(),
+            reason=error,
+        )
+    except Exception:
+        # Broad on purpose, as fetch_feed_retry_floor_seconds is: this runs
+        # inside fail()'s failure-recording write, and anything escaping
+        # aborts that write before retry_count advances, so the job would be
+        # re-pended at the same count and crash-loop. A missing download row
+        # is the smaller loss. CancelledError is BaseException and still
+        # propagates.
+        logger.warning(
+            "fetch_feed failure: download row not written job=%s",
+            job.id,
+            exc_info=True,
+        )
+
+
+def _claim_instant(conn: sqlite3.Connection, job_id: int) -> datetime:
+    """The job row's claim stamp (its ``updated_at`` while running), or now
+    when it does not read."""
+    row = conn.execute("SELECT updated_at FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    stamp: object = None if row is None else row["updated_at"]
+    if isinstance(stamp, str):
+        try:
+            return parse_utc(stamp)
+        except ValueError:
+            pass
+    return utc_now()
 
 
 def _enabled_stations(

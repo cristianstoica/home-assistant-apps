@@ -32,11 +32,6 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from wxverify.scoring.downloads import (  # P4 piece 2 (plan §4.2, §4.3, §4.7)
-    ScoredDownload,
-    scored_download,
-    scored_version,
-)
 
 from tests.helpers import (
     STANDARD_NIGHT_R,
@@ -59,11 +54,16 @@ from tests.helpers import (
 )
 from wxverify.collection.budget import set_source_cap
 from wxverify.collection.forecast_fetcher import persist_fetch_result
-from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.queue import claim_next_job, enqueue_if_absent
+from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc
+from wxverify.db.queue import claim_next_job, complete, enqueue_if_absent
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.feeds.seam import FetchResult
 from wxverify.provider_ops import set_site_subscription
+from wxverify.scoring.downloads import (  # P4 piece 2 (plan §4.2, §4.3, §4.7)
+    ScoredDownload,
+    scored_download,
+    scored_version,
+)
 from wxverify.worker.processor import run_claimed_job
 
 R = STANDARD_NIGHT_R  # 2024-06-11 (plan §15.1's standard night: R = D + 1)
@@ -325,7 +325,23 @@ def test_dl2_each_failure_outcome_recorded(
     source = "synthetic-round-x"
     feed_id = feed_ids["X"]
 
+    def _finish_leftover() -> None:
+        # A failed try re-pends its job (status back to 'pending', with a
+        # retry's future next_attempt_at) -- enqueue_if_absent's dedupe
+        # query only checks status, not next_attempt_at, so the prior
+        # case's re-pended job would dedupe this case's enqueue if left in
+        # place. Finish it through the queue's own complete() first.
+        leftover = conn.execute(
+            "SELECT id FROM jobs WHERE type='fetch_feed' AND job_key=?"
+            " AND site_id IS ? AND status IN ('pending','running')",
+            (f"fetch:{feed_id}", site_id),
+        ).fetchone()
+        if leftover is not None:
+            complete(conn, int(leftover["id"]))
+            conn.commit()
+
     def _run_one() -> sqlite3.Row:
+        _finish_leftover()
         result = enqueue_if_absent(
             conn, "fetch_feed", site_id, f"fetch:{feed_id}", {"feed_id": feed_id}
         )
@@ -388,9 +404,11 @@ def test_dl2_each_failure_outcome_recorded(
     conn.commit()
 
     # 6. ineligible -> site_feed_state disabled after the job was enqueued.
-    enqueue_if_absent(
+    _finish_leftover()
+    result = enqueue_if_absent(
         conn, "fetch_feed", site_id, f"fetch:{feed_id}", {"feed_id": feed_id}
     )
+    assert result.created, "dedupe hit -- a leftover job from the prior case"
     conn.execute(
         "UPDATE site_feed_state SET enabled=0 WHERE site_id=? AND feed_id=?",
         (site_id, feed_id),
@@ -503,6 +521,11 @@ def test_dl9_catchup_writes_no_download_row_and_the_round_is_scored(
         },
     )
     conn.commit()
+    # The round's try is dated by its END (plan 4.2): advance the clock to
+    # the round's own time (R 00:10Z) before running it, the way a real
+    # round would run -- left at the setup's D 17:00Z, the row would date
+    # to D instead of R and scored_download would find nothing on S.
+    clock.set(datetime(R.year, R.month, R.day, 0, 10, tzinfo=UTC))
     job = claim_next_job(conn)
     assert job is not None, "no round job was claimable for X"
     asyncio.run(run_claimed_job(db, job, lane="main"))
@@ -577,6 +600,59 @@ def test_dl16_payload_with_no_slot_runs_unscheduled(
     )
 
 
+_DL17_SCORING_UTC_NOW_MODULES: tuple[str, ...] = (
+    "wxverify.scoring.consensus",
+    "wxverify.scoring.split",
+    "wxverify.verification.truth",
+    "wxverify.scoring.pairing",
+    "wxverify.scoring.persistence",
+    "wxverify.scoring.multimodel",
+    "wxverify.provider_ops",
+)
+
+
+def _patch_dl17_clock(monkeypatch: pytest.MonkeyPatch, clock: MovingClock) -> None:
+    """``wxverify.worker.wind_days`` imports ``utc_now`` BY NAME (:56) and
+    is not in ``_CLOSE_CLOCK_MODULES`` (helpers.py:874) -- without this
+    patch, DL17's minute-by-minute tick loop eventually runs the
+    scheduler-enqueued ``fetch_obs``/``wind-days`` job (``scheduler.py``'s
+    ``_enqueue_due_wind_days``), whose handler ``run_wind_days`` calls
+    ``_start_job`` (wind_days.py:653), which reads ``utc_now()`` directly
+    from this unpatched module instead of taking a ``now`` argument from
+    its caller. That real clock then reaches ``_lane_today``'s
+    ``ensure_site_days(conn, site_id, now_utc=now)`` (:490) and creates a
+    site_days record dated by today's real date, failing the close
+    teardown's ``check_day_close_records`` for a fixture reason, not a
+    DL17 one. Found by grepping ``ensure_site_days(`` callers and the
+    by-name ``utc_now`` importers in ``wind_days.py``; every OTHER
+    ``utc_now()`` call on this path (``scheduler.py``'s
+    ``_enqueue_due_wind_days``, ``_lane_today``'s own ``now`` parameter)
+    is already patched via a module in ``_CLOSE_CLOCK_MODULES``.
+
+    DL17's tick loop also runs scoring jobs, and ``wxverify.scoring.consensus``,
+    ``wxverify.scoring.split``, ``wxverify.verification.truth``, and, through
+    ``pair_and_score``, ``wxverify.scoring.pairing``,
+    ``wxverify.scoring.persistence`` and ``wxverify.scoring.multimodel`` each
+    import ``utc_now`` BY NAME and reach site_days' day-record writers
+    (``ensure_site_days``/``filter_day_writes``/``check_date_write``/
+    ``check_day_write``), or pass ``now_utc=utc_now()`` into them -- the same
+    leak fixed for TR4 in ``test_close_triggers.py``'s
+    ``_patch_tr4_close_clock``. Without these extra patches, those modules'
+    real clock reaches the same day-record writers and fails the close
+    teardown for a fixture reason, not a DL17 one.
+
+    ``wxverify.provider_ops`` also imports ``utc_now`` BY NAME: enabling a
+    subscription (``set_site_subscription`` -> ``rebuild_mean_for_site`` ->
+    ``_invalidate_mean_for_site``) calls ``writable_pairs_clause(conn,
+    site_id, now_utc=utc_now())`` (provider_ops.py:885), which with the
+    close on reaches site_days' ``_ensure`` and creates a day record dated
+    by today's real date -- the same fixture-reason teardown failure.
+    """
+    monkeypatch.setattr("wxverify.worker.wind_days.utc_now", clock.now, raising=False)
+    for module in _DL17_SCORING_UTC_NOW_MODULES:
+        monkeypatch.setattr(f"{module}.utc_now", clock.now, raising=False)
+
+
 def test_dl17_enable_time_fetch_runs_unscheduled_and_covers_the_next_slot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -589,6 +665,7 @@ def test_dl17_enable_time_fetch_runs_unscheduled_and_covers_the_next_slot(
         subscribe=(),
         clock_start=datetime(R.year, R.month, R.day, 12, 20, tzinfo=UTC),
     )
+    _patch_dl17_clock(monkeypatch, clock)
     feed_id = feed_ids["X"]
     standin.program(
         "synthetic-round-x",
@@ -633,6 +710,84 @@ def test_dl17_enable_time_fetch_runs_unscheduled_and_covers_the_next_slot(
     assert standin.calls.get("synthetic-round-x", 0) == 1, (
         f"M129 -> at this assertion: correct = 1 call, mutant ="
         f" {standin.calls.get('synthetic-round-x', 0)} calls"
+    )
+
+
+def test_dl18_started_and_ended_whole_second_fetched_at_keeps_microseconds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DL18: the clock (patch_close_clock, whose list includes
+    wxverify.core.timeutil) at an instant whose microsecond is 250000: a
+    stored download of X, then X's HTTP 500."""
+    clock_instant = datetime(R.year, R.month, R.day, 12, 20, 0, 250000, tzinfo=UTC)
+    db, conn, site_id, feed_ids, standin, clock = _setup(
+        tmp_path,
+        monkeypatch,
+        subscribe=("X",),
+        clock_start=clock_instant,
+    )
+    feed_id = feed_ids["X"]
+    source = "synthetic-round-x"
+
+    def _run_one() -> sqlite3.Row:
+        result = enqueue_if_absent(
+            conn, "fetch_feed", site_id, f"fetch:{feed_id}", {"feed_id": feed_id}
+        )
+        assert result.created, "dedupe hit -- a leftover job from the prior case"
+        job = claim_next_job(conn)
+        assert job is not None, "no fetch_feed job was claimable"
+        asyncio.run(run_claimed_job(db, job, lane="main"))
+        conn.commit()
+        rows = _downloads(conn, feed_id)
+        return rows[-1]
+
+    issued_at = _stamp(clock_instant)
+    valid_at = _stamp(clock_instant + timedelta(hours=6))
+    standin.program(
+        source,
+        ProviderReply(
+            samples=(
+                round_schedule_sample(
+                    source, "temperature", issued_at, valid_at, 6, 10.0
+                ),
+            )
+        ),
+    )
+    stored_row = _run_one()
+    assert stored_row["outcome"] == "stored", (
+        f"the stored case must record outcome 'stored', got {stored_row['outcome']!r}"
+    )
+
+    standin.program(source, ProviderHttpError(500))
+    backoff_row = _run_one()
+    assert backoff_row["outcome"] == "backoff", (
+        f"the 500 case must record outcome 'backoff', got {backoff_row['outcome']!r}"
+    )
+
+    for row in (stored_row, backoff_row):
+        started_ok = is_canonical_utc_stamp(row["started_at"])
+        assert started_ok, (
+            f"M142 -> at this assertion: correct = True, mutant = {started_ok!r}"
+        )
+        ended_ok = is_canonical_utc_stamp(row["ended_at"])
+        assert ended_ok, (
+            f"M142 -> at this assertion: correct = True, mutant = {ended_ok!r}"
+        )
+
+    sample_row = conn.execute(
+        "SELECT fetched_at FROM forecast_samples WHERE feed_id=? LIMIT 1",
+        (feed_id,),
+    ).fetchone()
+    assert sample_row is not None, "the stored download must have written a sample"
+    assert stored_row["fetched_at"] == sample_row["fetched_at"], (
+        "the stored row's fetched_at must equal its sample's fetched_at"
+        f" ({sample_row['fetched_at']!r}), got {stored_row['fetched_at']!r}"
+    )
+    fetched_at_canonical = is_canonical_utc_stamp(stored_row["fetched_at"])
+    assert not fetched_at_canonical, (
+        "fetched_at must keep the clock's microseconds (proving the test"
+        f" clock reached the writer), but is_canonical_utc_stamp ="
+        f" {fetched_at_canonical!r} for {stored_row['fetched_at']!r}"
     )
 
 
@@ -908,7 +1063,7 @@ def test_dl6_a_later_download_of_the_same_label_cannot_add_hours(
         issued_at=label,
         valid_at=h168_valid,
         lead_hours=168,
-        value=168.0,
+        value=16.8,
         fetched_at=first_fetch,
     )
     _seed_sample(
@@ -919,7 +1074,7 @@ def test_dl6_a_later_download_of_the_same_label_cannot_add_hours(
         issued_at=label,
         valid_at=h169_valid,
         lead_hours=169,
-        value=169.0,
+        value=16.9,
         fetched_at=second_fetch,
     )
     conn.commit()
@@ -1010,29 +1165,22 @@ def test_dl7_two_labels_in_one_download_resolve_to_the_newer(
 def test_dl8_excluded_samples_never_reach_the_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DL8: samples with lead 0, lead above max_lead_hours, an invalid
-    value, and a rain sample before the label boundary."""
+    """DL8: samples with lead above max_lead_hours, an invalid value, and
+    a rain sample before the label boundary.
+
+    Lead 0 is left out of this row -- ``forecast_samples``' own CHECK
+    (``lead_hours >= 1``) already forbids it, so a lead-0 sample can never
+    exist to seed.
+    """
     db, conn, site_id, feed_ids, _standin, _clock = _setup(tmp_path, monkeypatch)
     feed_id = feed_ids["X"]
     label = _stamp(datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC))
     fetched_at = _stamp(datetime(S.year, S.month, S.day, 0, 10, tzinfo=UTC))
-    lead0_valid = _stamp(datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC))
     above_max_valid = _stamp(
         datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC) + timedelta(hours=200)
     )
     invalid_valid = _stamp(
         datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC) + timedelta(hours=5)
-    )
-    _seed_sample(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at=label,
-        valid_at=lead0_valid,
-        lead_hours=0,
-        value=10.0,
-        fetched_at=fetched_at,
     )
     _seed_sample(
         conn,

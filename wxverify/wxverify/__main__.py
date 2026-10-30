@@ -72,6 +72,7 @@ from wxverify.worker.close_chain import (
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
+    DownloadSlot,
     FetchFeedNoOp,
     FetchFeedOutcome,
     FetchFeedSuccess,
@@ -1026,8 +1027,14 @@ async def _providers_run_now(args: argparse.Namespace, *, smoke: bool) -> int:
         {"status": "error", "message": message} for message in selection.errors
     ]
     for feed in selection.feeds:
+        # A command-line fetch is an unscheduled try (daily-close P4 4.2).
+        slot = DownloadSlot(
+            slot="unscheduled", round_date=None, round_try=None, started_at=utc_now()
+        )
         try:
-            outcome = await fetch_feed_once(get_db(), args.site_id, feed.feed_id)
+            outcome = await fetch_feed_once(
+                get_db(), args.site_id, feed.feed_id, slot=slot
+            )
         except Exception as exc:
             rows.append(
                 {

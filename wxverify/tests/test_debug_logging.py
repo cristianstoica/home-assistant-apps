@@ -41,12 +41,13 @@ import uvicorn.config
 
 from wxverify import config
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
 from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.worker.control import JobDeferred
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 from wxverify.worker.processor import run_worker
 from wxverify.worker.score_batches import run_batched_scoring
 
@@ -342,7 +343,20 @@ def test_feed_adapter_debug_url_secret_absent_in_caplog(
         caplog.at_level(logging.DEBUG, logger="wxverify.worker.feed_fetch"),
         pytest.raises(RuntimeError),
     ):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     assert "SYNTHETIC-SECRET-E2E" not in caplog.text, (
         "secret embedded in exception URL must be redacted in feed_fetch debug trace"
@@ -1397,7 +1411,20 @@ def test_d5_feed_fetch_http_error_emits_no_error_record(
         caplog.at_level(logging.DEBUG, logger="wxverify.worker.feed_fetch"),
         pytest.raises(httpx.HTTPStatusError),
     ):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     # Zero ERROR records from feed_fetch
     feed_fetch_errors = [
@@ -1451,7 +1478,20 @@ def test_d5_feed_fetch_transport_error_emits_no_error_record(
         caplog.at_level(logging.DEBUG, logger="wxverify.worker.feed_fetch"),
         pytest.raises(httpx.ConnectError),
     ):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     feed_fetch_errors = [
         r

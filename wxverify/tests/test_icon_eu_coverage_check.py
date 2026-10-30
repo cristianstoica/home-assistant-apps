@@ -50,7 +50,7 @@ from wxverify.db.migrations import create_schema
 from wxverify.feeds.open_meteo import OpenMeteoAdapter, _historical_hourly_names
 from wxverify.feeds.seam import ForecastRequest, NormalizedSample
 from wxverify.worker.backfill import SiteBackfillTarget, _fetch_historical_forecasts
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 # ---------------------------------------------------------------------------
 # Synthetic fixture coordinates (plan §8.3: in-box, open North Atlantic,
@@ -838,6 +838,12 @@ def test_d1_t6_forward_request_matches_production_fetch_feed_once(
                 site_id,
                 feed_id,
                 adapter_builder=lambda _source, _c: OpenMeteoAdapter(mock_client),
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=now,
+                ),
             )
 
     asyncio.run(_run_production())

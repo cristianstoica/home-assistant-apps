@@ -42,7 +42,7 @@ from tests.helpers import (
     standard_night,
 )
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.queue import claim_next_job, enqueue_if_absent
+from wxverify.db.queue import claim_next_job, complete, enqueue_if_absent
 from wxverify.worker.processor import run_claimed_job
 
 R = STANDARD_NIGHT_R  # 2024-06-11 (plan §15.1's standard night: R = D + 1)
@@ -107,7 +107,23 @@ def _run_unscheduled(db, conn: sqlite3.Connection, site_id: int, feed_id: int) -
     completion -- the simplest way to drive a second (or third) download
     of X without depending on the round's retry/bound mechanics, which
     the value-change log does not care about (5.2: "for every stored
-    download -- round, daytime or unscheduled")."""
+    download -- round, daytime or unscheduled").
+
+    A failed try (e.g. VC4's 404 between the two stored downloads)
+    re-pends its job -- status back to 'pending', with a retry's future
+    next_attempt_at -- and enqueue_if_absent's dedupe query only checks
+    status, not next_attempt_at, so that leftover job would dedupe the
+    next unscheduled fetch. Finish it through the queue's own complete()
+    first.
+    """
+    leftover = conn.execute(
+        "SELECT id FROM jobs WHERE type='fetch_feed' AND job_key=?"
+        " AND site_id IS ? AND status IN ('pending','running')",
+        (f"fetch:{feed_id}", site_id),
+    ).fetchone()
+    if leftover is not None:
+        complete(conn, int(leftover["id"]))
+        conn.commit()
     result = enqueue_if_absent(
         conn, "fetch_feed", site_id, f"fetch:{feed_id}", {"feed_id": feed_id}
     )
@@ -138,8 +154,19 @@ def _last_download_id(conn: sqlite3.Connection, feed_id: int) -> int:
 
 
 def _two_variable_reply(
-    label: str, base_valid: datetime, *, temperature: float, wind: float
+    label: str,
+    base_valid: datetime,
+    *,
+    temperature: float,
+    wind: float,
+    temperature_hour7: float | None = None,
 ) -> ProviderReply:
+    """``temperature_hour7`` defaults to ``temperature`` (both hours carry
+    the same value); pass it explicitly to change only hour 6's value
+    between two replies, as VC1 needs (one temperature hour changed, not
+    both)."""
+    if temperature_hour7 is None:
+        temperature_hour7 = temperature
     return ProviderReply(
         samples=(
             round_schedule_sample(
@@ -151,7 +178,7 @@ def _two_variable_reply(
                 label,
                 _stamp(base_valid + timedelta(hours=1)),
                 7,
-                temperature,
+                temperature_hour7,
             ),
             round_schedule_sample(SOURCE, "wind", label, _stamp(base_valid), 6, wind),
             round_schedule_sample(
@@ -186,7 +213,10 @@ def test_vc1_a_changed_value_is_logged_per_variable(
     _run_round(db, conn, site_id, feed_id)
 
     standin.program(
-        SOURCE, _two_variable_reply(label, base_valid, temperature=10.5, wind=5.0)
+        SOURCE,
+        _two_variable_reply(
+            label, base_valid, temperature=10.5, wind=5.0, temperature_hour7=10.0
+        ),
     )
     _run_unscheduled(db, conn, site_id, feed_id)
 

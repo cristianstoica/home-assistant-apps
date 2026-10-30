@@ -890,6 +890,15 @@ _CLOSE_CLOCK_MODULES: Final[tuple[str, ...]] = (
     # snapshot_utc + LATE_WRITE_WINDOW_HOURS and the build raises
     # JobCancelled on every record job.
     "wxverify.verification.record",
+    # wxverify.collection.budget imports utc_now BY NAME too (budget.py:15)
+    # and uses it to check a feed's daily call budget -- without this entry
+    # the round's tests cannot move the clock past the budget day boundary.
+    "wxverify.collection.budget",
+    # wxverify.worker.domain_backoff imports utc_now BY NAME too
+    # (domain_backoff.py:13) and uses it to check a domain's backoff end --
+    # without this entry the round's tests cannot move the clock past the
+    # backoff end to let a retry through.
+    "wxverify.worker.domain_backoff",
 )
 
 
@@ -1289,7 +1298,12 @@ def stub_fetch_feed(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
     calls: list[tuple[int, int]] = []
 
     async def _stub(
-        db: Database, writer: FencedWriter, site_id: int, feed_id: int
+        db: Database,
+        writer: FencedWriter,
+        site_id: int,
+        feed_id: int,
+        *,
+        payload: dict[str, object],
     ) -> None:
         calls.append((site_id, feed_id))
 
@@ -1709,19 +1723,25 @@ def install_provider_standin(monkeypatch: pytest.MonkeyPatch) -> ProviderStandIn
 
 def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
     """Map P4 §18.1's synthetic feed sources (X/Y/Z/G,
-    :data:`ROUND_SCHEDULE_SOURCES`) onto themselves in
-    ``worker.domain_backoff.SOURCE_DOMAINS`` (today keyed by real provider
-    names only -- ``open-meteo``, ``meteoblue``, etc.). Without this, a
-    real download run through the job pipeline for one of these feeds
-    hits a bare ``KeyError`` in ``source_domain``, called unconditionally
-    by ``_reserve_feed_call``/``_persist_fetch_success`` on every attempt
-    (success or failure) -- not the production behaviour under test. The
-    real ``meteoblue`` source already has an entry and needs no patch.
+    :data:`ROUND_SCHEDULE_SOURCES`) in ``worker.domain_backoff.SOURCE_DOMAINS``
+    (today keyed by real provider names only -- ``open-meteo``, ``meteoblue``,
+    etc.) onto ``"{source}.example.invalid"``, not onto the bare source name.
+    Without this, a real download run through the job pipeline for one of
+    these feeds hits a bare ``KeyError`` in ``source_domain``, called
+    unconditionally by ``_reserve_feed_call``/``_persist_fetch_success`` on
+    every attempt (success or failure) -- not the production behaviour under
+    test. The mapped value must match ``_StandInAdapter.fetch_forecast``'s
+    request host (``f"https://{source}.example.invalid/forecast"``, above):
+    ``record_http_backoff`` keys a domain-backoff row on ``response.url.host``,
+    so mapping the bare source name here would make ``check_domain_backoff``
+    look up a domain the stand-in's 429/500 never actually records under,
+    and a programmed backoff would never be seen. The real ``meteoblue``
+    source already has an entry and needs no patch.
     """
     from wxverify.worker.domain_backoff import SOURCE_DOMAINS
 
     for source in ROUND_SCHEDULE_SOURCES.values():
-        monkeypatch.setitem(SOURCE_DOMAINS, source, source)
+        monkeypatch.setitem(SOURCE_DOMAINS, source, f"{source}.example.invalid")
 
 
 # ---------------------------------------------------------------------------

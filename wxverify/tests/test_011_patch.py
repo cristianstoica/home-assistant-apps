@@ -44,6 +44,7 @@ from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
 from wxverify.worker.feed_fetch import (
     BackoffActive,
+    DownloadSlot,
     fetch_feed_once,
     fetch_feed_retry_floor_seconds,
 )
@@ -502,7 +503,20 @@ def test_fetch_feed_connect_error_refunds_budget(tmp_path: Path) -> None:
         return _ConnectErrorAdapter()
 
     with pytest.raises(httpx.ConnectError):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"
@@ -540,7 +554,20 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
     def _build(source: str, client: httpx.AsyncClient) -> _Http429Adapter:
         return _Http429Adapter()
 
-    result = asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+    result = asyncio.run(
+        fetch_feed_once(
+            db,
+            site_id,
+            feed_id,
+            adapter_builder=_build,
+            slot=DownloadSlot(
+                slot="unscheduled",
+                round_date=None,
+                round_try=None,
+                started_at=utc_now(),
+            ),
+        )
+    )
     assert isinstance(result, BackoffActive)
 
     budget = conn.execute(
@@ -572,7 +599,20 @@ def test_fetch_feed_read_timeout_keeps_budget(tmp_path: Path) -> None:
         return _ReadTimeoutAdapter()
 
     with pytest.raises(httpx.ReadTimeout):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"
@@ -598,7 +638,20 @@ def test_fetch_feed_success_consumes_budget_exactly_once(tmp_path: Path) -> None
     def _build(source: str, client: httpx.AsyncClient) -> _SuccessAdapter:
         return _SuccessAdapter()
 
-    asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+    asyncio.run(
+        fetch_feed_once(
+            db,
+            site_id,
+            feed_id,
+            adapter_builder=_build,
+            slot=DownloadSlot(
+                slot="unscheduled",
+                round_date=None,
+                round_try=None,
+                started_at=utc_now(),
+            ),
+        )
+    )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"

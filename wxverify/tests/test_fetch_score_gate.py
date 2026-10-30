@@ -22,7 +22,7 @@ import pytest
 
 import wxverify.core.timeutil as timeutil_module
 from wxverify import config
-from wxverify.core.timeutil import day_ahead, isoformat_utc
+from wxverify.core.timeutil import day_ahead, isoformat_utc, utc_now
 from wxverify.db import queue as queue_module
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
@@ -40,6 +40,7 @@ from wxverify.settings.service import set_rolling_window_days_sync
 from wxverify.worker import feed_fetch as feed_fetch_module
 from wxverify.worker import scheduler as scheduler_module
 from wxverify.worker.feed_fetch import (
+    DownloadSlot,
     FeedFetchTarget,
     _persist_fetch_success,
     fetch_feed_once,
@@ -732,7 +733,19 @@ def test_gate_live_path_injected_enqueue_failure_rolls_back_fetch(
 
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(
-            fetch_feed_once(db, site_id, feed_id, writer=writer, adapter_builder=_build)
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                writer=writer,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
         )
 
     assert (
@@ -789,7 +802,19 @@ def test_gate_live_path_probe_error_rolls_back_fetch(
 
     with pytest.raises(sqlite3.DatabaseError) as excinfo:
         asyncio.run(
-            fetch_feed_once(db, site_id, feed_id, writer=writer, adapter_builder=_build)
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                writer=writer,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
         )
 
     assert excinfo.value is exc

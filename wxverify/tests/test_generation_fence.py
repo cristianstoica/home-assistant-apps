@@ -28,6 +28,7 @@ from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import (
     Database,
     FencedWriter,
@@ -43,7 +44,7 @@ from wxverify.worker.backfill import (
     fetch_station_history_window,
 )
 from wxverify.worker.catchup import run_catchup
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 
 async def _idle_worker(db: object) -> None:
@@ -187,6 +188,12 @@ def test_fetch_feed_fence_discards_a_write_after_a_replace(
                     feed_id,
                     writer=writer,
                     adapter_builder=_adapter_builder,
+                    slot=DownloadSlot(
+                        slot="unscheduled",
+                        round_date=None,
+                        round_try=None,
+                        started_at=utc_now(),
+                    ),
                 )
             )
             await asyncio.wait_for(entered.wait(), timeout=5.0)
