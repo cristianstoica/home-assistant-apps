@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from collections.abc import Mapping
 from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
@@ -26,6 +27,95 @@ class MetricResult(BaseModel):
     csi: float | None = None
     ets: float | None = None
     hss: float | None = None
+
+
+#: One cell's sums, keyed by the ``day_scores`` sum columns (daily-close
+#: plan 6.4): ``n``, ``err_n``, ``err_sum``, ``abs_sum``, ``sq_sum``,
+#: ``hits``, ``false_alarms``, ``misses``, ``correct_negs``, ``skill_n``,
+#: ``skill_sq_sum`` and ``skill_ref_sq_sum``. A missing key reads as NULL.
+MetricSums = Mapping[str, float | int | None]
+
+
+def metrics_from_sums(sums: MetricSums, *, variable: str, min_n: int) -> MetricResult:
+    """The metrics of one cell from its sums (daily-close plan 6.4).
+
+    The one place the metric arithmetic lives: both strategies call it after
+    their SELECT, and the daily close's stored sums go through it too. Bias
+    is ``err_sum / err_n``, MAE ``abs_sum / err_n``, RMSE the square root of
+    ``sq_sum / err_n``. Continuous skill is one minus the ratio of the mean
+    squared errors over the ``skill_n`` pairs that have a persistence
+    reference (no reference pair, or a reference error of 0, gives none).
+    Rain (``variable == "precip"``) takes POD, FAR, CSI, ETS and HSS from
+    the four contingency sums, with ETS as its skill and 0.0 for a mean
+    that has no value. ``n == 0`` gives ``MetricResult(n=0,
+    confident=False)``. Pure.
+    """
+    n = _count(sums.get("n"))
+    if n == 0:
+        return MetricResult(n=0, confident=False)
+    err_n = _count(sums.get("err_n"))
+    if variable == "precip":
+        h = _total(sums.get("hits"))
+        f = _total(sums.get("false_alarms"))
+        m = _total(sums.get("misses"))
+        cn = _total(sums.get("correct_negs"))
+        pod = _safe_div(h, h + m)
+        far = _safe_div(f, h + f)
+        csi = _safe_div(h, h + f + m)
+        total = h + f + m + cn
+        random_hits = ((h + f) * (h + m) / total) if total else 0.0
+        ets = _safe_div(h - random_hits, h + f + m - random_hits)
+        hss = _safe_div(2 * (h * cn - f * m), (h + m) * (m + cn) + (h + f) * (f + cn))
+        mse = _mean(sums.get("sq_sum"), err_n) or 0.0
+        return MetricResult(
+            n=n,
+            bias=_mean(sums.get("err_sum"), err_n) or 0.0,
+            mae=_mean(sums.get("abs_sum"), err_n) or 0.0,
+            rmse=math.sqrt(mse),
+            pod=pod,
+            far=far,
+            csi=csi,
+            ets=ets,
+            hss=hss,
+            skill_score=ets,
+            confident=n >= min_n and ets is not None,
+        )
+    mse = _mean(sums.get("sq_sum"), err_n)
+    skill = _skill_from_sums(sums)
+    return MetricResult(
+        n=n,
+        bias=_mean(sums.get("err_sum"), err_n),
+        mae=_mean(sums.get("abs_sum"), err_n),
+        rmse=None if mse is None else math.sqrt(mse),
+        skill_score=skill,
+        confident=n >= min_n and skill is not None,
+    )
+
+
+def _skill_from_sums(sums: MetricSums) -> float | None:
+    """One minus the feed's mean squared error over the persistence one's,
+    each over the ``skill_n`` referenced pairs, as ``AVG`` makes them."""
+    skill_n = _count(sums.get("skill_n"))
+    feed_mse = _mean(sums.get("skill_sq_sum"), skill_n)
+    reference_mse = _mean(sums.get("skill_ref_sq_sum"), skill_n)
+    if feed_mse is None or reference_mse is None or reference_mse == 0:
+        return None
+    return 1.0 - feed_mse / reference_mse
+
+
+def _count(value: float | int | None) -> int:
+    return 0 if value is None else int(value)
+
+
+def _total(value: float | int | None) -> float:
+    return float(value or 0)
+
+
+def _mean(total: float | int | None, count: int) -> float | None:
+    """``total / count`` as SQL's ``AVG`` gives it; ``None`` for no value."""
+    if count == 0 or total is None:
+        return None
+    return float(total) / count
 
 
 class MetricStrategy(Protocol):
@@ -79,8 +169,8 @@ class ContinuousStrategy:
         asof_clause, asof_params = _asof_clause("forecast_pairs", as_of)
         row = conn.execute(
             f"""
-            SELECT COUNT(*) AS n, AVG(error) AS bias, AVG(abs_error) AS mae,
-                   AVG(sq_error) AS mse
+            SELECT COUNT(*) AS n, COUNT(error) AS err_n, SUM(error) AS err_sum,
+                   SUM(abs_error) AS abs_sum, SUM(sq_error) AS sq_sum
             FROM forecast_pairs
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
               AND {published_generation_clause("forecast_pairs")}
@@ -91,21 +181,22 @@ class ContinuousStrategy:
         ).fetchone()
         if row is None:
             return MetricResult(n=0, confident=False)
-        n = int(row["n"])
-        if n == 0:
-            return MetricResult(n=0, confident=False)
-        mse = float(row["mse"])
-        skill = _paired_skill(
-            conn, site_id, feed_id, variable, day_ahead, window_cutoff, as_of=as_of
-        )
-        return MetricResult(
-            n=n,
-            bias=float(row["bias"]),
-            mae=float(row["mae"]),
-            rmse=math.sqrt(mse),
-            skill_score=skill,
-            confident=n >= min_n and skill is not None,
-        )
+        sums: dict[str, float | int | None] = {
+            key: row[key] for key in ("n", "err_n", "err_sum", "abs_sum", "sq_sum")
+        }
+        if _count(sums["n"]) > 0:
+            sums.update(
+                _paired_skill(
+                    conn,
+                    site_id,
+                    feed_id,
+                    variable,
+                    day_ahead,
+                    window_cutoff,
+                    as_of=as_of,
+                )
+            )
+        return metrics_from_sums(sums, variable=variable, min_n=min_n)
 
 
 class PrecipStrategy:
@@ -126,9 +217,10 @@ class PrecipStrategy:
         row = conn.execute(
             f"""
             SELECT COUNT(*) AS n,
-                   SUM(cat_hit) AS h, SUM(cat_false) AS f,
-                   SUM(cat_miss) AS m, SUM(cat_correct_neg) AS cn,
-                   AVG(error) AS bias, AVG(abs_error) AS mae, AVG(sq_error) AS mse
+                   SUM(cat_hit) AS hits, SUM(cat_false) AS false_alarms,
+                   SUM(cat_miss) AS misses, SUM(cat_correct_neg) AS correct_negs,
+                   COUNT(error) AS err_n, SUM(error) AS err_sum,
+                   SUM(abs_error) AS abs_sum, SUM(sq_error) AS sq_sum
             FROM forecast_pairs
             WHERE site_id=? AND feed_id=? AND variable=? AND day_ahead=?
               AND {published_generation_clause("forecast_pairs")}
@@ -139,34 +231,21 @@ class PrecipStrategy:
         ).fetchone()
         if row is None:
             return MetricResult(n=0, confident=False)
-        n = int(row["n"])
-        if n == 0:
-            return MetricResult(n=0, confident=False)
-        h = float(row["h"] or 0)
-        f = float(row["f"] or 0)
-        m = float(row["m"] or 0)
-        cn = float(row["cn"] or 0)
-        pod = _safe_div(h, h + m)
-        far = _safe_div(f, h + f)
-        csi = _safe_div(h, h + f + m)
-        total = h + f + m + cn
-        random_hits = ((h + f) * (h + m) / total) if total else 0.0
-        ets = _safe_div(h - random_hits, h + f + m - random_hits)
-        hss = _safe_div(2 * (h * cn - f * m), (h + m) * (m + cn) + (h + f) * (f + cn))
-        mse = float(row["mse"] or 0.0)
-        return MetricResult(
-            n=n,
-            bias=float(row["bias"] or 0.0),
-            mae=float(row["mae"] or 0.0),
-            rmse=math.sqrt(mse),
-            pod=pod,
-            far=far,
-            csi=csi,
-            ets=ets,
-            hss=hss,
-            skill_score=ets,
-            confident=n >= min_n and ets is not None,
-        )
+        sums: dict[str, float | int | None] = {
+            key: row[key]
+            for key in (
+                "n",
+                "hits",
+                "false_alarms",
+                "misses",
+                "correct_negs",
+                "err_n",
+                "err_sum",
+                "abs_sum",
+                "sq_sum",
+            )
+        }
+        return metrics_from_sums(sums, variable=variable, min_n=min_n)
 
 
 def strategy_for(variable: str) -> MetricStrategy:
@@ -184,12 +263,16 @@ def _paired_skill(
     window_cutoff: str | None,
     *,
     as_of: str | None = None,
-) -> float | None:
+) -> dict[str, float | int | None]:
+    """The skill sums of one cell: the count of the feed's pairs that join a
+    persistence pair at the same ``valid_at``, ``lead_hours`` and
+    ``day_ahead``, and the sums of the two sides' ``sq_error``; ``{}`` with
+    no persistence feed. ``metrics_from_sums`` makes the skill from them."""
     persistence = conn.execute(
         "SELECT id FROM feeds WHERE source='virtual' AND model='_persistence'"
     ).fetchone()
     if persistence is None:
-        return None
+        return {}
     clause = "" if window_cutoff is None else "AND fp.valid_at >= ?"
     # Knowability applies to BOTH sides of the paired-skill join — the
     # candidate (fp) AND the persistence reference (pp) — never fp alone
@@ -208,8 +291,9 @@ def _paired_skill(
     params = (*params, *asof_fp_params, *asof_pp_params)
     row = conn.execute(
         f"""
-        SELECT AVG(fp.sq_error) AS feed_mse,
-               AVG(pp.sq_error) AS persistence_mse
+        SELECT COUNT(*) AS skill_n,
+               SUM(fp.sq_error) AS skill_sq_sum,
+               SUM(pp.sq_error) AS skill_ref_sq_sum
         FROM forecast_pairs fp
         JOIN forecast_pairs pp
           ON pp.site_id = fp.site_id
@@ -228,13 +312,9 @@ def _paired_skill(
         """,
         params,
     ).fetchone()
-    if row is None or row["feed_mse"] is None or row["persistence_mse"] is None:
-        return None
-    feed_mse = float(row["feed_mse"])
-    persistence_mse = float(row["persistence_mse"])
-    if persistence_mse == 0:
-        return None
-    return 1.0 - feed_mse / persistence_mse
+    if row is None:
+        return {}
+    return {key: row[key] for key in ("skill_n", "skill_sq_sum", "skill_ref_sq_sum")}
 
 
 def _safe_div(num: float, den: float) -> float | None:

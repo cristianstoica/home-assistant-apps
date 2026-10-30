@@ -633,9 +633,8 @@ def test_pd2_score_day_called_directly_with_close_off_is_refused() -> None:
     refusal above comes from the close switch specifically, not from
     ``score_day`` never reaching the guard either way.
     """
-    from wxverify.scoring.close_scores import ScoreDayRefused, score_day
-
     from wxverify.db.site_days import day_record
+    from wxverify.scoring.close_scores import ScoreDayRefused, score_day
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=False, with_records=True)
@@ -660,8 +659,6 @@ def test_pd2_score_day_called_directly_with_close_off_is_refused() -> None:
     )
 
     # --- Paired positive -----------------------------------------------
-    from wxverify.scoring.close_scores import ScoreDayInputMissing
-
     from wxverify.db.runtime_state import set_runtime_state
     from wxverify.db.site_days import (
         DAILY_CLOSE_ON_KEY,
@@ -669,6 +666,7 @@ def test_pd2_score_day_called_directly_with_close_off_is_refused() -> None:
         ensure_site_days,
         start_site_days,
     )
+    from wxverify.scoring.close_scores import ScoreDayInputMissing
 
     conn2 = asof_conn()
     site_b = day_close_site(conn2, close_on=True, with_records=False)

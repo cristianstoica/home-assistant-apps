@@ -1,5 +1,5 @@
 """Scoring the day (daily-close plan 2026-10-22-daily-close-pairs-and-
-publication.md, section 6; test IDs SD1-SD16, plan 18.6).
+publication.md, section 6; test IDs SD1-SD18, plan 18.6).
 
 Written before ``wxverify.scoring.close_scores`` exists: every test below
 collects, then fails at its own ``from wxverify.scoring.close_scores import
@@ -38,7 +38,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.helpers import D, asof_conn, day_close_site, note_day_clock
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, parse_utc
 from wxverify.db.site_days import (
     begin_close,
     day_record,
@@ -366,15 +366,26 @@ def _day_score_rows(conn, site_id: int, feed_id: int) -> list[dict[str, object]]
     ]
 
 
+_P4_TABLE_ORDER_BY = {
+    # close_pairs and day_scores are WITHOUT ROWID: order by their own
+    # primary key columns (wxverify/db/migrations.py), not `rowid`.
+    "close_pairs": "feed_id, variable, day_ahead, valid_at, lead_hours",
+    "day_scores": "feed_id, variable, day_ahead",
+    "close_records": "rowid",
+    "close_record_downloads": "feed_id, day_ahead",
+}
+
+
 def _p4_table_snapshot(conn, site_id: int) -> dict[str, list[dict[str, object]]]:
     tables = ("close_pairs", "day_scores", "close_records", "close_record_downloads")
     snapshot: dict[str, list[dict[str, object]]] = {}
     for table in tables:
-        key = "local_date" if table != "close_record_downloads" else "local_date"
+        order_by = _P4_TABLE_ORDER_BY[table]
         snapshot[table] = [
             dict(row)
             for row in conn.execute(
-                f"SELECT * FROM {table} WHERE site_id = ? AND {key} = ? ORDER BY rowid",
+                f"SELECT * FROM {table} WHERE site_id = ? AND local_date = ?"
+                f" ORDER BY {order_by}",
                 (site_id, D.isoformat()),
             ).fetchall()
         ]
@@ -512,7 +523,7 @@ def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: A
         (site_id, D.isoformat(), feeds["X"]),
     ).fetchone()
     assert rec_row is not None and rec_row["download_id"] is None
-    assert summary.absent.get("feed:X") == 1
+    assert summary.absent.get(f"feed:{feeds['X']}") == 1
 
     # --- Paired positive: Y, untouched, is scored at k=2 -----------------
     y_k2_rows = [
@@ -752,8 +763,8 @@ def test_sd6_thin_variables_not_counted_and_unpaired(tmp_path) -> None:  # noqa:
                 assert row["status"] == "not_counted"
             else:
                 assert row["status"] == "scored"
-    for name in feeds:
-        key = f"feed:{name}"
+    for feed_id in feeds.values():
+        key = f"feed:{feed_id}"
         scored = summary.scored.get(key, 0)
         absent = summary.absent.get(key, 0)
         # 8 day-aheads of temperature only ever counted (not 24 across 3 vars)
@@ -892,7 +903,13 @@ def test_sd9_multimodel_mean_over_active_feeds_only(tmp_path) -> None:  # noqa: 
     site_id, feeds, record, now_utc, _ids, _gen = _build_base(conn)
     feeds["Z"] = _make_feed(conn, "Z")
     _subscribe(conn, site_id, feeds["Z"], enabled=False)
-    _seed_downloads(conn, site_id, {"Z": feeds["Z"]}, D)
+    _seed_downloads(
+        conn,
+        site_id,
+        {"Z": feeds["Z"]},
+        D,
+        bias={"Z": {"temperature": 3.0, "wind": 3.0, "precip": 0.0}},
+    )
 
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
@@ -958,6 +975,20 @@ def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa
     conn = asof_conn()
     site_id, feeds, record, now_utc, _ids, _gen = _build_base(conn)
 
+    # By construction (lead = 24*k + hour + 1), every hour of day-ahead k
+    # references the same earlier instant, (D-k-1) 23:00, regardless of
+    # hour -- so the "has a value" and "has no value" cases must come from
+    # two different day-aheads, not two hours of the same one. Day-ahead 0
+    # references D-1 23:00 (left unseeded, so NULL); seed an observation at
+    # D-2 23:00 so day-ahead 1's reference (and only that one) has a value.
+    ref_valid_at = f"{(D - timedelta(days=2)).isoformat()}T23:00:00Z"
+    conn.execute(
+        "INSERT INTO observations"
+        " (site_id, variable, valid_at, value, n_stations, computed_at)"
+        " VALUES (?, 'temperature', ?, ?, 2, ?)",
+        (site_id, ref_valid_at, 12.0, ref_valid_at),
+    )
+
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
     temp_pairs = [
@@ -965,16 +996,22 @@ def test_sd10_ref_sq_error_null_when_no_earlier_value(tmp_path) -> None:  # noqa
         for p in _close_pairs(conn, site_id, feeds["X"])
         if p["variable"] == "temperature" and int(p["day_ahead"]) == 0
     ]
-    # Hour 0's day-ahead-0 pair has no earlier hour within D to reference
-    # (h - L would be before D's start): ref_sq_error must be NULL there.
+    # Day-ahead 0's reference, D-1 23:00, has no seeded observation:
+    # ref_sq_error must be NULL for every one of its hours.
     hour0 = next(p for p in temp_pairs if parse_utc(p["valid_at"]).hour == 0)
     assert hour0["ref_sq_error"] is None, (
-        "M51 -> at this assertion: correct = NULL (hour 0 has no earlier"
-        " hour within D, so no persistence reference), mutant"
-        " (ref_sq_error 0 where the earlier hour has no value) = 0.0"
+        "M51 -> at this assertion: correct = NULL (day-ahead 0's reference,"
+        " D-1 23:00, has no seeded observation), mutant (ref_sq_error 0"
+        " where the earlier hour has no value) = 0.0"
     )
-    # A later hour (lead 1 is available within D) must have a real value.
-    hour5 = next(p for p in temp_pairs if parse_utc(p["valid_at"]).hour == 5)
+    # Day-ahead 1's reference, D-2 23:00, was seeded above: its hours must
+    # have a real ref_sq_error.
+    temp_pairs_k1 = [
+        p
+        for p in _close_pairs(conn, site_id, feeds["X"])
+        if p["variable"] == "temperature" and int(p["day_ahead"]) == 1
+    ]
+    hour5 = next(p for p in temp_pairs_k1 if parse_utc(p["valid_at"]).hour == 5)
     assert hour5["ref_sq_error"] is not None
 
     temp_row = next(
@@ -1070,7 +1107,22 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
     from wxverify.scoring.close_scores import score_day
 
     conn = asof_conn()
-    site_id, feeds, record, now_utc, _ids, _gen = _build_base(conn)
+    site_id, feeds, record, now_utc, download_ids, _gen = _build_base(conn)
+
+    # X's k=1 download (S = D-1) is the one the late sample will re-add a
+    # row under: free up its (temperature, D 10:00) slot first, so the
+    # later INSERT does not collide with forecast_samples' UNIQUE(site_id,
+    # feed_id, variable, issued_at, valid_at).
+    s1 = D - timedelta(days=1)
+    k1_label = f"{(s1 - timedelta(days=1)).isoformat()}T00:00:00Z"
+    k1_valid_at = isoformat_utc(datetime(D.year, D.month, D.day, 10, tzinfo=UTC))
+    deleted = conn.execute(
+        "DELETE FROM forecast_samples"
+        " WHERE site_id = ? AND feed_id = ? AND variable = 'temperature'"
+        " AND issued_at = ? AND valid_at = ?",
+        (site_id, feeds["X"], k1_label, k1_valid_at),
+    )
+    assert deleted.rowcount == 1
 
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
     first = _p4_table_snapshot(conn, site_id)
@@ -1100,18 +1152,30 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
             " rows differ in more than scored_at"
         )
 
-    # A later sample for X does not change the rerun's output: its
-    # fetched_at is after the scored download's, so scored_version (4.3)
-    # leaves it out.
-    s0 = D
-    label0 = f"{(s0 - timedelta(days=1)).isoformat()}T00:00:00Z"
-    valid_at = isoformat_utc(datetime(D.year, D.month, D.day, 10, tzinfo=UTC))
+    # A later sample for X's k=1 (temperature, D 10:00) slot -- freed above
+    # -- does not change the rerun's output: its fetched_at is after the
+    # k=1 download's fetched_at, so scored_version (4.3) leaves it out.
+    k1_download = conn.execute(
+        "SELECT fetched_at FROM forecast_downloads"
+        " WHERE site_id = ? AND feed_id = ? AND local_date = ?",
+        (site_id, feeds["X"], s1.isoformat()),
+    ).fetchone()
+    assert k1_download is not None
+    late_fetched_at = f"{s1.isoformat()}T23:59:00Z"
+    assert late_fetched_at > k1_download["fetched_at"]
     conn.execute(
         "INSERT INTO forecast_samples"
         " (site_id, feed_id, variable, issued_at, valid_at, lead_hours, value,"
         "  source_raw, model_run_id, fetched_at)"
-        " VALUES (?, ?, 'temperature', ?, ?, 11, 999.0, 'late', ?, ?)",
-        (site_id, feeds["X"], label0, valid_at, label0, f"{D.isoformat()}T23:59:00Z"),
+        " VALUES (?, ?, 'temperature', ?, ?, 35, 45.0, 'late', ?, ?)",
+        (
+            site_id,
+            feeds["X"],
+            k1_label,
+            k1_valid_at,
+            k1_label,
+            late_fetched_at,
+        ),
     )
     record_after_2 = day_record(conn, site_id, D)
     assert record_after_2 is not None
@@ -1120,7 +1184,13 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
     )
     third = _p4_table_snapshot(conn, site_id)
     for table in first:
-        assert _without_scored_at(second[table]) == _without_scored_at(third[table])
+        assert _without_scored_at(second[table]) == _without_scored_at(third[table]), (
+            "4.3 -> at this assertion: correct = the late sample (fetched_at"
+            " after the download's) is left out, so the third call adds"
+            " nothing, mutant (fetched_at cutoff dropped from"
+            " scored_version) = the k=1 temperature pair at D 10:00 takes"
+            f" the late value (table={table})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1269,8 +1339,8 @@ def test_sd15_missing_truth_row_raises_nothing_written(tmp_path) -> None:  # noq
 
 def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) -> None:  # noqa: ARG001
     """SD16: no stored download of any feed on D-7 to D: `absent` rows for
-    every feed and day ahead, persistence pairs still made, the record
-    still written; no failure (6.9).
+    every switched-on feed and day ahead, persistence pairs still made, the
+    record still written; no failure (6.9).
     """
     from wxverify.scoring.close_scores import score_day
 
@@ -1292,7 +1362,7 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
             " rows) = this line is never reached"
         )
         assert _close_pairs(conn, site_id, feed_id) == []
-        assert summary.absent.get(f"feed:{name}") == 8
+        assert summary.absent.get(f"feed:{feed_id}") == 8
 
     persistence_row = conn.execute(
         "SELECT id FROM feeds WHERE source = 'virtual' AND model = '_persistence'"
@@ -1311,3 +1381,132 @@ def test_sd16_no_stored_download_gives_absent_everywhere_no_failure(tmp_path) ->
         " even with every forecast absent (6.9 'never empty'), mutant (a"
         " day with no forecasts raises) = no record row at all"
     )
+
+
+# ---------------------------------------------------------------------------
+# SD17
+# ---------------------------------------------------------------------------
+
+
+def test_sd17_scored_at_whole_second_microseconds_dropped(tmp_path) -> None:  # noqa: ARG001
+    """SD17: as SD1, with `now_utc` at an instant whose microsecond is
+    250000: `close_records.scored_at` passes `is_canonical_utc_stamp`, the
+    check import applies to it (15.2, 15.6).
+    """
+    from wxverify.scoring.close_scores import score_day
+
+    conn = asof_conn()
+    site_id, _feeds, record, now_utc, _ids, _gen = _build_base(conn)
+    fractional_now_utc = now_utc + timedelta(microseconds=250000)
+
+    score_day(
+        conn,
+        record=record,
+        attempt=1,
+        truth_version="fp-1",
+        now_utc=fractional_now_utc,
+    )
+
+    record_row = conn.execute(
+        "SELECT scored_at FROM close_records WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchone()
+    assert record_row is not None
+    scored_at_canonical = is_canonical_utc_stamp(record_row["scored_at"])
+    assert scored_at_canonical, (
+        "M143 -> at this assertion: correct = True, mutant (scored_at"
+        " stored as isoformat_utc(t), microseconds kept) ="
+        f" {scored_at_canonical!r}"
+    )
+    assert record_row["scored_at"] == isoformat_utc(
+        fractional_now_utc.replace(microsecond=0)
+    ), (
+        "M143 -> at this assertion: correct ="
+        f" {isoformat_utc(fractional_now_utc.replace(microsecond=0))!r} (15.2's"
+        " isoformat_utc(t.replace(microsecond=0))), mutant ="
+        f" {record_row['scored_at']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# SD18
+# ---------------------------------------------------------------------------
+
+
+def test_sd18_considered_feeds_switched_on_or_downloaded_not_never_fetched(
+    tmp_path,
+) -> None:  # noqa: ARG001
+    """SD18: the feeds considered at D (6.2) are X (switched on, no download
+    on D-7..D), Y (switched off, only its D-3 download) and V (a third real
+    feed with no `site_feed_state` row at all, never fetched): X and Y are
+    considered and get rows; V, never subscribed and never downloaded, gets
+    none (6.2, 6.7, 6.8).
+    """
+    from wxverify.scoring.close_scores import score_day
+
+    conn = asof_conn()
+    skip = frozenset(
+        [("X", k) for k in range(8)] + [("Y", k) for k in range(8) if k != 3]
+    )
+    site_id, feeds, record, now_utc, _ids, _gen = _build_base(conn, skip=skip)
+    conn.execute(
+        "UPDATE site_feed_state SET enabled = 0 WHERE site_id = ? AND feed_id = ?",
+        (site_id, feeds["Y"]),
+    )
+    feeds["V"] = _make_feed(conn, "V")
+
+    summary = score_day(
+        conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc
+    )
+
+    # --- X: switched on, no download anywhere -- still considered. --------
+    x_rows = _day_score_rows(conn, site_id, feeds["X"])
+    assert len(x_rows) == 24, (
+        "M148 -> at this assertion: correct = 24 (X is switched on, so it"
+        " is considered even with no download on D-7..D), mutant (only"
+        " feeds with a scored download on D-7..D are considered) = 0"
+    )
+    assert all(r["status"] == "absent" for r in x_rows)
+    x_dl_rows = conn.execute(
+        "SELECT download_id FROM close_record_downloads"
+        " WHERE site_id = ? AND local_date = ? AND feed_id = ?",
+        (site_id, D.isoformat(), feeds["X"]),
+    ).fetchall()
+    assert len(x_dl_rows) == 8 and all(r["download_id"] is None for r in x_dl_rows)
+    assert summary.absent.get(f"feed:{feeds['X']}") == 8
+
+    # --- Y: switched off, one download at k=3 -- still considered. --------
+    y_rows = _day_score_rows(conn, site_id, feeds["Y"])
+    assert len(y_rows) == 24
+    y_scored_k = {int(r["day_ahead"]) for r in y_rows if r["status"] == "scored"}
+    assert y_scored_k == {3}, (
+        "M149 -> at this assertion: correct = {3} (Y has a scored download"
+        " only at k=3; it is considered despite being switched off, by its"
+        " download history), mutant (only feeds switched on when the"
+        " attempt runs are considered) = set() -- Y would not be"
+        f" considered at all, got {y_scored_k!r}"
+    )
+    y_absent_k = {int(r["day_ahead"]) for r in y_rows if r["status"] == "absent"}
+    assert y_absent_k == {0, 1, 2, 4, 5, 6, 7}
+    assert summary.scored.get(f"feed:{feeds['Y']}") == 1
+    assert summary.absent.get(f"feed:{feeds['Y']}") == 7
+
+    # --- V: no site_feed_state row, never downloaded -- not considered. ---
+    v_rows = _day_score_rows(conn, site_id, feeds["V"])
+    assert v_rows == [], (
+        "M147 -> at this assertion: correct = [] (V is switched off --"
+        " default_subscribed 0, no site_feed_state row -- and never"
+        " downloaded, so it is not a considered feed at all), mutant"
+        " (every catalog real feed but the package row is considered,"
+        " switched off and never downloaded included) = day_scores rows"
+        " for V"
+    )
+    assert _close_pairs(conn, site_id, feeds["V"]) == []
+    v_dl_rows = conn.execute(
+        "SELECT 1 FROM close_record_downloads"
+        " WHERE site_id = ? AND local_date = ? AND feed_id = ?",
+        (site_id, D.isoformat(), feeds["V"]),
+    ).fetchall()
+    assert v_dl_rows == []
+    assert f"feed:{feeds['V']}" not in summary.scored
+    assert f"feed:{feeds['V']}" not in summary.absent
