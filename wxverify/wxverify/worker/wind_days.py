@@ -58,7 +58,6 @@ from wxverify.core.timeutil import (
 from wxverify.core.units import kmh_to_ms
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
 from wxverify.db.day_guard_log import warn_refused_dates, warn_refused_instants
-from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import (
     DayRecord,
     WriteKind,
@@ -95,6 +94,7 @@ from wxverify.obs.pws_adapter import (
 )
 from wxverify.obs.wind_pairs import MAX_PAIR_GAP_SECONDS, WindRecord, pair_max_by_hour
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.truth import mark_daily_truth_stale
 from wxverify.worker.access_hold import (
@@ -2062,10 +2062,9 @@ def _derive_days(
             changed.add(hour)
     for hour in sorted(changed):
         _materialize(conn, site_id, isoformat_utc(hour), now_utc=now)
+    # With the daily close on, enqueue_scoring_run queues nothing.
     if changed:
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
+        enqueue_scoring_run(conn, site_id)
     for day in days:
         conn.execute(
             "UPDATE station_wind_days SET pair_hours = ?"

@@ -210,7 +210,12 @@ def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:
     re-enqueue a persistently failing scoring job on every poll. The latest
     outcome (not "any recent failed row") decides, so a later ``completed``
     job supersedes an older failure.
+
+    With the daily close on it returns without enqueuing: the publication
+    replaces the post-read rescore (daily-close P4 plan, section 10).
     """
+    if daily_close_on(conn):
+        return
     enqueue_if_absent_with_cooldown(
         conn,
         "pair_and_score",

@@ -729,7 +729,7 @@ def test_gate_live_path_injected_enqueue_failure_rolls_back_fetch(
     def _raise_enqueue(*args: Any, **kwargs: Any) -> None:
         raise sqlite3.OperationalError("synthetic enqueue failure")
 
-    monkeypatch.setattr(feed_fetch_module, "enqueue_if_absent", _raise_enqueue)
+    monkeypatch.setattr("wxverify.scoring.engine.enqueue_if_absent", _raise_enqueue)
 
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(

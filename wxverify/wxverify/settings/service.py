@@ -6,7 +6,7 @@ import sqlite3
 
 from wxverify.core.options import RuntimeOptions, depth_option_values
 from wxverify.db.connection import get_db
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.settings.depth import depth_override_key
 from wxverify.settings.keys import get_number_setting, set_setting
 
@@ -34,7 +34,9 @@ def set_rolling_window_days_sync(conn: sqlite3.Connection, days: int) -> None:
     # slice and not the new one. Only the CLI can apply a change while the
     # worker runs; the boot apply runs before the worker. That site rebuilds on
     # its next trigger: a rolling read (`rebuilding` queues a rescore), an
-    # observation or pairable-fetch trigger, or the 6 h backstop.
+    # observation or pairable-fetch trigger, or the 6 h backstop. With the
+    # daily close on, enqueue_scoring_run queues nothing: the change waits
+    # for the next publication (daily-close P4 plan, 13.1).
     conn.execute(
         "DELETE FROM score_cache WHERE window_key LIKE 'w:%' "
         "AND window_key NOT IN ('w:all', ?)",
@@ -42,10 +44,7 @@ def set_rolling_window_days_sync(conn: sqlite3.Connection, days: int) -> None:
     )
     if prior != days:
         for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
-            site_id = int(row[0])
-            enqueue_if_absent(
-                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-            )
+            enqueue_scoring_run(conn, int(row[0]))
 
 
 async def apply_plain_settings(options: RuntimeOptions) -> None:

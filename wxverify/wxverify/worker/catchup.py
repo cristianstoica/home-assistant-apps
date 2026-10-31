@@ -24,11 +24,11 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter, StaleGenerationError
-from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import PwsObservation, fetch_hourly_history_range
 from wxverify.scoring.consensus import insert_station_observation
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.settings.keys import get_setting
 from wxverify.worker.backfill import BACKFILL_VARIABLES, SETUP_BACKFILL_DAYS
 from wxverify.worker.cadence import effective_due_minutes, parse_fetch_interval_minutes
@@ -155,11 +155,7 @@ async def run_catchup(
                 site_id,
                 exc.step,
             )
-            await writer.write(
-                lambda conn, sid=site_id: enqueue_if_absent(
-                    conn, "pair_and_score", sid, "score", {"site_id": sid}
-                )
-            )
+            await writer.write(lambda conn, sid=site_id: enqueue_scoring_run(conn, sid))
             continue
         except JobCancelled:
             continue

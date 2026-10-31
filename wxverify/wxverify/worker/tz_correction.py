@@ -35,7 +35,7 @@ from datetime import date, timedelta
 from typing import cast
 
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.queue import Job, enqueue_if_absent
+from wxverify.db.queue import Job
 from wxverify.db.runtime_state import (
     delete_runtime_state,
     get_runtime_state,
@@ -49,6 +49,7 @@ from wxverify.db.tz_generations import (
     published_generation_id,
     published_pointer_key,
 )
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.scoring.tz_rebuild import (
     DayReconciliation,
     delete_building_rows,
@@ -396,7 +397,8 @@ def _flip(
     set_runtime_state(conn, published_pointer_key(site_id), str(generation_id))
     conn.execute("DELETE FROM score_cache WHERE site_id = ?", (site_id,))
     conn.execute("UPDATE sites SET timezone = ? WHERE id = ?", (timezone, site_id))
-    enqueue_if_absent(conn, "pair_and_score", site_id, "score", {"site_id": site_id})
+    # With the daily close on, enqueue_scoring_run queues nothing.
+    enqueue_scoring_run(conn, site_id)
     _save_state(
         conn,
         generation_id,

@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Final
 
 from wxverify.db.connection import EpochMoved, FencedWriter
+from wxverify.db.site_days import daily_close_on
 from wxverify.scoring.engine import (
     SPLIT_PAIR_PHASES,
     ScoreCell,
@@ -76,6 +77,20 @@ SCORING_CAS_ATTEMPTS: Final = 3
 logger = logging.getLogger(__name__)
 
 
+async def _close_on(writer: FencedWriter) -> bool:
+    """Read P1's daily-close switch once, in its own read snapshot.
+
+    Each lane orchestrator asks it at entry and returns when it is on: the
+    close's stage 5 scores instead (daily-close P4 plan, section 10). The
+    read goes through ``read_at_epoch`` (its epoch unused), the read path
+    every writer handle the lanes take provides.
+    """
+    _epoch, close_on = await writer.read_at_epoch(
+        daily_close_on, label="score close switch"
+    )
+    return close_on
+
+
 class ScoringInputsBusy(Exception):
     """A scoring step's inputs changed on every one of its CAS attempts.
 
@@ -116,8 +131,12 @@ async def run_split_pair_phases(
     ``ScoringInputsBusy`` propagates. ``require_enabled`` runs the
     site-enabled check at the top of every chunk, inside its transaction.
     ``SPLIT_PAIR_PHASES`` and ``SCORING_APPLY_CHUNK_ROWS`` are looked up on
-    this module at call time.
+    this module at call time. With the daily close on it returns at entry,
+    writing nothing.
     """
+    if await _close_on(writer):
+        logger.debug("score pair phases skipped site=%s: daily close on", site_id)
+        return
     for phase in SPLIT_PAIR_PHASES:
         started = time.monotonic()
         compute_s = apply_s = apply_max = 0.0
@@ -253,8 +272,12 @@ async def run_batched_scoring(
     After ``SCORING_CAS_ATTEMPTS`` misses in a row on discovery or on one
     window, ``ScoringInputsBusy`` propagates. ``on_batch_committed`` is a
     test-only seam awaited after each batch transaction commits; production
-    callers leave it ``None``.
+    callers leave it ``None``. With the daily close on it returns at entry,
+    writing nothing.
     """
+    if await _close_on(writer):
+        logger.debug("score batches skipped site=%s: daily close on", site_id)
+        return
     started = time.monotonic()
     work, attempts = await _discover_and_stamp(writer, site_id)
     total_cells = sum(len(window.cells) for window in work.windows)

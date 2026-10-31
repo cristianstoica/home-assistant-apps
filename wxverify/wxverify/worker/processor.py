@@ -57,6 +57,7 @@ from wxverify.obs.pws_adapter import (
     is_hourly_history_no_content,
 )
 from wxverify.scoring.consensus import insert_station_observation
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
     compute_forecast_record_readonly,
@@ -1698,10 +1699,9 @@ def _persist_station_observations(
     # Queue the score run with this station's observations, so a later
     # station's failure in the same obs cycle cannot drop the trigger.
     # _complete_obs_cycle's own enqueue stays and dedupes against this one.
+    # With the daily close on, enqueue_scoring_run queues nothing.
     if changed:
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
+        enqueue_scoring_run(conn, site_id)
     clear_domain_backoff(conn, source_domain("weathercom"))
     clear_access_refused(conn, "hourly")
     conn.execute(
@@ -1770,9 +1770,7 @@ def _complete_obs_cycle(
             (newest_obs_at, site_id, newest_obs_at),
         )
     if changed:
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
+        enqueue_scoring_run(conn, site_id)
 
 
 def _mark_station_error(conn: sqlite3.Connection, station_id: int, error: str) -> None:

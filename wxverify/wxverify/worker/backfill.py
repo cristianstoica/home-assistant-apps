@@ -24,7 +24,6 @@ from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.queue import enqueue_if_absent
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.obs.pws_adapter import (
@@ -32,7 +31,7 @@ from wxverify.obs.pws_adapter import (
     fetch_hourly_history_range,
 )
 from wxverify.scoring.consensus import insert_station_observation
-from wxverify.scoring.engine import pair_and_score
+from wxverify.scoring.engine import enqueue_scoring_run, pair_and_score
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -638,7 +637,6 @@ def _finish_backfill_chunk(
             (status, backfill_through, site_id),
         )
     if should_score:
+        # With the daily close on, both return at once.
         pair_and_score(conn, site_id)
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
+        enqueue_scoring_run(conn, site_id)

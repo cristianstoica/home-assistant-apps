@@ -30,7 +30,7 @@ from wxverify.core import timeutil
 from wxverify.core.error_sanitize import sanitized_exception
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.queue import Job, enqueue_if_absent
+from wxverify.db.queue import Job
 from wxverify.db.site_days import daily_close_on, day_for_instant
 from wxverify.feeds.registry import build_adapter
 from wxverify.feeds.seam import (
@@ -45,6 +45,7 @@ from wxverify.scoring.downloads import (
     latest_stored_download,
     scored_version,
 )
+from wxverify.scoring.engine import enqueue_scoring_run
 from wxverify.scoring.pairing import real_model_pair_pending
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 from wxverify.worker.control import JobDeferred
@@ -549,7 +550,8 @@ def _persist_fetch_success(
             conn, comparisons, download_id=download_id, labels=outcome.labels
         )
     # Queue a score run only when an inserted sample would pair now, in this
-    # transaction, so the job commits or rolls back with the samples.
+    # transaction, so the job commits or rolls back with the samples. With
+    # the daily close on, enqueue_scoring_run queues nothing.
     started = time.monotonic()
     pairable = bool(outcome.inserted_sample_ids) and real_model_pair_pending(
         conn, outcome.inserted_sample_ids
@@ -557,9 +559,7 @@ def _persist_fetch_success(
     elapsed = time.monotonic() - started
     created: bool | None = None
     if pairable:
-        created = enqueue_if_absent(
-            conn, "pair_and_score", target.site_id, "score", {"site_id": target.site_id}
-        ).created
+        created = enqueue_scoring_run(conn, target.site_id)
     logger.debug(
         "fetch score gate site=%s feed=%s inserted=%d pairable=%s created=%s "
         "elapsed=%.3fs",

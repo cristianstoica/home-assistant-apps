@@ -548,7 +548,7 @@ class TestFlipAtomicity:
         def _boom(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("injected crash inside flip")
 
-        monkeypatch.setattr("wxverify.worker.tz_correction.enqueue_if_absent", _boom)
+        monkeypatch.setattr("wxverify.scoring.engine.enqueue_if_absent", _boom)
         with pytest.raises(RuntimeError, match="injected crash inside flip"):
             advance_correction(conn, site_id, payload)
         conn.rollback()

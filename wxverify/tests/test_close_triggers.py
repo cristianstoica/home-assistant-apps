@@ -98,6 +98,29 @@ def _table_count(conn, table: str) -> int:
     return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])  # noqa: S608
 
 
+def _seed_score_cache_row(conn, *, site_id: int, feed_id: int) -> None:
+    """One ``score_cache`` row (feed X, ``temperature``, day_ahead 1,
+    ``window_key`` ``w:all``) -- every NOT NULL column filled (18.9/M99)."""
+    conn.execute(
+        """
+        INSERT INTO score_cache
+            (site_id, feed_id, variable, day_ahead, window_key, n, computed_at)
+        VALUES (?, ?, 'temperature', 1, 'w:all', 3, '2020-01-01T00:00:00.000000Z')
+        """,
+        (site_id, feed_id),
+    )
+
+
+def _score_cache_snapshot(conn) -> list[tuple[object, ...]]:
+    return [
+        tuple(row)
+        for row in conn.execute(
+            "SELECT * FROM score_cache"
+            " ORDER BY site_id, feed_id, variable, day_ahead, window_key"
+        )
+    ]
+
+
 # ---------------------------------------------------------------------------
 # TR1
 # ---------------------------------------------------------------------------
@@ -142,6 +165,7 @@ _TR2_ALLOWED_QUALNAMES = frozenset(
         "enqueue_score_rescore",
         "dispatch",
         "record_precip_hour_start_boundary",
+        "_enqueue_due_score_refresh",
     }
 )
 # The monitor and the health route reference it in an f-string/column
@@ -553,18 +577,26 @@ def test_tr4_inline_and_lane_scoring_return_at_entry_with_the_close_on(
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
     _seed_pairable_sample(conn, site_id=site_id, feed_id=x)
+    _seed_score_cache_row(conn, site_id=site_id, feed_id=x)
     conn.commit()
     _patch_tr4_close_clock(monkeypatch, MovingClock(NOW))
 
+    before_score_cache = _score_cache_snapshot(conn)
     pair_and_score(conn, site_id)
     conn.commit()
     assert _table_count(conn, "forecast_pairs") == 0, (
-        "M99 -> at this assertion: correct = 0 (close on: the inline"
-        " pair_and_score returns at entry, section 10), mutant M99 (a lane"
-        " run without its entry check) = a pair was written -- got"
-        f" {_table_count(conn, 'forecast_pairs')}"
+        "M155 -> at this assertion: correct = 0 (close on: the inline"
+        " pair_and_score returns at entry, section 10), mutant M155"
+        " (pair_and_score without its entry check) = a pair was written --"
+        f" got {_table_count(conn, 'forecast_pairs')}"
     )
-    assert _table_count(conn, "score_cache") == 0
+    assert _score_cache_snapshot(conn) == before_score_cache, (
+        "M155 -> at this assertion: correct = unchanged (close on: the"
+        " inline pair_and_score returns at entry before touching"
+        " score_cache, section 10), mutant M155 (pair_and_score without its"
+        " entry check) = the pipeline's own sweep deletes the row -- got"
+        f" {_score_cache_snapshot(conn)!r}"
+    )
 
 
 def test_tr4_split_pair_phases_and_batched_scoring_return_at_entry(
@@ -589,20 +621,30 @@ def test_tr4_split_pair_phases_and_batched_scoring_return_at_entry(
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
     _seed_pairable_sample(conn, site_id=site_id, feed_id=x)
+    _seed_score_cache_row(conn, site_id=site_id, feed_id=x)
     conn.commit()
     _patch_tr4_close_clock(monkeypatch, MovingClock(NOW))
 
+    before_score_cache = _score_cache_snapshot(conn)
     writer = FencedWriter(db, db.generation)
     asyncio.run(run_split_pair_phases(writer, site_id, require_enabled=True))
     asyncio.run(run_batched_scoring(writer, site_id))
 
     assert _table_count(conn, "forecast_pairs") == 0, (
-        "M99 -> at this assertion: correct = 0 (close on: both lane"
-        " orchestrators return at entry, section 10), mutant M99 (a lane"
-        " run without its entry check) = a pair was written -- got"
-        f" {_table_count(conn, 'forecast_pairs')}"
+        "M156 -> at this assertion: correct = 0 (close on: both lane"
+        " orchestrators return at entry, section 10), mutant M156"
+        " (run_split_pair_phases without its entry check) = a pair was"
+        f" written -- got {_table_count(conn, 'forecast_pairs')}"
     )
-    assert _table_count(conn, "score_cache") == 0
+    assert _score_cache_snapshot(conn) == before_score_cache, (
+        "M99 -> at this assertion: correct = unchanged (close on:"
+        " run_batched_scoring returns at entry before touching"
+        " score_cache, section 10), mutant M99 (run_batched_scoring without"
+        " its entry check) = no cell to write (the pair phases wrote none)"
+        " but its sweep still deletes the old row (strictly older than the"
+        " run stamp) -- got"
+        f" {_score_cache_snapshot(conn)!r}"
+    )
 
 
 def test_tr4_a_job_queued_before_the_switch_completes_with_no_effect(
@@ -630,6 +672,7 @@ def test_tr4_a_job_queued_before_the_switch_completes_with_no_effect(
     x = _seed_feed(conn, "X")
     _subscribe(conn, site_id, x)
     _seed_pairable_sample(conn, site_id=site_id, feed_id=x)
+    _seed_score_cache_row(conn, site_id=site_id, feed_id=x)
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, payload, status)"
         " VALUES ('pair_and_score', ?, 'score', '{}', 'pending')",
@@ -637,6 +680,8 @@ def test_tr4_a_job_queued_before_the_switch_completes_with_no_effect(
     )
     conn.commit()
     _patch_tr4_close_clock(monkeypatch, MovingClock(NOW))
+
+    before_score_cache = _score_cache_snapshot(conn)
 
     async def _run() -> None:
         job = await db.write(claim_next_job)
@@ -646,10 +691,19 @@ def test_tr4_a_job_queued_before_the_switch_completes_with_no_effect(
     asyncio.run(_run())
 
     assert _table_count(conn, "forecast_pairs") == 0, (
-        "M99 -> at this assertion: correct = 0 (close on: the job"
-        " dispatch's own entry check), mutant M99 (the job run without its"
-        f" entry check) = a pair was written -- got"
-        f" {_table_count(conn, 'forecast_pairs')}"
+        "M156 -> at this assertion: correct = 0 (close on: the lanes'"
+        " entry checks, reached through dispatch), mutant M156"
+        " (run_split_pair_phases without its entry check) = a pair was"
+        f" written -- got {_table_count(conn, 'forecast_pairs')}"
+    )
+    assert _score_cache_snapshot(conn) == before_score_cache, (
+        "M99 -> at this assertion: correct = unchanged (close on:"
+        " run_batched_scoring returns at entry before touching"
+        " score_cache, section 10), mutant M99 (run_batched_scoring without"
+        " its entry check) = no cell to write (the pair phases wrote none)"
+        " but its sweep still deletes the old row (strictly older than the"
+        " run stamp) -- got"
+        f" {_score_cache_snapshot(conn)!r}"
     )
     status = conn.execute(
         "SELECT status FROM jobs WHERE type = 'pair_and_score' AND site_id = ?",

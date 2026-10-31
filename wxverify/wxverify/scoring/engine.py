@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
+from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import MetricResult, strategy_for
@@ -86,7 +88,14 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
     never held for a whole rebuild — see the convergence-invariant comment
     at the worker dispatch site (worker/processor.py).
     ``PAIR_AND_SCORE_PHASES`` remains for this monolithic path only.
+
+    With the daily close on it returns at once, writing nothing: the close's
+    stage 5 scores each closed day and stage 7 publishes (daily-close P4
+    plan, section 10).
     """
+    if daily_close_on(conn):
+        logger.debug("pair_and_score skipped site=%s: daily close on", site_id)
+        return
     logger.debug("pair_and_score start site=%s", site_id)
     cells = 0
     for phase in PAIR_AND_SCORE_PHASES:
@@ -99,6 +108,24 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
         "all" if site_id is None else site_id,
         cells,
     )
+
+
+def enqueue_scoring_run(conn: sqlite3.Connection, site_id: int) -> bool:
+    """Queue a ``pair_and_score`` run for ``site_id`` unless the close is on.
+
+    The one switch for every scoring enqueue site (daily-close P4 plan,
+    section 10): with the daily close on it enqueues nothing, since only the
+    close's stage 5 scores; with it off it makes today's deduped enqueue.
+    Returns whether a new job row was inserted (False when the close is on or
+    a pending or running run already exists), for the fetch score gate's log
+    line.
+    """
+    if daily_close_on(conn):
+        logger.debug("scoring enqueue skipped site=%s: daily close on", site_id)
+        return False
+    return enqueue_if_absent(
+        conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+    ).created
 
 
 def discover_score_inputs(conn: sqlite3.Connection, site_id: int | None) -> ScoreInputs:

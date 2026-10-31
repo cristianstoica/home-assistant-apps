@@ -59,7 +59,6 @@ from wxverify.db.wind_basis import write_auth_hold
 from wxverify.obs.pws_adapter import PwsObservation
 from wxverify.provider_ops import rebuild_mean_for_site
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
-from wxverify.scoring.engine import pair_and_score
 from wxverify.scoring.multimodel import compute_multimodel_mean
 from wxverify.scoring.pairing import REAL_MODEL_PAIR_PROBE_SQL, real_model_pair_pending
 from wxverify.scoring.persistence import compute_persistence_pairs
@@ -1361,18 +1360,12 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
 def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """GW11: ``PUT /api/sites/{id}`` with a new ``rain_threshold_mm``
+    guards the open/closed boundary at its own DELETE (sites.py:173-181),
+    not at ``pair_and_score``. D-1 (open) is a hand-planted precip pair,
+    confirmed present before the PUT; the handler's DELETE removes it and
+    nothing rebuilds it. D-3 (closed) decoys are untouched throughout."""
     monkeypatch.setattr("wxverify.api.routes.sites.utc_now", lambda: NOW, raising=False)
-    # update_site's DELETE only removes D1's precip row (D1 is open); the PUT
-    # handler then calls pair_and_score, whose real-model lane is an INSERT
-    # OR IGNORE that never re-reads a deleted row -- it only regenerates one
-    # from forecast_samples+observations. So the D1 precip assertion below
-    # needs a real sample/observation seed and an initial pair_and_score
-    # call, not just a hand-planted forecast_pairs row. That call runs each
-    # phase's own module-scoped utc_now (pairing/persistence/multimodel);
-    # left unpatched it would call ensure_site_days on the real wall clock.
-    monkeypatch.setattr("wxverify.scoring.pairing.utc_now", lambda: NOW)
-    monkeypatch.setattr("wxverify.scoring.persistence.utc_now", lambda: NOW)
-    monkeypatch.setattr("wxverify.scoring.multimodel.utc_now", lambda: NOW)
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn)
     feed_id = asof_make_real_feed(conn, "gw11-model")
@@ -1429,29 +1422,38 @@ def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
         first_known_at=d1_hour,
         generation_id=generation_id,
     )
-    # D1 precip: real samples+observation so pair_and_score's real-model
-    # lane can actually (re)materialize this pair, both now (to give it a
-    # starting rain_threshold_mm distinct from 1.0) and again inside the PUT.
-    d1_issued_at = f"{d1.isoformat()}T06:00:00Z"
+    # D1 (open) precip: hand-planted, same shape as D-3's decoy above --
+    # update_site's DELETE (sites.py:173-181) takes the open day's precip
+    # row on its own; nothing here needs pair_and_score to rebuild it.
     conn.execute(
         """
-        INSERT INTO forecast_samples
+        INSERT INTO forecast_pairs
             (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             value, source_raw, model_run_id, fetched_at)
-        VALUES (?, ?, 'precip', ?, ?, 6, 0.3, '0.3 mm', 'gw11-precip-run', ?)
+             day_ahead, forecast, observed, error, abs_error, sq_error,
+             first_known_at, tz_generation_id)
+        VALUES (?, ?, 'precip', ?, ?, 6, 1, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (site_id, feed_id, d1_issued_at, d1_hour, d1_issued_at),
-    )
-    conn.execute(
-        """
-        INSERT INTO observations (site_id, variable, valid_at, value, n_stations)
-        VALUES (?, 'precip', ?, 0.2, 1)
-        """,
-        (site_id, d1_hour),
+        (
+            site_id,
+            feed_id,
+            d1_hour,
+            d1_hour,
+            0.3,
+            0.2,
+            0.1,
+            0.1,
+            0.01,
+            d1_hour,
+            generation_id,
+        ),
     )
     conn.commit()
-    pair_and_score(conn, site_id)
-    conn.commit()
+    d1_precip_before = conn.execute(
+        "SELECT COUNT(*) AS n FROM forecast_pairs"
+        " WHERE site_id=? AND feed_id=? AND variable='precip' AND valid_at=?",
+        (site_id, feed_id, d1_hour),
+    ).fetchone()
+    assert d1_precip_before is not None and int(d1_precip_before["n"]) == 1
     before_d3 = _rows(
         conn,
         "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at LIKE ?",
@@ -1470,17 +1472,10 @@ def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
 
     # The app's lifespan closes `conn` (the same connection `_init_tmp_db`
     # handed back) on TestClient exit, so a fresh connection to the same
-    # file is needed to read the result and to make the plan row's second
-    # `pair_and_score` call (the PUT handler, sites.py:173, makes the
-    # first).
+    # file is needed to read the result.
     direct = sqlite3.connect(config.db_path)
     direct.row_factory = sqlite3.Row
     try:
-        caplog.clear()
-        pair_and_score(direct, site_id)
-        direct.commit()
-        _assert_no_guard_warning(caplog)
-
         after_d3 = _rows(
             direct,
             "SELECT * FROM forecast_pairs WHERE site_id=? AND valid_at LIKE ?",
@@ -1492,9 +1487,7 @@ def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
             " WHERE site_id=? AND feed_id=? AND variable='precip' AND valid_at=?",
             (site_id, feed_id, f"{d1.isoformat()}T12:00:00Z"),
         ).fetchone()
-        assert d1_precip is not None and d1_precip[
-            "rain_threshold_mm"
-        ] == pytest.approx(1.0)
+        assert d1_precip is None
     finally:
         direct.close()
 
