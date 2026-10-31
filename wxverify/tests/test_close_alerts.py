@@ -630,6 +630,41 @@ def test_al11_skipped_day_does_not_break_or_extend_run() -> None:
     _run(_absent_skip)
     _run(_missed_skip)
 
+    # M22: a refused day OLDER than every counted day must stay skipped
+    # too -- placed between the counted days (above), skipping it never
+    # changes the run's oldest date, since that date is unaffected either
+    # way. Placed older than all of them, an erroneous inclusion extends
+    # the run past the counted days and pushes "since" back to the skip
+    # date itself.
+    older_skip = D - timedelta(days=5)
+    conn_older = asof_conn()
+    site_id_older = day_close_site(conn_older, close_on=True, with_records=False)
+    station_b_older = _station_id(conn_older, site_id_older, "ISTATION02")
+    all_dates_older = sorted({*counted, older_skip})
+    for i, d in enumerate(all_dates_older):
+        if d == older_skip:
+            _set_refused(conn_older, station_b_older, d)
+        else:
+            _set_answered(conn_older, station_b_older, d)
+        _close_day(conn_older, site_id_older, d, first=(i == 0))
+
+    alerts_older = close_alerts(conn_older, NOW)
+    nothing_usable_older = next(
+        a for a in alerts_older if a.id == "station_nothing_usable"
+    )
+    expected_older = (
+        f"station ISTATION02: nothing usable for temperature, rain and wind"
+        f" since {counted[0].isoformat()}"
+    )
+    assert nothing_usable_older.detail == expected_older, (
+        f"M22 -> at this assertion: correct = {expected_older!r} (the"
+        " refused day older than every counted day stays skipped, so"
+        " 'since' is unaffected by it), mutant ="
+        f" {nothing_usable_older.detail!r} (the skip removed, so the"
+        " older refused day is counted too, with nothing usable, and"
+        f" 'since' shifts back to {older_skip.isoformat()})"
+    )
+
 
 def test_al12_usable_judged_per_variable_and_qc_flag() -> None:
     """AL12: AL9 with one day having B's temperature rows qc_flag 'ok',
@@ -978,6 +1013,19 @@ def test_ad2_ok_before_t_and_ok_once_published() -> None:
         f" D-2, already published), mutant = tripped={late_before.tripped}"
     )
 
+    # M33 paired positive: at T, D-1 is still unpublished and the active
+    # publication reaches only D-2 -- behind the now-expected day D-1, so
+    # its cutoff must be read and compared, not merely checked for
+    # existence.
+    at_t_behind = close_alerts(conn, _AD_T)
+    late_at_t_behind = next(a for a in at_t_behind if a.id == "publication_late")
+    assert late_at_t_behind.tripped, (
+        "M33 -> at this assertion: correct = tripped at T (the active"
+        " publication's cutoff, D-2, is read and found behind the"
+        " expected day, D-1), mutant = ok regardless of cutoff once any"
+        f" active publication exists; tripped={late_at_t_behind.tripped}"
+    )
+
     from wxverify.core.timeutil import isoformat_utc_micro
 
     published_at = opened_at + timedelta(minutes=1)
@@ -1317,6 +1365,62 @@ def test_ad10_publication_failed_then_recovers() -> None:
         f"M41 -> at this assertion: correct = tripped, {expected!r} in"
         f" detail, mutant = tripped={stage_failed.tripped}, detail="
         f"{stage_failed.detail!r}"
+    )
+
+    # M41 (b): advance only the ACTIVE publication past D-2's cutoff,
+    # leaving the latest publication record (``publication_state``'s own
+    # ``MAX(cutoff)`` row) still D-2's failed one. The stale record never
+    # changes state here, so the clearing can only come from reading
+    # ``active.cutoff > publication.cutoff`` -- a close-and-republish for
+    # D-1 (below) would instead make D-1 the latest publication record,
+    # which is never "failed"/"retry_due" regardless of the gate, and so
+    # cannot discriminate this mutant on its own.
+    from wxverify.worker.close_chain import publication_state
+
+    conn_b = asof_conn()
+    site_id_b = _ad_start(conn_b)
+    record_d2_b = day_record(conn_b, site_id_b, d_minus_2)
+    assert record_d2_b is not None
+    opened_at_b = record_d2_b.day_end_utc + timedelta(minutes=10)
+    finished_at_b = opened_at_b + timedelta(minutes=5)
+    seed_publication_state(
+        conn_b,
+        site_id=site_id_b,
+        cutoff=d_minus_2,
+        state="failed",
+        opened_at=opened_at_b,
+        finished_at=finished_at_b,
+        last_failure="build: out of memory",
+    )
+    seed_active_publication(
+        conn_b, site_id=site_id_b, cutoff=d_minus_3, published_at=opened_at_b
+    )
+    seed_active_publication(
+        conn_b,
+        site_id=site_id_b,
+        cutoff=d_minus_1,
+        published_at=finished_at_b + timedelta(minutes=1),
+    )
+    publication_still_failed = publication_state(conn_b, site_id=site_id_b)
+    assert (
+        publication_still_failed is not None
+        and publication_still_failed.cutoff == d_minus_2
+        and publication_still_failed.state == "failed"
+    ), (
+        "precondition -> the latest publication record must stay D-2's"
+        " failed one while only the active publication advances, got"
+        f" {publication_still_failed!r}"
+    )
+    alerts_advanced = close_alerts(conn_b, _AD_T)
+    stage_failed_advanced = next(
+        a for a in alerts_advanced if a.id == "close_stage_failed"
+    )
+    assert not stage_failed_advanced.tripped, (
+        "M41 -> at this assertion: correct = ok once the active"
+        " publication reaches a later day even though the stale failed"
+        " record is unchanged (active.cutoff > publication.cutoff read),"
+        " mutant = (b) never clears; tripped="
+        f"{stage_failed_advanced.tripped}"
     )
 
     t_close1 = _close_d_minus_1(conn, site_id)
@@ -1717,7 +1821,9 @@ def test_dw5_start_of_count_latest_of_worker_and_close_on() -> None:
 
 
 def test_dw6_clears_on_new_store() -> None:
-    """DW6: DW1's second case, then a download stores one reading (M66)."""
+    """DW6: DW1's second case, read TWICE -- once before a fresher store
+    exists (establishing the tripped baseline, and, under a per-site
+    cache, poisoning it), then again after it exists (M66)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
@@ -1726,6 +1832,15 @@ def test_dw6_clears_on_new_store() -> None:
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
     at = store_time + timedelta(hours=6, seconds=1)
+
+    # First read, before the newer store exists: tripped, and (under a
+    # cache keyed by site id) this is the read that would stick.
+    alerts_first = close_alerts(conn, at)
+    warning_first = next(a for a in alerts_first if a.id == "daytime_download_missed")
+    assert warning_first.tripped, (
+        "precondition -> the warning must be tripped before the newer"
+        f" store arrives, got tripped={warning_first.tripped}"
+    )
 
     new_store = store_time + timedelta(hours=1)
     _store_five_minute(conn, station_a, new_store)
@@ -1734,14 +1849,18 @@ def test_dw6_clears_on_new_store() -> None:
     warning = next(a for a in alerts if a.id == "daytime_download_missed")
     assert not warning.tripped, (
         "M66 -> at this assertion: correct = ok (the last store is read"
-        " fresh, not once per day), mutant = tripped={warning.tripped}"
+        " fresh on this SECOND call too, not cached from the first),"
+        f" mutant = tripped={warning.tripped} (the first call's store"
+        " cached per site, so the newer store is never seen)"
     )
 
 
 def test_dw7_close_alerts_writes_nothing() -> None:
-    """DW7: DW1's second case: every station row, hourly row and stored
-    score of the site, read with SELECT * before and after close_alerts
-    (M67, K32)."""
+    """DW7: DW1's second case, with a real 'ok' station_observations row at
+    the warning's own ``start`` instant so a consensus write would have
+    something to materialize, not a no-op on an empty table; every
+    station row, hourly row and stored score of the site, read with
+    SELECT * before and after close_alerts (M67, K32)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
@@ -1750,6 +1869,12 @@ def test_dw7_close_alerts_writes_nothing() -> None:
     store_time = NOW + timedelta(hours=1)
     _store_five_minute(conn, station_a, store_time)
     at = store_time + timedelta(hours=6, seconds=1)
+    conn.execute(
+        "INSERT INTO station_observations"
+        " (station_id, variable, valid_at, value, qc_flag)"
+        " VALUES (?, 'temperature', ?, 10.0, 'ok')",
+        (station_a, isoformat_utc(store_time)),
+    )
 
     def _snapshot():
         return (
@@ -1805,27 +1930,15 @@ def test_dw8_start_of_count_includes_first_record_start() -> None:
 
 
 def test_pd1_provider_down_since_the_slots_earliest_try() -> None:
-    """PD1: close on; the site's latest judged slot: two tries, network
-    and provider http 503 (M68)."""
+    """PD1: close on; the site's latest judged slot: one try, provider
+    http 503, with no network/backoff try in the same slot to make it
+    down any other way (M68)."""
     from wxverify.close_monitor import close_alerts
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=True)
-    station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
     slot_time = NOW + timedelta(hours=1)
-    seed_try(
-        conn,
-        site_id=site_id,
-        station_id=station_a,
-        local_date=D,
-        kind="five_minute",
-        slot="daytime",
-        close_attempt=None,
-        tried_at=slot_time,
-        outcome="failed",
-        reason="network",
-    )
     seed_try(
         conn,
         site_id=site_id,
@@ -1848,8 +1961,9 @@ def test_pd1_provider_down_since_the_slots_earliest_try() -> None:
     )
     assert down.tripped and down.detail == expected, (
         f"M68 -> at this assertion: correct = tripped, detail={expected!r}"
-        f", mutant = a provider http 503 try not an outage; tripped="
-        f"{down.tripped}, detail={down.detail!r}"
+        f", mutant = a provider http 503 try not an outage (and with no"
+        " network/backoff try in the same slot to make it down anyway);"
+        f" tripped={down.tripped}, detail={down.detail!r}"
     )
 
 
@@ -1894,6 +2008,54 @@ def test_pd2_answered_or_other_only_slots_are_ok() -> None:
     _run([("failed", "call_limit", None), ("failed", "call_limit", None)])
     _run([("held", "refused_access", None), ("refused", "refused_access", None)])
     _run([("failed", "provider", "http 404")])
+
+    # M69 paired positive: a no_readings slot must count as ANSWERED, not
+    # merely "not down" in isolation -- otherwise it is never judged at
+    # all, and a prior down run reads as still ongoing instead of
+    # recovered at the no_readings slot.
+    conn_recovered = asof_conn()
+    site_id_recovered = day_close_site(conn_recovered, close_on=True)
+    station_a_recovered = _station_id(conn_recovered, site_id_recovered, "ISTATION01")
+    station_b_recovered = _station_id(conn_recovered, site_id_recovered, "ISTATION02")
+    down_time = slot_time
+    recovered_time = slot_time + timedelta(hours=4)
+    seed_try(
+        conn_recovered,
+        site_id=site_id_recovered,
+        station_id=station_a_recovered,
+        local_date=D,
+        kind="five_minute",
+        slot="daytime",
+        close_attempt=None,
+        tried_at=down_time,
+        outcome="failed",
+        reason="network",
+    )
+    seed_try(
+        conn_recovered,
+        site_id=site_id_recovered,
+        station_id=station_b_recovered,
+        local_date=D,
+        kind="five_minute",
+        slot="daytime",
+        close_attempt=None,
+        tried_at=recovered_time,
+        outcome="no_readings",
+    )
+
+    alerts_recovered = close_alerts(
+        conn_recovered, recovered_time + timedelta(minutes=5)
+    )
+    down_recovered = next(a for a in alerts_recovered if a.id == "provider_down")
+    expected_recovered = f"recovered at {isoformat_utc(recovered_time)}"
+    assert not down_recovered.tripped and down_recovered.detail == expected_recovered, (
+        f"M69 -> at this assertion: correct = ok, detail="
+        f"{expected_recovered!r} (the no_readings slot answers and ends"
+        " the prior down run), mutant = no_readings not an answered try,"
+        " so this slot is never judged and the prior down run still"
+        f" reads as ongoing; tripped={down_recovered.tripped}, detail="
+        f"{down_recovered.detail!r}"
+    )
 
 
 def test_pd3_down_run_survives_other_only_slot() -> None:

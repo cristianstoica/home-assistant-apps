@@ -541,22 +541,29 @@ def test_pl8_retry_due_kept_missed_dropped(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_pl9_close_off_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     """PL9 (plan §13.8, §8, §12.1): with the close off, the line returns
-    nothing, even with readings stored (M83: ``sites.timezone`` used to
-    draw a line anyway)."""
+    nothing, even over data a close-on walk draws into real values (M83:
+    ``sites.timezone`` used to draw a line anyway).
+
+    The original version of this test stored readings for one station
+    only and never established whether a close-on walk over that same
+    data draws anything at all, so an empty result proved nothing about
+    the guard. This reuses PL1's exact seed (``_seed_pl1``, A and B every
+    5 minutes through 12:15) -- PL1's own test pins that it puts a real
+    value at every hour 00:00-11:00 with the close on -- and only then
+    turns the close off, by deleting ``DAILY_CLOSE_ON_KEY``, so the
+    empty result here is checked against a fixture already known to be
+    productive, not an empty one.
+    """
+    from wxverify.db.runtime_state import delete_runtime_state
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
     from wxverify.provisional_line import provisional_site_hours
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=False)
-    station_a = _station_id(conn, site_id, "ISTATION01")
+    site_id = day_close_site(conn, close_on=True)
+    _seed_pl1(conn, site_id)
     now = datetime(D.year, D.month, D.day, 12, 20, tzinfo=UTC)
-    store_readings(
-        conn,
-        station_id=station_a,
-        source="five_minute",
-        readings=_five_minute_readings(D),
-        fetched_at=now,
-        now_utc=now,
-    )
+
+    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
 
     line = provisional_site_hours(
         conn, site_id=site_id, variable="temperature", now_utc=now
@@ -565,7 +572,9 @@ def test_pl9_close_off_returns_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
         "M83 -> at this assertion: correct = an empty mapping (the close"
         " is off, so the provisional line draws nothing), mutant ="
         " `sites.timezone` used to draw a line with the close off anyway,"
-        " so this would be non-empty."
+        " so this would be non-empty -- this exact seed puts a value at"
+        " hour 00:00 (and every hour through 11:00) when the close is on,"
+        " per PL1's own test."
     )
 
 

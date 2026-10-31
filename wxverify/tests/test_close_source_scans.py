@@ -14,6 +14,7 @@ right reason.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -125,21 +126,63 @@ def test_ss2_provisional_line_never_imported_by_scoring_or_the_close() -> None:
         )
 
 
+def _monitor_import_site(node: ast.AST) -> str | None:
+    """A human-readable form of ``node`` if it imports ``wxverify.monitor``
+    in any way (module scope or inside a function body), else ``None``."""
+    if isinstance(node, ast.Import):
+        for alias in node.names:
+            if alias.name == "wxverify.monitor":
+                return f"import {alias.name}" + (
+                    f" as {alias.asname}" if alias.asname else ""
+                )
+    elif isinstance(node, ast.ImportFrom):
+        if node.module == "wxverify.monitor":
+            return f"from {node.module} import ..."
+        if node.module == "wxverify" and node.level == 0:
+            for alias in node.names:
+                if alias.name == "monitor":
+                    return "from wxverify import monitor" + (
+                        f" as {alias.asname}" if alias.asname else ""
+                    )
+        if node.module is None and node.level >= 1:
+            for alias in node.names:
+                if alias.name == "monitor":
+                    return "." * node.level + " import monitor (relative)"
+    return None
+
+
 def test_ss3_close_monitor_is_read_only_and_imports_nothing_from_monitor() -> None:
     """SS3 (plan §13.11, §5.1): ``close_monitor.py`` imports nothing from
     ``monitor`` and contains no ``INSERT``, ``UPDATE`` or ``DELETE`` (M111).
-    """
-    text = (PACKAGE_ROOT / "close_monitor.py").read_text(encoding="utf-8")
 
-    monitor_import = re.compile(
-        r"(?m)^\s*(?:from\s+wxverify\.monitor\s+import"
-        r"|import\s+wxverify\.monitor\b)"
-    )
-    assert not monitor_import.search(text), (
+    A source regex for ``from wxverify.monitor import`` /
+    ``import wxverify.monitor`` misses ``from wxverify import monitor``
+    (a different statement: importing the name ``monitor`` from the
+    ``wxverify`` package, not the dotted path ``wxverify.monitor``) --
+    M111's own planted import is exactly that form, as a function-body
+    import, so the original regex-based version of this test could not
+    see it. An ``ast`` walk over every node (so a function-body import is
+    reached too) catches every import form: ``import wxverify.monitor``,
+    ``from wxverify.monitor import ...``, ``from wxverify import monitor``
+    and the relative ``from . import monitor``.
+    """
+    path = PACKAGE_ROOT / "close_monitor.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text, filename=str(path))
+
+    offenders = [
+        (node.lineno, site)
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        and (site := _monitor_import_site(node)) is not None
+    ]
+    assert not offenders, (
         "M111 -> at this assertion: correct = close_monitor.py imports"
-        " nothing from `monitor` (it copies the stamp helper instead,"
-        " §5.1), mutant = close_monitor.py imports `monitor`, which this"
-        " pattern would catch."
+        " nothing from `monitor`, at module scope or inside a function"
+        " body (it copies the stamp helper instead, §5.1), mutant ="
+        " close_monitor.py imports `monitor` (the mutant's own form is a"
+        " function-body `from wxverify import monitor as ...`); found"
+        f" {offenders!r}."
     )
     # No mutant of §14.2 targets this half of SS1's row on its own (M111's
     # one planted mutant is the `monitor` import, pinned above); this half

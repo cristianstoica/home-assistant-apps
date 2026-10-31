@@ -249,6 +249,14 @@ def test_op3_failed_attempt_shows_retry_and_stage(
         "M100 -> at this assertion: correct = retry_at shown in the state"
         f" text, mutant = retry_at not shown; got {day.state!r}"
     )
+    assert day.retry_at == retry_at_text, (
+        "M100 -> at this assertion: correct = `day.retry_at` ="
+        f" {retry_at_text!r} (`CloseDayRow.retry_at`, plan §10.2), mutant ="
+        " `retry_at` always `None` -- the check above only reads"
+        " `_close_day_state`'s own text, built straight from the raw"
+        " ``site_days`` record and never touched by this mutant, so it"
+        f" cannot see the field's own value go missing; got {day.retry_at!r}"
+    )
     assert day.failure == "gap fill: network"
     assert day.stage is not None and "stage 2 gap check and fill" in day.stage
 

@@ -24,7 +24,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.helpers import D, asof_conn, day_close_site
+from tests.helpers import NOW, D, asof_conn, day_close_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.monitor import build_verdict
 from wxverify.worker.access_hold import record_access_refused
@@ -339,27 +339,131 @@ def test_ac6_detail_unchanged_with_close_off(monkeypatch: pytest.MonkeyPatch) ->
     )
 
 
+def _mark_answered(conn: sqlite3.Connection, station_id: int, local_date) -> None:
+    """A 204-equivalent 5-minute try: answered, but no raw readings stored
+    (mirrors ``tests/test_close_alerts.py``'s ``_set_answered``, kept local
+    to this module since that name is private to its own file)."""
+    stamp = isoformat_utc(
+        datetime(local_date.year, local_date.month, local_date.day, 12, tzinfo=UTC)
+    )
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, last_ok_at, updated_at)"
+        " VALUES (?, ?, 'fetched', ?, ?)",
+        (station_id, local_date.isoformat(), stamp, stamp),
+    )
+
+
+def _close_plain(conn: sqlite3.Connection, site_id: int, local_date) -> None:
+    """Close ``local_date`` just after its own end, with no other state
+    change (mirrors ``tests/test_close_alerts.py``'s ``_close_day``, kept
+    local for the same reason as ``_mark_answered``)."""
+    from wxverify.db.site_days import begin_close, day_record, finish_close
+
+    record = day_record(conn, site_id, local_date)
+    assert record is not None
+    t = record.day_end_utc + timedelta(minutes=5)
+    begin_close(conn, site_id, local_date, now_utc=t)
+    finish_close(conn, site_id, local_date, now_utc=t)
+
+
 def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AC7 (plan §13.6, §5.4, §6.4): alert 6's detail never names a station,
-    even when alert 3 and the nightly gap-fill pause apply to the same day
-    (M59).
+    even when alert 3 has a real nothing-usable finding at the same time
+    (M59: ``access_days_affected`` also appends ``station <id>`` for each
+    alert-3 station to alert 6's days).
 
-    Also checks what P5 adds on this row: ``close_alerts`` (imported here,
-    inside the test body, since it does not exist on today's code) does not
-    count this refused day against the station for alert 3 -- a day lost to
-    a refused key is skipped, never counted with nothing usable (§5.4) --
-    and the close-on days-affected clause of AC1 is present in alert 6's
-    detail. Both are P5 additions, so this row fails on today's code (the
-    import raises ``ModuleNotFoundError``, and the days-affected text is
-    absent) and passes only once P5 lands.
+    The original version of this test never gave alert 3 anything to find
+    (the fixture's only closed day, D-3, has real presence), so
+    ``_nothing_usable`` was always empty and M59's extra append was always
+    the empty tuple -- unobservable regardless of the bug. This instead
+    builds the site from scratch (``with_records=False``) with D-6, D-5
+    and D-4 closed, each with station A answered but with no usable
+    reading at all (``_mark_answered``, 3 is
+    ``close_monitor.STATION_NOTHING_USABLE_DAYS``), then D-3 closed
+    plainly (skipped either way, never breaking or extending the run,
+    exactly as ``tests/test_close_alerts.py``'s own ``_close_day``
+    documents) and D-2 ``missed``, matching ``day_close_site``'s own
+    ``with_records=True`` layout from D-3 on. A direct sanity check
+    confirms ``_nothing_usable`` is genuinely non-empty before the real
+    assertions run.
     """
-    from wxverify.close_monitor import close_alerts
+    from wxverify.close_monitor import _nothing_usable
+    from wxverify.db.site_days import ensure_site_days, mark_missed, start_site_days
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn, close_on=True, with_records=False)
+    station_a = _station_id(conn, site_id, "ISTATION01")
     site_name = _site_name(conn, site_id)
+
+    d_minus_6 = D - timedelta(days=6)
+    start_site_days(
+        conn,
+        site_id,
+        d_minus_6,
+        now_utc=datetime(d_minus_6.year, d_minus_6.month, d_minus_6.day, tzinfo=UTC),
+    )
+    ensure_site_days(conn, site_id, now_utc=NOW)
+    for offset in (6, 5, 4):
+        d = D - timedelta(days=offset)
+        _mark_answered(conn, station_a, d)
+        _close_plain(conn, site_id, d)
+    d_minus_3 = D - timedelta(days=3)
+    _close_plain(conn, site_id, d_minus_3)
+    d_minus_2 = D - timedelta(days=2)
+    d2_record_row = conn.execute(
+        "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, d_minus_2.isoformat()),
+    ).fetchone()
+    assert d2_record_row is not None
+    from wxverify.core.timeutil import parse_utc
+
+    mark_missed(
+        conn,
+        site_id,
+        d_minus_2,
+        now_utc=parse_utc(d2_record_row[0]) + timedelta(minutes=30),
+        reason="never_attempted",
+    )
+
+    sanity_now = datetime(D.year, D.month, D.day, 9, 5, tzinfo=UTC)
+    findings = _nothing_usable(conn, sanity_now)
+    assert findings, (
+        "fixture sanity check (not a mutant kill): alert 3 must have a real"
+        " nothing-usable finding here, or M59's extra append has nothing to"
+        " add and this test cannot distinguish it from correct code -- got"
+        f" {findings!r}."
+    )
+
+    from wxverify.close_monitor import close_alerts
+
+    alerts_before = close_alerts(conn, sanity_now)
+    nothing_usable_before = next(
+        a for a in alerts_before if a.id == "station_nothing_usable"
+    )
+    expected_before = (
+        "station ISTATION01: nothing usable for temperature, rain and wind"
+        f" since {d_minus_6.isoformat()}"
+    )
+    assert (
+        nothing_usable_before.tripped
+        and nothing_usable_before.count == 1
+        and nothing_usable_before.detail == expected_before
+    ), (
+        f"fixture check: correct = tripped, count=1, detail={expected_before!r}"
+        f" for the D-6..D-4 run, got tripped={nothing_usable_before.tripped},"
+        f" count={nothing_usable_before.count},"
+        f" detail={nothing_usable_before.detail!r}. This pins alert 3's own"
+        " reading of this fixture before the refusal below is written. The"
+        " refusal that follows is recorded on D itself (today, never a done"
+        " day -- D is still `collecting`, per the detail checked below), so"
+        " it can never be a day alert 3 counts or skips either way; a repeat"
+        " of this same assertion after the refusal would prove only that the"
+        " refusal adds nothing to alert 3's D-6..D-4 reading, not that a day"
+        " lost to it is skipped (plan §5.4, §6.4, TODO.md:1138)."
+    )
 
     refusal_at = datetime(D.year, D.month, D.day, 9, 0, tzinfo=UTC)
     _freeze(monkeypatch, refusal_at)
@@ -370,27 +474,19 @@ def test_ac7_no_station_named_with_alert3_and_gap_fill_pause(
     detail = str(cond["detail"])
     assert "ISTATION01" not in detail and "ISTATION02" not in detail, (
         "M59 -> at this assertion: correct = no pws_station_id appears in"
-        " alert 6's detail, mutant = stations named in alert 6's detail,"
-        " so a station id would appear here."
+        " alert 6's detail even though alert 3 has a real finding for"
+        " ISTATION01 (confirmed above), mutant = stations named in alert"
+        " 6's detail, so a station id would appear here."
     )
     assert "station " not in detail, (
         "M59 -> at this assertion: correct = the detail never says"
         " 'station ...', mutant = stations named in alert 6's detail, so"
-        " that word would appear in this text."
+        " that word would appear in this text (the mutant's own literal"
+        " text is 'station <id>')."
     )
     assert f"days affected: {site_name} {D.isoformat()} (collecting)" in detail, (
         "M59 -> at this assertion: correct = the close-on days-affected"
         f" clause names '{site_name} {D.isoformat()} (collecting)', mutant ="
         " stations named in alert 6's detail in place of the days-affected"
         " clause, so this exact text would be absent here."
-    )
-
-    alerts = close_alerts(conn, now)
-    nothing_usable = next(a for a in alerts if a.id == "station_nothing_usable")
-    assert not nothing_usable.tripped, (
-        "M59 -> at this assertion: correct = alert 3 does not trip on a day"
-        " lost to a refused key (the day is skipped, never counted with"
-        " nothing usable, §5.4), mutant = a refused day counted against the"
-        f" station, tripping alert 3 here too; actual tripped="
-        f"{nothing_usable.tripped}"
     )

@@ -315,10 +315,15 @@ def test_pg3_close_off_adds_only_empty_new_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PG3 (plan §13.9, §9.2): with the close off, the reply equals today's
-    plus the new keys empty/null (M89). PASSES today: with the close off
-    P5 changes nothing here, so today's reply already has no such keys and
-    the loop below, which tolerates an absent key as "empty", finds every
-    one of them already satisfied."""
+    plus the new keys empty/null (M89).
+
+    ``body.get(key, empty)`` reads the SAME ``empty`` value whether the
+    mutant's code drops the key or correct code sets it explicitly to
+    ``empty`` -- an absent key and a key present but empty are the same
+    thing to a ``dict.get`` with a matching default, so the original
+    version of this loop could not tell M89's missing keys from M0's
+    present-and-empty ones. Each key must be checked present first.
+    """
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=False)
     feed_id = asof_make_real_feed(conn, "pg3-feed")
@@ -339,7 +344,13 @@ def test_pg3_close_off_adds_only_empty_new_keys(
         ("provisional_valid_at", []),
         ("provisional_latest_reading_at", None),
     ):
-        value = body.get(key, empty)
+        assert key in body, (
+            f"M89 -> at this assertion: correct = {key!r} present with the"
+            " close off (explicitly set to its empty value), mutant = the"
+            f" new keys left out with the close off, so {key!r} would be"
+            f" absent here; body keys={sorted(body)!r}"
+        )
+        value = body[key]
         assert value == empty or value is None, (
             f"M89 -> at this assertion: correct = {key} empty/null with the"
             f" close off, mutant = the new keys left out with the close"
@@ -430,7 +441,15 @@ def test_pg4_zone_changeover_day_and_zone_flagged_days(
 def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
     """PG5 (plan §13.9, §9.2): app.js pins the provisional series (dashed),
     the missed band, the empty test reading all three, and the summary
-    sentences (M91)."""
+    sentences (M91).
+
+    The word "dashed" also appears in this series' own comment ("the
+    observed colour with a dashed stroke"), which stays put whether or
+    not the series itself carries a `dash:` setting -- a bare
+    ``"dashed" in app_js`` check cannot tell the two apart. This instead
+    isolates the ``"Observed (provisional)"`` series' own line and checks
+    its `dash:` setting directly.
+    """
     app_js = (_ROOT / "wxverify" / "web" / "static" / "app.js").read_text(
         encoding="utf-8"
     )
@@ -439,9 +458,16 @@ def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
         " 'Observed (provisional)' present, mutant = the provisional"
         " series never added (today's app.js has no such label)"
     )
-    assert "dashed" in app_js, (
-        "M91 -> at this assertion: correct = the provisional series uses a"
-        " dashed stroke, mutant = the provisional series drawn solid"
+    provisional_series_line = next(
+        line for line in app_js.splitlines() if '"Observed (provisional)"' in line
+    )
+    assert "dash:" in provisional_series_line, (
+        "M91 -> at this assertion: correct = the provisional series' own"
+        " object literal carries a `dash:` setting, mutant = the"
+        " provisional series drawn solid (no `dash:` on this series) --"
+        " the word 'dashed' alone would still appear in this file's"
+        " comment either way, so this checks the series' own line, not"
+        f" the comment above it; line={provisional_series_line!r}"
     )
     assert "Provisional observed values from" in app_js
     assert "Missed, never scored:" in app_js
@@ -606,20 +632,79 @@ def test_pg8_dashboard_close_off_no_coverage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PG8 (plan §13.9, §9.4): the dashboard with the close off shows no
-    coverage table and no "Scored" column (M95). PASSES today: with the
-    close off nothing here changes, and today's dashboard already has
-    neither."""
+    coverage table and no "Scored" column (M95).
+
+    The original version of this test seeded no active publication at
+    all, so the dashboard's publication lookup found nothing to show
+    regardless of the close flag -- M95's dropped ``daily_close_on(conn)``
+    check was unobservable. This seeds a real active publication and a
+    coverage row (PG7's pattern) with the close off, so the lookup would
+    actually find something if the guard were gone. The two coverage
+    checks still can't see M95 either way (with the close off the
+    Leaderboard never reads the publication's rankings, so the coverage
+    table is None regardless), so a third assertion checks the
+    "evidence-through" line instead, which M95 does change because it
+    comes straight from the (wrongly found) publication lookup.
+    """
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=False)
+    feed_id = asof_make_real_feed(conn, "pg8-feed")
     _patch_clock(monkeypatch, NOW)
+
+    pub_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=D - timedelta(days=1),
+        published_at=NOW,
+        window_days=30,
+    )
+    seed_coverage(
+        conn,
+        publication_id=pub_id,
+        variable="temperature",
+        window_key="w:30",
+        day_ahead=3,
+        feed_id=feed_id,
+        scored=7,
+        expected=7,
+    )
+    _seed_ranking(
+        conn,
+        publication_id=pub_id,
+        feed_id=feed_id,
+        variable="temperature",
+        day_ahead=3,
+        window_key="w:30",
+        n=7,
+        skill_score=50.0,
+    )
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
-        response = client.get("/dashboard", params={"site": site_id})
+        response = client.get(
+            "/dashboard", params={"site": site_id, "window": "rolling", "lead": "D+3"}
+        )
     assert response.status_code == 200
     text = response.text
-    assert "Forecasts scored in this window" not in text
-    assert ">Scored<" not in text
+    assert "Forecasts scored in this window" not in text, (
+        "M95 -> at this assertion: correct = no coverage table with the"
+        " close off, even though a real active publication and coverage"
+        " row exist, mutant = the publication lookup drops"
+        " `and daily_close_on(conn)`, so it would find the seeded"
+        " publication and this text would show"
+    )
+    assert ">Scored<" not in text, (
+        "M95 -> at this assertion: correct = no 'Scored' column with the"
+        " close off, mutant = the publication lookup drops"
+        " `and daily_close_on(conn)`, so the Leaderboard's 'Scored' column"
+        " would show here too"
+    )
+    assert 'id="evidence-through"' not in text, (
+        "M95 -> at this assertion: correct = no 'Rankings use … days"
+        " through' line with the close off (no publication is read, plan"
+        " 9.1), mutant = the lookup finds the seeded publication, so"
+        " evidence_through is its cutoff and the line shows"
+    )
 
 
 def test_pg9_worker_status_newest_published_at_with_close_on(
