@@ -382,12 +382,20 @@ def test_al5_changeover_day_not_alerted() -> None:
     assert change_date == D + timedelta(days=1)
     record = day_record(conn, site_id, change_date)
     assert record is not None
+    _close_gaps_before(conn, site_id, change_date)
     mark_missed(
         conn,
         site_id,
         change_date,
         now_utc=record.day_end_utc + timedelta(minutes=5),
         reason="zone_changeover",
+    )
+    record = day_record(conn, site_id, change_date)
+    assert record is not None
+    assert record.state == "missed" and record.missed_reason == "zone_changeover", (
+        f"precondition -> the changeover day must be missed(zone_changeover)"
+        f" before close_alerts runs, got state={record.state!r}"
+        f" missed_reason={record.missed_reason!r}"
     )
 
     alerts = close_alerts(conn, record.day_end_utc + timedelta(days=7))
@@ -565,8 +573,8 @@ def test_al11_skipped_day_does_not_break_or_extend_run() -> None:
     (M22, M23)."""
     from wxverify.close_monitor import close_alerts
 
-    counted = (D - timedelta(days=8), D - timedelta(days=6), D - timedelta(days=4))
-    skip_date = D - timedelta(days=5)
+    counted = (D - timedelta(days=4), D - timedelta(days=2), D - timedelta(days=1))
+    skip_date = D - timedelta(days=3)
 
     def _run(skip_setup) -> None:
         conn = asof_conn()

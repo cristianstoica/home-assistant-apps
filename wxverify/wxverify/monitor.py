@@ -18,7 +18,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.close_monitor import CloseAlert, station_silent
+from wxverify.close_monitor import CloseAlert, close_alerts, station_silent
 from wxverify.collection.budget import (
     current_billing_day,
     effective_daily_call_limit,
@@ -665,14 +665,100 @@ def _stuck_verification_chunks(
     return stuck
 
 
+def _retired_check_results(
+    conn: sqlite3.Connection, now: datetime, *, eligible_feeds: int
+) -> dict[str, tuple[bool, int | None, str]]:
+    """The five pipeline checks the daily close retires, by id.
+
+    Each as ``(tripped, count, detail)`` for ``_cond``. Called only while the
+    close is off (daily-close plan P5 §4.1): with it on, none of these
+    queries runs and none of these rows is built.
+    """
+    obs_cutoff = isoformat_utc(now - timedelta(hours=OBS_STALE_HOURS))
+    fetch_obs_cutoff = isoformat_utc(now - timedelta(hours=FETCH_OBS_LIVE_HOURS))
+    pair_cutoff = isoformat_utc(now - timedelta(hours=PAIR_SCORE_LIVE_HOURS))
+
+    # obs_stale: enabled site with >=1 enabled station and last_obs_at >12h/NULL.
+    obs_stale_n = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) FROM sites s
+        WHERE {_ELIGIBLE_OBS_WHERE}
+          AND (s.last_obs_at IS NULL OR s.last_obs_at < ?)
+        """,
+        (obs_cutoff,),
+    )
+    eligible_obs = _count(
+        conn,
+        f"SELECT COUNT(*) FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}",
+        (),
+    )
+
+    # fetch_obs carries two lanes; only the live "obs" stream proves liveness,
+    # so a completing wind-days lane cannot mask a dead live stream.
+    fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
+        conn, "fetch_obs", fetch_obs_cutoff, job_key="obs"
+    )
+    pair_score_live_tripped = eligible_feeds > 0 and not _has_completed_within(
+        conn, "pair_and_score", pair_cutoff, job_key=None
+    )
+
+    # obs_station_history_failing (Item B.7): enabled stations of enabled sites
+    # whose hourly history is failing. Trips on the first park and clears only
+    # when the station returns a recent observation (B.3 outcome 1), the only
+    # thing that zeroes the counter.
+    (
+        history_failing_n,
+        history_worst_rung,
+        history_next_retry,
+    ) = _station_history_failures(conn)
+
+    # wind_history (plan §10): per enabled site with an enabled station, a
+    # failing station-day, a missed collection before midnight, or a station
+    # whose wind stopped updating today.
+    wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
+
+    return {
+        "obs_stale": (
+            obs_stale_n > 0,
+            obs_stale_n,
+            f"{obs_stale_n} sites not observed >12h",
+        ),
+        "fetch_obs_live": (
+            fetch_obs_live_tripped,
+            None,
+            "no completed fetch_obs in 8h",
+        ),
+        "pair_score_live": (
+            pair_score_live_tripped,
+            None,
+            "no completed pair_and_score in 12h",
+        ),
+        "obs_station_history_failing": (
+            history_failing_n > 0,
+            history_failing_n,
+            f"{history_failing_n} stations with failing hourly history"
+            f" (worst rung {history_worst_rung},"
+            f" earliest retry {history_next_retry})",
+        ),
+        "wind_history": (
+            wind_tripped_n > 0,
+            wind_tripped_n,
+            wind_detail or "wind history needs attention",
+        ),
+    }
+
+
 def _pipeline_conditions(
     conn: sqlite3.Connection, now: datetime, *, grace_active: bool
 ) -> list[Condition]:
+    # The daily close's switch (daily-close plan P5 §4.1, §5.1). With it on,
+    # the five checks it retires are not built and close_alerts adds its
+    # rows; with it off, every row is built as before.
+    close_on = daily_close_on(conn)
+
     feed_cutoff = isoformat_utc(now - timedelta(hours=FEED_STALE_HOURS))
-    obs_cutoff = isoformat_utc(now - timedelta(hours=OBS_STALE_HOURS))
-    fetch_obs_cutoff = isoformat_utc(now - timedelta(hours=FETCH_OBS_LIVE_HOURS))
     fetch_feed_cutoff = isoformat_utc(now - timedelta(hours=FETCH_FEED_LIVE_HOURS))
-    pair_cutoff = isoformat_utc(now - timedelta(hours=PAIR_SCORE_LIVE_HOURS))
 
     # feed_stale: eligible feed with last_run_at > 12h ago OR NULL.
     feed_stale_n = _count(
@@ -688,17 +774,6 @@ def _pipeline_conditions(
         (feed_cutoff,),
     )
 
-    # obs_stale: enabled site with >=1 enabled station and last_obs_at >12h/NULL.
-    obs_stale_n = _count(
-        conn,
-        f"""
-        SELECT COUNT(*) FROM sites s
-        WHERE {_ELIGIBLE_OBS_WHERE}
-          AND (s.last_obs_at IS NULL OR s.last_obs_at < ?)
-        """,
-        (obs_cutoff,),
-    )
-
     eligible_feeds = _count(
         conn,
         f"""
@@ -710,22 +785,13 @@ def _pipeline_conditions(
         """,
         (),
     )
-    eligible_obs = _count(
-        conn,
-        f"SELECT COUNT(*) FROM sites s WHERE {_ELIGIBLE_OBS_WHERE}",
-        (),
-    )
-
-    # fetch_obs carries two lanes; only the live "obs" stream proves liveness,
-    # so a completing wind-days lane cannot mask a dead live stream.
-    fetch_obs_live_tripped = eligible_obs > 0 and not _has_completed_within(
-        conn, "fetch_obs", fetch_obs_cutoff, job_key="obs"
-    )
     fetch_feed_live_tripped = eligible_feeds > 0 and not _has_completed_within(
         conn, "fetch_feed", fetch_feed_cutoff, job_key=None
     )
-    pair_score_live_tripped = eligible_feeds > 0 and not _has_completed_within(
-        conn, "pair_and_score", pair_cutoff, job_key=None
+    retired: dict[str, tuple[bool, int | None, str]] = (
+        {}
+        if close_on
+        else _retired_check_results(conn, now, eligible_feeds=eligible_feeds)
     )
 
     # problem_jobs = failed scopes + in-flight problems. The failed arm counts
@@ -818,16 +884,6 @@ def _pipeline_conditions(
     # job completes, by design, so the failure is only visible here.
     gap_scan_failed_n, gap_scan_newest = gap_scan_degraded_sites(conn)
 
-    # obs_station_history_failing (Item B.7): enabled stations of enabled sites
-    # whose hourly history is failing. Trips on the first park and clears only
-    # when the station returns a recent observation (B.3 outcome 1), the only
-    # thing that zeroes the counter.
-    (
-        history_failing_n,
-        history_worst_rung,
-        history_next_retry,
-    ) = _station_history_failures(conn)
-
     # obs_collection_delayed (D1.3): enabled stations of enabled sites whose
     # current-obs poll is overdue. Reads schedule and job rows only, never the
     # poller heartbeat, so a dead or stalled poller cannot hold it green.
@@ -850,18 +906,14 @@ def _pipeline_conditions(
         _main_liveness_evidence(conn), now
     )
 
-    # wind_history (plan §10): per enabled site with an enabled station, a
-    # failing station-day, a missed collection before midnight, or a station
-    # whose wind stopped updating today.
-    wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
-
     # station_silent_today (daily-close plan P5 §6.3): built with the close
-    # on and off. Its own `try` keeps a fault in it from dropping the
-    # group's other rows: a sqlite3.Error still reaches the group's `try`
-    # in build_verdict (db_readable), and any other exception becomes one
-    # unexpected_error row in place of this one.
-    close_on = daily_close_on(conn)
+    # on and off. close_alerts (§5.1): called only with the close on. Each
+    # call's own `try` keeps a fault in it from dropping the group's other
+    # rows: a sqlite3.Error still reaches the group's `try` in build_verdict
+    # (db_readable), and any other exception becomes one unexpected_error
+    # row in place of that call's rows.
     silent: CloseAlert | None = None
+    close_rows: list[CloseAlert] = []
     close_errors: list[Condition] = []
     try:
         silent = station_silent(conn, now, close_on=close_on)
@@ -869,6 +921,13 @@ def _pipeline_conditions(
         raise
     except Exception as exc:
         close_errors.append(_close_error_condition(exc))
+    if close_on:
+        try:
+            close_rows = close_alerts(conn, now)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:
+            close_errors.append(_close_error_condition(exc))
 
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
@@ -890,6 +949,12 @@ def _pipeline_conditions(
             detail=detail if tripped else None,
         )
 
+    def _retired(cid: str) -> list[Condition]:
+        # A retired check's row in today's place while the close is off;
+        # nothing while it is on.
+        result = retired.get(cid)
+        return [] if result is None else [_cond(cid, *result)]
+
     conditions = [
         _cond(
             "feed_stale",
@@ -897,30 +962,15 @@ def _pipeline_conditions(
             feed_stale_n,
             f"{feed_stale_n} feeds not run >12h",
         ),
-        _cond(
-            "obs_stale",
-            obs_stale_n > 0,
-            obs_stale_n,
-            f"{obs_stale_n} sites not observed >12h",
-        ),
-        _cond(
-            "fetch_obs_live",
-            fetch_obs_live_tripped,
-            None,
-            "no completed fetch_obs in 8h",
-        ),
+        *_retired("obs_stale"),
+        *_retired("fetch_obs_live"),
         _cond(
             "fetch_feed_live",
             fetch_feed_live_tripped,
             None,
             "no completed fetch_feed in 12h",
         ),
-        _cond(
-            "pair_score_live",
-            pair_score_live_tripped,
-            None,
-            "no completed pair_and_score in 12h",
-        ),
+        *_retired("pair_score_live"),
         _cond(
             "problem_jobs",
             problem_jobs_n > 0,
@@ -941,14 +991,7 @@ def _pipeline_conditions(
             f"{gap_scan_failed_n} sites with unassessed record gap-scan dates"
             f" (newest failure {gap_scan_newest})",
         ),
-        _cond(
-            "obs_station_history_failing",
-            history_failing_n > 0,
-            history_failing_n,
-            f"{history_failing_n} stations with failing hourly history"
-            f" (worst rung {history_worst_rung},"
-            f" earliest retry {history_next_retry})",
-        ),
+        *_retired("obs_station_history_failing"),
         _cond(
             "obs_collection_delayed",
             collection_overdue_n > 0,
@@ -959,12 +1002,7 @@ def _pipeline_conditions(
             f" {collection_backoff_n} in backoff",
         ),
         _cond("main_worker_liveness", liveness_tripped, None, liveness_detail),
-        _cond(
-            "wind_history",
-            wind_tripped_n > 0,
-            wind_tripped_n,
-            wind_detail or "wind history needs attention",
-        ),
+        *_retired("wind_history"),
     ]
     if silent is not None:
         conditions.append(
@@ -975,6 +1013,12 @@ def _pipeline_conditions(
                 silent.detail or "",
             )
         )
+    # Each close alert as a pipeline row, severity warning, through `_cond`,
+    # so the start-up grace holds for it as for every pipeline row (§5.1).
+    conditions.extend(
+        _cond(alert.id, alert.tripped, alert.count, alert.detail or "")
+        for alert in close_rows
+    )
     conditions.extend(close_errors)
     return conditions
 
