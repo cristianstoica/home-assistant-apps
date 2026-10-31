@@ -1395,10 +1395,17 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         " lead is D+0, so 'Today' would be active instead; tomorrow_line="
         f"{tomorrow_line!r}"
     )
-    assert "lead=D%2B1" in no_lead_text, (
+    no_lead_data_src_line = next(
+        (line for line in no_lead_text.splitlines() if "data-src=" in line), None
+    )
+    assert no_lead_data_src_line is not None, (
+        "setup check for the chart's data-src line being present"
+    )
+    assert "lead=D%2B1" in no_lead_data_src_line, (
         "M138 -> at this assertion: correct = the chart's data-src"
-        " carries `lead=D%2B1` (urlencoded D+1), mutant = the chart's"
-        " data-src built without `lead`, so this string would be absent"
+        " line carries `lead=D%2B1` (urlencoded D+1), mutant = the"
+        " chart's data-src built without `lead`, so this string would"
+        f" be absent; no_lead_data_src_line={no_lead_data_src_line!r}"
     )
     assert overlay_d2.status_code == 200
     d2_text = overlay_d2.text
@@ -1406,6 +1413,13 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
         (line for line in d2_text.splitlines() if ">+2 days<" in line), None
     )
     assert plus2_line is not None and "active" in plus2_line
+    d2_data_src_line = next(
+        (line for line in d2_text.splitlines() if "data-src=" in line), None
+    )
+    assert d2_data_src_line is not None and "lead=D%2B2" in d2_data_src_line, (
+        "setup check for the chart's data-src line carrying"
+        f" `lead=D%2B2`; d2_data_src_line={d2_data_src_line!r}"
+    )
     assert d2_text.count("lead=D%2B2") >= 2, (
         "setup check for the data-src and the site link both carrying"
         f" `lead=D%2B2`; count={d2_text.count('lead=D%2B2')!r}"
