@@ -259,6 +259,15 @@ def test_op3_failed_attempt_shows_retry_and_stage(
     )
     assert day.failure == "gap fill: network"
     assert day.stage is not None and "stage 2 gap check and fill" in day.stage
+    assert day.stage_line == (
+        "stage 2 gap check and fill, started"
+        f" {isoformat_utc(t + timedelta(seconds=5))}, waited 5 s in the"
+        f" queue, ended {isoformat_utc(t + timedelta(minutes=3))}"
+    ), (
+        "OP3 -> at this assertion: correct = the stage-log row's started,"
+        " queue wait and ended times in the stage line, mutant = a wrong"
+        f" or missing field; got {day.stage_line!r}"
+    )
 
 
 def test_op4_publication_state_published_then_failed(

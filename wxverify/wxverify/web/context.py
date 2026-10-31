@@ -695,8 +695,9 @@ def _coverage_table(
         return None
     if not window_key.startswith("w:"):
         # A typed `window=<N>d` view (`live:{N}d`), for which P4 stores no
-        # coverage: no table and no line in its place. The owner's answer
-        # to plan 17.2's `<N>d` coverage question decides this branch.
+        # coverage: no table and no line in its place. The owner left this
+        # view without coverage, and without a line in its place
+        # (2026-10-31).
         return None
     stored = published_coverage(
         conn, pub=publication, variable=variable, window_key=window_key

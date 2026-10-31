@@ -171,8 +171,10 @@ class CloseAlert:
     ``count`` is the number of items tripped (0 while ok); ``detail`` names
     them in a fixed order, at most five then "and N more", and is None while
     ok, except for alert 7, whose "recovered at <time>" line shows while ok
-    for ``CLOSE_RECOVERED_SHOW_HOURS``. ``recovered_at`` is that recovery
-    time, None for every other alert and outside that window.
+    for ``CLOSE_RECOVERED_SHOW_HOURS`` from the first answered try of the
+    slot that ended the last run of down slots, whatever answered slots
+    follow it. ``recovered_at`` is that recovery time, None for every other
+    alert and outside that window.
     """
 
     id: str
@@ -844,8 +846,13 @@ def _provider_down(
 
     The first is set when the latest judged slot is down: ``since`` the
     earliest slot of the run of down judged slots, counted. The second is
-    set when the latest judged slot ended such a run with an answered try
-    at most ``CLOSE_RECOVERED_SHOW_HOURS`` ago (its first answered try).
+    set when the latest judged slot is answered: walking back through the
+    answered slots to the first down slot, it is the first answered try of
+    the slot that ended that down run, while at most
+    ``CLOSE_RECOVERED_SHOW_HOURS`` before ``now`` (plan §6.6), so later
+    answered slots do not remove it. The walk stops with no recovery time
+    at an answered slot whose first answered try is older than that, or
+    when the slots run out before a down slot.
     """
     slots = _slots_newest_first(conn, current, interval)
     latest = next(slots, None)
@@ -858,11 +865,15 @@ def _provider_down(
                 break
             since, count = slot.time, count + 1
         return (since, count), None
-    if now - latest.answered_at > timedelta(hours=CLOSE_RECOVERED_SHOW_HOURS):
-        return None, None
-    previous = next(slots, None)
-    if previous is not None and previous.answered_at is None:
-        return None, latest.answered_at
+    window = timedelta(hours=CLOSE_RECOVERED_SHOW_HOURS)
+    recovered_at = latest.answered_at
+    while now - recovered_at <= window:
+        slot = next(slots, None)
+        if slot is None:
+            return None, None
+        if slot.answered_at is None:
+            return None, recovered_at
+        recovered_at = slot.answered_at
     return None, None
 
 

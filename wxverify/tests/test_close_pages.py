@@ -472,6 +472,17 @@ def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
     assert "Provisional observed values from" in app_js
     assert "Missed, never scored:" in app_js
     assert "Scored under the zone it had then:" in app_js
+    assert "zone changeover, not scored" in app_js, (
+        "PG5 -> at this assertion: correct = a changeover day's missed"
+        " band labelled 'zone changeover, not scored', mutant = the"
+        " changeover label dropped (today's app.js has no such string)"
+    )
+    assert "missedDays.length === 0" in app_js, (
+        "PG5 -> at this assertion: correct = the empty-test for the chart"
+        " reads all three of pairAt, provisionalAt and missedDays, mutant"
+        " = missedDays left out of the empty test (today's app.js has no"
+        " such string)"
+    )
 
 
 def test_pg6_station_trust_closed_and_history_only(

@@ -148,6 +148,8 @@ def _monitor_import_site(node: ast.AST) -> str | None:
             for alias in node.names:
                 if alias.name == "monitor":
                     return "." * node.level + " import monitor (relative)"
+        if node.module == "monitor" and node.level >= 1:
+            return "from " + "." * node.level + "monitor import ... (relative)"
     return None
 
 

@@ -2337,3 +2337,94 @@ def test_pd6_daytime_slots_grouped_by_refresh_interval() -> None:
         " slots), mutant = all of a day's daytime tries judged as one"
         f" slot; tripped={down.tripped}, detail={down.detail!r}"
     )
+
+
+def test_pd7_recovered_line_survives_a_later_answered_slot() -> None:
+    """PD7: PD3's down run, then two later daytime slots each with one
+    stored try, at <t> and <t>+3 h; now <t>+4 h, then <t>+24 h 1 s
+    (M125)."""
+    from wxverify.close_monitor import close_alerts
+    from wxverify.settings.keys import set_setting
+
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=True)
+    set_setting(conn, "obs_interval_minutes", "60")
+    station_a = _station_id(conn, site_id, "ISTATION01")
+    station_b = _station_id(conn, site_id, "ISTATION02")
+
+    day_start = datetime(D.year, D.month, D.day, tzinfo=UTC)
+    t1 = day_start + timedelta(hours=1, minutes=30)
+    t2 = day_start + timedelta(hours=2, minutes=30)
+    t3 = day_start + timedelta(hours=3, minutes=30)
+    t4 = day_start + timedelta(hours=4, minutes=30)
+    t5 = day_start + timedelta(hours=5, minutes=30)
+    t = day_start + timedelta(hours=6, minutes=30)
+
+    for ti in (t1, t2, t3, t5):
+        seed_try(
+            conn,
+            site_id=site_id,
+            station_id=station_a,
+            local_date=D,
+            kind="five_minute",
+            slot="daytime",
+            close_attempt=None,
+            tried_at=ti,
+            outcome="failed",
+            reason="network",
+        )
+    seed_try(
+        conn,
+        site_id=site_id,
+        station_id=station_b,
+        local_date=D,
+        kind="five_minute",
+        slot="daytime",
+        close_attempt=None,
+        tried_at=t4,
+        outcome="failed",
+        reason="call_limit",
+    )
+    seed_try(
+        conn,
+        site_id=site_id,
+        station_id=station_a,
+        local_date=D,
+        kind="five_minute",
+        slot="daytime",
+        close_attempt=None,
+        tried_at=t,
+        outcome="stored",
+    )
+    seed_try(
+        conn,
+        site_id=site_id,
+        station_id=station_a,
+        local_date=D,
+        kind="five_minute",
+        slot="daytime",
+        close_attempt=None,
+        tried_at=t + timedelta(hours=3),
+        outcome="stored",
+    )
+
+    at_4h = close_alerts(conn, t + timedelta(hours=4))
+    down_4h = next(a for a in at_4h if a.id == "provider_down")
+    expected_4h = f"recovered at {isoformat_utc(t)}"
+    assert not down_4h.tripped and down_4h.detail == expected_4h, (
+        f"M125 -> at this assertion: correct = ok, detail={expected_4h!r}"
+        " (the recovered line stays for 24 h after the slot that ended"
+        " the run, even past a later answered slot), mutant = the"
+        " recovered line kept only while the slot that ended the run is"
+        f" the latest judged slot; tripped={down_4h.tripped}, detail="
+        f"{down_4h.detail!r}"
+    )
+
+    at_24h1s = close_alerts(conn, t + timedelta(hours=24, seconds=1))
+    down_24h1s = next(a for a in at_24h1s if a.id == "provider_down")
+    assert not down_24h1s.tripped and down_24h1s.detail is None, (
+        "M125 paired positive -> at this assertion: correct = ok, no"
+        " detail (past 24 h since the slot that ended the run), mutant ="
+        f" the recovered line kept past 24 h; tripped={down_24h1s.tripped}"
+        f", detail={down_24h1s.detail!r}"
+    )
