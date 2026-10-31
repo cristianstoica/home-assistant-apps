@@ -1,6 +1,6 @@
 """Pages (daily-close plan 2026-10-22-daily-close-alerts-and-pages.md §9;
-test IDs PG1-PG12 of this file's §13.9; PG13 and PG14 are held back for the
-owner's open questions, 17.2, and are not written here).
+test IDs PG1-PG14 of this file's §13.9; PG13 and PG14 needed the owner's
+open questions of 17.2 answered first (2026-10-31) and are added here now).
 
 Written before P5's page changes exist: every test below imports a name P5
 adds (or reaches new JSON/HTML it has not yet produced) inside its own body
@@ -30,6 +30,7 @@ from tests.helpers import (
     NOW,
     D,
     asof_make_real_feed,
+    asof_persistence_feed_id,
     day_close_site,
     seed_active_publication,
     seed_closed_pairs,
@@ -38,8 +39,10 @@ from tests.helpers import (
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.connection import close_db, init_db
+from wxverify.db.connection import close_db, get_db, init_db
+from wxverify.db.runtime_state import delete_runtime_state
 from wxverify.db.site_days import (
+    DAILY_CLOSE_ON_KEY,
     begin_close,
     day_record,
     ensure_site_days,
@@ -189,7 +192,10 @@ def test_pg1_closed_day_pairs_replace_forecast_pairs(
 ) -> None:
     """PG1 (plan §13.9, §9.2): closed-day pairs (D-3) and the starting
     history are kept; a missed day (D-2) is dropped and listed in
-    `missed_days`; an open day (D-1) is dropped too (M86, M87)."""
+    `missed_days`; an open day (D-1) is dropped too (M86, M87). The
+    starting-history row is itself a D+1 forecast (`lead_hours` 24,
+    `issued_at` 24h before its `valid_at`), so the route's default `lead`
+    (D+1) keeps it too (plan row ~812, 9.2)."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg-feed")
@@ -223,15 +229,25 @@ def test_pg1_closed_day_pairs_replace_forecast_pairs(
             tzinfo=UTC,
         )
     )
+    before_issued_at = isoformat_utc(
+        datetime(
+            before_first_record.year,
+            before_first_record.month,
+            before_first_record.day,
+            6,
+            tzinfo=UTC,
+        )
+        - timedelta(hours=24)
+    )
     _seed_pair(
         conn,
         site_id=site_id,
         feed_id=feed_id,
         variable="temperature",
-        issued_at=before_valid_at,
+        issued_at=before_issued_at,
         valid_at=before_valid_at,
-        lead_hours=6,
-        day_ahead=0,
+        lead_hours=24,
+        day_ahead=1,
         forecast=5.0,
         observed=5.5,
         generation_id=generation_id,
@@ -825,7 +841,9 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
 ) -> None:
     """PG12 (plan §13.9, §9.2): `issued_at=I1` keeps only I1's starting-
     history rows and no closed-day row (ClosedPair carries no issued_at);
-    with no `issued_at`, PG1's rows return (M124)."""
+    with no `issued_at`, D-3's row returns, and I1/I2 (D+0) drop out once
+    the default `lead` (D+1) is applied to the starting history (M124,
+    M136)."""
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg12-feed")
@@ -899,7 +917,15 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
         )
     assert with_issued_at.status_code == 200 and without_issued_at.status_code == 200
     with_body = with_issued_at.json()
-    assert i1 in with_body["valid_at"] and i2 not in with_body["valid_at"]
+    assert i1 in with_body["valid_at"], (
+        "M136 -> at this assertion: correct = I1's starting-history row"
+        " (day_ahead 0) kept though issued_at is given and the default"
+        " lead is D+1 (with issued_at given, k filters nothing for the"
+        " starting history), mutant = the starting history filtered to k"
+        f" while issued_at is given, so I1 would be dropped; valid_at="
+        f"{with_body['valid_at']!r}"
+    )
+    assert i2 not in with_body["valid_at"]
     assert d3_valid_at not in with_body["valid_at"], (
         "M124 -> at this assertion: correct = no closed-day row while"
         " issued_at is given (ClosedPair carries no issued_at to match"
@@ -909,3 +935,504 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
     assert "missed_days" in with_body
     without_body = without_issued_at.json()
     assert d3_valid_at in without_body["valid_at"]
+    assert i1 not in without_body["valid_at"] and i2 not in without_body["valid_at"], (
+        "paired negative of the M136 check above: correct = with no"
+        " issued_at given, the starting history IS filtered to the"
+        " default lead (D+1), so I1/I2 (day_ahead 0) drop out here;"
+        f" valid_at={without_body['valid_at']!r}"
+    )
+
+
+def _seed_day_score(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date,
+    feed_id: int,
+    variable: str = "temperature",
+    day_ahead: int = 1,
+    status: str = "scored",
+    n: int = 1,
+    err_n: int = 1,
+    err_sum: float = 2.0,
+    abs_sum: float = 2.0,
+    sq_sum: float = 4.0,
+) -> None:
+    """A closed day's scored cell (P4's ``day_scores``), local to this file
+    (mirrors ``tests/test_publication_readers.py``'s own private helper of
+    the same name -- a cross-module import of a private helper between two
+    independent test files is awkward, so this is a self-contained copy,
+    not an import)."""
+    conn.execute(
+        """
+        INSERT INTO day_scores
+            (site_id, local_date, feed_id, variable, day_ahead, status,
+             download_id, download_date, fetched_at, n, err_n, err_sum,
+             abs_sum, sq_sum, hits, false_alarms, misses, correct_negs,
+             skill_n, skill_sq_sum, skill_ref_sq_sum, wind_fc_high,
+             wind_fc_hours, wind_obs_high)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?, NULL, NULL,
+                NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+        """,
+        (
+            site_id,
+            local_date.isoformat(),
+            feed_id,
+            variable,
+            day_ahead,
+            status,
+            n,
+            err_n,
+            err_sum,
+            abs_sum,
+            sq_sum,
+        ),
+    )
+
+
+def test_pg13_typed_nd_window_shows_no_coverage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PG13 (plan §13.9, §9.4): a typed `window=14d` view (`live_ranking`,
+    summed live) shows the Leaderboard's scored feed but no coverage table,
+    no "Scored" column and no coverage line -- P4 stores coverage for
+    `w:{N}` and `w:all` only, never a live window (owner, 2026-10-31; M126).
+
+    This PASSES on today's code: `_coverage_table` (`web/context.py:675-
+    723`) already guards on `window_key.startswith("w:")` before reading
+    `published_coverage`, so this pins that guard as a regression test
+    rather than driving new work. The paired positive -- that the SAME
+    coverage machinery DOES show on the "Last N days" view -- is PG7
+    (`test_pg7_coverage_table_next_to_the_rankings`, above), so this test's
+    absence claim is not resting on an ambient coincidence.
+
+    Gap: the plan's row (§13.9, PG13) names a "Coverage is counted for"
+    line as one of the two coverage-line strings that must be absent. That
+    exact string does not appear anywhere in `wxverify/web/templates/` or
+    `wxverify/web/static/app.js` today (checked by direct grep), so this
+    only checks the other one, "Coverage per day ahead is in the table
+    above." (`dashboard/_composite.html:5`), which is real and does exist,
+    conditional on `coverage`.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = day_close_site(conn, close_on=True)
+    feed_x = asof_make_real_feed(conn, "pg13-x")
+    _patch_clock(monkeypatch, NOW)
+
+    cutoff = D - timedelta(days=1)
+    seed_active_publication(
+        conn, site_id=site_id, cutoff=cutoff, published_at=NOW, window_days=30
+    )
+    _seed_day_score(
+        conn,
+        site_id=site_id,
+        local_date=D - timedelta(days=3),
+        feed_id=feed_x,
+        variable="temperature",
+        day_ahead=3,
+    )
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        response = client.get(
+            "/dashboard", params={"site": site_id, "window": "14d", "lead": "D+3"}
+        )
+    assert response.status_code == 200
+    text = response.text
+    leaderboard_start = text.index("<h2>Leaderboard</h2>")
+    leaderboard_html = text[
+        leaderboard_start : text.index("</section>", leaderboard_start)
+    ]
+    assert "example-src / pg13-x" in leaderboard_html, (
+        "setup check (not a mutant kill): the Leaderboard must actually"
+        " show the live:14d feed before the absence of coverage next to"
+        f" it means anything; leaderboard_html={leaderboard_html!r}"
+    )
+    assert 'id="coverage-table"' not in text, (
+        "M126 -> at this assertion: correct = no coverage table for a"
+        " typed `<N>d` window, mutant = the `w:` check left out, so"
+        " coverage is read (as empty rows) under every window key and"
+        " this table would render here too"
+    )
+    assert ">Scored<" not in leaderboard_html, (
+        "M126 -> at this assertion: correct = no 'Scored' column on the"
+        " Leaderboard for a typed `<N>d` window (the same `coverage is"
+        " None` guard the table above reads), mutant = the column would"
+        " show here too"
+    )
+    assert "Coverage per day ahead is in the table above." not in text, (
+        "M126 -> at this assertion: correct = no coverage line in the"
+        " Composite ranking's hint for a typed `<N>d` window (`coverage`"
+        " is None), mutant = the `w:` check left out makes `coverage`"
+        " truthy, so this line would show here too"
+    )
+
+
+def test_pg14_lead_pick_parameter_and_overlay_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PG14 (plan §13.9, §9.2): the `lead` parameter, the day-ahead pick at
+    a closed hour, the starting-history pick, the close-off route and the
+    Overlay's lead control (M127-M135, M137-M140).
+
+    Must FAIL on today's code: `/api/timeseries` has no `lead` parameter at
+    all (`api/routes/timeseries.py:46-52`), `_closed_hour_pick` keeps every
+    row of an hour unconditionally (`:340-349`), `_stored_pairs` has no
+    `day_ahead` keyword (`:189-199`), and `/overlay` has no `lead` control
+    (`web/routes.py:225-231`, `web/templates/overlay/show.html`) -- so a
+    `lead` of "D+8" or "x" is silently ignored rather than 422ing, and every
+    pair at an hour is returned unfiltered rather than picked by day ahead.
+    """
+    conn = _init_tmp_db(tmp_path)
+    site_id = day_close_site(conn, close_on=True)
+    feed_x = asof_make_real_feed(conn, "pg14-x")
+    feed_p = asof_persistence_feed_id(conn)
+    generation_id = ensure_published_generation(conn, site_id)
+    _patch_clock(monkeypatch, NOW)
+
+    d_minus_3 = D - timedelta(days=3)
+    t12 = isoformat_utc(
+        datetime(d_minus_3.year, d_minus_3.month, d_minus_3.day, 12, tzinfo=UTC)
+    )
+    t13 = isoformat_utc(
+        datetime(d_minus_3.year, d_minus_3.month, d_minus_3.day, 13, tzinfo=UTC)
+    )
+    # X's closed-day pairs on D-3.
+    seed_closed_pairs(
+        conn,
+        site_id=site_id,
+        local_date=d_minus_3,
+        feed_id=feed_x,
+        variable="temperature",
+        day_ahead=1,
+        valid_at=t12,
+        lead_hours=24,
+        forecast=10.0,
+        observed=11.0,
+    )
+    seed_closed_pairs(
+        conn,
+        site_id=site_id,
+        local_date=d_minus_3,
+        feed_id=feed_x,
+        variable="temperature",
+        day_ahead=2,
+        valid_at=t12,
+        lead_hours=48,
+        forecast=20.0,
+        observed=21.0,
+    )
+    seed_closed_pairs(
+        conn,
+        site_id=site_id,
+        local_date=d_minus_3,
+        feed_id=feed_x,
+        variable="temperature",
+        day_ahead=2,
+        valid_at=t13,
+        lead_hours=49,
+        forecast=21.0,
+        observed=22.0,
+    )
+    # P's closed-day pairs on D-3 at 12:00, two leads of the same day ahead.
+    seed_closed_pairs(
+        conn,
+        site_id=site_id,
+        local_date=d_minus_3,
+        feed_id=feed_p,
+        variable="temperature",
+        day_ahead=1,
+        valid_at=t12,
+        lead_hours=13,
+        forecast=1.0,
+        observed=1.5,
+    )
+    seed_closed_pairs(
+        conn,
+        site_id=site_id,
+        local_date=d_minus_3,
+        feed_id=feed_p,
+        variable="temperature",
+        day_ahead=1,
+        valid_at=t12,
+        lead_hours=36,
+        forecast=2.0,
+        observed=2.5,
+    )
+    # X's forecast_pairs before the first record, D-10 06:00: two D+1 runs
+    # (different issued_at) and one D+0 run, all valid at the same hour.
+    before_first_record = D - timedelta(days=10)
+    d_minus_11 = before_first_record - timedelta(days=1)
+    valid_before = isoformat_utc(
+        datetime(
+            before_first_record.year,
+            before_first_record.month,
+            before_first_record.day,
+            6,
+            tzinfo=UTC,
+        )
+    )
+    issued_d11_00 = isoformat_utc(
+        datetime(d_minus_11.year, d_minus_11.month, d_minus_11.day, 0, tzinfo=UTC)
+    )
+    issued_d11_12 = isoformat_utc(
+        datetime(d_minus_11.year, d_minus_11.month, d_minus_11.day, 12, tzinfo=UTC)
+    )
+    issued_d10_00 = isoformat_utc(
+        datetime(
+            before_first_record.year,
+            before_first_record.month,
+            before_first_record.day,
+            0,
+            tzinfo=UTC,
+        )
+    )
+    _seed_pair(
+        conn,
+        site_id=site_id,
+        feed_id=feed_x,
+        variable="temperature",
+        issued_at=issued_d11_00,
+        valid_at=valid_before,
+        lead_hours=30,
+        day_ahead=1,
+        forecast=5.0,
+        observed=5.5,
+        generation_id=generation_id,
+    )
+    _seed_pair(
+        conn,
+        site_id=site_id,
+        feed_id=feed_x,
+        variable="temperature",
+        issued_at=issued_d11_12,
+        valid_at=valid_before,
+        lead_hours=18,
+        day_ahead=1,
+        forecast=6.0,
+        observed=6.5,
+        generation_id=generation_id,
+    )
+    _seed_pair(
+        conn,
+        site_id=site_id,
+        feed_id=feed_x,
+        variable="temperature",
+        issued_at=issued_d10_00,
+        valid_at=valid_before,
+        lead_hours=6,
+        day_ahead=0,
+        forecast=7.0,
+        observed=7.5,
+        generation_id=generation_id,
+    )
+
+    app = _make_app(monkeypatch)
+    with TestClient(app) as client:
+        no_lead = client.get(
+            "/api/timeseries",
+            params={"site": site_id, "variable": "temperature", "feed_id": feed_x},
+        )
+        lead_d2 = client.get(
+            "/api/timeseries",
+            params={
+                "site": site_id,
+                "variable": "temperature",
+                "feed_id": feed_x,
+                "lead": "D+2",
+            },
+        )
+        lead_d0 = client.get(
+            "/api/timeseries",
+            params={
+                "site": site_id,
+                "variable": "temperature",
+                "feed_id": feed_x,
+                "lead": "D+0",
+            },
+        )
+        lead_d8 = client.get(
+            "/api/timeseries",
+            params={
+                "site": site_id,
+                "variable": "temperature",
+                "feed_id": feed_x,
+                "lead": "D+8",
+            },
+        )
+        lead_x = client.get(
+            "/api/timeseries",
+            params={
+                "site": site_id,
+                "variable": "temperature",
+                "feed_id": feed_x,
+                "lead": "x",
+            },
+        )
+        p_no_lead = client.get(
+            "/api/timeseries",
+            params={"site": site_id, "variable": "temperature", "feed_id": feed_p},
+        )
+        overlay_no_lead = client.get(
+            "/overlay", params={"site": site_id, "feed_id": feed_x}
+        )
+        overlay_d2 = client.get(
+            "/overlay", params={"site": site_id, "feed_id": feed_x, "lead": "D+2"}
+        )
+        # Close off, still inside the same client/connection: the route
+        # ignores `lead` entirely (all three forecast_pairs rows at the
+        # starting hour, in any order); the Overlay drops the lead
+        # control, its links and its data-src.
+        conn = get_db()._conn  # noqa: SLF001
+        delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
+        off_no_lead = client.get(
+            "/api/timeseries",
+            params={"site": site_id, "variable": "temperature", "feed_id": feed_x},
+        )
+        off_d2 = client.get(
+            "/api/timeseries",
+            params={
+                "site": site_id,
+                "variable": "temperature",
+                "feed_id": feed_x,
+                "lead": "D+2",
+            },
+        )
+        overlay_off = client.get(
+            "/overlay", params={"site": site_id, "feed_id": feed_x}
+        )
+
+    # -- No lead (default D+1): starting history's earliest-issued D+1 run,
+    # plus D-3 12:00's lone D+1 closed-day row; D-3 13:00 has no D+1 row and
+    # is not filled from day ahead 2. --
+    assert no_lead.status_code == 200
+    no_lead_body = no_lead.json()
+    assert no_lead_body["valid_at"] == [valid_before, t12], (
+        "M127 -> at this assertion: correct = exactly these two hours,"
+        " mutant = `_closed_hour_pick` keeps every row of the hour (day_"
+        " ahead unused), so D-3 12:00's day_ahead-2 row (forecast 20.0)"
+        " and D-3 13:00's day_ahead-2 row (forecast 21.0) would also"
+        f" appear; valid_at={no_lead_body['valid_at']!r}"
+    )
+    assert no_lead_body["forecast"] == [5.0, 10.0], (
+        "M132/M133 -> at this assertion: correct = forecast 5.0 at the"
+        " starting hour (the earliest-issued D+1 run) and 10.0 at D-3"
+        " 12:00, mutant M132 = the starting history keeps the LATEST"
+        " issued_at of the hour, so forecast would read 6.0 instead of"
+        " 5.0; mutant M133 = the route's default lead is D+0, so this"
+        f" whole response would read as lead_d0's instead; forecast="
+        f"{no_lead_body['forecast']!r}"
+    )
+    assert t13 not in no_lead_body["valid_at"], (
+        "M129 -> at this assertion: correct = D-3 13:00 absent (no fill:"
+        " it has no day_ahead-1 row, and its day_ahead-2 row does not"
+        " stand in), mutant = an hour with no row at k drawn from the"
+        f" nearest other day ahead, so D-3 13:00 (forecast 21.0, day"
+        f" ahead 2) would appear; valid_at={no_lead_body['valid_at']!r}"
+    )
+
+    # -- D+2: both of D-3's day_ahead-2 rows; no starting-history row (none
+    # is day_ahead 2). --
+    assert lead_d2.status_code == 200
+    d2_body = lead_d2.json()
+    assert d2_body["valid_at"] == [t12, t13] and d2_body["forecast"] == [20.0, 21.0], (
+        "M128 -> at this assertion: correct = D-3 12:00 (20.0) and 13:00"
+        " (21.0), mutant = `_closed_hour_pick` keeps D+1 whatever lead"
+        " asks, so this would read as the D+1 pick instead (12:00 only,"
+        f" forecast 10.0, 13:00 absent); valid_at={d2_body['valid_at']!r}"
+        f" forecast={d2_body['forecast']!r}"
+    )
+
+    # -- D+0: only the starting history's lone day_ahead-0 row. --
+    assert lead_d0.status_code == 200
+    d0_body = lead_d0.json()
+    assert d0_body["valid_at"] == [valid_before] and d0_body["forecast"] == [7.0], (
+        "M131 -> at this assertion: correct = forecast 7.0 (the single"
+        " day_ahead-0 row), mutant = the starting-history read without"
+        " its day_ahead=? clause, so the earliest-issued row of ANY day"
+        " ahead at this hour would be picked instead (forecast 5.0, the"
+        f" day_ahead-1 run issued D-11 00:00); forecast="
+        f"{d0_body['forecast']!r}"
+    )
+
+    # -- Out-of-range and unparsable `lead`: 422, never a 200 with k=0/8. --
+    assert lead_d8.status_code == 422, (
+        "M134 -> at this assertion: correct = 422 for a lead past D+7,"
+        f" mutant = a `lead` past D+7 accepted (the range check left"
+        f" out); got status {lead_d8.status_code}"
+    )
+    assert lead_d8.json()["detail"] == "lead is not a day ahead from D+0 to D+7"
+    assert lead_x.status_code == 422, (
+        "M135 -> at this assertion: correct = 422 for an unparsable lead,"
+        " mutant = the parser's ValueError left uncaught, so this would"
+        f" raise a 500 instead of a 422; got status {lead_x.status_code}"
+    )
+    assert lead_x.json()["detail"] == "lead is not a day ahead from D+0 to D+7"
+
+    # -- Persistence feed P: two leads of the same day ahead at one hour;
+    # the pick is the LARGEST lead_hours, not the smallest. --
+    assert p_no_lead.status_code == 200
+    p_body = p_no_lead.json()
+    assert p_body["valid_at"] == [t12] and p_body["forecast"] == [2.0], (
+        "M130 -> at this assertion: correct = forecast 2.0 (lead_hours"
+        " 36, the largest of the two day_ahead-1 rows at this hour),"
+        " mutant = `_closed_hour_pick` takes the SMALLEST lead_hours at"
+        f" k, so this would read 1.0 (lead_hours 13) instead; forecast="
+        f"{p_body['forecast']!r}"
+    )
+
+    # -- The Overlay's lead control: default D+1 ("Tomorrow" active, lead=
+    # D%2B1 in the chart's data-src); explicit D+2 ("+2 days" active, lead=
+    # D%2B2 in the data-src and the site link). --
+    assert overlay_no_lead.status_code == 200
+    no_lead_text = overlay_no_lead.text
+    tomorrow_line = next(
+        (line for line in no_lead_text.splitlines() if ">Tomorrow<" in line), None
+    )
+    assert tomorrow_line is not None and "active" in tomorrow_line, (
+        "M140 -> at this assertion: correct = 'Tomorrow' (D+1) marked"
+        " active with no `lead` given, mutant = `overlay_page`'s default"
+        " lead is D+0, so 'Today' would be active instead; tomorrow_line="
+        f"{tomorrow_line!r}"
+    )
+    assert "lead=D%2B1" in no_lead_text, (
+        "M138 -> at this assertion: correct = the chart's data-src"
+        " carries `lead=D%2B1` (urlencoded D+1), mutant = the chart's"
+        " data-src built without `lead`, so this string would be absent"
+    )
+    assert overlay_d2.status_code == 200
+    d2_text = overlay_d2.text
+    plus2_line = next(
+        (line for line in d2_text.splitlines() if ">+2 days<" in line), None
+    )
+    assert plus2_line is not None and "active" in plus2_line
+    assert d2_text.count("lead=D%2B2") >= 2, (
+        "setup check for the data-src and the site link both carrying"
+        f" `lead=D%2B2`; count={d2_text.count('lead=D%2B2')!r}"
+    )
+
+    # -- Close off (requested inside the same client/connection above): the
+    # route ignores `lead` entirely (all three forecast_pairs rows at the
+    # starting hour, in any order); the Overlay drops the lead control, its
+    # links and its data-src. --
+    assert off_no_lead.status_code == 200
+    off_no_lead_body = off_no_lead.json()
+    assert sorted(off_no_lead_body["forecast"]) == [5.0, 6.0, 7.0]
+    assert off_d2.status_code == 200
+    off_d2_body = off_d2.json()
+    assert sorted(off_d2_body["forecast"]) == [5.0, 6.0, 7.0], (
+        "M137 -> at this assertion: correct = all three forecast_pairs"
+        " rows regardless of `lead` (the close-off call passes day_ahead="
+        "None), mutant = the close-off call parses `lead` and passes its"
+        " k, not None, so with lead=D+2 (and none of the three rows at"
+        " day_ahead 2) this would read as an empty list instead; forecast="
+        f"{off_d2_body['forecast']!r}"
+    )
+    assert overlay_off.status_code == 200
+    off_text = overlay_off.text
+    assert "lead=" not in off_text and ">Tomorrow<" not in off_text, (
+        "M139 -> at this assertion: correct = no `lead` group and no"
+        " `lead=` in any link or data-src with the close off, mutant ="
+        " the lead group and `lead` in the links and data-src kept with"
+        " the close off"
+    )

@@ -228,6 +228,7 @@ async def overlay_page(
     site: int | None = None,
     variable: str = "temperature",
     feed_id: int | None = None,
+    lead: str = "D+1",
 ) -> HTMLResponse:
     context = await get_db().read(
         lambda conn: load_overlay(
@@ -235,6 +236,7 @@ async def overlay_page(
             site_id=site,
             variable=variable,
             feed_id=feed_id,
+            lead=lead,
         )
     )
     return render(request, "overlay/show.html", **context)

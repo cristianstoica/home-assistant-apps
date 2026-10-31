@@ -791,7 +791,14 @@ def load_overlay(
     site_id: int | None,
     variable: str,
     feed_id: int | None,
+    lead: str,
 ) -> dict[str, object]:
+    """The Overlay page's context.
+
+    ``lead`` and ``lead_options`` feed the page's lead control and links,
+    shown with the close on only; ``lead`` is not checked here, as the
+    dashboard does not check it (plan §9.2).
+    """
     sites = load_sites(conn, include_disabled=False)
     site = (
         load_site(conn, site_id)
@@ -813,6 +820,8 @@ def load_overlay(
         "feeds": feeds,
         "feed_id": selected_feed_id,
         "close_on": close_on,
+        "lead": lead,
+        "lead_options": LEAD_OPTIONS,
     }
 
 

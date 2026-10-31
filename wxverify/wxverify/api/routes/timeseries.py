@@ -6,7 +6,8 @@ stored pairs before the site's first day record (the starting history), P4's
 closed-day pairs on each closed day, the provisional observed line on the
 days not yet done, and the missed and zone-flagged days of the range. Every
 part comes from one read snapshot, so the closed part and the provisional
-part meet at the same instants.
+part meet at the same instants. With the close on, each hour gives one
+forecast of one day ahead, ``lead`` (default "D+1"), the Overlay's pick.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from typing import Final
 
 from fastapi import APIRouter, HTTPException, Query
 
+from wxverify.core.lead import parse_day_ahead
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.site_days import (
@@ -37,6 +39,9 @@ router = APIRouter(prefix="/api", tags=["timeseries"])
 _ONE_DAY: Final = timedelta(days=1)
 #: The smallest step of a ``datetime``: the inclusive ``to`` as a half-open end.
 _TICK: Final = timedelta(microseconds=1)
+#: The largest day ahead a pair holds (the ``day_ahead`` CHECK of both pair tables).
+_MAX_DAY_AHEAD: Final = 7
+_LEAD_REFUSED: Final = "lead is not a day ahead from D+0 to D+7"
 
 #: One pair as the reply lists it: ``valid_at``, forecast, observed.
 _PairRow = tuple[str, float, float]
@@ -50,12 +55,13 @@ async def timeseries(
     issued_at: str | None = None,
     from_: str | None = Query(default=None, alias="from"),
     to: str | None = None,
+    lead: str = Query("D+1"),
 ) -> dict[str, object]:
     def _read(conn: sqlite3.Connection) -> dict[str, object]:
         if conn.in_transaction:
-            return _reply(conn, site, variable, feed_id, issued_at, from_, to)
+            return _reply(conn, site, variable, feed_id, issued_at, from_, to, lead)
         with read_snapshot(conn, label="timeseries"):
-            return _reply(conn, site, variable, feed_id, issued_at, from_, to)
+            return _reply(conn, site, variable, feed_id, issued_at, from_, to, lead)
 
     return await get_db().read(_read)
 
@@ -68,8 +74,13 @@ def _reply(
     issued_at: str | None,
     from_: str | None,
     to: str | None,
+    lead: str,
 ) -> dict[str, object]:
-    """The route's reply; asks ``daily_close_on`` once (plan §9)."""
+    """The route's reply; asks ``daily_close_on`` once (plan §9).
+
+    With the close off, ``lead`` is never parsed and every stored pair of
+    the feed is returned, as before.
+    """
     head: dict[str, object] = {"site": site, "variable": variable, "feed_id": feed_id}
     if not daily_close_on(conn):
         rows = _stored_pairs(
@@ -81,6 +92,7 @@ def _reply(
             from_=from_,
             to=to,
             before=None,
+            day_ahead=None,
         )
         return {
             **head,
@@ -101,6 +113,7 @@ def _reply(
             issued_at=issued_at,
             from_=from_,
             to=to,
+            lead=lead,
         ),
     }
 
@@ -114,6 +127,7 @@ def _close_on_keys(
     issued_at: str | None,
     from_: str | None,
     to: str | None,
+    lead: str,
 ) -> dict[str, object]:
     """The reply's lists with the daily close on (plan §9.2).
 
@@ -124,10 +138,16 @@ def _close_on_keys(
     ``open``, ``closing``, ``retry_due`` or ``missed`` are never returned:
     the provisional line draws the first three, and a missed day has no
     observed line. ``now`` is read once.
+
+    ``lead`` is checked first, next to ``from`` and ``to``; each hour then
+    gives one forecast of that day ahead, with no fill from another. While
+    ``issued_at`` is given it filters nothing: the starting history keeps
+    that run's one row an hour, and closed days give none.
     """
     now = utc_now()
     low = _instant(from_, "from")
     high = _instant(to, "to")
+    day_ahead = _day_ahead(lead)
     through = closed_through(conn, site)
     top = None if through is None else day_record(conn, site, through)
     first = _first_record_start(conn, site, top, now)
@@ -140,6 +160,7 @@ def _close_on_keys(
         from_=from_,
         to=to,
         before=None if first is None else isoformat_utc(first),
+        day_ahead=None if issued_at is not None else day_ahead,
     )
     spans = _done_spans(conn, site, first=first, top=top, low=low, high=high)
     if issued_at is None:
@@ -156,6 +177,7 @@ def _close_on_keys(
                     span=span,
                     low=low,
                     high=high,
+                    day_ahead=day_ahead,
                 )
             )
     line = provisional_site_hours(conn, site_id=site, variable=variable, now_utc=now)
@@ -196,11 +218,16 @@ def _stored_pairs(
     from_: str | None,
     to: str | None,
     before: str | None,
+    day_ahead: int | None,
 ) -> list[_PairRow]:
     """The feed's stored ``forecast_pairs`` rows, oldest first.
 
     ``before``, when given, keeps only rows whose ``valid_at`` is earlier:
     with the close on, the instants before the site's first record.
+    ``day_ahead``, when given, keeps only that day ahead's rows and, of
+    each ``valid_at``'s, the one with the earliest ``issued_at``, compared
+    as instants (a fraction sorts after the whole-second form as text):
+    the first run issued on the local date that day ahead counts from.
     """
     clauses = [
         "site_id=?",
@@ -209,6 +236,11 @@ def _stored_pairs(
         published_generation_clause("forecast_pairs"),
     ]
     params: list[object] = [site, variable, feed_id]
+    columns = "valid_at, forecast, observed"
+    if day_ahead is not None:
+        clauses.append("day_ahead=?")
+        params.append(day_ahead)
+        columns += ", issued_at"
     if issued_at is not None:
         clauses.append("issued_at=?")
         params.append(issued_at)
@@ -223,13 +255,18 @@ def _stored_pairs(
         params.append(before)
     rows = conn.execute(
         f"""
-        SELECT valid_at, forecast, observed
+        SELECT {columns}
         FROM forecast_pairs
         WHERE {" AND ".join(clauses)}
         ORDER BY valid_at
         """,
         params,
     ).fetchall()
+    if day_ahead is not None:
+        rows = [
+            min(hour_rows, key=lambda row: parse_utc(str(row["issued_at"])))
+            for _, hour_rows in groupby(rows, key=lambda row: str(row["valid_at"]))
+        ]
     return [
         (str(row["valid_at"]), float(row["forecast"]), float(row["observed"]))
         for row in rows
@@ -255,6 +292,18 @@ def _instant(value: str | None, name: str) -> datetime | None:
         raise HTTPException(
             status_code=422, detail=f"{name} is not a UTC timestamp"
         ) from exc
+
+
+def _day_ahead(lead: str) -> int:
+    """``lead`` as a day ahead from 0 to 7, through the dashboard's parser;
+    422 when it does not parse or lies outside that range (plan §9.2)."""
+    try:
+        day_ahead = parse_day_ahead(lead)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=_LEAD_REFUSED) from exc
+    if not 0 <= day_ahead <= _MAX_DAY_AHEAD:
+        raise HTTPException(status_code=422, detail=_LEAD_REFUSED)
+    return day_ahead
 
 
 def _inside(instant: datetime, low: datetime | None, high: datetime | None) -> bool:
@@ -314,12 +363,13 @@ def _closed_rows(
     span: DaySpan,
     low: datetime | None,
     high: datetime | None,
+    day_ahead: int,
 ) -> list[ClosedPair]:
     """One closed day's pairs for the reply, oldest first (plan §9.2).
 
     P4's closed-day pairs of the feed and variable whose ``valid_at`` lies
     in the day's span and within ``from`` and ``to``; then, hour by hour,
-    the rows ``_closed_hour_pick`` keeps.
+    the row ``_closed_hour_pick`` keeps at ``day_ahead``.
     """
     kept: list[ClosedPair] = []
     for pair in closed_day_pairs(
@@ -333,17 +383,22 @@ def _closed_rows(
     return [
         pair
         for _, hour_rows in groupby(kept, key=lambda pair: pair.valid_at)
-        for pair in _closed_hour_pick(list(hour_rows))
+        for pair in _closed_hour_pick(list(hour_rows), day_ahead=day_ahead)
     ]
 
 
-def _closed_hour_pick(rows: list[ClosedPair]) -> list[ClosedPair]:
-    """The forecasts the Overlay draws at one closed hour (plan §9.2).
+def _closed_hour_pick(rows: list[ClosedPair], *, day_ahead: int) -> list[ClosedPair]:
+    """The forecast the Overlay draws at one closed hour (plan §9.2).
 
     A closed hour holds every forecast its day scored: for a real feed one
-    per day ahead, persistence one per lead. Which of them to draw (every
-    one, or one day ahead) is the owner's open question in plan §17.2, and
-    the owner's answer decides this pick. Until then every scored forecast
-    of the hour passes through unchanged.
+    per day ahead, persistence one per lead. Of the rows at ``day_ahead``
+    the pick keeps the one with the largest ``lead_hours``, compared by
+    value, not taken from the read's order. A real feed and the mean have
+    at most one such row; for persistence the largest lead is the forecast
+    made at the earliest hour of the day it counts from. Empty when the
+    hour has no row at ``day_ahead``: no other day ahead stands in.
     """
-    return rows
+    at_day = [row for row in rows if row.day_ahead == day_ahead]
+    if not at_day:
+        return []
+    return [max(at_day, key=lambda row: row.lead_hours)]
