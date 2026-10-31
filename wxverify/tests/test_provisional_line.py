@@ -201,8 +201,8 @@ def test_pl3_spike_left_out_by_qc(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(D.year, D.month, D.day, 12, 20, tzinfo=UTC)
 
     spike = _five_minute_readings(
-        D, temp_c=50.0, start=(6, 0), end=(6, 15)
-    )  # A's own 05:00 reading was 10.0C; 50.0C is a 40C jump.
+        D, temp_c=50.0, start=(6, 0), end=(6, 55)
+    )  # A's own 05:00 reading was 10.0C; 50.0C over the whole hour is a 40C jump.
     store_readings(
         conn,
         station_id=station_a,
@@ -221,10 +221,43 @@ def test_pl3_spike_left_out_by_qc(monkeypatch: pytest.MonkeyPatch) -> None:
     per_station = hourly_values(
         conn, site_id=site_id, local_date=D, through_utc=floor_hour(now)
     )
+    a_value = per_station.stations[station_a].values["temperature"][_hour(6)].value
+    a_prev = per_station.stations[station_a].values["temperature"][_hour(5)].value
+    assert a_value - a_prev >= 15.0, (
+        f"A's 06:00 hourly value ({a_value!r}) must be at least 15C above"
+        f" its 05:00 value ({a_prev!r}) -- `qc_flag`'s temperature spike"
+        " limit -- or the spike would not be large enough for `qc_flag` to"
+        " reject it."
+    )
+
     b_value = per_station.stations[station_b].values["temperature"][_hour(6)].value
-    assert actual == pytest.approx(b_value), (
-        f"M77 -> at this assertion: correct = {b_value!r} (B's own value --"
-        " A's spiked 06:00 reading is left out), mutant = `qc_flag` not"
+    site_row = conn.execute(
+        "SELECT elevation_m FROM sites WHERE id = ?", (site_id,)
+    ).fetchone()
+    assert site_row is not None
+    site_elevation_m = float(site_row[0])
+    dem_row = conn.execute(
+        "SELECT dem_elevation_m FROM stations WHERE id = ?", (station_b,)
+    ).fetchone()
+    assert dem_row is not None
+    b_reading = ConsensusReading(
+        station_id=station_b,
+        dem_elevation_m=float(dem_row[0]),
+        variable="temperature",
+        valid_at=isoformat_utc(_hour(6)),
+        value=b_value,
+    )
+    expected = compute_consensus(
+        [b_reading],
+        variable="temperature",
+        site_elevation_m=site_elevation_m,
+        mad_floor=MAD_FLOORS["temperature"],
+    )
+    assert expected is not None
+    assert actual == pytest.approx(expected.value), (
+        f"M77 -> at this assertion: correct = {expected.value!r} (B's own"
+        " value through the site's elevation-adjusted consensus -- A's"
+        " spiked 06:00 reading is left out), mutant = `qc_flag` not"
         " applied, so A's spike would be blended in and the site value"
         " would differ from B's alone."
     )
@@ -347,9 +380,8 @@ def test_pl6_line_holds_prior_closing_day(monkeypatch: pytest.MonkeyPatch) -> No
     """PL6 (plan §13.8, §8.1): with D-1 ``closing`` and ``now`` D 00:40, the
     line holds D-1's hours and shows none of D's yet (M80: only today
     drawn)."""
-    from wxverify.provisional_line import provisional_site_hours
-
     from wxverify.db.site_days import begin_close
+    from wxverify.provisional_line import provisional_site_hours
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=True)
@@ -395,9 +427,8 @@ def test_pl6_line_holds_prior_closing_day(monkeypatch: pytest.MonkeyPatch) -> No
 def test_pl7_closed_day_leaves_the_line(monkeypatch: pytest.MonkeyPatch) -> None:
     """PL7 (plan §13.8, §8.1): PL6, then D-1 ``closed`` -- it leaves the
     line (M81: a closed day kept on the line)."""
-    from wxverify.provisional_line import provisional_site_hours
-
     from wxverify.db.site_days import begin_close, finish_close
+    from wxverify.provisional_line import provisional_site_hours
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=True)
@@ -438,9 +469,8 @@ def test_pl7_closed_day_leaves_the_line(monkeypatch: pytest.MonkeyPatch) -> None
 def test_pl8_retry_due_kept_missed_dropped(monkeypatch: pytest.MonkeyPatch) -> None:
     """PL8 (plan §13.8, §8.1): PL6, then D-1 ``retry_due`` (still on the
     line), then ``missed`` (off the line entirely) (M82)."""
-    from wxverify.provisional_line import provisional_site_hours
-
     from wxverify.db.site_days import begin_close, fail_close
+    from wxverify.provisional_line import provisional_site_hours
 
     conn = asof_conn()
     site_id = day_close_site(conn, close_on=True)
@@ -548,7 +578,7 @@ def test_pl10_latest_reading_at_is_the_latest(monkeypatch: pytest.MonkeyPatch) -
     site_id = day_close_site(conn, close_on=True)
     station_a = _station_id(conn, site_id, "ISTATION01")
     station_b = _station_id(conn, site_id, "ISTATION02")
-    now = datetime(D.year, D.month, D.day, 12, 20, tzinfo=UTC)
+    now = datetime(D.year, D.month, D.day, 13, 5, tzinfo=UTC)
 
     store_readings(
         conn,
