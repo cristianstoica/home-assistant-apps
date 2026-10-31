@@ -27,7 +27,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify import __version__
 from wxverify.core.error_sanitize import sanitized_exception
-from wxverify.core.timeutil import day_ahead as issue_day_ahead
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.connection import StaleGenerationError
 from wxverify.db.runtime_state import (
@@ -35,6 +34,7 @@ from wxverify.db.runtime_state import (
     get_runtime_state,
     set_runtime_state,
 )
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
@@ -52,6 +52,7 @@ from wxverify.forecast.data import (
     count_null_availability_samples,
     forecast_ranking,
     load_future_samples,
+    sample_day_ahead,
 )
 from wxverify.forecast.selection import (
     CellCandidate,
@@ -77,6 +78,11 @@ from wxverify.forecast.wind_blend import (
 from wxverify.scoring.leaderboard import (
     LeaderboardRow,
     leaderboard_with_status_in_transaction,
+)
+from wxverify.scoring.publication import (
+    Publication,
+    active_publication,
+    published_ranking,
 )
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting, get_setting
@@ -580,6 +586,46 @@ def _leaderboard_status_cell(
     }
 
 
+def _record_ranking(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    as_of: str,
+    close_on: bool,
+    publication: Publication | None,
+    declared_min_n: int | None,
+    declared_window_days: int | None,
+) -> dict[int, LeaderboardRow]:
+    """One cell's ranking for the record, keyed by feed id.
+
+    Close on (section 12): ``publication``'s rows at ``w:{window_days}``,
+    the publication active at T; with none every feed is unranked, so the
+    ladder picks by sample count. Close off: the as-of ranking under the
+    declared configuration, as before.
+    """
+    if close_on:
+        if publication is None:
+            return {}
+        return published_ranking(
+            conn,
+            pub=publication,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_key=f"w:{publication.window_days}",
+        )
+    return forecast_ranking(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        as_of=as_of,
+        declared_min_n=declared_min_n,
+        declared_window_days=declared_window_days,
+    )
+
+
 _RECORD_INSERT_SQL = """
                 INSERT INTO forecast_of_record
                     (site_id, tz_generation_id, timezone,
@@ -590,9 +636,10 @@ _RECORD_INSERT_SQL = """
                      methodology_version, app_version, candidates,
                      selected_feed_ids, feed_weights, effective_cells,
                      source_runs, hourly_values, daily_quantities,
-                     leaderboard_status)
+                     leaderboard_status, publication_id, publication_cutoff,
+                     publication_age_days)
                 VALUES (?,?,?,?,?,?,?,?,?,?, 'recorded', NULL,
-                        ?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(site_id, tz_generation_id, snapshot_local_date,
                             variable, target_local_date) DO NOTHING
                 """
@@ -603,7 +650,7 @@ class RecordBuild:
     """One day's forecast-of-record rows, built on a read snapshot, persisted later."""
 
     site_id: int
-    rows: tuple[tuple[str | int, ...], ...]
+    rows: tuple[tuple[str | int | None, ...], ...]
 
 
 def build_forecast_record(
@@ -736,10 +783,23 @@ def compute_forecast_record(
     # §15 lockstep: the record resolves depth through the SAME per-variable
     # helper the live Forecast page and the run snapshot use.
     depths = effective_blend_depths(conn)
-    declared_min_n = get_number_setting(conn, "min_n", 30, minimum=0)
-    declared_window_days = get_number_setting(
-        conn, "rolling_window_days", 30, minimum=1
+    # The daily close (section 12), read once in the caller's snapshot: on,
+    # the record stores what was served at T -- the publication active at T,
+    # its rankings and its policy (None for both with no publication then).
+    close_on = daily_close_on(conn)
+    publication = (
+        active_publication(conn, site_id=site_id, at_utc=as_of) if close_on else None
     )
+    declared_min_n: int | None
+    declared_window_days: int | None
+    if close_on:
+        declared_min_n = None if publication is None else publication.min_n
+        declared_window_days = None if publication is None else publication.window_days
+    else:
+        declared_min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+        declared_window_days = get_number_setting(
+            conn, "rolling_window_days", 30, minimum=1
+        )
     # One set of wind weights per build, read inside the caller's snapshot
     # (§11.5).
     wind_serving = load_wind_serving(
@@ -768,10 +828,21 @@ def compute_forecast_record(
     )
     latency = int((at - snapshot_utc).total_seconds())
     rebuild_flag = _rebuild_in_progress(conn, site_id)
+    # The three publication columns: NULL with the close off, and with no
+    # publication at T.
+    publication_columns: tuple[int | None, str | None, int | None] = (
+        (None, None, None)
+        if publication is None
+        else (
+            publication.id,
+            publication.cutoff.isoformat(),
+            (local_date - publication.cutoff).days,
+        )
+    )
 
     rank_cache: dict[tuple[str, int], dict[int, LeaderboardRow]] = {}
     status_cache: dict[tuple[str, int], dict[str, object]] = {}
-    rows: list[tuple[str | int, ...]] = []
+    rows: list[tuple[str | int | None, ...]] = []
     for day in range(RECORD_DAY_COUNT):
         target_date = local_date + timedelta(days=day)
         for variable in RECORD_VARIABLES:
@@ -790,25 +861,26 @@ def compute_forecast_record(
                 covers_local_day_exactly if variable == "precip" else covers_local_day
             )
             for feed_id, feed_samples in feeds_samples.items():
+                # The day ahead counts as the served forecast counts it
+                # (9.5), with T as the read time.
                 rep = representative_day_ahead(
-                    [
-                        issue_day_ahead(s.issued_at, s.valid_at, timezone)
-                        for s in feed_samples
-                    ]
+                    [sample_day_ahead(s, timezone) for s in feed_samples]
                 )
                 effective_cells[str(feed_id)] = rep
                 key = (variable, rep)
                 if key not in rank_cache:
-                    rank_cache[key] = forecast_ranking(
+                    rank_cache[key] = _record_ranking(
                         conn,
                         site_id=site_id,
                         variable=variable,
                         day_ahead=rep,
                         as_of=as_of,
+                        close_on=close_on,
+                        publication=publication,
                         declared_min_n=declared_min_n,
                         declared_window_days=declared_window_days,
                     )
-                if key not in status_cache:
+                if not close_on and key not in status_cache:
                     status_cache[key] = _leaderboard_status_cell(
                         conn, site_id=site_id, variable=variable, day_ahead=rep
                     )
@@ -941,12 +1013,20 @@ def compute_forecast_record(
                 str(fid): max(s.issued_at for s in feeds_samples[fid])
                 for fid in source_ids
             }
-            statuses = {
-                str(effective_cells[str(fid)]): status_cache[
-                    (variable, effective_cells[str(fid)])
-                ]
-                for fid in selected_ids
-            }
+            # NULL with the close on: the live leaderboard status is not read
+            # (section 12).
+            leaderboard_status = (
+                None
+                if close_on
+                else _dumps(
+                    {
+                        str(effective_cells[str(fid)]): status_cache[
+                            (variable, effective_cells[str(fid)])
+                        ]
+                        for fid in selected_ids
+                    }
+                )
+            )
             rows.append(
                 (
                     site_id,
@@ -983,7 +1063,8 @@ def compute_forecast_record(
                             "outcomes": [asdict(o) for o in outcomes],
                         }
                     ),
-                    _dumps(statuses),
+                    leaderboard_status,
+                    *publication_columns,
                 )
             )
     return RecordBuild(site_id, tuple(rows))

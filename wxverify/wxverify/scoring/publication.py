@@ -15,6 +15,11 @@ the result in with one ``writer.write`` (8.2, 8.3). ``seed_starting_history``
 builds the starting history in the caller's transaction and never commits.
 Every function reads the clock only through ``now_utc`` (16), so both stamps
 of a publication are ``now_utc`` to the whole second (7.1, 15.2).
+
+The readers (sections 9, 12, 13.1 and 16.2) find the active publication and
+read its rows for the leaderboard, composite, served forecast, wind serving
+and record, applying each feed's subscription when they read (9.1). They
+never write and read no clock.
 """
 
 from __future__ import annotations
@@ -22,14 +27,16 @@ from __future__ import annotations
 import itertools
 import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
-from typing import Final, Literal
+from typing import Final, Literal, cast
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.connection import Database, FencedWriter
-from wxverify.db.site_days import day_record
+from wxverify.db.site_days import daily_close_on, day_record
+from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.data import EXCLUDED_FEEDS_SQL
 from wxverify.forecast.wind_blend import (
     DAY_AHEADS,
@@ -40,10 +47,14 @@ from wxverify.forecast.wind_blend import (
     MIN_TRAINING_DAYS,
     TRAINING_DAYS,
     WIND_METHOD,
+    FeedWeight,
     WindTraining,
+    WindWeights,
     compute_wind_weights,
 )
 from wxverify.scoring.close_scores import SCORING_RULE
+from wxverify.scoring.effective import active_competitor_clause
+from wxverify.scoring.leaderboard import LeaderboardRow, below_baseline, score_badge
 from wxverify.scoring.metrics import metrics_from_sums
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.methodology import METHODOLOGY_VERSION
@@ -259,6 +270,101 @@ _INSERT_STARTING_WIND_SQL: Final = """
     VALUES (?, ?, ?, ?, ?, ?)
 """
 
+# Readers (section 9). The defaults the build reads the two ranking
+# settings with (8.2).
+_DEFAULT_WINDOW_DAYS: Final = 30
+_DEFAULT_MIN_N: Final = 30
+# 7.5: the latest cutoff published at or before T; T NULL takes the latest.
+_ACTIVE_PUBLICATION_SQL: Final = """
+    SELECT id, site_id, cutoff, first_record_date, window_days,
+           window_start_date, wind_start_date, settings, methodology_version,
+           scoring_rule, wind_method, wind_constants, build_started_at,
+           published_at
+    FROM publications
+    WHERE site_id = ?
+      AND (? IS NULL OR julianday(published_at) <= julianday(?))
+    ORDER BY cutoff DESC
+    LIMIT 1
+"""
+_LATEST_PUBLISHED_AT_SQL: Final = """
+    SELECT p.published_at
+    FROM publications p
+    WHERE p.cutoff = (
+        SELECT MAX(q.cutoff) FROM publications q WHERE q.site_id = p.site_id
+    )
+    ORDER BY julianday(p.published_at) DESC, p.published_at DESC
+    LIMIT 1
+"""
+# A feed switched off now has no row in any read (9.1): each read joins the
+# feed and its site state to the publication's site, as ``_cached_leaderboard``
+# joins them to the cache's.
+_ACTIVE_AT_PUBLICATION_SITE: Final = active_competitor_clause(site_expr="p.site_id")
+_PUBLISHED_RANKING_SQL: Final = f"""
+    SELECT pr.feed_id, f.source, f.model, pr.variable, pr.day_ahead, pr.n,
+           pr.bias, pr.mae, pr.rmse, pr.skill_score
+    FROM publication_rankings pr
+    JOIN publications p ON p.id = pr.publication_id
+    JOIN feeds f ON f.id = pr.feed_id
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = p.site_id AND sfs.feed_id = pr.feed_id
+    WHERE pr.publication_id = ? AND pr.window_key = ?
+      AND pr.variable = ? AND pr.day_ahead = ?
+      AND {_ACTIVE_AT_PUBLICATION_SITE}
+    ORDER BY f.source, f.model
+"""
+_PUBLISHED_CELLS_SQL: Final = f"""
+    SELECT pr.feed_id, f.source, f.model, pr.variable, pr.day_ahead, pr.n,
+           pr.bias, pr.mae, pr.rmse, pr.skill_score
+    FROM publication_rankings pr
+    JOIN publications p ON p.id = pr.publication_id
+    JOIN feeds f ON f.id = pr.feed_id
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = p.site_id AND sfs.feed_id = pr.feed_id
+    WHERE pr.publication_id = ? AND pr.window_key = ?
+      AND {_ACTIVE_AT_PUBLICATION_SITE}
+    ORDER BY f.source, f.model, pr.variable, pr.day_ahead
+"""
+_PUBLISHED_COVERAGE_SQL: Final = f"""
+    SELECT pc.feed_id, pc.day_ahead, pc.scored, pc.expected, pc.starting_days
+    FROM publication_coverage pc
+    JOIN publications p ON p.id = pc.publication_id
+    JOIN feeds f ON f.id = pc.feed_id
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = p.site_id AND sfs.feed_id = pc.feed_id
+    WHERE pc.publication_id = ? AND pc.variable = ? AND pc.window_key = ?
+      AND {_ACTIVE_AT_PUBLICATION_SITE}
+    ORDER BY pc.feed_id, pc.day_ahead
+"""
+_PUBLISHED_WIND_SQL: Final = f"""
+    SELECT pw.feed_id, pw.day_ahead, pw.mae_ms, pw.days, pw.weight
+    FROM publication_wind_weights pw
+    JOIN publications p ON p.id = pw.publication_id
+    JOIN feeds f ON f.id = pw.feed_id
+    LEFT JOIN site_feed_state sfs
+      ON sfs.site_id = p.site_id AND sfs.feed_id = pw.feed_id
+    WHERE pw.publication_id = ?
+      AND {_ACTIVE_AT_PUBLICATION_SITE}
+    ORDER BY pw.feed_id, pw.day_ahead
+"""
+# The feeds an ``Nd`` view may show, in the leaderboard's order. Two binds:
+# the join, and the meteoblue package check inside the clause.
+_COMPETITOR_FEEDS_SQL: Final = f"""
+    SELECT f.id, f.source, f.model
+    FROM feeds f
+    LEFT JOIN site_feed_state sfs ON sfs.site_id = ? AND sfs.feed_id = f.id
+    WHERE {active_competitor_clause(site_expr="?")}
+    ORDER BY f.source, f.model
+"""
+_CLOSED_DAY_PAIRS_SQL: Final = """
+    SELECT cp.feed_id, cp.variable, cp.valid_at, cp.day_ahead, cp.lead_hours,
+           cp.forecast, cp.observed, cp.download_date, cp.fetched_at
+    FROM close_pairs cp
+    JOIN site_days sd ON sd.site_id = cp.site_id AND sd.local_date = cp.local_date
+    WHERE cp.site_id = ? AND cp.local_date = ? AND sd.state = 'closed'
+      AND (? IS NULL OR cp.feed_id = ?)
+    ORDER BY cp.feed_id, cp.variable, cp.valid_at, cp.day_ahead, cp.lead_hours
+"""
+
 _Number = float | int | None
 _Key = tuple[int, str, int]
 _Values = tuple[object, ...]
@@ -282,6 +388,68 @@ class SeedCounts:
 
     starting_scores: int
     starting_wind_days: int
+
+
+@dataclass(frozen=True, slots=True)
+class Publication:
+    """One ``publications`` row, with ``settings`` parsed into
+    ``rolling_window_days`` and ``min_n`` (9.1)."""
+
+    id: int
+    site_id: int
+    cutoff: date
+    first_record_date: date
+    window_days: int
+    window_start_date: date
+    wind_start_date: date
+    rolling_window_days: int
+    min_n: int
+    methodology_version: int
+    scoring_rule: str
+    wind_method: str
+    wind_constants: str
+    build_started_at: str
+    published_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ScoredCell:
+    """One feed's scores in one (variable, day ahead) cell of a window."""
+
+    feed_id: int
+    source: str
+    model: str
+    variable: str
+    day_ahead: int
+    n: int
+    bias: float | None
+    mae: float | None
+    rmse: float | None
+    skill_score: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class Coverage:
+    """One feed's coverage in one cell of a publication's window (7.4)."""
+
+    scored: int
+    expected: int
+    starting_days: int
+
+
+@dataclass(frozen=True, slots=True)
+class ClosedPair:
+    """One ``close_pairs`` row of a closed date (16.2)."""
+
+    feed_id: int
+    variable: str
+    valid_at: str
+    day_ahead: int
+    lead_hours: int
+    forecast: float
+    observed: float
+    download_date: date | None
+    fetched_at: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -782,6 +950,359 @@ def _seed_wind_days(
 
 
 # ---------------------------------------------------------------------------
+# Readers (sections 9, 12, 13.1 and 16.2)
+# ---------------------------------------------------------------------------
+
+
+def active_publication(
+    conn: sqlite3.Connection, *, site_id: int, at_utc: str | None
+) -> Publication | None:
+    """The site's publication active at ``at_utc`` (7.5), or ``None``.
+
+    The latest cutoff among the site's publications whose ``published_at``
+    is at or before ``at_utc``; ``at_utc`` None takes the latest cutoff.
+    Resolved by cutoff and publication time, never by id. One SELECT on
+    ``conn``, inside whatever snapshot the caller holds.
+    """
+    row = conn.execute(_ACTIVE_PUBLICATION_SQL, (site_id, at_utc, at_utc)).fetchone()
+    return None if row is None else _publication_from_row(row)
+
+
+def latest_published_at(conn: sqlite3.Connection) -> str | None:
+    """The newest ``published_at`` over the sites' active publications, or
+    ``None`` before the first publication (16.2, for P5)."""
+    row = conn.execute(_LATEST_PUBLISHED_AT_SQL).fetchone()
+    return None if row is None else str(row["published_at"])
+
+
+def published_ranking(
+    conn: sqlite3.Connection,
+    *,
+    pub: Publication,
+    variable: str,
+    day_ahead: int,
+    window_key: str,
+) -> dict[int, LeaderboardRow]:
+    """The publication's ranking for one cell and window, keyed by feed id.
+
+    Only feeds that pass ``active_competitor_clause`` now (9.1), in
+    ``_cached_leaderboard``'s order (source, model); ``confident`` from the
+    publication's ``min_n``. Shared by the leaderboard, the served forecast
+    and the record.
+    """
+    window_days = None if window_key == _ALL_WINDOW_KEY else pub.window_days
+    rows = conn.execute(
+        _PUBLISHED_RANKING_SQL, (pub.id, window_key, variable, day_ahead)
+    ).fetchall()
+    return _ranking_rows(
+        (_scored_cell(row) for row in rows),
+        min_n=pub.min_n,
+        window_key=window_key,
+        window_days=window_days,
+    )
+
+
+def published_cells(
+    conn: sqlite3.Connection, *, pub: Publication, window_key: str
+) -> list[ScoredCell]:
+    """Every ranking row of the publication's window, for the feeds that
+    pass ``active_competitor_clause`` now, ordered by source, model,
+    variable and day ahead (the composite's read, 9.2)."""
+    rows = conn.execute(_PUBLISHED_CELLS_SQL, (pub.id, window_key)).fetchall()
+    return [_scored_cell(row) for row in rows]
+
+
+def live_cells(
+    conn: sqlite3.Connection, *, pub: Publication, window_days: int
+) -> list[ScoredCell]:
+    """An ``Nd`` view, summed live over the ``window_days`` dates ending at
+    the publication's cutoff (9.2).
+
+    As 8.2 step 3: ``day_scores`` on the dates from the publication's first
+    record whose record is ``closed`` (a missed date's rows are never read,
+    7.2) and ``starting_scores`` before it, through ``metrics_from_sums``
+    with the publication's ``min_n``. Never reaches past the cutoff, so
+    never an open day. Only feeds that pass ``active_competitor_clause``
+    now, ordered by source, model, variable and day ahead; a cell with no
+    pair is left out.
+    """
+    sums = _window_cells(
+        conn,
+        pub.site_id,
+        start=_shift(pub.cutoff, -(window_days - 1)),
+        cutoff=pub.cutoff,
+        first=pub.first_record_date,
+    )
+    by_feed: dict[int, list[tuple[str, int]]] = {}
+    for feed_id, variable, day_ahead in sums:
+        by_feed.setdefault(feed_id, []).append((variable, day_ahead))
+    out: list[ScoredCell] = []
+    for row in conn.execute(_COMPETITOR_FEEDS_SQL, (pub.site_id, pub.site_id)):
+        feed_id = int(row["id"])
+        for variable, day_ahead in sorted(by_feed.get(feed_id, [])):
+            metrics = metrics_from_sums(
+                sums[(feed_id, variable, day_ahead)].sums,
+                variable=variable,
+                min_n=pub.min_n,
+            )
+            if metrics.n > 0:
+                out.append(
+                    ScoredCell(
+                        feed_id=feed_id,
+                        source=str(row["source"]),
+                        model=str(row["model"]),
+                        variable=variable,
+                        day_ahead=day_ahead,
+                        n=metrics.n,
+                        bias=metrics.bias,
+                        mae=metrics.mae,
+                        rmse=metrics.rmse,
+                        skill_score=metrics.skill_score,
+                    )
+                )
+    return out
+
+
+def live_ranking(
+    conn: sqlite3.Connection,
+    *,
+    pub: Publication,
+    variable: str,
+    day_ahead: int,
+    window_days: int,
+) -> dict[int, LeaderboardRow]:
+    """The ``Nd`` view of :func:`live_cells` for one cell, keyed by feed id,
+    as ``live:{N}d`` rows."""
+    cells = (
+        cell
+        for cell in live_cells(conn, pub=pub, window_days=window_days)
+        if cell.variable == variable and cell.day_ahead == day_ahead
+    )
+    return _ranking_rows(
+        cells,
+        min_n=pub.min_n,
+        window_key=f"live:{window_days}d",
+        window_days=window_days,
+    )
+
+
+def published_coverage(
+    conn: sqlite3.Connection, *, pub: Publication, variable: str, window_key: str
+) -> dict[tuple[int, int], Coverage]:
+    """The publication's coverage for one variable and window, keyed by
+    (feed id, day ahead), for the feeds that pass ``active_competitor_clause``
+    now (9.1, for P5)."""
+    rows = conn.execute(_PUBLISHED_COVERAGE_SQL, (pub.id, variable, window_key))
+    return {
+        (int(row["feed_id"]), int(row["day_ahead"])): Coverage(
+            scored=int(row["scored"]),
+            expected=int(row["expected"]),
+            starting_days=int(row["starting_days"]),
+        )
+        for row in rows
+    }
+
+
+def closed_day_pairs(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: date,
+    feed_id: int | None = None,
+) -> list[ClosedPair]:
+    """A closed date's ``close_pairs`` rows, one feed's when ``feed_id`` is
+    given; ``[]`` for a date whose record is not ``closed`` (16.2).
+
+    Ordered by feed, variable, hour, day ahead and lead.
+    """
+    rows = conn.execute(
+        _CLOSED_DAY_PAIRS_SQL, (site_id, local_date.isoformat(), feed_id, feed_id)
+    )
+    return [
+        ClosedPair(
+            feed_id=int(row["feed_id"]),
+            variable=str(row["variable"]),
+            valid_at=str(row["valid_at"]),
+            day_ahead=int(row["day_ahead"]),
+            lead_hours=int(row["lead_hours"]),
+            forecast=float(row["forecast"]),
+            observed=float(row["observed"]),
+            download_date=_optional_date(row["download_date"]),
+            fetched_at=None if row["fetched_at"] is None else str(row["fetched_at"]),
+        )
+        for row in rows
+    ]
+
+
+def pending_ranking_settings(
+    conn: sqlite3.Connection, *, pub: Publication | None
+) -> dict[str, tuple[int, int]]:
+    """``(published, saved)`` for each ranking setting whose saved value
+    differs from ``pub``'s; ``{}`` for ``pub`` None (13.1).
+
+    The saved values are read as the build reads them (8.2).
+    """
+    if pub is None:
+        return {}
+    pairs = {
+        "rolling_window_days": (
+            pub.rolling_window_days,
+            get_number_setting(
+                conn, "rolling_window_days", _DEFAULT_WINDOW_DAYS, minimum=1
+            ),
+        ),
+        "min_n": (
+            pub.min_n,
+            get_number_setting(conn, "min_n", _DEFAULT_MIN_N, minimum=0),
+        ),
+    }
+    return {key: pair for key, pair in pairs.items() if pair[0] != pair[1]}
+
+
+def published_wind_weights(
+    conn: sqlite3.Connection, *, pub: Publication
+) -> WindWeights:
+    """The publication's wind weights, for the feeds that pass
+    ``active_competitor_clause`` now (9.4, 11.1)."""
+    return {
+        (int(row["feed_id"]), int(row["day_ahead"])): FeedWeight(
+            mae_ms=float(row["mae_ms"]),
+            days=int(row["days"]),
+            weight=float(row["weight"]),
+        )
+        for row in conn.execute(_PUBLISHED_WIND_SQL, (pub.id,))
+    }
+
+
+def published_wind_serving(
+    conn: sqlite3.Connection, *, site_id: int, as_of: str | None
+) -> WindWeights | None:
+    """The wind weights served with the close on, else ``None`` (9.4).
+
+    On: the weights of the publication active at ``as_of`` (the latest with
+    ``as_of`` None), ``{}`` with no publication. Inside the caller's
+    transaction when one is open; otherwise the switch is read on its own
+    and, only when it is on, again with the rows in one read snapshot, so
+    the close-off path opens no transaction. ``None`` tells the caller to
+    run today's code.
+    """
+    if conn.in_transaction:
+        return _published_wind_now(conn, site_id=site_id, as_of=as_of)
+    if not daily_close_on(conn):
+        return None
+    with read_snapshot(conn, label="wind_weights"):
+        return _published_wind_now(conn, site_id=site_id, as_of=as_of)
+
+
+def _published_wind_now(
+    conn: sqlite3.Connection, *, site_id: int, as_of: str | None
+) -> WindWeights | None:
+    if not daily_close_on(conn):
+        return None
+    pub = active_publication(conn, site_id=site_id, at_utc=as_of)
+    return {} if pub is None else published_wind_weights(conn, pub=pub)
+
+
+def _publication_from_row(row: sqlite3.Row) -> Publication:
+    """A ``publications`` row as a :class:`Publication`.
+
+    A settings value that is missing or not a whole number in range falls
+    back to the row's ``window_days`` and the build's default ``min_n``.
+    """
+    settings = _settings_object(row["settings"])
+    window_days = int(row["window_days"])
+    return Publication(
+        id=int(row["id"]),
+        site_id=int(row["site_id"]),
+        cutoff=date.fromisoformat(str(row["cutoff"])),
+        first_record_date=date.fromisoformat(str(row["first_record_date"])),
+        window_days=window_days,
+        window_start_date=date.fromisoformat(str(row["window_start_date"])),
+        wind_start_date=date.fromisoformat(str(row["wind_start_date"])),
+        rolling_window_days=_setting_int(
+            settings, "rolling_window_days", minimum=1, default=window_days
+        ),
+        min_n=_setting_int(settings, "min_n", minimum=0, default=_DEFAULT_MIN_N),
+        methodology_version=int(row["methodology_version"]),
+        scoring_rule=str(row["scoring_rule"]),
+        wind_method=str(row["wind_method"]),
+        wind_constants=str(row["wind_constants"]),
+        build_started_at=str(row["build_started_at"]),
+        published_at=str(row["published_at"]),
+    )
+
+
+def _settings_object(raw: object) -> dict[str, object]:
+    """The ``settings`` JSON object; ``{}`` for anything else."""
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed: object = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {
+        key: value
+        for key, value in cast(dict[object, object], parsed).items()
+        if isinstance(key, str)
+    }
+
+
+def _setting_int(
+    settings: dict[str, object], key: str, *, minimum: int, default: int
+) -> int:
+    value = settings.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= minimum:
+        return value
+    return default
+
+
+def _scored_cell(row: sqlite3.Row) -> ScoredCell:
+    return ScoredCell(
+        feed_id=int(row["feed_id"]),
+        source=str(row["source"]),
+        model=str(row["model"]),
+        variable=str(row["variable"]),
+        day_ahead=int(row["day_ahead"]),
+        n=int(row["n"]),
+        bias=_optional_float(row["bias"]),
+        mae=_optional_float(row["mae"]),
+        rmse=_optional_float(row["rmse"]),
+        skill_score=_optional_float(row["skill_score"]),
+    )
+
+
+def _ranking_rows(
+    cells: Iterable[ScoredCell],
+    *,
+    min_n: int,
+    window_key: str,
+    window_days: int | None,
+) -> dict[int, LeaderboardRow]:
+    """Leaderboard rows in the cells' order, ``confident`` as the cache path
+    decides it (``n >= min_n`` and a skill score)."""
+    return {
+        cell.feed_id: LeaderboardRow(
+            feed_id=cell.feed_id,
+            source=cell.source,
+            model=cell.model,
+            n=cell.n,
+            skill_score=cell.skill_score,
+            badge=score_badge(cell.skill_score),
+            below_baseline=below_baseline(cell.skill_score),
+            confident=cell.n >= min_n and cell.skill_score is not None,
+            bias=cell.bias,
+            mae=cell.mae,
+            rmse=cell.rmse,
+            window_key=window_key,
+            window_days=window_days,
+        )
+        for cell in cells
+    }
+
+
+# ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
 
@@ -808,6 +1329,23 @@ def _local_date(value: object, tz: ZoneInfo) -> date | None:
         return parse_utc(str(value)).astimezone(tz).date()
     except ValueError:
         return None
+
+
+def _optional_date(value: object) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, int | float | str):
+        raise TypeError("invalid numeric publication value")
+    return float(value)
 
 
 def _shift(day: date, days: int) -> date:

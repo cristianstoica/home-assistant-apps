@@ -23,7 +23,9 @@ from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
 from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.core.units import ms_to_kmh
+from wxverify.db.connection import pinned_read_snapshot
 from wxverify.db.queue import ACTIVE_JOB_SQL
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.tz_generations import (
     correction_job_key,
     correction_state_key,
@@ -32,9 +34,10 @@ from wxverify.db.tz_generations import (
 )
 from wxverify.db.wind_basis import read_auth_holds
 from wxverify.forecast.wind_blend import load_wind_serving
-from wxverify.scoring.composite import composite_with_status
+from wxverify.scoring.composite import composite_in_snapshot
 from wxverify.scoring.effective import active_feed_cte
-from wxverify.scoring.leaderboard import leaderboard as leaderboard_query
+from wxverify.scoring.leaderboard import leaderboard_in_snapshot
+from wxverify.scoring.publication import active_publication, pending_ranking_settings
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.settings.keys import get_number_setting
 from wxverify.worker.access_hold import (
@@ -378,14 +381,57 @@ def load_dashboard(
     window: str,
     lead: str,
 ) -> dict[str, object]:
+    """The dashboard page's context, read in one snapshot (9.3).
+
+    Opens a ``pinned_read_snapshot`` unless the caller already holds a
+    transaction, so every part of the page -- with the daily close on, every
+    ranking and the wind weights -- comes from one publication version.
+    With the close on, ``rolling_days`` and ``min_n`` are the active
+    publication's, so the "Last N days" tab names the published window;
+    ``evidence_through`` is its cutoff and ``pending_settings`` the ranking
+    settings saved since (13.1). With the close off they are today's
+    settings, None and ``{}``.
+    """
+    if conn.in_transaction:
+        return _load_dashboard(
+            conn, site_id=site_id, variable=variable, window=window, lead=lead
+        )
+    with pinned_read_snapshot(conn, label="dashboard"):
+        return _load_dashboard(
+            conn, site_id=site_id, variable=variable, window=window, lead=lead
+        )
+
+
+def _load_dashboard(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int | None,
+    variable: str,
+    window: str,
+    lead: str,
+) -> dict[str, object]:
     sites = load_sites(conn, include_disabled=False)
     site = (
         load_site(conn, site_id)
         if site_id is not None
         else (sites[0] if sites else None)
     )
-    rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
-    min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    # One switch per read (9.1). The publication is the one the page's
+    # rankings read, in the same snapshot; none for a disabled site, as the
+    # leaderboard's own close-on read.
+    publication = (
+        active_publication(conn, site_id=site.id, at_utc=None)
+        if site is not None and site.enabled and daily_close_on(conn)
+        else None
+    )
+    if publication is not None:
+        rolling_days = publication.window_days
+        min_n = publication.min_n
+    else:
+        rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
+        min_n = get_number_setting(conn, "min_n", 30, minimum=0)
+    evidence_through = None if publication is None else publication.cutoff
+    pending_settings = pending_ranking_settings(conn, pub=publication)
     if site is None:
         return {
             "sites": sites,
@@ -397,6 +443,8 @@ def load_dashboard(
             "lead_options": LEAD_OPTIONS,
             "rolling_days": rolling_days,
             "min_n": min_n,
+            "evidence_through": evidence_through,
+            "pending_settings": pending_settings,
             "leaderboard": [],
             "verdict": compute_verdict([]),
             "winrate": [],
@@ -419,13 +467,13 @@ def load_dashboard(
             mae=row.mae,
             rmse=row.rmse,
         )
-        for row in leaderboard_query(
+        for row in leaderboard_in_snapshot(
             conn,
             site_id=site.id,
             variable=variable,
             day_ahead=day_ahead,
             window=window,
-        )
+        ).rows
     ]
     # Presentation-layer sort: eligible rows first (skill DESC, then label),
     # withheld rows after (label order). Never interleave by raw skill across
@@ -442,7 +490,7 @@ def load_dashboard(
     verdict = compute_verdict(leaderboard)
     # Pure read: the status is surfaced for the route to act on AFTER the read
     # connection closes (dashboard_page enqueues the rescore); never write here.
-    composite_result = composite_with_status(conn, site_id=site.id, window=window)
+    composite_result = composite_in_snapshot(conn, site_id=site.id, window=window)
     return {
         "sites": sites,
         "site": site,
@@ -453,6 +501,8 @@ def load_dashboard(
         "lead_options": LEAD_OPTIONS,
         "rolling_days": rolling_days,
         "min_n": min_n,
+        "evidence_through": evidence_through,
+        "pending_settings": pending_settings,
         "leaderboard": leaderboard,
         "verdict": verdict,
         "winrate": winrate_query(

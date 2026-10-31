@@ -682,7 +682,18 @@ def load_wind_serving(
 ) -> WindServing:
     """The wind weights: live ones through the cache, a record build's
     (``as_of`` given) computed uncached.
+
+    With the daily close on (9.4, 12) they are the active publication's
+    instead (the one active at ``as_of`` for a record build), for the feeds
+    switched on now; ``{}`` with no publication, which wind serving reads as
+    "not enough feeds".
     """
+    # Deferred: the publication module imports this one.
+    from wxverify.scoring.publication import published_wind_serving
+
+    published = published_wind_serving(conn, site_id=site_id, as_of=as_of)
+    if published is not None:
+        return WindServing(weights=published)
     if as_of is None:
         weights = live_wind_weights(
             conn, site_id=site_id, timezone=timezone, today=today

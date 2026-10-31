@@ -811,6 +811,7 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         extrema_state="normal",
         contributor_ids=(1,),
         fetch_unknown=False,
+        substitute=False,
     )
     # Adversarial: state is "not_available" (meta.available is False) yet
     # contributor_ids is non-empty -- a shape the real selection code never
@@ -824,6 +825,7 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         extrema_state="not_available",
         contributor_ids=(2,),
         fetch_unknown=False,
+        substitute=False,
     )
     empty_meta = CellMeta(
         state="not_available",
@@ -834,6 +836,7 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         extrema_state="not_available",
         contributor_ids=(),
         fetch_unknown=False,
+        substitute=False,
     )
 
     tile = DayTile(
@@ -847,6 +850,7 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         ),
         state="normal",
         confidence_state="normal",
+        substitute=False,
         stale=False,
         partial=False,
         fetch_unknown=False,

@@ -202,7 +202,7 @@ def _rank(pool: Sequence[CellCandidate]) -> tuple[list[CellCandidate], bool]:
     if confident:
         ranked = sorted(
             confident,
-            key=lambda c: (-_skill_or_zero(c.skill_score), c.source, c.model),
+            key=lambda c: confident_order_key(c.skill_score, c.source, c.model),
         )
         return ranked, False
 
@@ -224,6 +224,15 @@ def _rank(pool: Sequence[CellCandidate]) -> tuple[list[CellCandidate], bool]:
         key=lambda c: (-c.future_sample_count, c.source, c.model),
     )
     return ranked, True
+
+
+def confident_order_key(
+    skill_score: float | None, source: str, model: str
+) -> tuple[float, str, str]:
+    """The ladder's order among confident feeds: skill descending, then
+    source and model. Defined once, for ``_rank`` and the substitute flag's
+    choice (11.3)."""
+    return (-_skill_or_zero(skill_score), source, model)
 
 
 def _skill_or_zero(value: float | None) -> float:

@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Literal
 
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.db.queue import enqueue_if_absent_with_cooldown
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
@@ -21,6 +22,12 @@ from wxverify.scoring.effective import (
 )
 from wxverify.scoring.leaderboard import WindowResolution, resolve_window, score_badge
 from wxverify.scoring.metrics import strategy_for
+from wxverify.scoring.publication import (
+    ScoredCell,
+    active_publication,
+    live_cells,
+    published_cells,
+)
 from wxverify.settings.keys import get_number_setting
 
 logger = logging.getLogger(__name__)
@@ -46,6 +53,9 @@ class CompositeParts:
 class CompositeResult:
     rows: list[dict[str, object]]
     status: CompositeStatus
+    #: With the close on, the cutoff of the publication read (9.6); None
+    #: with the close off or with no publication.
+    evidence_through: date | None = None
 
 
 def composite(
@@ -76,29 +86,117 @@ def composite_with_status(
     WAL read snapshot (``read_snapshot``), so ``rebuilding`` is only ever
     reported for a mismatch that existed in one state of the database, never
     for two reads that straddled a rescore commit. The block is read-only.
+
+    With the daily close on (9.2) the verdict comes from the active
+    publication, decided once from ``daily_close_on`` in the same snapshot:
+    no publication, or the site disabled, is ``empty``; ``rolling`` and
+    ``all`` group the publication's ``w:{N}`` and ``w:all`` rows on
+    ``_cached_composite``'s grid, ``hit``; an ``Nd`` window groups the live
+    day sums ending at the publication's cutoff, ``live``.
     """
     with read_snapshot(conn, label="composite"):
-        resolved = resolve_window(conn, window)
-        if not resolved.cache_backed:
-            rows = _live_composite(
-                conn,
-                site_id=site_id,
-                window_key=resolved.window_key,
-                cutoff=resolved.cutoff,
-            )
-            return CompositeResult(rows=rows, status="live")
-        expected_cells = _expected_active_cells(
-            conn, site_id=site_id, resolved=resolved
+        return _composite_in_transaction(conn, site_id=site_id, window=window)
+
+
+def composite_in_snapshot(
+    conn: sqlite3.Connection, *, site_id: int, window: str = "rolling"
+) -> CompositeResult:
+    """``composite_with_status`` for a response that holds its own snapshot
+    (9.3: the dashboard), where the facade's snapshot would refuse to nest.
+
+    Raises ``RuntimeError`` when no transaction is open on ``conn``.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("composite_in_snapshot needs the caller's snapshot")
+    return _composite_in_transaction(conn, site_id=site_id, window=window)
+
+
+def _composite_in_transaction(
+    conn: sqlite3.Connection, *, site_id: int, window: str
+) -> CompositeResult:
+    """The verdict of ``composite_with_status``, inside the caller's snapshot."""
+    if daily_close_on(conn):
+        return _published_composite(conn, site_id=site_id, window=window)
+    resolved = resolve_window(conn, window)
+    if not resolved.cache_backed:
+        rows = _live_composite(
+            conn,
+            site_id=site_id,
+            window_key=resolved.window_key,
+            cutoff=resolved.cutoff,
         )
-        if not expected_cells or not _site_enabled(conn, site_id):
-            return CompositeResult(rows=[], status="empty")
-        cached = _cached_composite(
-            conn, site_id=site_id, resolved=resolved, expected_cells=expected_cells
+        return CompositeResult(rows=rows, status="live")
+    expected_cells = _expected_active_cells(conn, site_id=site_id, resolved=resolved)
+    if not expected_cells or not _site_enabled(conn, site_id):
+        return CompositeResult(rows=[], status="empty")
+    cached = _cached_composite(
+        conn, site_id=site_id, resolved=resolved, expected_cells=expected_cells
+    )
+    if cached is None:
+        return CompositeResult(rows=[], status="rebuilding")
+    rows, fresh = cached
+    return CompositeResult(rows=rows, status="hit" if fresh else "stale")
+
+
+def _published_composite(
+    conn: sqlite3.Connection, *, site_id: int, window: str
+) -> CompositeResult:
+    """The close-on verdict of ``composite_with_status`` (9.2)."""
+    pub = (
+        active_publication(conn, site_id=site_id, at_utc=None)
+        if _site_enabled(conn, site_id)
+        else None
+    )
+    if pub is None:
+        return CompositeResult(rows=[], status="empty")
+    if window.endswith("d") and window[:-1].isdigit():
+        days = int(window[:-1])
+        cells = live_cells(conn, pub=pub, window_days=days)
+        return CompositeResult(
+            rows=_grouped_composite(cells, min_n=pub.min_n, window_key=f"live:{days}d"),
+            status="live",
+            evidence_through=pub.cutoff,
         )
-        if cached is None:
-            return CompositeResult(rows=[], status="rebuilding")
-        rows, fresh = cached
-        return CompositeResult(rows=rows, status="hit" if fresh else "stale")
+    window_key = "w:all" if window == "all" else f"w:{pub.window_days}"
+    cells = published_cells(conn, pub=pub, window_key=window_key)
+    return CompositeResult(
+        rows=_grouped_composite(cells, min_n=pub.min_n, window_key=window_key),
+        status="hit",
+        evidence_through=pub.cutoff,
+    )
+
+
+def _grouped_composite(
+    cells: list[ScoredCell], *, min_n: int, window_key: str
+) -> list[dict[str, object]]:
+    """``_cached_composite``'s grid and grouping over a window's cells, in
+    their (source, model, variable, day ahead) order: a cell off the
+    canonical grid, with no skill score or below ``min_n`` is left out."""
+    canonical_variables = set(FORECAST_VARIABLES)
+    grouped: dict[int, CompositeParts] = {}
+    by_variable: dict[int, dict[str, list[float]]] = {}
+    for cell in cells:
+        on_grid = (
+            cell.variable in canonical_variables
+            and 0 <= cell.day_ahead <= MAX_DAY_AHEAD
+        )
+        skill = cell.skill_score
+        if not on_grid or skill is None or cell.n < min_n:
+            continue
+        grouped.setdefault(
+            cell.feed_id, CompositeParts(source=cell.source, model=cell.model)
+        )
+        by_variable.setdefault(cell.feed_id, {}).setdefault(cell.variable, []).append(
+            skill
+        )
+    for feed_id, variables in by_variable.items():
+        parts = grouped[feed_id]
+        for variable, scores in variables.items():
+            raw = sum(scores) / len(scores)
+            parts.raw_components[variable] = raw
+            parts.components[variable] = max(0.0, raw)
+            parts.lead_counts[variable] = len(scores)
+    return _format_composite(grouped, window_key)
 
 
 def enqueue_score_rescore(conn: sqlite3.Connection, site_id: int) -> None:

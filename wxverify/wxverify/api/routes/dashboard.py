@@ -1,33 +1,60 @@
-"""Dashboard JSON routes."""
+"""Dashboard JSON routes.
+
+With the daily close on, ``/leaderboard``, ``/composite`` and ``/winrate``
+send the active publication's cutoff as an ``X-Evidence-Through`` header
+(ISO date) and keep their bodies' shape; ``/curve`` carries it in its body
+as ``evidence_through`` (9.6). With the close off no header is sent and
+``evidence_through`` is None.
+"""
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import date
+from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query, Response
 
 from wxverify.api.schemas import LeaderboardOut
 from wxverify.core.lead import parse_day_ahead
-from wxverify.db.connection import get_db
+from wxverify.db.connection import get_db, pinned_read_snapshot
 from wxverify.scoring.composite import composite_with_status
 from wxverify.scoring.leaderboard import (
     LeaderboardResult,
     LeaderboardStatus,
+    leaderboard_in_snapshot,
     leaderboard_with_status,
 )
 from wxverify.scoring.rescore import schedule_score_rescore
-from wxverify.scoring.winrate import winrate as winrate_query
+from wxverify.scoring.winrate import winrate_with_evidence
 from wxverify.web.context import feed_label
 
 _CURVE_LEADS: list[int] = list(range(0, 8))
 _MAX_SERIES = 6  # number of --chart-* palette tokens
+_EVIDENCE_HEADER = "X-Evidence-Through"
 
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 
+async def _request_response(response: Response) -> Response:
+    """The request's ``Response``, which FastAPI injects here.
+
+    FastAPI injects a parameter annotated ``Response`` but not one annotated
+    ``Response | None``, so the handlers take it through this dependency:
+    that keeps their ``response`` optional, and a direct call with no
+    request returns the same body and sends no header.
+    """
+    return response
+
+
+# A handler's ``response``: the request's, or None on a direct call.
+_OptionalResponse = Annotated[Response | None, Depends(_request_response)]
+
+
 @router.get("/leaderboard", response_model=list[LeaderboardOut])
 async def leaderboard(
+    response: _OptionalResponse = None,
     site: int = Query(...),
     variable: str = Query("temperature"),
     window: str = Query("rolling"),
@@ -37,7 +64,7 @@ async def leaderboard(
 
     def _read(
         conn: sqlite3.Connection,
-    ) -> tuple[list[LeaderboardOut], LeaderboardStatus]:
+    ) -> tuple[list[LeaderboardOut], LeaderboardStatus, date | None]:
         result = leaderboard_with_status(
             conn,
             site_id=site,
@@ -45,9 +72,14 @@ async def leaderboard(
             day_ahead=day_ahead,
             window=window,
         )
-        return [LeaderboardOut(**row.__dict__) for row in result.rows], result.status
+        return (
+            [LeaderboardOut(**row.__dict__) for row in result.rows],
+            result.status,
+            result.evidence_through,
+        )
 
-    result, status = await get_db().read(_read)
+    result, status, evidence_through = await get_db().read(_read)
+    _set_evidence_header(response, evidence_through)
 
     if status in ("stale", "rebuilding"):
         schedule_score_rescore(site)
@@ -75,17 +107,21 @@ async def curve(
     top_clamped = max(1, min(_MAX_SERIES, top))
 
     def _read(conn: sqlite3.Connection) -> tuple[dict[str, object], bool]:
-        results = [
-            leaderboard_with_status(
-                conn,
-                site_id=site,
-                variable=variable,
-                day_ahead=day,
-                window=window,
-            )
-            for day in _CURVE_LEADS
-        ]
+        # The eight leads in one snapshot, so with the close on every one
+        # reads the same publication (9.3).
+        with pinned_read_snapshot(conn, label="curve"):
+            results = [
+                leaderboard_in_snapshot(
+                    conn,
+                    site_id=site,
+                    variable=variable,
+                    day_ahead=day,
+                    window=window,
+                )
+                for day in _CURVE_LEADS
+            ]
         series = _build_series(results, selected_index, top_clamped)
+        evidence_through = results[0].evidence_through if results else None
         return {
             "site": site,
             "variable": variable,
@@ -94,6 +130,9 @@ async def curve(
             "series": series,
             "window_key": results[0].window_key if results else None,
             "window_days": results[0].window_days if results else None,
+            "evidence_through": (
+                None if evidence_through is None else evidence_through.isoformat()
+            ),
         }, any(result.status in ("stale", "rebuilding") for result in results)
 
     result, needs_rescore = await get_db().read(_read)
@@ -180,35 +219,51 @@ def _build_series(
 
 @router.get("/winrate")
 async def winrate(
+    response: _OptionalResponse = None,
     site: int = Query(...),
     variable: str = Query("temperature"),
     lead: str = Query("D+1"),
     window: str = Query("rolling"),
 ) -> list[dict[str, object]]:
-    def _read(conn: sqlite3.Connection) -> list[dict[str, object]]:
-        return winrate_query(
+    result = await get_db().read(
+        lambda conn: winrate_with_evidence(
             conn,
             site_id=site,
             variable=variable,
             day_ahead=_lead_to_day(lead),
             window=window,
         )
-
-    return await get_db().read(_read)
+    )
+    _set_evidence_header(response, result.evidence_through)
+    return result.rows
 
 
 @router.get("/composite")
 async def composite(
-    site: int = Query(...), window: str = Query("rolling")
+    response: _OptionalResponse = None,
+    site: int = Query(...),
+    window: str = Query("rolling"),
 ) -> list[dict[str, object]]:
     result = await get_db().read(
         lambda conn: composite_with_status(conn, site_id=site, window=window)
     )
+    _set_evidence_header(response, result.evidence_through)
     # The read connection is already released; the fire-and-forget scheduler
     # carries the terminal-failure cooldown and never gates the response.
     if result.status in ("stale", "rebuilding"):
         schedule_score_rescore(site)
     return result.rows
+
+
+def _set_evidence_header(
+    response: Response | None, evidence_through: date | None
+) -> None:
+    """Send the cutoff as ``X-Evidence-Through`` when there is one (9.6).
+
+    ``response`` is None on a direct call, which sends nothing.
+    """
+    if response is not None and evidence_through is not None:
+        response.headers[_EVIDENCE_HEADER] = evidence_through.isoformat()
 
 
 def _lead_to_day(lead: str) -> int:

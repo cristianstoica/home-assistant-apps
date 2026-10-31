@@ -30,11 +30,13 @@ from tests.helpers import (
     asof_insert_pair,
     asof_make_real_feed,
     asof_make_site,
+    asof_persistence_feed_id,
     day_close_site,
     install_provider_standin,
     seed_round_schedule_feeds,
 )
 from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.settings.keys import set_setting
 
 # ---------------------------------------------------------------------------
 # PD1
@@ -142,6 +144,7 @@ def test_pd1_composite_nd_window_close_off_reads_live_pairs_not_day_scores() -> 
     from wxverify.scoring.composite import composite_with_status
 
     conn = asof_conn()
+    set_setting(conn, "min_n", "1")
     site_id = asof_make_site(conn, "Testsite")
     feed_id = asof_make_real_feed(conn, "model-a")
 
@@ -160,6 +163,19 @@ def test_pd1_composite_nd_window_close_off_reads_live_pairs_not_day_scores() -> 
         day_ahead=0,
         lead_hours=2,
     )
+    asof_insert_pair(
+        conn,
+        site_id=site_id,
+        feed_id=asof_persistence_feed_id(conn),
+        valid_at=valid_at,
+        issued_at=issued_at,
+        forecast=11.0,
+        observed=8.0,
+        first_known_at=issued_at,
+        day_ahead=0,
+        lead_hours=2,
+    )
+    _pd1_publication(conn, site_id=site_id, cutoff=D - timedelta(days=1))
     conn.commit()
 
     day_scores_count = conn.execute("SELECT COUNT(*) FROM day_scores").fetchone()[0]
@@ -236,6 +252,21 @@ def test_pd1_leaderboard_rolling_and_all_close_off_read_forecast_pairs() -> None
         " VALUES (?, ?, 1, 0)",
         (site_id, feed_id),
     )
+    now = datetime.now(UTC)
+    valid_at = isoformat_utc(now - timedelta(hours=2))
+    issued_at = isoformat_utc(now - timedelta(hours=8))
+    asof_insert_pair(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        valid_at=valid_at,
+        issued_at=issued_at,
+        forecast=10.0,
+        observed=8.0,
+        first_known_at=issued_at,
+        day_ahead=1,
+        lead_hours=2,
+    )
     upsert_score_cache(
         conn,
         site_id=site_id,
@@ -246,6 +277,16 @@ def test_pd1_leaderboard_rolling_and_all_close_off_read_forecast_pairs() -> None
         result=MetricResult(n=4, skill_score=0.4, confident=True),
         computed_at=isoformat_utc(),
     )
+    upsert_score_cache(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        day_ahead=1,
+        window_key="w:all",
+        result=MetricResult(n=4, skill_score=0.4, confident=True),
+        computed_at=isoformat_utc(),
+    )
     _pd1_publication(conn, site_id=site_id, cutoff=D - timedelta(days=1))
     conn.commit()
 
@@ -253,10 +294,14 @@ def test_pd1_leaderboard_rolling_and_all_close_off_read_forecast_pairs() -> None
         result = leaderboard_with_status_in_transaction(
             conn, site_id=site_id, variable="temperature", day_ahead=1, window=window
         )
-        assert result.status in ("hit", "stale", "rebuilding"), (
+        assert result.status == "hit", (
             f"window={window}: close off must take today's cache-backed"
-            f" branch, not the close-on 'empty'/'live' statuses -- got"
-            f" {result.status!r}"
+            f" 'hit' branch, not the close-on 'empty'/'live' statuses --"
+            f" got {result.status!r}"
+        )
+        assert [r.feed_id for r in result.rows] == [feed_id], (
+            f"window={window}: close off must serve the cached row for the"
+            f" seeded feed, got {[r.feed_id for r in result.rows]!r}"
         )
         assert result.evidence_through is None, (
             "M120 -> at this assertion: correct = None (close off never"
@@ -397,9 +442,10 @@ def test_pd1_served_forecast_close_off_keeps_issue_time_day_ahead() -> None:
         " VALUES (?, ?, 1, 0)",
         (site_id, feed_id),
     )
-    issued_at = isoformat_utc(datetime.now(UTC) - timedelta(days=2))
-    valid_at = isoformat_utc(datetime.now(UTC) + timedelta(hours=6))
-    fetched_at = isoformat_utc(datetime.now(UTC) - timedelta(hours=1))
+    now = datetime.now(UTC).replace(microsecond=0)
+    issued_at = isoformat_utc(now - timedelta(days=2))
+    valid_at = isoformat_utc(now + timedelta(hours=6))
+    fetched_at = isoformat_utc(now - timedelta(hours=1))
     conn.execute(
         """
         INSERT INTO forecast_samples
@@ -433,9 +479,9 @@ def test_pd1_served_forecast_close_off_keeps_issue_time_day_ahead() -> None:
     rows = load_future_samples(
         conn,
         site_id=site_id,
-        since_valid_at=isoformat_utc(datetime.now(UTC)),
+        since_valid_at=isoformat_utc(now),
         served_only=False,
-        as_of=isoformat_utc(datetime.now(UTC)),
+        as_of=isoformat_utc(now),
     )
     row = next(r for r in rows if r.feed_id == feed_id)
     assert getattr(row, "download_date", None) is None, (
@@ -462,9 +508,12 @@ def test_pd1_record_schema_has_null_publication_columns_available() -> None:
     gives NULL for all three -- the shape a close-off (or close-on,
     missed) record actually writes.
     """
+    from wxverify.db.tz_generations import ensure_published_generation
+
     conn = asof_conn()
     site_id = asof_make_site(conn, "Testsite")
     conn.commit()
+    generation_id = ensure_published_generation(conn, site_id)
 
     cur = conn.execute(
         """
@@ -479,7 +528,7 @@ def test_pd1_record_schema_has_null_publication_columns_available() -> None:
         """,
         (
             site_id,
-            1,
+            generation_id,
             D.isoformat(),
             isoformat_utc(),
             D.isoformat(),

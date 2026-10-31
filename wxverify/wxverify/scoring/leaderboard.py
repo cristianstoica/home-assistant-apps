@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from wxverify.core.timeutil import parse_utc, window_cutoff
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
 from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
@@ -50,6 +51,10 @@ class LeaderboardResult:
     status: LeaderboardStatus
     window_key: str
     window_days: int | None
+    #: With the close on, the cutoff and id of the publication read (9.6);
+    #: None with the close off or with no publication.
+    evidence_through: date | None = None
+    publication_id: int | None = None
 
 
 def leaderboard(
@@ -131,7 +136,23 @@ def leaderboard_with_status_in_transaction(
     ``BEGIN IMMEDIATE`` on the synchronous path), and
     ``forecast_ranking_with_status`` when a forecast route's read snapshot is
     open on ``conn``. Other read paths call the facade.
+
+    With the daily close on (9.2) the verdict comes from the active
+    publication instead, decided once from ``daily_close_on`` in the same
+    snapshot: no publication, or the site disabled, is ``empty``;
+    ``rolling`` and ``all`` are the publication's ``w:{N}`` and ``w:all``
+    rows, ``hit``; an ``Nd`` window is summed live over the N closed dates
+    ending at the publication's cutoff, ``live``. No ``score_cache`` read, so
+    never ``stale`` or ``rebuilding``.
     """
+    if daily_close_on(conn):
+        return _published_leaderboard(
+            conn,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
     resolved = resolve_window(conn, window)
     if not resolved.cache_backed:
         rows = _live_leaderboard(
@@ -190,6 +211,108 @@ def leaderboard_with_status_in_transaction(
         window_key=resolved.window_key,
         window_days=resolved.window_days,
     )
+
+
+def leaderboard_in_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    window: str,
+) -> LeaderboardResult:
+    """``leaderboard_with_status`` for a response that reads several
+    rankings inside its own snapshot (9.3: ``/curve`` and the dashboard).
+
+    Raises ``RuntimeError`` when no transaction is open on ``conn``, so it
+    can never read outside a caller-held snapshot; the facade serves every
+    other read.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("leaderboard_in_snapshot needs the caller's snapshot")
+    return leaderboard_with_status_in_transaction(
+        conn,
+        site_id=site_id,
+        variable=variable,
+        day_ahead=day_ahead,
+        window=window,
+    )
+
+
+def _published_leaderboard(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    window: str,
+) -> LeaderboardResult:
+    """The close-on verdict of ``leaderboard_with_status_in_transaction``."""
+    # Deferred: the publication module imports this one (its rows are
+    # ``LeaderboardRow``s) through ``forecast/data.py``.
+    from wxverify.scoring.publication import (
+        active_publication,
+        live_ranking,
+        published_ranking,
+    )
+
+    pub = (
+        active_publication(conn, site_id=site_id, at_utc=None)
+        if _site_enabled(conn, site_id)
+        else None
+    )
+    if pub is None:
+        resolved = resolve_window(conn, window)
+        return LeaderboardResult(
+            rows=[],
+            status="empty",
+            window_key=resolved.window_key,
+            window_days=resolved.window_days,
+        )
+    live_days = _live_window_days(window)
+    if live_days is not None:
+        live = live_ranking(
+            conn,
+            pub=pub,
+            variable=variable,
+            day_ahead=day_ahead,
+            window_days=live_days,
+        )
+        return LeaderboardResult(
+            rows=list(live.values()),
+            status="live",
+            window_key=f"live:{live_days}d",
+            window_days=live_days,
+            evidence_through=pub.cutoff,
+            publication_id=pub.id,
+        )
+    window_key, window_days = (
+        ("w:all", None)
+        if window == "all"
+        else (f"w:{pub.window_days}", pub.window_days)
+    )
+    published = published_ranking(
+        conn,
+        pub=pub,
+        variable=variable,
+        day_ahead=day_ahead,
+        window_key=window_key,
+    )
+    return LeaderboardResult(
+        rows=list(published.values()),
+        status="hit",
+        window_key=window_key,
+        window_days=window_days,
+        evidence_through=pub.cutoff,
+        publication_id=pub.id,
+    )
+
+
+def _live_window_days(window: str) -> int | None:
+    """N for an ``Nd`` window token, else None (``resolve_window``'s test)."""
+    if window.endswith("d") and window[:-1].isdigit():
+        return int(window[:-1])
+    return None
 
 
 def _site_enabled(conn: sqlite3.Connection, site_id: int) -> bool:

@@ -379,19 +379,19 @@ def _leaderboard_no_cell(conn: sqlite3.Connection) -> tuple[int, ...]:
 
 _O2_LEADERBOARD_CASES = [
     pytest.param(
-        "rolling", _leaderboard_rolling_hit, "rolling", 5, id="leaderboard-rolling-hit"
+        "rolling", _leaderboard_rolling_hit, "rolling", 6, id="leaderboard-rolling-hit"
     ),
-    pytest.param("all", _leaderboard_all_hit, "all", 4, id="leaderboard-all-hit"),
+    pytest.param("all", _leaderboard_all_hit, "all", 5, id="leaderboard-all-hit"),
     pytest.param("7d", _leaderboard_rolling_hit, "7d", 3, id="leaderboard-7d-live"),
     pytest.param(
         "disabled",
         _leaderboard_disabled_site,
         "rolling",
-        2,
+        3,
         id="leaderboard-disabled-site-empty",
     ),
     pytest.param(
-        "no-cell", _leaderboard_no_cell, "rolling", 3, id="leaderboard-no-cell-empty"
+        "no-cell", _leaderboard_no_cell, "rolling", 4, id="leaderboard-no-cell-empty"
     ),
 ]
 
@@ -413,6 +413,7 @@ def test_o2_leaderboard_statement_shape(
     real = _sql_trace(conn, _call)
     assert real[0] == "BEGIN DEFERRED"
     assert real[1] == "PRAGMA user_version"
+    assert real[2] == "SELECT value FROM runtime_state WHERE key = 'daily_close_on_at'"
     assert real[-1] == "ROLLBACK"
     unbracketed = real[2:-1]
     if window == "7d":
@@ -457,13 +458,13 @@ def _composite_no_cell(conn: sqlite3.Connection) -> tuple[int, ...]:
 
 
 _O2_COMPOSITE_CASES = [
-    pytest.param(_composite_rolling_hit, "rolling", 5, id="composite-rolling-hit"),
-    pytest.param(_composite_all_hit, "all", 4, id="composite-all-hit"),
+    pytest.param(_composite_rolling_hit, "rolling", 6, id="composite-rolling-hit"),
+    pytest.param(_composite_all_hit, "all", 5, id="composite-all-hit"),
     pytest.param(_composite_rolling_hit, "7d", 3, id="composite-7d-live"),
     pytest.param(
-        _composite_disabled_site, "rolling", 3, id="composite-disabled-site-empty"
+        _composite_disabled_site, "rolling", 4, id="composite-disabled-site-empty"
     ),
-    pytest.param(_composite_no_cell, "rolling", 2, id="composite-no-cell-empty"),
+    pytest.param(_composite_no_cell, "rolling", 3, id="composite-no-cell-empty"),
 ]
 
 
@@ -483,6 +484,7 @@ def test_o2_composite_statement_shape(
     real = _sql_trace(conn, _call)
     assert real[0] == "BEGIN DEFERRED"
     assert real[1] == "PRAGMA user_version"
+    assert real[2] == "SELECT value FROM runtime_state WHERE key = 'daily_close_on_at'"
     assert real[-1] == "ROLLBACK"
     unbracketed = real[2:-1]
     if window == "7d":
