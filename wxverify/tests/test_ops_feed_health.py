@@ -612,7 +612,7 @@ def test_backfill_htmx_fragment_does_not_load_ops(
         assert "load_ops" not in called, (
             "HTMX backfill fragment still runs the full ops context"
         )
-        assert "load_backfill" in called
+        assert "load_backfill_panel" in called
         assert "Backfill Progress" in resp.text
         assert (
             db.read_sync(
@@ -668,7 +668,7 @@ def test_backfill_site_htmx_fragment_does_not_load_ops(
         assert "load_ops" not in called, (
             "HTMX backfill fragment still runs the full ops context"
         )
-        assert "load_backfill" in called
+        assert "load_backfill_panel" in called
         assert "Backfill Target" in resp.text
         assert (
             db.read_sync(

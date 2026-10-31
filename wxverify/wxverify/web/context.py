@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from wxverify import close_monitor
 from wxverify.collection.budget import (
     current_billing_day,
     effective_daily_call_limit,
@@ -26,10 +27,12 @@ from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import pinned_read_snapshot
 from wxverify.db.queue import ACTIVE_JOB_SQL
 from wxverify.db.site_days import (
+    DayRecord,
     closed_through,
     current_day,
     daily_close_on,
     day_record,
+    zone_flagged,
 )
 from wxverify.db.tz_generations import (
     correction_job_key,
@@ -55,6 +58,14 @@ from wxverify.worker.access_hold import (
     ACCESS_KIND_LABELS,
     ACCESS_KINDS,
     read_access_record,
+)
+from wxverify.worker.close_chain import (
+    CloseStatus,
+    CollectionTry,
+    PublicationRecord,
+    close_status,
+    collection_tries,
+    stage_log,
 )
 
 
@@ -285,6 +296,63 @@ class ObservationHealthRow:
     status: str
     last_obs_at: str | None
     enabled_station_count: int
+    #: With the daily close on, the site's ``closed_through`` date (plan
+    #: §10.1); None with the close off, and while no day is done.
+    closed_through: str | None = None
+
+
+@dataclass(frozen=True)
+class CloseDayRow:
+    """One day on the close status panel (plan §10.2)."""
+
+    local_date: str
+    #: P1's state in words, e.g. "closing, attempt 1 of 2".
+    state: str
+    #: P1's ``attempts``, 0 to 2.
+    attempts: int
+    #: P1's ``retry_at``, in UTC.
+    retry_at: str | None
+    #: P1's ``last_failure``.
+    failure: str | None
+    #: The blocking stage (R3.4) through ``stage_text``, for a day not done.
+    stage: str | None
+    #: Since when the stage runs or waits, or a failed stage's start, queue
+    #: wait and end (R3.5).
+    stage_line: str | None
+    #: A closed day's publication record (R3.7) in words, with its time.
+    publication: str | None
+    #: "zone changeover, not scored", "zone changes on <date>: that day is
+    #: not scored" or "scored under its own zone, <zone>".
+    marks: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ClosePanelRow:
+    """One site on the close status panel (plan §10.2)."""
+
+    site_id: int
+    site_name: str
+    enabled: bool
+    #: Newest first.
+    days: tuple[CloseDayRow, ...]
+    #: The site's newest collection try (R3.6) in words.
+    latest_try: str | None
+    #: "no day closed yet", "site disabled", or the zone note.
+    note: str | None
+
+
+@dataclass(frozen=True)
+class ClosePanel:
+    """The close status panel, shown on Ops while the close is on (§10.2)."""
+
+    #: One per site, in ``load_backfill``'s order.
+    rows: tuple[ClosePanelRow, ...]
+    #: "<id>: <detail>" per tripped close alert, alert 7's "recovered" line,
+    #: and alert 6's next try and full list of days affected.
+    alert_lines: tuple[str, ...]
+    #: "Close status unavailable: <Type>: <msg>" when the read raised
+    #: something other than ``sqlite3.Error``; the panel then shows only it.
+    unavailable: str | None = None
 
 
 @dataclass(frozen=True)
@@ -665,8 +733,18 @@ def _coverage_cell(coverage: Coverage | None, day_ahead: int) -> CoverageCell:
 
 
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
+    """The Ops page's context (plan §10).
+
+    Reads ``now`` and the daily close's switch once, at its start, and
+    passes the answer to every panel that has two views, so the page never
+    mixes them. With the close on, the time-zone correction panel is not
+    loaded (§10.3) and ``close_panel`` holds the close status panel; with it
+    off the panels are today's and ``close_panel`` is None.
+    """
     from wxverify.verification.publish_hold import read_publish_hold
 
+    now = utc_now()
+    close_on = daily_close_on(conn)
     sites = load_sites(conn)
     return {
         "sites": sites,
@@ -678,11 +756,31 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
             for provider, present in sorted(key_status().items())
         ],
         "access_holds": load_access_holds(conn),
-        "observation_health": load_observation_health(conn),
+        "observation_health": load_observation_health(conn, close_on=close_on),
         "station_trust": load_station_trust(conn),
         "wind_history": load_wind_history(conn),
         "publish_hold": read_publish_hold(conn),
-        "timezone_correction": load_timezone_correction(conn, sites),
+        "timezone_correction": (
+            [] if close_on else load_timezone_correction(conn, sites)
+        ),
+        "close_on": close_on,
+        "close_panel": load_close_status(conn, now, close_on=close_on),
+    }
+
+
+def load_backfill_panel(conn: sqlite3.Connection) -> dict[str, object]:
+    """The backfill panel alone, in the same view as the page (plan §10.2).
+
+    What ``render_backfill`` renders after a button press: ``rows``
+    (``load_backfill``), ``close_on`` and ``close_panel``, with ``now`` and
+    the switch read once, as ``load_ops`` reads them.
+    """
+    now = utc_now()
+    close_on = daily_close_on(conn)
+    return {
+        "rows": load_backfill(conn),
+        "close_on": close_on,
+        "close_panel": load_close_status(conn, now, close_on=close_on),
     }
 
 
@@ -872,10 +970,21 @@ def load_backfill(conn: sqlite3.Connection) -> list[BackfillRow]:
     ]
 
 
-def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthRow]:
+def load_observation_health(
+    conn: sqlite3.Connection, *, close_on: bool
+) -> list[ObservationHealthRow]:
+    """Each site's Observation Status row (plan §10.1).
+
+    With the daily close off: today's query, ``sites.last_obs_at`` and the
+    status "never run / due" while it is NULL. With it on: the same query
+    without ``s.last_obs_at``, the site's ``closed_through`` in its place
+    and the status "no day closed yet" while it is None. "site disabled"
+    and "no enabled stations" come first in both views.
+    """
+    last_obs_column = "" if close_on else " s.last_obs_at,"
     rows = conn.execute(
-        """
-        SELECT s.id, s.name, s.enabled, s.last_obs_at,
+        f"""
+        SELECT s.id, s.name, s.enabled,{last_obs_column}
                COALESCE(station_counts.n, 0) AS enabled_station_count
         FROM sites s
         LEFT JOIN (
@@ -890,27 +999,430 @@ def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthR
     ).fetchall()
     out: list[ObservationHealthRow] = []
     for row in rows:
+        site_id = int(row["id"])
         enabled_station_count = int(row["enabled_station_count"])
+        last_obs_at: str | None = None
+        through: date | None = None
+        if close_on:
+            through = closed_through(conn, site_id)
+        elif row["last_obs_at"] is not None:
+            last_obs_at = str(row["last_obs_at"])
         if not bool(row["enabled"]):
             status = "site disabled"
         elif enabled_station_count == 0:
             status = "no enabled stations"
-        elif row["last_obs_at"] is None:
+        elif close_on:
+            status = "no day closed yet" if through is None else "ok"
+        elif last_obs_at is None:
             status = "never run / due"
         else:
             status = "ok"
         out.append(
             ObservationHealthRow(
-                site_id=int(row["id"]),
+                site_id=site_id,
                 site_name=str(row["name"]),
                 status=status,
-                last_obs_at=None
-                if row["last_obs_at"] is None
-                else str(row["last_obs_at"]),
+                last_obs_at=last_obs_at,
                 enabled_station_count=enabled_station_count,
+                closed_through=None if through is None else through.isoformat(),
             )
         )
     return out
+
+
+# A done day shows on the close status panel for this long after its
+# ``done_at``, as alerts 1 and 2 show it (plan §5.1, §10.2).
+_CLOSE_PANEL_DONE_WINDOW: Final = timedelta(days=close_monitor.CLOSE_ALERT_DAYS)
+
+# Alert 6's id: the budget group's condition, whose close part the panel
+# shows (plan §6.4, §10.2).
+_ACCESS_REFUSED_ID: Final = "weathercom_access_refused"
+
+
+def _parse_stamp(value: str | None) -> datetime | None:
+    """``parse_utc(value)``, or None for NULL or a value that does not read."""
+    if value is None:
+        return None
+    try:
+        return parse_utc(value)
+    except ValueError:
+        return None
+
+
+def _utc_text(value: datetime | None) -> str:
+    """``value`` as stored, in UTC, or "unknown" when it is None."""
+    return "unknown" if value is None else isoformat_utc(value)
+
+
+def _wait_text(seconds: float) -> str:
+    """A queue wait in whole seconds, as "5 s", "2 min 5 s" or "1 h 2 min"."""
+    total = max(0, round(seconds))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    parts = [f"{hours} h"] if hours else []
+    if minutes:
+        parts.append(f"{minutes} min")
+    if secs or not parts:
+        parts.append(f"{secs} s")
+    return " ".join(parts)
+
+
+def _missed_why(record: DayRecord, status: CloseStatus | None) -> str:
+    """Why a day was missed, worded as alert 1 words it (plan §5.2, §10.2).
+
+    A changeover day, which alert 1 never names, reads "zone changeover".
+    """
+    failure = (
+        "no reason recorded" if record.last_failure is None else record.last_failure
+    )
+    reason = record.missed_reason
+    if reason == "never_attempted":
+        return "the close never ran (the add-on was not running when it was due)"
+    if reason == "retry_not_run":
+        return (
+            "the retry fell due while the add-on was not running;"
+            f" attempt 1 failed: {failure}"
+        )
+    if reason == "retry_failed":
+        stage = None if status is None else status.blocking_stage
+        return (
+            f"both attempts failed, the retry at {close_monitor.stage_text(stage)}:"
+            f" {failure}"
+        )
+    if reason == "zone_changeover":
+        return "zone changeover"
+    return "unreadable missed_reason"
+
+
+def _close_day_state(
+    record: DayRecord, status: CloseStatus | None, now: datetime
+) -> str:
+    """P1's state of the day in words (plan §10.2).
+
+    An ``open`` day reads "collecting", "waiting for the close" once its
+    end has passed, and "not started" before its start (a changeover day
+    still to come).
+    """
+    if record.state == "open":
+        if now < record.day_start_utc:
+            return "not started"
+        if now < record.day_end_utc:
+            return "collecting"
+        return "waiting for the close"
+    if record.state == "closing":
+        return f"closing, attempt {record.attempts} of 2"
+    if record.state == "retry_due":
+        return f"attempt 1 failed; retry due {_utc_text(record.retry_at)}"
+    if record.state == "closed":
+        return "closed"
+    return f"missed: {_missed_why(record, status)}"
+
+
+def _close_day_stage(
+    conn: sqlite3.Connection,
+    record: DayRecord,
+    status: CloseStatus | None,
+    now: datetime,
+) -> tuple[str | None, str | None]:
+    """The blocking stage and the stage line of a day not done (§10.2).
+
+    None for a done day and for a day still collecting. A stage running or
+    waiting to run (``open`` after its end, ``closing``): "stage <n> <name>
+    since <t>", <t> the current attempt's ``last_progress_at``, or the
+    day's end when no attempt has begun. A failed stage (``retry_due``):
+    its stage-log row, "stage <n> <name>, started <t>, waited <w> in the
+    queue, ended <e>"; no line when the row is not found.
+    """
+    if record.state in ("closed", "missed") or (
+        record.state == "open" and now < record.day_end_utc
+    ):
+        return None, None
+    stage = None if status is None else status.blocking_stage
+    text = close_monitor.stage_text(stage)
+    if record.state == "retry_due":
+        run = next(
+            (
+                row
+                for row in reversed(
+                    stage_log(
+                        conn, site_id=record.site_id, local_date=record.local_date
+                    )
+                )
+                if row.stage == stage
+                and row.attempt == record.attempts
+                and row.outcome == "failed"
+            ),
+            None,
+        )
+        if run is None:
+            return text, None
+        return text, (
+            f"{text}, started {isoformat_utc(run.started_at)}, waited"
+            f" {_wait_text(run.queue_wait_s)} in the queue, ended"
+            f" {isoformat_utc(run.ended_at)}"
+        )
+    current = (
+        None
+        if status is None
+        else next(
+            (row for row in status.attempt_records if row.attempt == status.attempts),
+            None,
+        )
+    )
+    since = record.day_end_utc if current is None else current.last_progress_at
+    return text, f"{text} since {isoformat_utc(since)}"
+
+
+def _publication_text(publication: PublicationRecord | None) -> str | None:
+    """A closed day's publication record (R3.7) in words (plan §10.2)."""
+    if publication is None:
+        return None
+    reason = (
+        "no reason recorded"
+        if publication.last_failure is None
+        else publication.last_failure
+    )
+    if publication.state == "pending":
+        return f"publication queued since {isoformat_utc(publication.opened_at)}"
+    if publication.state == "building":
+        started = publication.started_at or publication.opened_at
+        return f"publishing since {isoformat_utc(started)}"
+    if publication.state == "published":
+        return f"published {_utc_text(publication.finished_at)}"
+    if publication.state == "retry_due":
+        return (
+            f"publication attempt 1 failed: {reason}; retry due"
+            f" {_utc_text(publication.retry_at)}"
+        )
+    if publication.state == "failed":
+        return f"publication failed {_utc_text(publication.finished_at)}: {reason}"
+    return "included in a later publication"
+
+
+def _close_day_marks(
+    conn: sqlite3.Connection, record: DayRecord, now: datetime
+) -> tuple[str, ...]:
+    """The day's zone marks (plan §10.2; P1 6.4, 6.5)."""
+    marks: list[str] = []
+    if record.zone_changeover:
+        if now < record.day_start_utc:
+            marks.append(
+                f"zone changes on {record.local_date.isoformat()}: that day is not"
+                " scored"
+            )
+        else:
+            marks.append("zone changeover, not scored")
+    if record.state == "closed" and zone_flagged(
+        conn, record.site_id, record.local_date
+    ):
+        marks.append(f"scored under its own zone, {record.timezone}")
+    return tuple(marks)
+
+
+def _close_day_row(
+    conn: sqlite3.Connection, record: DayRecord, now: datetime
+) -> CloseDayRow:
+    """One day on the close status panel (plan §10.2)."""
+    status = close_status(
+        conn, site_id=record.site_id, local_date=record.local_date, now_utc=now
+    )
+    stage, stage_line = _close_day_stage(conn, record, status, now)
+    return CloseDayRow(
+        local_date=record.local_date.isoformat(),
+        state=_close_day_state(record, status, now),
+        attempts=record.attempts,
+        retry_at=None if record.retry_at is None else isoformat_utc(record.retry_at),
+        failure=record.last_failure,
+        stage=stage,
+        stage_line=stage_line,
+        publication=(
+            _publication_text(status.publication)
+            if status is not None and record.state == "closed"
+            else None
+        ),
+        marks=_close_day_marks(conn, record, now),
+    )
+
+
+def _close_panel_days(
+    conn: sqlite3.Connection,
+    site_id: int,
+    through: date | None,
+    current: DayRecord | None,
+    now: datetime,
+) -> list[DayRecord]:
+    """The days the panel shows for one enabled site, newest first (§10.2).
+
+    The day that holds ``now``, every day not done that has ended, every
+    done day whose ``done_at`` is within ``CLOSE_ALERT_DAYS`` (one whose
+    ``done_at`` does not read is kept), and the next day when it is a
+    changeover day. Walks P1's ``day_record`` date by date, as records
+    follow one another one date apart: down from ``closed_through`` for the
+    done days, then up from the first day not done; with no day done, that
+    is the site's first record, found by walking down from the current day,
+    and with no current day either there is none.
+    """
+    one_day = timedelta(days=1)
+    found: dict[date, DayRecord] = {}
+    start: date | None = None
+    if through is not None:
+        local_date = through
+        while (record := day_record(conn, site_id, local_date)) is not None:
+            done_at = _parse_stamp(record.done_at)
+            if done_at is not None and now - done_at > _CLOSE_PANEL_DONE_WINDOW:
+                break
+            found[record.local_date] = record
+            local_date -= one_day
+        start = through + one_day
+    elif current is not None:
+        start = current.local_date
+        while day_record(conn, site_id, start - one_day) is not None:
+            start -= one_day
+    if start is not None:
+        local_date = start
+        while (record := day_record(conn, site_id, local_date)) is not None:
+            if record.day_start_utc > now:
+                break
+            found[record.local_date] = record
+            local_date += one_day
+    if current is not None:
+        following = day_record(conn, site_id, current.local_date + one_day)
+        if (
+            following is not None
+            and following.zone_changeover
+            and now < following.day_start_utc
+        ):
+            found[following.local_date] = following
+    return [found[key] for key in sorted(found, reverse=True)]
+
+
+def _latest_try_text(tries: list[CollectionTry]) -> str | None:
+    """The newest collection try (R3.6) in words (plan §10.2)."""
+    if not tries:
+        return None
+    latest = max(tries, key=lambda attempt: attempt.tried_at)
+    when = isoformat_utc(latest.tried_at)
+    if latest.slot == "gap_fill":
+        return f"last gap-fill try {when}: {latest.outcome}"
+    return (
+        f"last 5-minute try {when}: {latest.outcome}, {latest.readings_kept} readings"
+    )
+
+
+def _close_panel_row(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    now: datetime,
+) -> ClosePanelRow:
+    """One site's part of the close status panel (plan §10.2)."""
+    site_id = int(row["id"])
+    site_name = str(row["name"])
+    if not bool(row["enabled"]):
+        return ClosePanelRow(
+            site_id=site_id,
+            site_name=site_name,
+            enabled=False,
+            days=(),
+            latest_try=None,
+            note="site disabled",
+        )
+    through = closed_through(conn, site_id)
+    current = current_day(conn, site_id, now_utc=now)
+    notes: list[str] = []
+    if through is None:
+        notes.append(
+            "no day closed yet"
+            if current is not None
+            else "no day closed yet; the first day has not started"
+        )
+    try:
+        ZoneInfo(str(row["timezone"]))
+    except (ZoneInfoNotFoundError, ValueError):
+        notes.append("the site's zone cannot be read; new days cannot be created")
+    records = _close_panel_days(conn, site_id, through, current, now)
+    tries = [
+        attempt
+        for record in records
+        for attempt in collection_tries(
+            conn, site_id=site_id, local_date=record.local_date
+        )
+    ]
+    return ClosePanelRow(
+        site_id=site_id,
+        site_name=site_name,
+        enabled=True,
+        days=tuple(_close_day_row(conn, record, now) for record in records),
+        latest_try=_latest_try_text(tries),
+        note="; ".join(notes) if notes else None,
+    )
+
+
+def _close_alert_lines(conn: sqlite3.Connection, now: datetime) -> tuple[str, ...]:
+    """The panel's alert lines, read in the caller's read (plan §10.2).
+
+    "<id>: <detail>" for each tripped alert of ``close_alerts`` and
+    ``station_silent``, alert 7's "recovered" line while it shows, and
+    alert 6's close part from ``access_days_affected``: its next try and
+    its full list of days affected. The monitor's start-up grace and its
+    toggles do not apply.
+    """
+    lines: list[str] = []
+    alerts = [
+        *close_monitor.close_alerts(conn, now),
+        close_monitor.station_silent(conn, now, close_on=True),
+    ]
+    for alert in alerts:
+        if alert.tripped:
+            lines.append(
+                alert.id if alert.detail is None else f"{alert.id}: {alert.detail}"
+            )
+        elif alert.recovered_at is not None and alert.detail is not None:
+            lines.append(f"{alert.id}: {alert.detail}")
+    access = close_monitor.access_days_affected(conn, now)
+    parts: list[str] = []
+    if access.next_try:
+        parts.append(f"next try: {', '.join(access.next_try)}")
+    if access.days:
+        parts.append(f"days affected: {', '.join(access.days)}")
+    if parts:
+        lines.append(f"{_ACCESS_REFUSED_ID}: {'; '.join(parts)}")
+    return tuple(lines)
+
+
+def load_close_status(
+    conn: sqlite3.Connection, now: datetime, *, close_on: bool
+) -> ClosePanel | None:
+    """The close status panel (plan §10.2), or None with the close off.
+
+    One row per site, in ``load_backfill``'s order: a disabled site reads
+    "site disabled" and nothing else; an enabled site has its recent days
+    (``_close_panel_days``), its newest collection try and its notes. Then
+    the alert lines. Day states come only from P1's reads and the close's
+    from P3's. The whole read is wrapped: an ``Exception`` other than
+    ``sqlite3.Error`` gives a panel that shows only "Close status
+    unavailable: <Type>: <msg>", so the rest of Ops renders; a
+    ``sqlite3.Error`` propagates as every other panel's does.
+    """
+    if not close_on:
+        return None
+    try:
+        sites = conn.execute(
+            """
+            SELECT id, name, enabled, timezone
+            FROM sites
+            ORDER BY name COLLATE NOCASE
+            """
+        ).fetchall()
+        rows = tuple(_close_panel_row(conn, row, now) for row in sites)
+        return ClosePanel(rows=rows, alert_lines=_close_alert_lines(conn, now))
+    except sqlite3.Error:
+        raise
+    except Exception as exc:
+        return ClosePanel(
+            rows=(),
+            alert_lines=(),
+            unavailable=f"Close status unavailable: {type(exc).__name__}: {exc}",
+        )
 
 
 def _station_trust_limits(

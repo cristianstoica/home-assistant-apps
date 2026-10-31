@@ -1,7 +1,21 @@
 <section class="panel" id="backfill-panel">
   {% set backfill_rows = rows if rows is defined else backfill %}
+  {% macro backfill_button(site_id) %}
+                <button
+                  type="button"
+                  hx-post="{{ url('/api/sites/' ~ site_id ~ '/backfill') }}"
+                  hx-ext="json-enc"
+                  hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
+                  hx-target="#backfill-panel"
+                  hx-swap="outerHTML">Backfill</button>
+  {% endmacro %}
+  {% if close_on and close_panel %}
+  <h2>Close Status</h2>
+  <p class="panel-hint">Each site's recent days: the state, the retry time and any failure.</p>
+  {% else %}
   <h2>Backfill Progress</h2>
   <p class="panel-hint">How far each site's history has been filled in, and controls to fetch more.</p>
+  {% endif %}
   <div class="button-row">
     <button
       type="button"
@@ -11,7 +25,48 @@
       hx-target="#backfill-panel"
       hx-swap="outerHTML">Catch up</button>
   </div>
-  {% if backfill_rows %}
+  {% if close_on and close_panel %}
+    {% if close_panel.unavailable %}
+      <p class="empty">{{ close_panel.unavailable }}</p>
+    {% elif close_panel.rows %}
+      {% for site in close_panel.rows %}
+        <h3>{{ site.site_name }}</h3>
+        {{ backfill_button(site.site_id) }}
+        {% if site.note %}<p class="panel-hint">{{ site.note }}</p>{% endif %}
+        {% if site.latest_try %}<p class="panel-hint">{{ site.latest_try }}</p>{% endif %}
+        {% if site.days %}
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Date</th><th>State</th><th>Stage</th><th>Failure</th><th>Publication</th><th>Marks</th></tr></thead>
+              <tbody>
+                {% for day in site.days %}
+                  <tr>
+                    <td>{{ day.local_date }}</td>
+                    <td>{{ day.state }}</td>
+                    <td>{{ day.stage_line or day.stage or "" }}</td>
+                    <td>{{ day.failure or "" }}</td>
+                    <td>{{ day.publication or "" }}</td>
+                    <td>{{ day.marks | join("; ") }}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+        {% endif %}
+      {% endfor %}
+      {% if close_panel.alert_lines %}
+        <ul>
+          {% for line in close_panel.alert_lines %}
+            <li>{{ line }}</li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <p class="empty">No close alerts.</p>
+      {% endif %}
+    {% else %}
+      <p class="empty">No sites configured.</p>
+    {% endif %}
+  {% elif backfill_rows %}
     <div class="table-wrap">
       <table>
         <thead><tr><th>Site</th><th>Status</th><th>Through</th><th></th></tr></thead>
@@ -22,13 +77,7 @@
               <td>{{ row.status or "not started" }}</td>
               <td>{{ row.through or "n/a" }}</td>
               <td>
-                <button
-                  type="button"
-                  hx-post="{{ url('/api/sites/' ~ row.site_id ~ '/backfill') }}"
-                  hx-ext="json-enc"
-                  hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'
-                  hx-target="#backfill-panel"
-                  hx-swap="outerHTML">Backfill</button>
+                {{ backfill_button(row.site_id) }}
               </td>
             </tr>
           {% endfor %}

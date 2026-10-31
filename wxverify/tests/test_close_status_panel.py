@@ -20,6 +20,7 @@ from the fixture's ``D``/``NOW``.
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,7 @@ from tests.helpers import (
     D,
     asof_conn,
     day_close_site,
+    seed_active_publication,
     seed_attempt,
     seed_publication_state,
     seed_stage_log,
@@ -74,6 +76,27 @@ def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
 def _make_app(monkeypatch: pytest.MonkeyPatch) -> Any:
     monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
     return create_app(root_path="")
+
+
+_BACKFILL_PANEL_RE = re.compile(
+    r'<section[^>]*id="backfill-panel"[^>]*>.*?</section>', re.DOTALL
+)
+_CSRF_HEADER_RE = re.compile(r'"X-CSRF-Token":\s*"[^"]*"')
+
+
+def _panel_html(html: str) -> str:
+    """Cut out the ``id="backfill-panel"`` section (OP11, plan §10.2)."""
+    match = _BACKFILL_PANEL_RE.search(html)
+    assert match is not None, f"no backfill-panel section in: {html[:400]!r}"
+    return match.group(0)
+
+
+def _normalize_csrf(panel_html: str) -> str:
+    """Each render issues its own CSRF pair (``render``/``render_fragment``
+    in ``wxverify/web/render.py``), so every button's ``hx-headers`` embeds
+    a different token on the page than on a refreshed fragment even when
+    the panel is otherwise identical; blank out only that token."""
+    return _CSRF_HEADER_RE.sub('"X-CSRF-Token": "CSRF"', panel_html)
 
 
 def _close_day(
@@ -242,6 +265,9 @@ def test_op4_publication_state_published_then_failed(
     site_id = day_close_site(conn, close_on=True)
     d_minus_3 = D - timedelta(days=3)
     published_at = NOW - timedelta(hours=2)
+    pub_id = seed_active_publication(
+        conn, site_id=site_id, cutoff=d_minus_3, published_at=published_at
+    )
     seed_publication_state(
         conn,
         site_id=site_id,
@@ -249,6 +275,7 @@ def test_op4_publication_state_published_then_failed(
         state="published",
         opened_at=published_at - timedelta(minutes=5),
         finished_at=published_at,
+        publication_id=str(pub_id),
     )
     panel = load_close_status(conn, NOW, close_on=True)
     assert panel is not None
@@ -513,29 +540,80 @@ def test_op10_close_on_never_loads_timezone_correction(
     )
 
 
+@pytest.mark.parametrize(
+    "close_on",
+    (True, False),
+    ids=("close-on", "close-off"),
+)
 def test_op11_htmx_refresh_matches_the_page(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, close_on: bool
 ) -> None:
-    """OP11 (plan §13.10, §10.2): an htmx press of a button refreshes the
-    close panel to the same view the page itself shows, close on and off
-    (M108)."""
+    """OP11 (plan §13.10, §10.2): an htmx press of each button (Catch up
+    and the per-site Backfill) refreshes the close panel to the same view
+    the page itself shows, close on and off (M108)."""
     conn = _init_tmp_db(tmp_path)
-    site_id = day_close_site(conn, close_on=True)
+    site_id = day_close_site(conn, close_on=close_on)
     monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:
         page = client.get("/ops")
-        fragment = client.post("/api/catchup", headers={"hx-request": "true"})
-    assert page.status_code == 200 and fragment.status_code == 200
-    assert "Close Status" in page.text, (
-        "M108 -> at this assertion: correct = the page itself shows the"
-        " close panel once close_on branches in load_ops, mutant = (not"
-        " yet implemented) -- the page has no 'Close Status' heading today"
-    )
-    assert "Close Status" in fragment.text, (
-        "M108 -> at this assertion: correct = the refreshed fragment"
-        f" (render_backfill -> load_backfill_panel) shows the same close"
-        " panel, mutant = render_backfill passes `rows` only, so the"
-        f" fragment would show the old backfill table instead; site={site_id}"
-    )
+        assert page.status_code == 200
+        csrf = client.get("/api/csrf").json()["csrf_token"]
+        headers = {
+            "Origin": "http://testserver",
+            "X-CSRF-Token": csrf,
+            "HX-Request": "true",
+        }
+        catchup_fragment = client.post("/api/catchup", headers=headers)
+        site_fragment = client.post(f"/api/sites/{site_id}/backfill", headers=headers)
+    assert catchup_fragment.status_code == 200
+    assert site_fragment.status_code == 200
+
+    if close_on:
+        assert "Close Status" in page.text, (
+            "M108 -> at this assertion: correct = the page itself shows the"
+            " close panel once close_on branches in load_ops, mutant = (not"
+            " yet implemented) -- the page has no 'Close Status' heading today"
+        )
+        for fragment, button in (
+            (catchup_fragment, "Catch up"),
+            (site_fragment, "Backfill"),
+        ):
+            assert "Close Status" in fragment.text, (
+                "M108 -> at this assertion: correct = the refreshed fragment"
+                f" (render_backfill -> load_backfill_panel) shows the same"
+                " close panel, mutant = render_backfill passes `rows` only,"
+                f" so the fragment would show the old backfill table instead;"
+                f" site={site_id} button={button!r}"
+            )
+    else:
+        assert "Backfill Progress" in page.text and "Close Status" not in page.text
+        for fragment, button in (
+            (catchup_fragment, "Catch up"),
+            (site_fragment, "Backfill"),
+        ):
+            assert (
+                "Backfill Progress" in fragment.text
+                and "Close Status" not in fragment.text
+            ), (
+                "M108 -> at this assertion: correct = with the close off the"
+                " refreshed fragment keeps showing today's backfill table"
+                f" (no close panel), mutant = site={site_id} button={button!r}"
+                f" fragment={fragment.text[:400]!r}"
+            )
+
+    page_panel = _normalize_csrf(_panel_html(page.text))
+    for fragment, button in (
+        (catchup_fragment, "Catch up"),
+        (site_fragment, "Backfill"),
+    ):
+        fragment_panel = _normalize_csrf(_panel_html(fragment.text))
+        assert fragment_panel == page_panel, (
+            "M108 -> at this assertion: correct = the refreshed panel"
+            " (CSRF token normalized -- the one piece each render issues"
+            " fresh, per wxverify/web/render.py's render/render_fragment)"
+            " equals the page's own panel in the same state, mutant = the"
+            f" two differ; site={site_id} button={button!r}\npage="
+            f"{page_panel!r}\nfragment={fragment_panel!r}"
+        )

@@ -5,13 +5,15 @@
 <section class="page-heading">
   <div>
     <h1>Ops</h1>
-    <p>Feed, budget, backfill, key, and station trust status</p>
+    <p>Feed, budget, {% if close_on %}close{% else %}backfill{% endif %}, key, and station trust status</p>
   </div>
 </section>
 
 <section class="ops-grid">
   {% include "ops/_publish_hold.html" %}
+  {% if not close_on %}
   {% include "ops/_timezone_correction.html" %}
+  {% endif %}
   {% include "ops/_feed_status.html" %}
   {% include "ops/_budget_gauges.html" %}
   {% include "ops/_backfill.html" %}
