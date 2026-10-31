@@ -501,19 +501,44 @@ def test_pb2_a_deleted_date_shrinks_the_sum_not_the_bounds(tmp_path: Path) -> No
 
 def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PB3: a second ``publish`` for the same cutoff returns the first
     id and writes nothing new -- proven by emptying the inputs before the
     second call and showing the first ranking row survives untouched
-    (8.2)."""
+    (8.2).
+
+    The row-unchanged check alone cannot discriminate M66 (the repeat
+    check at step 1 removed): even with it gone, ``_swap``'s OWN repeat
+    check (8.3 step 1, ``scoring/publication.py``'s ``_swap``) still
+    fires on the WRITE side and returns the existing id before any insert,
+    so the stored row survives either way. What step 1's check actually
+    buys is never reaching the BUILD (8.2 steps 2-5) at all on a repeat;
+    with it removed, the second call wastefully rebuilds from the
+    (emptied) inputs although the swap then discards the result. A spy on
+    ``compute_wind_weights`` -- the one pure step 8.2 always reaches,
+    patched the same way PB5/PB6/PB9 inject into it -- counts the builds.
+    """
 
     async def _run() -> None:
+        import wxverify.scoring.publication as pub_module
         from wxverify.scoring.publication import publish
 
         db, writer, conn, site_id, feed_x = _build_base(tmp_path)
+
+        real_compute = pub_module.compute_wind_weights
+        build_calls = {"n": 0}
+
+        def _counting_compute(training):
+            build_calls["n"] += 1
+            return real_compute(training)
+
+        monkeypatch.setattr(pub_module, "compute_wind_weights", _counting_compute)
+
         first_id = await publish(
             db, writer, site_id=site_id, cutoff=CUTOFF, attempt=1, now_utc=NOW
         )
+        assert build_calls["n"] == 1, "fixture bug: the first publish must build once"
         pub = _fetch_publication(conn, site_id, CUTOFF)
         assert pub is not None
         before = dict(_fetch_ranking(conn, pub["id"], feed_x, "temperature", 0, "w:5"))
@@ -531,6 +556,17 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
             now_utc=NOW + timedelta(minutes=5),
         )
         assert second_id == first_id
+        assert build_calls["n"] == 1, (
+            "M66 -> at this assertion: correct = 1 (the repeat check at"
+            " 8.2 step 1 returns the existing id before the build is ever"
+            " reached a second time; compute_wind_weights is the one pure"
+            " step the build always calls, once per build, so this count"
+            " is the build count), mutant M66 (the repeat check removed)"
+            " = 2 (the second publish call reaches the build -- and so"
+            " compute_wind_weights -- even though _swap's own, separate"
+            " repeat check then discards the result and the row below is"
+            " unaffected either way)"
+        )
 
         after_row = _fetch_ranking(conn, pub["id"], feed_x, "temperature", 0, "w:5")
         assert after_row is not None and dict(after_row) == before, (
@@ -539,6 +575,9 @@ def test_pb3_repeat_publish_returns_same_id_and_rebuilds_nothing(
             " nothing else), mutant M66 (the repeat check removed) = the"
             " row gone (its inputs were emptied before the second call) or"
             " an IntegrityError from a duplicate (site_id, cutoff) insert"
+            " -- in fact neither: _swap's own inner repeat check (8.3 step"
+            " 1) still catches it and this row stays unchanged either way;"
+            " the build-count assertion above is M66's actual kill"
         )
         counts = _publication_table_counts(conn, site_id)
         assert counts["publications"] == 1

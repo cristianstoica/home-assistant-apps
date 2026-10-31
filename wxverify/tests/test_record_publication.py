@@ -25,6 +25,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from tests.helpers import D, day_close_site
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
@@ -206,11 +208,26 @@ def _build_site_with_sample(tmp_path: Path) -> tuple[sqlite3.Connection, int, in
 # ---------------------------------------------------------------------------
 
 
-def test_rc1_record_uses_the_active_publication_at_t(tmp_path: Path) -> None:
+def test_rc1_record_uses_the_active_publication_at_t(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """RC1: a D-1 publication published at D 01:30Z (before T, D 07:00Z) is
     active at T -> the record's saved publication_id/cutoff/age (1) match
     it, and leaderboard_status is NULL (the live as-of ranking is not
-    read with the close on, 12)."""
+    read with the close on, 12).
+
+    The ``leaderboard_status`` column is written by its OWN
+    ``if close_on: None else: ...`` check (``verification/record.py``,
+    the line building ``leaderboard_status``), independent of the earlier
+    ``if not close_on and key not in status_cache:`` guard that
+    ``_leaderboard_status_cell`` sits behind (M101's target): with the
+    close on, that first guard merely controls whether the live
+    leaderboard status cell is COMPUTED AT ALL, a wasted read whose result
+    the second, unaffected check then always discards. So a bare
+    ``leaderboard_status is None`` assertion cannot discriminate the
+    mutant -- it is None either way. The spy below observes the guard
+    directly: it must prevent the live read happening in the first place.
+    """
     from wxverify.verification.record import build_forecast_record
 
     conn, site_id, feed_x = _build_site_with_sample(tmp_path)
@@ -223,7 +240,35 @@ def test_rc1_record_uses_the_active_publication_at_t(tmp_path: Path) -> None:
     _seed_ranking(conn, publication_id=publication_id, feed_id=feed_x, window_days=5)
     conn.commit()
 
+    import wxverify.verification.record as record_module
+
+    real_status_in_transaction = record_module.leaderboard_with_status_in_transaction
+    calls = {"n": 0}
+
+    def _counting_status_in_transaction(*args, **kwargs):
+        calls["n"] += 1
+        return real_status_in_transaction(*args, **kwargs)
+
+    monkeypatch.setattr(
+        record_module,
+        "leaderboard_with_status_in_transaction",
+        _counting_status_in_transaction,
+    )
+
     build_forecast_record(conn, site_id, D.isoformat(), now=T)
+
+    assert calls["n"] == 0, (
+        "M101 -> at this assertion: correct = 0 (close on: the live"
+        " leaderboard-status cell is never computed at all, section 12 --"
+        " _leaderboard_status_cell, and so"
+        " leaderboard_with_status_in_transaction, must not even be"
+        " called), mutant M101 (the per-cell guard"
+        " 'if not close_on and key not in status_cache:' loses its 'not"
+        " close_on' term, so it fires as soon as a cell's key is first"
+        " seen, close on or not) = at least 1 call -- the write still"
+        " ends up None (a separate, unaffected check), so this count is"
+        " the only place the mutant is visible"
+    )
 
     row = _fetch_record_row(conn, site_id=site_id, snapshot_local_date=D, target_date=D)
     assert row is not None, "build_forecast_record must write at least one row"
@@ -231,10 +276,10 @@ def test_rc1_record_uses_the_active_publication_at_t(tmp_path: Path) -> None:
     assert row["publication_cutoff"] == CUTOFF_D1.isoformat()
     assert row["publication_age_days"] == 1
     assert row["leaderboard_status"] is None, (
-        "M101 -> at this assertion: correct = None (the close-on record"
-        " never calls _leaderboard_status_cell, section 12), mutant M101"
-        " (the record keeps the as-of ranking with the close on) = a JSON"
-        " object (status/window_key/computed_at) from the live score cache"
+        "the close-on record never calls _leaderboard_status_cell for its"
+        " OWN write of this column (section 12) -- kept as a paired"
+        " positive; the spy above is M101's actual kill, since both"
+        " branches write None here regardless"
     )
 
 

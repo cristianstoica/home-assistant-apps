@@ -374,6 +374,36 @@ def test_tr3_schedule_score_rescore_enqueues_nothing_with_the_close_on() -> None
     assert _table_count(conn, "publications") == 0
 
 
+def test_tr3_enqueue_score_rescore_enqueues_nothing_with_the_close_on() -> None:
+    """TR3 (``enqueue_score_rescore``'s own check, M100): called directly
+    with the close on it must enqueue nothing by itself.
+
+    The fire-and-forget path above (``schedule_score_rescore``/
+    ``drain_pending_rescores``) writes through the process-global
+    ``get_db()`` -- a different connection than this test's own ``conn``
+    -- so that test's job-count assertion cannot observe
+    ``enqueue_score_rescore``'s effect at all, on clean code or on M100.
+    This test calls ``enqueue_score_rescore`` directly on ``conn`` instead,
+    so the observation point actually sees what it writes.
+    """
+    from wxverify.scoring.composite import enqueue_score_rescore
+
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=True, with_records=True)
+    conn.commit()
+
+    enqueue_score_rescore(conn, site_id)
+    conn.commit()
+
+    assert _job_count(conn, site_id) == 0, (
+        "M100 -> at this assertion: correct = 0 (close on:"
+        " enqueue_score_rescore's own check returns without enqueuing),"
+        " mutant M100 (enqueue_score_rescore without its check) = a"
+        f" pair_and_score job was created -- got {_job_count(conn, site_id)}"
+    )
+    assert _table_count(conn, "publications") == 0
+
+
 def test_tr3_per_station_enqueue_enqueues_nothing_with_the_close_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

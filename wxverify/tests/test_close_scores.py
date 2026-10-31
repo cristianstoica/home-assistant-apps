@@ -558,12 +558,13 @@ def test_sd3_day_ahead_from_receipt_date_not_run_label(tmp_path) -> None:  # noq
 
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
-    k0_pairs = [
-        p for p in _close_pairs(conn, site_id, feeds["X"]) if int(p["day_ahead"]) == 0
+    x_pairs_by_label = [
+        p
+        for p in _close_pairs(conn, site_id, feeds["X"])
+        if p["issued_at"] == f"{(D - timedelta(days=1)).isoformat()}T00:00:00Z"
     ]
-    assert k0_pairs, "expected D's own round (k=0) to produce pairs"
-    for p in k0_pairs:
-        assert p["issued_at"] == f"{(D - timedelta(days=1)).isoformat()}T00:00:00Z"
+    assert x_pairs_by_label, "expected D's own round's run label to produce pairs"
+    for p in x_pairs_by_label:
         assert int(p["day_ahead"]) == 0, (
             "M41 -> at this assertion: correct = 0 (day ahead counted from"
             " the download's receipt date D, plan :148), mutant (day ahead"
@@ -1055,6 +1056,24 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
             (site_id, feeds["Y"], label1, valid_at),
         )
 
+    # M52's spike: the highest forecast wind of X's k=1 version sits at
+    # hour=1, one of the 3 gap hours with no observation (so no pair is
+    # ever made there). The correct wind_fc_high, taken over the 21 PAIRED
+    # hours only, must never see this value; the mutant (max over every
+    # forecast hour of the version, paired or not) would pick it up. The
+    # spike must stay within wind's valid range ([0.0, 150.0], see
+    # invalid_forecast_sample_sql in wxverify/collection/forecast_validation
+    # .py) -- a value above 150.0 is dropped before scored_version ever
+    # sees it, so the mutant's whole-version max could never pick it up
+    # either, and the test could not tell the mutant from correct code.
+    spike_valid_at = isoformat_utc(datetime(D.year, D.month, D.day, 1, tzinfo=UTC))
+    spiked = conn.execute(
+        "UPDATE forecast_samples SET value = 140.0 WHERE site_id = ?"
+        " AND feed_id = ? AND variable = 'wind' AND issued_at = ? AND valid_at = ?",
+        (site_id, feeds["X"], label1, spike_valid_at),
+    )
+    assert spiked.rowcount == 1, "fixture bug: expected exactly one row to spike"
+
     score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
 
     x_row = next(
@@ -1084,6 +1103,12 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
         "M52 -> at this assertion: correct = the highest of the 21 PAIRED"
         " forecasts, mutant (wind_fc_high over every forecast hour) would"
         " read a higher value from an hour this day score never paired"
+    )
+    assert x_row["wind_fc_high"] != pytest.approx(140.0), (
+        "M52 -> at this assertion: correct = the highest PAIRED forecast"
+        " (never 140.0, seeded at hour=1, a gap hour with no observation"
+        " and so no pair), mutant (wind_fc_high = max over the WHOLE"
+        " forecast version, paired or not) = 140.0"
     )
     truth_row = conn.execute(
         "SELECT value FROM daily_truth"
@@ -1191,6 +1216,69 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
             " scored_version) = the k=1 temperature pair at D 10:00 takes"
             f" the late value (table={table})"
         )
+
+
+def test_sd12_rerun_with_a_different_clock_replaces_close_records_row(
+    tmp_path,
+) -> None:  # noqa: ARG001
+    """SD12 (M54's discriminating case): the base SD12 test above calls
+    ``score_day`` a second and third time with the SAME ``now_utc`` as the
+    first, so `close_records.scored_at`` is identical across every call
+    regardless of whether the delete is keyed on it -- a mutant that adds
+    ``AND scored_at = ?`` to the ``close_records`` delete (using the
+    CURRENT call's own ``now_utc``) cannot be told apart there, since that
+    value never differs from the row already stored. This variant reruns
+    ``score_day`` with its clock advanced, so the two values differ and
+    the mutant's extra predicate can actually fail to match.
+    """
+    from wxverify.scoring.close_scores import score_day
+
+    conn = asof_conn()
+    site_id, _feeds, record, now_utc, _ids, _gen = _build_base(conn)
+
+    score_day(conn, record=record, attempt=1, truth_version="fp-1", now_utc=now_utc)
+    first_scored_at = conn.execute(
+        "SELECT scored_at FROM close_records WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchone()["scored_at"]
+
+    later_now_utc = now_utc + timedelta(hours=1)
+    record_after_1 = day_record(conn, site_id, D)
+    assert record_after_1 is not None and record_after_1.state == "closing"
+    # On correct code this rerun, with its OWN later now_utc, must succeed
+    # and replace the row -- never raise. Under M54 the close_records
+    # delete gains "AND scored_at = ?" keyed on THIS call's now_utc, which
+    # never matches the earlier row's (still first_scored_at); the earlier
+    # row survives the delete, and the plain INSERT that follows then
+    # collides with it on the (site_id, local_date) PRIMARY KEY.
+    score_day(
+        conn,
+        record=record_after_1,
+        attempt=2,
+        truth_version="fp-1",
+        now_utc=later_now_utc,
+    )
+
+    rows = conn.execute(
+        "SELECT scored_at FROM close_records WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchall()
+    assert len(rows) == 1, (
+        "M54 -> at this assertion: correct = 1 (the rerun's delete removes"
+        " the earlier attempt's close_records row no matter its"
+        " scored_at), mutant (the delete additionally keyed on"
+        " scored_at, which this rerun's later now_utc never matches) ="
+        f" {len(rows)} rows -- or the second score_day call above already"
+        " raised sqlite3.IntegrityError on the close_records insert before"
+        " this SELECT ever ran, which is the same M54 divergence one step"
+        " earlier"
+    )
+    assert rows[0]["scored_at"] != first_scored_at, (
+        "M54 -> at this assertion: correct = the SECOND call's scored_at"
+        f" (the row was replaced), mutant leaves the stale first-call"
+        f" value, {first_scored_at!r}, in place"
+    )
+    assert rows[0]["scored_at"] == isoformat_utc(later_now_utc.replace(microsecond=0))
 
 
 # ---------------------------------------------------------------------------

@@ -1043,6 +1043,51 @@ def test_dl5_no_download_stored_all_day_is_absent(
     if result is not None:
         pytest.fail(f"M23 -> at this assertion: correct = None, mutant = {result!r}")
 
+    # M23 targeted: seed a genuinely stored download on the PREVIOUS day and
+    # confirm S is still absent -- the mutant falls back to it instead of
+    # returning None. The injected precondition is the previous day's own
+    # stored row; the paired positive below confirms that row is found when
+    # asked for directly, so the absence for S is not an ambient no-op.
+    yesterday = S - timedelta(days=1)
+    yesterday_stored_at = _stamp(
+        datetime(yesterday.year, yesterday.month, yesterday.day, 0, 10, tzinfo=UTC)
+    )
+    _seed_download(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        local_date=yesterday,
+        slot="round",
+        round_date=yesterday,
+        round_try=1,
+        started_at=yesterday_stored_at,
+        ended_at=yesterday_stored_at,
+        fetched_at=yesterday_stored_at,
+        outcome="stored",
+        usable=1,
+        inserted=1,
+        labels={str(feed_id): [yesterday_stored_at]},
+    )
+    conn.commit()
+
+    yesterday_result = scored_download(
+        conn, site_id=site_id, feed_id=feed_id, local_date=yesterday
+    )
+    assert yesterday_result is not None, (
+        "fixture sanity: the previous day's stored download must be found"
+        " when asked for directly"
+    )
+    assert yesterday_result.fetched_at == yesterday_stored_at
+
+    result_with_prev_day_data = scored_download(
+        conn, site_id=site_id, feed_id=feed_id, local_date=S
+    )
+    if result_with_prev_day_data is not None:
+        pytest.fail(
+            "M23 -> at this assertion: correct = None, mutant ="
+            f" {result_with_prev_day_data!r}"
+        )
+
     # Paired positive: seed a genuinely stored download the next day and
     # confirm it IS found, so the absence above is not an ambient no-op.
     tomorrow = S + timedelta(days=1)
@@ -1092,6 +1137,25 @@ def test_dl6_a_later_download_of_the_same_label_cannot_add_hours(
     )
     h169_valid = _stamp(
         datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC) + timedelta(hours=169)
+    )
+    # M24 targeted: h169 above has lead_hours=169, past the feed's
+    # max_lead_hours=168 (seed_round_schedule_feeds), so it is excluded by
+    # the lead-hours filter in BOTH clean and mutant code and cannot alone
+    # discriminate the mutant that drops the fetched_at bound. h2 below has
+    # lead_hours=2, well within the lead bound, under the SAME label, but
+    # fetched at second_fetch -- after the scored download's fetched_at --
+    # so only the bound this row targets keeps it out.
+    h2_valid = _stamp(datetime(S.year, S.month, S.day, 2, 0, tzinfo=UTC))
+    _seed_sample(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        variable="temperature",
+        issued_at=label,
+        valid_at=h2_valid,
+        lead_hours=2,
+        value=1.2,
+        fetched_at=second_fetch,
     )
     _seed_sample(
         conn,
@@ -1148,6 +1212,11 @@ def test_dl6_a_later_download_of_the_same_label_cannot_add_hours(
     assert ("temperature", h169_valid) not in version, (
         f"M24 -> at this assertion: correct = h169 absent, mutant = h169 present"
         f" ({version.get(('temperature', h169_valid))!r})"
+    )
+    h2_present = ("temperature", h2_valid) in version
+    assert not h2_present, (
+        "M24 -> at this assertion: correct = h2 absent, mutant = h2 present"
+        f" ({version.get(('temperature', h2_valid))!r})"
     )
     assert ("temperature", h1_valid) in version, "h1 is missing from the version"
     assert ("temperature", h168_valid) in version, "h168 is missing from the version"

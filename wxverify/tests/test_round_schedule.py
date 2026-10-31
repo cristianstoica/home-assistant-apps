@@ -44,7 +44,7 @@ from tests.helpers import (
     subscribe_meteoblue_package,
     tick,
 )
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.queue import claim_next_job, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.tz_generations import ensure_published_generation
@@ -920,6 +920,20 @@ def test_rs12_round_without_a_record_uses_the_latest_records_zone(
     assert no_r_row is None, (
         "M135 -> at this assertion: correct = no row (read-only stand-in),"
         " mutant = a site_days row was added"
+    )
+
+    # M136 targeted: round_state's bound_utc alone does not discriminate
+    # the zone the stand-in is built in here, because _round_start_utc
+    # reads day.timezone (never touched by the swap to sites.timezone),
+    # and the round's configured local time still falls inside the wider,
+    # UTC-zone stand-in bounds the mutant produces. Read schedule_day's own
+    # bounds directly: its day_end_utc must come from L's stored zone
+    # (Etc/GMT-14), not from sites.timezone (now UTC).
+    stand_in = schedule_day(conn, site_id=site_id, local_date=R)
+    expected_day_end = local_day_slots(R, "Etc/GMT-14")[1]
+    assert stand_in.day_end_utc == expected_day_end, (
+        f"M136 -> at this assertion: correct = {expected_day_end.isoformat()},"
+        f" mutant = {stand_in.day_end_utc.isoformat()}"
     )
 
 

@@ -25,6 +25,7 @@ name ``Testsite``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -1110,6 +1111,104 @@ def test_rd7_curve_response_reads_one_publication_version_throughout(
         " own snapshot) = the second call, no longer sharing the first"
         f" call's snapshot, would see the newly-committed D publication"
         f" instead -- got {seen_cutoffs!r}"
+    )
+
+
+def test_rd7_curve_route_itself_reads_one_publication_version_throughout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RD7, routed through the real production code: the test above proves
+    the MECHANISM (a pinned_read_snapshot holds one publication version
+    across calls inside it); it calls
+    ``leaderboard_with_status_in_transaction`` directly inside a
+    manually-opened ``pinned_read_snapshot`` of its own, so a mutant that
+    changes what ``/curve`` itself does (M85: drops
+    ``pinned_read_snapshot`` and reads each of its eight leads through
+    ``leaderboard_with_status``, which opens its own snapshot per call)
+    never runs any of the route's own code and cannot be seen by it.
+
+    This test instead calls ``wxverify.api.routes.dashboard.curve`` itself
+    (the actual ``/curve`` handler, as ``tests/test_write_lock_serialization
+    .py`` calls ``leaderboard`` directly) against a real two-connection
+    file database, with a second connection committing a newer (D)
+    publication right after the FIRST of the eight leads is read -- the
+    same rendezvous as above, but spliced into the route's own call to
+    ``leaderboard_in_snapshot`` (``wxverify.api.routes.dashboard``'s own
+    import, patched by name there), so the divergence is in the route's
+    own code path, not a copy of it.
+    """
+    import wxverify.api.routes.dashboard as dashboard_module
+    from wxverify.api.routes.dashboard import curve
+
+    conn, db_path = _rd7_make_file_db(tmp_path)
+    site_id, _x, _y, _pub_d1 = _rolling_fixture(conn)
+
+    real_in_snapshot = dashboard_module.leaderboard_in_snapshot
+    real_with_status = dashboard_module.leaderboard_with_status
+    seen_cutoffs: list[object] = []
+    committed = {"done": False}
+
+    def _record(result) -> None:
+        seen_cutoffs.append(result.evidence_through)
+        if not committed["done"]:
+            committed["done"] = True
+            blocker = sqlite3.connect(db_path, timeout=0)
+            try:
+                _seed_publication(
+                    blocker, site_id=site_id, cutoff=D, window_days=5, min_n=3
+                )
+                blocker.commit()
+            finally:
+                blocker.close()
+
+    def _spy_in_snapshot(conn_arg, *, site_id, variable, day_ahead, window):
+        result = real_in_snapshot(
+            conn_arg,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
+        _record(result)
+        return result
+
+    def _spy_with_status(conn_arg, *, site_id, variable, day_ahead, window):
+        # Patched too: a mutant that calls this instead of
+        # leaderboard_in_snapshot (M85's own change) must still be seen by
+        # this oracle, not silently miss the spy altogether.
+        result = real_with_status(
+            conn_arg,
+            site_id=site_id,
+            variable=variable,
+            day_ahead=day_ahead,
+            window=window,
+        )
+        _record(result)
+        return result
+
+    monkeypatch.setattr(dashboard_module, "leaderboard_in_snapshot", _spy_in_snapshot)
+    monkeypatch.setattr(dashboard_module, "leaderboard_with_status", _spy_with_status)
+
+    asyncio.run(
+        curve(site=site_id, variable="temperature", window="rolling", lead="D+1", top=5)
+    )
+
+    assert seen_cutoffs, (
+        "fixture bug: the route must call leaderboard_in_snapshot or"
+        " leaderboard_with_status for each of its 8 leads"
+    )
+    assert len(seen_cutoffs) == 8, (
+        f"fixture bug: /curve reads 8 leads, got {len(seen_cutoffs)} spy calls"
+    )
+    assert len(set(seen_cutoffs)) == 1 and seen_cutoffs[0] == _D1, (
+        "M85 -> at this assertion (the route's OWN eight calls, not a"
+        " manual simulation of the mechanism): correct = every one of"
+        " /curve's 8 leaderboard reads reports evidence_through D-1, the"
+        " publication active when /curve's one pinned_read_snapshot"
+        " opened (9.3), mutant M85 (/curve drops pinned_read_snapshot and"
+        " reads each lead through leaderboard_with_status, its own"
+        " snapshot per call) = the leads read after the first would see"
+        f" the newly-committed D publication instead -- got {seen_cutoffs!r}"
     )
 
 
