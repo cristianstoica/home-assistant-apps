@@ -949,6 +949,22 @@ def _pipeline_conditions(
             detail=detail if tripped else None,
         )
 
+    def _provider_down_cond(alert: CloseAlert) -> Condition:
+        # Alert 7's own builder (§5.1, §6.6): `_cond` drops `detail` while
+        # ok, and alert 7's "recovered at" line shows while ok. The start-up
+        # grace still applies: during it the row is `_cond`'s grace row.
+        if grace_active:
+            return _cond(alert.id, alert.tripped, alert.count, alert.detail or "")
+        return Condition(
+            id=alert.id,
+            group="pipeline",
+            ok=not alert.tripped,
+            skipped=False,
+            severity="warning",
+            count=alert.count,
+            detail=alert.detail,
+        )
+
     def _retired(cid: str) -> list[Condition]:
         # A retired check's row in today's place while the close is off;
         # nothing while it is on.
@@ -1014,9 +1030,12 @@ def _pipeline_conditions(
             )
         )
     # Each close alert as a pipeline row, severity warning, through `_cond`,
-    # so the start-up grace holds for it as for every pipeline row (§5.1).
+    # so the start-up grace holds for it as for every pipeline row (§5.1);
+    # alert 7 through its own builder, which keeps its recovered line.
     conditions.extend(
-        _cond(alert.id, alert.tripped, alert.count, alert.detail or "")
+        _provider_down_cond(alert)
+        if alert.id == "provider_down"
+        else _cond(alert.id, alert.tripped, alert.count, alert.detail or "")
         for alert in close_rows
     )
     conditions.extend(close_errors)

@@ -12,23 +12,47 @@ module parses that does not read makes its item trip, with the detail
 ``<item>: unreadable <field>`` in place of the alert's message, so its own
 reading never raises; a ``sqlite3.Error`` propagates to the caller, which
 reports it as ``db_readable``. Day states are read only through
-``wxverify.db.site_days``'s functions; a row that P1's or P3's readers
-cannot parse raises their ``ValueError``, which the caller reports as
+``wxverify.db.site_days``'s functions, and P2's, P3's and P4's data only
+through their public readers; a row that one of those readers cannot
+parse raises its ``ValueError``, which the caller reports as
 ``unexpected_error``.
 """
 
 from __future__ import annotations
 
+import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Final
+from zoneinfo import ZoneInfoNotFoundError
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.site_days import DayRecord, closed_through, day_record
+from wxverify.db.runtime_state import get_runtime_state
+from wxverify.db.site_days import (
+    DayRecord,
+    closed_through,
+    current_day,
+    daily_close_on_at,
+    day_record,
+    day_station_ids,
+)
+from wxverify.db.station_readings import last_five_minute_store
+from wxverify.scoring.publication import Publication, active_publication
+from wxverify.settings.keys import get_number_setting
+from wxverify.verification.record import resolve_snapshot_utc, snapshot_wall_clock
 from wxverify.worker.access_hold import refused_kinds
-from wxverify.worker.close_chain import close_status
+from wxverify.worker.close_chain import (
+    CLOSE_LOG_KEEP_DAYS,
+    AttemptRecord,
+    CloseStatus,
+    CollectionTry,
+    PublicationRecord,
+    close_status,
+    collection_tries,
+    publication_state,
+)
 from wxverify.worker.day_values import day_presence
 
 #: Alert 5's silence threshold, in hours (plan §7.3). Provisional until the
@@ -50,6 +74,14 @@ STATION_ALERT_DAYS: Final[int] = 7
 #: many counted days all have nothing usable for it (plan §5.4, Q12).
 STATION_NOTHING_USABLE_DAYS: Final[int] = 3
 
+#: A closing day whose current attempt has made no progress for more than
+#: this many hours has stalled (plan §6.2 (c)).
+CLOSE_STALL_HOURS: Final[int] = 6
+
+#: Alert 7's "recovered at" line shows for this many hours after the first
+#: answered try of the slot that ended a run of down slots (plan §6.6).
+CLOSE_RECOVERED_SHOW_HOURS: Final[int] = 24
+
 #: The close's stages by number, P3 §8.1's stage titles in lower case (plan
 #: §5.1, "Stage names"). Every line that names a stage prints it through
 #: ``stage_text``.
@@ -68,6 +100,18 @@ CLOSE_STAGE_NAMES: Final[Mapping[int, str]] = {
 _DETAIL_MAX_ITEMS: Final = 5
 
 _STATION_SILENT_ID: Final = "station_silent_today"
+
+_ONE_DAY: Final = timedelta(days=1)
+
+# The daytime-download warning trips after this many refreshes of
+# ``obs_interval_minutes`` with nothing stored (plan §6.5).
+_DAYTIME_MISSED_REFRESHES: Final = 2
+
+# Alert 7's try kinds (plan §6.6): an answered try's outcomes; an outage
+# try's reasons, and a ``provider`` try's detail that makes it one.
+_ANSWERED_OUTCOMES: Final = frozenset({"stored", "no_readings"})
+_OUTAGE_REASONS: Final = frozenset({"network", "backoff"})
+_OUTAGE_HTTP: Final = re.compile(r"http (?:429|5[0-9]{2})")
 
 # Alert 2's quantities in ``daily_truth``, in its line's order, with the label
 # each prints (plan §5.3).
@@ -108,8 +152,9 @@ class CloseAlert:
 
     ``count`` is the number of items tripped (0 while ok); ``detail`` names
     them in a fixed order, at most five then "and N more", and is None while
-    ok. ``recovered_at`` is alert 7's recovery time, None for every other
-    alert.
+    ok, except for alert 7, whose "recovered at <time>" line shows while ok
+    for ``CLOSE_RECOVERED_SHOW_HOURS``. ``recovered_at`` is that recovery
+    time, None for every other alert and outside that window.
     """
 
     id: str
@@ -397,6 +442,410 @@ def _alert(alert_id: str, items: list[str]) -> CloseAlert:
     )
 
 
+def _current_attempt(status: CloseStatus) -> AttemptRecord | None:
+    """The day's current attempt, the one numbered ``attempts``, or None."""
+    return next(
+        (row for row in status.attempt_records if row.attempt == status.attempts),
+        None,
+    )
+
+
+def _stalled_since(status: CloseStatus | None, now: datetime) -> datetime | None:
+    """A stalled close's ``last_progress_at``, or None (plan §6.2 (c)).
+
+    A ``closing`` day has stalled when its current attempt's
+    ``last_progress_at`` is more than ``CLOSE_STALL_HOURS`` before ``now``.
+    A day with no record of its current attempt is not judged.
+    """
+    if status is None or status.state != "closing":
+        return None
+    current = _current_attempt(status)
+    if current is None:
+        return None
+    if now - current.last_progress_at <= timedelta(hours=CLOSE_STALL_HOURS):
+        return None
+    return current.last_progress_at
+
+
+def _late_line(
+    conn: sqlite3.Connection,
+    site_name: str,
+    record: DayRecord,
+    now: datetime,
+    publication: PublicationRecord | None,
+    active: Publication | None,
+) -> str | None:
+    """Alert 4's line for a site whose current day is ``record`` (§6.1).
+
+    T is the day's snapshot time in the day's zone; the expected day E is
+    the day before from T on, two days before until T. None while the
+    active publication reaches E, for a day before the site's first
+    record, and for a day another alert names: ``missed`` (alert 1),
+    ``retry_due``, its publication ``retry_due`` or ``failed``, or a
+    stalled close (§6.2). ``publication`` is the site's latest publication
+    record (R3.7), E's own when its cutoff is E or later.
+    """
+    try:
+        deadline = resolve_snapshot_utc(
+            record.timezone,
+            record.local_date,
+            snapshot_wall_clock(conn, record.site_id),
+        )
+    except (ValueError, ZoneInfoNotFoundError):
+        return f"{site_name}: unreadable timezone"
+    expected = record.local_date - (_ONE_DAY if now >= deadline else 2 * _ONE_DAY)
+    if active is not None and active.cutoff >= expected:
+        return None
+    day = day_record(conn, record.site_id, expected)
+    if day is None or day.state in ("missed", "retry_due"):
+        return None
+    if publication is not None and publication.cutoff < expected:
+        publication = None
+    if publication is not None and publication.state in ("retry_due", "failed"):
+        return None
+    if day.state == "closed":
+        stage: int | None = 7
+        if publication is None:
+            # No publication record opened for E yet: stage 7 has waited
+            # since the day was closed.
+            since = _parse_or_none(day.done_at)
+            if since is None:
+                return f"{site_name}: unreadable done_at"
+        elif publication.state == "building" and publication.started_at is not None:
+            since = publication.started_at
+        else:
+            since = publication.opened_at
+    else:
+        status = close_status(
+            conn, site_id=record.site_id, local_date=expected, now_utc=now
+        )
+        if _stalled_since(status, now) is not None:
+            return None
+        stage = None if status is None else status.blocking_stage
+        current = None if status is None else _current_attempt(status)
+        since = day.day_end_utc if current is None else current.last_progress_at
+    if active is None:
+        reach = "no active publication"
+    else:
+        age = (record.local_date - active.cutoff).days
+        reach = (
+            f"active publication through {active.cutoff.isoformat()}, {age} days old"
+        )
+    return (
+        f"{site_name}: {expected.isoformat()} not published at"
+        f" {isoformat_utc(deadline)}; {reach}; blocked at {stage_text(stage)}"
+        f" since {isoformat_utc(since)}"
+    )
+
+
+def _undone_days(
+    conn: sqlite3.Connection, site_id: int, current: DayRecord | None
+) -> list[DayRecord]:
+    """The site's records not yet done, in date order.
+
+    They follow ``closed_through``: a day is done only once every earlier
+    day is. With no day done yet, they start at the site's first record,
+    found by walking down from the current day; with no current day either
+    (before the first record starts) there is none to judge.
+    """
+    through = closed_through(conn, site_id)
+    if through is not None:
+        local_date = through + _ONE_DAY
+    elif current is not None:
+        local_date = current.local_date
+        while day_record(conn, site_id, local_date - _ONE_DAY) is not None:
+            local_date -= _ONE_DAY
+    else:
+        return []
+    found: list[DayRecord] = []
+    while (record := day_record(conn, site_id, local_date)) is not None:
+        found.append(record)
+        local_date += _ONE_DAY
+    return found
+
+
+def _stage_failed_parts(
+    conn: sqlite3.Connection,
+    undone: list[DayRecord],
+    publication: PublicationRecord | None,
+    active: Publication | None,
+    now: datetime,
+) -> list[str]:
+    """The failed-attempt alert's parts for one site, in date order (§6.2).
+
+    (a) a ``retry_due`` day, its stage from R3.4; (b) the latest
+    publication record in ``retry_due`` or ``failed`` while the active
+    publication does not reach a later day; (c) a stalled ``closing`` day.
+    """
+    parts: list[tuple[date, str]] = []
+    for record in undone:
+        if record.state not in ("retry_due", "closing"):
+            continue
+        status = close_status(
+            conn, site_id=record.site_id, local_date=record.local_date, now_utc=now
+        )
+        day = record.local_date.isoformat()
+        stage = None if status is None else status.blocking_stage
+        if record.state == "retry_due":
+            retry = (
+                "unknown" if record.retry_at is None else isoformat_utc(record.retry_at)
+            )
+            parts.append(
+                (
+                    record.local_date,
+                    f"{day}: attempt 1 failed at {stage_text(stage)}:"
+                    f" {_failure_text(record)}; retry due {retry}",
+                )
+            )
+        elif (since := _stalled_since(status, now)) is not None:
+            parts.append(
+                (
+                    record.local_date,
+                    f"{day}: {stage_text(stage)} has made no progress since"
+                    f" {isoformat_utc(since)}",
+                )
+            )
+    passed = (
+        publication is not None
+        and active is not None
+        and active.cutoff > publication.cutoff
+    )
+    if publication is not None and not passed:
+        cutoff = publication.cutoff.isoformat()
+        reason = (
+            "no reason recorded"
+            if publication.last_failure is None
+            else publication.last_failure
+        )
+        if publication.state == "retry_due":
+            retry = (
+                "unknown"
+                if publication.retry_at is None
+                else isoformat_utc(publication.retry_at)
+            )
+            parts.append(
+                (
+                    publication.cutoff,
+                    f"{cutoff}: publication attempt 1 failed: {reason};"
+                    f" retry due {retry}",
+                )
+            )
+        elif publication.state == "failed":
+            failed = (
+                ""
+                if publication.finished_at is None
+                else f" at {isoformat_utc(publication.finished_at)}"
+            )
+            parts.append(
+                (
+                    publication.cutoff,
+                    f"{cutoff}: publication failed{failed}: {reason}; the"
+                    " previous publication stays in use",
+                )
+            )
+    parts.sort(key=lambda part: part[0])
+    return [text for _, text in parts]
+
+
+def _all_answered_empty(
+    conn: sqlite3.Connection,
+    record: DayRecord,
+    stations: frozenset[int],
+    start: datetime,
+) -> bool:
+    """Whether every station's latest 5-minute try since ``start`` ended
+    ``no_readings`` (plan §6.5).
+
+    Reads the try log of the current day ``record`` and each earlier day
+    whose end lies less than a day before ``start`` (a day's evening tries
+    can end after the day does), up to ``CLOSE_LOG_KEEP_DAYS`` days, the
+    log's own retention. A station with no try since ``start`` makes it
+    False.
+    """
+    days: list[list[CollectionTry]] = []
+    local_date = record.local_date
+    for _ in range(CLOSE_LOG_KEEP_DAYS + 1):
+        day = day_record(conn, record.site_id, local_date)
+        if day is None or day.day_end_utc + _ONE_DAY <= start:
+            break
+        days.append(
+            collection_tries(conn, site_id=record.site_id, local_date=local_date)
+        )
+        local_date -= _ONE_DAY
+    latest: dict[int, CollectionTry] = {}
+    for tries in reversed(days):
+        for attempt in tries:
+            if attempt.kind != "five_minute" or attempt.tried_at < start:
+                continue
+            held = latest.get(attempt.station_id)
+            if held is None or attempt.tried_at >= held.tried_at:
+                latest[attempt.station_id] = attempt
+    return all(
+        station_id in latest and latest[station_id].outcome == "no_readings"
+        for station_id in stations
+    )
+
+
+def _daytime_line(
+    conn: sqlite3.Connection,
+    site_name: str,
+    record: DayRecord,
+    now: datetime,
+    interval: int,
+    floors: list[datetime],
+) -> str | None:
+    """The daytime-download warning's line for one site, or None (§6.5).
+
+    Its start of count is the latest of the site's last 5-minute store,
+    ``floors`` (the worker's start and the close's turn-on) and, on the
+    site's first record, that record's start. It trips when ``now`` is
+    more than ``_DAYTIME_MISSED_REFRESHES`` refreshes past it, for a site
+    with a station on the current day's list, unless ``five_minute`` is
+    refused (alert 6's) or every station answered with no data (alerts 3
+    and 5's).
+    """
+    stations = day_station_ids(conn, record.site_id, record.local_date)
+    if not stations:
+        return None
+    starts = [*floors]
+    store = last_five_minute_store(conn, site_id=record.site_id)
+    if store is not None:
+        starts.append(store)
+    if day_record(conn, record.site_id, record.local_date - _ONE_DAY) is None:
+        starts.append(record.day_start_utc)
+    if not starts:
+        return None
+    start = max(starts)
+    if now - start <= timedelta(minutes=_DAYTIME_MISSED_REFRESHES * interval):
+        return None
+    if any(held.kind == "five_minute" for held in refused_kinds(conn, now)):
+        return None
+    if _all_answered_empty(conn, record, stations, start):
+        return None
+    return (
+        f"{site_name}: no 5-minute readings stored since {isoformat_utc(start)}"
+        f" ({_DAYTIME_MISSED_REFRESHES} refreshes of {interval} min missed)"
+    )
+
+
+@dataclass(frozen=True)
+class _Slot:
+    """One judged collection slot of alert 7 (plan §6.6).
+
+    ``time`` is its earliest try's ``tried_at``; ``answered_at`` its
+    earliest answered try's, None for a down slot (an outage try and no
+    answered one).
+    """
+
+    time: datetime
+    answered_at: datetime | None
+
+
+def _is_outage(attempt: CollectionTry) -> bool:
+    """A network or back-off try, or a ``provider`` 429 or 5xx (§6.6)."""
+    if attempt.reason in _OUTAGE_REASONS:
+        return True
+    return (
+        attempt.reason == "provider"
+        and attempt.detail is not None
+        and _OUTAGE_HTTP.fullmatch(attempt.detail) is not None
+    )
+
+
+def _day_slots(
+    record: DayRecord, tries: list[CollectionTry], interval: int
+) -> list[_Slot]:
+    """The judged slots of one site-day's tries (plan §6.6).
+
+    An evening slot is one ``slot`` value; a gap-fill slot one close
+    attempt; a daytime slot the tries in one refresh interval counted from
+    the day's start. A slot with only tries that are neither answered nor
+    an outage (held, refused, ``call_limit``, another status) is not
+    judged and not returned.
+    """
+    step = timedelta(minutes=interval)
+    groups: dict[tuple[str, int], list[CollectionTry]] = {}
+    for attempt in tries:
+        if attempt.slot == "daytime":
+            key = ("daytime", (attempt.tried_at - record.day_start_utc) // step)
+        elif attempt.slot == "gap_fill":
+            key = ("gap_fill", attempt.close_attempt or 0)
+        else:
+            key = (attempt.slot, 0)
+        groups.setdefault(key, []).append(attempt)
+    slots: list[_Slot] = []
+    for group in groups.values():
+        answered = [a.tried_at for a in group if a.outcome in _ANSWERED_OUTCOMES]
+        if answered or any(_is_outage(a) for a in group):
+            slots.append(
+                _Slot(
+                    time=min(a.tried_at for a in group),
+                    answered_at=min(answered) if answered else None,
+                )
+            )
+    return slots
+
+
+def _slots_newest_first(
+    conn: sqlite3.Connection, current: DayRecord, interval: int
+) -> Iterator[_Slot]:
+    """The site's judged slots, newest first, read day by day on demand.
+
+    Walks down from the current day, up to ``CLOSE_LOG_KEEP_DAYS`` days
+    (the try log's retention) or the site's first record. A day's tries
+    can end after the day does (its evening and gap-fill tries), so once a
+    day is read only its slots timed at or after its end are yielded; the
+    rest wait for the earlier day.
+    """
+    pending: list[_Slot] = []
+    local_date = current.local_date
+    for _ in range(CLOSE_LOG_KEEP_DAYS + 1):
+        record = day_record(conn, current.site_id, local_date)
+        if record is None:
+            break
+        pending.extend(
+            _day_slots(
+                record,
+                collection_tries(conn, site_id=current.site_id, local_date=local_date),
+                interval,
+            )
+        )
+        ready = [slot for slot in pending if slot.time >= record.day_end_utc]
+        pending = [slot for slot in pending if slot.time < record.day_end_utc]
+        yield from sorted(ready, key=lambda slot: slot.time, reverse=True)
+        local_date -= _ONE_DAY
+    yield from sorted(pending, key=lambda slot: slot.time, reverse=True)
+
+
+def _provider_down(
+    conn: sqlite3.Connection, current: DayRecord, now: datetime, interval: int
+) -> tuple[tuple[datetime, int] | None, datetime | None]:
+    """Alert 7 for one site: ``(since, down slots)`` and ``recovered_at``.
+
+    The first is set when the latest judged slot is down: ``since`` the
+    earliest slot of the run of down judged slots, counted. The second is
+    set when the latest judged slot ended such a run with an answered try
+    at most ``CLOSE_RECOVERED_SHOW_HOURS`` ago (its first answered try).
+    """
+    slots = _slots_newest_first(conn, current, interval)
+    latest = next(slots, None)
+    if latest is None:
+        return None, None
+    if latest.answered_at is None:
+        since, count = latest.time, 1
+        for slot in slots:
+            if slot.answered_at is not None:
+                break
+            since, count = slot.time, count + 1
+        return (since, count), None
+    if now - latest.answered_at > timedelta(hours=CLOSE_RECOVERED_SHOW_HOURS):
+        return None, None
+    previous = next(slots, None)
+    if previous is not None and previous.answered_at is None:
+        return None, latest.answered_at
+    return None, None
+
+
 def close_alerts(conn: sqlite3.Connection, now: datetime) -> list[CloseAlert]:
     """The close's alerts, one ``CloseAlert`` per id in plan §5.1's order.
 
@@ -405,13 +854,24 @@ def close_alerts(conn: sqlite3.Connection, now: datetime) -> list[CloseAlert]:
     Alert 2, ``close_day_thin`` (§5.3): a closed day in the same window
     with a daily value not counted. Alert 3, ``station_nothing_usable``
     (§5.4): a station whose newest ``STATION_NOTHING_USABLE_DAYS`` counted
-    days all have nothing usable for a variable. Enabled sites only, and
-    only days with a P1 record, so before any day is done every alert is
-    ok. Called only while the close is on. Read-only.
+    days all have nothing usable for a variable. Alert 4,
+    ``publication_late`` (§6.1): at the snapshot time the active
+    publication does not reach the expected day. ``close_stage_failed``
+    (§6.2): one line per site listing a failed first attempt, a failed
+    publication and a stalled close. ``daytime_download_missed`` (§6.5):
+    no 5-minute readings stored for two refreshes. Alert 7,
+    ``provider_down`` (§6.6): the latest judged collection slot is down;
+    while ok, its "recovered at" line shows for
+    ``CLOSE_RECOVERED_SHOW_HOURS``. Enabled sites only, and only days with
+    a P1 record, so before any day has a state every alert is ok; a site
+    with no record holding ``now`` has no current day, and alerts 4 and 7
+    and the daytime warning leave it out. Called only while the close is
+    on. Read-only.
     """
     missed: list[str] = []
     thin: list[str] = []
-    for site_id, site_name in _enabled_sites(conn):
+    sites = _enabled_sites(conn)
+    for site_id, site_name in sites:
         for record, done_at in reversed(
             _done_days(conn, site_id, now, CLOSE_ALERT_DAYS)
         ):
@@ -437,15 +897,70 @@ def close_alerts(conn: sqlite3.Connection, now: datetime) -> list[CloseAlert]:
         f" {_and_join(finding.variables)} since {finding.since.isoformat()}"
         for finding in _nothing_usable(conn, now)
     ]
+
+    interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
+    # The daytime warning's floors (§6.5): the worker's start, read as the
+    # start-up grace reads it (an unreadable stamp is no floor), and the
+    # time the close was turned on.
+    floors = [
+        stamp
+        for stamp in (
+            _parse_or_none(get_runtime_state(conn, "worker_started_at")),
+            daily_close_on_at(conn),
+        )
+        if stamp is not None
+    ]
+    late: list[str] = []
+    stage_failed: list[str] = []
+    daytime: list[str] = []
+    down: list[str] = []
+    recovered: list[datetime] = []
+    for site_id, site_name in sites:
+        current = current_day(conn, site_id, now_utc=now)
+        publication = publication_state(conn, site_id=site_id)
+        active = active_publication(conn, site_id=site_id, at_utc=isoformat_utc(now))
+        parts = _stage_failed_parts(
+            conn, _undone_days(conn, site_id, current), publication, active, now
+        )
+        if parts:
+            stage_failed.append(f"{site_name}: {'; '.join(parts)}")
+        if current is None:
+            continue
+        line = _late_line(conn, site_name, current, now, publication, active)
+        if line is not None:
+            late.append(line)
+        line = _daytime_line(conn, site_name, current, now, interval, floors)
+        if line is not None:
+            daytime.append(line)
+        run, recovered_at = _provider_down(conn, current, now, interval)
+        if run is not None:
+            down.append(
+                f"{site_name}: weather.com unreachable or failing since"
+                f" {isoformat_utc(run[0])}; down slots: {run[1]}"
+            )
+        elif recovered_at is not None:
+            recovered.append(recovered_at)
+
+    provider = _alert("provider_down", down)
+    if not down and recovered:
+        # Ok, with the recovery line(s) while they show (§6.6).
+        provider = CloseAlert(
+            id="provider_down",
+            tripped=False,
+            count=0,
+            detail=_items_detail(
+                [f"recovered at {isoformat_utc(stamp)}" for stamp in recovered]
+            ),
+            recovered_at=max(recovered),
+        )
     return [
         _alert("close_day_missed", missed),
         _alert("close_day_thin", thin),
         _alert("station_nothing_usable", nothing_usable),
-        # Step 4 piece 3 builds these four (plan §6.1, §6.2, §6.5, §6.6).
-        CloseAlert(id="publication_late", tripped=False, count=0),
-        CloseAlert(id="close_stage_failed", tripped=False, count=0),
-        CloseAlert(id="daytime_download_missed", tripped=False, count=0),
-        CloseAlert(id="provider_down", tripped=False, count=0),
+        _alert("publication_late", late),
+        _alert("close_stage_failed", stage_failed),
+        _alert("daytime_download_missed", daytime),
+        provider,
     ]
 
 

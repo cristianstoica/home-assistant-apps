@@ -978,20 +978,24 @@ def test_ad2_ok_before_t_and_ok_once_published() -> None:
         f" D-2, already published), mutant = tripped={late_before.tripped}"
     )
 
-    seed_publication_state(
+    from wxverify.core.timeutil import isoformat_utc_micro
+
+    published_at = opened_at + timedelta(minutes=1)
+    pub_id = seed_active_publication(
         conn,
         site_id=site_id,
         cutoff=d_minus_1,
-        attempt=1,
-        state="published",
-        opened_at=opened_at,
-        finished_at=opened_at + timedelta(minutes=1),
+        published_at=published_at,
     )
-    seed_active_publication(
-        conn,
-        site_id=site_id,
-        cutoff=d_minus_1,
-        published_at=opened_at + timedelta(minutes=1),
+    conn.execute(
+        "UPDATE close_publications SET state = 'published', publication_id = ?,"
+        " finished_at = ? WHERE site_id = ? AND cutoff = ?",
+        (
+            str(pub_id),
+            isoformat_utc_micro(published_at),
+            site_id,
+            d_minus_1.isoformat(),
+        ),
     )
     at_t = close_alerts(conn, _AD_T)
     late_at_t = next(a for a in at_t if a.id == "publication_late")
@@ -1316,19 +1320,21 @@ def test_ad10_publication_failed_then_recovers() -> None:
     )
 
     t_close1 = _close_d_minus_1(conn, site_id)
+    published_at_1 = t_close1 + timedelta(minutes=5)
+    pub_id_1 = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=d_minus_1,
+        published_at=published_at_1,
+    )
     seed_publication_state(
         conn,
         site_id=site_id,
         cutoff=d_minus_1,
         state="published",
         opened_at=t_close1,
-        finished_at=t_close1 + timedelta(minutes=5),
-    )
-    seed_active_publication(
-        conn,
-        site_id=site_id,
-        cutoff=d_minus_1,
-        published_at=t_close1 + timedelta(minutes=5),
+        finished_at=published_at_1,
+        publication_id=str(pub_id_1),
     )
     alerts_after = close_alerts(conn, _AD_T)
     stage_failed_after = next(a for a in alerts_after if a.id == "close_stage_failed")
@@ -2067,10 +2073,33 @@ def test_pd5_grace_applies_to_alert_7() -> None:
 
     alerts = close_alerts(conn, now)
     down = next(a for a in alerts if a.id == "provider_down")
-    assert not down.tripped and down.detail is None, (
-        "M74 -> at this assertion: correct = ok, no detail (the start-up"
-        " grace), mutant = alert 7's builder skips the grace; tripped="
-        f"{down.tripped}, detail={down.detail!r}"
+    assert down.tripped, (
+        "M74 paired positive -> at this assertion: correct = tripped (no"
+        " grace applied by close_alerts itself), mutant = tripped="
+        f"{down.tripped}"
+    )
+
+    from wxverify.monitor import build_verdict
+
+    verdict = build_verdict(
+        conn,
+        pipeline_enabled=True,
+        budget_enabled=True,
+        db_enabled=True,
+        now=now,
+        export_sweeper_dead=None,
+    )
+    provider_down_cond = next(
+        c
+        for c in verdict["conditions"]  # type: ignore[index]
+        if c["id"] == "provider_down"
+    )
+    assert (
+        provider_down_cond["ok"] is True and provider_down_cond.get("detail") is None
+    ), (
+        "M74 -> at this assertion: correct = ok=True, no detail (the"
+        " 10-minute start-up grace), mutant = alert 7's builder skips the"
+        f" grace; cond={provider_down_cond!r}"
     )
 
 
