@@ -1985,3 +1985,326 @@ def build_record_site_with_sample(
     )
     conn.commit()
     return site_id, feed_id
+
+
+# ---------------------------------------------------------------------------
+# P5's seven role seeds (daily-close plan 2026-10-22-daily-close-alerts-and-
+# pages.md §13.1). Each writes through P3's or P4's own writer where one
+# exists outside a running close, else a plain INSERT with that table's own
+# columns and stamp forms, so a renamed column changes one place. Station
+# ids and dates are synthetic; see ``day_close_site`` above for D/NOW.
+# ---------------------------------------------------------------------------
+
+
+def seed_attempt(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: date,
+    attempt: int,
+    started_at: datetime,
+    last_stage: int = 1,
+    last_progress_at: datetime | None = None,
+    outcome: str = "running",
+    failed_stage: int | None = None,
+    failure_reason: str | None = None,
+    ended_at: datetime | None = None,
+    truth_version: str | None = None,
+) -> None:
+    """R3.1's attempt record (one ``close_attempts`` row, P3 11.3).
+
+    The row behind P3's ``AttemptRecord``: a close attempt (1 or 2) of a
+    site-day, from which P3 derives R3.4's blocking stage and which holds a
+    running stage's ``last_progress_at``. Plain INSERT: no P3 writer builds
+    one outside a running close. ``last_progress_at`` defaults to
+    ``started_at``.
+    """
+    conn.execute(
+        "INSERT INTO close_attempts"
+        " (site_id, local_date, attempt, started_at, last_stage,"
+        "  last_progress_at, outcome, failed_stage, failure_reason, ended_at,"
+        "  truth_version)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            local_date.isoformat(),
+            attempt,
+            isoformat_utc_micro(started_at),
+            last_stage,
+            isoformat_utc_micro(last_progress_at or started_at),
+            outcome,
+            failed_stage,
+            failure_reason,
+            None if ended_at is None else isoformat_utc_micro(ended_at),
+            truth_version,
+        ),
+    )
+
+
+def seed_stage_log(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: date,
+    stage: int,
+    attempt: int,
+    job_id: int | None,
+    enqueued_at: datetime,
+    started_at: datetime,
+    ended_at: datetime,
+    queue_wait_s: float,
+    duration_s: float,
+    outcome: str,
+    reason: str | None = None,
+    detail: str = "{}",
+) -> None:
+    """R3.5's stage-log row (one ``close_stage_log`` row, P3 11.1).
+
+    One finished stage run: its start, end, queue wait and outcome
+    (``completed``, ``failed``, ``superseded`` or ``skipped``). Plain
+    INSERT: P3 writes this only from inside a running close. ``job_id`` is
+    None for stage 1 only (the table's own CHECK).
+    """
+    conn.execute(
+        "INSERT INTO close_stage_log"
+        " (site_id, local_date, attempt, stage, job_id, enqueued_at,"
+        "  started_at, ended_at, queue_wait_s, duration_s, outcome, reason,"
+        "  detail)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            local_date.isoformat(),
+            attempt,
+            stage,
+            job_id,
+            isoformat_utc_micro(enqueued_at),
+            isoformat_utc_micro(started_at),
+            isoformat_utc_micro(ended_at),
+            queue_wait_s,
+            duration_s,
+            outcome,
+            reason,
+            detail,
+        ),
+    )
+
+
+def seed_try(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    kind: str,
+    slot: str,
+    close_attempt: int | None,
+    tried_at: datetime,
+    outcome: str,
+    reason: str | None = None,
+    detail: str | None = None,
+    readings_kept: int = 0,
+    readings_refused: int = 0,
+) -> None:
+    """R3.6's collection-try row (one ``close_try_log`` row, P3 11.2).
+
+    Thin wrapper over P3's own writer, ``record_collection_try``
+    (``worker/close_chain.py``), which exists outside a running close: one
+    weather.com collection try, its station, download kind, slot (evening
+    ``HH:MM``, ``daytime``, or ``gap_fill`` with ``close_attempt``), outcome
+    and reading counts.
+    """
+    from wxverify.worker.close_chain import record_collection_try
+
+    record_collection_try(
+        conn,
+        site_id=site_id,
+        station_id=station_id,
+        local_date=local_date.isoformat(),
+        kind=kind,
+        slot=slot,
+        close_attempt=close_attempt,
+        tried_at=isoformat_utc_micro(tried_at),
+        outcome=outcome,
+        reason=reason,
+        detail=detail,
+        readings_kept=readings_kept,
+        readings_refused=readings_refused,
+    )
+
+
+def seed_publication_state(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    cutoff: date,
+    attempt: int = 1,
+    state: str,
+    opened_at: datetime,
+    started_at: datetime | None = None,
+    retry_at: datetime | None = None,
+    finished_at: datetime | None = None,
+    publication_id: str | None = None,
+    last_failure: str | None = None,
+) -> None:
+    """R3.7's publication record (one ``close_publications`` row, P3 11.5).
+
+    The site-day's publication state (``pending``, ``building``,
+    ``published``, ``retry_due``, ``failed`` or ``superseded``), its
+    ``opened_at``, ``started_at``, ``retry_at``, ``finished_at`` and
+    ``last_failure``. Plain INSERT: P3's own reader, ``publication_record``,
+    is read-only, and the only writer runs inside a running close.
+    """
+    conn.execute(
+        "INSERT INTO close_publications"
+        " (site_id, cutoff, attempt, state, opened_at, started_at, retry_at,"
+        "  finished_at, publication_id, last_failure)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            cutoff.isoformat(),
+            attempt,
+            state,
+            isoformat_utc_micro(opened_at),
+            None if started_at is None else isoformat_utc_micro(started_at),
+            None if retry_at is None else isoformat_utc(retry_at),
+            None if finished_at is None else isoformat_utc_micro(finished_at),
+            publication_id,
+            last_failure,
+        ),
+    )
+
+
+def seed_active_publication(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    cutoff: date,
+    published_at: datetime,
+    first_record_date: date | None = None,
+    window_days: int = 7,
+    window_start_date: date | None = None,
+    wind_start_date: date | None = None,
+    methodology_version: int = 1,
+    scoring_rule: str = "synthetic-rule",
+    wind_method: str = "synthetic-wind",
+    wind_constants: str = "{}",
+    build_started_at: datetime | None = None,
+) -> int:
+    """R4.1's active publication (one ``publications`` row, P4 §16.2).
+
+    What ``active_publication(conn, site_id=…, at_utc=…)`` resolves: the
+    site's publication through ``cutoff``, published at ``published_at``.
+    Plain INSERT: P4 writes this row only from inside ``publish``/
+    ``publish_first``, which run a real build. Returns the new row's id.
+    ``first_record_date``/``window_start_date``/``wind_start_date`` default
+    to ``cutoff`` minus ``window_days`` - 1 when not given.
+    """
+    first_record_date = first_record_date or (cutoff - timedelta(days=window_days - 1))
+    window_start_date = window_start_date or first_record_date
+    wind_start_date = wind_start_date or first_record_date
+    build_started_at = build_started_at or published_at
+    cur = conn.execute(
+        "INSERT INTO publications"
+        " (site_id, cutoff, first_record_date, window_days, window_start_date,"
+        "  wind_start_date, settings, methodology_version, scoring_rule,"
+        "  wind_method, wind_constants, build_started_at, published_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            cutoff.isoformat(),
+            first_record_date.isoformat(),
+            window_days,
+            window_start_date.isoformat(),
+            wind_start_date.isoformat(),
+            json.dumps({"rolling_window_days": window_days, "min_n": 0}),
+            methodology_version,
+            scoring_rule,
+            wind_method,
+            wind_constants,
+            isoformat_utc(build_started_at),
+            isoformat_utc(published_at),
+        ),
+    )
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
+
+
+def seed_coverage(
+    conn: sqlite3.Connection,
+    *,
+    publication_id: int,
+    variable: str,
+    window_key: str,
+    day_ahead: int,
+    feed_id: int,
+    scored: int,
+    expected: int,
+    starting_days: int = 0,
+) -> None:
+    """R4.2's coverage cell (one ``publication_coverage`` row, P4 §7.4).
+
+    What ``published_coverage(conn, pub=…, variable=…, window_key=…)``
+    returns, keyed by ``(feed_id, day_ahead)``: the forecasts scored and
+    expected, with the starting days apart. Plain INSERT: P4 writes this
+    table only during a build.
+    """
+    conn.execute(
+        "INSERT INTO publication_coverage"
+        " (publication_id, variable, window_key, day_ahead, feed_id, scored,"
+        "  expected, starting_days)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            publication_id,
+            variable,
+            window_key,
+            day_ahead,
+            feed_id,
+            scored,
+            expected,
+            starting_days,
+        ),
+    )
+
+
+def seed_closed_pairs(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    local_date: date,
+    feed_id: int,
+    variable: str,
+    day_ahead: int,
+    valid_at: str,
+    lead_hours: int,
+    forecast: float,
+    observed: float,
+    download_date: date | None = None,
+    fetched_at: str | None = None,
+) -> None:
+    """R4.3's closed-day pair (one ``close_pairs`` row, over P4's
+    ``close_pairs``, P4 §16.2).
+
+    What ``closed_day_pairs(conn, site_id=…, local_date=…, feed_id=…)``
+    returns: one hour's forecast and observed value for a closed day and
+    feed, the forecast and the observed value the scores rest on. Plain
+    INSERT: P4 writes ``close_pairs`` only from inside ``score_day``.
+    """
+    conn.execute(
+        "INSERT INTO close_pairs"
+        " (site_id, local_date, feed_id, variable, day_ahead, valid_at,"
+        "  lead_hours, forecast, observed, download_date, fetched_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            site_id,
+            local_date.isoformat(),
+            feed_id,
+            variable,
+            day_ahead,
+            valid_at,
+            lead_hours,
+            forecast,
+            observed,
+            None if download_date is None else download_date.isoformat(),
+            fetched_at,
+        ),
+    )
