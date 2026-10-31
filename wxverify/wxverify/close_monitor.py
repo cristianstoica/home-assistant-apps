@@ -38,11 +38,11 @@ from wxverify.db.site_days import (
     day_record,
     day_station_ids,
 )
-from wxverify.db.station_readings import last_five_minute_store
+from wxverify.db.station_readings import last_five_minute_store, next_five_minute_try
 from wxverify.scoring.publication import Publication, active_publication
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import resolve_snapshot_utc, snapshot_wall_clock
-from wxverify.worker.access_hold import refused_kinds
+from wxverify.worker.access_hold import AccessKind, AccessRecord, refused_kinds
 from wxverify.worker.close_chain import (
     CLOSE_LOG_KEEP_DAYS,
     AttemptRecord,
@@ -100,6 +100,24 @@ CLOSE_STAGE_NAMES: Final[Mapping[int, str]] = {
 _DETAIL_MAX_ITEMS: Final = 5
 
 _STATION_SILENT_ID: Final = "station_silent_today"
+
+# Alert 6's days affected name at most this many days, then "and N more", so
+# the line stays near the 300 characters Home Assistant shows (plan §6.4).
+_ACCESS_DAYS_MAX_ITEMS: Final = 3
+
+# Alert 6's word for each day state (plan §6.4); ``retry_due`` reads
+# "retry due <retry_at>" (``_access_day_item``).
+_ACCESS_DAY_STATES: Final[Mapping[str, str]] = {
+    "open": "collecting",
+    "closing": "closing",
+    "closed": "closed",
+    "missed": "missed",
+}
+
+# Day states whose close still downloads after the day's bounds end, so
+# alert 6 counts them as affected by any run that ends after the day starts
+# (plan §6.4).
+_ACCESS_STILL_CLOSING: Final = frozenset({"closing", "retry_due"})
 
 _ONE_DAY: Final = timedelta(days=1)
 
@@ -178,15 +196,17 @@ def _parse_or_none(value: object) -> datetime | None:
         return None
 
 
-def _items_detail(items: list[str]) -> str | None:
-    """``items`` joined by "; ", at most ``_DETAIL_MAX_ITEMS``, then
-    "and N more"; None when there are none."""
+def _items_detail(
+    items: list[str], *, limit: int = _DETAIL_MAX_ITEMS, sep: str = "; "
+) -> str | None:
+    """``items`` joined by ``sep``, at most ``limit``, then "and N more";
+    None when there are none."""
     if not items:
         return None
-    shown = items[:_DETAIL_MAX_ITEMS]
-    if len(items) > _DETAIL_MAX_ITEMS:
-        shown.append(f"and {len(items) - _DETAIL_MAX_ITEMS} more")
-    return "; ".join(shown)
+    shown = items[:limit]
+    if len(items) > limit:
+        shown.append(f"and {len(items) - limit} more")
+    return sep.join(shown)
 
 
 def _age_text(age: timedelta) -> str:
@@ -1057,4 +1077,174 @@ def station_silent(
         tripped=bool(lines),
         count=len(lines),
         detail=_items_detail(lines),
+    )
+
+
+@dataclass(frozen=True)
+class AccessDays:
+    """The close's part of alert 6, ``weathercom_access_refused`` (plan §6.4).
+
+    ``next_try`` holds one clause per refused kind whose hold is in force,
+    in ``ACCESS_KINDS`` order. ``days`` holds every day affected as
+    "<site> <date> (<state>)", by site name then date, with no cap: the
+    close status panel shows the full list (plan §10.2). Neither names a
+    station.
+    """
+
+    next_try: tuple[str, ...] = ()
+    days: tuple[str, ...] = ()
+
+    def detail_suffix(self) -> str:
+        """The text the budget group appends to 0.16.13's line.
+
+        "; next try: <clauses>" and "; days affected: <days>", each only
+        when it has an item, the items joined by ", "; the days at most
+        ``_ACCESS_DAYS_MAX_ITEMS``, then "and N more". Empty when both
+        are empty.
+        """
+        parts: list[str] = []
+        if self.next_try:
+            parts.append(f"; next try: {', '.join(self.next_try)}")
+        days = _items_detail(list(self.days), limit=_ACCESS_DAYS_MAX_ITEMS, sep=", ")
+        if days is not None:
+            parts.append(f"; days affected: {days}")
+        return "".join(parts)
+
+
+def _access_day_item(site_name: str, record: DayRecord) -> str:
+    """One day affected, "<site> <date> (<state>)" (plan §6.4)."""
+    if record.state == "retry_due":
+        retry = "unknown" if record.retry_at is None else isoformat_utc(record.retry_at)
+        state = f"retry due {retry}"
+    else:
+        state = _ACCESS_DAY_STATES.get(record.state, record.state)
+    return f"{site_name} {record.local_date.isoformat()} ({state})"
+
+
+def _next_try_clause(
+    conn: sqlite3.Connection,
+    kind: AccessKind,
+    until: datetime,
+    sites: list[tuple[int, str]],
+    undone: list[DayRecord],
+    now: datetime,
+) -> str:
+    """The next-try clause of one kind whose hold is in force (plan §6.4).
+
+    ``current_obs``: a held poll is deferred to the hold's end. ``hourly``:
+    the gap fill's next try is the close's retry, the earliest ``retry_at``
+    of the enabled sites' ``retry_due`` days, else the next close.
+    ``five_minute``: the earliest of the enabled sites' next scheduled
+    5-minute downloads when it lies after ``until``; at or before it (a try
+    the hold will skip), or with none, the first one after ``until``.
+    """
+    held_until = isoformat_utc(until)
+    if kind == "current_obs":
+        return f"current conditions at {held_until}"
+    if kind == "hourly":
+        retries = [record for record in undone if record.state == "retry_due"]
+        if not retries:
+            return "hourly gap fill at the next close"
+        stamps = [record.retry_at for record in retries if record.retry_at is not None]
+        if not stamps:
+            return "hourly gap fill: unreadable retry_at"
+        return f"hourly gap fill at {isoformat_utc(min(stamps))}"
+    tries = [
+        stamp
+        for site_id, _ in sites
+        if (stamp := next_five_minute_try(conn, site_id=site_id, now_utc=now))
+        is not None
+    ]
+    earliest = min(tries, default=None)
+    if earliest is not None and earliest > until:
+        return f"5-minute readings at {isoformat_utc(earliest)}"
+    return f"5-minute readings at the first scheduled download after {held_until}"
+
+
+def _affected_days(
+    conn: sqlite3.Connection,
+    refused: list[AccessRecord],
+    sites: list[tuple[int, str]],
+    undone: dict[int, list[DayRecord]],
+    now: datetime,
+) -> list[str]:
+    """Every day affected by the refusal run, by site name then date (§6.4).
+
+    The run is from the earliest readable ``since`` to the latest readable
+    ``until``, or ``now`` if later, over the rows whose ``until`` reads, as
+    0.16.13's line takes its times. A day is affected when its record's
+    bounds overlap the run and it is not done or was done within
+    ``CLOSE_ALERT_DAYS``. A ``closing`` or ``retry_due`` day still needs
+    the key for its close's downloads after its bounds end, so it counts
+    as overlapping any run that ends after the day starts. With no
+    readable ``until`` or ``since`` the run is unknown, and the one item
+    says which does not read.
+    """
+    readable = [record for record in refused if record.until is not None]
+    untils = [
+        stamp
+        for record in readable
+        if (stamp := _parse_or_none(record.until)) is not None
+    ]
+    sinces = [
+        stamp
+        for record in readable
+        if (stamp := _parse_or_none(record.since)) is not None
+    ]
+    if not untils:
+        return ["unreadable until"]
+    if not sinces:
+        return ["unreadable since"]
+    start = min(sinces)
+    end = max(now, *untils)
+    found: list[str] = []
+    for site_id, site_name in sites:
+        done = [
+            record
+            for record, _ in reversed(_done_days(conn, site_id, now, CLOSE_ALERT_DAYS))
+        ]
+        for record in (*done, *undone[site_id]):
+            if record.day_start_utc >= end:
+                continue
+            if record.state in _ACCESS_STILL_CLOSING or record.day_end_utc > start:
+                found.append(_access_day_item(site_name, record))
+    return found
+
+
+def access_days_affected(conn: sqlite3.Connection, now: datetime) -> AccessDays:
+    """The close's part of alert 6, ``weathercom_access_refused`` (§6.4).
+
+    Reads ``refused_kinds``. The next try: one clause per listed kind whose
+    hold is in force (``until`` after ``now``), "current conditions at
+    <until>", "hourly gap fill at <retry_at>" (or "at the next close") and
+    "5-minute readings at <time>" (or "at the first scheduled download
+    after <until>"); a kind whose hold has ended, or does not read, has no
+    clause and keeps 0.16.13's "waiting for the next try". The days
+    affected: for each enabled site, the days whose record's bounds overlap
+    the refusal run and that are not done or were done within
+    ``CLOSE_ALERT_DAYS``, with the state as "collecting", "closing", "retry
+    due <retry_at>", "closed" or "missed". Never judges or names a station.
+    Empty while no kind is listed. Called only while the close is on.
+    Read-only.
+    """
+    refused = refused_kinds(conn, now)
+    if not refused:
+        return AccessDays()
+    sites = _enabled_sites(conn)
+    undone = {
+        site_id: _undone_days(conn, site_id, current_day(conn, site_id, now_utc=now))
+        for site_id, _ in sites
+    }
+    every_undone = [record for days in undone.values() for record in days]
+    clauses: list[str] = []
+    for record in refused:
+        until = _parse_or_none(record.until)
+        if until is None or until <= now:
+            continue
+        clauses.append(
+            _next_try_clause(conn, record.kind, until, sites, every_undone, now)
+        )
+    return AccessDays(
+        next_try=tuple(clauses),
+        days=tuple(_affected_days(conn, refused, sites, undone, now)),
     )

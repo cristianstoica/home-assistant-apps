@@ -18,7 +18,12 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.close_monitor import CloseAlert, close_alerts, station_silent
+from wxverify.close_monitor import (
+    CloseAlert,
+    access_days_affected,
+    close_alerts,
+    station_silent,
+)
 from wxverify.collection.budget import (
     current_billing_day,
     effective_daily_call_limit,
@@ -1133,6 +1138,23 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
     # weathercom_access_refused: every download kind whose latest answer was a
     # 401/403, listed until 24 h after its hold ended (``refused_kinds``).
     refused = refused_kinds(conn, now)
+    access_detail = _access_refused_detail(refused, now) if refused else ""
+    # With the daily close on, its part of the row is appended: the next try
+    # and the days affected (daily-close plan P5 §6.4), read only while a
+    # kind is listed, since only then does the row show a detail. With the
+    # close off the detail is 0.16.13's line, unchanged. The call's own `try`
+    # keeps a fault in it from dropping the group's other rows (§5.1): a
+    # sqlite3.Error still reaches the group's `try` in build_verdict
+    # (db_readable), and any other exception becomes one unexpected_error row
+    # and leaves 0.16.13's line as it is.
+    close_errors: list[Condition] = []
+    if refused and daily_close_on(conn):
+        try:
+            access_detail += access_days_affected(conn, now).detail_suffix()
+        except sqlite3.Error:
+            raise
+        except Exception as exc:
+            close_errors.append(_close_error_condition(exc))
 
     def _c(cid: str, sev: str, n: int, detail: str) -> Condition:
         return Condition(
@@ -1179,8 +1201,9 @@ def _budget_conditions(conn: sqlite3.Connection, now: datetime) -> list[Conditio
             "weathercom_access_refused",
             "warning",
             len(refused),
-            _access_refused_detail(refused, now) if refused else "",
+            access_detail,
         ),
+        *close_errors,
     ]
 
 

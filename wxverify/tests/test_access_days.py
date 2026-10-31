@@ -273,11 +273,12 @@ def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> Non
     """AC5 (plan §13.6, §6.4): the days-affected list caps at 3 days, then
     "and N more" (M57).
 
-    ``day_close_site``'s fixture already gives 4 qualifying days (D-3
-    closed, D-2 missed, D-1 open, D open; none is done more than 7 days
+    ``day_close_site``'s fixture already gives 5 qualifying days (D-3
+    closed, D-2 missed, D-1 open, D open, D+1 open -- the buffer day
+    ``ensure_site_days`` fills through; none is done more than 7 days
     ago). ``ACCESS_HOLD_SECONDS`` is monkeypatched to 6 days so that ONE
     ``record_access_refused`` call at D-3's start keeps a window open
-    (``since``..``until``) spanning all four days at the test's ``now`` --
+    (``since``..``until``) spanning all five days at the test's ``now`` --
     no production code changes, only the test's own fixture-setup budget.
     """
     monkeypatch.setattr(
@@ -297,10 +298,10 @@ def test_ac5_days_affected_caps_at_three(monkeypatch: pytest.MonkeyPatch) -> Non
     now = datetime(D.year, D.month, D.day, 0, 10, tzinfo=UTC)
     cond = _cond(conn, now)
     detail = str(cond["detail"])
-    assert "and 1 more" in detail, (
-        "M57 -> at this assertion: correct = the 4-day run ends 'and 1"
+    assert "and 2 more" in detail, (
+        "M57 -> at this assertion: correct = the 5-day run ends 'and 2"
         " more' once 3 days are listed, mutant = no cap of 3 days, so every"
-        " one of the 4 days is listed and this suffix never appears."
+        " one of the 5 days is listed and this suffix never appears."
     )
     assert detail.count(f"{site_name} ") <= 3, (
         "M57 -> at this assertion: correct = at most 3 '<site> <date>"
