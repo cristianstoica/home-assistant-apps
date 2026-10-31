@@ -88,6 +88,29 @@ def _patch_clock(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
         monkeypatch.setattr(target, lambda: now, raising=False)
 
 
+def _seed_ranking(
+    conn: sqlite3.Connection,
+    *,
+    publication_id: int,
+    feed_id: int,
+    variable: str,
+    day_ahead: int,
+    window_key: str,
+    n: int,
+    skill_score: float | None,
+) -> None:
+    """Models ``tests/test_publication_readers.py``'s ``_seed_ranking``."""
+    conn.execute(
+        """
+        INSERT INTO publication_rankings
+            (publication_id, feed_id, variable, day_ahead, window_key, n,
+             bias, mae, rmse, pod, far, csi, ets, hss, skill_score)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)
+        """,
+        (publication_id, feed_id, variable, day_ahead, window_key, n, skill_score),
+    )
+
+
 def _station_id(conn: sqlite3.Connection, site_id: int, pws_station_id: str) -> int:
     row = conn.execute(
         "SELECT id FROM stations WHERE site_id = ? AND pws_station_id = ?",
@@ -511,6 +534,22 @@ def test_pg7_coverage_table_next_to_the_rankings(
             scored=scored,
             expected=expected,
         )
+    for window_key, feed_id in (
+        ("w:30", feed_x),
+        ("w:30", feed_y),
+        ("w:all", feed_x),
+        ("w:all", feed_y),
+    ):
+        _seed_ranking(
+            conn,
+            publication_id=pub_id,
+            feed_id=feed_id,
+            variable="temperature",
+            day_ahead=3,
+            window_key=window_key,
+            n=7,
+            skill_score=50.0,
+        )
     from wxverify.settings.keys import set_setting
 
     set_setting(conn, "rolling_window_days", "14")
@@ -545,6 +584,21 @@ def test_pg7_coverage_table_next_to_the_rankings(
         " w:all, mutant = coverage always read under w:{N}, the All-time"
         f" view included, so this cell would be absent; text contains"
         f" 'Forecasts scored'={'Forecasts scored' in all_time.text!r}"
+    )
+    leaderboard_start = rolling_text.index("<h2>Leaderboard</h2>")
+    leaderboard_html = rolling_text[
+        leaderboard_start : rolling_text.index("</section>", leaderboard_start)
+    ]
+    assert (
+        ">Scored<" in leaderboard_html
+        and "7 of 7" in leaderboard_html
+        and "5 of 7" in leaderboard_html
+    ), (
+        'M94 -> at this assertion: correct = the Leaderboard\'s own "Scored"'
+        " column shows 'w:30' coverage, feed X \"7 of 7\" and feed Y"
+        ' "5 of 7", mutant = the Leaderboard table has no "Scored"'
+        " column or shows neither feed's cell; leaderboard_html contains"
+        f" 'Scored'={'Scored' in leaderboard_html!r}"
     )
 
 

@@ -132,29 +132,102 @@
     return (n < 10 ? "0" : "") + n;
   }
 
+  // Each missed day's shaded band, drawn under the lines, labelled "missed"
+  // or, for a zone changeover day, "zone changeover, not scored". Canvas
+  // pixels: valToPos(..., true) and bbox are both in device pixels.
+  function drawMissedBands(u, bands) {
+    var ratio = window.devicePixelRatio || 1;
+    var left = u.bbox.left;
+    var right = u.bbox.left + u.bbox.width;
+    var ctx = u.ctx;
+    ctx.save();
+    ctx.font = Math.round(11 * ratio) + "px sans-serif";
+    bands.forEach(function (band) {
+      var x0 = Math.max(u.valToPos(band.start, "x", true), left);
+      var x1 = Math.min(u.valToPos(band.end, "x", true), right);
+      if (x1 <= x0) {
+        return;
+      }
+      ctx.globalAlpha = 0.35;
+      ctx.fillStyle = cssVar("--chart-grid");
+      ctx.fillRect(x0, u.bbox.top, x1 - x0, u.bbox.height);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = cssVar("--chart-axis");
+      ctx.fillText(band.label, x0 + 4 * ratio, u.bbox.top + 12 * ratio);
+    });
+    ctx.restore();
+  }
+
+  // With the daily close on, /api/timeseries also returns the provisional
+  // observed line (provisional_valid_at / provisional) and the missed days.
+  // The kept pairs, the line and the missed bands share one x axis; a null
+  // point at each band's edges breaks every line there, so no line is drawn
+  // across a missed day.
   function renderOverlay(el, payload) {
-    if (!payload.valid_at || payload.valid_at.length === 0 || !window.uPlot) {
+    var pairAt = payload.valid_at || [];
+    var provisionalAt = payload.provisional_valid_at || [];
+    var missedDays = payload.missed_days || [];
+    if (
+      !window.uPlot ||
+      (pairAt.length === 0 && provisionalAt.length === 0 && missedDays.length === 0)
+    ) {
       emptyChart(el, "No overlay pairs.");
       return;
     }
     var forecastRaw = payload.forecast || [];
     var observedRaw = payload.observed || [];
-    var xs = [];
+    var provisionalRaw = payload.provisional || [];
+    var pairXs = [];
     var forecast = [];
     var observed = [];
-    payload.valid_at.forEach(function (value, index) {
+    pairAt.forEach(function (value, index) {
       var t = parseTime(value);
       if (t === null) {
         return;
       }
-      xs.push(t);
+      pairXs.push(t);
       forecast.push(forecastRaw[index] === undefined ? null : forecastRaw[index]);
       observed.push(observedRaw[index] === undefined ? null : observedRaw[index]);
     });
-    if (xs.length === 0) {
+    var points = pairXs.map(function (t, index) {
+      return [t, forecast[index], observed[index], null];
+    });
+    provisionalAt.forEach(function (value, index) {
+      var t = parseTime(value);
+      if (t === null) {
+        return;
+      }
+      var v = provisionalRaw[index];
+      points.push([t, null, null, v === undefined ? null : v]);
+    });
+    var bands = [];
+    missedDays.forEach(function (day) {
+      var start = parseTime(day.start);
+      var end = parseTime(day.end);
+      if (start === null || end === null || end <= start) {
+        return;
+      }
+      bands.push({
+        start: start,
+        end: end,
+        label: day.reason === "zone changeover" ? "zone changeover, not scored" : "missed"
+      });
+      points.push([start, null, null, null]);
+      points.push([end - 1, null, null, null]);
+    });
+    if (points.length === 0) {
       emptyChart(el, "No overlay pairs.");
       return;
     }
+    points.sort(function (a, b) {
+      return a[0] - b[0];
+    });
+    var columns = [[], [], [], []];
+    points.forEach(function (point) {
+      for (var c = 0; c < 4; c++) {
+        columns[c].push(point[c]);
+      }
+    });
     el.innerHTML = "";
     var chart = new uPlot({
       width: Math.max(el.clientWidth, 320),
@@ -164,13 +237,23 @@
       series: [
         {},
         { label: "Forecast", stroke: cssVar("--chart-1"), width: 2 },
-        { label: "Observed", stroke: cssVar("--chart-2"), width: 2 }
-      ]
-    }, [xs, forecast, observed], el);
+        { label: "Observed", stroke: cssVar("--chart-2"), width: 2 },
+        // The third series: the observed colour with a dashed stroke.
+        { label: "Observed (provisional)", stroke: cssVar("--chart-2"), width: 2, dash: [6, 4] }
+      ],
+      hooks: {
+        drawClear: [
+          function (u) {
+            drawMissedBands(u, bands);
+          }
+        ]
+      }
+    }, columns, el);
     labelChartCanvas(chart, "Forecast vs. observed overlay chart");
     var summary = summaryEl(el);
     if (summary) {
-      renderOverlaySummary(summary, payload, xs, forecast, observed);
+      // The kept pairs only: the counts and errors describe closed days.
+      renderOverlaySummary(summary, payload, pairXs, forecast, observed);
     }
   }
 
@@ -223,6 +306,44 @@
     return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
   }
 
+  // The sentences the daily close adds after the pairs' summary, each only
+  // when present: the provisional line, the missed days, and the closed days
+  // scored under the zone they had then.
+  function overlayCloseSentences(payload) {
+    var parts = [];
+    var hours = [];
+    (payload.provisional_valid_at || []).forEach(function (value) {
+      var t = parseTime(value);
+      if (t !== null) {
+        hours.push(t);
+      }
+    });
+    if (hours.length > 0) {
+      var latest = payload.provisional_latest_reading_at
+        ? parseTime(payload.provisional_latest_reading_at)
+        : null;
+      parts.push(
+        "Provisional observed values from " + formatLocal(hours[0]) + " to " +
+          formatLocal(hours[hours.length - 1]) +
+          (latest === null ? "" : ", from station readings up to " + formatLocal(latest)) +
+          "; they are replaced by the closed values once each day closes."
+      );
+    }
+    var missed = (payload.missed_days || []).map(function (day) {
+      return day.local_date;
+    });
+    if (missed.length > 0) {
+      parts.push("Missed, never scored: " + missed.join(", ") + ".");
+    }
+    var zoned = (payload.zone_days || []).map(function (day) {
+      return day.local_date + " (" + day.timezone + ")";
+    });
+    if (zoned.length > 0) {
+      parts.push("Scored under the zone it had then: " + zoned.join(", ") + ".");
+    }
+    return parts.length > 0 ? " " + parts.join(" ") : "";
+  }
+
   // Computed strictly from xs/forecast/observed -- the same parseTime-
   // filtered arrays renderOverlay just plotted, not payload.valid_at -- so
   // the summary can never describe a row the chart itself dropped. Error
@@ -231,6 +352,7 @@
   // subset is everything, but the guard stays for a short/malformed array.
   function renderOverlaySummary(summary, payload, xs, forecast, observed) {
     var unit = VARIABLE_UNITS[payload.variable] || "";
+    var closeSentences = overlayCloseSentences(payload);
     var pairs = [];
     for (var i = 0; i < xs.length; i++) {
       if (forecast[i] !== null && observed[i] !== null) {
@@ -238,7 +360,7 @@
       }
     }
     if (pairs.length === 0) {
-      summaryStatus(summary, "No overlay pairs.");
+      summaryStatus(summary, "No overlay pairs." + closeSentences);
       summaryDetail(summary);
       return;
     }
@@ -269,7 +391,7 @@
         biasSentence(bias, unit, "forecast ran high", "forecast ran low", "no net bias") +
         ". Worst interval " + formatLocal(worst.t) + ", off by " +
         biasSentence(worst.error, unit, "forecast was high", "forecast was low", "no error") +
-        "."
+        "." + closeSentences
     );
 
     // Bucketed by browser-local calendar day (renderOverlay's x scale has no
@@ -403,13 +525,36 @@
   // one just states the data's shape (leads x feeds) with no headline stat.
   // leadLabel is the same function the chart's own x-axis uses, so the row
   // labels can never drift from what the chart shows.
+  // One sentence per feed and day ahead of the dashboard's coverage table
+  // (shown with the daily close on) whose scored count is below its expected
+  // count; "" when the page has no coverage table.
+  function coverageSentences() {
+    var table = document.getElementById("coverage-table");
+    if (!table) {
+      return "";
+    }
+    var parts = [];
+    table.querySelectorAll("td[data-day-ahead]").forEach(function (cell) {
+      var scored = Number(cell.dataset.scored);
+      var expected = Number(cell.dataset.expected);
+      if (scored < expected) {
+        parts.push(
+          cell.dataset.feed + ", D+" + cell.dataset.dayAhead + ": " + scored + " of " +
+            expected + " forecasts scored."
+        );
+      }
+    });
+    return parts.length > 0 ? " " + parts.join(" ") : "";
+  }
+
   function renderSkillSummary(summary, payload) {
     var leads = payload.leads || [];
     var series = payload.series || [];
     summaryStatus(
       summary,
       leads.length + " lead day" + (leads.length === 1 ? "" : "s") + ", " +
-        series.length + " feed" + (series.length === 1 ? "" : "s") + "."
+        series.length + " feed" + (series.length === 1 ? "" : "s") + "." +
+        coverageSentences()
     );
     var detail = summaryDetail(summary);
     var table = buildDetailsTable(

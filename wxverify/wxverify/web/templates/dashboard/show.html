@@ -35,6 +35,38 @@
     </div>
   </section>
 
+  {% if evidence_through %}
+    <p class="muted" id="evidence-through">{% if evidence_before_close %}Rankings use days through {{ evidence_through }}, from before the daily close.{% else %}Rankings use closed days through {{ evidence_through }}.{% endif %}</p>
+  {% endif %}
+  {% for name, values in pending_settings.items() %}
+    <p class="muted">Saved {{ name }}: {{ values[1] }}. The rankings use {{ values[0] }} until the next daily publication.</p>
+  {% endfor %}
+  {% if coverage %}
+    <section class="panel wide" id="coverage-panel">
+      <h2>Forecasts scored in this window, per day ahead</h2>
+      <div class="table-wrap">
+        <table id="coverage-table">
+          <thead>
+            <tr>
+              <th>Feed</th>
+              {% for day in coverage.days %}<th>D+{{ day }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in coverage.rows %}
+              <tr>
+                <td>{{ row.label }}</td>
+                {% for cell in row.cells %}
+                  <td data-feed="{{ row.label }}" data-day-ahead="{{ cell.day_ahead }}" data-scored="{{ cell.scored }}" data-expected="{{ cell.expected }}">{{ cell.text }}</td>
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
   {% include "dashboard/_wind_banner.html" %}
   <section class="dashboard-grid">
     {% include "dashboard/_verdict.html" %}

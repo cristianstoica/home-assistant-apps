@@ -27,7 +27,7 @@
 
   <section class="panel wide">
     <h2>Forecast Overlay</h2>
-    <p class="panel-hint">Two lines on one chart: what the feed predicted and what was observed.</p>
+    <p class="panel-hint">Two lines on one chart: what the feed predicted and what was observed.{% if close_on %} After the last closed day, a dashed line shows provisional observed values from today's station readings. Missed days have no observed line.{% endif %}</p>
     <div
       class="chart tall"
       data-chart="overlay"

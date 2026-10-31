@@ -409,7 +409,10 @@ def test_scoring_feeds_match_distinct_form_including_order() -> None:
             lead_hours=_FAR_LEAD_HOURS[0],
         )
 
-    actual = [(ft.id, ft.source, ft.model) for ft in _scoring_feeds(conn, 1, "wind")]
+    actual = [
+        (ft.id, ft.source, ft.model)
+        for ft in _scoring_feeds(conn, 1, "wind", close_on=False)
+    ]
     expected = _reference_scoring_feeds(conn, site_id=1, variable="wind")
     assert actual == expected
     # Non-vacuous: source-alphabetical order actually differs from insertion

@@ -21,11 +21,16 @@ from wxverify.collection.wind_quota import (
 )
 from wxverify.core.lead import parse_day_ahead
 from wxverify.core.secrets import key_status
-from wxverify.core.timeutil import parse_utc, utc_now
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.connection import pinned_read_snapshot
 from wxverify.db.queue import ACTIVE_JOB_SQL
-from wxverify.db.site_days import daily_close_on
+from wxverify.db.site_days import (
+    closed_through,
+    current_day,
+    daily_close_on,
+    day_record,
+)
 from wxverify.db.tz_generations import (
     correction_job_key,
     correction_state_key,
@@ -35,9 +40,15 @@ from wxverify.db.tz_generations import (
 from wxverify.db.wind_basis import read_auth_holds
 from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_in_snapshot
-from wxverify.scoring.effective import active_feed_cte
+from wxverify.scoring.effective import MAX_DAY_AHEAD, active_feed_cte
 from wxverify.scoring.leaderboard import leaderboard_in_snapshot
-from wxverify.scoring.publication import active_publication, pending_ranking_settings
+from wxverify.scoring.publication import (
+    Coverage,
+    Publication,
+    active_publication,
+    pending_ranking_settings,
+    published_coverage,
+)
 from wxverify.scoring.winrate import winrate as winrate_query
 from wxverify.settings.keys import get_number_setting
 from wxverify.worker.access_hold import (
@@ -110,6 +121,44 @@ class Verdict:
     winner: LeaderboardItem | None
     runner_up: LeaderboardItem | None
     margin: float | None
+
+
+@dataclass(frozen=True)
+class CoverageCell:
+    """One feed's coverage at one day ahead, as the dashboard shows it (9.4).
+
+    ``text`` is "<scored> of <expected>", or "none yet" when nothing is
+    expected, with "; <n> earlier days" when the window holds days from
+    before the daily close.
+    """
+
+    day_ahead: int
+    scored: int
+    expected: int
+    text: str
+
+
+@dataclass(frozen=True)
+class CoverageRow:
+    """One feed's row of the coverage table: a cell per day ahead (9.4)."""
+
+    feed_id: int
+    label: str
+    cells: tuple[CoverageCell, ...]
+
+
+@dataclass(frozen=True)
+class CoverageTable:
+    """The coverage next to the rankings in view (9.4).
+
+    ``rows`` follow the Leaderboard's order; ``days`` are the columns, D+0
+    to D+7. ``selected`` holds each Leaderboard feed's cell text at the
+    selected day ahead, for the Leaderboard's "Scored" column.
+    """
+
+    days: tuple[int, ...]
+    rows: tuple[CoverageRow, ...]
+    selected: dict[int, str]
 
 
 VARIABLE_LABELS: dict[str, str] = {
@@ -431,6 +480,11 @@ def _load_dashboard(
         rolling_days = get_number_setting(conn, "rolling_window_days", 30, minimum=1)
         min_n = get_number_setting(conn, "min_n", 30, minimum=0)
     evidence_through = None if publication is None else publication.cutoff
+    # 9.5: a cutoff before the site's first record is a starting-history day,
+    # which the label must not call closed.
+    evidence_before_close = (
+        publication is not None and publication.cutoff < publication.first_record_date
+    )
     pending_settings = pending_ranking_settings(conn, pub=publication)
     if site is None:
         return {
@@ -444,7 +498,9 @@ def _load_dashboard(
             "rolling_days": rolling_days,
             "min_n": min_n,
             "evidence_through": evidence_through,
+            "evidence_before_close": evidence_before_close,
             "pending_settings": pending_settings,
+            "coverage": None,
             "leaderboard": [],
             "verdict": compute_verdict([]),
             "winrate": [],
@@ -454,6 +510,13 @@ def _load_dashboard(
             "wind_weights": None,
         }
     day_ahead = _lead_to_day(lead)
+    leaderboard_result = leaderboard_in_snapshot(
+        conn,
+        site_id=site.id,
+        variable=variable,
+        day_ahead=day_ahead,
+        window=window,
+    )
     leaderboard = [
         LeaderboardItem(
             feed_id=row.feed_id,
@@ -467,13 +530,7 @@ def _load_dashboard(
             mae=row.mae,
             rmse=row.rmse,
         )
-        for row in leaderboard_in_snapshot(
-            conn,
-            site_id=site.id,
-            variable=variable,
-            day_ahead=day_ahead,
-            window=window,
-        ).rows
+        for row in leaderboard_result.rows
     ]
     # Presentation-layer sort: eligible rows first (skill DESC, then label),
     # withheld rows after (label order). Never interleave by raw skill across
@@ -502,7 +559,16 @@ def _load_dashboard(
         "rolling_days": rolling_days,
         "min_n": min_n,
         "evidence_through": evidence_through,
+        "evidence_before_close": evidence_before_close,
         "pending_settings": pending_settings,
+        "coverage": _coverage_table(
+            conn,
+            publication=publication,
+            variable=variable,
+            window_key=leaderboard_result.window_key,
+            leaderboard=leaderboard,
+            day_ahead=day_ahead,
+        ),
         "leaderboard": leaderboard,
         "verdict": verdict,
         "winrate": winrate_query(
@@ -519,6 +585,83 @@ def _load_dashboard(
             load_wind_weights(conn, site, day_ahead) if variable == "wind" else None
         ),
     }
+
+
+def _coverage_text(coverage: Coverage | None) -> str:
+    """A coverage cell as the dashboard writes it (9.4).
+
+    "<scored> of <expected>", or "none yet" when nothing is expected (a
+    cell P4 stored no row for expects nothing); then "; <n> earlier days"
+    when the window holds days from before the daily close.
+    """
+    if coverage is None or coverage.expected == 0:
+        text = "none yet"
+    else:
+        text = f"{coverage.scored} of {coverage.expected}"
+    if coverage is not None and coverage.starting_days > 0:
+        days = "day" if coverage.starting_days == 1 else "days"
+        text += f"; {coverage.starting_days} earlier {days}"
+    return text
+
+
+def _coverage_table(
+    conn: sqlite3.Connection,
+    *,
+    publication: Publication | None,
+    variable: str,
+    window_key: str,
+    leaderboard: list[LeaderboardItem],
+    day_ahead: int,
+) -> CoverageTable | None:
+    """The coverage table for the rankings in view, or None (9.4).
+
+    P4's stored numbers for the active publication the rankings read, under
+    the Leaderboard's own window key, so the table and the rankings name one
+    window: ``w:{N}`` for the "Last N days" tab, N the publication's
+    ``window_days``, and ``w:all`` for "All time". None with the close off
+    or no active publication (``publication`` None), and when the
+    Leaderboard has no row: the table has a row per Leaderboard feed, in the
+    Leaderboard's order.
+    """
+    if publication is None or not leaderboard:
+        return None
+    if not window_key.startswith("w:"):
+        # A typed `window=<N>d` view (`live:{N}d`), for which P4 stores no
+        # coverage: no table and no line in its place. The owner's answer
+        # to plan 17.2's `<N>d` coverage question decides this branch.
+        return None
+    stored = published_coverage(
+        conn, pub=publication, variable=variable, window_key=window_key
+    )
+    days = tuple(range(MAX_DAY_AHEAD + 1))
+    rows = tuple(
+        CoverageRow(
+            feed_id=item.feed_id,
+            label=item.label,
+            cells=tuple(
+                _coverage_cell(stored.get((item.feed_id, day)), day) for day in days
+            ),
+        )
+        for item in leaderboard
+    )
+    return CoverageTable(
+        days=days,
+        rows=rows,
+        selected={
+            item.feed_id: _coverage_text(stored.get((item.feed_id, day_ahead)))
+            for item in leaderboard
+        },
+    )
+
+
+def _coverage_cell(coverage: Coverage | None, day_ahead: int) -> CoverageCell:
+    """One coverage table cell; a cell with no stored row expects nothing."""
+    return CoverageCell(
+        day_ahead=day_ahead,
+        scored=0 if coverage is None else coverage.scored,
+        expected=0 if coverage is None else coverage.expected,
+        text=_coverage_text(coverage),
+    )
 
 
 def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
@@ -556,7 +699,11 @@ def load_overlay(
         if site_id is not None
         else (sites[0] if sites else None)
     )
-    feeds = _scoring_feeds(conn, site.id if site is not None else None, variable)
+    # One switch per read (9.2): it picks the feed list and the chart hint.
+    close_on = daily_close_on(conn)
+    feeds = _scoring_feeds(
+        conn, site.id if site is not None else None, variable, close_on=close_on
+    )
     selected_feed_id = (
         feed_id if feed_id is not None else (feeds[0].id if feeds else None)
     )
@@ -566,6 +713,7 @@ def load_overlay(
         "variable": variable,
         "feeds": feeds,
         "feed_id": selected_feed_id,
+        "close_on": close_on,
     }
 
 
@@ -765,9 +913,95 @@ def load_observation_health(conn: sqlite3.Connection) -> list[ObservationHealthR
     return out
 
 
+def _station_trust_limits(
+    conn: sqlite3.Connection, now: datetime
+) -> tuple[list[tuple[int, str]], list[tuple[int, str, str]]]:
+    """Per site, where Station Trust stops and the missed days it skips (9.3).
+
+    The stop is the end of the site's latest done day (``closed_through``)
+    or, with no day done, the start of its first record, so only the
+    starting history is read; a site with neither a done day nor a record
+    holding ``now`` has no record started and gets no stop. The missed days
+    are the site's ``missed`` records up to its latest done day, each as
+    its stored bounds. Both are found by walking down by date with P1's
+    ``day_record``: records follow one another one date apart.
+    """
+    stops: list[tuple[int, str]] = []
+    missed: list[tuple[int, str, str]] = []
+    for site_row in conn.execute("SELECT id FROM sites ORDER BY id").fetchall():
+        site_id = int(site_row[0])
+        through = closed_through(conn, site_id)
+        record = None if through is None else day_record(conn, site_id, through)
+        if record is None:
+            first = current_day(conn, site_id, now_utc=now)
+            if first is None:
+                continue
+            earlier = day_record(conn, site_id, first.local_date - timedelta(days=1))
+            while earlier is not None:
+                first = earlier
+                earlier = day_record(
+                    conn, site_id, first.local_date - timedelta(days=1)
+                )
+            stops.append((site_id, isoformat_utc(first.day_start_utc)))
+            continue
+        stops.append((site_id, isoformat_utc(record.day_end_utc)))
+        while record is not None:
+            if record.state == "missed":
+                missed.append(
+                    (
+                        site_id,
+                        isoformat_utc(record.day_start_utc),
+                        isoformat_utc(record.day_end_utc),
+                    )
+                )
+            record = day_record(conn, site_id, record.local_date - timedelta(days=1))
+    return stops, missed
+
+
 def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
+    """Each station's ``ok`` values against its site's, worst mean gap first.
+
+    With the daily close off, over all time. With it on (9.3), over each
+    site's closed days and starting history only: rows at or after the
+    site's stop and rows on its missed days (``_station_trust_limits``) are
+    left out, each list passed as a ``VALUES`` table; a list with no row
+    leaves its clause out, as an empty ``VALUES`` list is not valid SQL.
+    The ``observations`` join is on the same ``valid_at``, so both sides end
+    there. Never reads the provisional line.
+    """
+    ctes: list[str] = []
+    clauses = ["so.qc_flag = 'ok'"]
+    params: list[object] = []
+    if daily_close_on(conn):
+        stops, missed = _station_trust_limits(conn, utc_now())
+        if stops:
+            ctes.append(
+                "trust_stops(site_id, valid_before) AS (VALUES "
+                + ", ".join("(?, ?)" for _ in stops)
+                + ")"
+            )
+            params.extend(value for stop in stops for value in stop)
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM trust_stops t"
+                " WHERE t.site_id = stations.site_id"
+                " AND so.valid_at >= t.valid_before)"
+            )
+        if missed:
+            ctes.append(
+                "trust_missed(site_id, start_utc, end_utc) AS (VALUES "
+                + ", ".join("(?, ?, ?)" for _ in missed)
+                + ")"
+            )
+            params.extend(value for day in missed for value in day)
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM trust_missed m"
+                " WHERE m.site_id = stations.site_id"
+                " AND so.valid_at >= m.start_utc AND so.valid_at < m.end_utc)"
+            )
+    with_clause = f"WITH {', '.join(ctes)}" if ctes else ""
     rows = conn.execute(
-        """
+        f"""
+        {with_clause}
         SELECT sites.name AS site_name, stations.pws_station_id, so.variable,
                COUNT(*) AS n,
                AVG(so.value - observations.value) AS mean_delta
@@ -778,12 +1012,13 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
           ON observations.site_id = stations.site_id
          AND observations.variable = so.variable
          AND observations.valid_at = so.valid_at
-        WHERE so.qc_flag = 'ok'
+        WHERE {" AND ".join(clauses)}
         GROUP BY stations.id, so.variable
         HAVING n > 0
         ORDER BY ABS(mean_delta) DESC, sites.name COLLATE NOCASE
         LIMIT 25
-        """
+        """,
+        params,
     ).fetchall()
     return [
         StationTrustRow(
@@ -1302,27 +1537,47 @@ def _fetch_unit_feeds(
 
 
 def _scoring_feeds(
-    conn: sqlite3.Connection, site_id: int | None, variable: str
+    conn: sqlite3.Connection, site_id: int | None, variable: str, *, close_on: bool
 ) -> list[FeedToggle]:
+    """The Overlay's feed list for a site, ordered by source and model.
+
+    With the daily close off, the site's active feeds that have a stored
+    pair of ``variable``. With it on (9.2), every active feed: closed days'
+    pairs are P4's, so ``forecast_pairs`` no longer says which feed has data.
+    """
     if site_id is None:
         return []
-    rows = conn.execute(
-        f"""
-        WITH {active_feed_cte()}
-        SELECT f.*, sfs.enabled AS override_enabled
-        FROM active_feeds a
-        JOIN feeds f ON f.id = a.feed_id
-        LEFT JOIN site_feed_state sfs
-          ON sfs.site_id = ? AND sfs.feed_id = f.id
-        WHERE EXISTS (
-            SELECT 1 FROM forecast_pairs fp
-            WHERE fp.site_id = ? AND fp.feed_id = a.feed_id AND fp.variable = ?
-              AND {published_generation_clause("fp")}
-        )
-        ORDER BY f.source, f.model
-        """,
-        (site_id, site_id, site_id, site_id, variable),
-    ).fetchall()
+    if close_on:
+        rows = conn.execute(
+            f"""
+            WITH {active_feed_cte()}
+            SELECT f.*, sfs.enabled AS override_enabled
+            FROM active_feeds a
+            JOIN feeds f ON f.id = a.feed_id
+            LEFT JOIN site_feed_state sfs
+              ON sfs.site_id = ? AND sfs.feed_id = f.id
+            ORDER BY f.source, f.model
+            """,
+            (site_id, site_id, site_id),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""
+            WITH {active_feed_cte()}
+            SELECT f.*, sfs.enabled AS override_enabled
+            FROM active_feeds a
+            JOIN feeds f ON f.id = a.feed_id
+            LEFT JOIN site_feed_state sfs
+              ON sfs.site_id = ? AND sfs.feed_id = f.id
+            WHERE EXISTS (
+                SELECT 1 FROM forecast_pairs fp
+                WHERE fp.site_id = ? AND fp.feed_id = a.feed_id AND fp.variable = ?
+                  AND {published_generation_clause("fp")}
+            )
+            ORDER BY f.source, f.model
+            """,
+            (site_id, site_id, site_id, site_id, variable),
+        ).fetchall()
     out: list[FeedToggle] = []
     for row in rows:
         override = (
