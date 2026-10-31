@@ -998,7 +998,6 @@ def test_ad3_per_site_snapshot_time() -> None:
     """AD3: AD1 on a site whose snapshot time is 08:00, at 07:30 and at
     08:00 (M34)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.settings.keys import set_setting
     from wxverify.verification.record import SNAPSHOT_TIME_KEY
 
@@ -1541,7 +1540,6 @@ def test_dw1_daytime_warning_trips_after_2_refreshes() -> None:
 def test_dw2_interval_30_trips_at_60_minutes() -> None:
     """DW2: DW1's second case with obs_interval_minutes 30 (M62)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
@@ -1569,7 +1567,6 @@ def test_dw3_refused_five_minute_kind_left_out(
 ) -> None:
     """DW3: DW1's second case with five_minute among refused_kinds (M63)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.worker.access_hold import record_access_refused
 
     conn = asof_conn()
@@ -1653,7 +1650,6 @@ def test_dw5_start_of_count_latest_of_worker_and_close_on() -> None:
     with the close turned on 1 h before now; with no store at all and
     both 7 h old (M65)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.db.runtime_state import set_runtime_state
     from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
 
@@ -1890,7 +1886,6 @@ def test_pd3_down_run_survives_other_only_slot() -> None:
     """PD3: three down slots, a slot of only call_limit tries, then a
     down slot (M71)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()
@@ -1950,7 +1945,6 @@ def test_pd4_recovered_line_for_24_hours() -> None:
     """PD4: PD3 followed by a slot with a stored try at <t>; now 24 h
     after <t>, then 24 h and 1 s (M72, M73)."""
     from wxverify.close_monitor import close_alerts
-
     from wxverify.settings.keys import set_setting
 
     conn = asof_conn()

@@ -28,8 +28,11 @@ import pytest
 
 from tests.helpers import NOW, D, asof_conn, day_close_site
 from wxverify.core.timeutil import isoformat_utc
+from wxverify.db.runtime_state import delete_runtime_state
 from wxverify.db.site_days import (
+    DAILY_CLOSE_ON_KEY,
     begin_close,
+    daily_close_on,
     day_record,
     ensure_site_days,
     finish_close,
@@ -489,18 +492,22 @@ def test_sl7_alert3_every_variable_suppresses_once_only(
 
 def test_sl8_close_off_never_suppresses(monkeypatch: pytest.MonkeyPatch) -> None:
     """SL8 (plan §13.5, §6.3): SL7's second case (alert 3 would name B for
-    every variable) with the close off: the line still shows, since alert 3
-    does not exist with the close off (M52)."""
+    every variable) with the close off: the days are built with the close
+    on, then the close is turned off, and the line still shows, since
+    alert 3 does not exist with the close off (M52)."""
     from wxverify.close_monitor import station_silent
 
     conn = asof_conn()
-    site_id = day_close_site(conn, close_on=False, with_records=False)
+    site_id = day_close_site(conn, close_on=True, with_records=False)
     station_b = _station_id(conn, site_id, "ISTATION02")
 
     dates = (D - timedelta(days=6), D - timedelta(days=5), D - timedelta(days=4))
     for i, d in enumerate(dates):
         _set_answered(conn, station_b, d)  # nothing usable on any day
         _close_day(conn, site_id, d, first=(i == 0))
+
+    delete_runtime_state(conn, DAILY_CLOSE_ON_KEY)
+    assert not daily_close_on(conn)
 
     obs_instant = NOW - timedelta(hours=10)
     _persist_online(

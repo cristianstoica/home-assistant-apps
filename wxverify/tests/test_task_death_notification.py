@@ -40,7 +40,6 @@ import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -49,6 +48,7 @@ from wxverify import config
 from wxverify.api.app import create_app, lifespan
 from wxverify.api.routes.db_transfer import export_sweeper_death
 from wxverify.db.connection import FencedWriter, close_db, init_db
+from wxverify.db.migrations import run_migrations
 from wxverify.monitor import build_verdict
 from wxverify.verification import read_cache as rc
 
@@ -360,7 +360,9 @@ def test_o6_verdict_clean_when_export_sweeper_alive() -> None:
     instead of omitting the key (the ``as_dict`` contract at
     ``monitor.py:69-72``).
     """
-    conn = cast(sqlite3.Connection, None)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
     verdict = build_verdict(
         conn,
         pipeline_enabled=False,
@@ -387,7 +389,9 @@ def test_o7_verdict_trips_when_latched() -> None:
     ``verdict["overall"] == "critical"`` since a warning-severity condition
     cannot raise ``overall`` past a pre-existing ``ok``.
     """
-    conn = cast(sqlite3.Connection, None)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
     verdict = build_verdict(
         conn,
         pipeline_enabled=False,
@@ -493,7 +497,9 @@ def test_o9_condition_survives_every_group_toggled_off() -> None:
     ``if pipeline_enabled: ... condition appended``) = ``"ok"``, since with
     every group disabled the condition would never be appended at all.
     """
-    conn = cast(sqlite3.Connection, None)
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
     verdict = build_verdict(
         conn,
         pipeline_enabled=False,

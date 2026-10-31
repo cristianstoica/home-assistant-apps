@@ -18,6 +18,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from wxverify.close_monitor import CloseAlert, station_silent
 from wxverify.collection.budget import (
     current_billing_day,
     effective_daily_call_limit,
@@ -26,6 +27,7 @@ from wxverify.collection.forecast_fetcher import NO_USABLE_SAMPLES_SENTINEL
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
+from wxverify.db.site_days import daily_close_on
 from wxverify.db.wind_basis import count_missed_final, read_auth_holds
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
@@ -99,6 +101,22 @@ class Condition:
 
 def _skipped(cond_id: str, group: str, severity: str) -> Condition:
     return Condition(id=cond_id, group=group, ok=True, skipped=True, severity=severity)
+
+
+def _close_error_condition(exc: Exception) -> Condition:
+    """The row a close-alert call's own ``try`` adds for a non-SQLite fault.
+
+    The ``unexpected_error`` shape ``error_verdict`` builds (daily-close plan
+    P5 §5.1); the group's other rows stay in place. Nothing is logged.
+    """
+    return Condition(
+        id="unexpected_error",
+        group="monitor",
+        ok=False,
+        skipped=False,
+        severity="critical",
+        detail=f"close alerts: {type(exc).__name__}: {exc}",
+    )
 
 
 # Filled in by Tasks 4-6. Each returns a list[Condition]; grace_active is passed
@@ -837,6 +855,21 @@ def _pipeline_conditions(
     # whose wind stopped updating today.
     wind_tripped_n, wind_detail = _wind_history_trips(conn, now)
 
+    # station_silent_today (daily-close plan P5 §6.3): built with the close
+    # on and off. Its own `try` keeps a fault in it from dropping the
+    # group's other rows: a sqlite3.Error still reaches the group's `try`
+    # in build_verdict (db_readable), and any other exception becomes one
+    # unexpected_error row in place of this one.
+    close_on = daily_close_on(conn)
+    silent: CloseAlert | None = None
+    close_errors: list[Condition] = []
+    try:
+        silent = station_silent(conn, now, close_on=close_on)
+    except sqlite3.Error:
+        raise
+    except Exception as exc:
+        close_errors.append(_close_error_condition(exc))
+
     def _cond(cid: str, tripped: bool, count: int | None, detail: str) -> Condition:
         if grace_active:
             return Condition(
@@ -857,7 +890,7 @@ def _pipeline_conditions(
             detail=detail if tripped else None,
         )
 
-    return [
+    conditions = [
         _cond(
             "feed_stale",
             feed_stale_n > 0,
@@ -933,6 +966,17 @@ def _pipeline_conditions(
             wind_detail or "wind history needs attention",
         ),
     ]
+    if silent is not None:
+        conditions.append(
+            _cond(
+                "station_silent_today",
+                silent.tripped,
+                silent.count,
+                silent.detail or "",
+            )
+        )
+    conditions.extend(close_errors)
+    return conditions
 
 
 _ACTIVE_FEED_WHERE = """
@@ -1186,6 +1230,44 @@ def _grace_active(conn: sqlite3.Connection, now: datetime) -> bool:
     return now < started + timedelta(minutes=GRACE_MINUTES)
 
 
+# The pipeline group's skipped list while monitor_pipeline is off (daily-close
+# plan P5 §5.1). With the close off: today's twelve ids plus
+# station_silent_today. With it on: the seven kept pipeline ids,
+# station_silent_today and close_alerts' seven ids, none of the five retired.
+_PIPELINE_SKIPPED_CLOSE_OFF: Final[tuple[str, ...]] = (
+    "feed_stale",
+    "obs_stale",
+    "fetch_obs_live",
+    "fetch_feed_live",
+    "pair_score_live",
+    "problem_jobs",
+    "forecast_record_gap",
+    "record_gap_scan_degraded",
+    "obs_station_history_failing",
+    "obs_collection_delayed",
+    "main_worker_liveness",
+    "wind_history",
+    "station_silent_today",
+)
+_PIPELINE_SKIPPED_CLOSE_ON: Final[tuple[str, ...]] = (
+    "feed_stale",
+    "fetch_feed_live",
+    "problem_jobs",
+    "forecast_record_gap",
+    "record_gap_scan_degraded",
+    "obs_collection_delayed",
+    "main_worker_liveness",
+    "station_silent_today",
+    "close_day_missed",
+    "close_day_thin",
+    "station_nothing_usable",
+    "publication_late",
+    "close_stage_failed",
+    "provider_down",
+    "daytime_download_missed",
+)
+
+
 def build_verdict(
     conn: sqlite3.Connection,
     *,
@@ -1215,23 +1297,25 @@ def build_verdict(
         except sqlite3.Error:
             db_read_failed = True
     else:
-        conditions.extend(
-            _skipped(cid, "pipeline", "warning")
-            for cid in (
-                "feed_stale",
-                "obs_stale",
-                "fetch_obs_live",
-                "fetch_feed_live",
-                "pair_score_live",
-                "problem_jobs",
-                "forecast_record_gap",
-                "record_gap_scan_degraded",
-                "obs_station_history_failing",
-                "obs_collection_delayed",
-                "main_worker_liveness",
-                "wind_history",
+        # The skipped list follows the close switch, read in its own narrow
+        # `try` (daily-close plan P5 §5.1). On sqlite3.Error the switch is
+        # unknown, so no list is guessed: db_read_failed makes db_readable
+        # report the failed read, and the sweeper row still reaches the
+        # verdict. Any other exception propagates: a code fault never turns
+        # into a fallback list.
+        try:
+            close_on = daily_close_on(conn)
+        except sqlite3.Error:
+            db_read_failed = True
+        else:
+            conditions.extend(
+                _skipped(cid, "pipeline", "warning")
+                for cid in (
+                    _PIPELINE_SKIPPED_CLOSE_ON
+                    if close_on
+                    else _PIPELINE_SKIPPED_CLOSE_OFF
+                )
             )
-        )
 
     if budget_enabled:
         try:
