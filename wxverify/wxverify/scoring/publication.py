@@ -189,9 +189,18 @@ _SITE_PUBLICATIONS_SQL: Final = (
     "SELECT id, published_at FROM publications WHERE site_id = ? ORDER BY cutoff"
 )
 _DELETE_PUBLICATION_SQL: Final = "DELETE FROM publications WHERE id = ?"
+# forecast_downloads is never pruned, so the lower id bound keeps the walk to
+# downloads that can still have value-change rows (every remaining row's
+# download_id is at least the MIN, so the bound drops only downloads with
+# none). NOT INDEXED stops the planner walking the covering index
+# idx_forecast_downloads_day instead (the same idiom as the O16 manifest probe
+# in tests/test_query_plan_regressions.py). With an empty log MIN is NULL and
+# nothing is deleted.
 _DELETE_OLD_VALUE_CHANGES_SQL: Final = (
     "DELETE FROM forecast_value_changes WHERE download_id IN"
-    " (SELECT id FROM forecast_downloads WHERE ended_at < ?)"
+    " (SELECT id FROM forecast_downloads NOT INDEXED"
+    "  WHERE id >= (SELECT MIN(download_id) FROM forecast_value_changes)"
+    "    AND ended_at < ?)"
 )
 
 # The starting history (7.3): today's pairs of the passed generation, before
@@ -247,9 +256,12 @@ _SEED_WIND_OBS_SQL: Final = (
 # The dates today's training leaves out of the observed side: an enabled
 # station's inventory row still to fetch, retryable, or waiting on a refetch
 # (the predicate of ``forecast/wind_blend.py`` ``_UNSETTLED_DAYS_SQL``).
+# CROSS JOIN is load-bearing: it keeps stations in the outer loop, so
+# station_wind_days is sought on its key (station_id, local_date) instead of
+# walked; SQLite's CROSS JOIN gives the same rows as an inner join.
 _SEED_UNSETTLED_SQL: Final = """
     SELECT DISTINCT d.local_date
-    FROM station_wind_days d JOIN stations st ON st.id = d.station_id
+    FROM stations st CROSS JOIN station_wind_days d ON d.station_id = st.id
     WHERE st.site_id = ? AND st.enabled = 1 AND d.local_date < ?
       AND (d.status IN ('pending', 'partial')
            OR (d.status = 'failed' AND d.attempts < 3)

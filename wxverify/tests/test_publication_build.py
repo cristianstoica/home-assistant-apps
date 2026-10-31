@@ -1639,3 +1639,69 @@ def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
         )
 
     asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# PB18
+# ---------------------------------------------------------------------------
+
+
+def _plan_ops_for_alias(details: list[str], alias: str) -> list[str]:
+    """The leading ``SCAN``/``SEARCH`` op of every plan line naming
+    ``alias`` as its table reference (the plan detail's second word), or
+    ``[]`` for a line with no such reference (e.g. ``USE TEMP B-TREE``)."""
+    ops = []
+    for d in details:
+        parts = d.split()
+        if len(parts) >= 2 and parts[1] == alias:
+            ops.append(parts[0])
+    return ops
+
+
+def test_pb18_seed_unsettled_plan_searches_station_wind_days_by_station(
+    tmp_path: Path,
+) -> None:
+    """PB18: ``_SEED_UNSETTLED_SQL``'s own query plan, pinned directly
+    (data-layer fix), run exactly as the add-on runs it -- with bound
+    parameters, never with the values written into the SQL text. Pins
+    that ``station_wind_days`` (alias ``d``) is SOUGHT per station via
+    a ``station_id=`` SEARCH and never walked in full, since a SCAN of
+    that table grows with stations * days and nothing else prunes it;
+    a scan of the small ``stations`` table is allowed (one row per
+    enabled station). On this SQLite build, with no statistics
+    gathered, the older inner-join form (``FROM station_wind_days d
+    JOIN stations st ON st.id = d.station_id``) plans identically to
+    the current CROSS JOIN form when run with bound parameters, so
+    this test does not distinguish the two; the CROSS JOIN exists to
+    keep the loop order fixed regardless of whatever statistics the
+    planner later gathers. Matched on alias plus SCAN/SEARCH and the
+    bound column name only, never the whole plan line (the shipping
+    SQLite build differs from the dev one)."""
+    from wxverify.scoring.publication import _SEED_UNSETTLED_SQL
+
+    _db, _writer, conn = _make_db(tmp_path)
+    site_id = asof_make_site(conn, "pb18-site")
+    bound_date = (D - timedelta(days=3)).isoformat()
+
+    plan_rows = conn.execute(
+        f"EXPLAIN QUERY PLAN {_SEED_UNSETTLED_SQL}", (site_id, bound_date)
+    ).fetchall()
+    details = [str(row["detail"]) for row in plan_rows]
+
+    d_ops = _plan_ops_for_alias(details, "d")
+    assert "SCAN" not in d_ops, (
+        "correct = no SCAN of station_wind_days (alias d; stations drives"
+        " the loop and station_wind_days is sought per station), a broken"
+        " form = SCAN d (e.g. the join's station_id condition dropped, or"
+        " a planner choice under statistics that puts station_wind_days"
+        f" outer, so the whole table is walked), got plan lines {details!r}"
+    )
+
+    search_d_lines = [d for d in details if d.split()[:2] == ["SEARCH", "d"]]
+    assert search_d_lines and any("station_id=" in d for d in search_d_lines), (
+        "correct = a SEARCH d line binding station_id= (station_wind_days"
+        " sought per station, not walked), a broken form = no such SEARCH d"
+        " line (station_wind_days walked instead, e.g. with the join's"
+        " station_id condition dropped or under a planner choice that puts"
+        f" station_wind_days outer), got plan lines {details!r}"
+    )

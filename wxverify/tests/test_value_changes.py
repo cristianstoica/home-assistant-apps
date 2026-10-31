@@ -555,3 +555,163 @@ def test_vc5_the_swap_deletes_value_change_rows_older_than_90_days(
         f"M36 -> at this assertion: correct = kept (89 days old),"
         f" mutant = deleted (ids remaining: {sorted(remaining)!r})"
     )
+
+
+# ---------------------------------------------------------------------------
+# VC7: the swap's delete list subquery, insertion order reversed, plus the
+# query-plan pin for ``_DELETE_OLD_VALUE_CHANGES_SQL`` itself (data-layer
+# fix: the list subquery now seeks ``forecast_downloads`` by rowid from the
+# delete log's own minimum ``download_id`` instead of walking every download
+# ever stored).
+# ---------------------------------------------------------------------------
+
+
+def test_vc7_the_delete_list_follows_ended_at_not_insertion_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VC7(i): three downloads inserted in an order that does NOT match
+    their age -- a download with no value-change rows at all (95 days old)
+    inserted first (lowest id), then the 89-day-old download, then the
+    91-day-old download (so the 91-day-old row has the HIGHER id despite
+    being chronologically older than the 89-day-old one). The publish swap
+    must still delete only the 91-day-old row by its ``ended_at``, not by
+    id order -- this catches a rewrite that bounds the delete by id/
+    insertion order as a stand-in for age, which would get the wrong answer
+    here precisely because id order and age order disagree.
+    """
+    from wxverify.scoring.publication import publish  # P4 piece 6 (plan sec 8)
+
+    db, writer, site_id, _stations = standard_night(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    feed_id = int(
+        conn.execute("SELECT id FROM feeds ORDER BY id LIMIT 1").fetchone()["id"]
+    )
+
+    now = datetime(D.year, D.month, D.day, 12, 0, tzinfo=UTC)
+    no_vc_ended = _stamp(now - timedelta(days=95))
+    kept_ended = _stamp(now - timedelta(days=89))
+    old_ended = _stamp(now - timedelta(days=91))
+
+    def _insert_download(ended_at: str, local_date) -> int:
+        return int(
+            conn.execute(
+                "INSERT INTO forecast_downloads"
+                " (site_id, feed_id, local_date, slot, started_at, ended_at,"
+                "  fetched_at, outcome, usable, inserted, labels)"
+                " VALUES (?, ?, ?, 'unscheduled', ?, ?, ?, 'stored', 1, 1, '{}')",
+                (
+                    site_id,
+                    feed_id,
+                    local_date.isoformat(),
+                    ended_at,
+                    ended_at,
+                    ended_at,
+                ),
+            ).lastrowid
+        )
+
+    # Inserted first -> lowest id, but the OLDEST download of the three
+    # (95 days); no value-change row at all.
+    no_vc_download_id = _insert_download(no_vc_ended, D - timedelta(days=95))
+    # Inserted second (89 days old).
+    kept_download_id = _insert_download(kept_ended, D - timedelta(days=89))
+    # Inserted third -> the HIGHEST id, despite being 91 days old --
+    # chronologically older than kept_download_id, which has a lower id.
+    old_download_id = _insert_download(old_ended, D - timedelta(days=91))
+    assert old_download_id > kept_download_id > no_vc_download_id, (
+        "the fixture's own id order must disagree with its age order, or"
+        " this test cannot discriminate an id-ordered rewrite from the"
+        " correct ended_at-ordered delete"
+    )
+
+    conn.execute(
+        "INSERT INTO forecast_value_changes"
+        " (download_id, previous_download_id, feed_id, variable,"
+        "  hours_compared, hours_changed, max_abs_change,"
+        "  first_changed_valid_at, labels_changed)"
+        " VALUES (?, NULL, ?, 'temperature', 1, 0, 0.0, NULL, 0)",
+        (kept_download_id, feed_id),
+    )
+    conn.execute(
+        "INSERT INTO forecast_value_changes"
+        " (download_id, previous_download_id, feed_id, variable,"
+        "  hours_compared, hours_changed, max_abs_change,"
+        "  first_changed_valid_at, labels_changed)"
+        " VALUES (?, NULL, ?, 'temperature', 1, 0, 0.0, NULL, 0)",
+        (old_download_id, feed_id),
+    )
+    conn.commit()
+
+    d_minus_1 = D - timedelta(days=1)
+    asyncio.run(
+        publish(db, writer, site_id=site_id, cutoff=d_minus_1, attempt=1, now_utc=now)
+    )
+
+    remaining = {
+        row["download_id"]
+        for row in conn.execute("SELECT download_id FROM forecast_value_changes")
+    }
+    assert old_download_id not in remaining, (
+        "correct = the 91-day-old row deleted (ended_at < the 90-day"
+        " cutoff, regardless of its id being the HIGHEST of the three),"
+        f" old statement (an id-ordered rewrite) = still present"
+        f" (ids remaining: {sorted(remaining)!r})"
+    )
+    assert remaining == {kept_download_id}, (
+        "correct = only the 89-day-old row remains (the no-value-change"
+        " download never had a row to begin with, and is untouched),"
+        f" old statement (an id-ordered rewrite) = {sorted(remaining)!r}"
+    )
+
+    download_count = conn.execute(
+        "SELECT COUNT(*) FROM forecast_downloads WHERE id IN (?, ?, ?)",
+        (no_vc_download_id, kept_download_id, old_download_id),
+    ).fetchone()[0]
+    assert download_count == 3, (
+        "correct = all three forecast_downloads rows untouched (the swap"
+        " deletes only from forecast_value_changes), old statement ="
+        f" {download_count} rows found"
+    )
+
+
+def test_vc7_the_delete_plan_searches_forecast_downloads_by_primary_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """VC7(ii): ``_DELETE_OLD_VALUE_CHANGES_SQL``'s own query plan, pinned
+    directly -- the list subquery must never walk ``forecast_downloads``
+    (a scan whose cost grows with every download ever stored, since
+    nothing else prunes that table) and must instead seek it by its
+    integer primary key from the delete log's own minimum ``download_id``.
+    Matched on table name plus SCAN/SEARCH and PRIMARY KEY only, never the
+    whole plan line, since the shipping SQLite build differs from the dev
+    one (project convention, ``tests/test_wind_pair_max.py`` and others).
+    """
+    from wxverify.scoring.publication import _DELETE_OLD_VALUE_CHANGES_SQL
+
+    db, _writer, _site_id, _stations = standard_night(tmp_path)
+    conn = db._conn  # noqa: SLF001
+    stamp = _stamp(datetime(D.year, D.month, D.day, 12, 0, tzinfo=UTC))
+
+    plan_rows = conn.execute(
+        f"EXPLAIN QUERY PLAN {_DELETE_OLD_VALUE_CHANGES_SQL}", (stamp,)
+    ).fetchall()
+    details = [str(row["detail"]) for row in plan_rows]
+
+    scans_downloads = [d for d in details if "forecast_downloads" in d and "SCAN" in d]
+    assert scans_downloads == [], (
+        "correct = no plan line walks forecast_downloads (the list"
+        " subquery seeks it by rowid from the delete log's own minimum"
+        " download_id), old statement = a SCAN line naming"
+        f" forecast_downloads (e.g. its covering index), got {details!r}"
+    )
+
+    searches_by_pk = [
+        d
+        for d in details
+        if "forecast_downloads" in d and "SEARCH" in d and "PRIMARY KEY" in d
+    ]
+    assert searches_by_pk, (
+        "correct = a SEARCH line naming forecast_downloads USING"
+        " (INTEGER) PRIMARY KEY, old statement = no such line (only the"
+        f" full-table SCAN), got {details!r}"
+    )
