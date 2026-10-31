@@ -488,10 +488,14 @@ def test_pg5_app_js_provisional_series_missed_band_and_summary() -> None:
     assert "Provisional observed values from" in app_js
     assert "Missed, never scored:" in app_js
     assert "Scored under the zone it had then:" in app_js
-    assert "zone changeover, not scored" in app_js, (
+    assert (
+        'day.reason === "zone changeover" ? "zone changeover, not scored"'
+        ' : "missed"' in app_js
+    ), (
         "PG5 -> at this assertion: correct = a changeover day's missed"
-        " band labelled 'zone changeover, not scored', mutant = the"
-        " changeover label dropped (today's app.js has no such string)"
+        " band labelled 'zone changeover, not scored' by the band's own"
+        " code, mutant = the changeover label dropped from that code"
+        " (a comment-only match at app.js:136 would not catch this)"
     )
     assert "missedDays.length === 0" in app_js, (
         "PG5 -> at this assertion: correct = the empty-test for the chart"
@@ -1005,14 +1009,6 @@ def test_pg13_typed_nd_window_shows_no_coverage(
     coverage machinery DOES show on the "Last N days" view -- is PG7
     (`test_pg7_coverage_table_next_to_the_rankings`, above), so this test's
     absence claim is not resting on an ambient coincidence.
-
-    Gap: the plan's row (§13.9, PG13) names a "Coverage is counted for"
-    line as one of the two coverage-line strings that must be absent. That
-    exact string does not appear anywhere in `wxverify/web/templates/` or
-    `wxverify/web/static/app.js` today (checked by direct grep), so this
-    only checks the other one, "Coverage per day ahead is in the table
-    above." (`dashboard/_composite.html:5`), which is real and does exist,
-    conditional on `coverage`.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)

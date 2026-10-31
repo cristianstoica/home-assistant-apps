@@ -165,8 +165,9 @@ def test_ss3_close_monitor_is_read_only_and_imports_nothing_from_monitor() -> No
     import, so the original regex-based version of this test could not
     see it. An ``ast`` walk over every node (so a function-body import is
     reached too) catches every import form: ``import wxverify.monitor``,
-    ``from wxverify.monitor import ...``, ``from wxverify import monitor``
-    and the relative ``from . import monitor``.
+    ``from wxverify.monitor import ...``, ``from wxverify import monitor``,
+    the relative ``from . import monitor`` and the relative
+    ``from .monitor import ...``.
     """
     path = PACKAGE_ROOT / "close_monitor.py"
     text = path.read_text(encoding="utf-8")
