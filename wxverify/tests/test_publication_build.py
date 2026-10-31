@@ -1,5 +1,5 @@
 """The publication (daily-close plan 2026-10-22-daily-close-pairs-and-
-publication.md, sections 7 and 8; test IDs PB1-PB15, plan 18.7).
+publication.md, sections 7 and 8; test IDs PB1-PB17, plan 18.7).
 
 Written before ``wxverify.scoring.publication`` exists: every test below
 collects, then fails at its own ``from wxverify.scoring.publication import
@@ -44,7 +44,7 @@ import pytest
 
 from tests.helpers import NOW, D, asof_make_site, day_close_site, note_day_clock
 from wxverify import config
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.site_days import begin_close, ensure_site_days, start_site_days
 from wxverify.db.tz_generations import ensure_published_generation
@@ -311,7 +311,7 @@ def _build_base(tmp_path: Path):
     set_setting(conn, "rolling_window_days", "5")
     set_setting(conn, "min_n", "9")
     dates = [D - timedelta(days=k) for k in range(8, 0, -1)]
-    closed = {D - timedelta(days=k) for k in range(3)}
+    closed = {D - timedelta(days=k) for k in range(1, 4)}
     _seed_uniform_x_scores(conn, site_id, feed_x, dates, closed_dates=closed)
     conn.commit()
     return db, writer, conn, site_id, feed_x
@@ -411,9 +411,8 @@ def test_pb1_publish_builds_rankings_bounds_and_settings(tmp_path: Path) -> None
     """
 
     async def _run() -> None:
-        from wxverify.scoring.publication import publish
-
         from wxverify.forecast.wind_blend import WIND_METHOD
+        from wxverify.scoring.publication import publish
         from wxverify.verification.methodology import METHODOLOGY_VERSION
 
         db, writer, conn, site_id, feed_x = _build_base(tmp_path)
@@ -1406,3 +1405,237 @@ def test_pb15_seed_starting_history_sums_only_the_passed_generation(
         (site_id, local_date.isoformat(), feed_x, "temperature"),
     ).fetchone()[0]
     assert count == 1, "a second call must replace, not add, a duplicate row"
+
+
+# ---------------------------------------------------------------------------
+# PB16
+# ---------------------------------------------------------------------------
+
+
+def test_pb16_build_started_at_published_at_whole_second_microseconds_dropped(
+    tmp_path: Path,
+) -> None:
+    """PB16: as PB1, with ``now_utc`` at an instant whose microsecond is
+    250000: ``publications.build_started_at`` and ``published_at`` pass
+    ``is_canonical_utc_stamp``, the check import applies to them (15.2,
+    15.6)."""
+
+    async def _run() -> None:
+        from wxverify.scoring.publication import publish
+
+        db, writer, conn, site_id, _feed_x = _build_base(tmp_path)
+        fractional_now_utc = NOW + timedelta(microseconds=250000)
+
+        await publish(
+            db,
+            writer,
+            site_id=site_id,
+            cutoff=CUTOFF,
+            attempt=1,
+            now_utc=fractional_now_utc,
+        )
+
+        pub = _fetch_publication(conn, site_id, CUTOFF)
+        assert pub is not None
+        whole_second_stamp = isoformat_utc(fractional_now_utc.replace(microsecond=0))
+
+        build_started_at_canonical = is_canonical_utc_stamp(pub["build_started_at"])
+        assert build_started_at_canonical, (
+            "M144 -> at this assertion: correct = True, mutant"
+            " (build_started_at stored as isoformat_utc(t), microseconds"
+            f" kept) = {build_started_at_canonical!r}"
+        )
+        assert pub["build_started_at"] == whole_second_stamp, (
+            "M144 -> at this assertion: correct ="
+            f" {whole_second_stamp!r} (15.2's"
+            " isoformat_utc(t.replace(microsecond=0))), mutant ="
+            f" {pub['build_started_at']!r}"
+        )
+
+        published_at_canonical = is_canonical_utc_stamp(pub["published_at"])
+        assert published_at_canonical, (
+            "M144 -> at this assertion: correct = True, mutant"
+            " (published_at stored as isoformat_utc(t), microseconds kept)"
+            f" = {published_at_canonical!r}"
+        )
+        assert pub["published_at"] == whole_second_stamp, (
+            "M144 -> at this assertion: correct ="
+            f" {whole_second_stamp!r} (15.2's"
+            " isoformat_utc(t.replace(microsecond=0))), mutant ="
+            f" {pub['published_at']!r}"
+        )
+
+    asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# PB17
+# ---------------------------------------------------------------------------
+
+
+def _close_through_with_missed(
+    conn: sqlite3.Connection,
+    site_id: int,
+    *,
+    first_date,
+    last_closed_date,
+    missed_date,
+) -> None:
+    """Like ``_close_through``, but ``missed_date`` (between ``first_date``
+    and ``last_closed_date`` inclusive) becomes ``missed`` via P1's own
+    retry-exhaustion path (``begin_close`` then ``fail_close``, twice) in
+    place of ``closed``; every other date in range still closes normally.
+    Dates are processed in order, as P1 requires (``_has_earlier_undone``,
+    ``db/site_days.py:757``): a ``missed`` date counts as done, so the date
+    after it still closes.
+    """
+    from wxverify.db.site_days import fail_close, finish_close
+
+    start_dt = datetime(first_date.year, first_date.month, first_date.day, tzinfo=UTC)
+    start_site_days(conn, site_id, first_date, now_utc=start_dt)
+    far_future = note_day_clock(
+        datetime(
+            last_closed_date.year,
+            last_closed_date.month,
+            last_closed_date.day,
+            tzinfo=UTC,
+        )
+        + timedelta(days=3)
+    )
+    ensure_site_days(conn, site_id, now_utc=far_future)
+    d = first_date
+    while d <= last_closed_date:
+        row = conn.execute(
+            "SELECT day_end_utc FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, d.isoformat()),
+        ).fetchone()
+        assert row is not None
+        t = parse_utc(row["day_end_utc"]) + timedelta(minutes=5)
+        if d == missed_date:
+            begin_close(conn, site_id, d, now_utc=t)
+            fail_close(conn, site_id, d, now_utc=t, reason="pb17 synthetic retry 1")
+            t2 = t + timedelta(hours=1, minutes=1)
+            begin_close(conn, site_id, d, now_utc=t2)
+            fail_close(conn, site_id, d, now_utc=t2, reason="pb17 synthetic retry 2")
+        else:
+            begin_close(conn, site_id, d, now_utc=t)
+            finish_close(conn, site_id, d, now_utc=t)
+        d += timedelta(days=1)
+
+
+def test_pb17_a_missed_dates_leftover_day_scores_rows_are_excluded(
+    tmp_path: Path,
+) -> None:
+    """PB17: D-2's record is ``missed`` (P1's ``begin_close`` then
+    ``fail_close``, twice), its ``day_scores`` rows left in place, scored
+    with sums as on D-3 and D-1. X's ``w:5``/``w:all`` sums and w:5
+    coverage leave D-2 out, as PB2 does by deleting its rows outright (7.2);
+    here the rows stay and only the record's ``closed`` state excludes
+    them, proving ``_DAY_SUMS_SQL`` joins on it (M150). Y's wind row on the
+    missed D-2 would be its 20th qualifying day (``MIN_TRAINING_DAYS``) if
+    counted; excluded, Y stays at 19 and gets no weight, proving
+    ``_CLOSED_WIND_SQL`` joins on it too (M151)."""
+
+    async def _run() -> None:
+        from wxverify.scoring.publication import publish
+
+        db, writer, conn = _make_db(tmp_path)
+        site_id = day_close_site(conn, close_on=True, with_records=False)
+        missed_date = D - timedelta(days=2)
+        _close_through_with_missed(
+            conn,
+            site_id,
+            first_date=FIRST_RECORD_DATE,
+            last_closed_date=CUTOFF,
+            missed_date=missed_date,
+        )
+        feed_x = _make_feed(conn, "X")
+        feed_y = _make_feed(conn, "Y")
+        set_setting(conn, "rolling_window_days", "5")
+        set_setting(conn, "min_n", "1")
+
+        dates = [D - timedelta(days=k) for k in range(8, 0, -1)]
+        closed = {D - timedelta(days=k) for k in range(1, 4)}  # D-3, D-2, D-1
+        _seed_uniform_x_scores(conn, site_id, feed_x, dates, closed_dates=closed)
+
+        # Y's wind: 17 starting dates D-20..D-4, plus the closed D-3 and
+        # D-1 -- 19 qualifying days. The same row on the missed D-2 would
+        # be the 20th, reaching MIN_TRAINING_DAYS, only if the closed
+        # record filter is dropped (M151).
+        starting_wind_dates = [D - timedelta(days=k) for k in range(20, 3, -1)]
+        assert len(starting_wind_dates) == 17
+        for sd in starting_wind_dates:
+            _seed_starting_wind_day(
+                conn,
+                site_id=site_id,
+                local_date=sd,
+                feed_id=feed_y,
+                day_ahead=1,
+                forecast_high=11.0,
+                observed_high=10.0,
+            )
+        for cd in (D - timedelta(days=3), D - timedelta(days=1), missed_date):
+            _seed_day_score(
+                conn,
+                site_id=site_id,
+                local_date=cd,
+                feed_id=feed_y,
+                variable="wind",
+                day_ahead=1,
+                status="scored",
+                n=24,
+                err_n=24,
+                wind_fc_high=11.0,
+                wind_fc_hours=24,
+                wind_obs_high=10.0,
+            )
+        conn.commit()
+
+        await publish(
+            db, writer, site_id=site_id, cutoff=CUTOFF, attempt=1, now_utc=NOW
+        )
+
+        pub = _fetch_publication(conn, site_id, CUTOFF)
+        assert pub is not None
+
+        rank5 = _fetch_ranking(conn, pub["id"], feed_x, "temperature", 0, "w:5")
+        assert rank5 is not None
+        assert rank5["n"] == 8, (
+            "M150 -> at this assertion: correct = 8 (the starting D-5,D-4"
+            " (2*2) plus the closed D-3,D-1 (2*2); D-2's record is missed,"
+            " so its leftover day_scores row is left out, 7.2), mutant M150"
+            " (_DAY_SUMS_SQL reads day_scores without the record's closed"
+            " state) = 10 (D-2's leftover row, n=2, counted in)"
+        )
+
+        rank_all = _fetch_ranking(conn, pub["id"], feed_x, "temperature", 0, "w:all")
+        assert rank_all is not None
+        assert rank_all["n"] == 14, (
+            "the starting D-8..D-4 (5*2=10) plus the closed D-3,D-1 (2*2=4);"
+            " D-2 excluded as above"
+        )
+
+        coverage5 = _fetch_coverage(conn, pub["id"], feed_x, "temperature", 0, "w:5")
+        assert coverage5 is not None
+        assert (
+            coverage5["scored"],
+            coverage5["expected"],
+            coverage5["starting_days"],
+        ) == (2, 2, 2), (
+            "scored/expected count only D-3 and D-1 (D-2's record is not"
+            " closed); starting_days counts D-5 and D-4"
+        )
+
+        weight_y = _fetch_wind_weight(conn, pub["id"], feed_y, 1)
+        assert weight_y is None, (
+            "M151 -> at this assertion: correct = no weight row for Y (19"
+            " qualifying days -- the 17 starting dates plus the closed D-3"
+            " and D-1; D-2's record is missed, so its day_scores wind row"
+            " is excluded, below MIN_TRAINING_DAYS 20), mutant M151"
+            " (_CLOSED_WIND_SQL takes day_scores' wind columns without the"
+            " record's closed state) = a weight row for Y too (D-2's row"
+            " counted as the 20th qualifying day, reaching"
+            " MIN_TRAINING_DAYS)"
+        )
+
+    asyncio.run(_run())

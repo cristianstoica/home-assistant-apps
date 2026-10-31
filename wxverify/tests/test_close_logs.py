@@ -63,7 +63,7 @@ from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.site_days import begin_close, fail_close, finish_close, mark_missed
 from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.worker.close_p4 import ScoreSummary
+from wxverify.scoring.close_scores import score_day as _real_score_day
 from wxverify.worker.day_values import GapFillResult, StationFill
 from wxverify.worker.processor import run_claimed_job
 
@@ -208,6 +208,20 @@ def _job_id_for_key(conn, job_type: str, key_suffix: str) -> int:  # type: ignor
     return int(row[0])
 
 
+def _real_publication_id(conn, site_id: int, cutoff) -> str:  # type: ignore[no-untyped-def]
+    """The real ``publications`` row's id for ``cutoff``, as text -- the
+    id ``close_p4.publish``'s call-through actually returns, now that
+    P3's stand-in no longer invents one (plan 18.13)."""
+    row = conn.execute(
+        "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
+        (site_id, cutoff.isoformat()),
+    ).fetchone()
+    assert row is not None, (
+        f"expected a real publications row for site {site_id}, cutoff {cutoff}"
+    )
+    return str(row[0])
+
+
 def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -239,15 +253,18 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        # score_day must return a ScoreSummary, not a plain dict: stage 5
-        # reads summary.scored/summary.absent as attributes, and a dict
-        # raises AttributeError there, failing the attempt at stage 5 and
-        # stopping the chain before it ever reaches day_publish.
-        standins["score_day"].result = ScoreSummary(
-            scored={"temperature_high": 1}, absent={}
-        )
-        standins["publish"].result = f"pub-{D.isoformat()}"
-        standins["clean_worksheets"].result = 0
+        # score_day now calls through to P4's real body (plan 18.13); this
+        # wrapper only records what it actually returned, so the stage-5
+        # detail assertion below can check the log against P4's own
+        # computed summary instead of a value this test invented.
+        captured_summary = []
+
+        def _capture_score_day(*args, **kwargs):  # type: ignore[no-untyped-def]
+            result = _real_score_day(*args, **kwargs)
+            captured_summary.append(result)
+            return result
+
+        standins["score_day"].result = _capture_score_day
 
         clock.set(BOUND)
         claims = await run_due_jobs(db, clock)
@@ -317,14 +334,18 @@ def test_lg1_the_stage_log_rows_match_the_jobs_that_ran(
             assert row["job_id"] == job_id
             assert row["outcome"] == "completed"
 
+        assert len(captured_summary) == 1, "score_day must have run exactly once"
+        real_summary = captured_summary[0]
         stage5 = _stage_log_row(conn, site_id, D, 5)
         detail5 = json.loads(stage5["detail"])
-        assert detail5 == {"scored": {"temperature_high": 1}, "absent": {}}, (
-            "stage 5's detail must hold P4's score summary (11.1)"
-        )
+        assert detail5 == {
+            "scored": real_summary.scored,
+            "absent": real_summary.absent,
+        }, "stage 5's detail must hold P4's own computed score summary (11.1)"
+        expected_pub_id = _real_publication_id(conn, site_id, D)
         stage7 = _stage_log_row(conn, site_id, D, 7)
-        assert f"pub-{D.isoformat()}" in stage7["detail"], (
-            "stage 7's detail must hold P4's publication identifier (11.1)"
+        assert expected_pub_id in stage7["detail"], (
+            "stage 7's detail must hold P4's real publication identifier (11.1)"
         )
 
     asyncio.run(_run())
@@ -763,8 +784,7 @@ def test_lg4_the_truth_version_is_a_pure_function_of_the_truth_rows(
     src2, site2 = _build_lg4_source(tmp_path / "b")
     src3, site3 = _build_lg4_source(tmp_path / "c", high_bump=1.0)
     monkeypatch.setattr(config, "db_path", str(tmp_path / "other.db"))
-    standins = install_p4_standins(monkeypatch)
-    standins["score_day"].result = ScoreSummary(scored={}, absent={})
+    install_p4_standins(monkeypatch)
 
     new_files: dict[str, object] = {}
     for label, src, site_id in (

@@ -1,9 +1,12 @@
 """P4's four call points in the daily close (plan 14.1).
 
 The close calls the scored round and publication plan (P4) only through
-these names, always through this module, so P4 binds them here. Until it
-does, each raises ``NotImplementedError``: a build without P4 fails its
-first close attempt loudly instead of closing a day unscored.
+these names, always through this module, so P4 binds them here. Each is a
+one-line call into its P4 body, imported inside the function at call time
+(P4 plan 16.1): this module's own imports stay ``db.*``, so loading it loads
+no P4 module, and P4's modules import ``RoundState`` and ``ScoreSummary``
+from here without a cycle. The names stay module attributes, so a test can
+patch them.
 
 Inside every call point P4 changes no day state, enqueues no job, reads a
 day's scores and record only once the day is ``closed``, and never fetches
@@ -47,9 +50,11 @@ def round_state(
     """Whether the round of ``round_date`` has settled, and its bound (stage 1).
 
     Read-only. The bound exists for every round date, a round that never
-    ran included (plan 5.2).
+    ran included (plan 5.2). Body: ``worker/round.py`` ``round_state``.
     """
-    raise NotImplementedError("round_state is bound by the daily close's P4")
+    from wxverify.worker.round import round_state as body
+
+    return body(conn, site_id=site_id, round_date=round_date)
 
 
 def score_day(
@@ -64,9 +69,18 @@ def score_day(
 
     Writes through P1's guard in the caller's transaction, replacing any
     rows of an earlier attempt. An exception, or a guard refusal of its
-    writes, fails the attempt (plan 5.3).
+    writes, fails the attempt (plan 5.3). Body: ``scoring/close_scores.py``
+    ``score_day``.
     """
-    raise NotImplementedError("score_day is bound by the daily close's P4")
+    from wxverify.scoring.close_scores import score_day as body
+
+    return body(
+        conn,
+        record=record,
+        attempt=attempt,
+        truth_version=truth_version,
+        now_utc=now_utc,
+    )
 
 
 async def publish(
@@ -82,9 +96,19 @@ async def publish(
 
     Returns the publication's identifier; for a cutoff already published,
     returns that identifier and publishes nothing new. Commits in its own
-    writes and is safe to repeat.
+    writes and is safe to repeat. Body: ``scoring/publication.py``
+    ``publish``.
     """
-    raise NotImplementedError("publish is bound by the daily close's P4")
+    from wxverify.scoring.publication import publish as body
+
+    return await body(
+        db,
+        writer,
+        site_id=site_id,
+        cutoff=cutoff,
+        attempt=attempt,
+        now_utc=now_utc,
+    )
 
 
 async def clean_worksheets(
@@ -93,6 +117,9 @@ async def clean_worksheets(
     """Delete the worksheets of runs older than the latest published (stage 8).
 
     Works in small saves and returns how many runs it finished. Commits in
-    its own writes and is safe to repeat.
+    its own writes and is safe to repeat. Body: ``verification/cleanup.py``
+    ``clean_worksheets``.
     """
-    raise NotImplementedError("clean_worksheets is bound by the daily close's P4")
+    from wxverify.verification.cleanup import clean_worksheets as body
+
+    return await body(db, writer, site_id=site_id, now_utc=now_utc)

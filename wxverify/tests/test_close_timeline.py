@@ -59,9 +59,9 @@ from tests.helpers import (
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.queue import claim_next_job, enqueue_if_absent, reclaim_all_stale
 from wxverify.db.site_days import begin_close, day_record, fail_close, finish_close
+from wxverify.scoring.close_scores import score_day as _real_score_day
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.truth import write_close_truth
-from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.day_values import write_hourly_values
 
 
@@ -1327,12 +1327,11 @@ def test_f1_stage5_duration_is_read_after_score_day_not_before(
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
 
         def _score_and_advance_clock(*args, **kwargs):  # type: ignore[no-untyped-def]
+            result = _real_score_day(*args, **kwargs)
             clock.advance(timedelta(seconds=30))
-            return ScoreSummary(scored={}, absent={})
+            return result
 
         standins["score_day"].result = _score_and_advance_clock
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 6))
@@ -1483,11 +1482,8 @@ def test_f1_stage6_duration_is_read_after_finish_close_not_before(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
         monkeypatch.setattr(
             "wxverify.worker.close_chain.finish_close",
             _advance_clock_after(finish_close, clock),

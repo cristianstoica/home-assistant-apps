@@ -74,7 +74,6 @@ from wxverify.db.site_days import (
     fail_close,
     finish_close,
 )
-from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 
 
@@ -241,6 +240,22 @@ async def _publication_count(db, site_id: int, cutoff):  # type: ignore[no-untyp
         ).fetchone()
     )
     return int(row[0])
+
+
+async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
+    """The real ``publications`` row's id for ``cutoff``, as text -- the
+    id ``close_p4.publish``'s call-through actually returns, now that
+    P3's stand-in no longer invents one (plan 18.13)."""
+    row = await db.read(
+        lambda c: c.execute(
+            "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
+            (site_id, cutoff.isoformat()),
+        ).fetchone()
+    )
+    assert row is not None, (
+        f"expected a real publications row for site {site_id}, cutoff {cutoff}"
+    )
+    return str(row[0])
 
 
 # ---------------------------------------------------------------------------
@@ -683,15 +698,13 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
     """
 
     async def _run() -> None:
-        db, _writer, site_id, _stations = standard_night(tmp_path)
+        db, writer, site_id, _stations = standard_night(tmp_path)
         disable_other_enqueuers(monkeypatch)
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
         standins["publish"].raises = Stop(
             "synthetic stop for RS5, after publish recorded its call"
         )
@@ -748,14 +761,13 @@ def test_rs5_a_stop_during_stage_7_never_publishes_twice(
         )
 
         standins["publish"].raises = None
-        standins["publish"].result = "pub-D"
         result = await standins["publish"](
-            site_id=site_id, cutoff=D, attempt=2, now_utc=clock.now()
+            db, writer, site_id=site_id, cutoff=D, attempt=2, now_utc=clock.now()
         )
-        assert result == "pub-D", (
-            "the retry's call to publish must return the SAME identifier"
-            " as before the stop (P4's own idempotence, exercised through"
-            " the stand-in's fixed result)"
+        expected_pub_id = await _real_publication_id(db, site_id, D)
+        assert result == expected_pub_id, (
+            "the retry's call to publish must return P4's real publications"
+            " row id for this cutoff (P4's own idempotence)"
         )
         publication_count = await _publication_count(db, site_id, D)
         assert publication_count == 1, (

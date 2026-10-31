@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import inspect
 import json
 import sqlite3
 import time
@@ -43,7 +44,6 @@ from wxverify.verification.methodology import (
     CONTINUOUS_BASELINES,
     OCCURRENCE_BASELINES,
 )
-from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 from wxverify.worker.scheduler import scheduler_tick
 
@@ -1092,16 +1092,19 @@ async def run_due_jobs(
 
 class RoundStateStandIn:
     """``close_p4.round_state`` stand-in (plan §14.1, stage 1 only; §15.1
-    "P4."). Answers per ``(site_id, round_date)``, programmed with
+    "P4."; §18.13). Answers per ``(site_id, round_date)``, programmed with
     :meth:`set_answer`; :meth:`raise_for_site` makes every call for one
     site raise instead (TL10's per-site fault), leaving other sites
-    unaffected. Every call is recorded in :attr:`calls`, in call order.
+    unaffected. A ``(site_id, round_date)`` with no programmed answer calls
+    through to P4's real ``round_state`` instead of raising ``KeyError``.
+    Every call is recorded in :attr:`calls`, in call order.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, call_through: Callable[..., object] | None = None) -> None:
         self.calls: list[tuple[int, date]] = []
         self._answers: dict[tuple[int, date], tuple[bool, datetime]] = {}
         self._site_raises: dict[int, BaseException | type[BaseException]] = {}
+        self._call_through = call_through
 
     def set_answer(
         self, site_id: int, round_date: date, *, settled: bool, bound_utc: datetime
@@ -1119,7 +1122,11 @@ class RoundStateStandIn:
         self.calls.append((site_id, round_date))
         if site_id in self._site_raises:
             raise self._site_raises[site_id]
-        settled, bound_utc = self._answers[(site_id, round_date)]
+        answer = self._answers.get((site_id, round_date))
+        if answer is None:
+            assert self._call_through is not None
+            return self._call_through(conn, site_id=site_id, round_date=round_date)
+        settled, bound_utc = answer
         from wxverify.worker.close_p4 import RoundState  # P3 name, §14.1
 
         return RoundState(settled=settled, bound_utc=bound_utc)
@@ -1127,33 +1134,39 @@ class RoundStateStandIn:
 
 def install_round_state_standin(monkeypatch: pytest.MonkeyPatch) -> RoundStateStandIn:
     """Patch ``close_p4.round_state`` with a fresh :class:`RoundStateStandIn`
-    (plan §15.1 "P4."). ``close_p4.py`` does not exist until piece 3, so
-    this raises ``ModuleNotFoundError`` until then -- the right failure for
-    any TL test that calls it before that piece lands.
+    (plan §15.1 "P4."; §18.13). ``close_p4.py`` does not exist until piece
+    3, so this raises ``ModuleNotFoundError`` until then -- the right
+    failure for any TL test that calls it before that piece lands.
     """
-    standin = RoundStateStandIn()
+    from wxverify.worker import close_p4
+
+    standin = RoundStateStandIn(close_p4.round_state)
     monkeypatch.setattr("wxverify.worker.close_p4.round_state", standin, raising=False)
     return standin
 
 
 class RecordingStandIn:
     """Generic recorder for a sync P4 call point (plan §14.1's
-    ``score_day``; §15.1 "P4."). Records every call's ``kwargs`` in
+    ``score_day``; §15.1 "P4."; §18.13). Records every call's ``kwargs`` in
     :attr:`calls`; returns :attr:`result` (calling it first if it is a
-    plain callable) or raises :attr:`raises` when the test sets one.
-    Deliberately ignorant of P4's own return types -- the test that
-    configures ``result`` builds those itself, from ``close_p4`` directly.
+    plain callable) or raises :attr:`raises` when the test sets one. When
+    neither is set, calls through to P4's real body. Deliberately ignorant
+    of P4's own return types -- the test that configures ``result`` builds
+    those itself, from ``close_p4`` directly.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, call_through: Callable[..., object] | None = None) -> None:
         self.calls: list[dict[str, object]] = []
         self.result: object = None
         self.raises: BaseException | type[BaseException] | None = None
+        self._call_through = call_through
 
     def __call__(self, *args: object, **kwargs: object) -> object:
         self.calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
+        if self.result is None and self._call_through is not None:
+            return self._call_through(*args, **kwargs)
         result = self.result
         if callable(result) and not isinstance(result, type):
             return result(*args, **kwargs)
@@ -1162,32 +1175,43 @@ class RecordingStandIn:
 
 class AsyncRecordingStandIn(RecordingStandIn):
     """:class:`RecordingStandIn` for an async P4 call point (``publish``,
-    ``clean_worksheets``, plan §14.1)."""
+    ``clean_worksheets``, plan §14.1; §18.13). Awaits what the call-through,
+    or a callable ``result``, returns when that value is awaitable.
+    """
 
     async def __call__(self, *args: object, **kwargs: object) -> object:
         self.calls.append(kwargs)
         if self.raises is not None:
             raise self.raises
-        result = self.result
-        if callable(result) and not isinstance(result, type):
-            return result(*args, **kwargs)
-        return result
+        if self.result is None and self._call_through is not None:
+            value = self._call_through(*args, **kwargs)
+        else:
+            result = self.result
+            if callable(result) and not isinstance(result, type):
+                value = result(*args, **kwargs)
+            else:
+                value = result
+        if inspect.isawaitable(value):
+            return await value
+        return value
 
 
 def install_p4_standins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, RecordingStandIn]:
     """Patch ``close_p4``'s other three call points -- ``score_day``,
-    ``publish``, ``clean_worksheets`` -- with generic recorders (plan
-    §15.1 "P4."; stage 1's ``round_state`` has its own
-    :func:`install_round_state_standin`, since its answer is keyed by
-    round date and may need to fault one site only). Raises
+    ``publish``, ``clean_worksheets`` -- with generic recorders that call
+    through to P4's real body when the test leaves neither ``result`` nor
+    ``raises`` set (plan §15.1 "P4."; §18.13; stage 1's ``round_state`` has
+    its own :func:`install_round_state_standin`, since its answer is keyed
+    by round date and may need to fault one site only). Raises
     ``ModuleNotFoundError`` until piece 3 adds ``close_p4.py``.
     """
-    score_day = RecordingStandIn()
-    score_day.result = ScoreSummary(scored={}, absent={})
-    publish = AsyncRecordingStandIn()
-    clean_worksheets = AsyncRecordingStandIn()
+    from wxverify.worker import close_p4
+
+    score_day = RecordingStandIn(close_p4.score_day)
+    publish = AsyncRecordingStandIn(close_p4.publish)
+    clean_worksheets = AsyncRecordingStandIn(close_p4.clean_worksheets)
     monkeypatch.setattr("wxverify.worker.close_p4.score_day", score_day, raising=False)
     monkeypatch.setattr("wxverify.worker.close_p4.publish", publish, raising=False)
     monkeypatch.setattr(

@@ -454,7 +454,6 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
     it makes) = the source file modified and no new file created.
     """
     from tests.helpers import install_p4_standins, patch_weathercom_transport
-    from wxverify.worker.close_p4 import ScoreSummary
 
     path = tmp_path / "wxverify.db"
     site_id, _stations = _build_v12_file(path)
@@ -466,7 +465,6 @@ def test_cl3_closes_a_past_day_offline_from_stored_hours(
 
     patch_weathercom_transport(monkeypatch, _handler)  # type: ignore[arg-type]
     standins = install_p4_standins(monkeypatch)
-    standins["score_day"].result = ScoreSummary(scored={}, absent={})
 
     before_names = sorted(p.name for p in tmp_path.iterdir())
     before_bytes, before_version = _file_bytes_and_version(path)

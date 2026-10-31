@@ -58,7 +58,6 @@ from tests.helpers import (
 )
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.site_days import begin_close, day_record, finish_close, mark_missed
-from wxverify.worker.close_p4 import ScoreSummary
 
 R = STANDARD_NIGHT_R
 BOUND = STANDARD_NIGHT_ROUND_BOUND
@@ -304,11 +303,8 @@ def test_sp1_a_station_with_nothing_for_two_days_is_paused(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)
@@ -392,11 +388,8 @@ def test_sp2_a_returning_station_is_not_paused(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)
@@ -463,11 +456,8 @@ def test_sp3_a_day_lost_to_refused_access_does_not_pause(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)
@@ -544,11 +534,8 @@ def test_sp4_a_missed_day_is_skipped_the_earlier_day_decides(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)
@@ -619,11 +606,8 @@ def test_sp5_current_conditions_readings_count_as_something(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)
@@ -694,11 +678,8 @@ def test_sp6_the_counted_day_is_the_latest_one_listing_the_station(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         conn = db._conn  # noqa: SLF001
         d_minus_2 = D - timedelta(days=2)

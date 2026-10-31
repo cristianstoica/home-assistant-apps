@@ -1144,6 +1144,109 @@ def test_rs14_a_changeover_day_with_no_round_slot(
     )
 
 
+def test_rs14_ii_d_attempt_starts_on_the_r_0000z_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RS14 (ii): a fresh night with the same setup as (i) -- close on,
+    zone UTC, only X subscribed; D the site's first record, made during
+    D-1; ``worker_started_at`` before D's end; at D 12:00Z
+    ``enter_zone_change`` to ``Etc/GMT-14``, making R a changeover day
+    with no round slot. With ``disable_other_enqueuers``, real ticks at D
+    23:59Z and R 00:00Z: neither tick logs an ERROR line for the site,
+    and at the R 00:00Z tick D's attempt 1 starts and D moves to
+    ``closing`` (``_close_due_days``, D's own round being R's, 4.4, 4.5;
+    ``worker/close_chain.py:1946-1983``)."""
+    from wxverify import config
+    from wxverify.db.connection import close_db, init_db
+    from wxverify.db.site_days import (
+        DAILY_CLOSE_ON_KEY,
+        enter_zone_change,
+        start_site_days,
+    )
+
+    close_db()
+    db_path = tmp_path / "rs14ii.db"
+    config.db_path = str(db_path)
+    db = init_db(str(db_path))
+    conn = db._conn  # noqa: SLF001
+
+    site_id = asof_make_site(conn, "rs14ii-site")
+    ensure_published_generation(conn, site_id)
+    seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
+    _exclude_seeded_feeds_from_the_round(conn)
+
+    d_minus_1 = D - timedelta(days=1)
+    seed_now = datetime(d_minus_1.year, d_minus_1.month, d_minus_1.day, 0, tzinfo=UTC)
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(seed_now))
+    start_site_days(conn, site_id, D, now_utc=seed_now)
+    set_runtime_state(
+        conn,
+        "worker_started_at",
+        isoformat_utc(datetime(D.year, D.month, D.day, 0, tzinfo=UTC)),
+    )
+    conn.commit()
+
+    change_at = datetime(D.year, D.month, D.day, 12, tzinfo=UTC)
+    changeover_date = enter_zone_change(conn, site_id, "Etc/GMT-14", now_utc=change_at)
+    conn.commit()
+    assert changeover_date == R, "R must be the changeover day"
+
+    disable_other_enqueuers(monkeypatch)
+    clock = MovingClock(datetime(D.year, D.month, D.day, 23, 59, tzinfo=UTC))
+    patch_close_clock(monkeypatch, clock)
+
+    caplog.set_level("ERROR", logger="wxverify.worker.close_chain")
+    asyncio.run(
+        tick(db, clock, at=datetime(D.year, D.month, D.day, 23, 59, tzinfo=UTC))
+    )
+    errors_at_d_tick = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors_at_d_tick == [], (
+        "M145/M146 -> at this assertion: correct = no ERROR line (D has"
+        " not ended yet, so nothing is due), mutant ="
+        f" {[r.getMessage() for r in errors_at_d_tick]!r}"
+    )
+
+    row_before = conn.execute(
+        "SELECT state FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchone()
+    assert row_before is not None
+    assert row_before["state"] == "open", "D must still be open before R 00:00Z"
+
+    caplog.clear()
+    asyncio.run(tick(db, clock, at=datetime(R.year, R.month, R.day, 0, 0, tzinfo=UTC)))
+    errors_at_r_tick = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert errors_at_r_tick == [], (
+        "M145/M146 -> at this assertion: correct = no ERROR line at the R"
+        " 00:00Z tick, mutant (round_state(R) raises, or answers the"
+        " wrong settled/bound_utc, so D's own round -- R's, 4.5's '_round'"
+        f" -- fails the site's steps) = {[r.getMessage() for r in errors_at_r_tick]!r}"
+    )
+
+    row_after = conn.execute(
+        "SELECT state FROM site_days WHERE site_id = ? AND local_date = ?",
+        (site_id, D.isoformat()),
+    ).fetchone()
+    assert row_after is not None
+    assert row_after["state"] == "closing", (
+        "M145/M146 -> at this assertion: correct = 'closing' (D's attempt 1"
+        " starts once round_state(R) answers settled True with bound_utc"
+        " R's day_start_utc, so D's due instant is R 00:00Z), mutant ="
+        f" {row_after['state']!r}"
+    )
+
+    attempt_row = conn.execute(
+        "SELECT 1 FROM close_attempts WHERE site_id = ? AND local_date = ?"
+        " AND attempt = 1",
+        (site_id, D.isoformat()),
+    ).fetchone()
+    assert attempt_row is not None, (
+        "M145/M146 -> at this assertion: correct = a close_attempts row for"
+        " D's attempt 1 (_start_attempt ran), mutant = no such row (the"
+        " site's steps raised instead and began nothing this tick)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # §18.3 Daytime downloads
 # ---------------------------------------------------------------------------

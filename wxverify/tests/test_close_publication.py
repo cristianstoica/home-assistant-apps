@@ -59,7 +59,6 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.queue import claim_next_job, enqueue_if_absent
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.db.site_days import day_record
-from wxverify.worker.close_p4 import ScoreSummary
 from wxverify.worker.processor import run_claimed_job
 
 
@@ -98,6 +97,22 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
             (site_id, cutoff.isoformat()),
         ).fetchone()
     )
+
+
+async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
+    """The real ``publications`` row's id for ``cutoff``, as text -- the
+    id ``close_p4.publish``'s call-through actually returns, now that
+    P3's stand-in no longer invents one (plan 18.13)."""
+    row = await db.read(
+        lambda c: c.execute(
+            "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
+            (site_id, cutoff.isoformat()),
+        ).fetchone()
+    )
+    assert row is not None, (
+        f"expected a real publications row for site {site_id}, cutoff {cutoff}"
+    )
+    return str(row[0])
 
 
 async def _publication_count(db, site_id, cutoff):  # type: ignore[no-untyped-def]
@@ -243,14 +258,11 @@ def test_pb1_a_missed_day_opens_no_publication(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
         round_state.set_answer(
             site_id, D_PLUS_2, settled=False, bound_utc=_bound_for(D_PLUS_2)
         )
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         await run_due_jobs(db, clock)
@@ -315,8 +327,6 @@ def test_pb2_a_failed_publish_retries_once_an_hour_later(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB2")
 
         clock.set(BOUND)
@@ -347,15 +357,15 @@ def test_pb2_a_failed_publish_retries_once_an_hour_later(
         )
 
         standins["publish"].raises = None
-        standins["publish"].result = "pub-D"
         await tick(db, clock, retry_at)
         await run_due_jobs(db, clock)
 
+        expected_pub_id = await _real_publication_id(db, site_id, D)
         retried = await _publication_row(db, site_id, D)
         assert (retried["attempt"], retried["state"], retried["publication_id"]) == (
             2,
             "published",
-            "pub-D",
+            expected_pub_id,
         ), "the retry must close out as published, attempt 2, with P4's identifier"
 
     asyncio.run(_run())
@@ -397,8 +407,6 @@ def test_pb3_a_failed_publication_does_not_block_the_next_cutoff(
         round_state.set_answer(
             site_id, D_PLUS_2, settled=True, bound_utc=_bound_for(D_PLUS_2)
         )
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB3")
 
         clock.set(BOUND)
@@ -428,17 +436,17 @@ def test_pb3_a_failed_publication_does_not_block_the_next_cutoff(
             lambda c: _seed_five_minute_day(c, stations["ISTATION02"], D_PLUS_1)
         )
         standins["publish"].raises = None
-        standins["publish"].result = "pub-D+1"
         await tick(db, clock, _bound_for(D_PLUS_2))
         await run_due_jobs(db, clock)
 
+        expected_pub_id = await _real_publication_id(db, site_id, D_PLUS_1)
         second = await _publication_row(db, site_id, D_PLUS_1)
         assert (second["attempt"], second["state"], second["publication_id"]) == (
             1,
             "published",
-            "pub-D+1",
+            expected_pub_id,
         ), (
-            "M66 -> at this assertion: correct = (1, 'published', 'pub-D+1')"
+            f"M66 -> at this assertion: correct = (1, 'published', {expected_pub_id!r})"
             " (D + 1's own publication is built and published, unblocked by"
             " D's failed one), mutant M66 (a failed publication record"
             " blocks the next cutoff) = D + 1 never opens or never"
@@ -487,11 +495,6 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         standins = install_p4_standins(monkeypatch)
-
-        def _publish_result(**kwargs: object) -> str:
-            return f"pub-{kwargs['cutoff']}"
-
-        standins["publish"].result = _publish_result
 
         opened_d = NOW
         opened_d1 = NOW + timedelta(minutes=1)
@@ -542,10 +545,11 @@ def test_pb4_an_older_open_record_is_superseded_by_a_newer_one(
         assert second is not None and second.id == job_d1
         await run_claimed_job(db, second, lane="main")
 
+        expected_pub_id = await _real_publication_id(db, site_id, D_PLUS_1)
         newer = await _publication_row(db, site_id, D_PLUS_1)
         assert (newer["state"], newer["publication_id"]) == (
             "published",
-            f"pub-{D_PLUS_1.isoformat()}",
+            expected_pub_id,
         ), (
             "the newer cutoff's own stage 7 must publish normally, with"
             " its own identifier"
@@ -593,7 +597,6 @@ def test_pb4b_a_retrying_older_record_is_superseded_by_a_published_newer_one(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         standins = install_p4_standins(monkeypatch)
-        standins["publish"].result = "pub-D-retry"
 
         opened_c1 = NOW
         opened_c2 = NOW + timedelta(minutes=1)
@@ -942,8 +945,6 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB7")
 
         clock.set(BOUND)
@@ -981,7 +982,6 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
         assert still_retry_due["state"] == "retry_due", "the record must not move early"
 
         standins["publish"].raises = None
-        standins["publish"].result = "pub-D"
         await tick(db, clock, retry_at)
 
         retried = await _publication_row(db, site_id, D)
@@ -1007,6 +1007,7 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
         }, "the retry's own stage-7 job must carry the new attempt"
 
         await run_due_jobs(db, clock)
+        expected_pub_id = await _real_publication_id(db, site_id, D)
         published = await _publication_row(db, site_id, D)
         assert (
             published["attempt"],
@@ -1015,7 +1016,7 @@ def test_pb7_a_retry_due_record_is_not_repaired_early(
         ) == (
             2,
             "published",
-            "pub-D",
+            expected_pub_id,
         ), "the retry must publish, with P4's identifier"
 
     asyncio.run(_run())
@@ -1164,7 +1165,6 @@ def test_pb8_a_failed_cleanup_counts_until_a_real_recovery_clears_it(
         )
 
         standins["clean_worksheets"].raises = None
-        standins["clean_worksheets"].result = 0
         job3_id = await db.write(
             lambda c: (
                 enqueue_if_absent(
@@ -1226,8 +1226,6 @@ def test_pb9_both_failed_stage7_jobs_report_no_failed_scope(
         round_state = install_round_state_standin(monkeypatch)
         standins = install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
         standins["publish"].raises = RuntimeError("synthetic publish failure for PB9")
 
         clock.set(BOUND)

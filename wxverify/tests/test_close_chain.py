@@ -53,7 +53,6 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import DayStateError, day_record, finish_close
 from wxverify.scoring.consensus import materialize_consensus, write_station_observation
-from wxverify.worker.close_p4 import ScoreSummary
 
 
 @pytest.fixture(autouse=True)
@@ -80,6 +79,22 @@ async def _publication_row(db, site_id, cutoff):  # type: ignore[no-untyped-def]
             (site_id, cutoff.isoformat()),
         ).fetchone()
     )
+
+
+async def _real_publication_id(db, site_id, cutoff):  # type: ignore[no-untyped-def]
+    """The real ``publications`` row's id for ``cutoff``, as text -- the
+    id ``close_p4.publish``'s call-through actually returns, now that
+    P3's stand-in no longer invents one (plan 18.13)."""
+    row = await db.read(
+        lambda c: c.execute(
+            "SELECT id FROM publications WHERE site_id = ? AND cutoff = ?",
+            (site_id, cutoff.isoformat()),
+        ).fetchone()
+    )
+    assert row is not None, (
+        f"expected a real publications row for site {site_id}, cutoff {cutoff}"
+    )
+    return str(row[0])
 
 
 async def _attempt_row(db, site_id, local_date, attempt):  # type: ignore[no-untyped-def]
@@ -132,11 +147,8 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         claims = await run_due_jobs(db, clock)
@@ -172,10 +184,11 @@ def test_ho1_the_standard_night_hands_off_every_stage_in_order(
 
         record = await _state(db, site_id)
         assert record.state == "closed", "the standard night must close D"
+        expected_pub_id = await _real_publication_id(db, site_id, D)
         publication = await _publication_row(db, site_id, D)
         assert (publication["state"], publication["publication_id"]) == (
             "published",
-            "pub-D",
+            expected_pub_id,
         ), "the publication must be published with P4's identifier"
 
     asyncio.run(_run())
@@ -239,11 +252,8 @@ def test_ho2_a_lost_handoff_is_repaired_once_a_published_record_never(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         day_close_stops = [2, 3, 4, 5, 6]
@@ -350,11 +360,8 @@ def test_ho3_a_repeated_stage_job_is_skipped_not_rerun(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 4))
@@ -506,11 +513,8 @@ def test_ho4_stage_6_refuses_over_stale_truth_fails_the_attempt(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["publish"].result = "pub-D"
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 6))
@@ -702,10 +706,8 @@ def test_ho6_a_failed_handoff_after_stage_6_fails_the_attempt_atomically(
         clock = MovingClock(NOW)
         patch_close_clock(monkeypatch, clock)
         round_state = install_round_state_standin(monkeypatch)
-        standins = install_p4_standins(monkeypatch)
+        install_p4_standins(monkeypatch)
         round_state.set_answer(site_id, R, settled=True, bound_utc=BOUND)
-        standins["score_day"].result = ScoreSummary(scored={}, absent={})
-        standins["clean_worksheets"].result = 0
 
         clock.set(BOUND)
         await run_due_jobs(db, clock, stop_before=("day_close", 6))
