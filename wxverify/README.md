@@ -106,7 +106,7 @@ The add-on config exposes these options:
 | `rolling_window_days`  | No               | `30`    | Default rolling score window                     |
 | `min_n`                | No               | `30`    | Minimum paired samples for confident scores      |
 | `obs_interval_minutes` | No               | `180`   | Base observation refresh cadence                 |
-| `obs_jitter_minutes`   | No               | `20`    | Per-cycle bounded jitter for PWS refreshes       |
+| `obs_jitter_minutes`   | No               | `20`    | Not used. Kept so existing configurations still load |
 | `log_level`            | No               | `info`  | Runtime logging level                            |
 
 The add-on serves through Home Assistant Ingress. Do not pass an extra root path
@@ -176,8 +176,9 @@ The option is temporary and will be removed in a later release.
    - rain threshold in mm
 4. Add at least one Weather.com PWS station to the site.
 5. Confirm provider key status on the Ops page.
-6. Let the worker run. It refreshes PWS observations, materializes consensus,
-   and queues scoring work when observations change.
+6. Let the worker run. It collects each station's readings through the day.
+   A new site's first scored day is the first full local day after it was
+   created; each day is closed and scored once, after it ends.
 
 Site creation does not require a Weather.com key. Adding a station does require
 the key because the station ID is validated synchronously.
@@ -206,8 +207,9 @@ You usually do not need to change it unless your station reports noisy tiny
 precip amounts or you want a stricter definition such as `1.0 mm`.
 
 It only affects precipitation: event scoring and the Forecast page's wet-hour
-count. Temperature and wind are unaffected. Changing it later recomputes precip
-pairs and cached scores for that site.
+count. Temperature and wind are unaffected. Changing it later affects the
+scoring of the days not yet closed; a closed day keeps the scores it was
+closed with.
 
 A rain value for an hour is the rain that falls in the hour that starts at that
 time. Open-Meteo and meteoblue label rain by the hour's end, so wxverify moves
@@ -274,24 +276,16 @@ statistic; it makes no claim to match a WMO definition. The site's hourly wind
 is still the 90th percentile of its stations' values, and the daily reference is
 the day's highest site hourly value.
 
-A background wind lane fetches the 5-minute records for every enabled
-station-day, from the site's first stored observation through today, and
-derives the hourly pair-max figure from them. Past station-days use only the
-weather.com headroom left under the daily limit after today's own use, the
-expected remaining live demand and a 200-call reserve, so live observations
-always come first. The lane keeps today's and yesterday's station wind current
-on the observation interval, with a last call shortly before local midnight and
-one retry if that call fails; today's figure never includes the hour still in
-progress. When the key cannot download past days, each past day is finished
-from the records already stored. A past station-day whose call keeps failing is
-given up after 3 attempts and counted as failed; one the provider has no data
-for is counted as unavailable.
+A background wind lane downloads today's 5-minute records for every enabled
+station: from the start of the local day every `obs_interval_minutes` (default
+`180`) until 23:00, then at fixed evening slots from 23:00 to 23:59 local time.
+In the evening a failed try moves to the next slot, and a good one skips ahead
+to the 23:56 slot, which always runs. Past days are not downloaded again. A
+day's hourly pair-max figures are written when the daily close closes that
+day, after it ends.
 
 The Ops page's `Wind History` panel shows the station-day counts, today's call
-headroom and the lane's calls, and the latest errors. If weather.com refuses
-the key for a wind request, the lane stops that request type and holds it until
-you press `Try again` on that panel; the next wind fetch then makes one check
-call, and only a successful call clears the hold.
+headroom and the lane's calls, and the latest errors.
 
 **The served wind forecast.** The forecast wind uses every feed with a track
 record, weighted by past accuracy. For each day-ahead (today through 7 days
@@ -340,9 +334,7 @@ lowered in 0.16.0. Adding a model means editing all three mappings
 runs on every start, inserts the new model's row, and the 0.16.0 one-shot
 corrections leave a model added later as it was seeded. Meteoblue is
 unchanged: its seed stays at `168` and its package data is filtered to that
-feed's `max_lead_hours`. Open-Meteo historical backfill stores previous-run
-day-ahead leads from day 1 through day 7, or through the last whole day of the
-feed's `max_lead_hours` when that comes sooner: day 5 for `icon_eu`.
+feed's `max_lead_hours`.
 
 `DISPLAY_REQUEST_HOURS` is `217`, and it is a display figure, not a scoring
 one. The product displays `forecast.service.DAY_COUNT` days; the request has to
@@ -415,8 +407,7 @@ Dashboard panels:
   so instead, and when no feed beats its baseline it adds that caveat. For wind,
   this card shows the wind weights instead: each feed's MAE (km/h), the number
   of days behind it and its share of the weight for the selected lead. The
-  `Leaderboard` stays as information for wind and highlights no winner. While
-  weather.com refuses the key for wind, a banner above the panels says so.
+  `Leaderboard` stays as information for wind and highlights no winner.
 - `Leaderboard` is the main ranking for the selected site, variable, window,
   and lead. `Samples` is the number of matched forecast-vs-observation pairs.
   `Skill` is a `0-100` badge: temperature and wind use skill against the
@@ -479,37 +470,24 @@ Everything else stays as it was:
   badge is never set for wind. `Rain` has a stricter rule of its own, described
   below.
 
-The `Today` tile normally shows a high and low too. Adding a site's station
-starts a setup backfill, which fetches earlier forecast runs of every
-subscribed Open-Meteo feed up to the start of the hour the backfill began, and
-regular fetches supply the rest of the day from the hour they run. So once the
-backfill has finished, today's elapsed hours are already there. A feed can
+The `Today` tile normally shows a high and low too: a feed fetched before
+today began normally has all of today's hours. Earlier forecast runs are not
+fetched, and regular fetches supply hours from the hour they run. A feed can
 lack some of today's hours, and then cannot cover `Today`, when:
 
-- the setup backfill has not finished yet;
-- the feed comes from a provider other than Open-Meteo and was first fetched
-  today: those providers have no earlier runs to fetch, so the feed may lack
-  today's earliest hours (a feed already fetched before today normally has
-  them);
-- it is an Open-Meteo feed subscribed after the backfill finished, which the
-  backfill does not go back for (a catch-up, from the `Catch up` button on the
-  Ops page or the `catchup` command, may fetch its history);
-- the provider returned an hour without a value, or an hour fell after the
-  backfill's end and before the feed's first regular fetch;
-- the provider refused that feed's history request during setup backfill (for
-  example ICON-EU for a site outside Europe); the backfill records the error,
-  continues with the other feeds and does not go back for that feed.
+- it was first fetched today, as on a new site or for a feed subscribed today,
+  and so may lack today's hours before that fetch;
+- the provider returned an hour without a value.
 
 The label appears only when none of the feeds with forecasts for that day
 covers it, so a feed added later never blanks a day another feed already
 covers. Regular fetches never fill the hours before their own forecast run: a
 fetch keeps only hours at least an hour after its forecast run was issued, and
 Open-Meteo's regular fetches start at the hour they run. So when no feed covers
-today, `Today` shows the label for the rest of the date, unless the backfill or
-a catch-up fills the gap, or a later fetch returns a value for an hour an
-earlier one left without one. At local midnight the next date becomes `Today`,
-and it shows a high and low only if a feed covers that whole date: the change
-of day fills in no missing hours.
+today, `Today` shows the label for the rest of the date, unless a later fetch
+returns a value for an hour an earlier one left without one. At local midnight
+the next date becomes `Today`, and it shows a high and low only if a feed
+covers that whole date: the change of day fills in no missing hours.
 
 The `Rain` row has a stricter rule, because a daily total and a count of wet
 hours are only right if each hour is counted exactly once. A feed counts
@@ -575,8 +553,6 @@ Available commands:
 python -m wxverify --db /path/to/wxverify.db serve --options /path/to/options.json
 python -m wxverify --db /path/to/wxverify.db fetch <site_id> <feed_id>
 python -m wxverify --db /path/to/wxverify.db score [--site-id <site_id>]
-python -m wxverify --db /path/to/wxverify.db backfill <site_id>
-python -m wxverify --db /path/to/wxverify.db catchup
 python -m wxverify --db /path/to/wxverify.db settings list
 python -m wxverify --db /path/to/wxverify.db settings get <key>
 python -m wxverify --db /path/to/wxverify.db settings set <key> <value>
@@ -586,17 +562,17 @@ python -m wxverify --db /path/to/wxverify.db providers reconcile
 python -m wxverify --db /path/to/wxverify.db providers enable --site-id <site_id> --all-new
 python -m wxverify --db /path/to/wxverify.db providers fetch --site-id <site_id> --source visualcrossing
 python -m wxverify --db /path/to/wxverify.db providers smoke --site-id <site_id> --all-new
-python -m wxverify --db /path/to/wxverify.db timezone status [--site-id <site_id>] [--json]
-python -m wxverify --db /path/to/wxverify.db timezone correct --site-id <site_id> --timezone <IANA> [--json]
-python -m wxverify --db /path/to/wxverify.db timezone change --site-id <site_id> --timezone <IANA> --effective-from <ISO-8601 UTC> [--json]
+python -m wxverify --db /path/to/wxverify.db timezone change --site-id <site_id> --timezone <IANA zone> [--json]
+python -m wxverify --db /path/to/wxverify.db wind-history prune --dry-run [--json]
+python -m wxverify --db /path/to/wxverify.db wind-history prune --restored-backup <backup_name> [--json]
 ```
 
 For `weathercom`, the cap in force is the lower of the value stored with
 `sources set-cap` and a provisional provider allowance of 1500 calls a day; the
 Ops page's Budget Gauges panel shows both.
 
-Changing `rolling_window_days` through the settings path invalidates old cached
-scores. Other settings are plain runtime knobs.
+Changing `rolling_window_days` takes effect at the next publication, which
+follows each day's close. Other settings are plain runtime knobs.
 
 Provider operations are local admin commands. `doctor`, `reconcile`,
 `enable`, `disable`, and enqueue-only `providers fetch` do not call external
@@ -609,194 +585,53 @@ overwriting edited caps or feed settings. New or changed Python adapter code
 still requires restarting the app process so the running interpreter loads that
 code.
 
-## Timezone corrections
+`wind-history prune` deletes, once, the 5-minute wind readings stored before
+0.16.14 that are dated more than 20 minutes before their site's first closed
+day. Run it with `--dry-run` first: that only reads, and prints each station's
+row count and date range, then every reason the prune would refuse. A run that
+deletes needs `--restored-backup`, naming a backup from before 0.16.14 whose
+restore you have checked. It refuses until the daily close is on and the first
+closed day of every site that still has such readings is closed or missed. It
+deletes one station at a time, prints the rows left, and exits `0` only when
+none is left, so it is safe to run again after a stop.
 
-A site's timezone is **not** an ordinary editable field. `PUT /api/sites/{id}`
-has no timezone attribute and the Sites page cannot change one, on purpose: the
-timezone decides which observations fall on which local day, so changing it
-changes every daily truth row, every daily verification result, and every
-leaderboard value derived from them. A normal edit must never silently rewrite
-history, so the two ways to change a timezone are separate, deliberately
-obvious commands.
+## Changing a site's time zone
 
-Every change produces a numbered **generation**. Exactly one generation per
-site is *published* at a time, and readers keep serving the published one until
-a new generation is complete.
+A site's time zone decides which readings fall on which local day, and each day is closed and scored once under the zone it was created with. A zone is therefore not an ordinary editable field: `PUT /api/sites/{id}` has no time-zone attribute and the Sites page cannot change one.
 
-```sh
-# Read-only: every generation for every site (or one site), with its
-# reconciliation counts.
-python -m wxverify --db /data/wxverify.db timezone status --site-id 7
-```
-
-```text
-site=7 generation=1 published=yes timezone=UTC mode=initial state=published
-  effective_from=- effective_to=- published_at=2026-08-01T09:12:04Z
-  examined=- changed=- unchanged=- excluded=-
-site=7 generation=2 published=no timezone=America/Denver mode=retrospective_correction state=building
-  effective_from=- effective_to=- published_at=-
-  examined=612 changed=118 unchanged=494 excluded=0
-```
-
-`--json` prints the same rows as a JSON document for scripting. A correction is
-reconciled when `examined == changed + unchanged + excluded`.
-
-### Which command
-
-**`timezone correct` — the stored timezone was always wrong.**
+If a site's zone is wrong, or the site moves to another zone, enter the change with:
 
 ```sh
-python -m wxverify --db /data/wxverify.db timezone correct \
-  --site-id 7 --timezone America/Denver
+python -m wxverify --db /data/wxverify.db timezone change --site-id <site_id> --timezone <IANA zone>
 ```
 
-This starts a **retrospective correction**: a new generation is built
-*alongside* the live one, re-bucketing and rescoring the entire timezone-derived
-history, and only flips to published when the rebuild finishes. Until then
-readers keep serving the previous generation, so nothing goes blank mid-rebuild.
+The change takes effect from the next full local day. The command prints the first full day under the new zone, and the changeover day before it when there is one.
 
-> **A retrospective correction rewrites history.** Published leaderboard and
-> verification values for past days will change once the rebuilt generation is
-> published — a day that scored one way under the old zone can score
-> differently under the new one. That is the intended effect of fixing a wrong
-> timezone; it is not a display glitch, and it is not reversible except by
-> running another correction back.
+- The **changeover day** runs from the end of the last day under the old zone to the start of the first day under the new one, so it is shorter or longer than a normal day. It is flagged and not scored, like a missed day. Its readings are still stored.
+- **Days already closed keep the zone they were scored under.** They are not rebuilt, and the pages flag them as scored under their own zone.
+- Past days cannot be re-bucketed into a different zone. The earlier retrospective correction was retired when the daily close turned on.
 
-**`timezone change` — the site genuinely moved to a different zone on a date.**
-
-```sh
-python -m wxverify --db /data/wxverify.db timezone change \
-  --site-id 7 --timezone America/Denver --effective-from 2026-09-01T00:00:00Z
-```
-
-This applies a **prospective change**: the previous generation is closed at that
-instant and the new one takes over from it. History before the instant keeps its
-own generation and is not rebuilt.
-
-Both commands exit non-zero with a one-line `error …` message (no traceback) if
-the site is unknown, the timezone is not a valid IANA name, the instant does not
-parse, or a correction is already building for that site.
-
-### Correction runbook
-
-Order matters. Run these steps in sequence:
-
-1. **Ship** the release that contains the timezone-aware code and migration,
-   and let the add-on start normally.
-2. **Correct** the site: `timezone correct --site-id 7 --timezone America/Denver`.
-3. **Verify the counts** with `timezone status --site-id 7`, repeating until the
-   building generation reports `examined == changed + unchanged + excluded`.
-   Do not move on while the numbers are still climbing.
-4. **The generation activates** on its own: when the rebuild is reconciled the
-   published pointer flips to it, and `status` then shows `published=yes`
-   against the new generation. This is the moment historical values change.
-5. **The forecast-of-record log begins** after the flip, so every appended entry
-   is stamped against the corrected generation from its first row.
+The command exits non-zero with a one-line message, for example when the site is unknown, the zone is not a valid IANA name, the site already runs under that zone from the next day, or the daily close is not yet on.
 
 ## Operational Notes
 
 - SQLite runs in WAL mode.
 - All writes are serialized through one writer connection.
-- The observation refresh window is six hours in steady state and widens
-  automatically, up to the provider's seven-day limit, to cover a gap in stored
-  coverage. It is not a setting.
-- A station for which the provider returns no data, or no reading from the last
-  six hours, is retried on a growing delay, from one hour doubling to
-  twenty-four hours, while the site's other stations keep being fetched. The
-  health monitor (`/api/health/monitor`) flags the station until it reports a
-  recent reading again. Older hours it does return are still stored and used.
 - Weather.com PWS calls are budgeted per enabled station.
-- A site with no enabled stations is not observation-due and advances neither
-  `last_obs_cycle_at` (cycle completion) nor `last_obs_at` (data freshness).
 - Forecast and observation provider keys are never stored in the database.
 - `/api/health/keys` reports only present or absent, never secret values.
-- Audit queries against `verification_trigger_decisions` must select
-  `MAX(id)` per `(site_id, trigger_date)`: a retried trigger appends a new
-  decision row for the same site and day rather than updating the old one,
-  so the highest `id` is the decision that actually stood.
+- Audit queries against `verification_trigger_decisions`, which is no longer
+  written, must select `MAX(id)` per `(site_id, trigger_date)`: a retried
+  trigger appended a new decision row for the same site and day rather than
+  updating the old one, so the highest `id` is the decision that actually stood.
 
 ## Verification Publish Hold
 
-The publish hold is the kill switch for the nightly verification chain. While it
-is held, no **new** verification run is started. It does not stop a run that is
-already queued or under way — that chain continues and may publish — so read the
-active-chain badge before you rely on the hold.
-
-Ops → Nightly Verification Run Hold is the control. It shows whether the hold
-is held or released, whether a chain is currently active, and when the state last
-changed and from where (Ops or Bootstrap). The button arms or releases the hold:
-it asks for confirmation in the browser, then sends
-`PUT /api/verification/publish-hold` and rewrites the badges, the button, and the
-last-changed line from what that call returns — no manual reload. Arming reloads
-the page once, so the banner is written by the server rather than restated in the
-browser. While the hold is on, `/ops` and `/verification` also carry a banner
-saying so.
-
-- **Arming is never refused.** You can hold publishing at any time, including
-  while a chain is running.
-- **Releasing is refused with `409` while any site has a queued or running
-  verification chain**, and the state is left unchanged. Wait for the chain to
-  finish, then click again.
-
-Upgrading an existing pre-0.11.3 installation arms the hold once during startup.
-This blocks newly scheduled verification runs until you review and release it.
-A run already queued or under way may still publish, which is why deployment
-requires confirming that no job is pending or running first. A fresh install is
-not held. Once released, this 0.11.3 bootstrap decision is preserved across
-subsequent 0.11.3 restarts.
-
-### Emergency fallback: the CLI
-
-For when the Ops control itself is unreachable — a broken toggle, a template or
-route regression, or a downgrade to a version that honours the hold but has no
-control for it. Releasing is the direction this fallback exists for: a
-downgraded 0.11.2 honours an armed hold and has no control to clear it. The
-command writes the same `settings` row the Ops control writes, but it bypasses
-the last-transition record, which will keep describing the older transition.
-
-On 0.11.3 the scheduler picks the change up on its next tick, with no restart.
-**On 0.11.2 it does not:** the skip decision already recorded for that day stops
-the scheduler before it re-reads the key, so a release there only takes effect
-at the next nightly trigger (02:00 local time) — up to about a day later. Plan
-the window accordingly if you are releasing on a downgraded instance.
-
-The command runs **inside the add-on's own container**, against that container's
-own `/data/wxverify.db`:
-
-```sh
-python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 0
-```
-
-`0` releases the hold, `1` arms it. There is no `wxverify` executable in the
-image — `python3 -m wxverify` is the invocation the service itself uses — and
-`--db` is a global option that must come before the `settings` subcommand.
-
-Getting a shell there is the part to plan in advance. The *Advanced SSH & Web
-Terminal* add-on is a **different** container: the wxverify package is not
-importable in it and its `/data` is a different volume. From there, find the
-wxverify container first, then run the command inside it:
-
-```sh
-docker ps --filter name=wxverify --format '{{.Names}}'
-docker exec <name-from-the-line-above> \
-    python3 -m wxverify --db /data/wxverify.db settings set verification_publish_hold 0
-```
-
-Two links in that chain cannot be answered from this repository. Confirm both
-once, in advance, rather than during an incident:
-
-- **The container name.** The Supervisor composes it from the repository the
-  add-on was installed from plus the slug — `addon_local_wxverify` for a local
-  install, `addon_<repository-id>_wxverify` for one added by URL. Only the slug,
-  `wxverify`, is fixed here, which is why the `docker ps` line is a required
-  discovery step and not decoration.
-- **Whether the SSH add-on can reach Docker at all.** That generally requires its
-  *Protection mode* to be off. Check that `docker ps` returns output before you
-  need this procedure.
-
-If the wxverify container is restart-looping, `docker exec` may not land at all.
-The fallback then is the add-on *Restore from backup* path, or reinstalling a
-known-good version.
+Ops → Nightly Verification Run Hold, and the `verification_publish_hold`
+setting behind it, held the nightly verification run, which the daily close
+replaced. Arming or releasing it now changes only that panel and the banner it
+puts on `/ops` and `/verification`. It starts, stops and delays nothing: each
+day is still closed and scored once after it ends.
 
 ## Database Export and Import
 
@@ -814,20 +649,23 @@ add-on's own UTC form, `YYYY-MM-DDTHH:MM:SSZ`), and the current database is
 automatically backed up to `/data/wxverify-<timestamp>-<id>Z.db.bak` before
 the swap. Only the newest `.bak` file is kept; older ones are swept
 automatically after each import and on every add-on startup, so the operator
-never needs to remove them by hand. After a successful import the add-on
-rebuilds consensus observations, forecast pairs, and cached scores in the
-background — no restart is needed. Import needs SQLite 3.37 or newer. The
+never needs to remove them by hand. After a successful import no restart
+is needed. A file exported while the daily close was on keeps the scores
+of its closed days; its days not yet closed are rebuilt in the background
+and closed as usual. A file from before the daily close is kept as it
+stands, and the daily close then turns on for it as at an upgrade, from
+the next full local day. Import needs SQLite 3.37 or newer. The
 add-on image ships a newer SQLite, so this matters only for local standalone
 use. There, on an older SQLite, every import is refused before the add-on
 starts processing the uploaded file (reading, checking or swapping it in), the
 current database is left untouched, and the message names the version it
 found.
 
-**An import discards any verification run that was in progress in the donor.**
-Its `verification_run` job is failed with `suppressed: imported active
-verification chain`, any run still marked running is failed with the same
-reason, and the partial evidence of every unpublished run is deleted. Published
-runs, and every other job type, are untouched.
+**A file from before 0.16.14 is upgraded when the import opens it.** Its
+pending and running jobs of kinds this release no longer runs are deleted, a
+verification run still marked running is failed with `retired at the switch to
+the daily close`, and the partial evidence of every unpublished run is
+deleted. Published runs are untouched.
 
 **Before importing, set the per-variable forecast blend depths in the
 destination's options** — an imported database's overrides are cleared at the
@@ -870,8 +708,8 @@ The four levels, loudest to quietest:
   per scoring run. If these keep ticking over, the add-on is alive and doing its job.
   Finer-grained per-batch and per-request detail stays at DEBUG.
 - **DEBUG — show me literally everything.** The full firehose: every forecast fetch, every
-  observation fetch, every scoring phase, every queue and worker transition, every backfill
-  and catch-up step, every database transaction, and the raw HTTP requests and responses.
+  observation fetch, every scoring phase, every queue and worker transition, every database
+  transaction, and the raw HTTP requests and responses.
   Use this when you're diagnosing a specific problem; it is very verbose.
 
 ### Setting the level
@@ -879,9 +717,9 @@ The four levels, loudest to quietest:
 Set `log_level` in the add-on configuration (Settings → Add-ons → Weather Verify →
 Configuration) to one of `error`, `warning`, `info` (default), or `debug`, then restart the
 add-on. The chosen level applies to the running service **and** to any one-shot command you
-run inside the add-on container (for example the CLI `fetch`, `score`, `backfill`, and
-`catchup` commands) — so `log_level: debug` gives you the full trace for a manual command
-too, not just the background worker.
+run inside the add-on container (for example the CLI `fetch` and `score` commands) — so
+`log_level: debug` gives you the full trace for a manual command too, not just the
+background worker.
 
 ### API keys are never logged
 
@@ -927,17 +765,6 @@ three database groups can be turned off via the `monitor_pipeline`,
 `monitor_budget`, and `monitor_db` options; a disabled group runs no queries and
 its conditions report `skipped`. The `process` group has no toggle — it runs no
 queries, so switching it off could only hide a fault, never save any work.
-
-The pipeline group includes a `wind_history` warning. For each enabled site with
-an enabled station it trips when a station-day kept failing in the last 7 days;
-when, while the key cannot download past days, yesterday's last collection
-before midnight was missed for a station; from 6 hours after local midnight,
-when no station has any
-wind records today or one station's wind has stopped updating today. While
-weather.com refuses today's wind download, it names no station and does not
-report a missed last collection. A key that cannot download past days does not trip it on that alone. Its `count` is the number of sites tripped and its `detail` the first
-reason. When the site's time zone cannot be loaded it reports
-`cannot evaluate` rather than passing.
 
 The budget group includes a `weathercom_access_refused` warning. It trips when
 weather.com refuses (HTTP 401 or 403) one of the three download kinds: current
@@ -1057,9 +884,11 @@ stations, enabled forecast feeds, and fetch cadence.
 
 With the default cadences, each enabled site makes:
 
-- Weather.com PWS: one call per enabled station per observation cycle. With the
-  default `obs_interval_minutes=180` and up to `obs_jitter_minutes=20`, that is
-  roughly `7.2` to `8` cycles per day.
+- Weather.com PWS: per enabled station, the current-conditions poll, the
+  5-minute downloads described under [Station wind](#station-wind), and, once
+  a day has ended, an hourly download for a station whose day has gaps. The
+  Ops page's Budget Gauges panel shows the day's calls against the cap in
+  force.
 - Open-Meteo forecasts: each enabled Open-Meteo model is polled every `360`
   minutes (`4` calls per day), except `gem_global`, whose interval is `720`
   minutes. The add-on reports a feed as stale after `12` hours, so `gem_global`
@@ -1095,7 +924,6 @@ use is:
 
 | Provider        |          Expected steady-state use |
 | --------------- | ---------------------------------: |
-| Weather.com PWS |            about `56-64` calls/day |
 | Open-Meteo      |                     `30` calls/day |
 | Meteoblue       | `4` calls/day, `64000` credits/day |
 
@@ -1122,10 +950,8 @@ because a fifth would require `80000` credits. The `5/day` call cap is a
 secondary safety limit; the credit cap remains the practical Meteoblue
 constraint.
 
-One-time setup and recovery work can add temporary extra calls. Adding a station
-uses one Weather.com validation call and one Open-Meteo elevation call. Backfill
-and catchup can add Weather.com and Open-Meteo calls while filling missing
-history.
+One-time setup work can add a few calls: adding a station uses one Weather.com
+validation call and one Open-Meteo elevation call.
 
 ## Local Checks
 
