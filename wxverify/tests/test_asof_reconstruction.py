@@ -203,6 +203,10 @@ def test_resolve_window_default_now_is_wall_clock() -> None:
 
 def test_load_future_samples_asof_bounds_before_latest_run_pick() -> None:
     conn = _conn()
+    # Two labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour and no interim values): the
+    # pick is a no-op on a v16 file.
+    conn.execute("DROP INDEX idx_samples_slot")
     site_id = _make_site(conn, "AsOf Samples Site")
     feed_id = _make_real_feed(conn, "model-a")
     valid_at = "2035-01-03T06:00:00Z"

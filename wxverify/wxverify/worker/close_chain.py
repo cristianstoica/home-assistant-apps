@@ -71,6 +71,7 @@ from wxverify.worker.day_values import (
     fill_gaps,
     write_hourly_values,
 )
+from wxverify.worker.rain_check import check_station_rain
 
 logger = logging.getLogger(__name__)
 
@@ -1050,7 +1051,8 @@ async def _gap_fill_stage(
 
 
 def _hourly_values_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> None:
-    """Stage 3: the day's hourly values and site hours (8.1, 8.3)."""
+    """Stage 3: the day's hourly values and site hours (8.1, 8.3), then the
+    rain check over them (rain release, A2), in the one transaction."""
     now = utc_now()
     running = _open_stage(conn, raw, job, now)
     if running is None:
@@ -1061,6 +1063,9 @@ def _hourly_values_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> 
     if result.outcome == "refused":
         _fail_stage(conn, job, "hourly values refused by the closed-day guard", now)
         return
+    check_station_rain(
+        conn, site_id=job.site_id, local_date=job.local_date, now_utc=now
+    )
     _complete_stage(conn, job, running.stamps, now_utc=utc_now())
 
 
@@ -1705,13 +1710,35 @@ def _database_failing(exc: Exception) -> bool:
     )
 
 
-def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
-    """Prune raw readings and trim the close's two logs (plan 8.4, 11.6).
+#: Rain release Part B (B6): each site's oldest day not yet done, by its
+#: start. A site's scored values for hours before it have been read by
+#: their closes; a site with no such day keeps all of its rows.
+_OLDEST_UNDONE_STARTS_SQL: Final = """
+    SELECT d.site_id, d.day_start_utc
+    FROM site_days AS d
+    WHERE d.state NOT IN ('closed', 'missed')
+      AND d.local_date = (
+          SELECT MIN(u.local_date)
+          FROM site_days AS u
+          WHERE u.site_id = d.site_id
+            AND u.state NOT IN ('closed', 'missed')
+      )
+"""
+_DELETE_OLD_SCORED_SQL: Final = (
+    "DELETE FROM forecast_scored"
+    " WHERE site_id = ? AND julianday(valid_at) < julianday(?)"
+)
 
-    Runs P2's ``prune_raw_readings`` and deletes the stage-log and try-log
-    rows older than ``CLOSE_LOG_KEEP_DAYS``, inside ``SAVEPOINT
-    close_retention`` in the caller's transaction, for every site. An
-    exception is re-raised when the transaction is gone or it is a
+
+def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
+    """Prune raw readings, the old scored values and the close's two logs
+    (plan 8.4, 11.6; rain release Part B, B6).
+
+    Runs P2's ``prune_raw_readings``, deletes the ``forecast_scored`` rows
+    of hours before each site's oldest day not yet done, and deletes the
+    stage-log and try-log rows older than ``CLOSE_LOG_KEEP_DAYS``, inside
+    ``SAVEPOINT close_retention`` in the caller's transaction, for every
+    site. An exception is re-raised when the transaction is gone or it is a
     database error (``_database_failing``); any other is rolled back to the
     savepoint with one ERROR line naming its type, so the caller's writes
     commit.
@@ -1719,6 +1746,8 @@ def run_close_retention(conn: sqlite3.Connection, *, now_utc: datetime) -> None:
     conn.execute("SAVEPOINT close_retention")
     try:
         prune_raw_readings(conn, now_utc=now_utc)
+        for site_id, day_start in conn.execute(_OLDEST_UNDONE_STARTS_SQL).fetchall():
+            conn.execute(_DELETE_OLD_SCORED_SQL, (site_id, day_start))
         cutoff = isoformat_utc_micro(now_utc - timedelta(days=CLOSE_LOG_KEEP_DAYS))
         conn.execute("DELETE FROM close_stage_log WHERE ended_at < ?", (cutoff,))
         conn.execute("DELETE FROM close_try_log WHERE tried_at < ?", (cutoff,))

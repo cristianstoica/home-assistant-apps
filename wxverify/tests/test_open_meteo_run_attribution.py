@@ -2,8 +2,8 @@
 
 Covers ``wxverify.feeds.open_meteo._snap_run``/``_run_shape`` (per-model run
 boundary + availability lag, no silent defaults), ``persist_fetch_result``'s
-first-write-wins behaviour under Open-Meteo's ``UNIQUE(site_id, feed_id,
-variable, issued_at, valid_at)`` key, ``config.OPEN_METEO_FETCH_INTERVAL_MINUTES``
+newest-write-wins behaviour on the one row per hour ``idx_samples_slot``
+keeps (rain release, Part B), ``config.OPEN_METEO_FETCH_INTERVAL_MINUTES``
 and ``db.migrations.correct_open_meteo_fetch_intervals`` (the fetch-interval
 counterpart to the horizon correction in
 ``tests/test_open_meteo_horizon_correction.py``), and the scheduler's cadence
@@ -205,11 +205,12 @@ def test_e_t3_delayed_gem_global_fetch_in_the_same_window_is_the_same_run() -> N
 
 
 # ---------------------------------------------------------------------------
-# E-T4 -- duplicate ingestion: first write wins.
+# E-T4 -- duplicate ingestion: the newest write wins (rain release, Part B:
+# forecast_samples keeps the newest value of each hour).
 # ---------------------------------------------------------------------------
 
 
-def test_e_t4_duplicate_forward_fetch_keeps_the_first_written_value() -> None:
+def test_e_t4_duplicate_forward_fetch_keeps_the_newest_value() -> None:
     conn = asof_conn()
     site_id = _make_site(conn, "ISTATION01")
     feed_id = asof_make_real_feed(conn, "gem_global")
@@ -240,7 +241,7 @@ def test_e_t4_duplicate_forward_fetch_keeps_the_first_written_value() -> None:
     assert outcome1.usable_sample_count == 1
 
     # A second poll inside the same 12-hour window: same run key, a
-    # DIFFERENT value. A false oracle here would assert the second value.
+    # DIFFERENT value, which replaces the first (one row per hour).
     second = first.model_copy(update={"value": 99.9, "source_raw": "99.9"})
     outcome2 = persist_fetch_result(
         conn,
@@ -252,19 +253,33 @@ def test_e_t4_duplicate_forward_fetch_keeps_the_first_written_value() -> None:
     )
     conn.commit()
 
-    assert outcome2.inserted_count == 0
+    assert outcome2.inserted_count == 1
     assert outcome2.usable_sample_count == 1
 
-    row = conn.execute(
+    rows = conn.execute(
         """
-        SELECT value FROM forecast_samples
+        SELECT value, fetched_at FROM forecast_samples
         WHERE site_id = ? AND feed_id = ? AND variable = 'temperature'
-          AND issued_at = ? AND valid_at = ?
+          AND valid_at = ?
         """,
-        (site_id, feed_id, key_issued_at, key_valid_at),
-    ).fetchone()
-    assert row is not None
-    assert row["value"] == 10.0
+        (site_id, feed_id, key_valid_at),
+    ).fetchall()
+    assert [(r["value"], r["fetched_at"]) for r in rows] == [
+        (99.9, "2026-06-02T11:00:00Z")
+    ]
+
+    # An identical third poll writes nothing.
+    outcome3 = persist_fetch_result(
+        conn,
+        site_id=site_id,
+        source="example-src",
+        fetch_feed_id=feed_id,
+        result=FetchResult(samples=[second]),
+        fetched_at="2026-06-02T11:30:00Z",
+    )
+    conn.commit()
+    assert outcome3.inserted_count == 0
+    assert outcome3.usable_sample_count == 1
 
     state = conn.execute(
         "SELECT last_run_at, last_error, error_count"
@@ -274,20 +289,21 @@ def test_e_t4_duplicate_forward_fetch_keeps_the_first_written_value() -> None:
     assert state is not None
     # The feed still records a successful run: usable > 0 even though
     # inserted == 0, so _clear_feed_state runs, not _stamp_no_op.
-    assert state["last_run_at"] == "2026-06-02T11:00:00Z"
+    assert state["last_run_at"] == "2026-06-02T11:30:00Z"
     assert state["last_error"] is None
     assert state["error_count"] == 0
 
 
 # ---------------------------------------------------------------------------
-# E-T5 -- a revised payload for the same run: the revision is not stored.
+# E-T5 -- a revised payload for the same run: the revision is stored.
 # ---------------------------------------------------------------------------
 
 
-def test_e_t5_revised_payload_for_the_same_run_is_not_stored() -> None:
-    """Documents the known limitation from E.3.5: a provider revision to an
-    already-fetched run's values is silently dropped, not merged or
-    overwritten. This must assert the ACTUAL behaviour, not the desired one.
+def test_e_t5_revised_payload_for_the_same_run_is_stored() -> None:
+    """E.3.5's known limitation (a provider revision to an already-fetched
+    run's values silently dropped) is gone since the rain release (Part B):
+    the revision replaces every non-key value the hour stored, and its
+    ``fetched_at``.
     """
     conn = asof_conn()
     site_id = _make_site(conn, "ISTATION01")
@@ -333,16 +349,17 @@ def test_e_t5_revised_payload_for_the_same_run_is_not_stored() -> None:
     )
     conn.commit()
 
-    assert outcome.inserted_count == 0
+    assert outcome.inserted_count == 1
     row = conn.execute(
-        "SELECT value, source_raw FROM forecast_samples"
+        "SELECT value, source_raw, fetched_at FROM forecast_samples"
         " WHERE site_id = ? AND feed_id = ? AND variable = 'temperature'"
         " AND issued_at = ? AND valid_at = ?",
         (site_id, feed_id, key_issued_at, key_valid_at),
     ).fetchone()
     assert row is not None
-    assert row["value"] == 10.0
-    assert row["source_raw"] == "10.0"
+    assert row["value"] == -5.0
+    assert row["source_raw"] == "-5.0 (revised)"
+    assert row["fetched_at"] == "2026-06-02T11:45:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -730,9 +747,10 @@ def test_e_t18_availability_lag_is_a_flat_90_minutes_for_every_model() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T19 -- INSERT OR IGNORE is per sample key, not per response: a later
-# same-label fetch still inserts previously-absent keys alongside an
-# unchanged already-stored one.
+# E-T19 -- the write is per sample, not per response: a later same-label
+# fetch still inserts previously-absent keys alongside an unchanged
+# already-stored one, which it leaves as it is (rain release, Part B: an
+# hour is written only when its value differs).
 # ---------------------------------------------------------------------------
 
 
@@ -769,12 +787,12 @@ def test_e_t19_same_label_refetch_inserts_only_the_new_key() -> None:
 
     before = samples_fingerprint(conn, site_id=site_id)
 
-    # (a) same (variable, issued_at, valid_at) key, changed value -- must be
-    # ignored, exactly like E-T4/E-T5.
-    changed = seed.model_copy(update={"value": 99.9, "source_raw": "99.9"})
+    # (a) same (variable, issued_at, valid_at) key, same value -- an
+    # unchanged hour, which writes nothing (E-T4's third poll).
+    unchanged = seed.model_copy()
     # (b) one extra, later valid_at not yet stored under this run -- a
-    # distinct key that must still be inserted, proving the ignore is
-    # per-sample-key and not a whole-response reject once any key collides.
+    # distinct key that must still be inserted, proving the write is
+    # per sample and not a whole-response decision once any key collides.
     new_key = seed.model_copy(
         update={
             "valid_at": later_valid_at,
@@ -788,7 +806,7 @@ def test_e_t19_same_label_refetch_inserts_only_the_new_key() -> None:
         site_id=site_id,
         source="example-src",
         fetch_feed_id=feed_id,
-        result=FetchResult(samples=[changed, new_key]),
+        result=FetchResult(samples=[unchanged, new_key]),
         fetched_at="2026-06-02T11:00:00Z",
     )
     conn.commit()

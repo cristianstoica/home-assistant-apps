@@ -261,6 +261,10 @@ def test_partial_badge_stays_set_under_eighteen_hour_coverage() -> None:
 
 def test_freshest_run_wins_for_elapsed_hour_via_build_hourly() -> None:
     conn = _make_db()
+    # Two labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # v16 file, and the v16 carry-over keeps the row it picks.
+    conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
     valid_at = "2026-07-20T05:00:00Z"  # elapsed local hour

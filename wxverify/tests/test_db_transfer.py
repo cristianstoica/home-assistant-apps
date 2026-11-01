@@ -3324,6 +3324,9 @@ def test_export_begin_sweeps_stale_gz_keeps_fresh_gz(
 
 _STAMP_CANONICAL_ISSUED = "2026-01-01T00:00:00Z"
 _STAMP_CANONICAL_VALID = "2026-01-01T01:00:00Z"
+# A second hour for a row whose issued_at differs from the canonical row's:
+# idx_samples_slot (rain release, Part B) keeps one row per hour.
+_STAMP_OTHER_VALID = "2026-01-01T02:00:00Z"
 
 
 def _sqlite_bytes_with_forecast_stamps(
@@ -3423,7 +3426,7 @@ def test_import_rejects_noncanonical_forecast_stamp(
         _STAMP_CANONICAL_ISSUED if column == "issued_at" else _STAMP_CANONICAL_VALID
     )
     if column == "issued_at":
-        bad_pair = (bad_value, _STAMP_CANONICAL_VALID)
+        bad_pair = (bad_value, _STAMP_OTHER_VALID)
     else:
         bad_pair = (_STAMP_CANONICAL_ISSUED, bad_value)
     canonical_pair = (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)
@@ -3486,7 +3489,7 @@ def test_import_rejects_noncanonical_forecast_stamp(
 def _o3_extra_sql(column: str) -> str:
     bad_expr = "CAST(x'ff61' AS TEXT)"
     issued_expr = bad_expr if column == "issued_at" else "issued_at"
-    valid_expr = bad_expr if column == "valid_at" else "valid_at"
+    valid_expr = bad_expr if column == "valid_at" else f"'{_STAMP_OTHER_VALID}'"
     return (
         "INSERT INTO forecast_samples "
         "(site_id, feed_id, variable, issued_at, valid_at, lead_hours, "
@@ -3612,7 +3615,7 @@ def test_import_accepts_all_canonical_forecast_stamps(
         reject_target,
         [
             (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID),
-            ("2026-01-01t06:00:00Z", _STAMP_CANONICAL_VALID),
+            ("2026-01-01t06:00:00Z", _STAMP_OTHER_VALID),
         ],
     )
     accept_target = tmp_path / "accept.db"
@@ -4809,12 +4812,17 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "feeds",
     "forecast_downloads",
     "forecast_of_record",
+    "forecast_scored",
     "forecast_value_changes",
     "jobs",
     "publication_coverage",
+    "publication_rain_ranks",
     "publication_rankings",
     "publication_wind_weights",
     "publications",
+    "rain_days",
+    "rain_forecast_days",
+    "rain_picks",
     "runtime_state",
     "settings",
     "site_day_stations",
@@ -4827,6 +4835,7 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "station_changes",
     "station_current_obs",
     "station_poll_state",
+    "station_rain_checks",
     "station_wind_days",
     "timezone_generations",
     "verification_day_context",
@@ -5399,7 +5408,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 50
+    assert len(schema_table_names()) == 56
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(

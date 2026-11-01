@@ -185,6 +185,10 @@ def _seed_cell_pairs(
 
 def test_latest_run_pick_keeps_newest_issued_at_value() -> None:
     conn = _make_db()
+    # Two labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # v16 file, and the v16 carry-over keeps the row it picks.
+    conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _insert_sample(
         conn,

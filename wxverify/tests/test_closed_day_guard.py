@@ -57,7 +57,6 @@ from wxverify.db.switch import ensure_site_generation
 from wxverify.provider_ops import rebuild_mean_for_site
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.multimodel import compute_multimodel_mean
-from wxverify.scoring.pairing import REAL_MODEL_PAIR_PROBE_SQL, real_model_pair_pending
 from wxverify.scoring.persistence import compute_persistence_pairs
 from wxverify.scoring.split import (
     DeleteOp,
@@ -578,58 +577,9 @@ def test_gw9b_pair_computes_propose_no_ops_for_a_done_or_recordless_day(
     _assert_no_guard_warning(caplog)
 
 
-def test_gw9c_real_model_pair_pending_probe_unchanged_from_today() -> None:
-    conn = asof_conn()
-    site_id = day_close_site(conn)
-    feed_id = asof_make_real_feed(conn, "gw9c-model")
-    hour = f"{_d3().isoformat()}T06:00:00Z"
-    asof_insert_sample(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        issued_at=hour,
-        valid_at=hour,
-        lead_hours=6,
-        value=5.0,
-        fetched_at=hour,
-    )
-    asof_insert_observation(
-        conn, site_id=site_id, valid_at=hour, value=4.0, computed_at=hour
-    )
-    conn.commit()
-
-    sample_id = int(
-        conn.execute(
-            "SELECT id FROM forecast_samples"
-            " WHERE site_id=? AND feed_id=? AND valid_at=?",
-            (site_id, feed_id, hour),
-        ).fetchone()["id"]
-    )
-
-    class _RecordingConn:
-        """Thin proxy: records the SQL text each `.execute` is given, then
-        passes the call straight through to the real connection."""
-
-        def __init__(self, inner: sqlite3.Connection) -> None:
-            self._inner = inner
-            self.statements: list[str] = []
-
-        def execute(self, sql: str, params: tuple[object, ...] = ()) -> sqlite3.Cursor:
-            self.statements.append(sql)
-            return self._inner.execute(sql, params)
-
-    recorder = _RecordingConn(conn)
-    assert real_model_pair_pending(recorder, [sample_id]) is True  # type: ignore[arg-type]
-    # The probe's SQL text, as actually executed, is the module constant
-    # itself -- not merely present somewhere in the source, which can never
-    # hold for a constant built by concatenation (REAL_MODEL_PAIR_PROBE_SQL
-    # = _CANDIDATE_PAIRS_SQL + " AND fs.id = ?").
-    assert recorder.statements == [REAL_MODEL_PAIR_PROBE_SQL]
-    # "Unchanged from today": the probe's SQL carries no open-day clause.
-    # open_day_clause's close-on branch always builds an EXISTS over
-    # site_days (wxverify/db/site_days.py), so that table name's absence
-    # here is the specific signal that no day clause was folded in.
-    assert "site_days" not in REAL_MODEL_PAIR_PROBE_SQL
+# GW9c (real_model_pair_pending's probe carries no open-day clause) is
+# removed: the rain release (Part B) deleted the fetch score gate and the
+# probe with it.
 
 
 # ---------------------------------------------------------------------------

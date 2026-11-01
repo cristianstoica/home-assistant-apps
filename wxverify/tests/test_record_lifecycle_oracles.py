@@ -40,6 +40,7 @@ import wxverify.verification.record as record_mod
 import wxverify.worker.scheduler as scheduler_mod
 from tests.test_forecast_record import (
     _conn,
+    _drop_slot_index,
     _insert_temp_day,
     _make_feed,
     _make_site,
@@ -273,6 +274,7 @@ def test_gap_scan_visits_a_partial_day_behind_a_later_complete_day() -> None:
     ``_DAY+2`` and is never visited, so it stays absent forever.
     """
     conn = _conn()
+    _drop_slot_index(conn)  # the two grids overlap: the as-of read's pre-v16 labels
     site_id = _make_site(conn, "site-behind")
     ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")

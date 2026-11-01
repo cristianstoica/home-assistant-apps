@@ -188,6 +188,10 @@ def test_post_t_sample_backfill_leaves_asof_selection_bit_identical() -> None:
     `fetched_at <= T` bound dropped (the backfilled newer run would win).
     """
     conn = asof_conn()
+    # Several labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour and no interim values): this
+    # pins the as-of pick over the labels such a file held.
+    conn.execute("DROP INDEX idx_samples_slot")
     site_id = asof_make_site(conn, "Backfill Site")
     feed_a = asof_make_real_feed(conn, "model-a")
     slot1, slot2 = "2035-01-03T06:00:00Z", "2035-01-03T07:00:00Z"

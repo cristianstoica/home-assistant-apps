@@ -9,11 +9,13 @@ the hourly JSON API. Pure read side — never writes.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import (
@@ -36,6 +38,7 @@ from wxverify.forecast.aggregate import (
     display_day_index,
     displayed_daily,
     fixed_membership_series,
+    wet_hours,
 )
 from wxverify.forecast.data import (
     FeedFreshness,
@@ -47,6 +50,7 @@ from wxverify.forecast.data import (
     load_future_samples,
     sample_day_ahead,
 )
+from wxverify.forecast.rain_pick import forecasts_rain
 from wxverify.forecast.selection import (
     CellCandidate,
     CellSelection,
@@ -54,19 +58,20 @@ from wxverify.forecast.selection import (
     representative_day_ahead,
     select_cell_feeds,
 )
+from wxverify.scoring.publication import RainRanks, published_rain_ranks
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.web.context import feed_label
 
 DAY_COUNT = 8
 #: Page column order = the canonical roster (NB-4).
 VARIABLES = DEPTH_VARIABLES
-# Rain glyph appears when a nontrivial part of the day is expected wet — not
-# on a single drizzly hour: when the displayed, rounded wet-hour count is at
-# least six, so the glyph always agrees with the "N h" figure. Six hours
-# is a quarter of a 24-hour day, but the rule is not equivalent to the 25%
-# trigger it replaces: a blended count of 5.5 rounds to 6 and shows the
-# glyph, where the old rounded percentage (23%) did not.
-RAIN_GLYPH_MIN_WET_HOURS = 6
+#: The rain icon is "heavy" when the winner's wettest hour is above this,
+#: "light" at or below it (rain release, C4).
+HEAVY_RAIN_MM_PER_HOUR: Final = 1.0
+#: Agreement % is shown only with this many group members with a full day.
+MIN_AGREEMENT_MEMBERS: Final = 2
+
+RainIcon = Literal["light", "heavy"]
 
 
 @dataclass(frozen=True)
@@ -148,10 +153,40 @@ class WindCell:
 
 @dataclass(frozen=True)
 class PrecipCell:
+    """The rain cell: the winner's own rain (rain release, C4).
+
+    The winner is the published rain ranking's selected model at the tile's
+    day ahead when its newest samples cover the local day exactly, else the
+    first ranked model that does. ``total_mm`` is its daily sum (shown to
+    one decimal) and ``wet_hours`` its hours at or above the site's rain
+    threshold; both are ``None`` with no winner ("No rain forecast"), never
+    0.0. ``icon`` is shown at a total of 0.2 mm or more: ``light`` when the
+    wettest hour is at most ``HEAVY_RAIN_MM_PER_HOUR``, ``heavy`` above it.
+    ``agreement_pct`` is the share of the ranking's group members with a
+    full day that forecast rain, shown with at least
+    ``MIN_AGREEMENT_MEMBERS`` such members. ``feed_label`` names the winner.
+    A provisional ranking sets ``meta.extrema_state`` to ``rebuilding``.
+    """
+
     meta: CellMeta
     total_mm: float | None
     wet_hours: int | None
-    show_rain_glyph: bool
+    icon: RainIcon | None
+    agreement_pct: int | None
+    feed_label: str | None
+
+
+@dataclass(frozen=True)
+class _RainChoice:
+    """One tile's rain winner, chosen from the published ranks (C4)."""
+
+    winner_id: int | None
+    selected_id: int | None
+    label: str | None
+    values: tuple[float, ...]
+    provisional: bool
+    agreement_pct: int | None
+    contributor_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -204,6 +239,10 @@ def build_forecast(
     consequence, a site with only elapsed-today samples renders tiles (with
     stale badges) instead of the empty state until local midnight — intended
     forecast-of-record behavior.
+
+    Rain does not go through the selection ladder: each tile shows the rain
+    of its day ahead's rain winner from the published rain ranking
+    (rain release, C4; :class:`PrecipCell`).
     """
     at = now or utc_now()
     samples = load_future_samples(
@@ -238,13 +277,26 @@ def build_forecast(
     serving = wind_blend.load_wind_serving(
         conn, site_id=site_id, timezone=timezone, today=today, as_of=None
     )
-    # Per day: the cells, then the wind weights and note for _build_tile.
-    day_cells: list[tuple[dict[str, _Cell], dict[int, float], str | None]] = []
+    # Rain follows the published rain ranking (rain release, C4), read once.
+    rain_ranks = published_rain_ranks(conn, site_id)
+    # Per day: the cells, the rain choice, then the wind weights and note
+    # for _build_tile.
+    day_cells: list[
+        tuple[dict[str, _Cell], _RainChoice, dict[int, float], str | None]
+    ] = []
     for day in range(DAY_COUNT):
         cells: dict[str, _Cell] = {}
         wind_weights: dict[int, float] = {}
         wind_note: str | None = None
+        rain = _rain_choice(
+            rain_ranks.get(day),
+            grouped.get("precip", {}).get(day, {}),
+            local_date=today + timedelta(days=day),
+            timezone=timezone,
+        )
         for variable in VARIABLES:
+            if variable == "precip":
+                continue
             feeds_samples = grouped.get(variable, {}).get(day, {})
             cell_k = _cell_day_ahead(feeds_samples, timezone) if close_on else None
             if variable == "wind":
@@ -303,18 +355,24 @@ def build_forecast(
                 ),
             )
             cells[variable] = (meta, selection, values)
-        day_cells.append((cells, wind_weights, wind_note))
+        day_cells.append((cells, rain, wind_weights, wind_note))
     tiles = [
         _build_tile(
             day,
             date_iso=(today + timedelta(days=day)).isoformat(),
             label=_day_label(day, today + timedelta(days=day)),
             cells=cells,
+            precip=_precip_cell(
+                rain,
+                rain_threshold_mm=rain_threshold_mm,
+                stale_ids=stale_ids,
+                unknown_ids=unknown_ids,
+            ),
             rain_threshold_mm=rain_threshold_mm,
             wind_weights=wind_weights,
             wind_note=wind_note,
         )
-        for day, (cells, wind_weights, wind_note) in enumerate(day_cells)
+        for day, (cells, rain, wind_weights, wind_note) in enumerate(day_cells)
     ]
     updated_at = _last_fetched_at(tiles, freshness)
     return ForecastView(
@@ -377,11 +435,13 @@ def build_hourly(
 
     Per-variable winner sets are the SAME selections the tile used. For
     temperature and wind the blend at each hour averages the selected feeds
-    that cover that hour. Precipitation's blend line averages its contributor
-    set (``selections["precip"].extrema_feeds``) with fixed membership and is
-    null at any hour a member does not supply; ``precip_aggregate`` names
-    those feeds. Per-feed series, drawn from ``feeds`` for every variable,
-    ride along for the "show individual feeds" toggle.
+    that cover that hour. Precipitation's blend line is the tile's rain
+    winner alone (rain release, C4: :func:`_rain_choice` over the published
+    rain ranks), all null with no winner; ``precip_aggregate`` names it and
+    ``states["precip"]`` is the tile's (``normal``, or ``not_available``
+    with no winner).
+    Per-feed series, drawn from ``feeds`` for every variable, ride along for
+    the "show individual feeds" toggle.
 
     The sample window starts at today's local midnight, so day 0 is the
     "forecast of record": each elapsed hour shows the freshest run that
@@ -439,21 +499,29 @@ def build_hourly(
             rank_cache=rank_cache,
         )
 
+    # The hourly rain line is the tile's rain winner only (rain release, C4).
+    precip_samples = grouped.get("precip", {}).get(day, {})
+    rain = _rain_choice(
+        published_rain_ranks(conn, site_id).get(day),
+        precip_samples,
+        local_date=today + timedelta(days=day),
+        timezone=timezone,
+    )
+    rain_feeds = [] if rain.winner_id is None else [rain.winner_id]
+
     # Hour axis: union of covered hours across every selected feed/variable,
-    # plus the hours of precipitation's aggregate contributors
-    # (``extrema_feeds``), which can lie outside ``feeds``. Widened for
-    # precipitation only: no temperature or wind line is drawn from them.
+    # plus the rain winner's hours, which can lie outside ``feeds``. Widened
+    # for precipitation only: no temperature or wind line is drawn from them.
     hour_set: set[str] = set()
     for variable in VARIABLES:
         feeds_samples = grouped.get(variable, {}).get(day, {})
-        axis_candidates = list(selections[variable].feeds)
+        axis_ids = [candidate.feed_id for candidate in selections[variable].feeds]
         if variable == "precip":
-            axis_candidates += selections[variable].extrema_feeds
-        for candidate in axis_candidates:
-            for sample in feeds_samples.get(candidate.feed_id, []):
+            axis_ids += rain_feeds
+        for feed_id in axis_ids:
+            for sample in feeds_samples.get(feed_id, []):
                 hour_set.add(sample.valid_at)
     hours = sorted(hour_set)
-    precip_samples = grouped.get("precip", {}).get(day, {})
     index = {valid_at: i for i, valid_at in enumerate(hours)}
 
     def series_for(variable: str, feed_id: int) -> list[float | None]:
@@ -514,6 +582,8 @@ def build_hourly(
         )
         for variable in VARIABLES
     }
+    # The rain state is the tile's (C4): normal with a winner, else none.
+    states["precip"] = "normal" if rain_feeds else "not_available"
     payload: dict[str, object] = {
         "site_id": site_id,
         "day": day,
@@ -525,14 +595,18 @@ def build_hourly(
             "precip_mm": fixed_membership_series(
                 hours,
                 [
-                    {s.valid_at: s.value for s in precip_samples.get(c.feed_id, [])}
-                    for c in selections["precip"].extrema_feeds
+                    {s.valid_at: s.value for s in precip_samples.get(feed_id, [])}
+                    for feed_id in rain_feeds
                 ],
             ),
         },
         "precip_aggregate": {
-            "feed_ids": [c.feed_id for c in selections["precip"].extrema_feeds],
-            "coverage": selections["precip"].extrema_coverage,
+            "feed_ids": rain_feeds,
+            "coverage": (
+                EXTREMA_COVERAGE_COMPLETE
+                if rain_feeds
+                else EXTREMA_COVERAGE_INSUFFICIENT
+            ),
         },
         "feeds": [
             {
@@ -915,21 +989,151 @@ def _cell_meta_and_values(
     return meta, values
 
 
+def _rain_choice(
+    ranks: RainRanks | None,
+    feeds_samples: Mapping[int, list[FutureSampleRow]],
+    *,
+    local_date: date,
+    timezone: str,
+) -> _RainChoice:
+    """One tile's rain winner from its day ahead's published ranks (C4).
+
+    A ranked model has a full day when its newest samples cover the local
+    day exactly (``covers_local_day_exactly``). The winner is the selected
+    model when it has one, else the first ranked model that does; with no
+    ranks, or no ranked model with a full day, there is none. Agreement %:
+    round(100·k/q), half up, over the group members with a full day, k of
+    them forecasting rain (0.2 mm or more); only with at least
+    ``MIN_AGREEMENT_MEMBERS`` such members.
+    """
+    if ranks is None or not ranks.ranked:
+        return _RainChoice(
+            winner_id=None,
+            selected_id=None,
+            label=None,
+            values=(),
+            provisional=False,
+            agreement_pct=None,
+            contributor_ids=(),
+        )
+    full: dict[int, list[FutureSampleRow]] = {}
+    for ranked in ranks.ranked:
+        samples = feeds_samples.get(ranked.feed_id, [])
+        if samples and covers_local_day_exactly(
+            (s.valid_at for s in samples), local_date=local_date, timezone=timezone
+        ):
+            full[ranked.feed_id] = sorted(samples, key=lambda s: s.valid_at)
+    selected_id = next((r.feed_id for r in ranks.ranked if r.selected), None)
+    winner_id = (
+        selected_id
+        if selected_id in full
+        else next((r.feed_id for r in ranks.ranked if r.feed_id in full), None)
+    )
+    members = [r.feed_id for r in ranks.ranked if r.in_group and r.feed_id in full]
+    agreement_pct: int | None = None
+    if len(members) >= MIN_AGREEMENT_MEMBERS:
+        wet = sum(
+            1
+            for feed_id in members
+            if forecasts_rain(math.fsum(s.value for s in full[feed_id]))
+        )
+        agreement_pct = (200 * wet + len(members)) // (2 * len(members))
+    winner = None if winner_id is None else full[winner_id]
+    contributors = ([] if winner_id is None else [winner_id]) + (
+        members if agreement_pct is not None else []
+    )
+    return _RainChoice(
+        winner_id=winner_id,
+        selected_id=selected_id,
+        label=None if winner is None else feed_label(winner[0].source, winner[0].model),
+        values=() if winner is None else tuple(s.value for s in winner),
+        provisional=ranks.provisional,
+        agreement_pct=agreement_pct,
+        contributor_ids=tuple(dict.fromkeys(contributors)),
+    )
+
+
+def _precip_cell(
+    rain: _RainChoice,
+    *,
+    rain_threshold_mm: float,
+    stale_ids: set[int],
+    unknown_ids: set[int],
+) -> PrecipCell:
+    """The rain cell of :func:`_rain_choice`'s winner (C4).
+
+    With no winner the cell is ``not_available`` and every value ``None``.
+    With one, ``state`` is ``normal`` and ``extrema_state`` is
+    ``rebuilding`` for a provisional ranking, else ``normal`` (the plan's
+    C4: the provisional ranking shows through ``extrema_state``, as a
+    rebuilding extrema set did); ``feeds`` is the winner; ``stale`` and
+    ``fetch_unknown`` cover the winner and the agreement members.
+    ``substitute`` (11.3) is set when the selected model is stale and
+    another ranked model stands in for it.
+    """
+    if rain.winner_id is None:
+        return PrecipCell(
+            meta=CellMeta(
+                state="not_available",
+                feeds=[],
+                partial=False,
+                stale=False,
+                extrema_unavailable=False,
+                extrema_state="not_available",
+                contributor_ids=(),
+                fetch_unknown=False,
+                substitute=False,
+            ),
+            total_mm=None,
+            wet_hours=None,
+            icon=None,
+            agreement_pct=None,
+            feed_label=None,
+        )
+    total = math.fsum(rain.values)
+    icon: RainIcon | None = None
+    if forecasts_rain(total):
+        icon = "heavy" if max(rain.values) > HEAVY_RAIN_MM_PER_HOUR else "light"
+    meta = CellMeta(
+        state="normal",
+        feeds=[FeedRef(feed_id=rain.winner_id, label=rain.label or "")],
+        partial=False,
+        stale=any(feed_id in stale_ids for feed_id in rain.contributor_ids),
+        extrema_unavailable=False,
+        extrema_state="rebuilding" if rain.provisional else "normal",
+        contributor_ids=rain.contributor_ids,
+        fetch_unknown=any(feed_id in unknown_ids for feed_id in rain.contributor_ids),
+        substitute=rain.selected_id is not None
+        and rain.selected_id != rain.winner_id
+        and rain.selected_id in stale_ids,
+    )
+    return PrecipCell(
+        meta=meta,
+        total_mm=total,
+        wet_hours=wet_hours(list(rain.values), threshold_mm=rain_threshold_mm),
+        icon=icon,
+        agreement_pct=rain.agreement_pct,
+        feed_label=rain.label,
+    )
+
+
 def _build_tile(
     day: int,
     *,
     date_iso: str,
     label: str,
     cells: dict[str, _Cell],
+    precip: PrecipCell,
     rain_threshold_mm: float,
     wind_weights: Mapping[int, float],
     wind_note: str | None,
 ) -> DayTile:
     """One day's tile. ``wind_weights`` gives the weighted daily wind high;
-    it is empty when wind is closed, so the high is None."""
+    it is empty when wind is closed, so the high is None. ``precip`` is the
+    rain cell of the tile's rain winner (:func:`_precip_cell`)."""
     temp_meta, _, temp_values = cells["temperature"]
     wind_meta, _, wind_values = cells["wind"]
-    precip_meta, _, precip_values = cells["precip"]
+    precip_meta = precip.meta
 
     temp_daily = displayed_daily(
         "temperature", list(temp_values.values()), rain_threshold_mm=rain_threshold_mm
@@ -944,17 +1148,6 @@ def _build_tile(
         meta=wind_meta,
         max_kmh=None if wind_max_ms is None else ms_to_kmh(wind_max_ms),
         note=wind_note,
-    )
-    precip_daily = displayed_daily(
-        "precip", list(precip_values.values()), rain_threshold_mm=rain_threshold_mm
-    )
-    raw_wet_hours = precip_daily["wet_hours"]
-    hours_wet = None if raw_wet_hours is None else round(raw_wet_hours)
-    precip = PrecipCell(
-        meta=precip_meta,
-        total_mm=precip_daily["total_mm"],
-        wet_hours=hours_wet,
-        show_rain_glyph=hours_wet is not None and hours_wet >= RAIN_GLYPH_MIN_WET_HOURS,
     )
     metas = (temp_meta, wind_meta, precip_meta)
     populated = [meta for meta in metas if meta.available]

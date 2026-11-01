@@ -489,33 +489,46 @@ returns a value for an hour an earlier one left without one. At local midnight
 the next date becomes `Today`, and it shows a high and low only if a feed
 covers that whole date: the change of day fills in no missing hours.
 
-The `Rain` row has a stricter rule, because a daily total and a count of wet
-hours are only right if each hour is counted exactly once. A feed counts
-towards them only when it supplies exactly one value for every hour of the
-local day — 24, or 23 or 25 on a daylight-saving change day. A missing hour,
-an hour given twice, or a value that falls between two hours rules the feed
-out. Each feed is checked on its own, and among the feeds that qualify, the
-usual skill ranking and blend depth decide which ones are used. The reasons
-above why a feed can lack some of `Today`'s hours apply to rain too.
+The `Rain` row shows one model's rain: the model with the best rain record for
+that day ahead. Each closed day records whether it rained nearby (at least
+0.2 mm at two of the site's counted stations, or at least 0.5 mm at one) and
+each model's forecast daily total for every day ahead. Over the last 60 closed
+days, each model is scored per day ahead on the days where both are known: a
+missed rainy day costs 2 points and a false alarm 1, and the lowest score
+wins. Once two models have 20 counted days, only models with 20 or more take
+part, and the shown model changes only when another one beats it by 3 points
+or more. Until then the ranking is provisional and the tile shows `ranking
+updating`. The rain ranking needs the daily close.
 
-The row then shows the day's rainfall and its number of wet hours, each
-averaged across those feeds, for example `3.1 mm · 5 h`. The rainfall is shown
-to one decimal place and the wet hours are rounded to a whole number. An hour
-is wet when its forecast rain is at or above the site's `rain_threshold_mm`;
-exactly at the threshold counts, and rain need not fall for the whole hour. A
-rain-cloud symbol follows when the row shows `6 h` or more. The rain bars on
-the day's hourly chart come from the same feeds, so they add up to the tile's
-total before it is rounded for display; `Show individual feeds` still shows
-every selected feed.
+A station's gauge stops counting for rain when it reads exactly zero while the
+other stations report rain, on 3 days spread over 2 wet spells within 30 days.
+It is set aside from the next day, and the Sites page shows `rain not counted
+since <date>`. It counts again after 3 days, in 2 wet spells, on which it
+agrees with the others. Temperature and wind from that station are unaffected.
 
-When feeds have rain forecasts for the day but none qualifies, the row reads
-`Daily rainfall unavailable — partial coverage` and the hourly chart has no
-rain bars. A `—` in the row means there are no rain forecasts for that day at
-all.
+The winner's rain counts only when it supplies exactly one value for every hour
+of the local day — 24, or 23 or 25 on a daylight-saving change day. A missing
+hour, an hour given twice, or a value that falls between two hours rules it out
+for that date, and the next ranked model is shown instead. The reasons above
+why a feed can lack some of `Today`'s hours apply to rain too.
+
+The row then shows the winner's rainfall and wet hours, for example
+`3.1 mm · 5 h`. The rainfall is shown to one decimal place. An hour is wet when
+its forecast rain is at or above the site's `rain_threshold_mm`. At 0.2 mm or
+more a rain symbol follows: a rain cloud when the wettest hour is at most
+1 mm, an umbrella above that. `Agreement N%` follows when two or more models
+are ranked: the share of the top-ranked group (about three-quarters of the
+ranked models) whose own daily total is 0.2 mm or more. Hovering over the row
+names the model. The rain bars on the day's hourly chart are the winner's.
+
+`No rain forecast` means no ranked model has a full day of rain forecasts for
+that date; it never means a dry forecast.
 
 A tile's `low confidence`, `ranking updating` and `stale` badges also cover the
-feeds its daily high and low come from and the feeds its daily rain figures
-come from, which can differ from the selected feeds its hourly chart plots.
+feeds its daily high and low come from, and the rain winner and its agreement
+group, which can differ from the selected feeds its hourly chart plots.
+`ranking updating` also shows whenever the rain ranking is provisional, even
+beside `low confidence`.
 
 A feed counts as `stale` when the app has not completed a successful forecast
 download for it within twice its fetch interval. Only a download that returned

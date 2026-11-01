@@ -19,6 +19,7 @@ from wxverify.db.site_days import (
     check_day_write,
     daily_close_on,
     day_for_instant,
+    day_rain_station_ids,
     day_station_ids,
 )
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
@@ -336,7 +337,9 @@ def materialize_consensus(
             instants=[valid_at],
         )
         return
-    station_filter, station_params = _consensus_station_filter(conn, site_id, valid_at)
+    station_filter, station_params = _consensus_station_filter(
+        conn, site_id, variable, valid_at
+    )
     rows = conn.execute(
         f"""
         SELECT so.station_id, s.dem_elevation_m, so.variable, so.valid_at, so.value
@@ -405,21 +408,23 @@ def materialize_consensus(
 
 
 def _consensus_station_filter(
-    conn: sqlite3.Connection, site_id: int, valid_at: str
+    conn: sqlite3.Connection, site_id: int, variable: str, valid_at: str
 ) -> tuple[str, tuple[int, ...]]:
     """The stations ``materialize_consensus`` reads for the hour (6.3).
 
     While the close is off, the site's enabled stations, as today. While it
-    is on, the saved station list of the day that holds the hour; no record
-    or an empty list reads no station.
+    is on, the saved station list of the day that holds the hour, and for
+    ``precip`` only its stations the rain check counts (rain release, A1);
+    no record or an empty list reads no station.
     """
     if not daily_close_on(conn):
         return "s.enabled = 1", ()
     record = day_for_instant(conn, site_id, valid_at)
+    listed = day_rain_station_ids if variable == "precip" else day_station_ids
     station_ids = (
         ()
         if record is None
-        else tuple(sorted(day_station_ids(conn, site_id, record.local_date)))
+        else tuple(sorted(listed(conn, site_id, record.local_date)))
     )
     if not station_ids:
         return "0", ()

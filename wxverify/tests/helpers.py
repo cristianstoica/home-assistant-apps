@@ -12,7 +12,7 @@ import inspect
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
@@ -1865,6 +1865,58 @@ def seed_coverage(
             starting_days,
         ),
     )
+
+
+def seed_rain_ranks(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    published_at: datetime,
+    ranked: Mapping[int, Sequence[int]],
+    provisional: Collection[int] = (),
+    selected: Mapping[int, int] | None = None,
+) -> int:
+    """The rain release's published rain ranking (C3), for tile tests.
+
+    Switches the daily close on at ``published_at`` (the published ranks
+    are read only then), adds the site's active publication through the
+    day before ``published_at`` (:func:`seed_active_publication`) and, per
+    day ahead, one ``publication_rain_ranks`` row per feed in ``ranked``'s
+    order: rank 1 is selected unless ``selected`` names another feed for
+    that day ahead, and the first (3J + 3) div 4 of the J feeds are in the
+    group. The day aheads in ``provisional`` are flagged provisional. Plain
+    INSERT: only ``publish`` writes these rows, from a real build. Returns
+    the publication id.
+    """
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(published_at))
+    publication_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=published_at.date() - timedelta(days=1),
+        published_at=published_at,
+    )
+    for day_ahead, feed_ids in ranked.items():
+        group = (3 * len(feed_ids) + 3) // 4
+        chosen = (selected or {}).get(day_ahead, feed_ids[0] if feed_ids else None)
+        for index, feed_id in enumerate(feed_ids):
+            conn.execute(
+                "INSERT INTO publication_rain_ranks"
+                " (publication_id, day_ahead, rank, feed_id, misses, false_alarms,"
+                "  common_days, counted_days, provisional, selected, in_group)"
+                " VALUES (?, ?, ?, ?, 0, 0, 20, 20, ?, ?, ?)",
+                (
+                    publication_id,
+                    day_ahead,
+                    index + 1,
+                    feed_id,
+                    int(day_ahead in provisional),
+                    int(feed_id == chosen),
+                    int(index < group),
+                ),
+            )
+    return publication_id
 
 
 def seed_closed_pairs(

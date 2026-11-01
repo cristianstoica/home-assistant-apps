@@ -3,11 +3,15 @@
 Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
 section 6. ``score_day`` scores one ``closing`` day D in the transaction P3
 passes: for every real feed considered at D (6.2) and day ahead k it takes
-the scored download of D - k (4.1, 4.3, ``scoring/downloads.py``), pairs
-that download's forecasts with D's hourly values, makes the two yardsticks
+the scored values the first stored download of D - k left in
+``forecast_scored`` (4.1, 4.3; rain release Part B, ``scoring/downloads.py``
+``scored_values``), pairs them with D's hourly values, makes the two yardsticks
 (4.6), and stores the pairs (``close_pairs``), the day's sums
 (``day_scores``) and the per-close record (``close_records``,
-``close_record_downloads``), replacing an earlier attempt's rows. It never
+``close_record_downloads``), replacing an earlier attempt's rows. Since the
+rain release (Part C, C1) it also writes D's rain nearby (``rain_days``) and
+each real feed's daily rain total per day ahead (``rain_forecast_days``),
+which the publication's rain ranking reads. It never
 commits, enqueues nothing, changes no day state, fetches nothing and reads
 the clock only through ``now_utc``.
 
@@ -29,13 +33,19 @@ from zoneinfo import ZoneInfo
 
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.site_days import DayRecord, WriteKind, check_date_write
+from wxverify.db.site_days import (
+    DayRecord,
+    WriteKind,
+    check_date_write,
+    day_rain_station_ids,
+)
 from wxverify.db.switch import site_generation_id
+from wxverify.forecast.aggregate import covers_local_day_exactly
 from wxverify.scoring.downloads import (
     ScoredDownload,
     StoredSample,
-    scored_download,
-    scored_version,
+    scored_values,
+    scored_values_download,
 )
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.metrics import metrics_from_sums as metrics_from_sums
@@ -92,7 +102,35 @@ _DELETE_EARLIER_SQL: Final = (
     "DELETE FROM day_scores WHERE site_id = ? AND local_date = ?",
     "DELETE FROM close_record_downloads WHERE site_id = ? AND local_date = ?",
     "DELETE FROM close_records WHERE site_id = ? AND local_date = ?",
+    "DELETE FROM rain_days WHERE site_id = ? AND local_date = ?",
+    "DELETE FROM rain_forecast_days WHERE site_id = ? AND local_date = ?",
 )
+# Rain nearby (rain release, C1): the day's ``ok`` station rain rows. The
+# station list is bound in Python, so the read seeks each station's key.
+_STATION_RAIN_SQL: Final = (
+    "SELECT valid_at, value FROM station_observations"
+    " WHERE station_id = ? AND variable = 'precip' AND qc_flag = 'ok'"
+    " AND valid_at >= ? AND valid_at < ?"
+)
+_INSERT_RAIN_DAY_SQL: Final = """
+    INSERT INTO rain_days
+        (site_id, local_date, outcome, stations_full, stations_partial)
+    VALUES (?, ?, ?, ?, ?)
+"""
+_INSERT_RAIN_FORECAST_SQL: Final = """
+    INSERT INTO rain_forecast_days
+        (site_id, local_date, feed_id, day_ahead, total_mm)
+    VALUES (?, ?, ?, ?, ?)
+"""
+#: Rain nearby: this many stations at ``RAIN_NEARBY_PAIR_HUNDREDTHS`` or
+#: more, or one at ``RAIN_NEARBY_SINGLE_HUNDREDTHS`` or more, in hundredths.
+RAIN_NEARBY_PAIR_STATIONS: Final = 2
+RAIN_NEARBY_PAIR_HUNDREDTHS: Final = 20
+RAIN_NEARBY_SINGLE_HUNDREDTHS: Final = 50
+#: A dry day needs a station with this many hours of rain readings.
+RAIN_DRY_MIN_HOURS: Final = 22
+
+RainOutcome = Literal["rain", "dry", "unknown"]
 _INSERT_PAIR_SQL: Final = """
     INSERT INTO close_pairs
         (site_id, local_date, feed_id, variable, day_ahead, valid_at,
@@ -216,6 +254,75 @@ def scored_variables(truth_rows: Iterable[TruthRow]) -> frozenset[str]:
     return frozenset(scored)
 
 
+def rain_nearby(stations: Iterable[tuple[float, int]]) -> tuple[RainOutcome, int, int]:
+    """A day's rain nearby from its stations' (day total, hours) (C1).
+
+    Totals are compared in hundredths (``round(total * 100)``). Rain: at
+    least ``RAIN_NEARBY_PAIR_STATIONS`` stations at 0.2 mm or more, or one
+    at 0.5 mm or more; a station with partial coverage counts. Dry: not
+    rain, and a station has ``RAIN_DRY_MIN_HOURS`` hours or more. Unknown
+    otherwise, never dry. Returns the outcome, the stations with that many
+    hours (full) and the stations with fewer (partial). Pure.
+    """
+    pair = single = full = partial = 0
+    for total, hours in stations:
+        if hours <= 0:
+            continue
+        hundredths = round(total * 100)
+        if hundredths >= RAIN_NEARBY_PAIR_HUNDREDTHS:
+            pair += 1
+        if hundredths >= RAIN_NEARBY_SINGLE_HUNDREDTHS:
+            single += 1
+        if hours >= RAIN_DRY_MIN_HOURS:
+            full += 1
+        else:
+            partial += 1
+    outcome: RainOutcome
+    if pair >= RAIN_NEARBY_PAIR_STATIONS or single >= 1:
+        outcome = "rain"
+    elif full >= 1:
+        outcome = "dry"
+    else:
+        outcome = "unknown"
+    return outcome, full, partial
+
+
+def day_rain_total(
+    samples: Iterable[StoredSample], *, local_date: date, timezone: str
+) -> float | None:
+    """A model's daily rain total for ``local_date``, or ``None`` (C1).
+
+    The sum of its ``precip`` values when they cover each hour of the local
+    day exactly once (``covers_local_day_exactly``); ``None`` otherwise, so a
+    partial day is never a total. Pure.
+    """
+    rain = [sample for sample in samples if sample.variable == "precip"]
+    if not rain or not covers_local_day_exactly(
+        (sample.valid_at for sample in rain), local_date=local_date, timezone=timezone
+    ):
+        return None
+    return math.fsum(sample.value for sample in rain)
+
+
+def _write_rain_day(conn: sqlite3.Connection, record: DayRecord) -> None:
+    """D's ``rain_days`` row from its rain-counted stations' ``ok`` rows (C1)."""
+    start = isoformat_utc(record.day_start_utc)
+    end = isoformat_utc(record.day_end_utc)
+    stations: list[tuple[float, int]] = []
+    for station_id in sorted(
+        day_rain_station_ids(conn, record.site_id, record.local_date)
+    ):
+        values: dict[str, float] = {}
+        for row in conn.execute(_STATION_RAIN_SQL, (station_id, start, end)):
+            values[str(row["valid_at"])] = float(row["value"])
+        stations.append((math.fsum(values.values()), len(values)))
+    outcome, full, partial = rain_nearby(stations)
+    conn.execute(
+        _INSERT_RAIN_DAY_SQL,
+        (record.site_id, record.local_date.isoformat(), outcome, full, partial),
+    )
+
+
 def score_day(
     conn: sqlite3.Connection,
     *,
@@ -232,7 +339,9 @@ def score_day(
     published generation (fewer raise ``ScoreDayInputMissing``), the removal
     of an earlier attempt's rows, then the scored forecasts (6.2), the pairs
     (6.3), the day scores (6.4) and the per-close record (6.7). The day's
-    zone and bounds come from ``record`` only. ``scored_at`` is ``now_utc``
+    zone and bounds come from ``record`` only. D's ``rain_days`` row and its
+    ``rain_forecast_days`` rows (rain release, C1) are written in the same
+    call. ``scored_at`` is ``now_utc``
     to the whole second (15.2). Returns, per feed considered at D (6.2) and
     yardstick, how many of D's 8 forecasts were scored and how many absent
     (6.8).
@@ -249,40 +358,59 @@ def score_day(
     for sql in _DELETE_EARLIER_SQL:
         conn.execute(sql, (site_id, day_text))
 
-    # 6.2: every candidate's scored download of D - k and its version. The
-    # candidates are the real feeds less the meteoblue package row; the
-    # active ones are those switched on at the site now, the mean's members.
+    # 6.2: every candidate's scored values of D at each day ahead k, from
+    # forecast_scored (rain release, Part B, B4), with the download they
+    # came from. The candidates are the real feeds less the meteoblue
+    # package row; the active ones are those switched on at the site now,
+    # the mean's members.
     real_feeds = [int(row["id"]) for row in conn.execute(_REAL_FEEDS_SQL)]
-    active = _active_real_feeds(conn, site_id) & set(real_feeds)
+    active = active_real_feeds(conn, site_id) & set(real_feeds)
     forecasts: dict[tuple[int, int], _Forecast] = {}
     for feed_id in real_feeds:
         for k in _DAYS_AHEAD:
-            download = scored_download(
+            download = scored_values_download(
                 conn,
                 site_id=site_id,
                 feed_id=feed_id,
-                local_date=record.local_date - timedelta(days=k),
+                day_ahead=k,
+                start_utc=record.day_start_utc,
+                end_utc=record.day_end_utc,
             )
             if download is None:
                 continue
             forecasts[(feed_id, k)] = _Forecast(
                 download=download,
-                version=scored_version(
+                version=scored_values(
                     conn,
                     site_id=site_id,
                     feed_id=feed_id,
-                    download=download,
+                    day_ahead=k,
                     start_utc=record.day_start_utc,
                     end_utc=record.day_end_utc,
                 ),
             )
-    # A candidate is considered at D when it is switched on now or has a
-    # scored download on D-7 to D; any other gets no row at D (6.2).
+    # A candidate is considered at D when it is switched on now or has
+    # scored values for D at some day ahead; any other gets no row at D
+    # (6.2). A download that does not reach D counts as no download for D.
     considered = [
         feed_id
         for feed_id in real_feeds
         if feed_id in active or any((feed_id, k) in forecasts for k in _DAYS_AHEAD)
     ]
+
+    # C1 (rain release): D's rain nearby, and each real feed's daily rain
+    # total at each day ahead whose scored values cover D's every hour.
+    _write_rain_day(conn, record)
+    rain_totals: list[tuple[object, ...]] = []
+    for (feed_id, k), forecast in sorted(forecasts.items()):
+        total = day_rain_total(
+            forecast.version.values(),
+            local_date=record.local_date,
+            timezone=record.timezone,
+        )
+        if total is not None:
+            rain_totals.append((site_id, day_text, feed_id, k, total))
+    conn.executemany(_INSERT_RAIN_FORECAST_SQL, rain_totals)
 
     # D's hourly values, and the earlier hours persistence and each pair's
     # skill reference read (value at valid_at - lead_hours, 6.3).
@@ -508,8 +636,9 @@ def _real_pairs(
     hourly: _Hourly,
     record: DayRecord,
 ) -> list[_Pair]:
-    """A real feed's pairs at day ahead ``k``: each scored-version hour of a
-    scored variable that D has a value for, one per hour (6.3)."""
+    """A real feed's pairs at day ahead ``k``: each scored hour of a scored
+    variable that D has a value for, one per hour (6.3); ``forecast_scored``
+    holds one row per hour (rain release, Part B, B4)."""
     chosen: dict[tuple[str, datetime], StoredSample] = {}
     for sample in forecast.version.values():
         if sample.variable not in variables:
@@ -518,11 +647,7 @@ def _real_pairs(
             instant = parse_utc(sample.valid_at)
         except ValueError:
             continue
-        key = (sample.variable, instant)
-        current = chosen.get(key)
-        # Two spellings of one hour: the newer label's row, as 4.3 keeps.
-        if current is None or sample.issued_at > current.issued_at:
-            chosen[key] = sample
+        chosen[(sample.variable, instant)] = sample
     pairs: list[_Pair] = []
     for (variable, instant), sample in sorted(chosen.items(), key=lambda i: i[0]):
         values = hourly.get(variable, {})
@@ -630,8 +755,11 @@ def _yardstick_id(conn: sqlite3.Connection, model: str) -> int | None:
     return None if row is None else int(row["id"])
 
 
-def _active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
-    """The real feeds active at the site now (``active_competitor_clause``)."""
+def active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
+    """The real feeds active at the site now (``active_competitor_clause``),
+    less the meteoblue package row: the feeds the close scores that are
+    switched on. The close's multi-model mean and the publication's rain
+    ranking (C3) read them."""
     return {
         int(row["id"])
         for row in conn.execute(
@@ -641,6 +769,7 @@ def _active_real_feeds(conn: sqlite3.Connection, site_id: int) -> set[int]:
             LEFT JOIN site_feed_state sfs
               ON sfs.site_id = ? AND sfs.feed_id = f.id
             WHERE f.is_virtual = 0
+              AND NOT (f.source = 'meteoblue' AND f.model = 'multimodel')
               AND {active_competitor_clause(site_expr="?")}
             """,
             (site_id, site_id),

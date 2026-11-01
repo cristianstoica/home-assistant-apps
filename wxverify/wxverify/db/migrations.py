@@ -18,7 +18,7 @@ from wxverify.db.switch import migrate_v15_switch
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 15
+TARGET_USER_VERSION = 16
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -596,9 +596,32 @@ def create_tables(conn: sqlite3.Connection) -> None:
             site_id INTEGER NOT NULL,
             local_date TEXT NOT NULL,
             station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            -- rain release, Part A: 0 while the rain check sets the station
+            -- aside; the day's rain reads only the stations with 1
+            rain_counted INTEGER NOT NULL DEFAULT 1 CHECK(rain_counted IN (0,1)),
             PRIMARY KEY (site_id, local_date, station_id),
             FOREIGN KEY (site_id, local_date)
                 REFERENCES site_days(site_id, local_date) ON DELETE CASCADE
+        );
+
+        -- The rain check (rain release, Part A): one row per listed station
+        -- and closed day. No link to site_days, so the rows outlive day
+        -- retention: the take-back rule needs the set-aside row.
+        CREATE TABLE IF NOT EXISTS station_rain_checks (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            outcome TEXT NOT NULL CHECK(outcome IN
+                ('zero','agree','disagree','dry','not_widespread','cant_judge')),
+            reason TEXT,
+            station_mm REAL,
+            peer_median_mm REAL,
+            peers INTEGER NOT NULL,
+            decision TEXT CHECK(decision IS NULL OR decision IN
+                ('set_aside','taken_back','ambiguous','site_limit')),
+            counted_after INTEGER NOT NULL CHECK(counted_after IN (0,1)),
+            checked_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, local_date, station_id)
         );
 
         CREATE TABLE IF NOT EXISTS site_zone_changes (
@@ -737,6 +760,24 @@ def create_tables(conn: sqlite3.Connection) -> None:
             labels_changed INTEGER NOT NULL,
             PRIMARY KEY (download_id, feed_id, variable)
         );
+
+        -- The scored value (rain release, Part B): the first stored download
+        -- of each local day S, one row per feed, variable, hour and day
+        -- ahead. forecast_samples keeps only the newest value.
+        CREATE TABLE IF NOT EXISTS forecast_scored (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            valid_at TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            value REAL NOT NULL,
+            lead_hours INTEGER NOT NULL,
+            issued_at TEXT NOT NULL,
+            download_id INTEGER,
+            download_date TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, feed_id, variable, valid_at, day_ahead)
+        ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS close_pairs (
             site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
@@ -909,6 +950,53 @@ def create_tables(conn: sqlite3.Connection) -> None:
             starting_days INTEGER NOT NULL,
             PRIMARY KEY (publication_id, variable, window_key, day_ahead, feed_id)
         );
+
+        -- Rain (rain release, Part C). The day's "rain nearby" truth, the
+        -- models' daily rain totals per day ahead, the selected rain model
+        -- per cutoff and day ahead, and each publication's rain ranking.
+        -- rain_days and rain_forecast_days are kept: the ranking reads 60
+        -- days, and they have no link to site_days.
+        CREATE TABLE IF NOT EXISTS rain_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            outcome TEXT NOT NULL CHECK(outcome IN ('rain','dry','unknown')),
+            stations_full INTEGER NOT NULL,
+            stations_partial INTEGER NOT NULL,
+            PRIMARY KEY (site_id, local_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS rain_forecast_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            total_mm REAL NOT NULL,
+            PRIMARY KEY (site_id, local_date, feed_id, day_ahead)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS rain_picks (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            cutoff TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            feed_id INTEGER REFERENCES feeds(id) ON DELETE SET NULL,
+            PRIMARY KEY (site_id, cutoff, day_ahead)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_rain_ranks (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            rank INTEGER NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            misses INTEGER NOT NULL,
+            false_alarms INTEGER NOT NULL,
+            common_days INTEGER NOT NULL,
+            counted_days INTEGER NOT NULL,
+            provisional INTEGER NOT NULL,
+            selected INTEGER NOT NULL,
+            in_group INTEGER NOT NULL,
+            PRIMARY KEY (publication_id, day_ahead, rank)
+        );
         """,
     )
 
@@ -937,7 +1025,7 @@ def schema_table_names() -> tuple[str, ...]:
 
 def create_indexes(conn: sqlite3.Connection) -> None:
     """Every CREATE INDEX IF NOT EXISTS of the current schema, verbatim, plus
-    the two code-generated forecast_samples indexes.
+    the two code-generated forecast_samples indexes and idx_samples_slot.
 
     Runs after the version migrations in `run_migrations`: by then every
     column an index names exists on any supported input (idx_pairs_winrate
@@ -1010,6 +1098,7 @@ def create_indexes(conn: sqlite3.Connection) -> None:
     )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
     _sync_forecast_sample_index(conn, "idx_samples_recent", SAMPLES_RECENT_INDEX_DDL)
+    conn.execute(SAMPLES_SLOT_INDEX_DDL)
 
 
 def create_schema(conn: sqlite3.Connection) -> None:
@@ -1034,6 +1123,15 @@ SAMPLES_RECENT_INDEX_DDL = (
     "CREATE INDEX IF NOT EXISTS idx_samples_recent "
     "ON forecast_samples(site_id, feed_id, issued_at, valid_at, "
     "variable, model_run_id)"
+)
+
+# One forecast_samples row per hour: the newest value (rain release, Part B).
+# The forecast_samples upsert names these four columns as its conflict
+# target. A file below version 16 can hold several rows per hour, so
+# migrate_v16_rain_release makes the index after it deletes the extra rows.
+SAMPLES_SLOT_INDEX_DDL: Final = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_slot"
+    " ON forecast_samples(site_id, feed_id, variable, valid_at)"
 )
 
 
@@ -1555,6 +1653,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 15:
         logger.debug("migrations applying v15 switch to the daily close")
         migrate_v15_switch(conn)
+    if current < 16:
+        logger.debug("migrations applying v16 rain release")
+        migrate_v16_rain_release(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -2434,6 +2535,70 @@ def migrate_v14_daily_close_scores(conn: sqlite3.Connection) -> None:
             DOWNLOAD_RECORD_SINCE_KEY,
             isoformat_utc(utc_now().replace(microsecond=0)),
         )
+
+
+def migrate_v16_rain_release(conn: sqlite3.Connection) -> None:
+    """The rain release's one migration (``plans/2026-11-01-rain-release.md``).
+
+    :func:`create_tables` makes ``station_rain_checks``, ``forecast_scored``
+    and Part C's four rain tables before the gates. Part A adds
+    ``site_day_stations.rain_counted`` when the table lacks it, 1 for every
+    existing list row: nothing else is carried over, and the first close
+    after the upgrade judges its day. Part B's carry-over then runs in the
+    plan's order: step 1 writes the scored
+    values of the open days and the coming days into ``forecast_scored``
+    (``carry_over_scored_values``); Part C's C6 fills ``rain_days`` and
+    ``rain_forecast_days`` for the 60 days before the oldest open day
+    (``fill_rain_history``); step 2 keeps one ``forecast_samples``
+    row per hour, the row the Forecast page showed
+    (``keep_newest_samples``), and step 3 makes ``idx_samples_slot``, which
+    the extra rows of step 2 would have refused. The clock is read through
+    this module's ``utc_now``.
+
+    The carry-over lives in ``collection/forecast_store.py`` and is
+    imported here: ``scoring/downloads.py``, which it calls, imports this
+    module.
+
+    One SAVEPOINT holds every step, following :func:`migrate_v4`: any error
+    rolls them all back and is re-raised, so the open fails before the
+    ``user_version`` write and the next open runs the migration again. As
+    in :func:`migrate_v12_widen_raw_readings`, the in_transaction check
+    covers an error that has already ended the transaction. Each step finds
+    its work done on a repeat (the column is added only when missing, the
+    scored and rain history rows are written only where none is stored, and
+    the index is IF NOT EXISTS), so a stop between this step and the version write
+    converges on the next open.
+    """
+    from wxverify.collection.forecast_store import (
+        carry_over_scored_values,
+        fill_rain_history,
+        keep_newest_samples,
+    )
+
+    conn.execute("SAVEPOINT migrate_v16")
+    try:
+        # Part A: the list rows' rain flag; every existing row is counted.
+        if "rain_counted" not in _table_columns(conn, "site_day_stations"):
+            conn.execute(
+                "ALTER TABLE site_day_stations ADD COLUMN rain_counted"
+                " INTEGER NOT NULL DEFAULT 1 CHECK(rain_counted IN (0,1))"
+            )
+        # Part B, step 1: the scored values of the open days.
+        carry_over_scored_values(conn, now_utc=utc_now())
+        # Part C, C6: the rain history of the 60 days before the oldest open
+        # day, before Part B's step 2, which deletes the older labels the
+        # fill's scored_version reads.
+        fill_rain_history(conn)
+        # Part B, step 2: one forecast_samples row per hour.
+        keep_newest_samples(conn)
+        # Part B, step 3: the index, after step 2's delete.
+        conn.execute(SAMPLES_SLOT_INDEX_DDL)
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_v16")
+            conn.execute("RELEASE migrate_v16")
+        raise
+    conn.execute("RELEASE migrate_v16")
 
 
 def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:

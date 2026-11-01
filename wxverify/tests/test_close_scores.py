@@ -22,7 +22,9 @@ chain-based alternative.
 The shared seed (18.6's intro paragraph): feeds X and Y, each with one
 recorded ``round`` download on every S from D-7 to D, each download's label
 dated the day before S, carrying hourly temperature/wind/precip forecasts
-for D at that download's day ahead; D has hourly observations for all three
+for D at that download's day ahead, seeded as its ``forecast_scored`` rows
+(rain release, Part B: the close's only forecast input); D has hourly
+observations for all three
 variables and five truth rows, all eligible, ``rain_threshold_mm`` 0.25.
 X's forecasts carry a constant, deterministic bias over the observed value
 (+1.0 C, +2.0 km/h wind, 0 mm rain); Y's a different one (-0.5 C, -1.0 km/h,
@@ -232,22 +234,30 @@ def _seed_forecast_hour(
     valid_at,
     lead_hours,
     value,
+    day_ahead,
+    download_id,
+    download_date,
     fetched_at,
 ) -> None:
+    """One scored value: the ``forecast_scored`` row the first download of
+    ``download_date`` wrote for ``valid_at`` at ``day_ahead`` (rain release,
+    Part B). The close reads only this table for its forecasts."""
     conn.execute(
-        "INSERT INTO forecast_samples"
-        " (site_id, feed_id, variable, issued_at, valid_at, lead_hours, value,"
-        "  source_raw, model_run_id, fetched_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, 'synthetic', ?, ?)",
+        "INSERT INTO forecast_scored"
+        " (site_id, feed_id, variable, valid_at, day_ahead, value, lead_hours,"
+        "  issued_at, download_id, download_date, fetched_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             site_id,
             feed_id,
             variable,
-            issued_at,
             valid_at,
-            lead_hours,
+            day_ahead,
             value,
+            lead_hours,
             issued_at,
+            download_id,
+            download_date,
             fetched_at,
         ),
     )
@@ -264,7 +274,8 @@ def _seed_downloads(
 ) -> dict[tuple[str, int], int]:
     """Seed one recorded ``round`` download per feed for each S in
     ``target_date``-7 to ``target_date``, with hourly forecasts for
-    ``target_date``'s 24 hours at that S's day ahead k = target_date - S.
+    ``target_date``'s 24 hours at that S's day ahead k = target_date - S,
+    stored as that download's ``forecast_scored`` rows.
     ``skip`` leaves (feed name, day ahead) pairs unseeded.
     """
     bias = bias if bias is not None else _BIAS
@@ -302,6 +313,9 @@ def _seed_downloads(
                         valid_at=valid_at,
                         lead_hours=lead,
                         value=value,
+                        day_ahead=k,
+                        download_id=download_id,
+                        download_date=s.isoformat(),
                         fetched_at=fetched_at,
                     )
     return download_ids
@@ -476,7 +490,7 @@ def test_sd1_scored_day_writes_pairs_scores_record(tmp_path) -> None:  # noqa: A
 
 def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: ARG001
     """SD2: X's download of D-2 (k=2) deleted from the record and its
-    samples: X's k=2 rows are `absent`, no pairs, a record row with NULL
+    scored values: X's k=2 rows are `absent`, no pairs, a record row with NULL
     download; `ScoreSummary.absent["feed:X"]` counts 1 (6.2, 6.8).
 
     Paired positive: Y, seeded identically but not deleted, gets `scored`
@@ -495,7 +509,7 @@ def test_sd2_missing_download_is_absent_not_scored(tmp_path) -> None:  # noqa: A
         (site_id, feeds["X"], s.isoformat()),
     )
     conn.execute(
-        "DELETE FROM forecast_samples"
+        "DELETE FROM forecast_scored"
         " WHERE site_id = ? AND feed_id = ? AND issued_at = ?",
         (site_id, feeds["X"], f"{(s - timedelta(days=1)).isoformat()}T00:00:00Z"),
     )
@@ -687,7 +701,7 @@ def test_sd5_gap_hours_unpaired_and_threshold_from_truth_row(tmp_path) -> None: 
         (site_id, rain_valid_at),
     )
     conn.execute(
-        "UPDATE forecast_samples SET value = 0.3 WHERE site_id = ? AND feed_id = ?"
+        "UPDATE forecast_scored SET value = 0.3 WHERE site_id = ? AND feed_id = ?"
         " AND variable = 'precip' AND valid_at = ?",
         (site_id, feeds["X"], rain_valid_at),
     )
@@ -1050,7 +1064,7 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
     for hour in y_extra_missing_hours:
         valid_at = isoformat_utc(datetime(D.year, D.month, D.day, hour, tzinfo=UTC))
         conn.execute(
-            "DELETE FROM forecast_samples"
+            "DELETE FROM forecast_scored"
             " WHERE site_id = ? AND feed_id = ? AND variable = 'wind'"
             " AND issued_at = ? AND valid_at = ?",
             (site_id, feeds["Y"], label1, valid_at),
@@ -1063,12 +1077,12 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
     # forecast hour of the version, paired or not) would pick it up. The
     # spike must stay within wind's valid range ([0.0, 150.0], see
     # invalid_forecast_sample_sql in wxverify/collection/forecast_validation
-    # .py) -- a value above 150.0 is dropped before scored_version ever
+    # .py) -- a value above 150.0 is dropped before scored_values ever
     # sees it, so the mutant's whole-version max could never pick it up
     # either, and the test could not tell the mutant from correct code.
     spike_valid_at = isoformat_utc(datetime(D.year, D.month, D.day, 1, tzinfo=UTC))
     spiked = conn.execute(
-        "UPDATE forecast_samples SET value = 140.0 WHERE site_id = ?"
+        "UPDATE forecast_scored SET value = 140.0 WHERE site_id = ?"
         " AND feed_id = ? AND variable = 'wind' AND issued_at = ? AND valid_at = ?",
         (site_id, feeds["X"], label1, spike_valid_at),
     )
@@ -1126,23 +1140,25 @@ def test_sd11_wind_sums_from_paired_hours_only(tmp_path) -> None:  # noqa: ARG00
 
 def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:  # noqa: ARG001
     """SD12: `score_day` called a second time leaves every row equal but
-    `scored_at`; a sample of X added for D, then a third call, adds
-    nothing (the sample's `fetched_at` is after the download's, 4.3) (6.9).
+    `scored_at`; a later download's value of X for D, then a third call,
+    adds nothing (6.9): the later value is the newest stored value in
+    `forecast_samples`, and the close reads only `forecast_scored`, which
+    holds the first download's values (rain release, Part B).
     """
     from wxverify.scoring.close_scores import score_day
 
     conn = asof_conn()
     site_id, feeds, record, now_utc, download_ids, _gen = _build_base(conn)
 
-    # X's k=1 download (S = D-1) is the one the late sample will re-add a
-    # row under: free up its (temperature, D 10:00) slot first, so the
-    # later INSERT does not collide with forecast_samples' UNIQUE(site_id,
-    # feed_id, variable, issued_at, valid_at).
+    # X's k=1 download (S = D-1) has no scored value at (temperature,
+    # D 10:00): the later download's value below is then the only value
+    # stored for that hour, so a close that fell back to the newest stored
+    # value where no scored value exists would pair it.
     s1 = D - timedelta(days=1)
     k1_label = f"{(s1 - timedelta(days=1)).isoformat()}T00:00:00Z"
     k1_valid_at = isoformat_utc(datetime(D.year, D.month, D.day, 10, tzinfo=UTC))
     deleted = conn.execute(
-        "DELETE FROM forecast_samples"
+        "DELETE FROM forecast_scored"
         " WHERE site_id = ? AND feed_id = ? AND variable = 'temperature'"
         " AND issued_at = ? AND valid_at = ?",
         (site_id, feeds["X"], k1_label, k1_valid_at),
@@ -1177,9 +1193,9 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
             " rows differ in more than scored_at"
         )
 
-    # A later sample for X's k=1 (temperature, D 10:00) slot -- freed above
-    # -- does not change the rerun's output: its fetched_at is after the
-    # k=1 download's fetched_at, so scored_version (4.3) leaves it out.
+    # A later download's value for X's (temperature, D 10:00) hour, stored
+    # as the newest value in forecast_samples, does not change the rerun's
+    # output: only the first download of S writes scored values.
     k1_download = conn.execute(
         "SELECT fetched_at FROM forecast_downloads"
         " WHERE site_id = ? AND feed_id = ? AND local_date = ?",
@@ -1210,11 +1226,11 @@ def test_sd12_rerun_replaces_not_adds_third_call_adds_nothing(tmp_path) -> None:
     third = _p4_table_snapshot(conn, site_id)
     for table in first:
         assert _without_scored_at(second[table]) == _without_scored_at(third[table]), (
-            "4.3 -> at this assertion: correct = the late sample (fetched_at"
-            " after the download's) is left out, so the third call adds"
-            " nothing, mutant (fetched_at cutoff dropped from"
-            " scored_version) = the k=1 temperature pair at D 10:00 takes"
-            f" the late value (table={table})"
+            "Part B -> at this assertion: correct = the later download's"
+            " value (the newest in forecast_samples) is left out, so the"
+            " third call adds nothing, mutant (the close reads the newest"
+            " stored value) = a k=1 temperature pair at D 10:00 with the"
+            f" late value (table={table})"
         )
 
 

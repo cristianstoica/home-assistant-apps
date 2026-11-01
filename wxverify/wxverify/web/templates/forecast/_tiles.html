@@ -39,25 +39,25 @@
               {% if tile.wind.max_kmh is none and tile.wind.note %}
                 <p class="muted" data-field="wind-note">{{ tile.wind.note }}</p>
               {% endif %}
-              <div class="tile-row" {% if tile.precip.meta.available and not tile.precip.meta.extrema_unavailable %}title="Feeds: {{ tile.precip.meta.feed_labels }}. Wet hours: the average number of hourly intervals forecast to meet this site's rain threshold, rounded for display. Rain need not fall throughout each interval."{% endif %}>
+              <div class="tile-row" {% if tile.precip.feed_label %}title="Rain from {{ tile.precip.feed_label }}, the best rain record for this day ahead."{% endif %}>
                 <span>Rain</span>
-                {% if tile.precip.meta.extrema_unavailable %}
-                  <strong class="muted">Daily rainfall unavailable &mdash; partial coverage</strong>
-                {% elif tile.precip.meta.available and tile.precip.total_mm is not none %}
+                {% if tile.precip.total_mm is not none %}
                   <strong>
                     {{ '%.1f'|format(tile.precip.total_mm) }} mm
                     {%- if tile.precip.wet_hours is not none %} &middot; {{ tile.precip.wet_hours }} h{% endif %}
-                    {%- if tile.precip.show_rain_glyph %} &#127783;{% endif %}
+                    {%- if tile.precip.icon == 'light' %} &#127783;{% elif tile.precip.icon == 'heavy' %} &#9748;{% endif %}
+                    {%- if tile.precip.agreement_pct is not none %} &middot; Agreement {{ tile.precip.agreement_pct }}%{% endif %}
                   </strong>
                 {% else %}
-                  <strong class="muted">&mdash;</strong>
+                  <strong class="muted">No rain forecast</strong>
                 {% endif %}
               </div>
             </div>
-            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.substitute or tile.fetch_unknown or tile.partial %}
+            {% set rain_provisional = tile.precip.meta.extrema_state == 'rebuilding' %}
+            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or rain_provisional or tile.stale or tile.substitute or tile.fetch_unknown or tile.partial %}
               <div class="tile-badges">
                 {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
-                {% if tile.confidence_state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
+                {% if tile.confidence_state == 'rebuilding' or rain_provisional %}<span class="badge muted">ranking updating</span>{% endif %}
                 {% if tile.stale %}<span class="badge warn" title="At least one feed used for this day has gone more than twice its scheduled fetch interval without a usable download, or its fetch interval is unknown. The age of the forecast itself doesn't count.">stale</span>{% endif %}
                 {% if tile.substitute %}<span class="badge muted" title="A feed this day would normally use has stopped updating, so the next-ranked feed stands in.">substitute</span>{% endif %}
                 {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="The app has no recorded time yet for a usable download from at least one feed used for this day. Each feed's time is recorded after its next usable download.">fetch time unknown</span>{% endif %}

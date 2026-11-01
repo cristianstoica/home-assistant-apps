@@ -42,6 +42,17 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
+def _drop_slot_index(conn: sqlite3.Connection) -> None:
+    """Allow several labels in one hour, as a file below v16 held them.
+
+    The rain release (Part B) keeps one ``forecast_samples`` row per hour
+    (``idx_samples_slot``) and no interim values, so on a v16 file a later
+    download replaces an hour's value. The tests that call this pin the
+    record's as-of reading over the labels a pre-v16 file held.
+    """
+    conn.execute("DROP INDEX idx_samples_slot")
+
+
 def _make_site(conn: sqlite3.Connection, name: str, timezone: str = "UTC") -> int:
     cur = conn.execute(
         """
@@ -377,6 +388,7 @@ def test_record_day_with_only_paused_samples(pause_kind: str) -> None:
 
 def test_record_retry_is_idempotent() -> None:
     conn = _conn()
+    _drop_slot_index(conn)
     site_id = _make_site(conn, "site-a")
     ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
@@ -419,6 +431,7 @@ def test_record_retry_is_idempotent() -> None:
 
 def test_record_excludes_samples_fetched_after_t() -> None:
     conn = _conn()
+    _drop_slot_index(conn)
     site_id = _make_site(conn, "site-a")
     ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
@@ -492,6 +505,7 @@ def test_gap_scan_fresh_site_is_noop() -> None:
 
 def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
     conn = _conn()
+    _drop_slot_index(conn)
     site_id = _make_site(conn, "site-a")
     generation_id = ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
@@ -530,6 +544,7 @@ def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
 
 def test_gap_scan_chunks_with_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _conn()
+    _drop_slot_index(conn)
     site_id = _make_site(conn, "site-a")
     ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")

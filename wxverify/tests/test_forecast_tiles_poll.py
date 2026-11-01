@@ -86,6 +86,13 @@ def _insert_sample(
     lead_hours: int,
     value: float,
 ) -> None:
+    # Since the rain release (Part B) an hour holds one row
+    # (idx_samples_slot): a later label replaces the hour's stored row.
+    conn.execute(
+        "DELETE FROM forecast_samples WHERE site_id = ? AND feed_id = ?"
+        " AND variable = ? AND valid_at = ?",
+        (site_id, feed_id, variable, valid_at),
+    )
     conn.execute(
         """
         INSERT INTO forecast_samples

@@ -30,6 +30,7 @@ from tests.helpers import (
     asof_insert_pair,
     asof_make_real_feed,
     asof_make_site,
+    seed_rain_ranks,
 )
 from tests.test_forecast_service import _hours
 from wxverify.core.timeutil import isoformat_utc
@@ -770,6 +771,12 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
         )
 
     build_forecast_record(conn, site_id, _DAY.isoformat(), now=t)
+    # Rain release, C4: the live tile's rain follows the published rain
+    # ranking (read with the daily close on), seeded after the record build
+    # so the record is built as before. B (14 h, no full day) is selected
+    # and hands over to A, the record's one contributor, so both sides use
+    # A's rain.
+    seed_rain_ranks(conn, site_id=site_id, published_at=t, ranked={0: [feed_b, feed_a]})
     conn.commit()
     view = build_forecast(
         conn,
@@ -1360,6 +1367,13 @@ def test_record_precip_hourly_is_exactly_the_drill_down_aggregate_line() -> None
     fixture (test_forecast_aggregate.py's
     test_fixed_membership_series_gap_in_one_member_is_null_not_the_other_value
     carries renormalisation).
+
+    Rain release, C4: the live drill-down's rain line is now the rain
+    ranking's winner alone, while the record (``verification/record.py``,
+    untouched by this release) keeps the contributor-set line. So the
+    recorded line is checked against the line built by hand from A and B
+    (the old drill-down line); the live drill-down still supplies the axis
+    the record's instants must lie on.
     """
     conn = asof_conn()
     site_id, feed_a, feed_b, feed_c = _seed_g29_g30_fixture(conn)
@@ -1372,33 +1386,36 @@ def test_record_precip_hourly_is_exactly_the_drill_down_aggregate_line() -> None
     assert json.loads(str(row["selected_feed_ids"])) == [feed_a, feed_b, feed_c]
     displayed = dict(json.loads(str(row["daily_quantities"]))["displayed"])
     assert displayed["extrema_feed_ids"] == [feed_a, feed_b]
-    assert payload["precip_aggregate"]["feed_ids"] == [feed_a, feed_b]
 
-    drill = dict(
-        zip(
-            [str(h) for h in payload["hours"]],
-            payload["blend"]["precip_mm"],
-            strict=True,
-        )
-    )
+    # Hand-built: the mean of A and B at each on-the-hour instant, null at
+    # C's 10:30 (neither member supplies it).
+    expected: dict[str, float | None] = {
+        f"{_DAY.isoformat()}T{h:02d}:00:00Z": (0.1 * (h % 3) + (0.4 if h < 9 else 0.0))
+        / 2
+        for h in range(24)
+    }
+    off_hour_precip = f"{_DAY.isoformat()}T10:30:00Z"
+    expected[off_hour_precip] = None
+    drill_hours = [str(h) for h in payload["hours"]]
     hourly = [(str(at), v) for at, v in json.loads(str(row["hourly_values"]))]
     recorded_ats = [at for at, _v in hourly]
 
     assert recorded_ats == sorted(recorded_ats)
     assert len(recorded_ats) == len(set(recorded_ats))
+    assert recorded_ats == sorted(expected)
     for at, value in hourly:
-        assert at in drill
-        assert value == drill[at]
-    for at, drill_value in drill.items():
-        if at not in recorded_ats:
-            assert drill_value is None
+        assert at in drill_hours
+        want = expected[at]
+        if want is None:
+            assert value is None
+        else:
+            assert value == pytest.approx(want, abs=1e-12)
 
-    off_hour_precip = f"{_DAY.isoformat()}T10:30:00Z"
     off_hour_temp = f"{_DAY.isoformat()}T05:30:00Z"
     assert len(hourly) == 25
     none_ats = [at for at, v in hourly if v is None]
     assert none_ats == [off_hour_precip]
-    assert off_hour_temp in drill
+    assert off_hour_temp in drill_hours
     assert off_hour_temp not in recorded_ats
 
 

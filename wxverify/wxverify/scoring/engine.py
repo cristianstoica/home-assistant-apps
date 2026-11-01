@@ -116,8 +116,7 @@ def enqueue_scoring_run(conn: sqlite3.Connection, site_id: int) -> bool:
     section 10): with the daily close on it enqueues nothing, since only the
     close's stage 5 scores; with it off it makes today's deduped enqueue.
     Returns whether a new job row was inserted (False when the close is on or
-    a pending or running run already exists), for the fetch score gate's log
-    line.
+    a pending or running run already exists).
     """
     if daily_close_on(conn):
         logger.debug("scoring enqueue skipped site=%s: daily close on", site_id)

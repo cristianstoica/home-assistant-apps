@@ -502,9 +502,16 @@ def _insert_sample_at(
 ) -> None:
     """One forecast row valid at ``valid_at``; an explicit id when asked.
 
-    Issued after the chain fixture's own rows so the UNIQUE key never
-    collides with them.
+    Issued after the chain fixture's own rows. Since the rain release
+    (Part B) an hour holds one row (``idx_samples_slot``), so the hour's
+    stored row is deleted first: a later download replaces it, under a new
+    row id unless the test pins one.
     """
+    conn.execute(
+        "DELETE FROM forecast_samples WHERE site_id = ? AND feed_id = ?"
+        " AND variable = 'temperature' AND valid_at = ?",
+        (site_id, feed_id, valid_at),
+    )
     conn.execute(
         """
         INSERT INTO forecast_samples
