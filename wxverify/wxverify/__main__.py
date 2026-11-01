@@ -9,7 +9,7 @@ import json
 import logging
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -40,6 +40,12 @@ from wxverify.db.site_days import (
     day_station_ids,
     enter_zone_change,
     open_day_on_copy,
+)
+from wxverify.db.switch import (
+    StationHistory,
+    history_prune_refusals,
+    history_prune_stations,
+    prune_station_history,
 )
 from wxverify.provider_ops import (
     NEW_PROVIDER_SOURCES,
@@ -86,6 +92,15 @@ def main(argv: list[str] | None = None) -> int:
         # Retired with the daily close (plan 7.3): the message and exit 1,
         # before logging is set up and before init_db opens the file.
         _die(RETIRED_CONTROL_MESSAGE)
+    if args.command == "wind-history" and not args.dry_run and not args.restored_backup:
+        # Plan 12.5: a run that deletes names the backup it relies on. Checked
+        # before logging is set up and before init_db opens (and so creates)
+        # the file.
+        raise SystemExit(
+            _wind_history_errors(
+                [_RESTORED_BACKUP_REQUIRED], json_output=bool(args.json)
+            )
+        )
     if args.command == "serve":
         return _serve(args)
     _configure_logging()
@@ -93,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
         # Before init_db, which migrates the file and sets WAL: close-day
         # reads --db only through a read-only connection (plan 8.8).
         return _close_day(args)
+    if args.command == "wind-history" and args.dry_run:
+        # Before init_db, which writes the file: --dry-run reads only (plan 12.5).
+        return _wind_history(args)
     init_db(args.db)
     if args.command == "score":
         return _score(args)
@@ -108,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         return _jobs(args)
     if args.command == "timezone":
         return _timezone(args)
+    if args.command == "wind-history":
+        return _wind_history(args)
     _die("unknown command")
 
 
@@ -195,6 +215,17 @@ def _build_parser() -> argparse.ArgumentParser:
     purge.add_argument("--failed-older-than-hours", type=int, default=168)
     purge.add_argument("--dry-run", action="store_true")
     purge.add_argument("--json", action="store_true")
+
+    # Switch-over plan 12.5: the owner's one-time prune of the wind history
+    # from before each site's first closed day.
+    wind_history = sub.add_parser("wind-history")
+    wind_history_sub = wind_history.add_subparsers(
+        dest="wind_history_command", required=True
+    )
+    prune = wind_history_sub.add_parser("prune")
+    prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--restored-backup", metavar="NAME")
+    prune.add_argument("--json", action="store_true")
 
     # A normal site edit (PUT /api/sites/{id}) cannot change a timezone by
     # design; ``change`` enters a zone change (daily-close P1 6.4). The
@@ -391,6 +422,135 @@ def _jobs_purge(args: argparse.Namespace) -> int:
         action = "would_purge" if args.dry_run else "purged"
         print(f"{action} failed_jobs={count} older_than_hours={hours}")
     return 0
+
+
+#: ``wind-history prune``'s refusal, before the file is opened, of a run that
+#: deletes without naming the backup it relies on (switch-over plan 12.5).
+_RESTORED_BACKUP_REQUIRED = (
+    "--restored-backup NAME is required without --dry-run: name the backup"
+    " whose restore check passed"
+)
+
+
+def _wind_history(args: argparse.Namespace) -> int:
+    if args.wind_history_command == "prune":
+        return _wind_history_prune(args)
+    _die("unknown wind-history command")
+
+
+def _wind_history_errors(lines: list[str], *, json_output: bool) -> int:
+    """Report why ``wind-history prune`` stopped: each line, exit 1 (12.5)."""
+    if json_output:
+        _print_json({"errors": lines})
+    else:
+        for line in lines:
+            print(f"error {line}")
+    return 1
+
+
+def _prune_one_station(station: StationHistory, backup: str) -> int:
+    """Prune one station's wind history in its own ``write_sync`` (12.5).
+
+    ``prune_station_history`` is looked up in this module at call time. Its
+    ``ValueError`` on a refusal propagates. Logs the station's row count and
+    the backup name at INFO, and returns the count.
+    """
+    rows = get_db().write_sync(
+        lambda conn: prune_station_history(
+            conn, station_id=station.station_id, now_utc=utc_now()
+        )
+    )
+    logger.info(
+        "wind-history prune: station %s (id %d, site %d): %d row(s) deleted;"
+        " restored backup %r",
+        station.pws_station_id,
+        station.station_id,
+        station.site_id,
+        rows,
+        backup,
+    )
+    return rows
+
+
+def _wind_history_prune(args: argparse.Namespace) -> int:
+    """``wind-history prune``: the one-time prune of the wind history (12.5).
+
+    ``--dry-run`` reads only, through a read-only connection to ``--db``
+    (``main`` routes it here before ``init_db``): each station's count of
+    rows to delete with their first and last ``obs_at``, then every refusal
+    line; exit 0, or an error line and exit 1 when ``--db`` cannot be read.
+    Otherwise the stations that own rows to delete are read, and each one's
+    rows go in a ``write_sync`` of their own; a refusal prints its lines and
+    exits 1. At the end the rows still matching the delete are counted and
+    printed, and the exit is 0 only when that count is 0. ``main`` has
+    already refused a run without ``--dry-run`` or ``--restored-backup``.
+    """
+    json_output = bool(args.json)
+    if args.dry_run:
+        try:
+            reader = sqlite3.connect(
+                f"{Path(str(args.db)).resolve().as_uri()}?mode=ro", uri=True
+            )
+            try:
+                reader.row_factory = sqlite3.Row
+                reader.execute("PRAGMA query_only=ON")
+                stations = history_prune_stations(reader)
+                refusals = history_prune_refusals(reader)
+            finally:
+                reader.close()
+        except (OSError, sqlite3.Error) as exc:
+            return _wind_history_errors(
+                [f"cannot read the database: {sanitized_exception(exc)}"],
+                json_output=json_output,
+            )
+        if json_output:
+            _print_json(
+                {
+                    "dry_run": True,
+                    "stations": [asdict(station) for station in stations],
+                    "refusals": refusals,
+                }
+            )
+        else:
+            for station in stations:
+                print(
+                    f"would_delete station={station.pws_station_id}"
+                    f" station_id={station.station_id} site={station.site_id}"
+                    f" rows={station.rows} first_obs_at={station.first_obs_at}"
+                    f" last_obs_at={station.last_obs_at}"
+                )
+            for line in refusals:
+                print(f"refusal {line}")
+        return 0
+    db = get_db()
+    backup = str(args.restored_backup)
+    deleted: list[dict[str, object]] = []
+    for station in db.read_sync(history_prune_stations):
+        try:
+            rows = _prune_one_station(station, backup)
+        except ValueError as exc:
+            return _wind_history_errors(str(exc).splitlines(), json_output=json_output)
+        deleted.append(
+            {
+                "station_id": station.station_id,
+                "pws_station_id": station.pws_station_id,
+                "site_id": station.site_id,
+                "rows": rows,
+            }
+        )
+    remaining = sum(station.rows for station in db.read_sync(history_prune_stations))
+    if json_output:
+        _print_json(
+            {
+                "dry_run": False,
+                "restored_backup": backup,
+                "deleted": deleted,
+                "remaining_rows": remaining,
+            }
+        )
+    else:
+        print(f"remaining_rows={remaining} restored_backup={backup}")
+    return 0 if remaining == 0 else 1
 
 
 def _timezone(args: argparse.Namespace) -> int:

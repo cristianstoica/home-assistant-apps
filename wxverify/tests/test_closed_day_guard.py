@@ -1350,6 +1350,9 @@ _GW17_ALLOWLIST: Final = frozenset(
         # A1's single-generation-per-site keep, only inside migrate_v15_switch
         # on a file below 15, which holds no closed day (plan 10.1).
         ("wxverify.db.switch", "keep_read_generations"),
+        # P6 12.5: the owner's one-time wind-history prune, before each
+        # site's first record, through P1's guard (WriteKind.HISTORY_PRUNE).
+        ("wxverify.db.switch", "prune_station_history"),
         ("wxverify.verification.runs", "*"),  # verification tables only
         ("wxverify.db.migrations", "SEED_STATION_CHANGES_SQL"),  # migration (v11)
         ("wxverify.scoring.consensus", "_invalidate_consensus_dependents"),  # 7.3

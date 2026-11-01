@@ -20,8 +20,9 @@ _ALLOWED_CALLERS = frozenset({"wxverify/__main__.py"})
 #: One call site each for `settings list`, `settings get`, `jobs purge
 #: --dry-run`, `providers doctor`, and `providers fetch`/`smoke`'s feed
 #: selection; `timezone status`'s was retired with the daily close (plan
-#: 7.3), dropping the total from 6 back to 5.
-_EXPECTED_TOTAL_CALLS = 5
+#: 7.3). `wind-history prune` adds two, its station list and its final
+#: count of the rows left (switch-over plan 12.5), for a total of 7.
+_EXPECTED_TOTAL_CALLS = 7
 
 
 def test_read_sync_is_only_called_from_the_cli_entry_point() -> None:
