@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.16.15
+
+The Forecast page's Rain row now shows one model's rain: the model with
+the best rain record for that day ahead. Each closed day now records
+whether it rained nearby and each model's forecast daily total, and the
+daily publication ranks the models for each day ahead over the last 60
+closed days: a missed rainy day costs 2 points and a false alarm 1.
+Once two models have 20 counted days, only models with 20 or more take
+part, and the shown model changes only when another one beats it by 3
+points or more; until then the tile shows `ranking updating`. The row
+shows the winner's total and wet hours, a rain symbol at 0.2 mm or more
+(a rain cloud, or an umbrella when the wettest hour is above 1 mm), and
+`Agreement N%` when two or more models are ranked. `No rain forecast`
+replaces the dash and the `partial coverage` note. The rain ranking
+needs the daily close.
+
+A rain gauge that reads exactly zero while the other stations report
+rain, on 3 days in 2 wet spells within 30 days, stops counting for rain
+from the next day, and the Sites page shows `rain not counted since
+<date>`. It counts again after 3 days in 2 wet spells on which it agrees
+with the others. Its temperature and wind still count.
+
+Forecasts now keep two values per hour and day ahead: the first
+download after local midnight, which the close scores, and the newest,
+which the Forecast page shows. A later download that corrects a value
+now replaces it instead of being dropped; the values in between are
+not kept.
+
+The first start of this version upgrades the database (schema 16). It
+keeps the scored values of the days not yet closed, fills the rain
+records of the 60 days before them from the stored history, and removes
+the forecast values that are no longer used. On a database of a few GB
+this takes about a minute on a fast computer and several minutes on a
+Raspberry Pi; the add-on does not answer until it finishes.
+
 ## 0.16.14
 
 Each day is now closed and scored once, after it ends (the daily

@@ -26,7 +26,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import asof_conn
+from tests.helpers import asof_conn, seed_rain_ranks
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import RuntimeOptions, load_runtime_options
@@ -896,6 +896,18 @@ def test_forecast_page_ride_alongs(
     # all; an empty-state site (zero samples) never renders "tile-row" or
     # "Rain", so the tooltip assertion below would silently never execute.
     _seed_full_day_precip(conn, site_id, now=fixed_now)
+    # Rain release, C4: the rain row shows the published rain ranking's
+    # winner, so the seeded feed is ranked for today (day ahead 0).
+    precip_feed = conn.execute(
+        "SELECT id FROM feeds WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
+    ).fetchone()
+    assert precip_feed is not None
+    seed_rain_ranks(
+        conn,
+        site_id=site_id,
+        published_at=fixed_now,
+        ranked={0: [int(precip_feed["id"])]},
+    )
     conn.commit()
     # The override must arrive via options.json: startup's
     # apply_plain_settings CLEARS any depth-override row whose key is
@@ -918,7 +930,9 @@ def test_forecast_page_ride_alongs(
         # is not vacuous.
         assert "tile-row" in page.text
         assert "Rain" in page.text
-        assert "Wet hours:" in page.text
+        # Rain release, C4: the row's tooltip names the winner (it was the
+        # "Wet hours:" definition).
+        assert "the best rain record for this day ahead." in page.text
         # Wording regression (0.16.3): the rain row dropped the "wet"
         # qualifier and the "~" approximation glyph from the wet-hours
         # figure, leaving a bare "<n> h".

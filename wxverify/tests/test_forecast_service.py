@@ -26,6 +26,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
+from tests.helpers import seed_rain_ranks
 from wxverify.collection.forecast_fetcher import register_feed_if_needed
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
@@ -33,7 +34,6 @@ from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migratio
 from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import (
-    RAIN_GLYPH_MIN_WET_HOURS,
     build_forecast,
     build_hourly,
     relative_ago,
@@ -531,59 +531,66 @@ def test_temperature_extrema_suppressed_under_coverage_partial_badge_set() -> No
 # ---------------------------------------------------------------------------
 
 
+def _seed_wind_weight(
+    conn: sqlite3.Connection,
+    *,
+    publication_id: int,
+    feed_id: int,
+    day_ahead: int,
+    weight: float = 1.0,
+) -> None:
+    """One published wind weight (``publication_wind_weights``)."""
+    conn.execute(
+        "INSERT INTO publication_wind_weights"
+        " (publication_id, feed_id, day_ahead, mae_ms, days, weight)"
+        " VALUES (?, ?, ?, 1.0, 30, ?)",
+        (publication_id, feed_id, day_ahead, weight),
+    )
+
+
 def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() -> None:
+    """Rain release, C4: the rain cell no longer reads the leaderboard; its
+    state comes from the published rain ranking, read with the daily close
+    on. So this runs with the close on, and the roles move: temperature has
+    samples and no published ranking (low_confidence), rain's winner has a
+    full day under a settled ranking (normal), wind has no published weights
+    (not_available)."""
     conn = _make_db()
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     gfs_id = _feed_id(conn, "open-meteo", "gfs_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    valid_ats = _hours("2026-07-20", 4, 20)
 
-    # temperature: confident -> normal.
+    # temperature: samples, no published ranking -> low_confidence.
     _seed_hourly(
         conn,
         feed_id=ecmwf_id,
         variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
-        valid_ats=valid_ats,
+        valid_ats=_hours("2026-07-20", 4, 20),
     )
-    _make_confident(conn, feed_id=ecmwf_id, variable="temperature", day_ahead=1)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=1)
-
-    # precip: samples present, but zero forecast_pairs anywhere ->
-    # low_confidence (fresh-install sample-count rung).
+    # precip: a settled ranking whose winner has a full day -> normal.
     _seed_hourly(
         conn,
         feed_id=gfs_id,
         variable="precip",
         issued_at="2026-07-19T20:00:00Z",
-        valid_ats=valid_ats,
-        value=5.0,
+        valid_ats=_hours("2026-07-20", 0, 24),
+        value=0.0,
     )
-
-    # wind: no samples at all -> not_available.
-
-    # The precip cell's leaderboard read is "empty" (no forecast_pairs at
-    # all), not "rebuilding" (an absent/mismatched cache snapshot over a REAL
-    # expected feed universe) -- states why the cell stays low_confidence
-    # rather than becoming rebuilding.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [gfs_id]})
+    # wind: no samples and no published weights -> not_available.
     conn.commit()
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="precip", day_ahead=1, window="rolling"
-        ).status
-        == "empty"
-    )
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     today = view.tiles[0]
-    assert today.temp.meta.state == "normal"
-    assert today.precip.meta.state == "low_confidence"
+    assert today.temp.meta.state == "low_confidence"
+    assert today.precip.meta.state == "normal"
     assert today.wind.meta.state == "not_available"
     assert today.wind.meta.available is False
     # Precedence: not_available (wind) excluded from the rollup; among the
-    # populated cells, low_confidence (precip) beats normal (temp).
+    # populated cells, low_confidence (temp) beats normal (precip).
     assert today.state == "low_confidence"
 
     # Paired negative: a day with NO data anywhere is fully not_available at
@@ -604,15 +611,22 @@ def test_tile_precedence_low_confidence_beats_normal_not_available_excluded() ->
 def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     """O4: tile rollup precedence over the new vocabulary member.
 
-    Day tile 0: temp is `low_confidence` from an EMPTY leaderboard read (no
-    forecast_pairs at all), precip is `rebuilding` -- the rollup must still
-    read `low_confidence`, because that caveat does not resolve on its own.
-    Day tile 1: temp is confident/`normal`, precip is `rebuilding` and
+    Day tile 0: temp is `low_confidence` (no published ranking), precip's
+    extrema state is `rebuilding` -- the rollup must still read
+    `low_confidence`, because that caveat does not resolve on its own. Day
+    tile 1: wind is `normal`, precip's extrema state is `rebuilding` and
     nothing else is degraded -- the rollup must read `rebuilding`.
 
-    Both feeds are single-candidate cells (agg_feeds == selection.feeds), so
-    this is purely about D4's precedence, not D2's per-surface width -- that
-    is O8's job.
+    This is purely about D4's precedence, not D2's per-surface width --
+    that is O8's job.
+
+    Rain release, C4: the rain cell's `rebuilding` is now a provisional
+    published rain ranking, read with the daily close on, and shows in its
+    extrema state (the cell's hourly state is `normal`), so the rollup is
+    the tile's `confidence_state`. The close-off leaderboard no longer
+    reaches the rain cell, so this runs with the close on, where the normal
+    cell of day tile 1 is wind (two feeds with published weights) and
+    temperature has no samples there.
     """
     conn = _make_db()
     ecmwf_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -620,81 +634,57 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
     icon_id = _feed_id(conn, "open-meteo", "icon_global")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
-    # --- Day tile 0 ("2026-07-20"): representative day_ahead=1 for both
-    # cells (issued the previous evening, matching the B2 fixture shape).
-    day0_valid_ats = _hours("2026-07-20", 4, 20)
+    # --- Day tile 0 ("2026-07-20"): temperature with samples and no
+    # published ranking -> low_confidence; rain provisional -> rebuilding.
     _seed_hourly(
         conn,
         feed_id=ecmwf_id,
         variable="temperature",
         issued_at="2026-07-19T20:00:00Z",
-        valid_ats=day0_valid_ats,
+        valid_ats=_hours("2026-07-20", 4, 20),
     )
-    # No forecast_pairs anywhere at (temperature, 1) -> empty universe ->
-    # "empty" status -> low_confidence (D5), never rebuilding.
     _seed_hourly(
         conn,
         feed_id=gfs_id,
         variable="precip",
         issued_at="2026-07-19T20:00:00Z",
-        valid_ats=day0_valid_ats,
-        value=5.0,
+        valid_ats=_hours("2026-07-20", 0, 24),
+        value=0.0,
     )
-    _seed_scoring_pairs(
-        conn, feed_id=gfs_id, variable="precip", day_ahead=1, forecast=10.5
-    )
-    # No score_cache seeded at (precip, 1) -> a real expected universe with no
-    # snapshot -> "rebuilding".
 
-    # --- Day tile 1 ("2026-07-21"): representative day_ahead=2 (issued two
-    # days before), so these keys cannot collide with day tile 0's cache
-    # entries above.
-    day1_valid_ats = _hours("2026-07-21", 0, 20)
-    _seed_hourly(
-        conn,
-        feed_id=ecmwf_id,
-        variable="temperature",
-        issued_at="2026-07-19T00:00:00Z",
-        valid_ats=day1_valid_ats,
-    )
-    _make_confident(conn, feed_id=ecmwf_id, variable="temperature", day_ahead=2)
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=2)
-    # A distinct feed (icon_id, not gfs_id) so its far-future scoring pairs
-    # -- fixed at a constant (issued_at, valid_at) shared with tile 0's gfs_id
-    # insert above -- cannot collide on the (site, feed, variable, issued_at,
-    # valid_at) UNIQUE constraint.
+    # --- Day tile 1 ("2026-07-21"): wind from two feeds with published
+    # weights at their representative day ahead (2: issued two days before)
+    # -> normal; rain provisional -> rebuilding; no temperature samples.
+    day1_valid_ats = _hours("2026-07-21", 0, 24)
+    for feed_id in (ecmwf_id, gfs_id):
+        _seed_hourly(
+            conn,
+            feed_id=feed_id,
+            variable="wind",
+            issued_at="2026-07-19T00:00:00Z",
+            valid_ats=day1_valid_ats,
+            value=5.0,
+        )
     _seed_hourly(
         conn,
         feed_id=icon_id,
         variable="precip",
         issued_at="2026-07-19T00:00:00Z",
         valid_ats=day1_valid_ats,
-        value=5.0,
+        value=0.0,
     )
-    _seed_scoring_pairs(
-        conn, feed_id=icon_id, variable="precip", day_ahead=2, forecast=10.5
+    publication_id = seed_rain_ranks(
+        conn,
+        site_id=1,
+        published_at=now,
+        ranked={0: [gfs_id], 1: [icon_id]},
+        provisional={0, 1},
     )
-    # No score_cache seeded at (precip, 2) either -> "rebuilding".
-
+    for feed_id in (ecmwf_id, gfs_id):
+        _seed_wind_weight(
+            conn, publication_id=publication_id, feed_id=feed_id, day_ahead=2
+        )
     conn.commit()
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="temperature", day_ahead=1, window="rolling"
-        ).status
-        == "empty"
-    )
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="precip", day_ahead=1, window="rolling"
-        ).status
-        == "rebuilding"
-    )
-    assert (
-        leaderboard_with_status(
-            conn, site_id=1, variable="precip", day_ahead=2, window="rolling"
-        ).status
-        == "rebuilding"
-    )
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -702,19 +692,22 @@ def test_tile_rollup_precedence_low_confidence_then_rebuilding() -> None:
 
     today = view.tiles[0]
     assert today.temp.meta.state == "low_confidence"
-    assert today.precip.meta.state == "rebuilding"
+    assert today.precip.meta.state == "normal"
+    assert today.precip.meta.extrema_state == "rebuilding"
     assert today.wind.meta.state == "not_available"
     # low_confidence (a caveat that does not resolve on its own) outranks
     # rebuilding (a caveat that resolves itself) -- D4.
-    assert today.state == "low_confidence"
+    assert today.confidence_state == "low_confidence"
 
     tomorrow = view.tiles[1]
-    assert tomorrow.temp.meta.state == "normal"
-    assert tomorrow.precip.meta.state == "rebuilding"
-    assert tomorrow.wind.meta.state == "not_available"
-    # No cell is low_confidence; the only degraded populated cell is
+    assert tomorrow.wind.meta.state == "normal"
+    assert tomorrow.precip.meta.state == "normal"
+    assert tomorrow.precip.meta.extrema_state == "rebuilding"
+    assert tomorrow.temp.meta.state == "not_available"
+    # No cell is low_confidence; the only degraded populated state is
     # rebuilding, so the rollup reads rebuilding, not normal.
-    assert tomorrow.state == "rebuilding"
+    assert tomorrow.state == "normal"
+    assert tomorrow.confidence_state == "rebuilding"
 
 
 def test_mixed_representative_leads_stay_normal_confident_winner() -> None:
@@ -960,24 +953,18 @@ def test_build_forecast_empty_when_no_samples_at_all() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Rain glyph threshold: sourced from RAIN_GLYPH_MIN_WET_HOURS, not a
-# hardcoded literal. The fixture must be a complete 24-hour local day so the
-# feed stays extrema-eligible under G.3 (covers_local_day_exactly); a
-# partial day would suppress the daily total/wet-hours entirely and the
-# glyph question would never get asked.
+# Rain icon and wet hours (rain release, C4): the icon follows the ranking's
+# 0.2 mm trigger on the winner's total, and the hours are the winner's own
+# count, not a blend. RAIN_GLYPH_MIN_WET_HOURS (the old six-wet-hour glyph
+# rule) is deleted. The fixture is a complete 24-hour local day so the
+# winner has a full day (covers_local_day_exactly).
 # ---------------------------------------------------------------------------
 
 
-def test_rain_glyph_shown_at_threshold_hidden_just_below() -> None:
-    conn = _make_db()
-    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    assert RAIN_GLYPH_MIN_WET_HOURS == 6
-
-    # A complete 24-hour local day with exactly RAIN_GLYPH_MIN_WET_HOURS wet
-    # hours (>=0.2mm) -> glyph shown.
-    valid_ats = _hours("2026-07-20", 0, 24)
-    for i, valid_at in enumerate(valid_ats):
+def _seed_precip_day(
+    conn: sqlite3.Connection, *, feed_id: int, values: list[float]
+) -> None:
+    for i, valid_at in enumerate(_hours("2026-07-20", 0, 24)):
         _insert_sample(
             conn,
             feed_id=feed_id,
@@ -985,143 +972,78 @@ def test_rain_glyph_shown_at_threshold_hidden_just_below() -> None:
             issued_at="2026-07-19T20:00:00Z",
             valid_at=valid_at,
             lead_hours=i + 1,
-            value=0.2 if i < RAIN_GLYPH_MIN_WET_HOURS else 0.0,
+            value=values[i],
         )
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    precip = view.tiles[0].precip
-    assert precip.wet_hours == RAIN_GLYPH_MIN_WET_HOURS
-    assert precip.show_rain_glyph is True
-
-    # Paired negative on a fresh connection/feed (never reuse the DB the
-    # positive already committed to): one hour below the threshold ->
-    # glyph hidden.
-    conn_below = _make_db()
-    feed_below = _feed_id(conn_below, "open-meteo", "ecmwf_ifs")
-    for i, valid_at in enumerate(valid_ats):
-        _insert_sample(
-            conn_below,
-            feed_id=feed_below,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < RAIN_GLYPH_MIN_WET_HOURS - 1 else 0.0,
-        )
-    conn_below.commit()
-    view_below = build_forecast(
-        conn_below, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
-    )
-    precip_below = view_below.tiles[0].precip
-    assert precip_below.wet_hours == RAIN_GLYPH_MIN_WET_HOURS - 1
-    assert precip_below.show_rain_glyph is False
 
 
-def test_rain_glyph_follows_the_rounded_blended_count() -> None:
-    """G-T32: the glyph follows the DISPLAYED, ROUNDED blend, not the raw mean.
-
-    Both cases blend per-feed wet-hour counts via ``blend_mean`` (a plain
-    mean, no rounding) and only THEN round for display (the
-    ``RAIN_GLYPH_MIN_WET_HOURS`` constant and the rain-glyph rule in
-    ``_build_tile``, both in ``wxverify/forecast/service.py``). Case A's
-    mean is 5.5 -- below RAIN_GLYPH_MIN_WET_HOURS as a
-    raw float -- but Python's round-half-to-even rounds 5.5 up to 6, so the
-    glyph shows. Case B's mean is 16/3 = 5.33..., which rounds down to 5,
-    below threshold. Each feed is a complete 24-hour local day so it clears
-    ``covers_local_day_exactly`` and stays extrema-eligible (G.3); a partial
-    day would suppress the wet-hour count entirely instead of exercising the
-    rounding rule.
-    """
-    assert RAIN_GLYPH_MIN_WET_HOURS == 6
-    valid_ats = _hours("2026-07-20", 0, 24)
+def test_rain_icon_shown_at_0_2_mm_hidden_at_0_19_mm() -> None:
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
 
-    # --- Case A: two complete-day feeds, 5 and 6 wet hours -> mean 5.5,
-    # which Python's round() takes to 6 -> at threshold -> glyph shown.
-    # Default forecast_blend_depth (2) is exactly enough to include BOTH
-    # feeds; do not set it explicitly so the default stays the point.
-    conn_a = _make_db()
-    feed_5 = _feed_id(conn_a, "open-meteo", "ecmwf_ifs")
-    feed_6 = _feed_id(conn_a, "open-meteo", "gfs_global")
-    for i, valid_at in enumerate(valid_ats):
-        _insert_sample(
-            conn_a,
-            feed_id=feed_5,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < 5 else 0.0,
-        )
-        _insert_sample(
-            conn_a,
-            feed_id=feed_6,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < 6 else 0.0,
-        )
-    conn_a.commit()
-    view_a = build_forecast(
-        conn_a, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+    # A winner whose day totals exactly 0.2 mm, in one hour -> icon shown
+    # (light: the wettest hour is at most 1.0 mm/h).
+    conn = _make_db()
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+    _seed_precip_day(conn, feed_id=feed_id, values=[0.2] + [0.0] * 23)
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
+    conn.commit()
+    precip = (
+        build_forecast(conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now)
+        .tiles[0]
+        .precip
     )
-    precip_a = view_a.tiles[0].precip
-    # Fixture guard: both feeds must actually be in the aggregate, or the
-    # 5.5-mean this case pins never happens.
-    assert len(precip_a.meta.feeds) == 2
-    assert precip_a.wet_hours == 6
-    assert precip_a.show_rain_glyph is True
+    assert precip.total_mm == pytest.approx(0.2)
+    assert precip.wet_hours == 1
+    assert precip.icon == "light"
 
-    # --- Case B: three complete-day feeds, 5, 5 and 6 wet hours -> mean
-    # 16/3 = 5.33... -> rounds to 5 -> below threshold -> glyph hidden.
-    # Requires depth 3 to include all three feeds in the blend.
-    conn_b = _make_db()
-    set_setting(conn_b, "forecast_blend_depth", "3")
-    feed_5a = _feed_id(conn_b, "open-meteo", "ecmwf_ifs")
-    feed_5b = _feed_id(conn_b, "open-meteo", "icon_global")
-    feed_6b = _feed_id(conn_b, "open-meteo", "gfs_global")
-    for i, valid_at in enumerate(valid_ats):
-        _insert_sample(
-            conn_b,
-            feed_id=feed_5a,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < 5 else 0.0,
+    # Paired negative on a fresh connection: 0.19 mm -> the amount is shown,
+    # with no icon and no wet hour at the 0.2 mm threshold.
+    conn_below = _make_db()
+    feed_below = _feed_id(conn_below, "open-meteo", "ecmwf_ifs")
+    _seed_precip_day(conn_below, feed_id=feed_below, values=[0.19] + [0.0] * 23)
+    seed_rain_ranks(conn_below, site_id=1, published_at=now, ranked={0: [feed_below]})
+    conn_below.commit()
+    precip_below = (
+        build_forecast(
+            conn_below, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
         )
-        _insert_sample(
-            conn_b,
-            feed_id=feed_5b,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < 5 else 0.0,
-        )
-        _insert_sample(
-            conn_b,
-            feed_id=feed_6b,
-            variable="precip",
-            issued_at="2026-07-19T20:00:00Z",
-            valid_at=valid_at,
-            lead_hours=i + 1,
-            value=0.2 if i < 6 else 0.0,
-        )
-    conn_b.commit()
-    view_b = build_forecast(
-        conn_b, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+        .tiles[0]
+        .precip
     )
-    precip_b = view_b.tiles[0].precip
-    # Fixture guard: all three feeds must be in the aggregate, or the
-    # 5.33-mean this case pins never happens (e.g. it would collapse to a
-    # 2-feed mean that could round differently).
-    assert len(precip_b.meta.feeds) == 3
-    assert precip_b.wet_hours == 5
-    assert precip_b.show_rain_glyph is False
+    assert precip_below.total_mm == pytest.approx(0.19)
+    assert precip_below.wet_hours == 0
+    assert precip_below.icon is None
+
+
+def test_wet_hours_are_the_winner_s_own_count_not_a_blend() -> None:
+    """The old rule rounded a blend of the selected feeds' wet-hour counts
+    (5 and 6 -> 5.5 -> 6). Now the count is the winner's alone: 5 while the
+    5-hour feed is selected, 6 once the 6-hour feed is."""
+    now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
+    for selected_hours in (5, 6):
+        conn = _make_db()
+        feed_5 = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+        feed_6 = _feed_id(conn, "open-meteo", "gfs_global")
+        _seed_precip_day(conn, feed_id=feed_5, values=[0.2] * 5 + [0.0] * 19)
+        _seed_precip_day(conn, feed_id=feed_6, values=[0.2] * 6 + [0.0] * 18)
+        winner = feed_5 if selected_hours == 5 else feed_6
+        seed_rain_ranks(
+            conn,
+            site_id=1,
+            published_at=now,
+            ranked={0: [feed_5, feed_6]},
+            selected={0: winner},
+        )
+        conn.commit()
+        precip = (
+            build_forecast(
+                conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
+            )
+            .tiles[0]
+            .precip
+        )
+        assert [f.feed_id for f in precip.meta.feeds] == [winner]
+        assert precip.wet_hours == selected_hours
+        assert precip.total_mm == pytest.approx(0.2 * selected_hours)
 
 
 # ---------------------------------------------------------------------------

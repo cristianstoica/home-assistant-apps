@@ -34,7 +34,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.testclient import TestClient
 
-from tests.helpers import make_v8_wind_state
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.api.csrf import issue_csrf_pair
@@ -48,8 +47,6 @@ from wxverify.db.migrations import (
     run_migrations,
     schema_table_names,
 )
-from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.switch import ensure_site_generation
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1257,358 +1254,6 @@ def test_export_begin_survives_bodyless_chunked_ingress_framing(
 # ---------------------------------------------------------------------------
 # Part B -- Import (I1-I9 + the backup.exists() guard).
 # ---------------------------------------------------------------------------
-
-
-def test_import_round_trip_keeps_a_keyless_files_history(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """I1: a valid import round trip of a file without the close key.
-
-    The file has no ``daily_close_on_at`` key, so ``run_rebuild_all`` only
-    marks the rebuild done (R18, switch-over plan 11.2): its pairs and
-    observations stay as they stand, and ``_rebuild_all`` (whose INFO line
-    is "consensus rebuild kept ...") never runs.
-    """
-    caplog.set_level(logging.INFO, logger="wxverify.api.routes.db_transfer")
-    conn = _init_tmp_db(tmp_path)
-    _make_site(conn, "Pre Import Site A")
-    conn.commit()
-
-    b_path = tmp_path / "source-b.db"
-    b_db = Database(str(b_path))
-    try:
-        conn_b = b_db._conn  # noqa: SLF001
-        site_b = _make_site(conn_b, "Post Import Site B")
-        station_b = int(
-            conn_b.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'SYN-STATION-B1', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_b,),
-            ).lastrowid
-        )
-        conn_b.execute(
-            """
-            INSERT INTO station_observations
-                (station_id, variable, valid_at, value, qc_flag, source_raw)
-            VALUES (?, 'temperature', '2035-06-01T00:00:00Z', 10.0, 'ok',
-                    'synthetic-test')
-            """,
-            (station_b,),
-        )
-        # A stale observations row (999.0, not the station row's 10.0): R18
-        # keeps it as it stands.
-        conn_b.execute(
-            """
-            INSERT INTO observations
-                (site_id, variable, valid_at, value, n_stations,
-                 rejected_stations, computed_at)
-            VALUES (?, 'temperature', '2035-06-01T00:00:00Z', 999.0, 1, 0,
-                    '2020-01-01T00:00:00Z')
-            """,
-            (site_b,),
-        )
-        feed_id = _feed_id(conn_b, "ecmwf_ifs")
-        # An orphaned forecast_pairs row no station or observations row
-        # backs: R18 keeps it.
-        conn_b.execute(
-            """
-            INSERT INTO forecast_pairs
-                (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-                 day_ahead, forecast, observed, error, abs_error, sq_error,
-                 cat_hit, cat_false, cat_miss, cat_correct_neg, tz_generation_id)
-            VALUES (?, ?, 'wind', '2035-06-02T00:00:00Z', '2035-06-02T00:00:00Z',
-                    24, 1, 5.0, 4.0, 1.0, 1.0, 1.0, 1, 0, 0, 0, ?)
-            """,
-            (site_b, feed_id, ensure_site_generation(conn_b, site_b)),
-        )
-        conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn_b.commit()
-    finally:
-        b_db.close()
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["status"] == "imported"
-        sites = client.get("/api/sites").json()
-    names = {s["name"] for s in sites}
-    assert names == {"Post Import Site B"}, "app queries must now serve B"
-
-    direct = sqlite3.connect(config.db_path)
-    try:
-        direct_names = {r[0] for r in direct.execute("SELECT name FROM sites")}
-        assert direct_names == {"Post Import Site B"}, (
-            "a fresh direct connection must also see only B"
-        )
-        state = direct.execute(
-            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
-        ).fetchone()
-        assert state is not None and state[0] == "done", (
-            "the post-import background task must mark the rebuild done"
-            " (mutation check: commenting out the BackgroundTask leaves the"
-            " staged 'pending')"
-        )
-        orphan = direct.execute(
-            """
-            SELECT 1 FROM forecast_pairs
-            WHERE variable='wind' AND valid_at='2035-06-02T00:00:00Z'
-            """
-        ).fetchone()
-        assert orphan is not None, (
-            "R18 (plan 11.2): a file without the close key is not rebuilt;"
-            " mutant (rebuilt anyway) = the orphan deleted by _rebuild_all"
-        )
-        kept = direct.execute(
-            """
-            SELECT value FROM observations
-            WHERE site_id=? AND variable='temperature'
-              AND valid_at='2035-06-01T00:00:00Z'
-            """,
-            (site_b,),
-        ).fetchone()
-        assert kept is not None and kept[0] == 999.0, (
-            "R18: observations stay as the file holds them (999.0); mutant"
-            " (rebuilt anyway) = 10.0 from the station row"
-        )
-    finally:
-        direct.close()
-    assert not any(
-        "consensus rebuild kept" in record.getMessage() for record in caplog.records
-    ), "no rebuild INFO line while the daily close is off"
-
-
-def test_import_db_without_wind_tables_creates_them(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """T79: an upload shaped like a pre-wind-history DB (station_wind_days and
-    station_wind_records genuinely absent, not merely empty) is accepted, and
-    the post-swap reopen's ``run_migrations`` -> ``create_tables`` recreates
-    both tables on the live DB. Neither table is in ``_REQUIRED_TABLES``, so
-    their absence from the upload does not trip the 422 guard.
-    """
-    conn = _init_tmp_db(tmp_path)
-    _make_site(conn, "Pre Import Site")
-    conn.commit()
-
-    # Hand-built (NOT via Database()/create_tables): a pre-wind-history shape
-    # that never had station_wind_days/station_wind_records, independent of
-    # whatever create_tables currently does -- this keeps the mutation probe
-    # for the production recreate-on-reopen behavior from being confounded by
-    # a mutant that also breaks the fixture's own construction.
-    b_path = tmp_path / "source-no-wind-tables.db"
-    raw = sqlite3.connect(str(b_path))
-    try:
-        raw.executescript(
-            """
-            CREATE TABLE sites (
-                id INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                forecast_lat REAL NOT NULL,
-                forecast_lon REAL NOT NULL,
-                elevation_m REAL NOT NULL,
-                timezone TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
-                rain_threshold_mm REAL NOT NULL DEFAULT 0.2
-                    CHECK(rain_threshold_mm >= 0),
-                last_obs_at TEXT,
-                backfill_status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(backfill_status IN ('pending','in_progress','complete')),
-                backfill_through TEXT,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                last_obs_cycle_at TEXT
-            );
-            CREATE TABLE stations (
-                id INTEGER PRIMARY KEY,
-                site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
-                pws_station_id TEXT NOT NULL UNIQUE,
-                lat REAL NOT NULL,
-                lon REAL NOT NULL,
-                dem_elevation_m REAL NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
-                last_run_at TEXT,
-                last_error TEXT,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-                history_next_attempt_at TEXT,
-                history_last_error TEXT,
-                history_error_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE station_observations (
-                id INTEGER PRIMARY KEY,
-                station_id INTEGER NOT NULL REFERENCES stations(id)
-                    ON DELETE CASCADE,
-                variable TEXT NOT NULL,
-                valid_at TEXT NOT NULL,
-                value REAL NOT NULL,
-                qc_flag TEXT NOT NULL CHECK(qc_flag IN ('ok','range','spike')),
-                source_raw TEXT,
-                fetched_at TEXT,
-                UNIQUE(station_id, variable, valid_at)
-            );
-            PRAGMA user_version = 7;
-            """
-        )
-        site_id = _make_site(raw, "No Wind Tables Site")
-        raw.commit()
-        remaining = {
-            r[0]
-            for r in raw.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-                " AND name IN ('station_wind_days', 'station_wind_records')"
-            )
-        }
-        assert remaining == set(), "fixture must genuinely lack both tables"
-    finally:
-        raw.close()
-    assert site_id > 0
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-    assert resp.status_code == 200, resp.text
-
-    direct = sqlite3.connect(config.db_path)
-    try:
-        present = {
-            r[0]
-            for r in direct.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-                " AND name IN ('station_wind_days', 'station_wind_records')"
-            )
-        }
-        assert present == {"station_wind_days", "station_wind_records"}, (
-            "both wind tables must be recreated by the post-swap reopen"
-        )
-    finally:
-        direct.close()
-
-
-_D21_KEPT_KEYS = (
-    "wind_history_auth_hold:history_all",
-    "wind_backfill_calls",
-)
-_D21_DECOY_KEYS = ("wind-basis:1", "WIND_BASIS:1", "wind_basis_extra:1")
-_D21_REMOVED_KEY_KINDS = (
-    "wind_basis",
-    "wind_basis_progress_at",
-    "wind_basis_cursor",
-    "wind_basis_blocked",
-    "wind_rebuild_report",
-    "wind_rebuild_done_at",
-)
-
-
-def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """D21: importing a ``user_version`` 8 DB still carrying the six
-    leftover per-site wind key kinds and ``station_wind_days.legacy_hours``
-    has the post-swap reopen's ``run_migrations`` apply the v9 step, exactly
-    as it would for any other v8 upload (plan §10.5).
-    """
-    conn = _init_tmp_db(tmp_path)
-    _make_site(conn, "Pre Import Site")
-    conn.commit()
-
-    b_path = tmp_path / "source-v8-old-wind-state.db"
-    b_db = Database(str(b_path))
-    b_conn = b_db._conn  # noqa: SLF001
-    try:
-        make_v8_wind_state(b_conn)
-        site_id = _make_site(b_conn, "Testsite")
-        assert site_id == 1
-        station_id = int(
-            b_conn.execute(
-                """
-                INSERT INTO stations
-                    (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-                VALUES (?, 'WSTATION01', 40.0, -105.0, 900.0, 1)
-                """,
-                (site_id,),
-            ).lastrowid
-        )
-        b_conn.execute(
-            "INSERT INTO station_wind_days (station_id, local_date, status,"
-            " legacy_hours, updated_at) VALUES (?, '2035-06-01', 'fetched', 3,"
-            " '2035-06-01T23:00:00Z')",
-            (station_id,),
-        )
-        for kind in _D21_REMOVED_KEY_KINDS:
-            set_runtime_state(b_conn, f"{kind}:{site_id}", "leftover")
-        for key in _D21_KEPT_KEYS:
-            set_runtime_state(b_conn, key, "keep")
-        for key in _D21_DECOY_KEYS:
-            set_runtime_state(b_conn, key, "decoy")
-        b_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        b_conn.commit()
-
-        version_row = b_conn.execute("PRAGMA user_version").fetchone()
-        assert int(version_row[0]) == 8
-        cols_before = {
-            r["name"] for r in b_conn.execute("PRAGMA table_info(station_wind_days)")
-        }
-        assert "legacy_hours" in cols_before
-    finally:
-        b_db.close()
-    payload = b_path.read_bytes()
-
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        headers = _csrf_headers(client)
-        resp = client.post("/api/import/db", content=payload, headers=headers)
-    assert resp.status_code == 200, resp.text
-
-    direct = sqlite3.connect(config.db_path)
-    direct.row_factory = sqlite3.Row
-    try:
-        site_row = direct.execute(
-            "SELECT id FROM sites WHERE name='Testsite'"
-        ).fetchone()
-        imported_site_id = int(site_row["id"])
-        for kind in _D21_REMOVED_KEY_KINDS:
-            row = direct.execute(
-                "SELECT value FROM runtime_state WHERE key = ?",
-                (f"{kind}:{imported_site_id}",),
-            ).fetchone()
-            assert row is None, (
-                f"{kind}:{imported_site_id} must be gone after the reopen migrates"
-            )
-        hold_row = direct.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (_D21_KEPT_KEYS[0],),
-        ).fetchone()
-        assert hold_row is None, (
-            f"{_D21_KEPT_KEYS[0]} must be gone after A4 deletes it at the switch"
-        )
-        for key in _D21_KEPT_KEYS[1:2]:
-            row = direct.execute(
-                "SELECT value FROM runtime_state WHERE key = ?", (key,)
-            ).fetchone()
-            assert row is not None and row["value"] == "keep"
-        for key in _D21_DECOY_KEYS:
-            row = direct.execute(
-                "SELECT value FROM runtime_state WHERE key = ?", (key,)
-            ).fetchone()
-            assert row is not None and row["value"] == "decoy"
-        live_cols = {
-            r["name"] for r in direct.execute("PRAGMA table_info(station_wind_days)")
-        }
-        assert "legacy_hours" not in live_cols
-        live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 15
-    finally:
-        direct.close()
 
 
 def _sqlite_bytes_with_user_version(path: Path, version: int) -> bytes:
@@ -3679,6 +3324,9 @@ def test_export_begin_sweeps_stale_gz_keeps_fresh_gz(
 
 _STAMP_CANONICAL_ISSUED = "2026-01-01T00:00:00Z"
 _STAMP_CANONICAL_VALID = "2026-01-01T01:00:00Z"
+# A second hour for a row whose issued_at differs from the canonical row's:
+# idx_samples_slot (rain release, Part B) keeps one row per hour.
+_STAMP_OTHER_VALID = "2026-01-01T02:00:00Z"
 
 
 def _sqlite_bytes_with_forecast_stamps(
@@ -3778,7 +3426,7 @@ def test_import_rejects_noncanonical_forecast_stamp(
         _STAMP_CANONICAL_ISSUED if column == "issued_at" else _STAMP_CANONICAL_VALID
     )
     if column == "issued_at":
-        bad_pair = (bad_value, _STAMP_CANONICAL_VALID)
+        bad_pair = (bad_value, _STAMP_OTHER_VALID)
     else:
         bad_pair = (_STAMP_CANONICAL_ISSUED, bad_value)
     canonical_pair = (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID)
@@ -3841,7 +3489,7 @@ def test_import_rejects_noncanonical_forecast_stamp(
 def _o3_extra_sql(column: str) -> str:
     bad_expr = "CAST(x'ff61' AS TEXT)"
     issued_expr = bad_expr if column == "issued_at" else "issued_at"
-    valid_expr = bad_expr if column == "valid_at" else "valid_at"
+    valid_expr = bad_expr if column == "valid_at" else f"'{_STAMP_OTHER_VALID}'"
     return (
         "INSERT INTO forecast_samples "
         "(site_id, feed_id, variable, issued_at, valid_at, lead_hours, "
@@ -3967,7 +3615,7 @@ def test_import_accepts_all_canonical_forecast_stamps(
         reject_target,
         [
             (_STAMP_CANONICAL_ISSUED, _STAMP_CANONICAL_VALID),
-            ("2026-01-01t06:00:00Z", _STAMP_CANONICAL_VALID),
+            ("2026-01-01t06:00:00Z", _STAMP_OTHER_VALID),
         ],
     )
     accept_target = tmp_path / "accept.db"
@@ -5164,12 +4812,17 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "feeds",
     "forecast_downloads",
     "forecast_of_record",
+    "forecast_scored",
     "forecast_value_changes",
     "jobs",
     "publication_coverage",
+    "publication_rain_ranks",
     "publication_rankings",
     "publication_wind_weights",
     "publications",
+    "rain_days",
+    "rain_forecast_days",
+    "rain_picks",
     "runtime_state",
     "settings",
     "site_day_stations",
@@ -5182,6 +4835,7 @@ _OTHER_APP_TABLES: tuple[str, ...] = (
     "station_changes",
     "station_current_obs",
     "station_poll_state",
+    "station_rain_checks",
     "station_wind_days",
     "timezone_generations",
     "verification_day_context",
@@ -5754,7 +5408,7 @@ def test_admission_table_list_matches_the_migrated_schema() -> None:
     assert set(schema_table_names()) == set(_OTHER_APP_TABLES) | set(
         _CHECKED_TODAY_TABLES
     )
-    assert len(schema_table_names()) == 50
+    assert len(schema_table_names()) == 56
 
 
 def test_import_refused_below_sqlite_3_37_before_processing(

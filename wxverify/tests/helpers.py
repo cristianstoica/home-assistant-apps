@@ -12,7 +12,7 @@ import inspect
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from html.parser import HTMLParser
@@ -428,56 +428,6 @@ def seed_pair_max_wind(
         source_raw=f"pair-max {round(ms_to_kmh(value), 2)} km/h",
     )
     materialize_consensus(conn, site_id=site_id, variable="wind", valid_at=valid_at)
-
-
-# ---------------------------------------------------------------------------
-# v8-shape station_wind_days (old-wind-method-removal plan §10.5). Shared by
-# test_v9_old_wind_state_migration.py and test_db_transfer.py's D21: puts a
-# migrated-to-8 database back in the exact v8 shape the owner's database has,
-# with ``legacy_hours`` between ``pair_hours`` and ``attempts``.
-# ---------------------------------------------------------------------------
-
-_V8_STATION_WIND_DAYS_DDL = """
-    CREATE TABLE station_wind_days (
-        station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
-        local_date TEXT NOT NULL,        -- YYYY-MM-DD in the site time zone
-        status TEXT NOT NULL DEFAULT 'pending'
-            CHECK (status IN
-                ('pending','partial','fetched','unavailable','failed')),
-        record_count INTEGER NOT NULL DEFAULT 0,   -- records inside the day
-        pair_hours INTEGER NOT NULL DEFAULT 0,     -- hours with a pair
-        -- old wind rows on the day; NULL until counted
-        legacy_hours INTEGER,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        next_attempt_at TEXT,
-        -- always via core/error_sanitize.sanitized_exception
-        last_error TEXT,
-        last_ok_at TEXT,                 -- last successful persist, a 204 included
-        refetch_at TEXT,                 -- reconcile refetch due time
-        refetched INTEGER NOT NULL DEFAULT 0 CHECK (refetched IN (0, 1)),
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (station_id, local_date)
-    )
-"""
-
-
-def make_v8_wind_state(conn: sqlite3.Connection) -> None:
-    """Put a migrated database back in the v8 ``station_wind_days`` shape.
-
-    Drops the table (safe: nothing references or indexes it, plan §6.9) and
-    recreates it from a frozen copy of the v8 DDL, verbatim, so
-    ``legacy_hours`` sits between ``pair_hours`` and ``attempts`` as on the
-    owner's database -- not via ``ALTER TABLE ... ADD COLUMN``, which would
-    put the column last. Asserts ``legacy_hours`` is present as an
-    anti-vacuity guard, then sets ``PRAGMA user_version = 8``.
-    """
-    conn.execute("DROP TABLE station_wind_days")
-    conn.execute(_V8_STATION_WIND_DAYS_DDL)
-    columns = {
-        row["name"] for row in conn.execute("PRAGMA table_info(station_wind_days)")
-    }
-    assert "legacy_hours" in columns, "v8 DDL copy is missing legacy_hours"
-    conn.execute("PRAGMA user_version = 8")
 
 
 # ---------------------------------------------------------------------------
@@ -1915,6 +1865,58 @@ def seed_coverage(
             starting_days,
         ),
     )
+
+
+def seed_rain_ranks(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    published_at: datetime,
+    ranked: Mapping[int, Sequence[int]],
+    provisional: Collection[int] = (),
+    selected: Mapping[int, int] | None = None,
+) -> int:
+    """The rain release's published rain ranking (C3), for tile tests.
+
+    Switches the daily close on at ``published_at`` (the published ranks
+    are read only then), adds the site's active publication through the
+    day before ``published_at`` (:func:`seed_active_publication`) and, per
+    day ahead, one ``publication_rain_ranks`` row per feed in ``ranked``'s
+    order: rank 1 is selected unless ``selected`` names another feed for
+    that day ahead, and the first (3J + 3) div 4 of the J feeds are in the
+    group. The day aheads in ``provisional`` are flagged provisional. Plain
+    INSERT: only ``publish`` writes these rows, from a real build. Returns
+    the publication id.
+    """
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(published_at))
+    publication_id = seed_active_publication(
+        conn,
+        site_id=site_id,
+        cutoff=published_at.date() - timedelta(days=1),
+        published_at=published_at,
+    )
+    for day_ahead, feed_ids in ranked.items():
+        group = (3 * len(feed_ids) + 3) // 4
+        chosen = (selected or {}).get(day_ahead, feed_ids[0] if feed_ids else None)
+        for index, feed_id in enumerate(feed_ids):
+            conn.execute(
+                "INSERT INTO publication_rain_ranks"
+                " (publication_id, day_ahead, rank, feed_id, misses, false_alarms,"
+                "  common_days, counted_days, provisional, selected, in_group)"
+                " VALUES (?, ?, ?, ?, 0, 0, 20, 20, ?, ?, ?)",
+                (
+                    publication_id,
+                    day_ahead,
+                    index + 1,
+                    feed_id,
+                    int(day_ahead in provisional),
+                    int(feed_id == chosen),
+                    int(index < group),
+                ),
+            )
+    return publication_id
 
 
 def seed_closed_pairs(

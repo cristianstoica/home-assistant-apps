@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
+from tests.helpers import seed_rain_ranks
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
@@ -462,6 +463,13 @@ def test_mixed_denominators_partial_feed_never_reaches_displayed_values() -> Non
         valid_ats=_hours("2026-07-20", 0, 12),
         values=partial_values,
     )
+    # Rain release, C4: the tile follows the published rain ranking's
+    # winner. The partial feed is even the SELECTED model here; with no full
+    # day it hands over to the complete feed, so it still never reaches the
+    # displayed values.
+    seed_rain_ranks(
+        conn, site_id=1, published_at=now, ranked={0: [partial_id, complete_id]}
+    )
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -557,6 +565,9 @@ def test_covers_local_day_vs_exactly_diverge_on_an_off_hour_extra() -> None:
         valid_ats=with_extra,
         value=1.0,
     )
+    # Rain release, C4: the feed is the ranking's only model; with no exact
+    # day it is no winner, so the tile has no rain forecast.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -564,7 +575,7 @@ def test_covers_local_day_vs_exactly_diverge_on_an_off_hour_extra() -> None:
     precip = view.tiles[0].precip
     assert precip.total_mm is None
     assert precip.wet_hours is None
-    assert precip.meta.extrema_unavailable is True
+    assert precip.meta.state == "not_available"
 
 
 # ===========================================================================
@@ -592,13 +603,16 @@ def test_half_hourly_series_is_ineligible() -> None:
         valid_ats=half_hourly,
         value=1.0,
     )
+    # Rain release, C4: the ranking's only model has no exact day -> no
+    # winner.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     precip = view.tiles[0].precip
     assert precip.total_mm is None  # never 48.0 (a doubled sum)
-    assert precip.meta.extrema_unavailable is True
+    assert precip.meta.state == "not_available"
 
 
 # ===========================================================================
@@ -623,6 +637,9 @@ def test_missing_hour_is_not_a_dry_hour() -> None:
         valid_ats=all_but_one,
         value=0.0,
     )
+    # Rain release, C4: ranked, so the None below comes from the missing
+    # hour, not from an absent ranking.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -640,6 +657,10 @@ def test_missing_hour_is_not_a_dry_hour() -> None:
 
 
 def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -> None:
+    """Rain release, C4: a day with no winner (insufficient coverage, or no
+    rain candidate at all) reads "No rain forecast"; a winner's all-dry day
+    reads "0.0 mm". The old "Daily rainfall unavailable" text and the plain
+    dash are gone."""
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
@@ -651,6 +672,7 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
         valid_ats=_hours("2026-07-20", 0, 24),
         value=0.0,
     )
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     dry_view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -658,12 +680,11 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     dry = dry_view.tiles[0].precip
     assert dry.total_mm == 0.0
     assert dry.wet_hours == 0
-    assert dry.meta.extrema_unavailable is False
+    assert dry.meta.state == "normal"
     dry_html = _render_tiles(site_id=1, view=dry_view)
-    assert (
-        "Daily rainfall unavailable"
-        not in (dry_html.split("Rain</span>")[1].split("</div>")[0])
-    )
+    dry_row = dry_html.split("Rain</span>")[1].split("</div>")[0]
+    assert "No rain forecast" not in dry_row
+    assert "0.0 mm" in dry_row
 
     empty_conn = _make_db()
     empty_view = build_forecast(
@@ -671,10 +692,8 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     )
     assert empty_view.empty is True
 
-    # Insufficient (not zero) coverage: a feed present but short of
-    # ``covers_local_day_exactly`` -- the case ``extrema_unavailable``
-    # actually models, distinct from having no precip candidate at all
-    # (which renders a plain "-" per the template, not this labeled string).
+    # Insufficient (not zero) coverage: the ranked feed is short of
+    # ``covers_local_day_exactly``, so there is no winner.
     partial_conn = _make_db()
     partial_feed = _feed_id(partial_conn, "open-meteo", "ecmwf_ifs")
     _seed_uniform(
@@ -685,6 +704,19 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
         valid_ats=_hours("2026-07-20", 0, 20),
         value=0.0,
     )
+    # A temperature feed keeps the tile available: with no rain winner and
+    # nothing else the whole tile reads "Not available yet".
+    _seed_uniform(
+        partial_conn,
+        feed_id=_feed_id(partial_conn, "open-meteo", "gfs_global"),
+        variable="temperature",
+        issued_at="2026-07-19T20:00:00Z",
+        valid_ats=_hours("2026-07-20", 0, 24),
+        value=10.0,
+    )
+    seed_rain_ranks(
+        partial_conn, site_id=1, published_at=now, ranked={0: [partial_feed]}
+    )
     partial_conn.commit()
     partial_view = build_forecast(
         partial_conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -692,19 +724,17 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
     partial = partial_view.tiles[0].precip
     assert partial.total_mm is None
     assert partial.wet_hours is None
-    assert partial.meta.extrema_unavailable is True
+    assert partial.meta.state == "not_available"
     partial_html = _render_tiles(site_id=1, view=partial_view)
-    assert (
-        "Daily rainfall unavailable"
-        in (partial_html.split("Rain</span>")[1].split("</div>")[0])
-    )
+    partial_row = partial_html.split("Rain</span>")[1].split("</div>")[0]
+    assert "No rain forecast" in partial_row
+    assert " mm" not in partial_row
     # A forecast of no rain must never look the same as insufficient coverage.
     assert (dry.total_mm, dry.wet_hours) != (partial.total_mm, partial.wet_hours)
 
-    # Paired positive at the OTHER end: a precip candidate is completely
-    # absent (no candidate at all, as opposed to an insufficient one) -- the
-    # template shows a plain dash, never the "unavailable" string, proving
-    # the string is specific to the insufficient-coverage case above.
+    # The OTHER end: a ranked feed with no rain candidate at all (its only
+    # samples are temperature) reads the same "No rain forecast", never a
+    # zero.
     no_precip_conn = _make_db()
     temp_feed = _feed_id(no_precip_conn, "open-meteo", "ecmwf_ifs")
     _seed_uniform(
@@ -715,17 +745,20 @@ def test_all_dry_complete_day_renders_differently_from_insufficient_coverage() -
         valid_ats=_hours("2026-07-20", 0, 24),
         value=10.0,
     )
+    seed_rain_ranks(
+        no_precip_conn, site_id=1, published_at=now, ranked={0: [temp_feed]}
+    )
     no_precip_conn.commit()
     no_precip_view = build_forecast(
         no_precip_conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     no_precip = no_precip_view.tiles[0].precip
-    assert no_precip.meta.extrema_unavailable is False
+    assert no_precip.meta.state == "not_available"
     assert no_precip.total_mm is None
     no_precip_html = _render_tiles(site_id=1, view=no_precip_view)
     assert (
-        "Daily rainfall unavailable"
-        not in (no_precip_html.split("Rain</span>")[1].split("</div>")[0])
+        "No rain forecast"
+        in (no_precip_html.split("Rain</span>")[1].split("</div>")[0])
     )
 
 
@@ -756,6 +789,9 @@ def test_reconciliation_invariant_24h_two_feeds() -> None:
         valid_ats=ats,
         values=[0.05 * i for i in range(24)],
     )
+    # Rain release, C4: the tile and the drill-down's line are the selected
+    # model's (B here, ranked first), not a blend of both.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_b, feed_a]})
     conn.commit()
 
     import pytest
@@ -769,13 +805,14 @@ def test_reconciliation_invariant_24h_two_feeds() -> None:
     assert isinstance(series, list)
     total = sum(v for v in series if v is not None)
     assert total == pytest.approx(tile.precip.total_mm, abs=1e-9)
+    assert total == pytest.approx(sum(0.05 * i for i in range(24)), abs=1e-9)
 
     precip_aggregate = payload["precip_aggregate"]  # type: ignore[index]
     assert isinstance(precip_aggregate, dict)
-    assert precip_aggregate["feed_ids"] == [feed_a, feed_b]
-    assert [ref.feed_id for ref in tile.precip.meta.feeds] == [feed_a, feed_b]
+    assert precip_aggregate["feed_ids"] == [feed_b]
+    assert [ref.feed_id for ref in tile.precip.meta.feeds] == [feed_b]
 
-    # A same-sized but differently-composed eligible set yields different ids.
+    # A same-sized but differently-composed ranking yields different ids.
     other_conn = _make_db()
     feed_c = _feed_id(other_conn, "open-meteo", "gfs_global")
     feed_d = _feed_id(other_conn, "open-meteo", "icon_global")
@@ -794,6 +831,9 @@ def test_reconciliation_invariant_24h_two_feeds() -> None:
         issued_at="2026-07-19T20:00:00Z",
         valid_ats=ats,
         values=[0.05 * i for i in range(24)],
+    )
+    seed_rain_ranks(
+        other_conn, site_id=1, published_at=now, ranked={0: [feed_d, feed_c]}
     )
     other_conn.commit()
     other_payload = build_hourly(other_conn, site_id=1, timezone="UTC", day=0, now=now)
@@ -836,10 +876,12 @@ def test_reconciliation_invariant_23h_and_25h_days() -> None:
             valid_ats=ats,
             values=[0.05 * i for i in range(count)],
         )
-        conn.commit()
         now = datetime(
             local_date.year, local_date.month, local_date.day, 12, tzinfo=UTC
         )
+        # Rain release, C4: the line and the total are the winner's (B).
+        seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_b, feed_a]})
+        conn.commit()
         view = build_forecast(
             conn, site_id=1, timezone="Europe/Berlin", rain_threshold_mm=0.2, now=now
         )
@@ -851,6 +893,7 @@ def test_reconciliation_invariant_23h_and_25h_days() -> None:
         assert len(payload["hours"]) == count  # type: ignore[arg-type]
         total = sum(v for v in series if v is not None)
         assert total == pytest.approx(view.tiles[0].precip.total_mm, abs=1e-9)
+        assert total == pytest.approx(sum(0.05 * i for i in range(count)), abs=1e-9)
 
 
 # ===========================================================================
@@ -899,6 +942,8 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
         lead_hours=15,
         value=3.0,
     )
+    # Rain release, C4: the line is the winner's (A).
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_a, feed_b]})
     conn.commit()
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     hours = payload["hours"]  # type: ignore[index]
@@ -916,20 +961,28 @@ def test_aggregate_null_axis_instant_and_total_agrees_with_tile() -> None:
 
 
 # ===========================================================================
-# G-T13 -- the axis reaches an eligible contributor ranked below blend_depth.
+# G-T13 -- the axis reaches the rain winner outside the ladder's set (C4).
 # ===========================================================================
 
 
-def test_axis_widens_for_a_contributor_ranked_below_blend_depth() -> None:
+def test_axis_widens_for_the_rain_winner_outside_the_ladder_set() -> None:
     import pytest
 
+    # Rain release, C4: the axis reaches the rain WINNER when it is outside
+    # the ladder's precipitation set (the per-feed lines). With the daily
+    # close on and no published precipitation ranking, the ladder ranks by
+    # sample count, so the 20-hour feed gets more samples (five extra
+    # half-hours) and is the ladder's depth-1 pick. It is also the rain
+    # ranking's selected model, but with no full day it hands over to the
+    # 24-hour feed, the winner, whose hours 20-23 widen the axis.
     conn = _make_db()
     ineligible_high_skill = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     eligible_low_skill = _feed_id(conn, "open-meteo", "gfs_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
     set_setting(conn, "forecast_blend_depth", "1")
     now = datetime(2026, 7, 20, 23, 0, tzinfo=UTC)
-    ats20 = _hours("2026-07-20", 0, 20)
+    ats20 = _hours("2026-07-20", 0, 20) + [
+        f"2026-07-20T{h:02d}:30:00Z" for h in range(5)
+    ]
     ats24 = _hours("2026-07-20", 0, 24)
     _seed_varying(
         conn,
@@ -937,7 +990,7 @@ def test_axis_widens_for_a_contributor_ranked_below_blend_depth() -> None:
         variable="precip",
         issued_at="2026-07-20T20:00:00Z",
         valid_ats=ats20,
-        values=[0.1 * i for i in range(20)],
+        values=[0.1 * i for i in range(25)],
     )
     _seed_varying(
         conn,
@@ -947,26 +1000,26 @@ def test_axis_widens_for_a_contributor_ranked_below_blend_depth() -> None:
         valid_ats=ats24,
         values=[0.05 * i for i in range(24)],
     )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="precip", day_ahead=0, forecast=8.0
-    )
-    _seed_scoring_pairs(
+    seed_rain_ranks(
         conn,
-        feed_id=ineligible_high_skill,
-        variable="precip",
-        day_ahead=0,
-        forecast=10.02,
+        site_id=1,
+        published_at=now,
+        ranked={0: [ineligible_high_skill, eligible_low_skill]},
     )
-    _seed_scoring_pairs(
-        conn, feed_id=eligible_low_skill, variable="precip", day_ahead=0, forecast=10.2
-    )
-    _seed_complete_score_cache(conn, variable="precip", day_ahead=0)
     conn.commit()
 
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     hours = payload["hours"]  # type: ignore[index]
     assert isinstance(hours, list)
-    assert len(hours) == 24  # widened for the eligible-but-unselected feed
+    # Fixture guard: the ladder's own precipitation set is the 20-hour feed
+    # alone, so hours 20-23 can come only from the winner.
+    feeds_payload = payload["feeds"]  # type: ignore[index]
+    assert isinstance(feeds_payload, list)
+    assert [int(f["feed_id"]) for f in feeds_payload] == [ineligible_high_skill]  # type: ignore[index]
+    late_hours = _hours("2026-07-20", 20, 4)
+    assert not set(late_hours) & set(ats20)
+    assert set(late_hours) <= set(hours)  # widened for the winner
+    assert len(hours) == 29  # the ladder feed's 25 instants + 4 of the winner's
     precip_aggregate = payload["precip_aggregate"]  # type: ignore[index]
     assert isinstance(precip_aggregate, dict)
     assert precip_aggregate["feed_ids"] == [eligible_low_skill]
@@ -989,10 +1042,10 @@ def test_rain_glyph_never_shows_on_a_suppressed_cell() -> None:
     conn = _make_db()
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     now = datetime(2026, 7, 20, 2, 0, tzinfo=UTC)
-    # 20 hours, every one well above the wet threshold -- would clear the
-    # glyph threshold many times over IF the cell were available, but the
-    # feed is not extrema-eligible (only 20 of 24 hours), so the cell is
-    # suppressed and must show no glyph regardless.
+    # 20 hours, every one well above the wet threshold -- would show the
+    # rain icon IF the feed were the winner, but it has no full day (only 20
+    # of 24 hours), so the ranking's only model is no winner (rain release,
+    # C4) and the cell must show no icon regardless.
     _seed_uniform(
         conn,
         feed_id=feed_id,
@@ -1001,14 +1054,16 @@ def test_rain_glyph_never_shows_on_a_suppressed_cell() -> None:
         valid_ats=_hours("2026-07-20", 0, 20),
         value=5.0,
     )
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
     precip = view.tiles[0].precip
-    assert precip.meta.extrema_unavailable is True
+    assert precip.meta.state == "not_available"
     assert precip.wet_hours is None
-    assert precip.show_rain_glyph is False
+    assert precip.icon is None
+    assert precip.agreement_pct is None
 
 
 # ===========================================================================
@@ -1039,11 +1094,14 @@ def test_temperature_and_per_feed_series_survive_precip_suppression() -> None:
         valid_ats=partial_ats,
         values=[0.1 * i for i in range(20)],
     )
+    # Rain release, C4: ranked, but with no full day -> no winner.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [partial_precip]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
     )
-    assert view.tiles[0].precip.meta.extrema_unavailable is True
+    assert view.tiles[0].precip.meta.state == "not_available"
+    assert view.tiles[0].precip.total_mm is None
 
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     temp_blend = payload["blend"]["temp_c"]  # type: ignore[index]
@@ -1175,9 +1233,15 @@ def test_persisted_row_complete_day() -> None:
     conn.commit()
     t = _record_snapshot_t()
     build_forecast_record(conn, 1, _RECORD_DAY.isoformat(), now=t)
+    # Rain release, C4: the tile follows the published rain ranking (read
+    # with the daily close on), seeded after the record build so the record
+    # is built as before. With one feed, the winner's own total and hours
+    # match the record's one-feed figures.
+    seed_rain_ranks(conn, site_id=1, published_at=t, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=t)
     tile = view.tiles[0]
+    assert tile.precip.total_mm == 12.0  # fixture guard: the tile has a winner
 
     row = conn.execute(
         """
@@ -1570,48 +1634,98 @@ def _seed_ab_precip_fixture(
 
 
 def test_stale_union_for_precipitation() -> None:
+    """Rain release, C4: the rain cell's stale flag covers the feeds the
+    tile's rain uses -- the winner and the agreement members -- and no
+    other. Each case ranks A (20 h, the selected model, no full day) first
+    and B (24 h, the winner) second."""
+    # Case 1: the winner B is stale -> stale.
     conn = _make_db()
-    _seed_ab_precip_fixture(
+    feed_a, feed_b = _seed_ab_precip_fixture(
         conn, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_STALE_ISSUED
     )
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a, feed_b]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
+    assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_b]
     assert today.precip.meta.stale is True
     assert today.stale is True
     html = _render_tiles(site_id=1, view=view)
     assert _STALE_BADGE in html
 
+    # Case 2: only A is stale. A is no contributor (no full day), so the
+    # rain is not stale; A is the selected model, though, and B stands in
+    # for it, so the cell is a substitute.
     conn2 = _make_db()
-    _seed_ab_precip_fixture(
+    feed_a2, feed_b2 = _seed_ab_precip_fixture(
         conn2, feed_a_issued_at=_AB_STALE_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
+    )
+    seed_rain_ranks(
+        conn2, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a2, feed_b2]}
     )
     conn2.commit()
     view2 = build_forecast(
         conn2, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
-    assert view2.tiles[0].precip.meta.stale is True
-    html2 = _render_tiles(site_id=1, view=view2)
-    assert _STALE_BADGE in html2
+    assert [ref.feed_id for ref in view2.tiles[0].precip.meta.feeds] == [feed_b2]
+    assert view2.tiles[0].precip.meta.stale is False
+    assert view2.tiles[0].precip.meta.substitute is True
+
+    # Case 3: the winner B is fresh, and a stale third feed C with a full day
+    # is an agreement member -> stale.
+    conn3 = _make_db()
+    feed_a3, feed_b3 = _seed_ab_precip_fixture(
+        conn3, feed_a_issued_at=_AB_FRESH_ISSUED, feed_b_issued_at=_AB_FRESH_ISSUED
+    )
+    feed_c3 = _feed_id(conn3, "open-meteo", "icon_global")
+    _seed_varying(
+        conn3,
+        feed_id=feed_c3,
+        variable="precip",
+        issued_at=_AB_STALE_ISSUED,
+        valid_ats=_hours(_AB_VALID_DAY, 0, 24),
+        values=[0.0] * 24,
+    )
+    _stamp_usable_fetch(conn3, feed_id=feed_c3, at=_AB_STALE_ISSUED)
+    seed_rain_ranks(
+        conn3, site_id=1, published_at=_AB_NOW, ranked={0: [feed_b3, feed_c3, feed_a3]}
+    )
+    conn3.commit()
+    view3 = build_forecast(
+        conn3, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
+    )
+    precip3 = view3.tiles[0].precip
+    assert [ref.feed_id for ref in precip3.meta.feeds] == [feed_b3]
+    assert precip3.agreement_pct is not None  # fixture guard: C is a member
+    assert precip3.meta.stale is True
+    assert _STALE_BADGE in _render_tiles(site_id=1, view=view3)
 
 
 def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
+    """Tile half, rain release C4: the rain cell has one feed set, the
+    winner, and no leaderboard verdict. B (no precipitation pairs, the old
+    unscored extrema set) is the winner of a settled rain ranking: both of
+    the cell's states read normal, and no confidence badge shows. The record
+    half (``build_forecast_record``, unchanged by C4) still flags its
+    extrema set low-confidence."""
     conn = _make_db()
-    _seed_ab_precip_fixture(conn, seed_b_scoring=False)
+    feed_a, feed_b = _seed_ab_precip_fixture(conn, seed_b_scoring=False)
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a, feed_b]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
+    assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_b]
     assert today.precip.meta.state == "normal"
-    assert today.precip.meta.extrema_state == "low_confidence"
+    assert today.precip.meta.extrema_state == "normal"
     assert today.state == "normal"
-    assert today.confidence_state == "low_confidence"
+    assert today.confidence_state == "normal"
     html = _render_tiles(site_id=1, view=view)
     assert '<article class="tile state-normal">' in html
-    assert '<span class="badge warn">low confidence</span>' in html
+    assert '<span class="badge warn">low confidence</span>' not in html
     assert '<span class="badge muted">ranking updating</span>' not in html
 
     record_conn = _record_conn()
@@ -1687,6 +1801,11 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
 
 
 def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
+    """Tile half, rain release C4: a PROVISIONAL rain ranking whose winner
+    is B shows as the rain cell's rebuilding extrema state: the tile stays
+    state-normal and shows "ranking updating", never "low confidence". The
+    leaderboard statuses below are the old fixture's and no longer reach
+    the rain cell; they stay as the record half's setup."""
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
@@ -1749,11 +1868,20 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
         ).status
         == "rebuilding"
     )
+    seed_rain_ranks(
+        conn,
+        site_id=1,
+        published_at=_AB_NOW,
+        ranked={0: [feed_a, feed_b]},
+        provisional={0},
+    )
+    conn.commit()
 
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
+    assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_b]
     assert today.precip.meta.state == "normal"
     assert today.precip.meta.extrema_state == "rebuilding"
     assert today.state == "normal"
@@ -1817,86 +1945,76 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
 
 
 def test_suppressed_precip_extrema_contribute_to_neither_warning() -> None:
-    conn = _make_db()
-    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    set_setting(conn, "forecast_blend_depth", "1")
-    a_ats = _hours(_AB_VALID_DAY, 0, 20)
-    _seed_varying(
-        conn,
-        feed_id=feed_a,
-        variable="precip",
-        issued_at=_AB_FRESH_ISSUED,
-        valid_ats=a_ats,
-        values=[0.1 * i for i in range(20)],
-    )
-    _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_FRESH_ISSUED)
-    _seed_scoring_pairs(
-        conn,
-        feed_id=persistence_id,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_POOR_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
-    _seed_scoring_pairs(
-        conn,
-        feed_id=feed_a,
-        variable="precip",
-        day_ahead=0,
-        forecast=_PRECIP_ACCURATE_FORECAST,
-        observed=_PRECIP_MIXED_OBSERVED,
-    )
-    _seed_complete_score_cache(conn, variable="precip", day_ahead=0)
-    conn.commit()
-    view = build_forecast(
-        conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    today = view.tiles[0]
-    assert today.precip.meta.extrema_unavailable is True
-    assert today.precip.meta.extrema_state == "not_available"
-    assert today.precip.meta.state == "normal"
-    assert today.precip.meta.stale is False
-    assert today.confidence_state == "normal"
-    html = _render_tiles(site_id=1, view=view)
-    assert '<span class="badge warn">low confidence</span>' not in html
-    assert '<span class="badge muted">ranking updating</span>' not in html
-    assert _STALE_BADGE not in html
-
-    # Paired positive: the stale badge still shows when A itself is stale,
-    # so the negative above is not a blanket "badges never fire" fixture.
-    stale_conn = _make_db()
-    stale_feed = _feed_id(stale_conn, "open-meteo", "ecmwf_ifs")
-    stale_persistence = _feed_id(stale_conn, "virtual", "_persistence")
-    set_setting(stale_conn, "forecast_blend_depth", "1")
-    _seed_varying(
-        stale_conn,
-        feed_id=stale_feed,
-        variable="precip",
-        issued_at=_AB_STALE_ISSUED,
-        valid_ats=a_ats,
-        values=[0.1 * i for i in range(20)],
-    )
-    _stamp_usable_fetch(stale_conn, feed_id=stale_feed, at=_AB_STALE_ISSUED)
-    _seed_scoring_pairs(
-        stale_conn,
-        feed_id=stale_persistence,
-        variable="precip",
-        day_ahead=0,
-        forecast=8.0,
-    )
-    _seed_scoring_pairs(
-        stale_conn, feed_id=stale_feed, variable="precip", day_ahead=0, forecast=10.1
-    )
-    _seed_complete_score_cache(stale_conn, variable="precip", day_ahead=0)
-    stale_conn.commit()
-    stale_view = build_forecast(
-        stale_conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
-    )
-    assert stale_view.tiles[0].precip.meta.extrema_unavailable is True
-    assert stale_view.tiles[0].precip.meta.stale is True
-    stale_html = _render_tiles(site_id=1, view=stale_view)
-    assert _STALE_BADGE in stale_html
+    """Rain release, C4: a ranked model with no full day is no winner and
+    feeds no warning. A is stale and its ranking provisional, yet the tile
+    (kept available by a normal wind cell) shows neither the stale nor the
+    "ranking updating" badge. Paired positive: the same A with a full day
+    is the winner, and both badges show, so the negative is not a blanket
+    "badges never fire" fixture."""
+    for full_day in (False, True):
+        conn = _make_db()
+        feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+        wind_feeds = (
+            _feed_id(conn, "open-meteo", "gfs_global"),
+            _feed_id(conn, "open-meteo", "icon_global"),
+        )
+        hours = 24 if full_day else 20
+        _seed_varying(
+            conn,
+            feed_id=feed_a,
+            variable="precip",
+            issued_at=_AB_STALE_ISSUED,
+            valid_ats=_hours(_AB_VALID_DAY, 0, hours),
+            values=[0.1 * i for i in range(hours)],
+        )
+        _stamp_usable_fetch(conn, feed_id=feed_a, at=_AB_STALE_ISSUED)
+        for wind_feed in wind_feeds:
+            _seed_uniform(
+                conn,
+                feed_id=wind_feed,
+                variable="wind",
+                issued_at=_AB_FRESH_ISSUED,
+                valid_ats=_hours(_AB_VALID_DAY, 0, 24),
+                value=5.0,
+            )
+            _stamp_usable_fetch(conn, feed_id=wind_feed, at=_AB_FRESH_ISSUED)
+        publication_id = seed_rain_ranks(
+            conn,
+            site_id=1,
+            published_at=_AB_NOW,
+            ranked={0: [feed_a]},
+            provisional={0},
+        )
+        for wind_feed in wind_feeds:
+            conn.execute(
+                "INSERT INTO publication_wind_weights"
+                " (publication_id, feed_id, day_ahead, mae_ms, days, weight)"
+                " VALUES (?, ?, 0, 1.0, 30, 1.0)",
+                (publication_id, wind_feed),
+            )
+        conn.commit()
+        view = build_forecast(
+            conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
+        )
+        today = view.tiles[0]
+        html = _render_tiles(site_id=1, view=view)
+        assert today.wind.meta.state == "normal"  # fixture guard: tile shows
+        assert today.wind.meta.stale is False
+        if full_day:
+            assert [ref.feed_id for ref in today.precip.meta.feeds] == [feed_a]
+            assert today.precip.meta.stale is True
+            assert today.precip.meta.extrema_state == "rebuilding"
+            assert _STALE_BADGE in html
+            assert '<span class="badge muted">ranking updating</span>' in html
+        else:
+            assert today.precip.meta.state == "not_available"
+            assert today.precip.meta.extrema_state == "not_available"
+            assert today.precip.meta.stale is False
+            assert today.stale is False
+            assert today.confidence_state == "normal"
+            assert '<span class="badge warn">low confidence</span>' not in html
+            assert '<span class="badge muted">ranking updating</span>' not in html
+            assert _STALE_BADGE not in html
 
 
 # ===========================================================================

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import logging
 import sqlite3
-from collections.abc import Sequence
 from typing import Final
 
 from wxverify.collection.precip_labels import precip_label_eligible_sql
@@ -13,13 +11,10 @@ from wxverify.db.site_days import open_day_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
 
-logger = logging.getLogger(__name__)
-
 # The real-model pairing candidates: a sample with a matching observation, a
 # lead in the feed's range, no pair yet and a rain label past the
 # hour-start boundary (precip_label_eligible_sql). compute_real_model_pairs
-# runs it whole or for one site; real_model_pair_pending runs it for one
-# sample id, so both read the same predicate.
+# runs it whole or for one site.
 _CANDIDATE_PAIRS_SQL: Final = f"""
         SELECT fs.site_id, fs.feed_id, fs.variable, fs.issued_at, fs.valid_at,
                fs.lead_hours, fs.value AS forecast, fs.fetched_at,
@@ -43,7 +38,6 @@ _CANDIDATE_PAIRS_SQL: Final = f"""
           )
           AND {precip_label_eligible_sql("fs", "f")}
         """
-REAL_MODEL_PAIR_PROBE_SQL: Final = _CANDIDATE_PAIRS_SQL + " AND fs.id = ?"
 _PAIR_MAX_DAY_AHEAD: Final = 7
 
 _PAIR_INSERT_SQL: Final = """
@@ -143,31 +137,3 @@ def _pair_bucket(row: sqlite3.Row) -> int | None:
     if bucket < 0 or bucket > _PAIR_MAX_DAY_AHEAD:
         return None
     return bucket
-
-
-def real_model_pair_pending(
-    conn: sqlite3.Connection, sample_ids: Sequence[int]
-) -> bool:
-    """Whether compute_real_model_pairs would pair any of sample_ids right now.
-
-    Allowlist: False only when every id was probed and none would pair.
-    A bucket that cannot be computed returns True, so the score run meets
-    the error it meets today. Database errors propagate and roll back
-    the caller's transaction.
-    """
-    for sample_id in sample_ids:
-        row = conn.execute(REAL_MODEL_PAIR_PROBE_SQL, (sample_id,)).fetchone()
-        if row is None:
-            continue
-        try:
-            if _pair_bucket(row) is not None:
-                return True
-        except (ValueError, KeyError, OverflowError):
-            logger.warning(
-                "fetch score gate: day-ahead bucket failed site=%s sample=%s; "
-                "queueing the score run",
-                row["site_id"],
-                sample_id,
-            )
-            return True
-    return False

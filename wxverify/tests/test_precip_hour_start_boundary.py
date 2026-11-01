@@ -423,18 +423,16 @@ def test_m2_boundary_step_changes_no_sample_row() -> None:
 
 
 # ---------------------------------------------------------------------------
-# M3 -- the pairer and the probe read the same gate
+# M3 -- the pairer reads the gate (the fetch score gate's probe, which read
+# the same gate, was deleted in the rain release, Part B)
 # ---------------------------------------------------------------------------
 
 
 def test_m3_pairer_and_probe_use_the_same_gate() -> None:
-    # Pins the pairer and the probe to the same eligibility gate: the named
-    # counts (4 eligible, exactly 3 excluded) must hold.
+    # Pins the pairer to the eligibility gate: the named counts (4 eligible,
+    # exactly 3 excluded) must hold.
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.scoring.pairing import (
-        compute_real_model_pairs,
-        real_model_pair_pending,
-    )
+    from wxverify.scoring.pairing import compute_real_model_pairs
 
     conn = _make_db()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
@@ -454,7 +452,7 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
     for valid_at in valid_ats:
         _insert_observation(conn, variable="precip", valid_at=valid_at, value=0.0)
 
-    excluded_ids = [
+    _excluded_ids = [
         # Fetched exactly at K: strict > required, so this stays excluded.
         _insert_sample(
             conn,
@@ -486,7 +484,7 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
             fetched_at=None,
         ),
     ]
-    eligible_om_id = _insert_sample(
+    _insert_sample(
         conn,
         feed_id=om,
         variable="precip",
@@ -523,9 +521,6 @@ def test_m3_pairer_and_probe_use_the_same_gate() -> None:
         fetched_at="2026-01-01T11:00:00Z",
     )
     _insert_observation(conn, variable="temperature", valid_at=valid_ats[5], value=10.0)
-
-    assert real_model_pair_pending(conn, excluded_ids) is False
-    assert real_model_pair_pending(conn, [eligible_om_id]) is True
 
     delta = compute_real_model_pairs(conn)
     paired_valid_ats = {op.values[4] for op in delta.ops}
@@ -788,6 +783,10 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
     )
 
     conn = _make_db()
+    # Two labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # v16 file, and the v16 carry-over keeps the row it picks.
+    conn.execute("DROP INDEX idx_samples_slot")
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
     set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
@@ -1060,18 +1059,16 @@ def test_m15_missing_key_excludes_affected_rows_and_reopen_recomputes_from_store
 
 
 def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
-    # A refetch of the same model run keeps the old row's fetched_at and
-    # excluded status; a genuinely new run is eligible.
+    # An identical refetch of the same model run keeps the old row's
+    # fetched_at and excluded status; a genuinely new run replaces the hour
+    # (one row per hour since the rain release, Part B) and is eligible.
     from wxverify.collection.forecast_fetcher import (
         persist_fetch_result,
     )
     from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
     from wxverify.feeds.seam import FetchResult, NormalizedSample
     from wxverify.forecast.data import load_future_samples
-    from wxverify.scoring.pairing import (
-        compute_real_model_pairs,
-        real_model_pair_pending,
-    )
+    from wxverify.scoring.pairing import compute_real_model_pairs
 
     conn = _make_db()
     site_id = 1
@@ -1114,7 +1111,7 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
         fetch_feed_id=om,
         result=FetchResult(
             samples=[
-                _sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=2.0)
+                _sample(issued_at="2026-01-01T00:00:00Z", lead_hours=13, value=1.0)
             ]
         ),
     )
@@ -1127,12 +1124,8 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
     assert row["fetched_at"] == "2026-01-01T11:00:00Z"
     assert row["value"] == 1.0
 
-    id_row = conn.execute(
-        "SELECT id FROM forecast_samples WHERE variable='precip'"
-    ).fetchone()
     delta = compute_real_model_pairs(conn)
     assert not any(op.values[2] == "precip" for op in delta.ops)
-    assert real_model_pair_pending(conn, [int(id_row["id"])]) is False
     live = load_future_samples(
         conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False
     )
@@ -1154,6 +1147,10 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
         " WHERE variable='precip' AND issued_at='2026-01-01T06:00:00Z'"
     ).fetchone()
     assert new_row is not None
+    precip_rows = conn.execute(
+        "SELECT COUNT(*) FROM forecast_samples WHERE variable='precip'"
+    ).fetchone()[0]
+    assert precip_rows == 1, "the new run must replace the hour's row"
     from wxverify.core.timeutil import parse_utc
 
     assert parse_utc(str(new_row["fetched_at"])) > parse_utc(_K)
@@ -1163,7 +1160,6 @@ def test_m16_refetch_keeps_the_old_row_and_a_new_run_is_eligible() -> None:
         op.values[2] == "precip" and op.values[3] == "2026-01-01T06:00:00Z"
         for op in delta2.ops
     )
-    assert real_model_pair_pending(conn, [int(new_row["id"])]) is True
     live2 = load_future_samples(
         conn, site_id=site_id, since_valid_at="2026-01-01T00:00:00Z", served_only=False
     )
@@ -1224,6 +1220,21 @@ def _m17_build_forecast_tile(
     return tile
 
 
+def _m17_seed_rain_ranks(conn: sqlite3.Connection, feed_ids: list[int]) -> None:
+    """Rain release, C4: the published rain ranking for the tile's day ahead
+    (0: 2026-01-02 is today at the build's clock), first feed selected."""
+    from datetime import UTC, datetime
+
+    from tests.helpers import seed_rain_ranks
+
+    seed_rain_ranks(
+        conn,
+        site_id=1,
+        published_at=datetime(2026, 1, 2, 2, tzinfo=UTC),
+        ranked={0: feed_ids},
+    )
+
+
 def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
     # The excluded feed's rain must be dropped from the blend entirely, not
     # just scored differently.
@@ -1249,6 +1260,10 @@ def test_m17a_an_excluded_feed_is_dropped_from_the_blend() -> None:
         value=0.5,
         fetched_at="2026-01-01T13:00:00Z",
     )
+    # Rain release, C4: the excluded feed is even the rain ranking's
+    # selected model; with its rain dropped it has no full day, so the tile
+    # follows the next ranked model.
+    _m17_seed_rain_ranks(conn, [om, google])
 
     tile = _m17_build_forecast_tile(conn)
 
@@ -1281,6 +1296,8 @@ def test_m17b_a_fully_excluded_rain_feed_is_not_available_not_zero() -> None:
         value=10.0,
         fetched_at="2026-01-01T13:00:00Z",
     )
+    # Rain release, C4: ranked, so not_available comes from the exclusion.
+    _m17_seed_rain_ranks(conn, [om])
 
     tile = _m17_build_forecast_tile(conn)
 
@@ -1313,10 +1330,13 @@ def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
     # (The "eligible_hour" set is implicit: every hour not in excluded_hours
     # keeps the eligible stamp -- only 00:00 keeps "2026-01-01T13:00:00Z".)
     assert eligible_hour  # documents intent; no behavior depends on this line
+    _m17_seed_rain_ranks(conn, [om])
 
     tile = _m17_build_forecast_tile(conn)
 
-    assert tile.precip.meta.extrema_unavailable is True
+    # Rain release, C4: one hour is no full day, so the ranked feed is no
+    # winner.
+    assert tile.precip.meta.state == "not_available"
     assert tile.precip.total_mm is None
     assert tile.precip.wet_hours is None
     assert tile.precip.meta.feeds == []
@@ -1402,7 +1422,16 @@ def _m18_seed_rank(
     )
 
 
-def test_m18a0_control_two_confident_feeds_both_selected() -> None:
+# Rain release, C4: the rain tile no longer blends the leaderboard's
+# selected feeds; it shows the published rain ranking's winner. The M18
+# cases keep their leaderboard fixtures and now pin that neither the
+# leaderboard's ranks nor the blend depth reach the rain tile.
+
+
+def test_m18a0_rain_tile_follows_the_rain_ranking_not_the_leaderboard() -> None:
+    # Both feeds are confident in the leaderboard, om above google; the rain
+    # ranking selects google, so the tile is google's rain alone, with both
+    # (full-day, wet) group members agreeing.
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
@@ -1410,12 +1439,14 @@ def test_m18a0_control_two_confident_feeds_both_selected() -> None:
     _m18_seed_feed_rain(conn, google, 0.5)
     _m18_seed_rank(conn, feed_id=om, n=3, skill=0.7)
     _m18_seed_rank(conn, feed_id=google, n=3, skill=0.5)
+    _m17_seed_rain_ranks(conn, [google, om])
 
     tile = _m17_build_forecast_tile(conn)
 
-    assert [f.feed_id for f in tile.precip.meta.feeds] == [om, google]
-    assert tile.precip.total_mm == 18.0
+    assert [f.feed_id for f in tile.precip.meta.feeds] == [google]
+    assert tile.precip.total_mm == 12.0
     assert tile.precip.wet_hours == 24
+    assert tile.precip.agreement_pct == 100
 
 
 @pytest.mark.parametrize(
@@ -1426,13 +1457,13 @@ def test_m18a0_control_two_confident_feeds_both_selected() -> None:
         pytest.param(2, 0.9, id="a3-below-min-n"),
     ],
 )
-def test_m18a_available_but_not_ranked_is_not_selected(
+def test_m18a_leaderboard_unranked_feed_can_be_the_rain_winner(
     om_n: int,
     om_skill: float | None,
 ) -> None:
-    # Pins availability vs. selection: a feed present in the data but not
-    # confidently ranked (no row, skill None, or below min_n) must still be
-    # left out of the blend's selected feeds.
+    # A feed present in the data but not confidently ranked in the
+    # leaderboard (no row, skill None, or below min_n) is still the rain
+    # tile's winner when the rain ranking selects it.
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
@@ -1441,17 +1472,19 @@ def test_m18a_available_but_not_ranked_is_not_selected(
     _m18_seed_rank(conn, feed_id=google, n=3, skill=0.5)
     if om_n > 0:
         _m18_seed_rank(conn, feed_id=om, n=om_n, skill=om_skill)
+    _m17_seed_rain_ranks(conn, [om, google])
 
     tile = _m17_build_forecast_tile(conn)
 
-    assert [f.feed_id for f in tile.precip.meta.feeds] == [google]
-    assert om not in tile.precip.meta.contributor_ids
+    assert [f.feed_id for f in tile.precip.meta.feeds] == [om]
     assert tile.precip.meta.state == "normal"
-    assert tile.precip.total_mm == 12.0
+    assert tile.precip.total_mm == 24.0
     assert tile.precip.wet_hours == 24
 
 
-def test_m18b_confident_but_outside_blend_depth_is_not_selected() -> None:
+def test_m18b_blend_depth_does_not_reach_the_rain_tile() -> None:
+    # The blend depth (2 or 3) changes nothing on the rain tile: the winner
+    # is the rain ranking's selected model either way.
     conn = _m18_setup()
     om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     google = _feed_id(conn, "google", "blend")
@@ -1462,15 +1495,15 @@ def test_m18b_confident_but_outside_blend_depth_is_not_selected() -> None:
     _m18_seed_rank(conn, feed_id=google, n=3, skill=0.5)
     _m18_seed_rank(conn, feed_id=vc, n=3, skill=0.4)
     _m18_seed_rank(conn, feed_id=om, n=3, skill=0.3)
+    _m17_seed_rain_ranks(conn, [vc, google, om])
 
     tile_depth2 = _m17_build_forecast_tile(conn)
-    assert [f.feed_id for f in tile_depth2.precip.meta.feeds] == [google, vc]
-    assert om not in tile_depth2.precip.meta.contributor_ids
+    assert [f.feed_id for f in tile_depth2.precip.meta.feeds] == [vc]
     assert tile_depth2.precip.meta.state == "normal"
-    assert tile_depth2.precip.total_mm == 9.0
+    assert tile_depth2.precip.total_mm == 6.0
     assert tile_depth2.precip.wet_hours == 24
 
     tile_depth3 = _m17_build_forecast_tile(conn, depth="3")
-    assert [f.feed_id for f in tile_depth3.precip.meta.feeds] == [google, vc, om]
-    assert tile_depth3.precip.total_mm == 14.0
+    assert [f.feed_id for f in tile_depth3.precip.meta.feeds] == [vc]
+    assert tile_depth3.precip.total_mm == 6.0
     assert tile_depth3.precip.wet_hours == 24

@@ -89,6 +89,10 @@ def test_load_future_samples_picks_latest_run_per_slot() -> None:
     """Two runs covering the same (feed, variable, valid_at) slot; only the
     newer survives -- the ROW_NUMBER() rewrite's headline contract."""
     conn = _make_db()
+    # Two labels in one hour exist only in a file below v16 (the rain
+    # release, Part B, keeps one row per hour): the pick is a no-op on a
+    # v16 file, and the v16 carry-over keeps the row it picks.
+    conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _insert_sample(
         conn,
@@ -117,8 +121,15 @@ def test_load_future_samples_picks_latest_run_per_slot() -> None:
 def test_load_future_samples_newer_invalid_does_not_shadow_valid_older() -> None:
     """The validity predicate is applied BEFORE the ROW_NUMBER() window, so
     an invalid sample from a newer run cannot shadow a valid older one --
-    the query's own docstring invariant, pinned directly."""
+    the query's own docstring invariant, pinned directly.
+
+    Two labels in one hour exist only in a file below v16; the v16
+    carry-over keeps the row this pick shows. On a v16 file the newer
+    invalid value replaces the hour instead, and the hour shows as missing
+    (``test_load_future_samples_invalid_newest_value_shows_as_missing``).
+    """
     conn = _make_db()
+    conn.execute("DROP INDEX idx_samples_slot")
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _insert_sample(
         conn,
@@ -143,6 +154,52 @@ def test_load_future_samples_newer_invalid_does_not_shadow_valid_older() -> None
     assert len(rows) == 1
     assert rows[0].value == 20.0
     assert rows[0].issued_at == "2026-06-25T00:00:00Z"
+
+
+def test_load_future_samples_invalid_newest_value_shows_as_missing() -> None:
+    """Rain release, Part B (B1): a newer download's invalid value replaces
+    the hour, since the newest value is what the feed last said, and the
+    reader leaves it out, so the hour shows as missing, never as the older
+    value."""
+    from wxverify.collection.forecast_fetcher import persist_fetch_result
+    from wxverify.feeds.seam import FetchResult, NormalizedSample
+
+    conn = _make_db()
+    feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
+
+    def _sample(issued_at: str, value: float) -> NormalizedSample:
+        return NormalizedSample(
+            model="ecmwf_ifs",
+            variable="temperature",
+            issued_at=issued_at,
+            valid_at="2026-07-01T00:00:00Z",
+            lead_hours=6,
+            value=value,
+            source_raw=str(value),
+            model_run_id=f"ecmwf_ifs:{issued_at}",
+        )
+
+    for issued_at, value in (
+        ("2026-06-25T00:00:00Z", 20.0),
+        # Newer run, out of FORECAST_VALUE_RANGES for temperature (> 70).
+        ("2026-06-30T00:00:00Z", 200.0),
+    ):
+        persist_fetch_result(
+            conn,
+            site_id=1,
+            source="open-meteo",
+            fetch_feed_id=feed_id,
+            result=FetchResult(samples=[_sample(issued_at, value)]),
+            fetched_at=issued_at,
+        )
+    stored = conn.execute(
+        "SELECT value FROM forecast_samples WHERE feed_id = ?", (feed_id,)
+    ).fetchall()
+    assert [r["value"] for r in stored] == [200.0]
+    rows = load_future_samples(
+        conn, site_id=1, since_valid_at="2026-01-01T00:00:00Z", served_only=False
+    )
+    assert [r for r in rows if r.feed_id == feed_id] == []
 
 
 def test_load_future_samples_excludes_virtual_and_package_feeds() -> None:

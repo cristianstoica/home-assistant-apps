@@ -7,6 +7,14 @@ row of ``forecast_downloads`` (4.2), or, for a day the record does not
 cover, the download inferred from ``forecast_samples`` and the completed
 ``fetch_feed`` job rows (4.7).
 
+Since the rain release (``plans/2026-11-01-rain-release.md``, Part B) the
+close reads the scored values from ``forecast_scored`` (``scored_values``),
+which the fetch path writes for a day's first stored download, and
+``forecast_samples`` keeps one row per hour, the newest value
+(``newest_values``). ``scored_download`` and ``scored_version`` are read
+only by the v16 carry-over (``collection/forecast_store.py``), over a file
+that can still hold several labels per hour.
+
 Read-only: every function here runs in the caller's snapshot or
 transaction and writes nothing.
 """
@@ -183,6 +191,204 @@ def scored_download(
     if recorded is None or inferred.fetched_at < recorded.fetched_at:
         return inferred
     return recorded
+
+
+def first_recorded_download(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    local_date: date,
+) -> ScoredDownload | None:
+    """The first recorded ``stored`` download of ``local_date`` for
+    ``feed_id`` (or its meteoblue package) whose labels for the feed are not
+    empty, ordered by ``ended_at``, then ``id``; or ``None``.
+
+    The record half of :func:`scored_download`, with no inference. The
+    fetch path asks it before a download's row is written, to decide whether
+    that download is the day's first and so writes the scored values (rain
+    release, Part B). Read-only.
+    """
+    return _first_recorded_download(
+        conn,
+        site_id=site_id,
+        feed_id=feed_id,
+        fetch_feed_id=_fetch_feed_id(conn, feed_id),
+        local_date=local_date,
+    )
+
+
+# The scored rows of one feed, day ahead and span. Lead, the shared
+# validator and the rain-label boundary are read as scored_version reads
+# them, so the close scores what 0.16.14 scored.
+_SCORED_ROWS_SQL: Final = f"""
+    SELECT fsc.variable, fsc.issued_at, fsc.valid_at, fsc.lead_hours,
+           fsc.value, fsc.fetched_at, fsc.download_id, fsc.download_date
+    FROM forecast_scored fsc
+    JOIN feeds f ON f.id = fsc.feed_id
+    WHERE fsc.site_id = ?
+      AND fsc.feed_id = ?
+      AND fsc.day_ahead = ?
+      AND fsc.valid_at >= ?
+      AND fsc.valid_at < ?
+      AND fsc.lead_hours BETWEEN 1 AND f.max_lead_hours
+      AND NOT {invalid_forecast_sample_sql("fsc")}
+      AND {precip_label_eligible_sql("fsc", "f")}
+    ORDER BY fsc.valid_at, fsc.variable
+"""
+
+
+def scored_values(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    day_ahead: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> dict[tuple[str, str], StoredSample]:
+    """The scored values of ``feed_id`` at ``day_ahead`` with ``valid_at`` in
+    ``[start_utc, end_utc)``, keyed by ``(variable, valid_at)`` (rain
+    release, Part B, B4).
+
+    Read from ``forecast_scored``: one row per hour, from the first stored
+    download of the local day ``day_ahead`` days before the hour's. A lead
+    above the feed's ``max_lead_hours``, an invalid value and rain before
+    the rain-label boundary are left out, as :func:`scored_version` leaves
+    them out. ``fetched_at`` is the download's. Read-only.
+    """
+    values: dict[tuple[str, str], StoredSample] = {}
+    for row in _scored_rows(conn, site_id, feed_id, day_ahead, start_utc, end_utc):
+        sample = StoredSample(
+            variable=str(row["variable"]),
+            issued_at=str(row["issued_at"]),
+            valid_at=str(row["valid_at"]),
+            lead_hours=int(row["lead_hours"]),
+            value=float(row["value"]),
+            fetched_at=str(row["fetched_at"]),
+        )
+        values[(sample.variable, sample.valid_at)] = sample
+    return values
+
+
+def scored_values_download(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    day_ahead: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> ScoredDownload | None:
+    """The download the :func:`scored_values` of the same arguments came
+    from, or ``None`` when there are none (B4).
+
+    Every scored row of one feed, local day and day ahead comes from one
+    download. With its ``download_id`` set it is ``recorded``, with that
+    ``forecast_downloads`` row's labels; with none (a row the v16 carry-over
+    wrote from an inferred download) it is ``inferred``, with no labels.
+    ``local_date`` is the row's ``download_date`` and ``fetched_at`` its
+    ``fetched_at``. Read-only.
+    """
+    rows = _scored_rows(conn, site_id, feed_id, day_ahead, start_utc, end_utc)
+    if not rows:
+        return None
+    first = rows[0]
+    try:
+        local_date = date.fromisoformat(str(first["download_date"]))
+    except ValueError:
+        return None
+    raw_id: object = first["download_id"]
+    if raw_id is None:
+        return ScoredDownload(
+            download_id=None,
+            feed_id=feed_id,
+            local_date=local_date,
+            fetched_at=str(first["fetched_at"]),
+            labels={},
+            source="inferred",
+        )
+    download_id = int(cast(int, raw_id))
+    labels_row = conn.execute(
+        "SELECT labels FROM forecast_downloads WHERE id = ?", (download_id,)
+    ).fetchone()
+    return ScoredDownload(
+        download_id=download_id,
+        feed_id=feed_id,
+        local_date=local_date,
+        fetched_at=str(first["fetched_at"]),
+        labels={} if labels_row is None else _parse_labels(labels_row["labels"]),
+        source="recorded",
+    )
+
+
+def _scored_rows(
+    conn: sqlite3.Connection,
+    site_id: int,
+    feed_id: int,
+    day_ahead: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        _SCORED_ROWS_SQL,
+        (
+            site_id,
+            feed_id,
+            day_ahead,
+            isoformat_utc(start_utc),
+            isoformat_utc(end_utc),
+        ),
+    ).fetchall()
+
+
+def newest_values(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    feed_id: int,
+    start_utc: datetime,
+    end_utc: datetime,
+) -> dict[tuple[str, str], StoredSample]:
+    """The feed's stored newest values with ``valid_at`` in ``[start_utc,
+    end_utc)``, keyed by ``(variable, valid_at)`` (B3).
+
+    ``forecast_samples`` holds one row per hour, the value the feed last
+    gave. Rows with no ``fetched_at``, a lead outside 1 to the feed's
+    ``max_lead_hours``, an invalid value, or rain before the rain-label
+    boundary are left out, as :func:`scored_version` leaves them out. The
+    value-change log reads it before a download's samples are written, as
+    the values that download replaces. Read-only.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT fs.variable, fs.issued_at, fs.valid_at, fs.lead_hours, fs.value,
+               fs.fetched_at
+        FROM forecast_samples fs
+        JOIN feeds f ON f.id = fs.feed_id
+        WHERE fs.site_id = ?
+          AND fs.feed_id = ?
+          AND fs.fetched_at IS NOT NULL
+          AND fs.valid_at >= ?
+          AND fs.valid_at < ?
+          AND fs.lead_hours BETWEEN 1 AND f.max_lead_hours
+          AND NOT {invalid_forecast_sample_sql("fs")}
+          AND {precip_label_eligible_sql("fs", "f")}
+        """,
+        (site_id, feed_id, isoformat_utc(start_utc), isoformat_utc(end_utc)),
+    ).fetchall()
+    values: dict[tuple[str, str], StoredSample] = {}
+    for row in rows:
+        sample = StoredSample(
+            variable=str(row["variable"]),
+            issued_at=str(row["issued_at"]),
+            valid_at=str(row["valid_at"]),
+            lead_hours=int(row["lead_hours"]),
+            value=float(row["value"]),
+            fetched_at=str(row["fetched_at"]),
+        )
+        values[(sample.variable, sample.valid_at)] = sample
+    return values
 
 
 def latest_stored_download(

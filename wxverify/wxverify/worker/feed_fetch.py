@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import sqlite3
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -25,6 +24,7 @@ from wxverify.collection.budget import (
 from wxverify.collection.forecast_fetcher import (
     PersistOutcome,
     persist_fetch_result,
+    write_scored_values,
 )
 from wxverify.core import timeutil
 from wxverify.core.error_sanitize import sanitized_exception
@@ -42,11 +42,10 @@ from wxverify.feeds.seam import (
 from wxverify.scoring.downloads import (
     ScoredDownload,
     StoredSample,
+    first_recorded_download,
     latest_stored_download,
-    scored_version,
+    newest_values,
 )
-from wxverify.scoring.engine import enqueue_scoring_run
-from wxverify.scoring.pairing import real_model_pair_pending
 from wxverify.worker.cadence import parse_fetch_interval_minutes
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
@@ -61,11 +60,6 @@ AdapterBuilder = Callable[[str, httpx.AsyncClient], ForecastAdapter]
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
-
-# Probe time above which the fetch score gate logs at INFO. The same figure
-# as the fetch-scoring-gate plan's section 2 threshold for a set-based probe;
-# change both together.
-SCORE_GATE_SLOW_SECONDS: Final = 0.25
 
 # The value-change log counts an hour as changed when its value differs by
 # more than this (daily-close P4 plan 5.2).
@@ -500,13 +494,18 @@ def _persist_fetch_success(
     *,
     slot: DownloadSlot | None = None,
 ) -> PersistOutcome:
-    """Persist a reply, its download row and its value changes in one transaction.
+    """Persist a reply, its download row, its scored values and its value
+    changes in one transaction.
 
     The ``stored`` or ``no_usable`` row of ``forecast_downloads`` is written
     with the samples, so a stored download always has its row, and a
     ``stored`` download logs its value changes (daily-close P4 plan 4.2,
-    5.2). ``slot=None`` records the try as ``unscheduled``, started at its
-    end.
+    5.2). For each feed the reply carried that has no earlier stored
+    download on the try's local date S (``first_recorded_download``, asked
+    before this try's row exists), the download is S's first, and its
+    valid samples become that feed's scored values (rain release, Part B,
+    B2). A failure anywhere rolls all of it back with the transaction.
+    ``slot=None`` records the try as ``unscheduled``, started at its end.
     """
     clear_domain_backoff(conn, source_domain(target.source))
     # One clock reading ends the try: the samples' fetched_at keeps its
@@ -515,8 +514,15 @@ def _persist_fetch_success(
     # db/queue.py's claim does.
     ended_at = timeutil.utc_now()
     fetched_at = isoformat_utc(ended_at)
-    # Read before the samples are inserted, so a previous download's scored
-    # version holds none of this reply's rows, even under an equal stamp.
+    # The try's local date S, as record_download_try dates its row.
+    aware_end = (
+        ended_at if ended_at.tzinfo is not None else ended_at.replace(tzinfo=UTC)
+    )
+    download_date = _download_local_date(
+        conn, target.site_id, aware_end.astimezone(UTC).replace(microsecond=0)
+    )
+    # Read before the samples are written, so each hour is compared with
+    # the value this reply replaces (B3).
     comparisons = _value_change_comparisons(conn, target, result)
     outcome = persist_fetch_result(
         conn,
@@ -527,6 +533,24 @@ def _persist_fetch_success(
         fetched_at=fetched_at,
     )
     stored = outcome.usable_sample_count > 0
+    # B2: decided before this try's download row is written, which would
+    # otherwise be S's first stored download itself.
+    first_feeds = (
+        []
+        if download_date is None or not stored
+        else [
+            feed_id
+            for feed_id, feed_labels in sorted(outcome.labels.items())
+            if feed_labels
+            and first_recorded_download(
+                conn,
+                site_id=target.site_id,
+                feed_id=feed_id,
+                local_date=download_date,
+            )
+            is None
+        ]
+    )
     download_id = record_download_try(
         conn,
         site_id=target.site_id,
@@ -545,38 +569,28 @@ def _persist_fetch_success(
         inserted=outcome.inserted_count,
         labels=outcome.labels,
     )
+    if download_id is not None and download_date is not None:
+        for feed_id in first_feeds:
+            scored = write_scored_values(
+                conn,
+                site_id=target.site_id,
+                feed_id=feed_id,
+                samples=outcome.samples.get(feed_id, ()),
+                download_id=download_id,
+                download_date=download_date,
+                fetched_at=fetched_at,
+            )
+            logger.debug(
+                "fetch scored values site=%s feed=%s date=%s download=%s rows=%d",
+                target.site_id,
+                feed_id,
+                download_date.isoformat(),
+                download_id,
+                scored,
+            )
     if stored and download_id is not None:
         _record_value_changes(
             conn, comparisons, download_id=download_id, labels=outcome.labels
-        )
-    # Queue a score run only when an inserted sample would pair now, in this
-    # transaction, so the job commits or rolls back with the samples. With
-    # the daily close on, enqueue_scoring_run queues nothing.
-    started = time.monotonic()
-    pairable = bool(outcome.inserted_sample_ids) and real_model_pair_pending(
-        conn, outcome.inserted_sample_ids
-    )
-    elapsed = time.monotonic() - started
-    created: bool | None = None
-    if pairable:
-        created = enqueue_scoring_run(conn, target.site_id)
-    logger.debug(
-        "fetch score gate site=%s feed=%s inserted=%d pairable=%s created=%s "
-        "elapsed=%.3fs",
-        target.site_id,
-        target.feed_id,
-        outcome.inserted_count,
-        pairable,
-        created,
-        elapsed,
-    )
-    if elapsed > SCORE_GATE_SLOW_SECONDS:
-        logger.info(
-            "fetch score gate slow site=%s feed=%s ids=%d elapsed=%.3fs",
-            target.site_id,
-            target.feed_id,
-            len(outcome.inserted_sample_ids),
-            elapsed,
         )
     return outcome
 
@@ -676,8 +690,9 @@ def _download_local_date(
 @dataclass(frozen=True)
 class _ValueComparison:
     """One carried feed's side of the value-change log (plan 5.2): the
-    reply's usable values, and the previous stored download with its scored
-    version over the reply's hours."""
+    reply's usable values, the previous stored download, and the stored
+    newest values over the reply's hours, which the reply replaces (rain
+    release, Part B, B3)."""
 
     cells: dict[str, dict[str, float]]
     previous: ScoredDownload
@@ -689,14 +704,13 @@ def _value_change_comparisons(
     conn: sqlite3.Connection, target: FeedFetchTarget, result: FetchResult
 ) -> dict[int, _ValueComparison]:
     """For each feed the reply carried that has a previous recorded stored
-    download, the reply's values and that download's scored version over
-    the reply's valid hours (plan 5.2).
+    download, the reply's values and the feed's stored newest values over
+    the reply's valid hours (plan 5.2; rain release, Part B, B3).
 
-    Called before the reply's samples are inserted, so the latest stored
-    download is the previous one and its version cannot hold this reply's
-    rows. The reply's values are kept in memory, so a provider's revision
-    under a stored label, which ``INSERT OR IGNORE`` drops, is still seen.
-    A model not registered as a feed yet has no previous download.
+    Called before the reply's samples are written, so the latest stored
+    download is the previous one and each stored value is the one this
+    reply replaces (``newest_values``), not the previous download's scored
+    version. A model not registered as a feed yet has no previous download.
     """
     comparisons: dict[int, _ValueComparison] = {}
     cells = _reply_cells(result, _reply_feed_ids(conn, target, result))
@@ -712,11 +726,10 @@ def _value_change_comparisons(
                 except ValueError:
                     continue
         version = (
-            scored_version(
+            newest_values(
                 conn,
                 site_id=target.site_id,
                 feed_id=feed_id,
-                download=previous,
                 start_utc=min(instants),
                 end_utc=max(instants) + timedelta(seconds=1),
             )
@@ -742,7 +755,7 @@ def _record_value_changes(
     """Write the value-change rows of a ``stored`` download (plan 5.2).
 
     One row per compared feed and variable: the hours present in both the
-    reply and the previous version, those whose value differs by more than
+    reply and the stored values it replaces, those whose value differs by more than
     ``VALUE_CHANGE_TOLERANCE``, the largest absolute difference, the first
     changed hour, and whether the two downloads' labels for the feed differ.
     """
@@ -819,8 +832,8 @@ def _reply_cells(
 
     A usable sample has a lead of at least 1 hour, as ``persist_fetch_result``
     counts it; a value that is not finite is left out. Where two labels give
-    the same hour, the newer label's value, as a scored version takes it
-    (plan 4.3).
+    the same hour, the newer label's value, as ``persist_fetch_result``
+    writes it.
     """
     newest: dict[tuple[int, str, str], tuple[str, float]] = {}
     for sample in result.samples:

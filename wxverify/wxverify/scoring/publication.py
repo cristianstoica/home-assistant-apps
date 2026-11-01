@@ -4,7 +4,10 @@ Daily-close P4 plan (``plans/2026-10-22-daily-close-pairs-and-publication.md``)
 sections 7 and 8, and the two calls 16.3 gives P6. A publication covers one
 site and one cutoff C, the last closed day it includes: rankings for the
 windows ``w:{N}`` and ``w:all``, wind weights over the ``TRAINING_DAYS``
-dates ending at C, and coverage. All of it is summed from stored rows --
+dates ending at C, coverage, and the rain ranking of each day ahead with its
+selected model (rain release, Part C: ``publication_rain_ranks`` and
+``rain_picks``, from ``rain_days`` and ``rain_forecast_days``). The rest is
+summed from stored rows --
 ``day_scores`` for closed record dates, ``starting_scores`` and
 ``starting_wind_days`` for the dates before the site's first record (the
 starting history, 7.3) -- and its rows never change once written.
@@ -41,6 +44,14 @@ from wxverify.db.connection import Database, FencedWriter
 from wxverify.db.site_days import daily_close_on, day_record
 from wxverify.db.snapshot import read_snapshot
 from wxverify.forecast.data import EXCLUDED_FEEDS_SQL
+from wxverify.forecast.rain_pick import (
+    RAIN_DAYS_AHEAD,
+    WINDOW_DAYS,
+    ModelSeries,
+    RainRanking,
+    forecasts_rain,
+    rank_rain,
+)
 from wxverify.forecast.wind_blend import (
     DAY_AHEADS,
     FLOOR_MS,
@@ -55,7 +66,7 @@ from wxverify.forecast.wind_blend import (
     WindWeights,
     compute_wind_weights,
 )
-from wxverify.scoring.close_scores import SCORING_RULE
+from wxverify.scoring.close_scores import SCORING_RULE, active_real_feeds
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import LeaderboardRow, below_baseline, score_badge
 from wxverify.scoring.metrics import metrics_from_sums
@@ -188,6 +199,47 @@ _INSERT_COVERAGE_SQL: Final = """
          expected, starting_days)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 """
+# Rain (rain release, C2, C3): the window's known truth days, the models'
+# daily totals, and the picks of the 60 cutoffs before.
+_RAIN_TRUTH_SQL: Final = """
+    SELECT local_date, outcome FROM rain_days
+    WHERE site_id = ? AND local_date >= ? AND local_date <= ?
+      AND outcome IN ('rain', 'dry')
+"""
+_RAIN_FORECASTS_SQL: Final = """
+    SELECT local_date, feed_id, day_ahead, total_mm FROM rain_forecast_days
+    WHERE site_id = ? AND local_date >= ? AND local_date <= ?
+"""
+_RAIN_FEEDS_SQL: Final = "SELECT id, source, model FROM feeds ORDER BY id"
+_RAIN_PICKS_SQL: Final = """
+    SELECT cutoff, day_ahead, feed_id FROM rain_picks
+    WHERE site_id = ? AND cutoff >= ? AND cutoff < ?
+    ORDER BY cutoff
+"""
+_INSERT_RAIN_RANK_SQL: Final = """
+    INSERT INTO publication_rain_ranks
+        (publication_id, day_ahead, rank, feed_id, misses, false_alarms,
+         common_days, counted_days, provisional, selected, in_group)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+_UPSERT_RAIN_PICK_SQL: Final = """
+    INSERT INTO rain_picks (site_id, cutoff, day_ahead, feed_id)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (site_id, cutoff, day_ahead) DO UPDATE SET feed_id = excluded.feed_id
+"""
+_DELETE_OLD_RAIN_PICKS_SQL: Final = (
+    "DELETE FROM rain_picks WHERE site_id = ? AND cutoff < ?"
+)
+_PUBLISHED_RAIN_SQL: Final = """
+    SELECT day_ahead, rank, feed_id, provisional, selected, in_group
+    FROM publication_rain_ranks
+    WHERE publication_id = ?
+    ORDER BY day_ahead, rank
+"""
+#: The incumbent is looked for in the picks of this many cutoffs before; the
+#: swap keeps one more day of picks.
+_RAIN_PICK_MEMORY_DAYS: Final = 60
+_RAIN_PICK_KEEP_DAYS: Final = 61
 _SITE_PUBLICATIONS_SQL: Final = (
     "SELECT id, published_at FROM publications WHERE site_id = ? ORDER BY cutoff"
 )
@@ -473,6 +525,25 @@ class ClosedPair:
 
 
 @dataclass(frozen=True, slots=True)
+class RainRank:
+    """One ranked rain model of a publication's day ahead (rain release, C3)."""
+
+    feed_id: int
+    rank: int
+    selected: bool
+    in_group: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RainRanks:
+    """A publication's rain ranking of one day ahead (C3), in rank order."""
+
+    day_ahead: int
+    provisional: bool
+    ranked: tuple[RainRank, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _Build:
     """What the build read and computed, ready for the swap (8.2)."""
 
@@ -484,6 +555,10 @@ class _Build:
     rankings: tuple[_Values, ...]
     coverage: tuple[_Values, ...]
     wind_weights: tuple[_Values, ...]
+    #: ``publication_rain_ranks`` rows less the publication id, and one
+    #: (day ahead, selected feed or None) per day ahead (C3).
+    rain_ranks: tuple[_Values, ...]
+    rain_picks: tuple[tuple[int, int | None], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -706,6 +781,7 @@ def _build(
     weights = compute_wind_weights(
         _wind_training(conn, site_id, start=wind_start, cutoff=cutoff, first=first)
     )
+    rain = _rain_rankings(conn, site_id, cutoff=cutoff)
     return _Build(
         window_days=window_days,
         min_n=min_n,
@@ -718,7 +794,89 @@ def _build(
             (day_ahead, feed_id, weight.mae_ms, weight.days, weight.weight)
             for (feed_id, day_ahead), weight in sorted(weights.items())
         ),
+        rain_ranks=tuple(
+            (
+                ranking.day_ahead,
+                ranked.rank,
+                ranked.feed_id,
+                ranked.misses,
+                ranked.false_alarms,
+                ranked.common_days,
+                ranked.counted_days,
+                int(ranking.provisional),
+                int(ranked.selected),
+                int(ranked.in_group),
+            )
+            for ranking in rain
+            for ranked in ranking.ranked
+        ),
+        rain_picks=tuple(
+            (ranking.day_ahead, ranking.selected_feed_id) for ranking in rain
+        ),
     )
+
+
+def _rain_rankings(
+    conn: sqlite3.Connection, site_id: int, *, cutoff: date
+) -> list[RainRanking]:
+    """The rain ranking of each day ahead 0 to 7 at ``cutoff`` (C2, C3).
+
+    Over the site's active real feeds (``active_real_feeds``; no yardstick),
+    the window's known truth days from ``cutoff`` - 59 to ``cutoff``
+    (``rain_days`` rain or dry) and each feed's daily totals there at the day
+    ahead (``rain_forecast_days``). The incumbent of a day ahead is the
+    latest ``rain_picks`` row at it among the 60 cutoffs before; a row with
+    no feed clears it. Read-only, in the build's snapshot.
+    """
+    window_start = _shift(cutoff, -(WINDOW_DAYS - 1))
+    span = (site_id, window_start.isoformat(), cutoff.isoformat())
+    truth = {
+        date.fromisoformat(str(row["local_date"])): str(row["outcome"]) == "rain"
+        for row in conn.execute(_RAIN_TRUTH_SQL, span)
+    }
+    totals: dict[tuple[int, int], dict[date, bool]] = {}
+    for row in conn.execute(_RAIN_FORECASTS_SQL, span):
+        key = (int(row["feed_id"]), int(row["day_ahead"]))
+        totals.setdefault(key, {})[date.fromisoformat(str(row["local_date"]))] = (
+            forecasts_rain(float(row["total_mm"]))
+        )
+    active = active_real_feeds(conn, site_id)
+    feeds = [
+        (int(row["id"]), str(row["source"]), str(row["model"]))
+        for row in conn.execute(_RAIN_FEEDS_SQL)
+        if int(row["id"]) in active
+    ]
+    incumbents: dict[int, int | None] = {}
+    for row in conn.execute(
+        _RAIN_PICKS_SQL,
+        (
+            site_id,
+            _shift(cutoff, -_RAIN_PICK_MEMORY_DAYS).isoformat(),
+            cutoff.isoformat(),
+        ),
+    ):
+        # Rows arrive in cutoff order, so the latest row of a day ahead wins.
+        feed_id: object = row["feed_id"]
+        incumbents[int(row["day_ahead"])] = (
+            None if feed_id is None else int(cast(int, feed_id))
+        )
+    return [
+        rank_rain(
+            day_ahead=day_ahead,
+            truth=truth,
+            models=[
+                ModelSeries(
+                    feed_id=feed_id,
+                    source=source,
+                    model=model,
+                    counted=totals.get((feed_id, day_ahead), {}),
+                )
+                for feed_id, source, model in feeds
+            ],
+            incumbent_feed_id=incumbents.get(day_ahead),
+        )
+        for day_ahead in RAIN_DAYS_AHEAD
+    ]
 
 
 def _window_cells(
@@ -854,6 +1012,22 @@ def _swap(
     )
     conn.executemany(
         _INSERT_COVERAGE_SQL, [(publication_id, *row) for row in build.coverage]
+    )
+    # C3: the rain ranking, one pick per day ahead, and the picks the next
+    # incumbent look-back no longer reaches.
+    conn.executemany(
+        _INSERT_RAIN_RANK_SQL, [(publication_id, *row) for row in build.rain_ranks]
+    )
+    conn.executemany(
+        _UPSERT_RAIN_PICK_SQL,
+        [
+            (site_id, cutoff.isoformat(), day_ahead, feed_id)
+            for day_ahead, feed_id in build.rain_picks
+        ],
+    )
+    conn.execute(
+        _DELETE_OLD_RAIN_PICKS_SQL,
+        (site_id, _shift(cutoff, -_RAIN_PICK_KEEP_DAYS).isoformat()),
     )
     _delete_superseded(conn, site_id, published)
     conn.execute(
@@ -1270,6 +1444,57 @@ def _published_wind_now(
         return None
     pub = active_publication(conn, site_id=site_id, at_utc=as_of)
     return {} if pub is None else published_wind_weights(conn, pub=pub)
+
+
+def published_rain_ranks(
+    conn: sqlite3.Connection, site_id: int
+) -> dict[int, RainRanks]:
+    """The active publication's rain ranking, by day ahead (rain release, C3).
+
+    Read as :func:`published_wind_serving` reads the weights: inside the
+    caller's transaction when one is open; otherwise the switch alone, then,
+    only when it is on, the rows in one read snapshot. Empty with the close
+    off, with no publication, and for a publication with no rain rows; a day
+    ahead with no ranked model has no entry, so its tile has no rain
+    forecast. Read-only.
+    """
+    if conn.in_transaction:
+        return _published_rain_now(conn, site_id)
+    if not daily_close_on(conn):
+        return {}
+    with read_snapshot(conn, label="rain_ranks"):
+        return _published_rain_now(conn, site_id)
+
+
+def _published_rain_now(conn: sqlite3.Connection, site_id: int) -> dict[int, RainRanks]:
+    if not daily_close_on(conn):
+        return {}
+    pub = active_publication(conn, site_id=site_id, at_utc=None)
+    if pub is None:
+        return {}
+    rows: dict[int, list[RainRank]] = {}
+    provisional: dict[int, bool] = {}
+    for row in conn.execute(_PUBLISHED_RAIN_SQL, (pub.id,)):
+        day_ahead = int(row["day_ahead"])
+        rows.setdefault(day_ahead, []).append(
+            RainRank(
+                feed_id=int(row["feed_id"]),
+                rank=int(row["rank"]),
+                selected=int(row["selected"]) == 1,
+                in_group=int(row["in_group"]) == 1,
+            )
+        )
+        provisional[day_ahead] = provisional.get(day_ahead, False) or (
+            int(row["provisional"]) == 1
+        )
+    return {
+        day_ahead: RainRanks(
+            day_ahead=day_ahead,
+            provisional=provisional[day_ahead],
+            ranked=tuple(ranked),
+        )
+        for day_ahead, ranked in rows.items()
+    }
 
 
 def _publication_from_row(row: sqlite3.Row) -> Publication:

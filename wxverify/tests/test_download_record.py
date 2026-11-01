@@ -1225,8 +1225,16 @@ def test_dl6_a_later_download_of_the_same_label_cannot_add_hours(
 def test_dl7_two_labels_in_one_download_resolve_to_the_newer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """DL7: one download with labels L1 and L2 both giving hour h."""
+    """DL7: one download with labels L1 and L2 both giving hour h.
+
+    Two labels of one hour exist only in a file below v16: since the rain
+    release (Part B) ``idx_samples_slot`` keeps one row per hour, and
+    ``scored_version`` reads such a file in the v16 carry-over
+    (``migrate_v16_rain_release``, step 1). The index is dropped to build
+    that shape.
+    """
     db, conn, site_id, feed_ids, _standin, _clock = _setup(tmp_path, monkeypatch)
+    conn.execute("DROP INDEX idx_samples_slot")
     feed_id = feed_ids["X"]
     fetched_at = _stamp(datetime(S.year, S.month, S.day, 0, 10, tzinfo=UTC))
     l1 = _stamp(datetime(S.year, S.month, S.day, 0, 0, tzinfo=UTC))

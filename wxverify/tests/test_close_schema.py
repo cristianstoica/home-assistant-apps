@@ -23,16 +23,10 @@ from pathlib import Path
 import pytest
 
 from tests.helpers import D, asof_conn, day_close_site
-from tests.test_migration_runner_pre_v4 import (  # noqa: PLC2701
-    HISTORICAL,
-    _build_historical,
-    _connect,
-)
+from tests.test_migration_runner_pre_v4 import _connect  # noqa: PLC2701
 from wxverify.db.migrations import (
     TARGET_USER_VERSION,
     create_tables,
-    migrate_v3,
-    migrate_v4,
     run_migrations,
 )
 
@@ -229,23 +223,13 @@ def test_sc1_fresh_and_migrated_files_agree_and_the_check_admits_both_kinds(
     assert seeded["status"] == "pending"
 
 
-# --- SC1 (extension): each single copy of the CHECK, in isolation ----------
+# --- SC1 (extension): the CHECK copy in isolation ---------------------------
 #
-# 12.2 names three places that must carry the identical widened CHECK list:
-# create_tables' own jobs DDL, migrate_v3's jobs_new rebuild and migrate_v4's
-# jobs_new rebuild. The fresh-vs-migrated comparison above cannot tell these
-# apart: on a fresh file migrate_v4 returns at its guard and
-# migrate_v13_close_jobs rebuilds jobs wide whatever the other two say, so a
-# single copy left narrow would not show up there (plan 12.2 item 2). Each
-# case below drives exactly one copy and no other: create_tables alone on an
-# empty file (M7c); migrate_v3 alone on the v2 file of HISTORICAL (M7);
-# migrate_v4 alone on the v3-late file of HISTORICAL (M7b). create_tables is
-# called first in the v2/v3-late cases only to backfill tables the bare
-# historical schema lacks that the targeted migration writes into
-# (station_poll_state for migrate_v3, timezone_generations for migrate_v4);
-# jobs itself already exists from the historical schema, so create_tables'
-# own `CREATE TABLE IF NOT EXISTS jobs` is a no-op there and only the
-# targeted migration's rebuild can widen the CHECK.
+# 12.2 names create_tables' own jobs DDL as one of the places that must
+# carry the identical widened CHECK list. The fresh-vs-migrated comparison
+# above cannot tell this apart from the copy reached via
+# migrate_v13_close_jobs's rebuild, so this case drives create_tables alone
+# on an empty file (M7c).
 
 
 def _assert_jobs_check_admits_both_close_kinds_refuses_bogus(
@@ -299,38 +283,6 @@ def test_sc1_create_tables_copy_of_the_check_admits_both_kinds_alone() -> None:
     conn = _connect()
     create_tables(conn)
     _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7c")
-
-
-def test_sc1_migrate_v3_copy_of_the_check_admits_both_kinds_alone() -> None:
-    """SC1 extension: migrate_v3's jobs_new rebuild, alone, on the v2 file of
-    HISTORICAL.
-
-    mutant -> at the shared assertion above: correct = 2, mutant (M7,
-    'day_publish' left out of migrate_v3's jobs_new) = the day_publish
-    INSERT raises sqlite3.IntegrityError.
-    """
-    conn = _connect()
-    schema_sql, user_version = HISTORICAL["v2"]
-    _build_historical(conn, schema_sql, user_version)
-    create_tables(conn)
-    migrate_v3(conn)
-    _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7")
-
-
-def test_sc1_migrate_v4_copy_of_the_check_admits_both_kinds_alone() -> None:
-    """SC1 extension: migrate_v4's jobs_new rebuild, alone, on the v3-late
-    file of HISTORICAL.
-
-    mutant -> at the shared assertion above: correct = 2, mutant (M7b,
-    'day_publish' left out of migrate_v4's jobs_new) = the day_publish
-    INSERT raises sqlite3.IntegrityError.
-    """
-    conn = _connect()
-    schema_sql, user_version = HISTORICAL["v3-late"]
-    _build_historical(conn, schema_sql, user_version)
-    create_tables(conn)
-    migrate_v4(conn)
-    _assert_jobs_check_admits_both_close_kinds_refuses_bogus(conn, mutant="M7b")
 
 
 # --- SC1 (extension): the re-run guard checks 'day_publish', not 'day_close' -

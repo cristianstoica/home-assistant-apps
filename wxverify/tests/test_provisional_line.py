@@ -643,3 +643,76 @@ def test_pl11_writes_no_scoring_or_truth_row(monkeypatch: pytest.MonkeyPatch) ->
             " `write_station_observation` called for the jump check, which"
             " would add or change a row in this table."
         )
+
+
+def test_pl12_set_aside_station_left_out_of_todays_rain() -> None:
+    """PL12 (rain release, Part A follow-up): a station the rain check set
+    aside for D (``rain_counted = 0`` on D's list row) does not count in
+    D's provisional rain line, and counts again once taken back. A reads
+    0.0 all morning; B's running total rises by 2.0 mm in hour 03:00, so
+    the two-station median differs from B's own value. Temperature is
+    read from every listed station either way."""
+    from wxverify.provisional_line import provisional_site_hours
+
+    conn = asof_conn()
+    site_id = day_close_site(conn, close_on=True)
+    station_a = _station_id(conn, site_id, "ISTATION01")
+    station_b = _station_id(conn, site_id, "ISTATION02")
+    now = datetime(D.year, D.month, D.day, 12, 20, tzinfo=UTC)
+    store_readings(
+        conn,
+        station_id=station_a,
+        source="five_minute",
+        readings=_five_minute_readings(D),
+        fetched_at=now,
+        now_utc=now,
+    )
+    for start, end, total in (((0, 0), (2, 55), 0.0), ((3, 0), (12, 15), 2.0)):
+        store_readings(
+            conn,
+            station_id=station_b,
+            source="five_minute",
+            readings=_five_minute_readings(D, rain_mm=total, start=start, end=end),
+            fetched_at=now,
+            now_utc=now,
+        )
+    b_alone = (
+        hourly_values(conn, site_id=site_id, local_date=D, through_utc=floor_hour(now))
+        .stations[station_b]
+        .values["precip"][_hour(3)]
+        .value
+    )
+
+    def _set_rain_counted(counted: int) -> None:
+        cur = conn.execute(
+            "UPDATE site_day_stations SET rain_counted = ?"
+            " WHERE site_id = ? AND local_date = ? AND station_id = ?",
+            (counted, site_id, D.isoformat(), station_a),
+        )
+        assert cur.rowcount == 1
+
+    def _lines() -> tuple[float | None, dict[datetime, float]]:
+        rain = provisional_site_hours(
+            conn, site_id=site_id, variable="precip", now_utc=now
+        )
+        temp = provisional_site_hours(
+            conn, site_id=site_id, variable="temperature", now_utc=now
+        )
+        return rain.values.get(_hour(3)), temp.values
+
+    both_rain, both_temp = _lines()
+    assert both_rain is not None
+    assert both_rain != pytest.approx(b_alone), "the fixture must discriminate"
+
+    _set_rain_counted(0)
+    aside_rain, aside_temp = _lines()
+    assert aside_rain == pytest.approx(b_alone), (
+        "correct = only B counts while A is set aside, mutant = the rain line"
+        " still reads every listed station, giving the two-station median"
+    )
+    assert aside_temp == both_temp
+
+    _set_rain_counted(1)
+    back_rain, back_temp = _lines()
+    assert back_rain == pytest.approx(both_rain)
+    assert back_temp == both_temp

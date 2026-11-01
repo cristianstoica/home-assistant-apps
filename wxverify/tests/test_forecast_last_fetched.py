@@ -846,7 +846,12 @@ def test_last_fetched_ignores_contributors_of_an_unavailable_cell() -> None:
         temp=TempCell(meta=available_meta, high_c=10.0, low_c=2.0),
         wind=WindCell(meta=unavailable_meta_with_contributors, max_kmh=None, note=None),
         precip=PrecipCell(
-            meta=empty_meta, total_mm=None, wet_hours=None, show_rain_glyph=False
+            meta=empty_meta,
+            total_mm=None,
+            wet_hours=None,
+            icon=None,
+            agreement_pct=None,
+            feed_label=None,
         ),
         state="normal",
         confidence_state="normal",

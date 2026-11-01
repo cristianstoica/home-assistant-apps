@@ -60,6 +60,7 @@ from wxverify.worker.close_chain import (
     collection_tries,
     stage_log,
 )
+from wxverify.worker.rain_check import rain_not_counted_since
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,9 @@ class StationView:
     dem_elevation_m: float
     enabled: bool
     observation_age: str | None
+    #: The first day the rain check left the station's rain out, ISO date,
+    #: while it is set aside; None while it is counted (rain release, A5).
+    rain_not_counted_since: str | None
 
 
 @dataclass(frozen=True)
@@ -1753,6 +1757,7 @@ def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
         (site_id,),
     ).fetchall()
     now = utc_now()
+    set_aside = rain_not_counted_since(conn, site_id)
     return [
         StationView(
             id=int(row["id"]),
@@ -1762,6 +1767,11 @@ def _load_stations(conn: sqlite3.Connection, site_id: int) -> list[StationView]:
             dem_elevation_m=float(row["dem_elevation_m"]),
             enabled=bool(row["enabled"]),
             observation_age=observation_age_text(row["last_obstime"], now=now),
+            rain_not_counted_since=(
+                since.isoformat()
+                if (since := set_aside.get(int(row["id"]))) is not None
+                else None
+            ),
         )
         for row in rows
     ]

@@ -391,6 +391,10 @@ def _make_db(tmp_path: Path, *, db_path: Path | None = None) -> tuple[Path, int,
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     run_migrations(conn)
+    # The check reads each fetch's rows, a shape only a file below v16 holds:
+    # the rain release (Part B) keeps one row per hour (idx_samples_slot), so
+    # on a v16 export a later fetch replaces an earlier one's hours.
+    conn.execute("DROP INDEX idx_samples_slot")
     site_id = asof_make_site(conn, "Icon-EU Post-Release Site")
     feed_row = conn.execute(
         "SELECT id FROM feeds WHERE source='open-meteo' AND model='icon_eu'"

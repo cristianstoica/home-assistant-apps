@@ -355,12 +355,22 @@ def _station_list(
 def _write_station_list(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> None:
+    """Write the day's list rows (6.2) with each station's rain flag.
+
+    ``rain_counted`` is the ``counted_after`` of the station's latest
+    ``station_rain_checks`` row dated before the day, or 1 when there is
+    none (rain release, Part A).
+    """
     day = local_date.isoformat()
     conn.executemany(
-        "INSERT OR IGNORE INTO site_day_stations (site_id, local_date, station_id)"
-        " VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO site_day_stations"
+        " (site_id, local_date, station_id, rain_counted)"
+        " VALUES (?, ?, ?, COALESCE((SELECT c.counted_after"
+        " FROM station_rain_checks AS c"
+        " WHERE c.site_id = ? AND c.station_id = ? AND c.local_date < ?"
+        " ORDER BY c.local_date DESC LIMIT 1), 1))",
         [
-            (site_id, day, station_id)
+            (site_id, day, station_id, site_id, station_id, day)
             for station_id in _station_list(conn, site_id, local_date)
         ],
     )
@@ -633,6 +643,42 @@ def day_station_ids(
         (site_id, local_date.isoformat()),
     ).fetchall()
     return frozenset(int(row[0]) for row in rows)
+
+
+def day_rain_station_ids(
+    conn: sqlite3.Connection, site_id: int, local_date: date
+) -> frozenset[int]:
+    """The listed stations whose rain the day counts (rain release, A1).
+
+    The day's saved list without the stations the rain check set aside
+    (``rain_counted = 0``). Read-only.
+    """
+    rows = conn.execute(
+        "SELECT station_id FROM site_day_stations"
+        " WHERE site_id = ? AND local_date = ? AND rain_counted = 1",
+        (site_id, local_date.isoformat()),
+    ).fetchall()
+    return frozenset(int(row[0]) for row in rows)
+
+
+def set_rain_counted_after(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    local_date: date,
+    *,
+    counted: int,
+) -> None:
+    """Set the station's rain flag on its list rows dated after ``local_date``.
+
+    The rain check's step 3 (rain release, A4): the day's own row is left
+    as it is, so the change takes effect from the next day.
+    """
+    conn.execute(
+        "UPDATE site_day_stations SET rain_counted = ?"
+        " WHERE site_id = ? AND station_id = ? AND local_date > ?",
+        (1 if counted else 0, site_id, station_id, local_date.isoformat()),
+    )
 
 
 def local_clock_utc(record: DayRecord, hour: int, minute: int) -> datetime:

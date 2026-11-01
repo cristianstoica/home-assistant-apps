@@ -487,11 +487,12 @@ def _fetch_state(
 def samples_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
     """Monotonic change token for a site's stored samples: MAX(rowid).
 
-    Inserting a previously absent sample key (the unique key includes
-    ``issued_at``) advances the fingerprint. A fetch whose samples are all
-    already stored inserts nothing and leaves it unchanged, which is correct
-    because nothing stored changed. The tiles auto-poll reads it through
-    :func:`forecast_fingerprint`, which also follows the fetch stamps.
+    A sample written new or changed takes the next row id
+    (``persist_fetch_result``), which advances the fingerprint. A fetch whose
+    samples are all already stored writes nothing and leaves it unchanged,
+    which is correct because nothing stored changed. The tiles auto-poll
+    reads it through :func:`forecast_fingerprint`, which also follows the
+    fetch stamps.
     """
     row = conn.execute(
         "SELECT COALESCE(MAX(id), 0) AS fp FROM forecast_samples WHERE site_id = ?",

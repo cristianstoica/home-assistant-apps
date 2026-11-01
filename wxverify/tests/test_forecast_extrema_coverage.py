@@ -44,7 +44,7 @@ import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
-from tests.helpers import asof_persistence_feed_id
+from tests.helpers import asof_persistence_feed_id, seed_rain_ranks
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.migrations import run_migrations
 from wxverify.db.switch import ensure_site_generation
@@ -686,8 +686,8 @@ def test_hourly_drilldown_survives_temperature_suppression() -> None:
 
 
 # ===========================================================================
-# F-T17 -- precipitation shares temperature's extrema-coverage rule (Item G),
-# so the SAME 12h partial fixture suppresses both.
+# F-T17 -- precipitation needs a whole local day too (Item G; rain release
+# C4: the winner's), so the SAME 12h partial fixture suppresses both.
 # ===========================================================================
 
 
@@ -713,6 +713,8 @@ def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
         valid_ats=valid_ats,
         value=1.0,
     )
+    # Rain release, C4: the feed is the published rain ranking's only model.
+    seed_rain_ranks(conn, site_id=1, published_at=now, ranked={0: [feed_id]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=now
@@ -720,16 +722,17 @@ def test_temperature_and_precip_suppress_on_the_same_partial_day() -> None:
     today = view.tiles[0]
     assert today.temp.meta.extrema_unavailable is True  # temperature suppressed
 
-    # Precipitation (Item G) now shares temperature's rule: 12 of 24 hours
-    # is short of a whole local day covered exactly once, so the feed is
-    # not extrema-eligible and the daily total/wet-hours are suppressed --
+    # Precipitation (rain release, C4) needs a whole local day covered
+    # exactly once from its winner: 12 of 24 hours is short of it, so the
+    # ranked feed is no winner and the daily total/wet-hours are absent --
     # not aggregated from the 12h partial range.
-    assert today.precip.meta.extrema_unavailable is True
+    assert today.precip.meta.state == "not_available"
     assert today.precip.total_mm is None
     assert today.precip.wet_hours is None
-    # The >=18h clearing-subset guard is unaffected by the extrema rule, so
-    # "partial" still fires on this same 12h shape.
-    assert today.precip.meta.partial is True
+    # The rain cell has no clearing subset, so it never sets "partial"; the
+    # >=18h guard still fires on temperature's same 12h shape.
+    assert today.precip.meta.partial is False
+    assert today.temp.meta.partial is True
     assert today.partial is True  # tile-level badge still fires
 
 
@@ -2032,14 +2035,15 @@ def test_tile_level_rollup_across_variables() -> None:
     )
     assert view.tiles[0].stale is True
 
-    # (2) Only precipitation's own clearing subset is stale -- temperature
-    # fully fresh, proving the tile-level ``stale`` union reaches another
-    # cell too, not only temperature's. Precipitation uses a THIRD feed
-    # (never touched by temperature) rather than feed_a:
-    # ``load_feed_freshness`` judges staleness per FEED on one last usable
-    # fetch shared by ALL that feed's variables (``wxverify/forecast/data.py``),
-    # so a stale precipitation cell on feed_a would be masked by that same
-    # feed's fresh stamp -- the trap this isolation avoids.
+    # (2) Only precipitation's own feed is stale -- temperature fully fresh,
+    # proving the tile-level ``stale`` union reaches another cell too, not
+    # only temperature's. Precipitation uses a THIRD feed (never touched by
+    # temperature) rather than feed_a: ``load_feed_freshness`` judges
+    # staleness per FEED on one last usable fetch shared by ALL that feed's
+    # variables (``wxverify/forecast/data.py``), so a stale precipitation
+    # cell on feed_a would be masked by that same feed's fresh stamp -- the
+    # trap this isolation avoids. Rain release, C4: the feed is the rain
+    # ranking's winner, so it needs a full day.
     conn = _make_db()
     _seed_ab_fixture(conn)
     precip_feed = _feed_id(conn, "open-meteo", "icon_global")
@@ -2048,10 +2052,11 @@ def test_tile_level_rollup_across_variables() -> None:
         feed_id=precip_feed,
         variable="precip",
         issued_at=_AB_STALE_ISSUED,
-        valid_ats=_hours(_AB_VALID_DAY, 0, 20),
+        valid_ats=_hours(_AB_VALID_DAY, 0, 24),
         value=0.5,
     )
     _stamp_usable_fetch(conn, feed_id=precip_feed, at=_AB_STALE_ISSUED)
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [precip_feed]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
@@ -2061,32 +2066,35 @@ def test_tile_level_rollup_across_variables() -> None:
     assert today.precip.meta.stale is True
     assert today.stale is True
 
-    # (3) Only a low-confidence PRECIPITATION cell -- no scoring pairs at all
-    # for precipitation (rung 3) beside a fully confident temperature.
-    # Because ``DayTile.state`` rolls up cells' plain ``state`` (not
-    # ``extrema_state``), a low-confidence BLEND-side cell (unlike case (4)
-    # below) moves both ``state`` and ``confidence_state`` together.
+    # (3) Rain release, C4: the rain cell never reads the leaderboard, so
+    # precipitation with no scoring pairs at all (the old rung 3, which made
+    # the cell low-confidence) is a normal cell under a settled rain
+    # ranking. No temperature here: with the daily close on (the ranks are
+    # read only then) and no published temperature ranking, a temperature
+    # cell would be low-confidence on its own.
     conn = _make_db()
-    feed_a, _feed_b = _seed_ab_fixture(conn)
+    feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     _seed_hourly(
         conn,
         feed_id=feed_a,
         variable="precip",
         issued_at=_AB_FRESH_ISSUED,
-        valid_ats=_hours(_AB_VALID_DAY, 0, 20),
+        valid_ats=_hours(_AB_VALID_DAY, 0, 24),
         value=0.5,
     )
+    seed_rain_ranks(conn, site_id=1, published_at=_AB_NOW, ranked={0: [feed_a]})
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
-    assert today.precip.meta.state == "low_confidence"
-    assert today.state == "low_confidence"
-    assert today.confidence_state == "low_confidence"
+    assert today.precip.meta.state == "normal"
+    assert today.precip.meta.extrema_state == "normal"
+    assert today.state == "normal"
+    assert today.confidence_state == "normal"
     html = _render_tiles(site_id=1, view=view)
-    assert '<article class="tile state-low_confidence">' in html
-    assert '<span class="badge warn">low confidence</span>' in html
+    assert '<article class="tile state-normal">' in html
+    assert '<span class="badge warn">low confidence</span>' not in html
 
     # (4) Only temperature's EXTREMA set is low-confidence (blend side
     # confident) -- ``state`` (CSS class) stays "normal" because it never
@@ -2107,66 +2115,53 @@ def test_tile_level_rollup_across_variables() -> None:
     assert '<article class="tile state-normal">' in html
     assert '<span class="badge warn">low confidence</span>' in html
 
-    # (5) Temperature's extrema set is rebuilding (F-T30's construction)
-    # BESIDE a low-confidence precipitation cell -- the rollup's precedence
-    # (low confidence outranks rebuilding) must resolve ACROSS cells, not
-    # only within one cell's own blend/extrema pair: the badge row shows
-    # "low confidence" alone, never "ranking updating" beside it.
+    # (5) Rain release, C4: a low-confidence temperature cell BESIDE a
+    # provisional rain ranking. The rollup's precedence (low confidence
+    # outranks rebuilding) still resolves ACROSS cells for
+    # ``confidence_state``, but the rain ranking's own "ranking updating"
+    # badge shows beside "low confidence" (owner, C6: the badge stays until
+    # a model really has 20 counted days). The old construction, a
+    # rebuilding temperature extrema set beside a low-confidence rain cell,
+    # cannot be built any more: the rain cell is never low-confidence.
+    # Temperature is low-confidence here because the daily close is on (the
+    # rain ranks are read only then) with no published temperature ranking.
     conn = _make_db()
     feed_a = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     feed_b = _feed_id(conn, "open-meteo", "gfs_global")
-    persistence_id = _feed_id(conn, "virtual", "_persistence")
-    set_setting(conn, "forecast_blend_depth", "1")
-    a_ats = _hours(_AB_VALID_DAY, 0, 20)
     _seed_varying(
         conn,
         feed_id=feed_a,
         variable="temperature",
         issued_at=_AB_FRESH_ISSUED,
-        valid_ats=a_ats,
-        values=[10.0 + i * 0.1 for i in range(20)],
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=persistence_id, variable="temperature", day_ahead=0, forecast=8.0
-    )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_a, variable="temperature", day_ahead=0, forecast=10.02
-    )
-    _seed_complete_score_cache(conn, variable="temperature", day_ahead=0)
-    # B: different representative day_ahead (issued the prior calendar
-    # day) from A's, with pairs but no score_cache row at its own cell --
-    # genuinely "rebuilding" (F-T30's construction, not repeated here).
-    _seed_varying(
-        conn,
-        feed_id=feed_b,
-        variable="temperature",
-        issued_at="2026-07-19T20:00:00Z",
         valid_ats=_hours(_AB_VALID_DAY, 0, 24),
-        values=[10.0 + i * 0.05 for i in range(24)],
+        values=[10.0 + i * 0.1 for i in range(24)],
     )
-    _seed_scoring_pairs(
-        conn, feed_id=feed_b, variable="temperature", day_ahead=1, forecast=9.0
-    )
-    # Precipitation: no scoring pairs at all -- low-confidence (rung 3).
     _seed_hourly(
         conn,
-        feed_id=feed_a,
+        feed_id=feed_b,
         variable="precip",
         issued_at=_AB_FRESH_ISSUED,
-        valid_ats=a_ats,
+        valid_ats=_hours(_AB_VALID_DAY, 0, 24),
         value=0.5,
+    )
+    seed_rain_ranks(
+        conn,
+        site_id=1,
+        published_at=_AB_NOW,
+        ranked={0: [feed_b]},
+        provisional={0},
     )
     conn.commit()
     view = build_forecast(
         conn, site_id=1, timezone="UTC", rain_threshold_mm=0.2, now=_AB_NOW
     )
     today = view.tiles[0]
-    assert today.temp.meta.extrema_state == "rebuilding"
-    assert today.precip.meta.state == "low_confidence"
+    assert today.temp.meta.state == "low_confidence"
+    assert today.precip.meta.extrema_state == "rebuilding"
     assert today.confidence_state == "low_confidence"
     html = _render_tiles(site_id=1, view=view)
     assert '<span class="badge warn">low confidence</span>' in html
-    assert '<span class="badge muted">ranking updating</span>' not in html
+    assert '<span class="badge muted">ranking updating</span>' in html
 
     # (6) None of the above -- temperature fully confident and fresh, wind
     # and precip left unpopulated (``not_available``, ignored by both

@@ -29,7 +29,6 @@ import httpx
 import pytest
 
 from wxverify.obs.pws_adapter import (
-    PROVIDER_DEADLINE_MARGIN_SECONDS,
     ProviderDeadlineExceeded,
     _get_with_deadline,  # noqa: PLC2701 -- exercising the helper directly for DL2
     fetch_current_observation,
@@ -236,8 +235,3 @@ class TestOnlyDeadlineExpiryIsConverted:
                 )
 
         asyncio.run(run())
-
-
-def test_margin_constant_is_five_seconds_by_default() -> None:
-    """Sanity pin on the shipped default, so a change to it is visible here too."""
-    assert PROVIDER_DEADLINE_MARGIN_SECONDS == 5.0

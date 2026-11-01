@@ -416,11 +416,13 @@ def test_vc4_the_comparison_is_with_the_last_stored_download(
     )
 
 
-def test_vc6_a_revised_value_under_a_stored_label_is_logged_not_stored(
+def test_vc6_a_revised_value_under_a_stored_label_is_logged_and_stored(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """VC6: a download with the provider's revised value under a label
-    already stored."""
+    already stored. Since the rain release (Part B) ``forecast_samples``
+    holds the newest value of each hour, so the revised value replaces the
+    first; the change is still logged."""
     db, conn, site_id, feed_id, standin, _clock = _setup(tmp_path, monkeypatch)
     label = _stamp(datetime(R.year, R.month, R.day, 0, 0, tzinfo=UTC))
     valid_at = _stamp(datetime(R.year, R.month, R.day, 6, 0, tzinfo=UTC))
@@ -454,9 +456,9 @@ def test_vc6_a_revised_value_under_a_stored_label_is_logged_not_stored(
     assert stored_value is not None, (
         "no forecast_samples row found for the stored label"
     )
-    assert stored_value["value"] == 10.0, (
-        f"M37 -> at this assertion: correct = 10.0 (the first value kept),"
-        f" mutant = {stored_value['value']!r}"
+    assert stored_value["value"] == 15.0, (
+        "Part B -> at this assertion: correct = 15.0 (the newest value"
+        f" stored), mutant (the first value kept) = {stored_value['value']!r}"
     )
 
     rows = _value_change_rows(conn, second_id)

@@ -239,10 +239,9 @@ def test_sc1_every_old_scoring_trigger_queues_and_runs_nothing(
             "scoring run complete" in record.message for record in caplog.records
         )
 
-        # Trigger: a feed fetch storing a sample that pairs now, built the way
-        # tests/test_fetch_score_gate.py:514 builds it: the fetch score gate
-        # must log pairable=True created=False, and enqueue_scoring_run its
-        # own skip, with no job queued.
+        # Trigger: a feed fetch storing a sample that pairs now. The fetch
+        # score gate is deleted (rain release, Part B, B1): the fetch no
+        # longer reaches enqueue_scoring_run at all, and queues no job.
         from wxverify.feeds.seam import FetchResult, NormalizedSample
         from wxverify.worker.feed_fetch import (
             FeedFetchTarget,
@@ -293,13 +292,18 @@ def test_sc1_every_old_scoring_trigger_queues_and_runs_nothing(
         conn.commit()
 
         assert pending_count() == 0
-        assert any(
-            "pairable=True created=False" in record.message for record in caplog.records
-        ), "the fetch score gate must find a pairable sample but create no job"
-        assert any(
-            f"scoring enqueue skipped site={site_id}: daily close on" in record.message
-            for record in caplog.records
-        ), "enqueue_scoring_run must log its own close-on skip"
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM forecast_samples WHERE feed_id = ?", (feed_id,)
+            ).fetchone()[0]
+            == 1
+        ), "the fetch must have stored its sample"
+        assert not any(
+            "fetch score gate" in record.message for record in caplog.records
+        ), "the fetch score gate is deleted"
+        assert not any(
+            "scoring enqueue skipped" in record.message for record in caplog.records
+        ), "the fetch path must not reach enqueue_scoring_run"
 
     # Trigger: scheduler_tick's old six-hour score backstop, built as DO2
     # does (tests/test_close_dormant.py:178-193), on its own connection and

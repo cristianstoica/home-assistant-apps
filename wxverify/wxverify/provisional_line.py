@@ -33,6 +33,7 @@ from wxverify.db.site_days import (
     current_day,
     daily_close_on,
     day_for_instant,
+    day_rain_station_ids,
     day_record,
     zone_flagged,
 )
@@ -240,6 +241,7 @@ def _ok_readings(
     hour: datetime,
     previous: dict[int, float | None],
     elevations: dict[int, float | None],
+    counted: frozenset[int] | None,
 ) -> list[ConsensusReading]:
     """The hour's station values that pass the close's jump check (plan §8.3).
 
@@ -251,6 +253,8 @@ def _ok_readings(
     values are kept, each with its station's ``dem_elevation_m``, as
     ``materialize_consensus`` builds its input; a station with no
     ``stations`` row is left out, as that function's join leaves it out.
+    When ``counted`` is given (rain), a station outside it is left out too:
+    the rain check set it aside for the day, as the close leaves it out.
     """
     readings: list[ConsensusReading] = []
     for station_id in sorted(day.stations):
@@ -265,6 +269,8 @@ def _ok_readings(
             elevations[station_id] = _dem_elevation(conn, station_id)
         dem_elevation_m = elevations[station_id]
         if flag != "ok" or dem_elevation_m is None:
+            continue
+        if counted is not None and station_id not in counted:
             continue
         readings.append(
             ConsensusReading(
@@ -292,8 +298,10 @@ def provisional_site_hours(
     UTC hour; for an earlier day, every hour. Each hour's station values go
     through the close's jump check and, the ``ok`` ones, to
     ``compute_consensus`` with the stations' and the site's elevations and
-    ``MAD_FLOORS``; an hour with no consensus has no value. A station's
-    previous value carries across the days drawn. Read-only.
+    ``MAD_FLOORS``; an hour with no consensus has no value. Rain reads only
+    the day's rain-counted stations (``day_rain_station_ids``), as the close
+    does. A station's previous value carries across the days drawn.
+    Read-only.
     """
     now = _as_utc(now_utc)
     quantity = _QUANTITY_BY_VARIABLE.get(variable)
@@ -316,6 +324,11 @@ def provisional_site_hours(
         day = hourly_values(
             conn, site_id=site_id, local_date=span.local_date, through_utc=through
         )
+        counted = (
+            day_rain_station_ids(conn, site_id, span.local_date)
+            if quantity == "precip"
+            else None
+        )
         stamps.extend(
             station.latest_reading_at
             for station in day.stations.values()
@@ -325,7 +338,9 @@ def provisional_site_hours(
             if through is not None and hour >= through:
                 break
             drawn.append(hour)
-            readings = _ok_readings(conn, day, quantity, hour, previous, elevations)
+            readings = _ok_readings(
+                conn, day, quantity, hour, previous, elevations, counted
+            )
             result = compute_consensus(
                 readings,
                 variable=quantity,

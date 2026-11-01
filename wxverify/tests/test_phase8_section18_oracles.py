@@ -1,14 +1,12 @@
 """Phase 8 Round C — the §18 named oracle families for 0.11.0.
 
-Four families live here, each pinned against the mutation it exists to kill
+Three families live here, each pinned against the mutation it exists to kill
 (named in the test docstring, not just in a report).
 
 * **NB-4** — the canonical depth/variable roster. ``DEPTH_VARIABLES`` and its
   four derived aliases, plus ``depth_option_values()``'s key set, pinned with
   tuple/set EQUALITY so an added, removed, renamed or REORDERED variable in
   one module without the others fails loudly.
-* **NB-1** — ``_contingency`` fails closed on an empty or partially covered
-  strict common core, in lockstep with ``_continuous_metrics``.
 * **NB-9** — ``current_result_basis_fingerprint`` is a pure read: proven
   against a connection with SQLite's ``query_only`` pragma engaged, where
   any write raises.
@@ -16,6 +14,18 @@ Four families live here, each pinned against the mutation it exists to kill
   transcribed from §16 of the specification (quoted per entry below), NOT
   read off the template — an oracle derived from the page it checks cannot
   catch an element the page dropped.
+
+Family 2 (NB-1, ``_contingency``/``_continuous_metrics`` fail-closed on a
+partial common core) was removed: both are called only from
+``verification.engine._write_result``, reached only from ``aggregate_run``,
+the nightly replay function that has no caller outside its own module (no
+install runs the daily close off, and only the close-off lane runs the
+replay). The other three families stay: ``depth_option_values`` is read by
+``settings/service.py`` on every settings save, and
+``current_result_basis_fingerprint`` is read by
+``verification.runs.result_basis_freshness``, shared by
+``/api/verification/status`` and the live ``/verification`` page — both run
+regardless of the daily close.
 
 Every fixture value is synthetic: invented site names, RFC-5737-style fake
 identifiers, ``UTC``/``Etc/GMT-3`` timezones, and hand-made feed ids.
@@ -42,10 +52,6 @@ from wxverify.db.connection import close_db, init_db
 from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
 from wxverify.settings.depth import DEPTH_VARIABLES
-from wxverify.verification.engine import (  # noqa: PLC2701
-    _contingency,
-    _continuous_metrics,
-)
 from wxverify.verification.record import RECORD_VARIABLES
 from wxverify.verification.runs import (
     capture_config_snapshot,
@@ -55,7 +61,6 @@ from wxverify.verification.runs import (
     result_basis_fingerprint,
 )
 from wxverify.verification.simulate import SIM_VARIABLES
-from wxverify.verification.stats import Contingency
 
 # ===========================================================================
 # Family 1 — NB-4: the depth roster is ONE tuple, pinned by equality.
@@ -138,136 +143,6 @@ class TestDepthRosterLockstep:
             if name.startswith("forecast_blend_depth_")
         }
         assert declared == set(DEPTH_VARIABLES)
-
-
-# ===========================================================================
-# Family 2 — NB-1: _contingency fails closed on a partially covered core.
-# ===========================================================================
-
-
-def _outcome_rows(
-    entries: list[tuple[str, float, float, str | None]],
-) -> dict[str, sqlite3.Row]:
-    """Real ``sqlite3.Row`` objects keyed by date — no mock rows.
-
-    The engine indexes rows by mapping key, so the shape has to be the real
-    one: a partially covered core is a genuinely MISSING dict key, which is
-    exactly the condition the guard tests for.
-    """
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        "CREATE TABLE ev (d TEXT, predicted REAL, truth_value REAL,"
-        " occurrence_outcome TEXT)"
-    )
-    conn.executemany("INSERT INTO ev VALUES (?, ?, ?, ?)", entries)
-    rows = {str(row["d"]): row for row in conn.execute("SELECT * FROM ev ORDER BY d")}
-    conn.close()
-    return rows
-
-
-_FULL_ENTRIES = [
-    ("2026-05-01", 3.0, 1.0, "hit"),
-    ("2026-05-02", 0.0, 4.0, "miss"),
-    ("2026-05-03", 2.0, 0.0, "false_alarm"),
-]
-
-
-class TestContingencyFailsClosed:
-    def test_empty_core_returns_none_never_a_zeroed_table(self) -> None:
-        """§16: 'insufficient' is never encoded as numeric zero.
-
-        Kills: dropping the ``not dates`` conjunct from the NB-1 guard. The
-        loop body would then never run and publish a 0/0/0/0 contingency,
-        which is indistinguishable on the page from a real day of all
-        correct negatives.
-        """
-        rows = _outcome_rows(_FULL_ENTRIES)
-        assert _contingency(rows, []) is None
-        # The distinction the pin protects: a REAL all-correct-negative core
-        # is a legitimate, non-None table with n == its day count.
-        negatives = _outcome_rows(
-            [
-                ("2026-05-01", 0.0, 0.0, "correct_negative"),
-                ("2026-05-02", 0.0, 0.0, "correct_negative"),
-            ]
-        )
-        real = _contingency(negatives, ["2026-05-01", "2026-05-02"])
-        assert real == Contingency(correct_negatives=2)
-        assert real is not None and real.n == 2
-
-    def test_partially_covered_core_returns_none_never_a_short_count(
-        self,
-    ) -> None:
-        """Kills: dropping the ``any(d not in rows for d in dates)``
-        conjunct. The counts would then be tallied over the 2 covered days
-        while ``common_days`` beside them says 3 — a table describing a
-        different sample than the column claims.
-        """
-        rows = _outcome_rows(_FULL_ENTRIES[:2])
-        core = ["2026-05-01", "2026-05-02", "2026-05-03"]
-        assert _contingency(rows, core) is None
-        # Paired positive on the SAME rows: the covered sub-core scores.
-        assert _contingency(rows, core[:2]) == Contingency(hits=1, misses=1)
-
-    def test_missing_date_anywhere_in_the_core_fails_closed(self) -> None:
-        """Kills: narrowing the coverage check to the first or last date
-        (e.g. ``dates[0] not in rows``) — a hole in the middle would slip
-        through with a short count.
-        """
-        rows = _outcome_rows([_FULL_ENTRIES[0], _FULL_ENTRIES[2]])
-        assert _contingency(rows, [e[0] for e in _FULL_ENTRIES]) is None
-
-    def test_fully_covered_core_scores_every_day(self) -> None:
-        """Non-vacuity anchor: the guard must not fail closed on a core it
-        fully covers. Kills: inverting the guard, or widening it to any
-        NULL-outcome day.
-        """
-        rows = _outcome_rows(
-            [*_FULL_ENTRIES, ("2026-05-04", 0.0, 0.0, "correct_negative")]
-        )
-        table = _contingency(rows, [e[0] for e in _FULL_ENTRIES] + ["2026-05-04"])
-        assert table == Contingency(
-            hits=1, misses=1, false_alarms=1, correct_negatives=1
-        )
-
-    def test_unclassified_day_is_counted_in_neither_cell(self) -> None:
-        """A covered day whose outcome is NULL contributes to no cell but
-        does not void the table.
-
-        Kills: turning the NULL-outcome skip into a fail-closed return (an
-        over-eager guard), and equally, counting NULL as a correct negative.
-        """
-        rows = _outcome_rows([*_FULL_ENTRIES[:1], ("2026-05-02", 1.0, 1.0, None)])
-        assert _contingency(rows, ["2026-05-01", "2026-05-02"]) == Contingency(hits=1)
-
-
-_GUARD_MATRIX: list[tuple[str, list[str], bool]] = [
-    ("empty core", [], False),
-    ("first date missing", ["2026-04-30", "2026-05-01"], False),
-    ("middle date missing", ["2026-05-01", "2026-04-30", "2026-05-02"], False),
-    ("last date missing", ["2026-05-01", "2026-05-99"], False),
-    ("single covered date", ["2026-05-02"], True),
-    ("fully covered core", ["2026-05-01", "2026-05-02", "2026-05-03"], True),
-]
-
-
-@pytest.mark.parametrize(("label", "dates", "measurable"), _GUARD_MATRIX)
-def test_contingency_and_continuous_guards_cannot_drift_apart(
-    label: str, dates: list[str], measurable: bool
-) -> None:
-    """The two guards are one rule stated twice; this pins them together.
-
-    Kills (either direction): relaxing the guard in ``_contingency`` alone,
-    or in ``_continuous_metrics`` alone. Both must return None on exactly the
-    same inputs, and both must return a value on exactly the same inputs —
-    so a mutation to either side is caught even if the sibling is untouched.
-    """
-    rows = _outcome_rows(_FULL_ENTRIES)
-    table = _contingency(rows, dates)
-    continuous = _continuous_metrics(rows, dates)
-    assert (table is None) == (continuous is None), label
-    assert (table is not None) is measurable, label
 
 
 # ===========================================================================
