@@ -42,12 +42,10 @@ hold across the run's life, and neither is absolute:
   hashed here, so an intervening consensus change only marks rows stale
   and leaves this digest alone. Excluding ``stale`` from the digest is a
   hashing choice and not a claim that a marked day still re-derives to
-  what it stored, so ``divergent_truth_in_horizon`` supplies that
-  enforcement instead — re-deriving every marked day of the run's
-  generation inside the horizon before publish and failing the run when
-  one no longer matches. Administrative paths — database import/replace,
-  repair tooling, migrations — have not been traced against an active run
-  and are outside this claim.
+  what it stored; the pre-publish re-derivation that enforced that was
+  retired with the nightly replay (switch-over plan G16). Administrative
+  paths — database import/replace, repair tooling, migrations — have not
+  been traced against an active run and are outside this claim.
 
 Pinning at ``start_run`` does not DEPEND on absolute immutability. What
 matters is that the recorded fingerprint accurately describes the basis
@@ -873,11 +871,6 @@ SUPERSEDED_REASON_PREFIX = "superseded:"
 #: publish hold suppressed the nightly enqueue, mirrored here for the two
 #: reader surfaces. The scheduler owns the write; this is the read-side name.
 PUBLISH_HOLD_REASON = "publish_hold"
-
-#: §D13 reason recorded on a `verification_run` job/run neutralized because it
-#: arrived via import while still active in the donor. One definition, used by
-#: `db_transfer.py` and by the tests — no caller may spell the string literally.
-IMPORT_SUPPRESSED_REASON = "suppressed: imported active verification chain"
 
 #: §12 trigger-status values carried on both the API status payload and the
 #: /verification page context.

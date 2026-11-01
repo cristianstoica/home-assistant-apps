@@ -20,7 +20,6 @@ from wxverify.collection.budget import reserve_budget
 from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc_micro, utc_now
 from wxverify.db.connection import FencedWriter, get_db
-from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import (
     StationChange,
     current_day_has_other_station,
@@ -379,8 +378,8 @@ async def create_station(
             )
         clear_domain_backoff(conn, source_domain("weathercom"))
         clear_domain_backoff(conn, source_domain("open-meteo"))
-        if held is None:
-            enqueue_if_absent(conn, "fetch_obs", site_id, "obs", {})
+        # No job is queued: a new station counts from its next full local day
+        # and is collected by the daily schedule (switch-over plan 7.2, R2).
         row = conn.execute(
             "SELECT * FROM stations WHERE id=?", (station_id,)
         ).fetchone()

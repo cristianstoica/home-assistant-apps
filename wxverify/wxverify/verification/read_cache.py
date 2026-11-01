@@ -476,8 +476,7 @@ async def warm_read_cache(db: Database) -> None:
         # The two placements are semantically identical, but a `_note_warm`
         # above the `try` would be the one statement in this function the total
         # catch does not cover -- the single path on which this coroutine can
-        # raise `Exception`, which the docstring contract above and
-        # `verification_run.py`'s "cannot fail the run" comment both forbid.
+        # raise `Exception`, which the docstring contract above forbids.
         _note_warm("running", failures)
 
         def _snapshot(

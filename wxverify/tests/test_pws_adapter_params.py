@@ -6,14 +6,13 @@ these tests capture the outgoing GET params for every call site that must carry
 it:
 
   - fetch_hourly_history  (observations/hourly/7day)
-  - fetch_hourly_history_range  (history/hourly)
   - fetch_current_observation  (observations/current)
 
 validate_station is deliberately excluded: it is a station-existence probe and
 is precision-insensitive by design.
 
 Convention: httpx.MockTransport with a synchronous handler function, matching
-the pattern established in test_m1_m5.py for fetch_hourly_history_range.
+the pattern established in test_m1_m5.py for fetch_hourly_history.
 The handler asserts the expected params directly, making a wrong or absent param
 an immediate test failure rather than a silent mismatch.
 """
@@ -31,7 +30,6 @@ import pytest
 from wxverify.obs.pws_adapter import (
     fetch_current_observation,
     fetch_hourly_history,
-    fetch_hourly_history_range,
 )
 
 # ---------------------------------------------------------------------------
@@ -174,147 +172,7 @@ class TestFetchHourlyHistoryParams:
 
 
 # ---------------------------------------------------------------------------
-# Class 2: fetch_hourly_history_range — numericPrecision regression pin
-# ---------------------------------------------------------------------------
-
-
-class TestFetchHourlyHistoryRangeParams:
-    """fetch_hourly_history_range sends numericPrecision=decimal on every call."""
-
-    # A narrow window that crosses midnight so date-range logic is exercised.
-    _WINDOW_START = "2026-07-09T23:00:00Z"
-    _WINDOW_END = "2026-07-10T01:00:00Z"
-
-    # Payload with one record inside the window.
-    _RANGE_PAYLOAD = {
-        "observations": [
-            {
-                "obsTimeUtc": "2026-07-10T00:30:00Z",
-                "metric": {
-                    "tempAvg": 14.7,
-                    "windspeedAvg": 10.0,
-                    "precipTotal": 0.0,
-                },
-            }
-        ]
-    }
-
-    def test_numeric_precision_decimal_sent(self) -> None:
-        """numericPrecision=decimal present in the GET to history/hourly."""
-        captured: list[httpx.Request] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            assert request.url.params["numericPrecision"] == "decimal", (
-                "fetch_hourly_history_range must send numericPrecision=decimal; "
-                f"got params: {dict(request.url.params)}"
-            )
-            return _json_response(self._RANGE_PAYLOAD)
-
-        async def run() -> object:
-            async with httpx.AsyncClient(
-                transport=httpx.MockTransport(handler)
-            ) as client:
-                return await fetch_hourly_history_range(
-                    _STATION_ID,
-                    _API_KEY,
-                    window_start=self._WINDOW_START,
-                    window_end=self._WINDOW_END,
-                    client=client,
-                )
-
-        asyncio.run(run())
-        assert len(captured) == 1
-
-    def test_all_required_params_sent(self) -> None:
-        """stationId, format, units, startDate, endDate, numericPrecision, apiKey all
-        present."""
-        captured: list[httpx.Request] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            params = dict(request.url.params)
-            assert params["stationId"] == _STATION_ID
-            assert params["format"] == "json"
-            assert params["units"] == "m"
-            assert params["numericPrecision"] == "decimal"
-            assert params["apiKey"] == _API_KEY
-            # startDate and endDate must be present (date strings in YYYYMMDD form)
-            assert "startDate" in params, "startDate must be present"
-            assert "endDate" in params, "endDate must be present"
-            return _json_response(self._RANGE_PAYLOAD)
-
-        async def run() -> object:
-            async with httpx.AsyncClient(
-                transport=httpx.MockTransport(handler)
-            ) as client:
-                return await fetch_hourly_history_range(
-                    _STATION_ID,
-                    _API_KEY,
-                    window_start=self._WINDOW_START,
-                    window_end=self._WINDOW_END,
-                    client=client,
-                )
-
-        asyncio.run(run())
-        assert len(captured) == 1
-
-    def test_endpoint_path_is_history_hourly(self) -> None:
-        """Request targets the pws/history/hourly endpoint."""
-        captured: list[httpx.Request] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            captured.append(request)
-            assert "/pws/history/hourly" in request.url.path, (
-                f"unexpected path: {request.url.path}"
-            )
-            return _json_response(self._RANGE_PAYLOAD)
-
-        async def run() -> object:
-            async with httpx.AsyncClient(
-                transport=httpx.MockTransport(handler)
-            ) as client:
-                return await fetch_hourly_history_range(
-                    _STATION_ID,
-                    _API_KEY,
-                    window_start=self._WINDOW_START,
-                    window_end=self._WINDOW_END,
-                    client=client,
-                )
-
-        asyncio.run(run())
-        assert len(captured) == 1
-
-    def test_empty_window_makes_no_request(self) -> None:
-        """window_end <= window_start → short-circuit, no HTTP call made.
-
-        Paired negative: if the guard were absent, the handler would be called
-        and the window-range assertion above would be trivially vacuous.
-        """
-        called: list[bool] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
-            called.append(True)
-            return _json_response({"observations": []})
-
-        async def run() -> object:
-            async with httpx.AsyncClient(
-                transport=httpx.MockTransport(handler)
-            ) as client:
-                return await fetch_hourly_history_range(
-                    _STATION_ID,
-                    _API_KEY,
-                    window_start="2026-07-10T01:00:00Z",
-                    window_end="2026-07-10T01:00:00Z",  # equal → empty
-                    client=client,
-                )
-
-        asyncio.run(run())
-        assert called == [], "empty window must short-circuit without an HTTP call"
-
-
-# ---------------------------------------------------------------------------
-# Class 3: fetch_current_observation — numericPrecision regression pin
+# Class 2: fetch_current_observation — numericPrecision regression pin
 # ---------------------------------------------------------------------------
 
 

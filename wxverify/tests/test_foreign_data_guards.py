@@ -306,15 +306,6 @@ def _setup_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at(
     return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "43199.5")
 
 
-def _setup_sites_last_obs_cycle_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
-    site_id = _insert_site(conn)
-    _insert_station(conn, site_id, "PWS-CASE-OBS")
-    conn.execute(
-        "UPDATE sites SET last_obs_cycle_at = x'0001' WHERE id = ?", (site_id,)
-    )
-    return _ExpectedJobs(must_exist=(("fetch_obs", site_id, "obs"),))
-
-
 def _setup_stations_site_id_hostile(
     conn: sqlite3.Connection, literal: str
 ) -> _ExpectedJobs:
@@ -423,12 +414,6 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         setup=(
             _setup_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at
         ),
-    ),
-    _TickCarrierCase(
-        case_id="sites_last_obs_cycle_at_blob",
-        logger_name="wxverify.worker.scheduler",
-        warning_substring="last_obs_cycle_at",
-        setup=_setup_sites_last_obs_cycle_at_blob,
     ),
     _TickCarrierCase(
         case_id="stations_site_id_real_infinity",

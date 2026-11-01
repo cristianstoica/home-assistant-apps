@@ -660,8 +660,6 @@ def test_smoke_requires_usable_samples_and_accepts_idempotent_success(
     empty = False
 
     class FakeAdapter:
-        supports_historical = True
-
         def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -688,11 +686,6 @@ def test_smoke_requires_usable_samples_and_accepts_idempotent_success(
                 ],
                 grid=GridProvenance(grid_lat=40.0, grid_lon=-105.0),
             )
-
-        async def fetch_historical(
-            self, req: ForecastRequest, *, window_start: str, window_end: str
-        ) -> FetchResult | None:
-            return None
 
     def fake_build_adapter(source: str, client: httpx.AsyncClient) -> FakeAdapter:
         assert source == "open-meteo"

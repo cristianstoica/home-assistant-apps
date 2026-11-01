@@ -78,9 +78,7 @@ from wxverify.db.site_days import (
     finish_close,
     mark_missed,
 )
-from wxverify.db.switch import site_generation_id
 from wxverify.verification.coverage import local_day_bounds
-from wxverify.verification.truth import _evaluate_day  # the PRE-split name, still live
 
 R = STANDARD_NIGHT_R
 BOUND = STANDARD_NIGHT_ROUND_BOUND
@@ -115,20 +113,6 @@ def _bounds():  # type: ignore[no-untyped-def]
     return local_day_bounds(D, "UTC")
 
 
-def _old_outcome(conn, site_id: int, quantity: str):  # type: ignore[no-untyped-def]
-    """The CURRENT ``_evaluate_day``'s outcome for ``quantity`` on D, under
-    the site's published generation -- the cross-check 15.8's preamble asks
-    every VD row to make against the new ``evaluate_day_window`` entry
-    point.
-    """
-    gen_id = site_generation_id(conn, site_id)
-    assert gen_id is not None
-    old = _evaluate_day(
-        conn, site_id=site_id, local_date=D.isoformat(), tz_generation_id=gen_id
-    )
-    return old.outcomes[quantity]
-
-
 # ---------------------------------------------------------------------------
 # VD1
 # ---------------------------------------------------------------------------
@@ -158,9 +142,6 @@ def test_vd1_the_18_hour_minimum_is_the_exact_boundary() -> None:
         "insufficient_coverage",
     ), "17 covered hours must leave the high ineligible, insufficient_coverage"
     assert (low17.eligible, low17.exclusion_reason) == (False, "insufficient_coverage")
-    assert high17 == _old_outcome(conn, site_id, "temperature_high"), (
-        "evaluate_day_window must reproduce _evaluate_day's own answer exactly"
-    )
 
     _seed_obs(conn, site_id, "temperature", 17, 27.0)
     conn.commit()
@@ -173,8 +154,6 @@ def test_vd1_the_18_hour_minimum_is_the_exact_boundary() -> None:
         "18 covered hours must make the high eligible (the exact boundary)"
     )
     assert (low18.eligible, low18.exclusion_reason) == (True, None)
-    assert high18 == _old_outcome(conn, site_id, "temperature_high")
-    assert low18 == _old_outcome(conn, site_id, "temperature_low")
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +186,6 @@ def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
         False,
         "missing_peak_window",
     ), "high must be ineligible for a missing peak window even with 18 covered hours"
-    assert high1 == _old_outcome(conn, site_id, "temperature_high")
 
     conn.execute("DELETE FROM observations WHERE site_id = ?", (site_id,))
     conn.commit()
@@ -225,7 +203,6 @@ def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
         True,
         None,
     ), "hour 17 alone satisfies the high's peak window, so 19 covered hours is eligible"
-    assert high2 == _old_outcome(conn, site_id, "temperature_high")
 
     conn.execute("DELETE FROM observations WHERE site_id = ?", (site_id,))
     conn.commit()
@@ -243,7 +220,6 @@ def test_vd2_the_peak_window_is_checked_separately_from_coverage() -> None:
         False,
         "missing_peak_window",
     )
-    assert low3 == _old_outcome(conn, site_id, "temperature_low")
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +249,6 @@ def test_vd3_wind_maximum_near_complete_is_expected_slots_minus_one() -> None:
         True,
         None,
     ), "23 of 24 covered hours is the near-complete boundary -- still eligible"
-    assert wind23 == _old_outcome(conn, site_id, "wind_max")
 
     conn.execute(
         "DELETE FROM observations WHERE site_id = ? AND variable = 'wind'"
@@ -290,7 +265,6 @@ def test_vd3_wind_maximum_near_complete_is_expected_slots_minus_one() -> None:
         False,
         "below_near_complete",
     ), "22 of 24 covered hours is one below the boundary -- ineligible"
-    assert wind22 == _old_outcome(conn, site_id, "wind_max")
 
 
 # ---------------------------------------------------------------------------
@@ -325,7 +299,6 @@ def test_vd4_rain_total_never_counts_a_missing_hour_as_zero() -> None:
     expected_full = sum(_value(h) for h in range(24))
     assert total_full.eligible is True
     assert total_full.value == pytest.approx(expected_full)
-    assert total_full == _old_outcome(conn, site_id, "precip_total")
 
     conn.execute(
         "DELETE FROM observations WHERE site_id = ? AND variable = 'precip'"
@@ -348,7 +321,6 @@ def test_vd4_rain_total_never_counts_a_missing_hour_as_zero() -> None:
         "the partial sum must be exactly the PRESENT hours' values -- never"
         " 0 contributed for a missing hour"
     )
-    assert total_short == _old_outcome(conn, site_id, "precip_total")
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +353,6 @@ def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> No
     assert (occ_a.value, occ_a.eligible, occ_a.exclusion_reason) == (1.0, True, None), (
         "one wet hour (value >= threshold) makes the day wet at ANY coverage"
     )
-    assert occ_a == _old_outcome(conn, site_id, "precip_occurrence")
     conn.execute("DELETE FROM observations WHERE site_id = ?", (site_id,))
 
     # (b) the same hour just below the threshold, short coverage.
@@ -395,7 +366,6 @@ def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> No
         False,
         "dry_without_near_complete",
     ), "no wet hour and short coverage must leave occurrence unknown"
-    assert occ_b == _old_outcome(conn, site_id, "precip_occurrence")
     conn.execute("DELETE FROM observations WHERE site_id = ?", (site_id,))
 
     # (c) a full dry day.
@@ -407,7 +377,6 @@ def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> No
     assert (occ_c.value, occ_c.eligible, occ_c.exclusion_reason) == (0.0, True, None), (
         "a near-complete dry day is a known dry day, eligible, value 0.0"
     )
-    assert occ_c == _old_outcome(conn, site_id, "precip_occurrence")
     conn.execute("DELETE FROM observations WHERE site_id = ?", (site_id,))
 
     # (d) a dry day short of near-complete (two hours missing).
@@ -421,7 +390,6 @@ def test_vd5_one_wet_hour_is_never_ignored_a_dry_day_needs_near_complete() -> No
         False,
         "dry_without_near_complete",
     ), "a dry day short of near-complete coverage gets no verdict, not 0"
-    assert occ_d == _old_outcome(conn, site_id, "precip_occurrence")
 
 
 # ---------------------------------------------------------------------------

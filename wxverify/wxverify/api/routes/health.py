@@ -278,8 +278,8 @@ async def observations_current(
     row (non-null obs) with ``health_state="offline"`` — the LEFT JOIN returns
     the retained row, so null-obs and ``offline`` are separate cases. The
     diagnostic fields (``health_state``, ``next_poll_at``, ``last_error``) come
-    from ``station_poll_state``, never ``stations.last_error`` (which the hourly
-    stream resets on success). Obs values are the stored native ``units:"m"``
+    from ``station_poll_state``, never ``stations.last_error``. Obs values are
+    the stored native ``units:"m"``
     form (km/h wind, hPa, mm) — no conversion in the route. Optional
     ``?station=<id>`` filter; empty registry → ``[]``.
 

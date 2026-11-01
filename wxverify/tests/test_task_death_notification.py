@@ -47,7 +47,7 @@ from fastapi.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app, lifespan
 from wxverify.api.routes.db_transfer import export_sweeper_death
-from wxverify.db.connection import FencedWriter, close_db, init_db
+from wxverify.db.connection import close_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.monitor import build_verdict
 from wxverify.verification import read_cache as rc
@@ -957,31 +957,6 @@ def test_o14_partial_derivation_failure_surfaces_the_fixture_derived_count(
     assert outcome is not None
     assert outcome.state == "ok"
     assert outcome.derivations_failed == 1
-
-
-def test_o15_publish_time_call_site_records_the_outcome(tmp_path: Path) -> None:
-    """The publish-time call site (``worker/verification_run.py:197``) also
-    records — the same self-report covers both call sites for free.
-
-    O15 -> at ``rc.warm_outcome()``: correct = not ``None`` after driving the
-    real chain to its terminal chunk, mutant (instrumenting only the
-    lifespan boot warm, e.g. recording only from ``api/app.py``'s call
-    site) = ``None``, since this path never touches the lifespan at all.
-    """
-    from tests.test_verification_read_cache import _o19_drive_all_chunks, _o19_make_site
-
-    close_db()
-    db = init_db(str(tmp_path / "o15-publish-time.db"))
-    conn = db._conn  # noqa: SLF001
-    site_id = _o19_make_site(conn)
-    payload: dict[str, object] = {"trigger_date": "2026-06-06"}
-    writer = FencedWriter(db, db.generation)
-
-    assert rc.warm_outcome() is None
-    asyncio.run(_o19_drive_all_chunks(db, writer, site_id, payload))
-
-    outcome = rc.warm_outcome()
-    assert outcome is not None
 
 
 # ---------------------------------------------------------------------------

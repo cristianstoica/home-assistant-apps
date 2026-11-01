@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import ClassVar, Final
+from typing import Final
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -58,8 +58,6 @@ class VisualCrossingResponse(BaseModel):
 
 
 class VisualCrossingAdapter:
-    supports_historical: ClassVar[bool] = False
-
     def __init__(
         self, api_key: str, client: httpx.AsyncClient, *, parse_cap_probe: bool = False
     ) -> None:
@@ -98,16 +96,6 @@ class VisualCrossingAdapter:
             len(result.samples),
         )
         return result
-
-    async def fetch_historical(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> FetchResult | None:
-        return None
-
-    def estimate_historical_cost(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> CostEstimate:
-        raise NotImplementedError("supports_historical is False")
 
 
 def _to_fetch_result(

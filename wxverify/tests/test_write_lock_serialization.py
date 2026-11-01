@@ -4,13 +4,13 @@ Two families:
 
 - R1-R4: the leaderboard route's fire-and-forget rescore scheduling no
   longer blocks the read behind a held write lock.
-- E1-E8: ``run_batched_scoring`` (a read-side compute and bounded batch
-  applies under the input-epoch CAS) reaches the same end state as the
-  monolithic ``_score_all_windows`` run it
+- E1, E1b, E2, E3, E5-E7: ``run_batched_scoring`` (a read-side compute and
+  bounded batch applies under the input-epoch CAS) reaches the same end
+  state as the monolithic ``_score_all_windows`` run it
   replaces, never exposes a half-populated cache mid-run, and survives a
   mid-run site-disable or an in-flight concurrent writer.
 
-R5 (cooldown) and the E1-E8 composite_with_status cross-check are out
+R5 (cooldown) and the composite_with_status cross-check are out
 of scope for this file.
 """
 
@@ -43,7 +43,6 @@ from wxverify.scoring.leaderboard import leaderboard_with_status
 from wxverify.scoring.metrics import MetricResult
 from wxverify.scoring.rescore import drain_pending_rescores
 from wxverify.settings.keys import set_setting
-from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled
 from wxverify.worker.score_batches import run_batched_scoring
 
@@ -1061,79 +1060,5 @@ def test_batched_scoring_discovery_blocks_on_inline_writer_e7(
         expected_cas_miss = f"score discovery site={site_id} cas_miss attempt=1"
         cas_miss_lines = [m for m in messages if m == expected_cas_miss]
         assert len(cas_miss_lines) == 1, f"got: {messages}"
-
-    asyncio.run(_run())
-
-
-# --------------------------------------------------------------------------
-# E8: catchup routes through the batched lane
-# --------------------------------------------------------------------------
-
-
-def test_catchup_routes_scoring_through_batched_lane_e8(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        _freeze_now(monkeypatch)
-        site_a = _make_site(conn, "e8-site-a")
-        site_b = _make_site(conn, "e8-site-b")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
-            calls.append(sid)
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        db = get_db()
-        await run_catchup(db, FencedWriter(db, db.generation), {})
-
-        assert sorted(calls) == sorted([site_a, site_b])
-
-    asyncio.run(_run())
-
-
-def test_catchup_continues_other_sites_after_one_cancelled_e8b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        _freeze_now(monkeypatch)
-        site_a = _make_site(conn, "e8b-site-a")
-        site_b = _make_site(conn, "e8b-site-b")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
-            calls.append(sid)
-            if sid == site_a:
-                raise JobCancelled()
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        db = get_db()
-        await run_catchup(db, FencedWriter(db, db.generation), {})
-
-        # Both sites were attempted despite site_a's cancellation.
-        assert set(calls) == {site_a, site_b}
 
     asyncio.run(_run())

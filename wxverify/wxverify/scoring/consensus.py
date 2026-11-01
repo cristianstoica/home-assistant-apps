@@ -369,10 +369,10 @@ def materialize_consensus(
     _invalidate_consensus_dependents(
         conn, site_id=site_id, variable=variable, valid_at=valid_at
     )
-    # Plan §4: every consensus mutation (rescore, catch-up, backfill — all
-    # of which funnel through here, the sole `observations` writer) marks
-    # the affected local day's daily_truth rows for regeneration. Runs for
-    # BOTH the upsert and the delete branch below.
+    # Plan §4: every consensus mutation (all of which funnel through here,
+    # the sole `observations` writer) marks the affected local day's
+    # daily_truth rows stale. Runs for BOTH the upsert and the delete branch
+    # below.
     mark_daily_truth_stale(conn, site_id=site_id, variable=variable, valid_at=valid_at)
     if result is None:
         conn.execute(

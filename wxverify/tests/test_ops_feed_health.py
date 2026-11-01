@@ -1,10 +1,9 @@
 """Equivalence and regression tests for the feed-health bound-seek rewrite.
 
-Covers three surfaces that answer "does this (site, feed) pair have any
+Covers two surfaces that answer "does this (site, feed) pair have any
 forecast samples": ``load_feed_health`` (the ``/ops`` page, a boolean
-question), ``health_feeds`` (``/api/health/feeds``, an exact count that is a
-published JSON field), and ``render_backfill`` (the HTMX fragment behind the
-"Catch up"/"Backfill" buttons, which must not run either of the other two).
+question) and ``health_feeds`` (``/api/health/feeds``, an exact count that is
+a published JSON field).
 
 Isolation: the SQL-level tests each open their own fresh
 ``sqlite3.connect(":memory:")`` and run ``run_migrations`` (mirrors
@@ -573,112 +572,6 @@ def test_health_feeds_publishes_its_documented_key_set(
     assert rows, "fixture produced no rows; the contract check is vacuous"
     for row in rows:
         assert set(row.keys()) == _PUBLISHED_HEALTH_FEEDS_KEYS
-
-
-# --- The HTMX backfill fragment: the only test that reaches it --------------
-
-
-def test_backfill_htmx_fragment_does_not_load_ops(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    close_db()
-    config.db_path = str(tmp_path / "backfill-catchup.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    config.standalone_origin = None
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-        called: list[str] = []
-        real_read = db.read
-
-        async def _tracking_read(fn: object) -> object:
-            called.append(getattr(fn, "__name__", repr(fn)))
-            return await real_read(fn)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(db, "read", _tracking_read)
-        csrf = client.get("/api/csrf").json()["csrf_token"]
-        headers = {
-            "Origin": "http://testserver",
-            "X-CSRF-Token": csrf,
-            "HX-Request": "true",
-        }
-        resp = client.post("/api/catchup", headers=headers)
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/html")
-        # The negative assertion is the load-bearing one: the positive
-        # assertions below pass unchanged against the pre-Change-3 code, so
-        # on their own they prove only that the route still works.
-        assert "load_ops" not in called, (
-            "HTMX backfill fragment still runs the full ops context"
-        )
-        assert "load_backfill_panel" in called
-        assert "Backfill Progress" in resp.text
-        assert (
-            db.read_sync(
-                lambda conn: conn.execute(
-                    "SELECT 1 FROM jobs WHERE type='catchup'"
-                ).fetchone()
-            )
-            is not None
-        )
-
-
-def test_backfill_site_htmx_fragment_does_not_load_ops(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    close_db()
-    config.db_path = str(tmp_path / "backfill-site.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    config.standalone_origin = None
-    monkeypatch.setattr("wxverify.api.app.run_worker", _idle_worker)
-    app = create_app(root_path="")
-    with TestClient(app) as client:
-        db = get_db()
-        site_id = int(
-            db.write_sync(
-                lambda conn: (
-                    conn.execute(
-                        """
-                    INSERT INTO sites
-                        (name, forecast_lat, forecast_lon, elevation_m, timezone)
-                    VALUES ('Backfill Target', 40.0, -105.0, 900.0, 'UTC')
-                    """
-                    ).lastrowid
-                )
-            )
-        )
-        called: list[str] = []
-        real_read = db.read
-
-        async def _tracking_read(fn: object) -> object:
-            called.append(getattr(fn, "__name__", repr(fn)))
-            return await real_read(fn)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(db, "read", _tracking_read)
-        csrf = client.get("/api/csrf").json()["csrf_token"]
-        headers = {
-            "Origin": "http://testserver",
-            "X-CSRF-Token": csrf,
-            "HX-Request": "true",
-        }
-        resp = client.post(f"/api/sites/{site_id}/backfill", headers=headers)
-        assert resp.status_code == 200
-        assert resp.headers["content-type"].startswith("text/html")
-        assert "load_ops" not in called, (
-            "HTMX backfill fragment still runs the full ops context"
-        )
-        assert "load_backfill_panel" in called
-        assert "Backfill Target" in resp.text
-        assert (
-            db.read_sync(
-                lambda conn: conn.execute(
-                    "SELECT 1 FROM jobs WHERE type='backfill_site' AND site_id=?",
-                    (site_id,),
-                ).fetchone()
-            )
-            is not None
-        )
 
 
 # --- The opt-out ?include_sample_count=false mode ---------------------------

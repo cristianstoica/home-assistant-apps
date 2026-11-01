@@ -1259,15 +1259,15 @@ def test_export_begin_survives_bodyless_chunked_ingress_framing(
 # ---------------------------------------------------------------------------
 
 
-def test_import_round_trip_rebuilds_derived_tables(
+def test_import_round_trip_keeps_a_keyless_files_history(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """I1: valid import round-trip + full derived-table rebuild.
+    """I1: a valid import round trip of a file without the close key.
 
-    This test never sets the daily-close runtime key, so the close is off
-    throughout -- the rebuild's "consensus rebuild kept" INFO line
-    (`db_transfer.py` ``_rebuild_all``) is gated on ``daily_close_on(conn)``
-    and must not appear.
+    The file has no ``daily_close_on_at`` key, so ``run_rebuild_all`` only
+    marks the rebuild done (R18, switch-over plan 11.2): its pairs and
+    observations stay as they stand, and ``_rebuild_all`` (whose INFO line
+    is "consensus rebuild kept ...") never runs.
     """
     caplog.set_level(logging.INFO, logger="wxverify.api.routes.db_transfer")
     conn = _init_tmp_db(tmp_path)
@@ -1298,9 +1298,8 @@ def test_import_round_trip_rebuilds_derived_tables(
             """,
             (station_b,),
         )
-        # Stale/wrong observations row, inserted directly (bypassing
-        # materialize_consensus) -- proves the rebuild recomputes it from the
-        # imported station data rather than trusting the shipped value.
+        # A stale observations row (999.0, not the station row's 10.0): R18
+        # keeps it as it stands.
         conn_b.execute(
             """
             INSERT INTO observations
@@ -1312,24 +1311,8 @@ def test_import_round_trip_rebuilds_derived_tables(
             (site_b,),
         )
         feed_id = _feed_id(conn_b, "ecmwf_ifs")
-        # Poisoned score_cache marker: a window_key no real rebuild produces
-        # (real windows are only "w:<rolling_days>" and "w:all").
-        conn_b.execute(
-            """
-            INSERT INTO score_cache
-                (site_id, feed_id, variable, day_ahead, window_key, n,
-                 skill_score, computed_at)
-            VALUES (?, ?, 'temperature', 1, 'w:poison-marker', 999, 42.0,
-                    '2020-01-01T00:00:00Z')
-            """,
-            (site_b, feed_id),
-        )
-        # Orphaned forecast_pairs row on a CONCRETE, non-virtual feed: no
-        # station_observations/observations row backs this (site, variable,
-        # valid_at) cell. Must be non-virtual: materialize_multimodel_mean
-        # deletes every published mean row the rebuild cannot derive, which
-        # would mask a regressed rebuild-step-1 DELETE if the orphan were
-        # virtual.
+        # An orphaned forecast_pairs row no station or observations row
+        # backs: R18 keeps it.
         conn_b.execute(
             """
             INSERT INTO forecast_pairs
@@ -1364,13 +1347,13 @@ def test_import_round_trip_rebuilds_derived_tables(
         assert direct_names == {"Post Import Site B"}, (
             "a fresh direct connection must also see only B"
         )
-        marker = direct.execute(
-            "SELECT 1 FROM score_cache WHERE window_key='w:poison-marker'"
+        state = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
         ).fetchone()
-        assert marker is None, (
-            "poisoned score_cache marker must be cleared by the post-import "
-            "rebuild (mutation check: commenting out the BackgroundTask "
-            "must turn this red)"
+        assert state is not None and state[0] == "done", (
+            "the post-import background task must mark the rebuild done"
+            " (mutation check: commenting out the BackgroundTask leaves the"
+            " staged 'pending')"
         )
         orphan = direct.execute(
             """
@@ -1378,12 +1361,11 @@ def test_import_round_trip_rebuilds_derived_tables(
             WHERE variable='wind' AND valid_at='2035-06-02T00:00:00Z'
             """
         ).fetchone()
-        assert orphan is None, (
-            "orphaned forecast_pairs row must be cleared by the rebuild's "
-            "from-scratch DELETE (mutation check: dropping that DELETE "
-            "must turn this specific assertion red)"
+        assert orphan is not None, (
+            "R18 (plan 11.2): a file without the close key is not rebuilt;"
+            " mutant (rebuilt anyway) = the orphan deleted by _rebuild_all"
         )
-        recomputed = direct.execute(
+        kept = direct.execute(
             """
             SELECT value FROM observations
             WHERE site_id=? AND variable='temperature'
@@ -1391,15 +1373,10 @@ def test_import_round_trip_rebuilds_derived_tables(
             """,
             (site_b,),
         ).fetchone()
-        assert recomputed is not None and recomputed[0] == 10.0, (
-            "observations must be recomputed from imported station data "
-            "(elevation-matched -> exactly 10.0), not the shipped stale "
-            "value (999.0)"
+        assert kept is not None and kept[0] == 999.0, (
+            "R18: observations stay as the file holds them (999.0); mutant"
+            " (rebuilt anyway) = 10.0 from the station row"
         )
-        stamped = direct.execute(
-            "SELECT value FROM runtime_state WHERE key='import_rebuild_done_at'"
-        ).fetchone()
-        assert stamped is not None, "import_rebuild_done_at must be stamped"
     finally:
         direct.close()
     assert not any(
@@ -1520,7 +1497,6 @@ def test_import_db_without_wind_tables_creates_them(
 _D21_KEPT_KEYS = (
     "wind_history_auth_hold:history_all",
     "wind_backfill_calls",
-    "verification_state:1",
 )
 _D21_DECOY_KEYS = ("wind-basis:1", "WIND_BASIS:1", "wind_basis_extra:1")
 _D21_REMOVED_KEY_KINDS = (
@@ -1625,14 +1601,6 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
                 "SELECT value FROM runtime_state WHERE key = ?", (key,)
             ).fetchone()
             assert row is not None and row["value"] == "decoy"
-        verification_row = direct.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (f"verification_state:{imported_site_id}",),
-        ).fetchone()
-        assert verification_row is None, (
-            "_neutralize_imported_verification_chains deletes each imported"
-            " site's verification_state key before the reopen"
-        )
         live_cols = {
             r["name"] for r in direct.execute("PRAGMA table_info(station_wind_days)")
         }
@@ -2180,7 +2148,9 @@ def test_import_oversized_streamed_body_rejected_despite_no_declared_length(
 def test_import_reclaim_failure_does_not_abort_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """I9: a post-swap reclaim failure must not abort the derived rebuild."""
+    """I9: a post-swap reclaim failure must not abort the run_rebuild_all
+    that follows.
+    """
     _init_tmp_db(tmp_path)
 
     def _raise_reclaim(_conn: sqlite3.Connection) -> int:
@@ -2199,15 +2169,15 @@ def test_import_reclaim_failure_does_not_abort_rebuild(
     assert resp.json()["status"] == "imported"
     direct = sqlite3.connect(config.db_path)
     try:
-        stamped = direct.execute(
-            "SELECT value FROM runtime_state WHERE key='import_rebuild_done_at'"
+        state = direct.execute(
+            "SELECT value FROM runtime_state WHERE key='import_rebuild_state'"
         ).fetchone()
     finally:
         direct.close()
-    assert stamped is not None, (
-        "reclaim failure must not abort the derived rebuild that follows "
-        "(mutation check: removing the reclaim-only try/except must turn "
-        "this red)"
+    assert state is not None and state[0] == "done", (
+        "reclaim failure must not abort run_rebuild_all, which follows it "
+        "(mutation check: removing the reclaim-only try/except leaves the "
+        "staged 'pending')"
     )
 
 
@@ -2354,10 +2324,10 @@ def test_import_clears_foreign_completion_stamp_and_promoted_db_reads_pending(
 def test_boot_resumes_interrupted_import_rebuild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A rebuild interrupted before its post-response background task ever
-    ran must resume on the next boot, not stay stuck `pending` forever --
-    and the resumed rebuild must actually recompute derived data, not just
-    flip the state string.
+    """A rebuild interrupted before its post-response background task ran
+    must resume on the next boot, not stay `pending` forever. For a file
+    without the close key the resumed run rebuilds nothing (R18, plan
+    11.2): the stale observations row is kept as it stands.
     """
     _init_tmp_db(tmp_path)
 
@@ -2385,10 +2355,8 @@ def test_boot_resumes_interrupted_import_rebuild(
             """,
             (station_b,),
         )
-        # Stale/wrong observations row, inserted directly (bypassing
-        # materialize_consensus) -- only a real rebuild recomputes this to
-        # 10.0; the state string alone can't tell "done" from "marked done
-        # without rebuilding."
+        # A stale observations row (999.0, not the station row's 10.0): R18
+        # keeps it, so a resumed run that rebuilt anyway would show 10.0.
         conn_b.execute(
             """
             INSERT INTO observations
@@ -2439,7 +2407,7 @@ def test_boot_resumes_interrupted_import_rebuild(
     )
     direct = sqlite3.connect(config.db_path)
     try:
-        recomputed = direct.execute(
+        kept = direct.execute(
             """
             SELECT value FROM observations
             WHERE site_id=? AND variable='temperature'
@@ -2449,9 +2417,9 @@ def test_boot_resumes_interrupted_import_rebuild(
         ).fetchone()
     finally:
         direct.close()
-    assert recomputed is not None and recomputed[0] == 10.0, (
-        "the boot-resumed rebuild must actually recompute derived data "
-        "(elevation-matched -> 10.0), not just mark done without rebuilding"
+    assert kept is not None and kept[0] == 999.0, (
+        "R18: the boot-resumed run keeps a keyless file's observations as "
+        "they stand (999.0); mutant (rebuilt anyway) = 10.0"
     )
 
 
@@ -2472,7 +2440,7 @@ def test_import_background_rebuild_failure_records_failed_and_is_not_retried_on_
         calls.append(None)
         raise RuntimeError("synthetic rebuild failure")
 
-    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+    monkeypatch.setattr(db_transfer, "_rebuild_or_keep", _raise_rebuild)
 
     app1 = _make_app(monkeypatch)
     with TestClient(app1) as client1:
@@ -2528,7 +2496,7 @@ def test_boot_resume_rebuild_failure_records_failed_without_crashing_startup(
         calls.append(None)
         raise RuntimeError("synthetic rebuild failure")
 
-    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+    monkeypatch.setattr(db_transfer, "_rebuild_or_keep", _raise_rebuild)
 
     app1 = _make_app(monkeypatch)
     with TestClient(app1) as client1:
@@ -2645,7 +2613,7 @@ def _inject_correlated_rebuild_and_mark_failed_failure(
             raise sqlite3.OperationalError("database or disk is full")
         real_set_runtime_state(conn, key, value)
 
-    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+    monkeypatch.setattr(db_transfer, "_rebuild_or_keep", _raise_rebuild)
     monkeypatch.setattr(db_transfer, "set_runtime_state", _set_runtime_state_or_raise)
     return calls
 
@@ -2833,7 +2801,7 @@ def test_boot_resume_survives_when_sanitizing_the_rebuild_failure_raises(
     def _raise_rebuild(_conn: sqlite3.Connection) -> None:
         raise sqlite3.OperationalError("disk I/O error near http://[::1 while syncing")
 
-    monkeypatch.setattr(db_transfer, "_rebuild_all", _raise_rebuild)
+    monkeypatch.setattr(db_transfer, "_rebuild_or_keep", _raise_rebuild)
 
     app = _make_app(monkeypatch)
     with TestClient(app) as client:

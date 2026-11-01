@@ -703,7 +703,6 @@ async def import_db(request: Request) -> JSONResponse:
                 raise ApiError(422, "empty upload")
             _validate_upload(tmp)
             _stage_pending_rebuild_state(tmp)
-            _neutralize_imported_verification_chains(tmp)
             _settle_imported_closes(tmp)
             backup = _new_backup_path(db_dir)
             # COMMIT POINT: past a successful replace_from the live DB has
@@ -1241,78 +1240,6 @@ def _stage_pending_rebuild_state(tmp: Path) -> None:
         conn.close()
 
 
-_VERIFICATION_RUN_TABLES = (
-    "verification_runs",
-    "verification_evidence",
-    "verification_day_context",
-    "verification_results",
-    "verification_verdicts",
-)
-
-
-def _neutralize_imported_verification_chains(tmp: Path) -> None:
-    """Neutralize an imported active verification chain before promotion (D13).
-
-    An import does not enqueue, so the hold (which gates the enqueue) never
-    sees a chain that arrives already ``pending``/``running`` inside the
-    imported ``jobs`` table. Run on the staged file, before promotion, so
-    the promoted database carries the neutralized state by construction --
-    ``replace_from``'s rename is atomic, exactly the precedent
-    ``_stage_pending_rebuild_state`` above already establishes.
-
-    The ``verification_*`` cleanups are conditional on their tables being
-    present in the staged file; ``runtime_state`` is ensured-then-written,
-    so a legacy (pre-verification) upload carrying none of the
-    ``verification_*`` tables still imports successfully rather than 500ing.
-    ``_validate_upload`` requires only ``sites``, ``stations`` and
-    ``station_observations``, so such an upload is legitimate.
-    """
-    from wxverify.verification.runs import (
-        IMPORT_SUPPRESSED_REASON,
-        fail_incomplete_attempts,
-    )
-    from wxverify.worker.verification_run import (
-        verification_heartbeat_key,
-        verification_state_key,
-    )
-
-    conn = sqlite3.connect(str(tmp))
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            if table_exists(conn, "jobs"):
-                conn.execute(
-                    """
-                    UPDATE jobs SET status = 'failed', last_error = ?,
-                        updated_at = ?
-                    WHERE type = 'verification_run'
-                      AND status IN ('pending', 'running')
-                    """,
-                    (IMPORT_SUPPRESSED_REASON, isoformat_utc()),
-                )
-            if all(table_exists(conn, table) for table in _VERIFICATION_RUN_TABLES):
-                for site_row in conn.execute("SELECT id FROM sites").fetchall():
-                    fail_incomplete_attempts(
-                        conn, int(site_row["id"]), error=IMPORT_SUPPRESSED_REASON
-                    )
-            ensure_runtime_state_table(conn)
-            for site_row in conn.execute("SELECT id FROM sites").fetchall():
-                site_id = int(site_row["id"])
-                delete_runtime_state(
-                    conn,
-                    verification_state_key(site_id),
-                    verification_heartbeat_key(site_id),
-                )
-        except BaseException:
-            conn.rollback()
-            raise
-        conn.commit()
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    finally:
-        conn.close()
-
-
 _CLOSE_TABLES = (
     "close_attempts",
     "close_station_days",
@@ -1394,7 +1321,7 @@ async def _rebuild_derived_and_release(backup: Path) -> None:
 
 
 async def run_rebuild_all() -> None:
-    """Run ``_rebuild_all``, committing ``done`` or -- on failure --
+    """Run ``_rebuild_or_keep``, committing ``done`` or -- on failure --
     separately committing ``failed`` plus a sanitized reason.
 
     Shared by the post-import background task and the boot-time resume: a
@@ -1406,7 +1333,7 @@ async def run_rebuild_all() -> None:
     """
     db = get_db()
     try:
-        await db.write(_rebuild_all)
+        await db.write(_rebuild_or_keep)
     except Exception as exc:
         logger.exception("import: derived rebuild failed")
 
@@ -1428,6 +1355,24 @@ async def run_rebuild_all() -> None:
             logger.exception("import: recording rebuild failure failed")
 
 
+def _rebuild_or_keep(conn: sqlite3.Connection) -> None:
+    """Rebuild a file whose daily close is on; keep one without the key.
+
+    ``daily_close_on`` is read first (switch-over plan 11.2, R18). A file
+    without the key, from before the daily close, is not rebuilt: its pairs,
+    truth and scores are its starting history as they stand, so only
+    ``import_rebuild_state`` = ``done`` is written, with one INFO line. A
+    file with the key goes through ``_rebuild_all`` (P1 7.5).
+    """
+    if not daily_close_on(conn):
+        set_runtime_state(conn, "import_rebuild_state", "done")
+        logger.info(
+            "import: file from before the daily close; its history is kept as it stands"
+        )
+        return
+    _rebuild_all(conn)
+
+
 def _rebuild_all(conn: sqlite3.Connection) -> None:
     """Rebuild consensus, pairs, and scores from the imported station data.
 
@@ -1435,19 +1380,19 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
     (worker/processor.py): observation-changing work runs the MONOLITHIC
     ``pair_and_score`` inline — never enqueued.
 
-    While the imported file's daily close is on, only days that still take
-    writes are rebuilt (7.5): done days keep their pairs and consensus, and
-    their cells are skipped, not refused. With the close off every pair and
-    cell is rebuilt.
+    Called only while the imported file's daily close is on
+    (``_rebuild_or_keep``): only days that still take writes are rebuilt
+    (7.5); done days keep their pairs and consensus, and their cells are
+    skipped, not refused.
     """
     now = utc_now()
     # From-scratch clear: per-cell dependent invalidation only reaches cells
     # present in station_observations or observations, so a forecast_pairs
     # row whose anchor observation is absent from BOTH tables would survive
     # stale. The delete guarantees none does — by construction — on every
-    # day that takes pairs (writable_pairs_clause; every day with the close
-    # off). score_cache needs no separate delete: the monolithic
-    # pair_and_score clears the whole table itself.
+    # day that takes pairs (writable_pairs_clause). score_cache needs no
+    # separate delete: the monolithic pair_and_score clears the whole table
+    # itself.
     conn.execute(
         "DELETE FROM forecast_pairs"
         f" WHERE {writable_pairs_clause(conn, None, now_utc=now)}"
@@ -1482,13 +1427,12 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
         for cell in cells
         if str(cell["valid_at"]) in writable[int(cell["site_id"])]
     ]
-    if daily_close_on(conn):
-        logger.info(
-            "import: consensus rebuild kept %d cells, skipped %d on days that"
-            " take no writes",
-            len(kept),
-            len(cells) - len(kept),
-        )
+    logger.info(
+        "import: consensus rebuild kept %d cells, skipped %d on days that"
+        " take no writes",
+        len(kept),
+        len(cells) - len(kept),
+    )
     for cell in kept:
         materialize_consensus(
             conn,

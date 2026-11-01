@@ -1178,65 +1178,6 @@
       });
   });
 
-  // Wind history auth hold (plan §8.8): "Try again" asks the wind lane to
-  // check a refused weather.com endpoint once more. The PUT only queues the
-  // check; the next wind fetch makes it, and only a successful call there
-  // clears the hold.
-  document.body.addEventListener("click", function (event) {
-    var target = event.target;
-    if (!target || !target.matches("button[data-wind-auth-hold-url]")) {
-      return;
-    }
-    var result = document.getElementById("wind-auth-hold-result");
-    function show(text) {
-      result.hidden = false;
-      result.textContent = text;
-    }
-    var endpoint = target.dataset.endpoint;
-    var confirmed = window.confirm(
-      "Try weather.com again? The check uses one call on the next wind fetch. If the key is still refused, the hold stays."
-    );
-    if (!confirmed) {
-      return;
-    }
-    var token = document.querySelector('meta[name="csrf-token"]').content;
-    fetch(target.dataset.windAuthHoldUrl, {
-      method: "PUT",
-      credentials: "same-origin",
-      headers: {
-        "X-CSRF-Token": token,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ endpoint: endpoint, confirm: true })
-    })
-      .then(function (response) {
-        return response.json().then(function (payload) {
-          if (!response.ok) {
-            show(payload.error || "Update failed.");
-            return;
-          }
-          var block = document.getElementById("wind-auth-hold-" + endpoint);
-          if (payload.status === "clear") {
-            if (block) {
-              block.parentNode.removeChild(block);
-            }
-            show("No hold: nothing to retry.");
-            return;
-          }
-          var badge = block
-            ? block.querySelector('[data-field="hold-status"]')
-            : null;
-          if (badge) {
-            badge.textContent = "Check queued";
-          }
-          show("Check queued for the next wind fetch.");
-        });
-      })
-      .catch(function () {
-        show("Update failed.");
-      });
-  });
-
   // Database export: prepare-then-chunked-download. A plain GET download would
   // hold the request open (no headers) through VACUUM INTO and trip HA
   // ingress's response-start timeout, so this POSTs /begin (with CSRF), polls

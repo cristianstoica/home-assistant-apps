@@ -384,100 +384,6 @@ def test_t92_headroom_exhausted_raises_before_reserve_budget_runs() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T46 -- the chunk-level integration: WindHeadroomExhausted raised inside
-# _run_row, caught by _run_fetch_chunk's loop, deferring the whole job.
-# ---------------------------------------------------------------------------
-
-
-def test_t46_chunk_level_headroom_exhaustion_defers_the_job_without_a_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Drives the real chunk loop (not ``_reserve_wind_day_call`` directly,
-    as T92 does) through a non-exempt due row at T112/T92's exact headroom-0
-    fixture. ``_run_row`` -> ``_reserve_wind_day_call`` raises
-    ``WindHeadroomExhausted`` before any HTTP call; ``_run_fetch_chunk``'s
-    ``except WindHeadroomExhausted`` sets ``exhausted`` and breaks, and with
-    ``chunk.calls == 0`` the chunk computes a headroom wake-up and defers the
-    whole job -- it must never reach the handler at all.
-    """
-    conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "KTEST001")
-    # T112/T92's exact headroom-0 fixture: stored cap 1200, one station (9
-    # calls of allowance), previous billing day 991 calls and no counter
-    # entries, nothing spent today, one minute into the billing day.
-    _set_source(conn, daily_call_limit=1200)
-    yesterday_billing = date(2026, 3, 9)
-    today = date(2026, 3, 10)
-    _set_budget(conn, yesterday_billing.isoformat(), 991)
-    now = datetime(2026, 3, 10, 0, 1, 0, tzinfo=UTC)
-    _freeze(monkeypatch, now)
-
-    # Pre-close today's auto-fabricated row (ensure_wind_days, inside
-    # _start_job, would otherwise fabricate a pending -- exempt -- row for
-    # today that runs and succeeds first, since exempt rows sort first; that
-    # would leave chunk.calls > 0 and mask the deferral this test targets).
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count,"
-        "  pair_hours, refetched, updated_at)"
-        " VALUES (?, ?, 'fetched', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, today.isoformat()),
-    )
-    # A non-exempt due row: local_date < yesterday (exempt is local_date >=
-    # yesterday OR a refetch-marked row), so it skips the headroom check only
-    # when exempt -- this row must NOT be exempt to reach it.
-    non_exempt_date = today - timedelta(days=3)
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count,"
-        "  pair_hours, refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, non_exempt_date.isoformat()),
-    )
-    conn.commit()
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(200, json={"observations": []})
-
-    from wxverify.worker.control import JobDeferred
-
-    with pytest.raises(JobDeferred):
-        _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-
-    assert call_log == [], (
-        "mutant -> at this assertion: correct = no HTTP call at all (the"
-        " headroom check raises before any reservation or call), mutant"
-        " (the except WindHeadroomExhausted clause removed from"
-        " _run_fetch_chunk, letting the exception propagate uncaught"
-        " instead of being handled per-row) = _run_wind_days would raise"
-        " WindHeadroomExhausted itself rather than the deferred JobDeferred"
-    )
-    day = conn.execute(
-        "SELECT status, attempts FROM station_wind_days"
-        " WHERE station_id=? AND local_date=?",
-        (station_id, non_exempt_date.isoformat()),
-    ).fetchone()
-    assert day is not None
-    assert day["status"] == "pending", (
-        "mutant -> at this assertion: correct = the row is untouched (no"
-        " reservation was ever made), mutant (a reservation made before the"
-        " headroom check in _reserve_wind_day_call) = the row's attempts or"
-        " status would have moved"
-    )
-    assert day["attempts"] == 0
-    assert _budget_calls(conn, today.isoformat()) == 0, (
-        "mutant -> at this assertion: correct = no call was ever reserved"
-        " against the daily budget, mutant (headroom checked after"
-        " reserve_budget instead of before) = a spent call recorded despite"
-        " the exhaustion"
-    )
-
-
-# ---------------------------------------------------------------------------
 # T93 -- the rate limiter with a fake (injectable) clock.
 # ---------------------------------------------------------------------------
 
@@ -502,20 +408,6 @@ def test_t93_the_21st_backfill_request_waits_while_live_still_fits() -> None:
     assert wait_live == 0.0
 
 
-def test_t93_wait_for_backfill_slot_records_nothing() -> None:
-    from wxverify import obs as _obs_pkg  # noqa: F401 -- ensure module import order
-
-    limiter = WeathercomRateLimiter(clock=lambda: 0.0)
-    with patch("wxverify.obs.pws_adapter.weathercom_rate_limiter", lambda: limiter):
-        from wxverify.obs.pws_adapter import wait_for_backfill_slot
-
-        asyncio.run(wait_for_backfill_slot())
-
-    assert len(limiter._requests) == 0, (  # noqa: SLF001 -- asserting nothing recorded
-        "wait_for_backfill_slot must record nothing when the slot already fits"
-    )
-
-
 def test_t93_a_new_event_loop_gets_a_fresh_limiter() -> None:
     from wxverify.obs.pws_adapter import weathercom_rate_limiter
 
@@ -528,153 +420,6 @@ def test_t93_a_new_event_loop_gets_a_fresh_limiter() -> None:
     asyncio.run(_grab())
 
     assert seen[0] != seen[1], "a new loop must not reuse the old limiter instance"
-
-
-# ---------------------------------------------------------------------------
-# T94 -- yield: a due, pending live-obs job ends a non-exempt chunk before
-# its next call; exempt rows still run; a not-yet-due job causes no yield.
-# ---------------------------------------------------------------------------
-
-
-def _t94_fixture(conn: sqlite3.Connection, now: datetime) -> tuple[int, int]:
-    """A site+station with ample backfill headroom, so the only thing a
-    non-exempt row's chunk can yield to is the live-obs job, never
-    ``WindHeadroomExhausted``."""
-    site_id = _make_site(conn)
-    station_id = _make_station(conn, site_id, "KTEST001")
-    _set_source(conn, daily_call_limit=5000, billing_tz="UTC")
-    previous_billing_day = (now.date() - timedelta(days=1)).isoformat()
-    _set_budget(conn, previous_billing_day, 0)
-    conn.commit()
-    return site_id, station_id
-
-
-def _insert_live_job(
-    conn: sqlite3.Connection, site_id: int, *, next_attempt_at: str | None
-) -> None:
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status, next_attempt_at)"
-        " VALUES ('fetch_obs', ?, 'obs', 'pending', ?)",
-        (site_id, next_attempt_at),
-    )
-    conn.commit()
-
-
-def test_t94_a_due_pending_fetch_obs_job_ends_the_chunk_before_the_next_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
-    _freeze(monkeypatch, now)
-    site_id, station_id = _t94_fixture(conn, now)
-    # A row "on or after yesterday" is exempt from the yield check (plan
-    # §8.13 / S4): only a row older than yesterday is non-exempt, so the
-    # yield target here is two days back.
-    two_days_ago = now.date() - timedelta(days=2)
-    conn.execute(
-        "UPDATE station_wind_days SET status='fetched'"
-        " WHERE station_id=? AND local_date=?",
-        (station_id, now.date().isoformat()),
-    )
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, two_days_ago.isoformat()),
-    )
-    conn.commit()
-    _insert_live_job(conn, site_id, next_attempt_at=None)  # always due
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(200, json={"observations": []})
-
-    _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-
-    assert not any("history/all" in url for url in call_log), (
-        "the non-exempt row (two days back) must yield to the due live-obs"
-        f" job without being fetched, got {call_log}"
-    )
-    row = conn.execute(
-        "SELECT status FROM station_wind_days WHERE station_id=? AND local_date=?",
-        (station_id, two_days_ago.isoformat()),
-    ).fetchone()
-    assert row["status"] == "pending", "the yielded row must be left untouched"
-
-
-def test_t94_exempt_rows_still_run_despite_a_due_live_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
-    _freeze(monkeypatch, now)
-    site_id, _station_id = _t94_fixture(conn, now)
-    _insert_live_job(conn, site_id, next_attempt_at=None)  # always due
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(200, json={"observations": []})
-
-    _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-
-    assert call_log, (
-        "today's row is exempt and must still be fetched despite the due live job"
-    )
-    assert all("all/1day" in url for url in call_log)
-
-
-def test_t94_a_pending_job_not_yet_due_does_not_cause_a_yield(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    now = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
-    _freeze(monkeypatch, now)
-    site_id, station_id = _t94_fixture(conn, now)
-    two_days_ago = now.date() - timedelta(days=2)
-    conn.execute(
-        "UPDATE station_wind_days SET status='fetched'"
-        " WHERE station_id=? AND local_date=?",
-        (station_id, now.date().isoformat()),
-    )
-    conn.execute(
-        "INSERT INTO station_wind_days"
-        " (station_id, local_date, status, attempts, record_count, pair_hours,"
-        "  refetched, updated_at)"
-        " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-        (station_id, two_days_ago.isoformat()),
-    )
-    conn.commit()
-    future = now + timedelta(hours=1)
-    _insert_live_job(conn, site_id, next_attempt_at=future.isoformat())
-
-    call_log: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        call_log.append(str(request.url))
-        return httpx.Response(
-            200,
-            json={
-                "observations": [
-                    {
-                        "epoch": int(
-                            datetime(2026, 3, 8, 12, 0, 0, tzinfo=UTC).timestamp()
-                        ),
-                        "metric": {"windspeedAvg": 5.0},
-                    }
-                ]
-            },
-        )
-
-    _run_wind_days(site_id, handler, monkeypatch=monkeypatch)
-
-    assert any("history/all" in url for url in call_log), (
-        f"a pending job that is not yet due must not cause a yield, got {call_log}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -732,44 +477,22 @@ def test_t95_a_slow_fake_limiter_does_not_cause_provider_deadline_exceeded(
 # ---------------------------------------------------------------------------
 # T96 -- a simulated pair_max day at the default interval (180 min) makes
 # 54 all_1day calls (6 stations x (ceil(1440/180)=8 interval calls + 1 final
-# call)) and 6 history_all calls (one per station, closed for good on its
-# first successful fetch).
+# call)).
 # ---------------------------------------------------------------------------
 
 
-def test_t96_a_simulated_day_makes_54_all_1day_and_6_history_all_calls(
+def test_t96_a_simulated_day_makes_54_all_1day_calls(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
     station_ids = [_make_station(conn, site_id, f"KTEST{i:03d}") for i in range(1, 7)]
     start = datetime(2026, 3, 10, 0, 0, 0, tzinfo=UTC)
-    yesterday = start.date() - timedelta(days=1)
-    for station_id in station_ids:
-        conn.execute(
-            "INSERT INTO station_wind_days"
-            " (station_id, local_date, status, attempts, record_count,"
-            "  pair_hours, refetched, updated_at)"
-            " VALUES (?, ?, 'pending', 0, 0, 0, 0, '2026-01-01T00:00:00Z')",
-            (station_id, yesterday.isoformat()),
-        )
-    conn.commit()
 
     all_1day_calls = 0
-    history_all_calls = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal all_1day_calls, history_all_calls
-        url = str(request.url)
-        if "history/all" in url:
-            history_all_calls += 1
-            epoch = int(datetime(2026, 3, 9, 12, 0, 0, tzinfo=UTC).timestamp())
-            return httpx.Response(
-                200,
-                json={
-                    "observations": [{"epoch": epoch, "metric": {"windspeedAvg": 5.0}}]
-                },
-            )
+        nonlocal all_1day_calls
         all_1day_calls += 1
         return httpx.Response(200, json={"observations": []})
 
@@ -788,7 +511,6 @@ def test_t96_a_simulated_day_makes_54_all_1day_and_6_history_all_calls(
         f" ({len(station_ids)} stations x ({interval_calls} interval calls"
         " + 1 final call))"
     )
-    assert history_all_calls == 6, f"got {history_all_calls} history_all calls"
 
 
 # ---------------------------------------------------------------------------

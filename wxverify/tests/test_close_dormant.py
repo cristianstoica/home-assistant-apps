@@ -1,14 +1,9 @@
-"""Landing dormant: DO1 to DO5 (plan 2026-10-21-daily-close-close-job.md
-section 15.2). DO1-DO4 need ``enqueue_due_close_work`` and
+"""Landing dormant: DO3 to DO5 (plan 2026-10-21-daily-close-close-job.md
+section 15.2). DO4 needs ``enqueue_due_close_work`` and
 ``settle_interrupted_closes``, which land with later pieces of this plan,
-and are written before they exist.
+and is written before they exist.
 
-DO1/DO2 drive ``scheduler_tick`` directly (a plain sync call on a real
-connection, as ``worker/scheduler.py:78`` is itself sync) and fail on a
-plain assertion that needs P3's ``daily_close_on`` branch in
-``scheduler_tick`` (4.2): that branch does not exist yet, so the old
-triggers keep firing even with the close on (DO2), which is exactly the
-assertion DO2 needs to go red on. DO3 claims and runs a stray ``day_close``/
+DO3 claims and runs a stray ``day_close``/
 ``day_publish`` job through the real queue and ``dispatch``
 (``worker/processor.py:601``); ``dispatch`` has no route for either kind
 yet, so each job dies on ``RuntimeError(f"unknown job type {job.type}")``
@@ -34,18 +29,17 @@ appears.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 import pytest
 
-from tests.helpers import D, MovingClock, asof_conn, day_close_site, patch_close_clock
+from tests.helpers import D, asof_conn, day_close_site
 from wxverify import config
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.queue import claim_next_job
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.worker.processor import run_claimed_job
-from wxverify.worker.scheduler import scheduler_tick
 
 _CLOSE_TABLES: tuple[str, ...] = (
     "close_attempts",
@@ -63,66 +57,6 @@ def _close_table_counts(conn) -> dict[str, int]:  # type: ignore[no-untyped-def]
         table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
         for table in _CLOSE_TABLES
     }
-
-
-# ---------------------------------------------------------------------------
-# DO2
-# ---------------------------------------------------------------------------
-
-
-def test_do2_the_old_triggers_are_suppressed_with_the_close_on() -> None:
-    """DO2: close on; ticks at D 05:00Z and with the score backstop due.
-    No ``verification_run``, no ``pair_and_score`` from the backstop
-    (4.2).
-
-    M1 -> at the verification_run assertion below: correct = 0 (the close
-    on suppresses ``_enqueue_due_verification_runs``), mutant M1
-    (``scheduler_tick`` still calls ``_enqueue_due_verification_runs`` with
-    the close on) = 1, since at ``a4a919c`` ``scheduler_tick`` has no
-    ``daily_close_on`` branch yet and so calls it unconditionally -- the
-    present-day state this test must find wrong.
-
-    M2 -> at the pair_and_score assertion below: correct = 0 (the close on
-    suppresses ``_enqueue_due_score_refresh``), mutant M2 (``scheduler_tick``
-    still calls ``_enqueue_due_score_refresh`` with the close on) = 1, for
-    the same present-day reason.
-    """
-    conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=False)
-
-    t_500 = datetime(D.year, D.month, D.day, 5, 0, tzinfo=UTC)
-    stale_score_at = isoformat_utc_micro(t_500 - timedelta(hours=6, minutes=1))
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at,"
-        " created_at) VALUES ('pair_and_score', ?, 'score', '{}', 'completed', ?, ?)",
-        (site_id, stale_score_at, stale_score_at),
-    )
-    conn.commit()
-
-    clock = MovingClock(t_500)
-    with pytest.MonkeyPatch.context() as mp:
-        patch_close_clock(mp, clock)
-        scheduler_tick(conn)
-
-    vr_count = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE type = 'verification_run' AND site_id = ?",
-        (site_id,),
-    ).fetchone()[0]
-    assert vr_count == 0, (
-        "M1 -> at this assertion: correct = 0 (the close on suppresses the"
-        " 05:00 trigger), mutant M1 (scheduler_tick still calls"
-        " _enqueue_due_verification_runs with the close on) = 1"
-    )
-    score_jobs = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE type = 'pair_and_score' AND site_id = ?"
-        " AND status = 'pending'",
-        (site_id,),
-    ).fetchone()[0]
-    assert score_jobs == 0, (
-        "M2 -> at this assertion: correct = 0 (the close on suppresses the"
-        " score backstop), mutant M2 (scheduler_tick still calls"
-        " _enqueue_due_score_refresh with the close on) = 1"
-    )
 
 
 # ---------------------------------------------------------------------------

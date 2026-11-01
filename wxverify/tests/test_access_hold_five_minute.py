@@ -1,29 +1,29 @@
-"""The three refused-access kinds' lanes run independently (plan §13.5 FM4).
+"""The refused-access kinds' lanes run independently (plan §13.5 FM4).
 
 ``current_obs``, ``hourly`` and ``five_minute`` (today's wind ``all_1day``
-download) each hold only their own ``AccessKind``. ``test_access_hold_
-current_obs.py``'s CO1 and ``test_access_hold_hourly.py``'s HD1 already
-prove that a refusal of one kind leaves the *other two kinds' hold rows*
-absent; what neither file (nor ``test_wind_auth_hold.py``) proves is the
-new, genuinely cross-lane half of this release -- that the wind lane's
-``five_minute`` hold does not block ``current_obs``/``hourly``'s real
+download) each hold only their own ``AccessKind``. ``hourly`` is the gap
+fill's kind now, with its own hold pinned by GF4 (``test_gap_fill.py``);
+only ``current_obs`` and ``five_minute`` run their lanes here.
+``test_access_hold_current_obs.py``'s CO1 already proves that a refusal
+of one kind leaves the *other kinds' hold rows* absent; what it does not
+prove is the new, genuinely cross-lane half of this release -- that the
+wind lane's ``five_minute`` hold does not block ``current_obs``'s real
 calls, and that a ``current_obs``/``hourly`` hold does not block the wind
-lane's real ``all_1day`` call. This file drives all three lanes against
-one site+station in the same test and parametrizes over which kind is
-held, so a copy-paste mix-up of the ``AccessKind`` constant at any of the
-three call sites shows up as a miscounted call somewhere in the matrix,
-not just as a wrong hold-row key.
+lane's real ``all_1day`` call. This file drives the current-obs job and
+the wind chunk against one site+station in the same test and
+parametrizes over which of the three kinds is held, so a copy-paste
+mix-up of the ``AccessKind`` constant at any call site shows up as a
+miscounted call somewhere in the matrix, not just as a wrong hold-row
+key.
 
 Isolation: a single real tmp-path ``Database`` (``init_db``); the
 current-obs job runs through ``run_claimed_job(db, job, lane=
 "current_obs")`` with ``wxverify.worker.processor.fetch_current_observation``
-monkeypatched; the hourly cycle runs through ``run_claimed_job(db, job,
-lane="main")`` against an ``httpx.MockTransport`` patched onto
-``wxverify.worker.processor.httpx.AsyncClient``; the wind chunk runs
-through ``run_wind_days`` against an ``httpx.MockTransport`` patched onto
-``wxverify.worker.wind_days.httpx.AsyncClient`` -- exactly the three
-patterns ``test_access_hold_current_obs.py``, ``test_access_hold_hourly.py``
-and ``test_wind_auth_hold.py`` each already use, combined onto one site.
+monkeypatched; the wind chunk runs through ``run_wind_days`` against an
+``httpx.MockTransport`` patched onto
+``wxverify.worker.wind_days.httpx.AsyncClient`` -- the same patterns
+``test_access_hold_current_obs.py`` and ``test_wind_auth_hold.py`` each
+already use, combined onto one site.
 
 Every station id below is synthetic: ``KTEST001``.
 """
@@ -45,7 +45,6 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.queue import (
     claim_next_current_obs_job,
-    claim_next_job,
     enqueue_if_absent,
 )
 from wxverify.db.runtime_state import set_runtime_state
@@ -65,14 +64,6 @@ _PAST_ISO = "2026-07-10T11:59:00Z"
 @pytest.fixture(autouse=True)
 def _weathercom_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("WXV_WEATHERCOM_KEY", _API_KEY)
-
-
-@pytest.fixture(autouse=True)
-def _fast_pace(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _fake_pace(site_id: int, station_id: int, ordinal: int) -> None:
-        return None
-
-    monkeypatch.setattr("wxverify.worker.processor.pace_station_call", _fake_pace)
 
 
 def _init_tmp_db(tmp_path: Path) -> Database:
@@ -149,19 +140,6 @@ def _online_response() -> httpx.Response:
         content=_online_body(),
         headers={"content-type": "application/json"},
         request=httpx.Request("GET", str(_WEATHER_COM_URL)),
-    )
-
-
-def _obs_response() -> httpx.Response:
-    body = {
-        "observations": [
-            {"obsTimeUtc": "2026-07-10T11:55:00Z", "metric": {"temp": 20.0}}
-        ]
-    }
-    return httpx.Response(
-        200,
-        content=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
     )
 
 
@@ -595,17 +573,17 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, held: AccessKind
 ) -> None:
     """Hold exactly one of ``current_obs``/``hourly``/``five_minute``, then
-    run one current-obs job, one hourly cycle and one wind chunk against
-    200-answering fakes: the held kind's lane makes 0 calls and its row
-    stays absent from the other two kinds' places; the other two each make
-    exactly 1 call and their own rows stay absent.
+    run one current-obs job and one wind chunk against 200-answering
+    fakes: a held ``current_obs`` or ``five_minute`` lane makes 0 calls
+    and its row stays absent from the other's place; a held ``hourly``
+    pins that neither lane checks it, so both still make their 1 call.
 
     Mutant (kind mix-up): any call site using the wrong ``AccessKind``
     constant (e.g. the wind lane checking ``"hourly"`` instead of
     ``"five_minute"``, or the current-obs lane never checking its own
     kind) shows up here as a held lane still making its call, or a
     not-held lane unexpectedly making 0 calls -- a combination none of
-    CO1/HD1/FM1 (each exercising only its own lane) can catch.
+    CO1/FM1 (each exercising only its own lane) can catch.
     """
     now = datetime(2026, 7, 10, 12, 0, 0, tzinfo=UTC)
     _freeze(monkeypatch, now)
@@ -622,7 +600,6 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         f"curobs:{station_id}",
         {"station_id": station_id},
     )
-    enqueue_if_absent(conn, "fetch_obs", site_id, "obs", {})
     conn.commit()
 
     record_access_refused(conn, held, 401)
@@ -647,7 +624,7 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         " 0.16.13's behaviour) = False when held='five_minute'"
     )
 
-    calls = {"current_obs": 0, "hourly": 0, "five_minute": 0}
+    calls = {"current_obs": 0, "five_minute": 0}
 
     async def _fake_fetch_current_obs(
         pws_station_id: str,
@@ -663,10 +640,6 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         "wxverify.worker.processor.fetch_current_observation", _fake_fetch_current_obs
     )
 
-    def hourly_handler(request: httpx.Request) -> httpx.Response:
-        calls["hourly"] += 1
-        return _obs_response()
-
     def wind_handler(request: httpx.Request) -> httpx.Response:
         calls["five_minute"] += 1
         return httpx.Response(200, json={"observations": []})
@@ -676,8 +649,8 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         # row already exists (the ensure_wind_days call above ran while the
         # site had no observations yet), so run_wind_days's own internal
         # ensure_wind_days call here is a no-op (`INSERT OR IGNORE`); the
-        # current-obs/hourly calls below running after it only matches how
-        # the real worker orders its lanes.
+        # current-obs call below running after it only matches how the real
+        # worker orders its lanes.
         real_client = httpx.AsyncClient
         writer = FencedWriter(db, db.generation)
         with patch(
@@ -692,19 +665,9 @@ def test_fm4_each_kinds_hold_leaves_the_other_two_lanes_running(
         assert job1 is not None
         await run_claimed_job(db, job1, lane="current_obs")
 
-        with patch(
-            "wxverify.worker.processor.httpx.AsyncClient",
-            lambda *a, **kw: real_client(  # type: ignore[arg-type]
-                transport=httpx.MockTransport(hourly_handler)
-            ),
-        ):
-            job2 = await db.write(claim_next_job)
-            assert job2 is not None
-            await run_claimed_job(db, job2, lane="main")
-
     asyncio.run(run())
 
-    for kind in ("current_obs", "hourly", "five_minute"):
+    for kind in ("current_obs", "five_minute"):
         expected = 0 if kind == held else 1
         assert calls[kind] == expected, (
             f"mutant -> at this assertion (kind={kind}): correct = "

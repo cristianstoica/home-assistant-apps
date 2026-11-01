@@ -30,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 DownloadSource = Literal["recorded", "inferred"]
 
-# A historical row (catch-up or backfill, plan 3.1) carries a source_raw
-# ending in " previous_dayN" (feeds/open_meteo.py). Such rows fetch past
-# runs; they are never a download of S (4.1).
+# A historical row (from the retired catch-up or backfill, plan 3.1) carries
+# a source_raw ending in " previous_dayN". Such rows hold past runs; they are
+# never a download of S (4.1).
 _FORWARD_ROW_SQL: Final = "fs.source_raw NOT GLOB '* previous_day[0-9]*'"
 
 # A meteoblue package member's fetch feed is its package row: the package

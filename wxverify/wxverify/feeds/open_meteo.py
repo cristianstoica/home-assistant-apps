@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
-from typing import ClassVar, Final, cast
+from datetime import timedelta
+from typing import Final, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -97,34 +97,13 @@ def _metered_calls(variables: int, days: int) -> int:
     return max(1, -(-numerator // scale))
 
 
-def _historical_date_range(window_start: str, window_end: str) -> tuple[date, date]:
-    """The inclusive calendar dates fetch_historical sends as start_date/end_date."""
-    return parse_utc(window_start).date(), parse_utc(window_end).date()
-
-
-def _billed_days(window_start: str, window_end: str) -> int:
-    """Billed span of that request: inclusive date count, floored at 1."""
-    start, end = _historical_date_range(window_start, window_end)
-    return max(1, (end - start).days + 1)
-
-
 class OpenMeteoAdapter:
-    supports_historical: ClassVar[bool] = True
-
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
         hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
         return CostEstimate(calls=_metered_calls(len(hourly), _METERED_REFERENCE_DAYS))
-
-    def estimate_historical_cost(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> CostEstimate:
-        names = _historical_hourly_names(req)
-        return CostEstimate(
-            calls=_metered_calls(len(names), _billed_days(window_start, window_end))
-        )
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
         hourly = [VARIABLE_MAP[v] for v in req.variables if v in VARIABLE_MAP]
@@ -154,48 +133,6 @@ class OpenMeteoAdapter:
         samples = _samples_from_hourly(req.model, estimated_issued_at, data)
         logger.debug(
             "open_meteo forecast response status=%s samples=%s",
-            response.status_code,
-            len(samples),
-        )
-        grid = GridProvenance(
-            grid_lat=payload.latitude,
-            grid_lon=payload.longitude,
-            grid_elevation_m=payload.elevation,
-        )
-        return FetchResult(samples=samples, grid=grid)
-
-    async def fetch_historical(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> FetchResult | None:
-        hourly = _historical_hourly_names(req)
-        if not hourly:
-            return FetchResult(samples=[], grid=None)
-        logger.debug(
-            "open_meteo historical request model=%s window=%s..%s",
-            req.model,
-            window_start,
-            window_end,
-        )
-        start_date, end_date = _historical_date_range(window_start, window_end)
-        response = await self._client.get(
-            "https://previous-runs-api.open-meteo.com/v1/forecast",
-            params={
-                "latitude": req.lat,
-                "longitude": req.lon,
-                "models": req.model,
-                "hourly": ",".join(hourly),
-                "timezone": "UTC",
-                "start_date": start_date.isoformat(),
-                "end_date": end_date.isoformat(),
-            },
-            timeout=httpx.Timeout(15.0, connect=5.0),
-        )
-        response.raise_for_status()
-        payload = OpenMeteoResponse.model_validate(response.json())
-        data = payload.model_dump()
-        samples = _historical_samples_from_hourly(req, data, window_start, window_end)
-        logger.debug(
-            "open_meteo historical response status=%s samples=%s",
             response.status_code,
             len(samples),
         )
@@ -267,103 +204,3 @@ def _normalized_value(variable: str, raw_value: float) -> float:
         # while source_raw preserves the provider value for diagnostics.
         return 0.0
     return raw_value
-
-
-def _historical_hourly_names(req: ForecastRequest) -> list[str]:
-    days = range(1, min(7, req.max_lead_hours // 24) + 1)
-    return [
-        f"{provider_name}_previous_day{day}"
-        for variable, provider_name in VARIABLE_MAP.items()
-        if variable in req.variables
-        for day in days
-    ]
-
-
-def _historical_samples_from_hourly(
-    req: ForecastRequest, data: object, window_start: str, window_end: str
-) -> list[NormalizedSample]:
-    if not isinstance(data, dict):
-        return []
-    payload = cast(dict[str, object], data)
-    hourly = payload.get("hourly")
-    if not isinstance(hourly, dict):
-        return []
-    hourly_map = cast(dict[str, object], hourly)
-    times = hourly_map.get("time")
-    if not isinstance(times, list):
-        return []
-    start = parse_utc(window_start)
-    end = parse_utc(window_end)
-    out: list[NormalizedSample] = []
-    for variable, provider_name in VARIABLE_MAP.items():
-        if variable not in req.variables:
-            continue
-        for day in range(1, min(7, req.max_lead_hours // 24) + 1):
-            values = hourly_map.get(f"{provider_name}_previous_day{day}")
-            if not isinstance(values, list):
-                continue
-            out.extend(
-                _historical_series_samples(
-                    req=req,
-                    variable=variable,
-                    day=day,
-                    times=cast(list[object], times),
-                    values=cast(list[object], values),
-                    start=start,
-                    end=end,
-                )
-            )
-    return out
-
-
-def previous_run_lead_hours(variable: str, day: int) -> int:
-    """Lead of a previous-runs value ``day`` days back, in whole hours.
-
-    The run is dated from the raw hour; rain is labelled one hour earlier
-    (``precip_hour_start``), so its lead is one hour shorter. The adapter and
-    the ICON-EU coverage check both call this, so they cannot drift.
-    """
-    return day * 24 - (1 if variable == "precip" else 0)
-
-
-def _historical_series_samples(
-    *,
-    req: ForecastRequest,
-    variable: str,
-    day: int,
-    times: list[object],
-    values: list[object],
-    start: datetime,
-    end: datetime,
-) -> list[NormalizedSample]:
-    out: list[NormalizedSample] = []
-    for idx, raw_time in enumerate(times):
-        if idx >= len(values) or values[idx] is None:
-            continue
-        raw_value = values[idx]
-        if not isinstance(raw_value, str | int | float):
-            continue
-        raw_dt = parse_utc(str(raw_time))
-        valid_at = isoformat_utc(raw_dt)
-        if variable == "precip":
-            valid_at = precip_hour_start(valid_at)
-        valid_dt = parse_utc(valid_at)
-        if valid_dt < start or valid_dt >= end:
-            continue
-        # The run is dated from the raw hour, so every variable of one raw
-        # hour keeps the same issued_at; only the rain label moves.
-        issued_at = isoformat_utc(raw_dt - timedelta(days=day))
-        value = _normalized_value(variable, float(raw_value))
-        out.append(
-            NormalizedSample(
-                model=req.model,
-                variable=variable,
-                issued_at=issued_at,
-                valid_at=valid_at,
-                lead_hours=previous_run_lead_hours(variable, day),
-                value=value,
-                source_raw=f"{raw_value} previous_day{day}",
-                model_run_id=f"{req.model}:{issued_at}",
-            )
-        )
-    return out

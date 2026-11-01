@@ -11,13 +11,9 @@ input moves the epoch, so the next apply misses and the step recomputes
 from committed state. So the process-wide write lock is never held for an
 aggregate, a ``DISTINCT`` or a whole rebuild.
 
-This module stands apart from ``processor.py`` for two forced reasons:
-(i) catchup's rescore lane needs these orchestrators too, and
-``processor.py`` imports ``run_catchup`` from ``catchup.py`` — catchup
-cannot import a processor-hosted orchestrator back at module level without
-a circular import; (ii) a public name spares the concurrent-rebuild bench
-(``scripts/bench_route_during_rebuild.py``) importing a processor-private
-symbol.
+This module stands apart from ``processor.py`` so that a public name spares
+the concurrent-rebuild bench (``scripts/bench_route_during_rebuild.py``)
+importing a processor-private symbol.
 
 Correctness rests on the convergence-invariant comment at the
 ``pair_and_score`` dispatch site (worker/processor.py) — read it before
@@ -95,8 +91,8 @@ class ScoringInputsBusy(Exception):
     """A scoring step's inputs changed on every one of its CAS attempts.
 
     Deliberately not a ``JobControl``: each caller decides what it means (the
-    processor defers the job, catchup hands the site to the main lane). It
-    carries only the site id and the step name, never an attempt's payload.
+    processor defers the job). It carries only the site id and the step name,
+    never an attempt's payload.
     """
 
     def __init__(self, site_id: int, step: str) -> None:

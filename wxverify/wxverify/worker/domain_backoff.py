@@ -45,12 +45,9 @@ SOURCE_DOMAINS: dict[str, str] = {
     "meteosource": "www.meteosource.com",
     "google": "weather.googleapis.com",
 }
-OPEN_METEO_HISTORICAL_DOMAIN = "previous-runs-api.open-meteo.com"
 
 
-def source_domain(source: str, *, historical: bool = False) -> str:
-    if source == "open-meteo" and historical:
-        return OPEN_METEO_HISTORICAL_DOMAIN
+def source_domain(source: str) -> str:
     return SOURCE_DOMAINS[source]
 
 

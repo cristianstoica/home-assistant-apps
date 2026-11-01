@@ -8,7 +8,6 @@ in 2035 (plan §11).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import types
@@ -17,7 +16,6 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 import wxverify.core.timeutil as timeutil_module
@@ -26,7 +24,7 @@ from wxverify.core.timeutil import day_ahead, utc_now
 from wxverify.db import queue as queue_module
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.queue import Job, claim_next_job, complete, enqueue_if_absent
+from wxverify.db.queue import claim_next_job, complete, enqueue_if_absent
 from wxverify.feeds.seam import CostEstimate, FetchResult, NormalizedSample
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import leaderboard_with_status
@@ -45,7 +43,7 @@ from wxverify.worker.feed_fetch import (
     _persist_fetch_success,
     fetch_feed_once,
 )
-from wxverify.worker.processor import dispatch, run_claimed_job
+from wxverify.worker.processor import run_claimed_job
 
 _SITE_NAME = "Testsite"
 _LAT = 12.3456
@@ -689,8 +687,6 @@ def test_gate_live_path_injected_enqueue_failure_rolls_back_fetch(
     writer = FencedWriter(db, db.generation) if fenced else None
 
     class _PairableAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -755,8 +751,6 @@ def test_gate_live_path_probe_error_rolls_back_fetch(
     writer = FencedWriter(db, db.generation) if fenced else None
 
     class _PairableAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -1278,8 +1272,6 @@ def _freeze(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
 # 11.3 Obs (T-obs-1, T-obs-2, T-obs-3)
 # ---------------------------------------------------------------------------
 
-_OBS_API_KEY = "0123456789abcdef0123456789abcdef"
-
 
 def _init_tmp_obs_db(tmp_path: Path) -> sqlite3.Connection:
     close_db()
@@ -1288,209 +1280,6 @@ def _init_tmp_obs_db(tmp_path: Path) -> sqlite3.Connection:
     config.options_path = str(tmp_path / "missing-options.json")
     db = init_db(str(db_path))
     return db._conn  # noqa: SLF001 -- tests inspect the real writer connection
-
-
-def _seed_obs_site_and_stations(
-    conn: sqlite3.Connection, station_ids: list[str]
-) -> tuple[int, dict[str, int]]:
-    site_id = int(
-        conn.execute(
-            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES (?, ?, ?, 100.0, 'UTC')",
-            (_SITE_NAME, _LAT, _LON),
-        ).lastrowid
-    )
-    ids: dict[str, int] = {}
-    for pws_id in station_ids:
-        ids[pws_id] = int(
-            conn.execute(
-                "INSERT INTO stations"
-                " (site_id, pws_station_id, lat, lon, dem_elevation_m)"
-                " VALUES (?, ?, ?, ?, 100.0)",
-                (site_id, pws_id, _LAT, _LON),
-            ).lastrowid
-        )
-    return site_id, ids
-
-
-def _obs_payload_response(readings: list[tuple[str, float]]) -> httpx.Response:
-    """A 200 whose body decodes to one temperature observation per reading
-    (only ``metric.temp`` is populated)."""
-    body = {
-        "observations": [
-            {"obsTimeUtc": stamp, "metric": {"temp": value}}
-            for stamp, value in readings
-        ]
-    }
-    return httpx.Response(
-        200,
-        content=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-    )
-
-
-def _empty_obs_response() -> httpx.Response:
-    return httpx.Response(200, content=b'{"observations": []}')
-
-
-def _run_fetch_obs(
-    db: object, writer: FencedWriter, site_id: int, handler: object
-) -> None:
-    real_client = httpx.AsyncClient
-    with patch(
-        "wxverify.worker.processor.httpx.AsyncClient",
-        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
-    ):
-        asyncio.run(
-            dispatch(
-                db,  # type: ignore[arg-type]
-                writer,
-                Job(
-                    id=1,
-                    type="fetch_obs",
-                    site_id=site_id,
-                    job_key="obs",
-                    payload={},
-                    status="running",
-                    retry_count=0,
-                    max_retries=5,
-                ),
-            )
-        )
-
-
-def test_obs_abort_after_a_changed_station_still_queues_that_stations_pair_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Regression pin for §3's lost trigger: a later station's transport
-    error must not drop the score-run trigger a changed earlier station
-    already queued (``_persist_station_observations``'s own per-station
-    enqueue, see M12)."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        if station == "ISTATION01":
-            return _obs_payload_response([("2035-03-01T11:00:00Z", 10.0)])
-        if station == "ISTATION02":
-            return _empty_obs_response()
-        raise httpx.ConnectError("synthetic", request=request)
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-    with pytest.raises(httpx.ConnectError):
-        _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT status FROM jobs WHERE type='pair_and_score' AND site_id=?",
-        (site_id,),
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["status"] == "pending"
-
-
-def test_obs_no_change_across_every_station_queues_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every station reports only a reading already stored byte-for-byte --
-    not an empty payload, which `_persist_station_observations` would never
-    even reach the `changed` computation for. Seed via a real fetch cycle
-    first (so the stored row has the exact value/qc_flag/source_raw the
-    repeat response will be compared against), retire that cycle's job, then
-    replay the identical payload and confirm nothing new is queued."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    # Freeze "now" inside every reading's RECENT_REFRESH_HOURS window so the
-    # replay cycle below doesn't park a station for "no recent history" --
-    # that park check runs off the real wall clock otherwise, and would
-    # skip every station on the second cycle regardless of the gate under
-    # test, hiding the mutant this test must kill.
-    moment = datetime(2035, 3, 1, 13, 30, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.processor.utc_now", lambda: moment)
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        return _obs_payload_response([(f"2035-03-01T1{station[-1]}:00:00Z", 10.0)])
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    # Seed: a first cycle stores each station's reading (and does queue a
-    # score run -- that is the paired positive this test leans on: the gate
-    # fires on real change). Retire that job so the dedupe check below can't
-    # mask the second cycle's own enqueue decision.
-    _run_fetch_obs(db, writer, site_id, handler)
-    stored_before = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations"
-    ).fetchone()["n"]
-    assert stored_before > 0
-    seeded_job = conn.execute(
-        "SELECT id FROM jobs WHERE type='pair_and_score' AND site_id=?", (site_id,)
-    ).fetchone()
-    assert seeded_job is not None
-    conn.execute("UPDATE jobs SET status='completed' WHERE id=?", (seeded_job["id"],))
-    conn.commit()
-
-    # Replay: every station now reports exactly what's already on file.
-    _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT 1 FROM jobs WHERE type='pair_and_score' AND site_id=?"
-        " AND status IN ('pending', 'running')",
-        (site_id,),
-    ).fetchall()
-    assert rows == []
-    stored_after = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations"
-    ).fetchone()["n"]
-    assert stored_after == stored_before
-
-
-def test_obs_full_success_queues_exactly_one_deduped_pair_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every station reports a new observation: the per-station enqueue
-    (M12) and ``_complete_obs_cycle``'s cycle-end enqueue must dedupe to one
-    row, not stack."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        return _obs_payload_response([(f"2035-03-01T1{station[-1]}:00:00Z", 10.0)])
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-    _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT status FROM jobs WHERE type='pair_and_score' AND site_id=?",
-        (site_id,),
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------

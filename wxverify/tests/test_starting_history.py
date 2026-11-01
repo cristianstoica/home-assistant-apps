@@ -410,26 +410,34 @@ def test_sh3_starting_history_rows_survive_the_cutover_and_two_triggers(
         )
         assert resp.status_code in (200, 204)
 
-    f_row = conn.execute(
-        "SELECT MIN(local_date) FROM site_days WHERE site_id = ?", (site_id,)
-    ).fetchone()
-    assert f_row[0] is not None
-    f = date.fromisoformat(f_row[0])
-    f_plus_1_hour = datetime(f.year, f.month, f.day, 1, tzinfo=UTC)
-    ensure_site_days(conn, site_id, now_utc=f_plus_1_hour)
-    close_at = datetime(f.year, f.month, f.day, tzinfo=UTC) + timedelta(
-        days=1, minutes=30
-    )
-    begin_close(conn, site_id, f, now_utc=close_at)
-    finish_close(conn, site_id, f, now_utc=close_at)
-
-    after = {
-        table: _table_hash(conn, table)
-        for table in (
-            "station_observations",
-            "observations",
-            "daily_truth",
-            "forecast_pairs",
+    # The lifespan closes the shared database on shutdown, so `conn` (opened
+    # before the app existed) is stale here -- reach the file through a fresh
+    # connection opened after the client has stopped.
+    after_conn = sqlite3.connect(config.db_path)
+    after_conn.row_factory = sqlite3.Row
+    try:
+        f_row = after_conn.execute(
+            "SELECT MIN(local_date) FROM site_days WHERE site_id = ?", (site_id,)
+        ).fetchone()
+        assert f_row[0] is not None
+        f = date.fromisoformat(f_row[0])
+        f_plus_1_hour = datetime(f.year, f.month, f.day, 1, tzinfo=UTC)
+        ensure_site_days(after_conn, site_id, now_utc=f_plus_1_hour)
+        close_at = datetime(f.year, f.month, f.day, tzinfo=UTC) + timedelta(
+            days=1, minutes=30
         )
-    }
+        begin_close(after_conn, site_id, f, now_utc=close_at)
+        finish_close(after_conn, site_id, f, now_utc=close_at)
+
+        after = {
+            table: _table_hash(after_conn, table)
+            for table in (
+                "station_observations",
+                "observations",
+                "daily_truth",
+                "forecast_pairs",
+            )
+        }
+    finally:
+        after_conn.close()
     assert after == before  # forecast_pairs_hash (and the other three tables)

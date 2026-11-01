@@ -5,18 +5,15 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from wxverify.core.hashing import obs_jitter_minutes
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.queue import (
     LATEST_JOB_SQL,
-    enqueue_if_absent,
     enqueue_if_absent_with_cooldown,
 )
 from wxverify.db.site_days import daily_close_on
-from wxverify.settings.keys import get_number_setting, get_setting
+from wxverify.settings.keys import get_setting
 from wxverify.worker.close_chain import enqueue_due_close_work
 from wxverify.worker.round import (
     enqueue_due_daytime_downloads,
@@ -56,14 +53,6 @@ _DUE_JOB_FAILURE_COOLDOWN = timedelta(hours=1)
 # re-runs at 24 instead of one per worker-loop iteration.
 RECORD_RETRY_INTERVAL = timedelta(hours=1)
 
-# How old a site's last completed score run may get before the scheduler
-# queues a refresh when nothing new can pair. Six hours matches the
-# fetch-block spacing the old fetch trigger refreshed at, is half the
-# monitor's PAIR_SCORE_LIVE_HOURS, and is under 1 % of a 30-day window's
-# time span. The served ranking is older by the tick delay, queue wait and
-# run time on top. See the fetch-scoring-gate plan, section 9.
-SCORE_REFRESH_MAX_AGE: Final = timedelta(hours=6)
-
 
 def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
     """Whether ``now`` is still inside the day's late-write window.
@@ -92,16 +81,10 @@ def scheduler_tick(conn: sqlite3.Connection) -> None:
     now = utc_now()
     enqueue_due_round_tries(conn, now_utc=now)
     enqueue_due_daytime_downloads(conn, now_utc=now)
-    _enqueue_due_obs(conn)
     _enqueue_due_wind_days(conn)
     _enqueue_due_forecast_records(conn)
-    # With the daily close on, the close's chain replaces the nightly replay
-    # and the score backstop: scores are written only by its stage 5.
-    if daily_close_on(conn):
-        enqueue_due_close_work(conn, now_utc=utc_now())
-    else:
-        _enqueue_due_verification_runs(conn)
-        _enqueue_due_score_refresh(conn)
+    # The close's chain: scores are written only by its stage 5.
+    enqueue_due_close_work(conn, now_utc=utc_now())
 
 
 # Site-local wall-clock time at/after which the nightly verification trigger
@@ -128,83 +111,6 @@ VERIFICATION_PUBLISH_HOLD_KEY = "verification_publish_hold"
 def verification_publish_held(conn: sqlite3.Connection) -> bool:
     """Whether the operator has held the nightly verification trigger."""
     return get_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY) == "1"
-
-
-def _enqueue_due_verification_runs(conn: sqlite3.Connection) -> None:
-    """Enqueue the nightly verification chain per site (§14).
-
-    Due when the site's local time has passed the trigger time and no
-    trigger decision exists yet for (site, local today). An active chain
-    suppresses the trigger with a DURABLE ``suppressed_because_active``
-    decision row — that row also gates re-enqueue for the rest of the day.
-    Bad tz config fails closed per site, like the record trigger above.
-    """
-    from wxverify.verification.record import resolve_snapshot_utc
-    from wxverify.verification.runs import (
-        PUBLISH_HOLD_REASON,
-        record_trigger_decision,
-        trigger_decision_blocks,
-    )
-    from wxverify.worker.verification_run import (
-        verification_chain_active,
-        verification_job_key,
-    )
-
-    now = utc_now()
-    held = verification_publish_held(conn)
-    rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
-    for row in rows:
-        site_id = int(row["id"])
-        timezone = str(row["timezone"])
-        try:
-            tz = ZoneInfo(timezone)
-            local_today = now.astimezone(tz).date()
-            trigger_utc = resolve_snapshot_utc(
-                timezone, local_today, VERIFICATION_TRIGGER_LOCAL_TIME
-            )
-        except (ZoneInfoNotFoundError, ValueError):
-            logger.warning(
-                "scheduler: unusable verification trigger config site=%s; skipping",
-                site_id,
-            )
-            continue
-        if now < trigger_utc:
-            continue
-        day_iso = local_today.isoformat()
-        if trigger_decision_blocks(conn, site_id, day_iso, held=held):
-            continue
-        active = verification_chain_active(conn, site_id)
-        if active:
-            record_trigger_decision(
-                conn,
-                site_id,
-                trigger_date=day_iso,
-                decision="suppressed_because_active",
-                reason="verification chain already active",
-            )
-            continue
-        if held:
-            # §3.1: the hold is a real control. The durable row uses the
-            # existing 'skipped' enum value -- `decision` is CHECK-constrained
-            # to four values and widening it means rebuilding the table -- and
-            # carries its meaning in `reason`, which has exactly one
-            # definition, shared with the reader surfaces.
-            record_trigger_decision(
-                conn,
-                site_id,
-                trigger_date=day_iso,
-                decision="skipped",
-                reason=PUBLISH_HOLD_REASON,
-            )
-            continue
-        enqueue_if_absent_with_cooldown(
-            conn,
-            "verification_run",
-            site_id,
-            verification_job_key(site_id),
-            {"trigger_date": day_iso},
-            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-        )
 
 
 def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
@@ -282,53 +188,6 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
             )
 
 
-def _enqueue_due_obs(conn: sqlite3.Connection) -> None:
-    interval = get_number_setting(conn, "obs_interval_minutes", 180, minimum=30)
-    jitter_cap = get_number_setting(conn, "obs_jitter_minutes", 20, minimum=0)
-    now = utc_now()
-    rows = conn.execute(
-        """
-        SELECT s.id, s.last_obs_cycle_at
-        FROM sites s
-        WHERE s.enabled=1
-          AND EXISTS (
-              SELECT 1 FROM stations st
-              WHERE st.site_id=s.id AND st.enabled=1
-          )
-        """
-    ).fetchall()
-    for row in rows:
-        last = row["last_obs_cycle_at"]
-        due = last is None
-        if last is not None:
-            try:
-                last_dt = parse_utc(str(last))
-            except ValueError:
-                # Foreign/corrupt last_obs_cycle_at: fail open (treat as due)
-                # so a single unreadable row cannot kill the tick.
-                logger.warning(
-                    "scheduler: unreadable last_obs_cycle_at site=%s; "
-                    "treating obs as due",
-                    int(row["id"]),
-                )
-                due = True
-            else:
-                cycle_bucket = int(last_dt.timestamp() // (interval * 60))
-                jitter = obs_jitter_minutes(int(row["id"]), cycle_bucket, jitter_cap)
-                elapsed = (now - last_dt).total_seconds() / 60
-                due = elapsed >= interval + jitter
-        if due:
-            logger.debug("scheduler due obs site=%s", int(row["id"]))
-            enqueue_if_absent_with_cooldown(
-                conn,
-                "fetch_obs",
-                int(row["id"]),
-                "obs",
-                {},
-                cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-            )
-
-
 def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
     """Enqueue the wind-history lane for each site with work (plan §8.13).
 
@@ -388,62 +247,6 @@ def _enqueue_due_wind_days(conn: sqlite3.Connection) -> None:
             {},
             cooldown=_DUE_JOB_FAILURE_COOLDOWN,
             success_cooldown=success_cooldown,
-        )
-
-
-def _enqueue_due_score_refresh(conn: sqlite3.Connection) -> None:
-    """Queue a score run for each enabled site whose last one is stale.
-
-    The time backstop behind the fetch score gate: a forward fetch queues
-    ``pair_and_score`` only when an inserted sample would pair now, so a
-    site with no new pairs and no page visits is rescored here once its
-    latest completed score job is ``SCORE_REFRESH_MAX_AGE`` old.
-
-    - A cancelled completion (``result`` NULL) counts as fresh.
-    - A terminal failure suppresses the backstop for
-      ``_DUE_JOB_FAILURE_COOLDOWN`` (1 h).
-    - A site that has never had a score job is skipped; its first run comes
-      from an observation insert or a read. The same holds for a site whose
-      only score rows were failed rows older than 168 h:
-      ``purge_failed_jobs_older_than`` deletes them, so the latest row is
-      gone and the backstop stops for that site until an observation insert
-      or a read queues a run.
-
-    An unreadable success stamp fails open here: the wrapper's success
-    cooldown fails closed on it, and with the non-date-scoped ``score`` key
-    that would stop the backstop for good and log a warning every tick.
-    Queueing once clears it, because the queued job becomes the latest row
-    and its completion rewrites ``updated_at`` with a valid stamp.
-    """
-    for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
-        site_id = int(row["id"])
-        latest = conn.execute(
-            LATEST_JOB_SQL, ("pair_and_score", "score", site_id)
-        ).fetchone()
-        if latest is None:
-            # Never scored: the first run comes from an obs insert or a read.
-            continue
-        if str(latest["status"]) == "completed":
-            try:
-                parse_utc(str(latest["updated_at"]))
-            except ValueError:
-                logger.warning(
-                    "score refresh: unreadable updated_at on latest completed"
-                    " score job site=%s; queueing a refresh",
-                    site_id,
-                )
-                enqueue_if_absent(
-                    conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-                )
-                continue
-        enqueue_if_absent_with_cooldown(
-            conn,
-            "pair_and_score",
-            site_id,
-            "score",
-            {"site_id": site_id},
-            cooldown=_DUE_JOB_FAILURE_COOLDOWN,
-            success_cooldown=SCORE_REFRESH_MAX_AGE,
         )
 
 

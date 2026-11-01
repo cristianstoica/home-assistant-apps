@@ -1,14 +1,12 @@
 """Current-observation poll: classification state machine + poll-state writes.
 
-The hourly ``_fetch_obs`` stream (processor.py) feeds the scoring pipeline and
-owns ``stations.last_error``/``error_count``/``last_run_at``. This module owns a
-SEPARATE, independent per-station poll of ``/observations/current`` whose only
-job is to learn each station's upload cadence and keep a last-good display
-snapshot in ``station_current_obs``, with liveness tracked on
-``station_poll_state``'s OWN diagnostic columns. The two streams never touch each
-other's diagnostics — that separation is load-bearing: the read route
-surfaces the current-obs terminal reason, and the hourly stream's success reset
-must not wipe it.
+This module owns a SEPARATE, independent per-station poll of
+``/observations/current`` whose only job is to learn each station's upload
+cadence and keep a last-good display snapshot in ``station_current_obs``,
+with liveness tracked on ``station_poll_state``'s OWN diagnostic columns. It
+never writes ``stations.last_error``/``error_count``/``last_run_at``: the read
+route surfaces the current-obs terminal reason from ``station_poll_state``,
+kept apart from those columns.
 
 The classification ordering in ``classify_current_obs`` is load-bearing:
 429 is checked BEFORE the 4xx-terminal branch (a rate-limit must never flip a

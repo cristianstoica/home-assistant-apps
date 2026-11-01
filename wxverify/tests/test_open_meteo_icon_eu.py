@@ -256,22 +256,6 @@ def test_d1_t5_cost_estimate_uses_the_seeded_max_lead_hours() -> None:
     )
     adapter = OpenMeteoAdapter(httpx.AsyncClient())
     assert adapter.estimate_cost(req).calls == 1
-    assert (
-        adapter.estimate_historical_cost(
-            req,
-            window_start="2026-06-01T00:00:00Z",
-            window_end="2026-06-08T00:00:00Z",
-        ).calls
-        == 2
-    )
-    assert (
-        adapter.estimate_historical_cost(
-            req,
-            window_start="2026-06-01T00:00:00Z",
-            window_end="2026-07-01T00:00:00Z",
-        ).calls
-        == 4
-    )
 
 
 # ---------------------------------------------------------------------------

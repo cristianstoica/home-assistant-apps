@@ -36,10 +36,14 @@ class PublishHoldState:
 
 
 def read_publish_hold(conn: sqlite3.Connection) -> PublishHoldState:
-    """Derive the current publish-hold state from its two sources of truth."""
+    """Derive the current publish-hold state from its two sources of truth.
+
+    ``chain_active`` is always False: the nightly replay chain it reported
+    is retired (switch-over plan R12). The field stays so the payload keeps
+    its shape for the Ops page and the banner.
+    """
     from wxverify.db.runtime_state import get_runtime_state_entry
     from wxverify.worker.scheduler import verification_publish_held
-    from wxverify.worker.verification_run import any_verification_chain_active
 
     last_state_entry = get_runtime_state_entry(conn, PUBLISH_HOLD_LAST_STATE_KEY)
     last_source = get_runtime_state(conn, PUBLISH_HOLD_LAST_SOURCE_KEY)
@@ -52,7 +56,7 @@ def read_publish_hold(conn: sqlite3.Connection) -> PublishHoldState:
             None if last_state_entry is None else last_state_entry.updated_at
         ),
         bootstrap=bootstrap,
-        chain_active=any_verification_chain_active(conn),
+        chain_active=False,
     )
 
 

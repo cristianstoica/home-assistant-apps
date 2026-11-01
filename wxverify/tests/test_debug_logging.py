@@ -25,7 +25,6 @@ Covers:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import copy
 import logging
 import sqlite3
@@ -45,7 +44,7 @@ from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
 from wxverify.db.switch import ensure_site_generation
-from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
+from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 from wxverify.worker.processor import run_worker
@@ -329,8 +328,6 @@ def test_feed_adapter_debug_url_secret_absent_in_caplog(
     secret_url = "https://api.example.com/v1?key=SYNTHETIC-SECRET-E2E"
 
     class _SecretUrlAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -966,104 +963,6 @@ def test_worker_cycle_debug_lines_at_debug(
 
 
 # ---------------------------------------------------------------------------
-# T12 — Backfill and catchup firehose at DEBUG
-# ---------------------------------------------------------------------------
-
-
-def test_backfill_debug_lines_present(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """T12-E: run_backfill_site at DEBUG emits chunk/window debug lines."""
-    conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
-    db = get_db()
-
-    from wxverify.worker.backfill import run_backfill_site  # noqa: PLC0415
-    from wxverify.worker.control import JobCancelled  # noqa: PLC0415
-
-    writer = FencedWriter(db, db.generation)
-
-    # run_backfill_site emits its window/chunk debug lines before it tries to fetch
-    # station history. With no stations configured, fetch_station_history_window
-    # raises JobCancelled (no weathercom key / no enabled stations). We catch that
-    # so we can inspect what was logged before the cancellation.
-    with (
-        caplog.at_level(logging.DEBUG, logger="wxverify.worker.backfill"),
-        contextlib.suppress(JobCancelled),
-    ):
-        asyncio.run(run_backfill_site(db, writer, site_id, {}))
-
-    backfill_debug = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == "wxverify.worker.backfill" and r.levelno == logging.DEBUG
-    ]
-    # At minimum the backfill site + chunk debug lines should appear
-    assert len(backfill_debug) > 0, (
-        "run_backfill_site must emit at least one DEBUG line"
-    )
-    # Confirm the site id appears in one of the trace lines
-    assert any(str(site_id) in m for m in backfill_debug), (
-        f"site_id {site_id} must appear in backfill debug output; got: {backfill_debug}"
-    )
-
-
-def test_catchup_debug_lines_present(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """T12-E: run_catchup at DEBUG emits sites/cursor debug lines.
-
-    The open-meteo adapter is stubbed so the due feeds are walked
-    without a request; the line under test is emitted before any fetch.
-    """
-    conn = _init_tmp_db(tmp_path)
-    _insert_site(conn)
-    db = get_db()
-
-    from wxverify.worker.catchup import run_catchup  # noqa: PLC0415
-
-    class _NoFetchAdapter:
-        supports_historical = True
-
-        def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
-            return CostEstimate(calls=1)
-
-        def estimate_historical_cost(
-            self, req: ForecastRequest, *, window_start: str, window_end: str
-        ) -> CostEstimate:
-            return CostEstimate(calls=1)
-
-        async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
-            raise AssertionError("catchup must not fetch a live forecast")
-
-        async def fetch_historical(
-            self, req: ForecastRequest, *, window_start: str, window_end: str
-        ) -> FetchResult | None:
-            return None
-
-    def _fake_build_adapter(source: str, client: httpx.AsyncClient) -> _NoFetchAdapter:
-        assert source == "open-meteo"
-        return _NoFetchAdapter()
-
-    monkeypatch.setattr("wxverify.worker.catchup.build_adapter", _fake_build_adapter)
-
-    writer = FencedWriter(db, db.generation)
-
-    with caplog.at_level(logging.DEBUG, logger="wxverify.worker.catchup"):
-        asyncio.run(run_catchup(db, writer, {}))
-
-    catchup_debug = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == "wxverify.worker.catchup" and r.levelno == logging.DEBUG
-    ]
-    assert len(catchup_debug) > 0, "run_catchup must emit at least one DEBUG line"
-    assert any("catchup sites=" in m for m in catchup_debug), (
-        f"'catchup sites=' DEBUG line missing; got: {catchup_debug}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # T13 — DB migration + transaction firehose at DEBUG
 # ---------------------------------------------------------------------------
 
@@ -1397,8 +1296,6 @@ def test_d5_feed_fetch_http_error_emits_no_error_record(
     resp = httpx.Response(403, request=req)
 
     class _Http403Adapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -1464,8 +1361,6 @@ def test_d5_feed_fetch_transport_error_emits_no_error_record(
     db = get_db()
 
     class _TransportErrorAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 

@@ -73,18 +73,6 @@ from tests.test_phase8_verification_v16 import (
 from tests.test_phase8_verification_v16 import (
     _seed_rich_run,
 )
-from tests.test_wind_auth_hold import (
-    _insert_day as _wa_insert_day,
-)
-from tests.test_wind_auth_hold import (
-    _make_db as _wa_make_db,
-)
-from tests.test_wind_auth_hold import (
-    _make_site as _wa_make_site,
-)
-from tests.test_wind_auth_hold import (
-    _make_station as _wa_make_station,
-)
 from tests.test_wind_basis import (
     _make_db as _wb_make_db,
 )
@@ -103,15 +91,12 @@ from tests.test_wind_basis import (
 from tests.test_wind_basis import (
     _seed_real_model_candidate as _wb_seed_real_model_candidate,
 )
-from wxverify.db.connection import get_db
-from wxverify.db.migrations import run_migrations
+from wxverify.db.migrations import run_migrations, seed_default_sources
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.wind_basis import write_auth_hold
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import WIND_METHOD
 from wxverify.monitor import _wind_history_trips  # noqa: PLC2701
 from wxverify.obs.pws_adapter import observations_from_payload
-from wxverify.obs.wind_pairs import WindRecord
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import _distinct_cells  # noqa: PLC2701
 from wxverify.scoring.pairing import compute_real_model_pairs
@@ -121,15 +106,71 @@ from wxverify.verification.runs import capture_config_snapshot
 from wxverify.web.context import (
     load_site,
     load_station_trust,
-    load_wind_banner,
     load_wind_weights,
 )
-from wxverify.worker.verification_run import _blocking_gate  # noqa: PLC2701
 from wxverify.worker.wind_days import (  # noqa: PLC2701
     _persist_day,
     _start_job,
     wind_lane_due,
 )
+
+# ---------------------------------------------------------------------------
+# Moved from tests/test_wind_auth_hold.py (R7; that file leaves whole).
+# ---------------------------------------------------------------------------
+
+
+def _wa_make_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    run_migrations(conn)
+    seed_default_sources(conn)
+    conn.commit()
+    return conn
+
+
+def _wa_make_site(
+    conn: sqlite3.Connection, name: str = "Testsite", tz: str = "UTC"
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
+        " VALUES (?, 0.0, 0.0, 0.0, ?)",
+        (name, tz),
+    )
+    assert cur.lastrowid is not None
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _wa_make_station(
+    conn: sqlite3.Connection, site_id: int, pws_id: str, *, enabled: bool = True
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m,"
+        " enabled) VALUES (?, ?, 0.0, 0.0, 0.0, ?)",
+        (site_id, pws_id, 1 if enabled else 0),
+    )
+    assert cur.lastrowid is not None
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def _wa_insert_day(
+    conn: sqlite3.Connection,
+    station_id: int,
+    local_date: date,
+    *,
+    status: str = "pending",
+    attempts: int = 0,
+) -> None:
+    conn.execute(
+        "INSERT INTO station_wind_days"
+        " (station_id, local_date, status, attempts, record_count, pair_hours,"
+        "  refetched, updated_at)"
+        " VALUES (?, ?, ?, ?, 0, 0, 0, '2026-01-01T00:00:00Z')",
+        (station_id, local_date.isoformat(), status, attempts),
+    )
+    conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # D1 -- insert_station_observation's wind guard.
@@ -394,11 +435,9 @@ def test_d5_dashboard_wind_weights_ignore_the_key() -> None:
 
 
 def test_d5_wind_banner_absent_and_station_trust_includes_wind() -> None:
-    """Paired with the hold-present web test below: without any auth hold,
-    ``load_wind_banner`` returns ``None`` regardless of the key (it is no
-    longer gated on a "pair_max"/mode read at all). ``load_station_trust``
-    is keyed on ``station_observations``/``observations`` rows, not on the
-    wind key, so a wind row surfaces there under any key too."""
+    """``load_station_trust`` is keyed on ``station_observations``/
+    ``observations`` rows, not on the wind key, so a wind row surfaces
+    there under any key."""
     conn = _wa_make_db()
     site_id = _wa_make_site(conn)
     station_id = _wa_make_station(conn, site_id, "WSTATION01")
@@ -418,54 +457,9 @@ def test_d5_wind_banner_absent_and_station_trust_includes_wind() -> None:
     )
     conn.commit()
 
-    banner = load_wind_banner(conn, site_id)
     trust = load_station_trust(conn)
 
-    assert banner is None
     assert any(row.variable == "wind" for row in trust)
-
-
-def test_d5_ops_and_dashboard_render_the_history_hold_text(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Plan §6.11 renames the Ops panel's "Rebuild calls today:" label to
-    "History calls today:" and drops the dashboard banner's progress note,
-    leaving only the auth-hold titles. Base's ``WIND_HOLD_TITLES`` for
-    "history_all" is "Rebuild stalled: weather.com refused the key", so its
-    dashboard banner both omits the removal tree's title text and still
-    contains "Rebuild stalled"."""
-    conn = _v16_init_tmp_db(tmp_path)
-    _v16_make_site(conn)
-    app = _v16_make_app(monkeypatch)
-    with TestClient(app) as client:
-        ops_resp = client.get("/ops")
-        assert ops_resp.status_code == 200
-        assert "History calls today" in ops_resp.text
-
-        db = get_db()
-        db.write_sync(
-            lambda conn: write_auth_hold(
-                conn,
-                "history_all",
-                status="held",
-                since="2035-07-01T00:00:00Z",
-                error="refused",
-            )
-        )
-
-        dash_resp = client.get("/dashboard")
-
-    assert dash_resp.status_code == 200
-    assert 'id="wind-banner"' in dash_resp.text
-    assert (
-        "<strong>This weather.com key cannot download wind history for"
-        " past days, a known limit of the key.</strong>" in dash_resp.text
-    )
-    assert (
-        'Use "Try again" in the Wind History panel on Ops to check the key'
-        " again." in dash_resp.text
-    )
-    assert "Rebuild stalled" not in dash_resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -501,27 +495,6 @@ def test_d6_monitor_today_checks_run_under_a_blocked_switching_key() -> None:
     assert first == "no wind readings today from any station"
     assert first is not None
     assert not first.startswith("wind rebuild")
-
-
-# ---------------------------------------------------------------------------
-# D7 -- the verification-run blocking gate.
-# ---------------------------------------------------------------------------
-
-
-def test_d7_blocking_gate_no_longer_defers_a_run_for_a_switching_key() -> None:
-    """Base's ``worker/verification_run.py::_blocking_gate`` returns
-    ``("skipped", "wind history switch in progress")`` while the key reads
-    "switching"/"rescoring". The removal tree's ``_blocking_gate`` has no
-    such first check -- a fresh site with no published run and no failed
-    attempts for the fingerprint falls through to ``None``."""
-    conn = _wa_make_db()
-    site_id = _wa_make_site(conn)
-    set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
-    conn.commit()
-
-    decision = _blocking_gate(conn, site_id, "fp-test")
-
-    assert decision is None
 
 
 # ---------------------------------------------------------------------------
@@ -599,7 +572,6 @@ def test_d11_persist_day_writes_no_wind_basis_progress_key() -> None:
         tz_name="UTC",
         today=today,
         records=[],
-        probe=None,
     )
 
     assert get_runtime_state(conn, f"wind_basis_progress_at:{site_id}") is None
@@ -702,52 +674,6 @@ def test_d15_wind_days_job_start_leaves_an_unrecognized_key_untouched() -> None:
     _start_job(conn, site_id)
 
     assert get_runtime_state(conn, f"wind_basis:{site_id}") == "bogus"
-
-
-# ---------------------------------------------------------------------------
-# D16 -- _persist_day's pair-max station rows, independent of the key.
-# ---------------------------------------------------------------------------
-
-
-def test_d16_persist_day_writes_pair_max_rows_under_a_staging_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Base's ``_persist_day`` only derives/writes pair-max station rows
-    when ``wind_basis_state(conn, site_id) == "pair_max"`` -- under the
-    "staging" key it skips that write block entirely. The removal tree's
-    ``_persist_day`` writes them unconditionally, whatever the key."""
-    conn = _wa_make_db()
-    site_id = _wa_make_site(conn)
-    station_id = _wa_make_station(conn, site_id, "WSTATION01")
-    set_runtime_state(conn, f"wind_basis:{site_id}", "staging")
-    today = date(2035, 7, 10)
-    local_date = date(2035, 7, 5)
-    frozen_now = datetime(2035, 7, 10, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.wind_days.utc_now", lambda: frozen_now)
-    _wa_insert_day(conn, station_id, local_date, status="pending")
-    conn.commit()
-    records = [
-        WindRecord(obs_at=datetime(2035, 7, 5, 10, 0, tzinfo=UTC), speed_kmh=5.0),
-        WindRecord(obs_at=datetime(2035, 7, 5, 10, 5, tzinfo=UTC), speed_kmh=7.0),
-    ]
-
-    _persist_day(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=local_date,
-        tz_name="UTC",
-        today=today,
-        records=records,
-        probe=None,
-    )
-
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations"
-        " WHERE station_id = ? AND variable = 'wind'",
-        (station_id,),
-    ).fetchone()
-    assert int(row["n"]) > 0
 
 
 # ---------------------------------------------------------------------------

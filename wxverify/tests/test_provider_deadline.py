@@ -7,7 +7,7 @@ in a total ``asyncio.timeout`` of ``read_seconds + PROVIDER_DEADLINE_MARGIN_SECO
 converting ONLY its own expiry to ``ProviderDeadlineExceeded`` -- a transport
 ``TimeoutError`` and an external cancel both pass through unchanged.
 
-Covers DL1 (deadline fires, all four call sites) and DL2 (only the
+Covers DL1 (deadline fires, all three call sites) and DL2 (only the
 deadline's own expiry is converted). DL3-DL5 exercise the shared call lock
 and are tested with it.
 
@@ -34,7 +34,6 @@ from wxverify.obs.pws_adapter import (
     _get_with_deadline,  # noqa: PLC2701 -- exercising the helper directly for DL2
     fetch_current_observation,
     fetch_hourly_history,
-    fetch_hourly_history_range,
     validate_station,
 )
 
@@ -92,7 +91,7 @@ def _trickling_transport() -> tuple[httpx.MockTransport, _TricklingByteStream]:
 
 
 # ---------------------------------------------------------------------------
-# DL1 -- the deadline fires, at all four call sites
+# DL1 -- the deadline fires, at all three call sites
 # ---------------------------------------------------------------------------
 
 # name -> that function's read timeout, so the per-test margin patch lands
@@ -102,13 +101,12 @@ def _trickling_transport() -> tuple[httpx.MockTransport, _TricklingByteStream]:
 _DL1_READ_SECONDS: Final[dict[str, float]] = {
     "validate_station": 10.0,
     "fetch_hourly_history": 10.0,
-    "fetch_hourly_history_range": 20.0,
     "fetch_current_observation": 10.0,
 }
 
 
 class TestDeadlineFires:
-    """DL1: parametrized over the four weather.com call sites.
+    """DL1: parametrized over the three weather.com call sites.
 
     Mutant: a raw ``client.get`` in place of ``_get_with_deadline`` at any
     call site. With no total deadline, the trickling body never yields
@@ -155,14 +153,6 @@ class TestDeadlineFires:
                                 if name == "fetch_hourly_history":
                                     await fetch_hourly_history(
                                         _STATION_ID, _API_KEY, client=client
-                                    )
-                                elif name == "fetch_hourly_history_range":
-                                    await fetch_hourly_history_range(
-                                        _STATION_ID,
-                                        _API_KEY,
-                                        window_start="2026-07-10T00:00:00Z",
-                                        window_end="2026-07-10T12:00:00Z",
-                                        client=client,
                                     )
                                 else:
                                     await fetch_current_observation(

@@ -174,7 +174,7 @@ def _seed_other_site(pws_ids: list[str]) -> int:
     return get_db().write_sync(_seed)
 
 
-def test_lr1_create_station_queues_fetch_obs_not_backfill(
+def test_lr1_create_station_queues_no_job_and_counts_from_the_next_day(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = _setup_app(tmp_path, monkeypatch, "lr1")
@@ -191,9 +191,9 @@ def test_lr1_create_station_queues_fetch_obs_not_backfill(
         )
         assert resp.status_code == 200
 
-        jobs = _jobs_for_site(site_id)
-        assert jobs.count("fetch_obs") == 1
-        assert "backfill_site" not in jobs
+        assert _jobs_for_site(site_id) == [], (
+            "R2 (switch-over plan 7.2): create_station queues no job"
+        )
 
         station_id = _station_db_id(site_id, "ISTATION03")
         changes = _station_changes(station_id)

@@ -35,11 +35,6 @@ from wxverify.verification.runs import (
     publish_run,
 )
 from wxverify.verification.simulate import SIM_VARIABLES
-from wxverify.worker.verification_run import (
-    _load_state,  # noqa: SLF001
-    _save_state,  # noqa: SLF001
-    advance_verification,
-)
 
 #: Ten truth-eligible target dates; the feed is forecast-eligible on six of
 #: them (0.6) so it lands BELOW the 0.70 availability floor.
@@ -308,40 +303,6 @@ def test_the_comparison_does_not_disturb_the_verdicts() -> None:
     before = [tuple(r) for r in conn.execute(query, (run_id,)).fetchall()]
     write_pairwise_comparisons(conn, cfg)
     assert [tuple(r) for r in conn.execute(query, (run_id,)).fetchall()] == before
-
-
-# ---------------------------------------------------------------------------
-# §3.2 — the phase mutates and re-saves the blob; `run_id` survives
-# ---------------------------------------------------------------------------
-
-
-def test_pairwise_phase_survives_a_separate_chunk_transaction() -> None:
-    """pairwise → publish across two committed transactions.
-
-    A fresh-dict write in `pairwise` drops `run_id`, `_blob_config` then
-    raises `JobCancelled`, the processor COMPLETES the cancellation, and the
-    chain ends with no publish and no error — so the assertion that matters
-    is that the run reaches `published`.
-    """
-    conn = asof_conn()
-    site_id, run_id, _cfg = _prepared(conn, wind_outcome="recommend")
-    _save_state(conn, site_id, {"phase": "pairwise", "run_id": run_id})
-    conn.commit()
-
-    assert advance_verification(conn, site_id, {}) is True
-    conn.commit()
-    blob = _load_state(conn, site_id)
-    assert blob is not None
-    assert blob["run_id"] == run_id
-    assert blob["phase"] == "publish"
-    assert _vs_recommended(_feed_row(conn, run_id))["available"] is True
-
-    assert advance_verification(conn, site_id, {}) is False
-    conn.commit()
-    state = conn.execute(
-        "SELECT state FROM verification_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    assert str(state["state"]) == "published"
 
 
 # ---------------------------------------------------------------------------

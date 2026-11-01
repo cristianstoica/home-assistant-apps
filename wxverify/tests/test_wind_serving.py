@@ -25,11 +25,9 @@ from tests.test_forecast_service import (
 )
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.wind_basis import write_auth_hold
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import NOT_ENOUGH_FEEDS_NOTE
-from wxverify.web.context import load_wind_banner
 
 # --- T59: one eligible feed is still below MIN_FEEDS ----------------------
 
@@ -159,32 +157,6 @@ def test_t60_stored_switching_or_rescoring_key_serves_weighted_wind(
     payload = build_hourly(conn, site_id=1, timezone="UTC", day=0, now=now)
     assert payload["blend"]["wind_kmh"] == pytest.approx([18.0] * 24)
     assert payload["notes"] == {"wind": None}
-
-
-def test_t60_banner_is_none_without_holds_and_shows_a_held_title() -> None:
-    """The dashboard banner (``load_wind_banner``) is None while no
-    weather.com auth hold exists, and carries the hold's title once one is
-    written -- paired, so the None proves the hold check rather than a
-    banner that can never fire.
-
-    mutant_banner_without_holds -> at the first ``is None``: correct = None
-    (no hold), mutant (a ``WindBanner`` returned with an empty ``holds``) =
-    ``WindBanner(holds=[])``.
-    """
-    history_title = (
-        "This weather.com key cannot download wind history for past days,"
-        " a known limit of the key"
-    )
-    conn = _make_db()
-    assert load_wind_banner(conn, 1) is None
-
-    write_auth_hold(
-        conn, "history_all", status="held", since="2026-01-02T22:00:00Z", error=None
-    )
-    conn.commit()
-    banner = load_wind_banner(conn, 1)
-    assert banner is not None
-    assert banner.holds == [history_title]
 
 
 # --- T66: build_hourly in weighted mode -------------------------------------

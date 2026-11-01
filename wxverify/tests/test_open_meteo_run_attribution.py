@@ -34,7 +34,7 @@ import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed
 from wxverify.collection.forecast_fetcher import persist_fetch_result
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import parse_utc
 from wxverify.db.migrations import (
     OPEN_METEO_INTERVAL_CORRECTION_KEY,
     correct_open_meteo_fetch_intervals,
@@ -45,12 +45,11 @@ from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.feeds.open_meteo import (
     RUN_AVAILABILITY_LAG_MINUTES,
     RUN_CADENCE_HOURS,
-    _historical_series_samples,  # noqa: SLF001
     _run_shape,  # noqa: SLF001
     _samples_from_hourly,  # noqa: SLF001
     _snap_run,  # noqa: SLF001
 )
-from wxverify.feeds.seam import FetchResult, ForecastRequest, NormalizedSample
+from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import samples_fingerprint
 from wxverify.verification.runs import capture_config_snapshot, input_fingerprint
 from wxverify.worker.round import enqueue_due_daytime_downloads
@@ -344,45 +343,6 @@ def test_e_t5_revised_payload_for_the_same_run_is_not_stored() -> None:
     assert row is not None
     assert row["value"] == 10.0
     assert row["source_raw"] == "10.0"
-
-
-# ---------------------------------------------------------------------------
-# E-T6 -- path fence: the previous-runs path is untouched by this item.
-# ---------------------------------------------------------------------------
-
-
-def test_e_t6_historical_path_issued_at_is_not_a_run_boundary() -> None:
-    """``_snap_run`` is not on the historical/previous-runs path; that path
-    keeps deriving ``issued_at`` from ``valid_at - day * 24h`` after the
-    cadence correction, with ``lead_hours == day * 24``.
-    """
-    req = ForecastRequest(
-        lat=0.0,
-        lon=0.0,
-        model="gem_global",
-        variables=("temperature",),
-        max_lead_hours=168,
-    )
-    day = 2
-    times: list[object] = ["2026-06-10T05:00:00Z"]
-    values: list[object] = [12.3]
-    start = parse_utc("2026-06-01T00:00:00Z")
-    end = parse_utc("2026-06-30T00:00:00Z")
-
-    samples = _historical_series_samples(
-        req=req,
-        variable="temperature",
-        day=day,
-        times=times,
-        values=values,
-        start=start,
-        end=end,
-    )
-    assert len(samples) == 1
-    sample = samples[0]
-    valid_dt = parse_utc(sample.valid_at)
-    assert sample.issued_at == isoformat_utc(valid_dt - timedelta(days=day))
-    assert sample.lead_hours == day * 24
 
 
 # ---------------------------------------------------------------------------

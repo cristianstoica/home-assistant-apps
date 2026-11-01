@@ -13,21 +13,19 @@ import sqlite3
 from datetime import date
 
 from wxverify.db.migrations import run_migrations
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.verification.coverage import (
     EXCLUDE_BELOW_NEAR_COMPLETE,
     EXCLUDE_DRY_WITHOUT_NEAR_COMPLETE,
     EXCLUDE_INSUFFICIENT_COVERAGE,
     EXCLUDE_MISSING_PEAK_WINDOW,
+    QuantityOutcome,
     evaluate_precip,
     evaluate_temperature,
     local_day_bounds,
 )
-from wxverify.verification.truth import (
-    mark_daily_truth_stale,
-    materialize_daily_truth,
-    regenerate_marked_truth,
-)
+from wxverify.verification.truth import evaluate_day_window, mark_daily_truth_stale
 
 
 def _conn() -> sqlite3.Connection:
@@ -75,20 +73,6 @@ def _utc_day(day: str, hours: range, values: list[float]) -> list[tuple[str, flo
     ]
 
 
-def _truth_row(
-    conn: sqlite3.Connection, site_id: int, local_date: str, quantity: str
-) -> sqlite3.Row:
-    row = conn.execute(
-        """
-        SELECT * FROM daily_truth
-        WHERE site_id=? AND local_date=? AND quantity=?
-        """,
-        (site_id, local_date, quantity),
-    ).fetchone()
-    assert row is not None
-    return row
-
-
 # ---------------------------------------------------------------- expected slots
 
 
@@ -106,7 +90,8 @@ def test_expected_slots_ordinary_and_dst_days() -> None:
 def test_full_day_truth_values_and_eligibility() -> None:
     conn = _conn()
     site_id = _make_site(conn)
-    day = "2026-06-10"
+    local_date = date(2026, 6, 10)
+    day = local_date.isoformat()
     temps = [float(h) for h in range(24)]
     _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), temps))
     _seed_obs(conn, site_id, "wind", _utc_day(day, range(24), [5.0] * 23 + [12.5]))
@@ -115,7 +100,13 @@ def test_full_day_truth_values_and_eligibility() -> None:
     precip[15] = 0.5
     _seed_obs(conn, site_id, "precip", _utc_day(day, range(24), precip))
 
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = evaluate_day_window(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        timezone="UTC",
+        bounds=local_day_bounds(local_date, "UTC"),
+    ).outcomes
 
     assert outcomes["temperature_high"].value == 23.0
     assert outcomes["temperature_low"].value == 0.0
@@ -124,14 +115,7 @@ def test_full_day_truth_values_and_eligibility() -> None:
     assert outcomes["precip_occurrence"].value == 1.0
     assert all(outcome.eligible for outcome in outcomes.values())
     assert all(outcome.covered_hours == 24 for outcome in outcomes.values())
-    # Rows persisted per quantity with generation tag + provenance.
-    row = _truth_row(conn, site_id, day, "precip_total")
-    assert row["eligible"] == 1
-    assert row["expected_slots"] == 24
-    assert row["tz_generation_id"] is not None
-    assert row["timezone"] == "UTC"
-    assert row["source_max_computed_at"] == "2026-06-11T02:00:00Z"
-    assert row["stale"] == 0
+    assert outcomes["precip_total"].expected_slots == 24
 
 
 # ------------------------------------------------------------------- temp gates
@@ -189,15 +173,23 @@ def test_peak_window_is_half_open() -> None:
 def test_near_complete_gate_boundaries() -> None:
     conn = _conn()
     site_id = _make_site(conn)
-    day = "2026-06-10"
+    local_date = date(2026, 6, 10)
+    day = local_date.isoformat()
+    bounds = local_day_bounds(local_date, "UTC")
+
+    def _evaluate() -> dict[str, QuantityOutcome]:
+        return evaluate_day_window(
+            conn, site_id=site_id, local_date=local_date, timezone="UTC", bounds=bounds
+        ).outcomes
+
     # 23 of 24 passes (>= expected - 1); 22 of 24 fails.
     _seed_obs(conn, site_id, "wind", _utc_day(day, range(23), [4.0] * 23))
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = _evaluate()
     assert outcomes["wind_max"].eligible
 
     conn.execute("DELETE FROM observations WHERE variable='wind'")
     _seed_obs(conn, site_id, "wind", _utc_day(day, range(22), [4.0] * 22))
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = _evaluate()
     assert not outcomes["wind_max"].eligible
     assert outcomes["wind_max"].exclusion_reason == EXCLUDE_BELOW_NEAR_COMPLETE
     assert outcomes["wind_max"].value == 4.0  # diagnostic retained
@@ -257,7 +249,9 @@ def test_occurrence_wet_at_any_coverage_dry_needs_near_complete() -> None:
 def test_fall_back_day_counts_both_fold_instants() -> None:
     conn = _conn()
     site_id = _make_site(conn, timezone="Europe/Athens")
-    day = "2026-10-25"  # 25-hour local day: 2026-10-24T21:00Z .. 2026-10-25T22:00Z
+    # 25-hour local day: 2026-10-24T21:00Z .. 2026-10-25T22:00Z
+    local_date = date(2026, 10, 25)
+    bounds = local_day_bounds(local_date, "Europe/Athens")
     hours = [f"2026-10-24T{h:02d}:00:00Z" for h in range(21, 24)] + [
         f"2026-10-25T{h:02d}:00:00Z" for h in range(22)
     ]
@@ -270,7 +264,13 @@ def test_fall_back_day_counts_both_fold_instants() -> None:
     ]
     _seed_obs(conn, site_id, "precip", list(zip(hours, values, strict=True)))
 
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = evaluate_day_window(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        timezone="Europe/Athens",
+        bounds=bounds,
+    ).outcomes
 
     total = outcomes["precip_total"]
     assert total.expected_slots == 25
@@ -283,7 +283,13 @@ def test_fall_back_day_counts_both_fold_instants() -> None:
     conn.execute(
         "DELETE FROM observations WHERE valid_at='2026-10-25T21:00:00Z'",
     )
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = evaluate_day_window(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        timezone="Europe/Athens",
+        bounds=bounds,
+    ).outcomes
     assert outcomes["precip_total"].covered_hours == 24
     assert outcomes["precip_total"].eligible
 
@@ -291,14 +297,21 @@ def test_fall_back_day_counts_both_fold_instants() -> None:
 def test_spring_forward_day_has_23_expected_slots() -> None:
     conn = _conn()
     site_id = _make_site(conn, timezone="Europe/Athens")
-    day = "2026-03-29"  # 23-hour local day: 2026-03-28T22:00Z .. 2026-03-29T21:00Z
+    # 23-hour local day: 2026-03-28T22:00Z .. 2026-03-29T21:00Z
+    local_date = date(2026, 3, 29)
     hours = [f"2026-03-28T{h:02d}:00:00Z" for h in (22, 23)] + [
         f"2026-03-29T{h:02d}:00:00Z" for h in range(21)
     ]
     assert len(hours) == 23
     _seed_obs(conn, site_id, "wind", [(h, 3.0) for h in hours[:22]])
 
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    outcomes = evaluate_day_window(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        timezone="Europe/Athens",
+        bounds=local_day_bounds(local_date, "Europe/Athens"),
+    ).outcomes
 
     wind = outcomes["wind_max"]
     assert wind.expected_slots == 23
@@ -315,8 +328,32 @@ def test_materialize_consensus_marks_affected_truth_rows() -> None:
     day = "2026-06-10"
     _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), [10.0] * 24))
     _seed_obs(conn, site_id, "wind", _utc_day(day, range(24), [4.0] * 24))
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    materialize_daily_truth(conn, site_id=site_id, local_date="2026-06-11")
+    generation_id = ensure_site_generation(conn, site_id)
+    for local_date in (day, "2026-06-11"):
+        for quantity in (
+            "temperature_high",
+            "temperature_low",
+            "wind_max",
+            "precip_total",
+        ):
+            conn.execute(
+                """
+                INSERT INTO daily_truth
+                    (site_id, local_date, quantity, value, eligible,
+                     covered_hours, expected_slots, day_start_utc, day_end_utc,
+                     timezone, tz_generation_id)
+                VALUES (?, ?, ?, 0.0, 1, 24, 24, ?, ?, 'UTC', ?)
+                """,
+                (
+                    site_id,
+                    local_date,
+                    quantity,
+                    f"{local_date}T00:00:00Z",
+                    f"{local_date}T23:59:59Z",
+                    generation_id,
+                ),
+            )
+    conn.commit()
 
     # No stations -> delete branch; the mark must still fire.
     materialize_consensus(
@@ -339,33 +376,6 @@ def test_materialize_consensus_marks_affected_truth_rows() -> None:
     assert other_day["s"] == 0  # neighboring day untouched
 
 
-def test_regenerate_marked_truth_recomputes_and_clears_stale() -> None:
-    conn = _conn()
-    site_id = _make_site(conn)
-    day = "2026-06-10"
-    _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), [10.0] * 24))
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    assert _truth_row(conn, site_id, day, "temperature_high")["value"] == 10.0
-
-    # A consensus rewrite changes an hourly value and marks the day.
-    conn.execute(
-        "UPDATE observations SET value=31.0 WHERE valid_at=?",
-        (f"{day}T14:00:00Z",),
-    )
-    marked = mark_daily_truth_stale(
-        conn, site_id=site_id, variable="temperature", valid_at=f"{day}T14:00:00Z"
-    )
-    assert marked == 2  # high + low only
-
-    regenerated = regenerate_marked_truth(conn)
-
-    assert regenerated == 1
-    row = _truth_row(conn, site_id, day, "temperature_high")
-    assert row["value"] == 31.0
-    assert row["stale"] == 0
-    assert regenerate_marked_truth(conn) == 0  # idempotent once clean
-
-
 def test_mark_ignores_unknown_variable_and_returns_rowcount() -> None:
     conn = _conn()
     site_id = _make_site(conn)
@@ -375,39 +385,3 @@ def test_mark_ignores_unknown_variable_and_returns_rowcount() -> None:
         )
         == 0
     )
-
-
-# --------------------------------------------------------- generation binding
-
-
-def test_regeneration_preserves_the_rows_own_generation() -> None:
-    conn = _conn()
-    site_id = _make_site(conn)
-    day = "2026-06-10"
-    _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), [10.0] * 24))
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'UTC', 'retrospective_correction', 'building')
-        """,
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    building = int(cur.lastrowid)
-    materialize_daily_truth(
-        conn, site_id=site_id, local_date=day, tz_generation_id=building
-    )
-    mark_daily_truth_stale(
-        conn, site_id=site_id, variable="temperature", valid_at=f"{day}T05:00:00Z"
-    )
-
-    regenerate_marked_truth(conn, site_id=site_id)
-
-    generations = {
-        int(row["tz_generation_id"])
-        for row in conn.execute(
-            "SELECT tz_generation_id FROM daily_truth WHERE quantity=?",
-            ("temperature_high",),
-        )
-    }
-    assert building in generations

@@ -191,27 +191,19 @@ async def set_publish_hold_route(body: PublishHoldIn) -> dict[str, object]:
 
     Behind the existing ``MutationGuard`` (same-origin, JSON content type,
     CSRF double-submit) by construction -- this route adds no exemption.
-    Release is refused with 409 while any site has a queued or running
-    verification chain; arming is never refused (D5).
     """
     if body.confirm is not True:
         raise ApiError(400, "confirmation required")
 
     def _write(conn: sqlite3.Connection) -> dict[str, object]:
         from wxverify.worker.scheduler import verification_publish_held
-        from wxverify.worker.verification_run import any_verification_chain_active
 
         was_held = verification_publish_held(conn)
-        chain_active = any_verification_chain_active(conn)
-        if not body.held and chain_active:
-            raise ApiError(409, "a verification run is active; release refused")
         set_publish_hold(conn, held=body.held, source="ops")
         logger.info(
-            "publish-hold transition old_held=%s new_held=%s source=ops "
-            "chain_active=%s",
+            "publish-hold transition old_held=%s new_held=%s source=ops",
             was_held,
             body.held,
-            chain_active,
         )
         state = read_publish_hold(conn)
         return cast("dict[str, object]", asdict(state))

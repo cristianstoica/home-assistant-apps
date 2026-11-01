@@ -33,10 +33,10 @@ def set_rolling_window_days_sync(conn: sqlite3.Connection, days: int) -> None:
     # That run keeps the window it discovered, so it can rebuild the old `w:N`
     # slice and not the new one. Only the CLI can apply a change while the
     # worker runs; the boot apply runs before the worker. That site rebuilds on
-    # its next trigger: a rolling read (`rebuilding` queues a rescore), an
-    # observation or pairable-fetch trigger, or the 6 h backstop. With the
-    # daily close on, enqueue_scoring_run queues nothing: the change waits
-    # for the next publication (daily-close P4 plan, 13.1).
+    # its next trigger: a rolling read (`rebuilding` queues a rescore) or a
+    # pairable-fetch trigger. With the daily close on, enqueue_scoring_run
+    # queues nothing: the change waits for the next publication (daily-close
+    # P4 plan, 13.1).
     conn.execute(
         "DELETE FROM score_cache WHERE window_key LIKE 'w:%' "
         "AND window_key NOT IN ('w:all', ?)",

@@ -29,7 +29,6 @@ from wxverify.db.connection import get_db, init_db
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import (
     count_failed_jobs_older_than,
-    enqueue_if_absent,
     purge_failed_jobs_older_than,
 )
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
@@ -81,7 +80,9 @@ logger = logging.getLogger(__name__)
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.command == "timezone" and args.timezone_command in ("correct", "status"):
+    if args.command in ("backfill", "catchup") or (
+        args.command == "timezone" and args.timezone_command in ("correct", "status")
+    ):
         # Retired with the daily close (plan 7.3): the message and exit 1,
         # before logging is set up and before init_db opens the file.
         _die(RETIRED_CONTROL_MESSAGE)
@@ -97,10 +98,6 @@ def main(argv: list[str] | None = None) -> int:
         return _score(args)
     if args.command == "fetch":
         return _fetch(args)
-    if args.command == "backfill":
-        return _backfill(args)
-    if args.command == "catchup":
-        return _catchup(args)
     if args.command == "settings":
         return _settings(args)
     if args.command == "sources":
@@ -135,6 +132,8 @@ def _build_parser() -> argparse.ArgumentParser:
     score = sub.add_parser("score")
     score.add_argument("--site-id", type=int)
 
+    # Retired with the daily close; the parsers stay, so a script that calls
+    # them gets the retirement message, not a usage error (plan 7.3).
     backfill = sub.add_parser("backfill")
     backfill.add_argument("site_id", type=int)
 
@@ -301,26 +300,6 @@ def _fetch(args: argparse.Namespace) -> int:
         return 0
     print(f"skipped feed_id={args.feed_id} reason={result.reason}")
     return 1
-
-
-def _backfill(args: argparse.Namespace) -> int:
-    get_db().write_sync(
-        lambda conn: enqueue_if_absent(
-            conn,
-            "backfill_site",
-            args.site_id,
-            f"backfill:{args.site_id}",
-            {"site_id": args.site_id},
-        )
-    )
-    return 0
-
-
-def _catchup(args: argparse.Namespace) -> int:
-    get_db().write_sync(
-        lambda conn: enqueue_if_absent(conn, "catchup", None, "catchup", {})
-    )
-    return 0
 
 
 def _settings(args: argparse.Namespace) -> int:

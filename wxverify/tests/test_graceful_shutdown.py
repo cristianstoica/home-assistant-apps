@@ -33,7 +33,6 @@ from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import _cancel_and_reap, create_app, lifespan
-from wxverify.collection.budget import is_refundable_transport_error
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.queue import (
@@ -41,7 +40,6 @@ from wxverify.db.queue import (
     claim_next_job,
     reclaim_all_stale,
 )
-from wxverify.obs.pws_adapter import ProviderDeadlineExceeded
 from wxverify.worker.processor import (
     _shutdown_reclaim,  # noqa: PLC2701
     run_claimed_job,
@@ -83,13 +81,29 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
 def _insert_job(
     conn: sqlite3.Connection, *, status: str = "pending", job_key: str = "k1"
 ) -> int:
-    """Insert a minimal, synthetic ``catchup`` job row (no site needed)."""
+    """Insert a minimal, synthetic ``fetch_feed`` job row against a minimal
+    seeded site. ``catchup`` (the job kind this fixture used before R8
+    retired it) is gone; ``fetch_feed`` is a kept main-lane kind the claim
+    still takes (``MAIN_LANE_TYPE_SQL``, ``db/queue.py``), and every test
+    here stubs ``dispatch`` so the literal kind is otherwise inert. The
+    jobs table's CHECK only allows a NULL ``site_id`` for ``catchup``, so a
+    real site is seeded here for every call. The site is seeded disabled so
+    a live scheduler_tick (two lifespan tests run a real worker with the
+    daily close on) queues none of its per-site work ahead of this job,
+    since the claim itself does not read ``sites.enabled``."""
+    cur = conn.execute(
+        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+        " timezone, enabled) VALUES (?, 40.0, -105.0, 900.0, 'UTC', 0)",
+        (f"job-site-{job_key}",),
+    )
+    site_id = cur.lastrowid
+    assert site_id is not None, "INSERT must produce a rowid"
     cur = conn.execute(
         """
         INSERT INTO jobs (type, site_id, job_key, payload, status)
-        VALUES ('catchup', NULL, ?, '{}', ?)
+        VALUES ('fetch_feed', ?, ?, '{}', ?)
         """,
-        (job_key, status),
+        (site_id, job_key, status),
     )
     conn.commit()
     job_id = cur.lastrowid
@@ -2239,93 +2253,6 @@ def test_c4_ordinary_failure_mutant_attempts_a_second_fenced_write(
             f"that discovers the stale generation) should be attempted; "
             f"saw {fenced_write_calls}"
         )
-
-    asyncio.run(_run())
-
-
-def test_dl4_history_call_deadline_is_not_refunded_and_marks_the_station(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """DL4: a provider-call deadline through the main lane's history call
-    site (`_fetch_obs` -> `fetch_hourly_history`) behaves like DL3's
-    current-obs case -- no refund (`ProviderDeadlineExceeded` is a
-    `TimeoutError`, not one of `_REFUNDABLE_TRANSPORT_ERRORS`), the job
-    fails/retries, the call lock is released -- and additionally the
-    station's `error_count` rises by exactly 1 with `last_error` set
-    (`_mark_station_error`, the generic-exception branch of `_fetch_obs`).
-
-    Mutant: accepting `TimeoutError` into `is_refundable_transport_error` --
-    the same mutant DL3 targets, killed here through the history call site.
-    """
-    conn = _init_tmp_db(tmp_path)
-    Path(config.options_path).write_text(
-        json.dumps({"weathercom_key": "ci-placeholder"}), encoding="utf-8"
-    )
-    db = get_db()
-
-    cur = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone, "
-        "enabled) VALUES ('DL4 Site', 40.0, -105.0, 900.0, 'UTC', 1)"
-    )
-    site_id = cur.lastrowid
-    assert site_id is not None
-    cur = conn.execute(
-        "INSERT INTO stations (site_id, pws_station_id, lat, lon, dem_elevation_m) "
-        "VALUES (?, 'ISTATION-DL4', 40.0, -105.0, 900.0)",
-        (site_id,),
-    )
-    station_id = cur.lastrowid
-    assert station_id is not None
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, max_retries) "
-        "VALUES ('fetch_obs', ?, 'obs', '{}', 'pending', 3)",
-        (site_id,),
-    )
-    conn.commit()
-
-    async def _raise_deadline(*_args: object, **_kwargs: object) -> list[object]:
-        raise ProviderDeadlineExceeded("provider call exceeded its deadline")
-
-    monkeypatch.setattr(
-        "wxverify.worker.processor.fetch_hourly_history", _raise_deadline
-    )
-
-    async def _run() -> None:
-        lock = weathercom_call_lock()
-
-        def _weathercom_calls() -> int:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(calls), 0) AS c FROM api_budget"
-                " WHERE source = 'weathercom'"
-            ).fetchone()
-            return int(row["c"])
-
-        before = _weathercom_calls()
-        job = await db.write(claim_next_job)
-        assert job is not None and job.type == "fetch_obs"
-
-        assert not is_refundable_transport_error(
-            ProviderDeadlineExceeded("provider call exceeded its deadline")
-        )
-
-        await run_claimed_job(db, job, lane="main")
-
-        after = _weathercom_calls()
-        assert after == before + 1, "a refund would bring the call count back down by 1"
-
-        station_row = conn.execute(
-            "SELECT error_count, last_error FROM stations WHERE id=?", (station_id,)
-        ).fetchone()
-        assert station_row["error_count"] == 1
-        assert station_row["last_error"] is not None
-
-        job_row = conn.execute(
-            "SELECT status, retry_count FROM jobs WHERE id=?", (job.id,)
-        ).fetchone()
-        assert job_row["status"] in ("pending", "failed")
-        assert job_row["retry_count"] == 1
-
-        assert lock.locked() is False
 
     asyncio.run(_run())
 

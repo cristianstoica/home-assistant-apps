@@ -33,7 +33,6 @@ from wxverify.core.secrets import resolve_secret
 from wxverify.core.timeutil import isoformat_utc, local_day_start, parse_utc
 from wxverify.db.queue import MAIN_LANE_TYPE_SQL
 from wxverify.db.site_days import daily_close_on
-from wxverify.db.wind_basis import count_missed_final, read_auth_holds
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
     gap_scan_degraded_sites,
@@ -153,8 +152,9 @@ _ELIGIBLE_OBS_WHERE = """
 # be built, or an hourly cycle stopped by a refused-access hold) completes
 # with result NULL, as did every completion before the marker existed, and
 # none of those rows resolves anything.
-# The chain types (verification_run, backfill_site, timezone_correction,
-# record_gap_scan, catchup) are deliberately absent: _complete_and_continue
+# The chain types (record_gap_scan, and the retired verification_run,
+# backfill_site, timezone_correction and catchup, whose failed rows a file
+# can still hold) are deliberately absent: _complete_and_continue
 # completes every finished chunk under the chain's own key, so a later
 # completed row there is a chunk, not a resolution, and those scopes count by
 # age alone.
@@ -501,12 +501,10 @@ def _wind_history_trips(
     """``(sites tripped, the first tripped site's first reason)`` for wind_history.
 
     Evaluated per enabled site with at least one enabled station, in site id
-    order, over the checks (c), (i), (e) and (h) of plan §10, in that order, or
+    order, over the checks (c), (e) and (h) of plan §10, in that order, or
     (f) when the site's time zone is unusable. While the ``five_minute`` kind
-    is among ``refused_kinds``, check (h) names no station and check (i) is
-    off. Read-only.
+    is among ``refused_kinds``, check (h) names no station. Read-only.
     """
-    holds = read_auth_holds(conn)
     # Read once per call. refused_kinds, not access_held, so the checks also
     # stay off between a hold's end and the next try, while the stored row
     # still says the last answer was a refusal.
@@ -532,15 +530,6 @@ def _wind_history_trips(
             reasons.append("cannot evaluate")
         else:
             reasons.extend(_wind_day_reasons(conn, site_id, today))
-            # (i) yesterday's final collection before midnight was missed.
-            if "history_all" in holds and not five_minute_refused:
-                yesterday = today - timedelta(days=1)
-                missed, total = count_missed_final(conn, site_id, yesterday, tz_name)
-                if missed > 0:
-                    reasons.append(
-                        "wind: last collection before midnight missed for "
-                        f"{missed} of {total} stations ({yesterday})"
-                    )
             today_rows = conn.execute(
                 _WIND_TODAY_ROWS_SQL, (today.isoformat(), site_id)
             ).fetchall()
@@ -609,65 +598,6 @@ def _wind_stale_station_reasons(
             f"wind for {row['pws_station_id']} has not updated since {since}"
         )
     return reasons
-
-
-# A running verification_run chunk's progress evidence for problem_jobs.
-# One compound statement, so each job row and its heartbeat come from one read
-# snapshot. With two reads, a chunk that fails for good between them would be
-# counted as stuck: the terminal-failure write deletes the heartbeat in the same
-# transaction that marks the row failed, and the first read would still have
-# seen the row running. The heartbeat key is stored data, 'verification_heartbeat:'
-# followed by the site id, written by wxverify.worker.verification_run. It is
-# spelled out here, and the problem_jobs progress tests write the heartbeat
-# through the worker's own key function and _heartbeat, so a change to the
-# format on either side fails them. site_id is never NULL for this type (the
-# jobs CHECK), and at most one verification_run row per site is active.
-_VERIFICATION_PROGRESS_SQL: Final = """
-    SELECT r.value
-      FROM jobs AS j
-      LEFT JOIN runtime_state AS r
-        ON r.key = 'verification_heartbeat:' || j.site_id
-     WHERE j.status = 'running'
-       AND j.type = 'verification_run'
-       AND j.updated_at <= ?
-"""
-
-# How far a heartbeat may lie ahead of the monitor's now and still count as
-# progress. now is taken before the read, so a day that commits while the read
-# waits for a pooled connection is legitimately newer. Five minutes covers that
-# wait with room to spare. It can hold off the stall count by up to five more
-# minutes; when an alert actually fires also depends on how often the monitor
-# runs, on read delays and on later clock changes. A heartbeat further ahead is
-# not valid clock evidence. It is treated as missing, not clamped to now: a
-# clamped value would read as fresh at every read until the clock caught up
-# with it.
-_HEARTBEAT_FUTURE_TOLERANCE: Final = timedelta(minutes=5)
-
-
-def _stuck_verification_chunks(
-    conn: sqlite3.Connection, now: datetime, claim_cutoff: str
-) -> int:
-    """Count running verification_run chunks with no recent progress.
-
-    A chunk counts when it was claimed at or before ``claim_cutoff`` (text
-    comparison, like the rest of the running arm) and its site's heartbeat is
-    missing, unreadable, at or before ``now`` minus STUCK_RUNNING_MINUTES, or
-    later than ``now`` plus _HEARTBEAT_FUTURE_TOLERANCE. The heartbeat is
-    parsed rather than compared as text: '.' sorts before 'Z', so text order
-    is not time order, and a value that does not parse (for example 'zzzz') is
-    no evidence of progress. A heartbeat more than the tolerance ahead of
-    ``now`` is treated like a missing one. One up to the tolerance ahead still
-    reads as progress, because ``now`` is taken before the read and a day
-    committed in between is legitimately newer.
-    """
-    progress_cutoff = now - timedelta(minutes=STUCK_RUNNING_MINUTES)
-    future_limit = now + _HEARTBEAT_FUTURE_TOLERANCE
-    stuck = 0
-    for row in conn.execute(_VERIFICATION_PROGRESS_SQL, (claim_cutoff,)):
-        beat = _parse_or_none(row[0])
-        if beat is None or beat <= progress_cutoff or beat > future_limit:
-            stuck += 1
-    return stuck
 
 
 def _retired_check_results(
@@ -823,10 +753,7 @@ def _pipeline_conditions(
     # anything but a real success. "Later" is id order, matched NULL-safely
     # with IS because job_key and site_id are nullable. The in-flight arm
     # below counts per row: pending overdue by at least 15 min, and running
-    # claimed at least 20 min ago, except that a running verification_run
-    # chunk counts only when its site's heartbeat is also at least 20 min
-    # old, more than 5 min in the future, missing or unreadable
-    # (_stuck_verification_chunks).
+    # claimed at least 20 min ago, every kind alike.
     # The pending arm mirrors claim_next_job's claim contract, which
     # treats `next_attempt_at IS NULL OR next_attempt_at <= now` as claimable —
     # so a stuck pending job can carry next_attempt_at=NULL. COALESCE(...,
@@ -861,7 +788,7 @@ def _pipeline_conditions(
         conn,
         """
         SELECT COUNT(*) FROM jobs
-        WHERE (status='running' AND type != 'verification_run' AND updated_at <= ?)
+        WHERE (status='running' AND updated_at <= ?)
            OR (status='pending'
                AND (COALESCE(next_attempt_at, updated_at) <= ?
                     OR (next_attempt_at IS NOT NULL
@@ -871,7 +798,6 @@ def _pipeline_conditions(
         """,
         (stuck_cutoff, pending_cutoff),
     )
-    inflight_n += _stuck_verification_chunks(conn, now, stuck_cutoff)
     problem_jobs_n = failed_scopes_n + inflight_n
 
     # forecast_record_gap (§16): enabled sites whose record log has begun

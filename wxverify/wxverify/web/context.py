@@ -34,7 +34,6 @@ from wxverify.db.site_days import (
     zone_flagged,
 )
 from wxverify.db.switch import first_record_date
-from wxverify.db.wind_basis import read_auth_holds
 from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_in_snapshot
 from wxverify.scoring.effective import MAX_DAY_AHEAD, active_feed_cte
@@ -358,28 +357,7 @@ class StationTrustRow:
     mean_delta: float
 
 
-#: The ops-page and banner title of a weather.com auth hold (plan §8.8).
-WIND_HOLD_TITLES: Final[dict[str, str]] = {
-    "history_all": (
-        "This weather.com key cannot download wind history for past days,"
-        " a known limit of the key"
-    ),
-}
-
 WIND_DAY_STATUSES: Final = ("pending", "partial", "fetched", "unavailable", "failed")
-
-
-@dataclass(frozen=True)
-class WindHoldView:
-    """One weather.com endpoint the wind lane is paused on (plan §8.8)."""
-
-    endpoint: str
-    #: "held" or "probing" (a check is queued for the next wind fetch).
-    status: str
-    title: str
-    since: str | None
-    #: The hold's last sanitized error, shown beside "Try again".
-    error: str | None
 
 
 @dataclass(frozen=True)
@@ -403,24 +381,16 @@ class WindSiteHistory:
 
 @dataclass(frozen=True)
 class WindHistoryPanel:
-    """The ops Wind History panel: the shared budget and holds, then per site.
+    """The ops Wind History panel: the shared budget, then per site.
 
-    Headroom, the lane counters and the auth holds are global (every site
-    shares one weather.com key and budget), so they are shown once.
+    Headroom and the lane counters are global (every site shares one
+    weather.com key and budget), so they are shown once.
     """
 
     headroom: int | None
     backfill_calls_today: int | None
     live_calls_today: int | None
-    holds: list[WindHoldView]
     sites: list[WindSiteHistory]
-
-
-@dataclass(frozen=True)
-class WindBanner:
-    """The dashboard's wind banner: any weather.com auth holds."""
-
-    holds: list[str]
 
 
 @dataclass(frozen=True)
@@ -567,7 +537,6 @@ def _load_dashboard(
             "winrate": [],
             "composite": [],
             "composite_status": "empty",
-            "wind_banner": None,
             "wind_weights": None,
         }
     day_ahead = _lead_to_day(lead)
@@ -644,7 +613,6 @@ def _load_dashboard(
         ),
         "composite": composite_result.rows,
         "composite_status": composite_result.status,
-        "wind_banner": load_wind_banner(conn, site.id),
         "wind_weights": (
             load_wind_weights(conn, site, day_ahead) if variable == "wind" else None
         ),
@@ -756,22 +724,6 @@ def load_ops(conn: sqlite3.Connection) -> dict[str, object]:
         "station_trust": load_station_trust(conn),
         "wind_history": load_wind_history(conn),
         "publish_hold": read_publish_hold(conn),
-        "close_on": close_on,
-        "close_panel": load_close_status(conn, now, close_on=close_on),
-    }
-
-
-def load_backfill_panel(conn: sqlite3.Connection) -> dict[str, object]:
-    """The backfill panel alone, in the same view as the page (plan §10.2).
-
-    What ``render_backfill`` renders after a button press: ``rows``
-    (``load_backfill``), ``close_on`` and ``close_panel``, with ``now`` and
-    the switch read once, as ``load_ops`` reads them.
-    """
-    now = utc_now()
-    close_on = daily_close_on(conn)
-    return {
-        "rows": load_backfill(conn),
         "close_on": close_on,
         "close_panel": load_close_status(conn, now, close_on=close_on),
     }
@@ -1550,19 +1502,6 @@ def load_station_trust(conn: sqlite3.Connection) -> list[StationTrustRow]:
     ]
 
 
-def _wind_holds(conn: sqlite3.Connection) -> list[WindHoldView]:
-    return [
-        WindHoldView(
-            endpoint=endpoint,
-            status=hold.status,
-            title=WIND_HOLD_TITLES[endpoint],
-            since=hold.since,
-            error=hold.error,
-        )
-        for endpoint, hold in read_auth_holds(conn).items()
-    ]
-
-
 def load_access_holds(conn: sqlite3.Connection) -> list[AccessHoldView]:
     """One line per download kind with a refused-access row, in kind order.
 
@@ -1665,17 +1604,8 @@ def load_wind_history(conn: sqlite3.Connection) -> WindHistoryPanel:
         headroom=backfill_headroom(conn, now=utc_now()),
         backfill_calls_today=backfill_calls,
         live_calls_today=live_calls,
-        holds=_wind_holds(conn),
         sites=sites,
     )
-
-
-def load_wind_banner(conn: sqlite3.Connection, site_id: int) -> WindBanner | None:
-    """The dashboard wind banner while a weather.com auth hold exists, else None."""
-    holds = [hold.title for hold in _wind_holds(conn)]
-    if not holds:
-        return None
-    return WindBanner(holds=holds)
 
 
 def load_wind_weights(

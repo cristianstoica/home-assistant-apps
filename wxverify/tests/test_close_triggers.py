@@ -20,7 +20,6 @@ itself). Synthetic data only: feed sources ``synthetic-tr-x``/
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -164,7 +163,6 @@ _TR2_ALLOWED_QUALNAMES = frozenset(
         "enqueue_scoring_run",
         "enqueue_score_rescore",
         "dispatch",
-        "_enqueue_due_score_refresh",
     }
 )
 # The monitor and the health route reference it in an f-string/column
@@ -228,8 +226,8 @@ def test_tr2_pair_and_score_literal_confined_to_allowed_call_sites() -> None:
     """TR2: an ``ast`` scan of ``wxverify/`` for the string literal
     ``"pair_and_score"`` finds it only inside the allowed call sites
     (``enqueue_scoring_run``, ``enqueue_score_rescore``, ``dispatch``, the
-    monitor, the health route and the scheduler's backstop); every OTHER
-    occurrence is a disallowed, unrouted enqueue site (10)."""
+    monitor and the health route); every OTHER occurrence is a disallowed,
+    unrouted enqueue site (10)."""
     hits = _find_pair_and_score_literals()
     assert hits, "fixture bug: the literal must occur somewhere in wxverify/"
 
@@ -400,154 +398,6 @@ def test_tr3_enqueue_score_rescore_enqueues_nothing_with_the_close_on() -> None:
         f" pair_and_score job was created -- got {_job_count(conn, site_id)}"
     )
     assert _table_count(conn, "publications") == 0
-
-
-def test_tr3_per_station_enqueue_enqueues_nothing_with_the_close_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """TR3 (per-station enqueue, ``worker/processor.py:1511-1514``): a
-    changed station observation must not enqueue ``pair_and_score`` with
-    the close on (10). Calls the narrowest function that holds the enqueue,
-    ``_persist_station_observations``, directly -- it takes only the
-    station's own id and its observations, no job dispatch needed.
-
-    ``_persist_station_observations`` reads ``utc_now()`` internally (no
-    ``now_utc`` override exists on it), so the close clock is pinned with
-    ``patch_close_clock``/``MovingClock`` first: left on the real 2026+
-    clock, the closed-day guard would see D-close-site's fixture dates
-    (2024) as long past any open record and refuse the write outright,
-    which would leave ``changed`` False for a fixture reason, not a P4 one.
-    """
-    from wxverify.obs.pws_adapter import PwsObservation
-    from wxverify.worker.processor import _persist_station_observations
-
-    conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
-    conn.commit()
-    patch_close_clock(monkeypatch, MovingClock(NOW))
-
-    station_id = int(
-        conn.execute(
-            "SELECT id FROM stations WHERE site_id = ? AND pws_station_id = ?",
-            (site_id, "ISTATION01"),
-        ).fetchone()[0]
-    )
-    valid_at = f"{D.isoformat()}T06:00:00Z"
-    outcome = _persist_station_observations(
-        conn,
-        site_id,
-        station_id,
-        [
-            PwsObservation(
-                variable="temperature",
-                valid_at=valid_at,
-                value=10.0,
-                source_raw="{}",
-            )
-        ],
-    )
-    conn.commit()
-    assert outcome.changed is True, "fixture bug: the observation must be a new write"
-
-    assert _job_count(conn, site_id) == 0, (
-        "M97/M98-shaped (per-station enqueue) -> at this assertion: correct"
-        " = 0 (close on: routed through enqueue_scoring_run, which"
-        " enqueues nothing, 10), mutant (the per-station enqueue not"
-        f" routed through enqueue_scoring_run) = a pair_and_score job was"
-        f" created -- got {_job_count(conn, site_id)}"
-    )
-
-
-def test_tr3_obs_cycle_enqueue_enqueues_nothing_with_the_close_on() -> None:
-    """TR3 (obs-cycle enqueue, ``worker/processor.py:1582-1585``): the end
-    of an observation cycle must not enqueue ``pair_and_score`` with the
-    close on (10). ``_complete_obs_cycle`` is the narrowest function
-    holding this enqueue site; it takes only ``site_id`` and the cycle's
-    own ``changed``/``newest_obs_at`` summary, with no internal
-    ``utc_now()``-driven day-write guard, so no clock patch is needed."""
-    from wxverify.worker.processor import _complete_obs_cycle
-
-    conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
-    conn.commit()
-
-    _complete_obs_cycle(conn, site_id, changed=True, newest_obs_at=None)
-    conn.commit()
-
-    assert _job_count(conn, site_id) == 0, (
-        "M97/M98-shaped (obs-cycle enqueue) -> at this assertion: correct ="
-        " 0 (close on: routed through enqueue_scoring_run, which enqueues"
-        " nothing, 10), mutant (the obs-cycle enqueue not routed through"
-        f" enqueue_scoring_run) = a pair_and_score job was created -- got"
-        f" {_job_count(conn, site_id)}"
-    )
-
-
-def test_tr3_wind_days_trigger_enqueues_nothing_with_the_close_on() -> None:
-    """TR3 (wind-days trigger, ``worker/wind_days.py:2066-2068``): a
-    station-wind-pairing run that changes an hour must not enqueue
-    ``pair_and_score`` with the close on (10). ``_derive_days`` is the
-    narrowest function holding this enqueue site -- the enqueue sits
-    inline in its own body, not in any further-nested helper -- called
-    with ``local_date`` D-1 (not ``today``) so it skips the
-    newest-record lookup that only applies to today's partial day, and an
-    explicit ``now_utc`` so no close-clock patch is needed. Two raw
-    5-minute wind records 5 minutes apart seed one pairable hour, so
-    ``_derive_days`` actually writes a changed station_observations row
-    (proving the enqueue site itself ran) rather than finding nothing to
-    pair."""
-    from wxverify.worker.wind_days import _derive_days
-
-    conn = asof_conn()
-    site_id = day_close_site(conn, close_on=True, with_records=True)
-    station_id = int(
-        conn.execute(
-            "SELECT id FROM stations WHERE site_id = ? AND pws_station_id = ?",
-            (site_id, "ISTATION01"),
-        ).fetchone()[0]
-    )
-    d_minus_1 = D - timedelta(days=1)
-    conn.execute(
-        "INSERT INTO station_wind_records"
-        " (station_id, obs_at, source, local_date, speed_kmh)"
-        " VALUES (?, ?, 'five_minute', ?, 10.0)",
-        (station_id, f"{d_minus_1.isoformat()}T10:00:00Z", d_minus_1.isoformat()),
-    )
-    conn.execute(
-        "INSERT INTO station_wind_records"
-        " (station_id, obs_at, source, local_date, speed_kmh)"
-        " VALUES (?, ?, 'five_minute', ?, 20.0)",
-        (station_id, f"{d_minus_1.isoformat()}T10:05:00Z", d_minus_1.isoformat()),
-    )
-    conn.commit()
-
-    _derive_days(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=d_minus_1,
-        tz_name="UTC",
-        today=D,
-        now_utc=NOW,
-    )
-    conn.commit()
-
-    paired = conn.execute(
-        "SELECT COUNT(*) FROM station_observations"
-        " WHERE station_id = ? AND variable = 'wind'",
-        (station_id,),
-    ).fetchone()[0]
-    assert paired == 1, (
-        "fixture bug: the two 5-minute records (5 minutes apart) must pair"
-        " into exactly one wind hour"
-    )
-    assert _job_count(conn, site_id) == 0, (
-        "M97/M98-shaped (wind-days trigger) -> at this assertion: correct ="
-        " 0 (close on: routed through enqueue_scoring_run, which enqueues"
-        " nothing, 10), mutant (the wind-days enqueue not routed through"
-        f" enqueue_scoring_run) = a pair_and_score job was created -- got"
-        f" {_job_count(conn, site_id)}"
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -14,7 +14,6 @@ from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.settings.depth import effective_blend_depths
 from wxverify.web.context import (
     SiteView,
-    load_backfill_panel,
     load_dashboard,
     load_ops,
     load_overlay,
@@ -276,16 +275,6 @@ async def render_feed_toggles(
     return render_fragment(
         request, "sites/_feed_toggles.html", site=site, toggle_notice=toggle_notice
     )
-
-
-async def render_backfill(request: Request) -> HTMLResponse:
-    """The backfill panel alone, after a button press, in the page's view.
-
-    One read, ``load_backfill_panel``, gives ``rows``, ``close_on`` and
-    ``close_panel`` (plan §10.2).
-    """
-    context = await get_db().read(load_backfill_panel)
-    return render_fragment(request, "ops/_backfill.html", **context)
 
 
 def wants_html_fragment(request: Request) -> bool:

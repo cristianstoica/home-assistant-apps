@@ -1,8 +1,9 @@
 """§8 oracles for the ``result_basis_fingerprint`` freshness feature.
 
 Covers the plan's Group A (which mutations move which hash), the remaining
-Group B cases (B1, B3, B4, B5 -- B2 lives in ``test_verification_run.py``
-and is not repeated here), Group C (API/page freshness surfaces), the new
+Group B cases (B1, B5 -- B2 lives in ``test_verification_run.py`` and is
+not repeated here; B3 and B4 drove the retired ``verification_run`` chain
+and left with it, R12), Group C (API/page freshness surfaces), the new
 Group D1 read-path purity oracle for the full ``result_basis_freshness``
 derivation, and Group E (the v5 migration). D2 (the EQP pin) and D3 (the
 §18.12 source tripwire) already live elsewhere and are unedited.
@@ -22,13 +23,7 @@ from typing import Any
 import pytest
 
 from tests.helpers import (
-    _W8_PAYLOAD,
     _advance_samples,
-    _decisions,
-    _drive_chain,
-    _drive_fixed,
-    _drive_to_phase,
-    _make_verification_site,
     asof_conn,
     asof_make_real_feed,
 )
@@ -381,9 +376,9 @@ def test_a11_input_and_result_basis_are_not_equal() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Group B remaining -- B1 (reference equivalence), B3 (no_change_skip), B4
-# (real-data divergence guard), B5 (attempt counting). B2 lives in
-# tests/test_verification_run.py and is not repeated here.
+# Group B remaining -- B1 (reference equivalence), B5 (attempt counting).
+# B2 lives in tests/test_verification_run.py and is not repeated here; B3
+# and B4 drove the retired verification_run chain and left with it (R12).
 # ---------------------------------------------------------------------------
 
 
@@ -484,59 +479,6 @@ def test_b1_reference_input_fingerprint_matches_production() -> None:
     prod, ref = _pair()
     assert prod == ref
     assert len(feeds) == 2  # roster participated in every snapshot above
-
-
-def test_b3_no_change_skip_gates_on_input_fingerprint_only() -> None:
-    """b3(a) -> at ``decisions[-1]['decision']``: correct = 'no_change_skip'
-    when nothing changed between two triggers. b3(b) -> at the SAME
-    assertion on a second trigger after a raw observation INSERT: correct =
-    'run_started' (the gate did NOT fire), mutant = 'no_change_skip' if the
-    gate ever stopped reading the raw observation counters."""
-    conn = asof_conn()
-    site_id, _feeds = _make_verification_site(conn)
-    _drive_chain(conn, site_id, dict(_W8_PAYLOAD))
-    before = len(_decisions(conn, site_id))
-
-    payload = dict(_W8_PAYLOAD)
-    payload["trigger_date"] = "2026-06-07"
-    _drive_chain(conn, site_id, payload)
-    rows = _decisions(conn, site_id)[before:]
-    assert rows[-1]["decision"] == "no_change_skip"
-
-    before2 = len(_decisions(conn, site_id))
-    conn.execute(
-        """
-        INSERT INTO observations
-            (site_id, variable, valid_at, value, n_stations, computed_at)
-        VALUES (?, 'temperature', '2026-06-08T06:00:00Z', 13.0, 1,
-                '2026-06-08T07:00:00Z')
-        """,
-        (site_id,),
-    )
-    payload["trigger_date"] = "2026-06-08"
-    _drive_chain(conn, site_id, payload)
-    rows2 = _decisions(conn, site_id)[before2:]
-    assert rows2[-1]["decision"] == "run_started"
-
-
-def test_b4_divergence_guard_fires_on_a_real_sample_insert() -> None:
-    """b4 -> at ``last['reason']``: correct = starts with 'superseded: ',
-    mutant = does not if the start-phase divergence check stops
-    re-deriving ``input_fingerprint`` against live state. Stronger than the
-    existing monkeypatched ``advancing`` fixture in
-    ``test_verification_run.py``: the divergence here is a genuine
-    ``forecast_samples`` INSERT landing between the decide and start
-    phases, not a substituted function."""
-    conn = asof_conn()
-    site_id, feeds = _make_verification_site(conn)
-    payload = dict(_W8_PAYLOAD)
-    calls: list[dict[str, object]] = []
-    _drive_to_phase(conn, site_id, payload, "start", calls)
-    before = len(_decisions(conn, site_id))
-    _advance_samples(conn, site_id, feeds[0])  # real write, no monkeypatch
-    _drive_fixed(conn, site_id, payload, calls, 10)
-    rows = _decisions(conn, site_id)[before:]
-    assert str(rows[0]["reason"]).startswith("superseded: ")
 
 
 def test_b5_failed_attempts_increments_for_repeated_failures() -> None:

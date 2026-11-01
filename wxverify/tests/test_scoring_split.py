@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gc
-import json
 import logging
 import sqlite3
 import threading
@@ -74,7 +73,6 @@ from wxverify.scoring.split import (
     chunk_ops,
 )
 from wxverify.settings.keys import set_setting
-from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import dispatch
 from wxverify.worker.score_batches import run_batched_scoring, run_split_pair_phases
@@ -1066,7 +1064,7 @@ def test_split_pair_phase_names_match_pair_phases_order() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 -- run_split_pair_phases / dispatch / run_catchup end-to-end.
+# Step 3 -- run_split_pair_phases / dispatch end-to-end.
 # ---------------------------------------------------------------------------
 
 
@@ -1411,197 +1409,6 @@ def test_pair_and_score_dispatch_raises_stale_generation_on_db_replacement(
         messages = [r.getMessage() for r in caplog.records]
         assert not [m for m in messages if "cas_miss" in m]
         assert not [m for m in messages if m.startswith("pair_and_score deferred")]
-
-    asyncio.run(_run())
-
-
-def test_run_catchup_enqueues_pair_and_score_when_a_site_is_busy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site = _make_site(conn, "t-busy-catchup-site")
-        conn.execute("CREATE TABLE _probe_bump(x)")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: object, **kwargs: object) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
-            calls.append(sid)
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        db = get_db()
-
-        class _AlwaysBumpWriter(FencedWriter):
-            def __init__(self) -> None:
-                super().__init__(db, db.generation)
-
-            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
-                await self._db.write(
-                    lambda c: c.execute("INSERT INTO _probe_bump VALUES (1)")
-                )
-                return await super().write_if_current(fn, epoch=epoch)
-
-        writer = _AlwaysBumpWriter()
-
-        assert (
-            conn.execute(
-                "SELECT count(*) FROM jobs WHERE type='pair_and_score'"
-            ).fetchone()[0]
-            == 0
-        )
-
-        with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
-            result = await run_catchup(db, writer, {})
-
-        assert result is None
-        assert calls == []
-
-        rows = conn.execute(
-            "SELECT job_key, status, payload FROM jobs WHERE type='pair_and_score'"
-        ).fetchall()
-        assert len(rows) == 1
-        job_row = rows[0]
-        assert job_row["job_key"] == "score"
-        assert job_row["status"] == "pending"
-        assert json.loads(job_row["payload"]) == {"site_id": site}
-
-        busy_warnings = [
-            r.getMessage()
-            for r in caplog.records
-            if r.getMessage().startswith("catchup rescore busy")
-        ]
-        assert busy_warnings == [
-            f"catchup rescore busy site={site} step=pair_real_models; "
-            "enqueued pair_and_score"
-        ]
-
-    asyncio.run(_run())
-
-
-def test_run_catchup_reports_and_skips_a_site_whose_chunk_raises_integrity_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site_a = _make_site(conn, "t-catchup-integrity-a")
-        site_b = _make_site(conn, "t-catchup-integrity-b")
-        conn.execute("CREATE TABLE _probe_pk(a INTEGER PRIMARY KEY, g)")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: object, **kwargs: object) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
-            calls.append(sid)
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
-            if site_id == site_a:
-                ops = (
-                    InsertOp(site_id, (1,), valid_at="2035-01-01T00:00:00Z"),
-                    InsertOp(site_id, (1,), valid_at="2035-01-01T00:00:00Z"),
-                )
-            else:
-                ops = (InsertOp(site_id, (2,), valid_at="2035-01-01T00:00:00Z"),)
-            return PairDelta(
-                seed_sites=(site_id,) if site_id is not None else (),
-                ops=ops,
-                insert_sql="INSERT INTO _probe_pk(a, g) VALUES (?, ?)",
-                count=None,
-            )
-
-        monkeypatch.setattr(
-            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
-            (SplitPhase("probe", _compute),),
-        )
-
-        db = get_db()
-        writer = FencedWriter(db, db.generation)
-
-        with caplog.at_level(logging.WARNING, logger="wxverify.worker.catchup"):
-            result = await run_catchup(db, writer, {})
-
-        assert result is None
-        assert calls == [site_b]
-
-        rows = conn.execute("SELECT a FROM _probe_pk").fetchall()
-        assert [r["a"] for r in rows] == [2]
-
-        failed_warnings = [
-            r.getMessage()
-            for r in caplog.records
-            if r.getMessage().startswith(f"catchup rescore failed site={site_a}:")
-        ]
-        assert len(failed_warnings) == 1
-
-    asyncio.run(_run())
-
-
-def test_run_catchup_pair_phases_run_without_an_enabled_check_m12(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site = _make_site(conn, "t-catchup-enabled-site")
-        conn.execute("CREATE TABLE _probe(a, g)")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        db = get_db()
-
-        async def _fake_catchup_site(
-            db_arg: object, writer_arg: FencedWriter, catchup_site: object, plan: object
-        ) -> bool:
-            await writer_arg.write(
-                lambda c: c.execute(
-                    "UPDATE sites SET enabled=0 WHERE id=?",
-                    (catchup_site.site_id,),
-                )
-            )
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer_arg: object, sid: int) -> None:
-            calls.append(sid)
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        monkeypatch.setattr(
-            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
-            (SplitPhase("probe", _probe_compute),),
-        )
-
-        writer = FencedWriter(db, db.generation)
-        result = await run_catchup(db, writer, {})
-
-        assert result is None
-
-        row_count = conn.execute("SELECT count(*) FROM _probe").fetchone()[0]
-        assert row_count == 3
-        assert calls == [site]
 
     asyncio.run(_run())
 

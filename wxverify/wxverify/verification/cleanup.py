@@ -12,10 +12,10 @@ The database is consistent after every save: a run either still has
 evidence rows and ``worksheet_kept`` 1, or has none and 0, so a stop part-way
 loses at most the save in flight and the next pass goes on.
 
-Two entry points, both only after a publish (14.4): the replay chain's
-``cleanup`` phase runs one :func:`clean_worksheet_slice` per chunk, and the
-daily close's stage 8 calls :func:`clean_worksheets`. Both re-read the
-published pointer in every save.
+One entry point, only after a publish (14.4): the daily close's stage 8
+calls :func:`clean_worksheets`. The replay chain's ``cleanup`` phase went
+with the nightly replay (switch-over plan R12). Every save re-reads the
+published pointer.
 """
 
 from __future__ import annotations
@@ -106,16 +106,6 @@ def _published_bound(conn: sqlite3.Connection, site_id: int) -> int | None:
 def _next_run(conn: sqlite3.Connection, site_id: int, published: int) -> int | None:
     row = conn.execute(_NEXT_RUN_SQL, (site_id, published)).fetchone()
     return None if row is None else int(row[0])
-
-
-def cleanup_pending(conn: sqlite3.Connection, *, site_id: int) -> bool:
-    """Whether any run of the site still has a worksheet the cleanup deletes.
-
-    Read-only; runs in the caller's transaction. The replay chain's
-    ``publish`` phase asks it to decide whether a ``cleanup`` phase follows.
-    """
-    published = _published_bound(conn, site_id)
-    return published is not None and _next_run(conn, site_id, published) is not None
 
 
 def clean_worksheet_slice(conn: sqlite3.Connection, *, site_id: int) -> CleanupStep:

@@ -1,8 +1,8 @@
 """Downstream consequences of the obs-204 Open-Meteo horizon change.
 
-Covers the request-shape side (``OpenMeteoAdapter.fetch_forecast`` /
-``_historical_hourly_names`` in ``wxverify/feeds/open_meteo.py``) and the
-pairing/display side (``wxverify.scoring.pairing.pair_real_models`` and
+Covers the request-shape side (``OpenMeteoAdapter.fetch_forecast`` in
+``wxverify/feeds/open_meteo.py``) and the pairing/display side
+(``wxverify.scoring.pairing.pair_real_models`` and
 ``wxverify.core.timeutil.day_ahead`` vs. ``wxverify.forecast.aggregate.
 display_day_index``) of raising each feed's ``max_lead_hours``.
 
@@ -26,7 +26,7 @@ import httpx
 
 from tests.helpers import asof_conn, asof_make_site
 from wxverify.core.timeutil import day_ahead
-from wxverify.feeds.open_meteo import OpenMeteoAdapter, _historical_hourly_names
+from wxverify.feeds.open_meteo import OpenMeteoAdapter
 from wxverify.feeds.seam import ForecastRequest
 from wxverify.scoring.pairing import pair_real_models
 
@@ -82,42 +82,6 @@ def test_fetch_forecast_sends_forecast_hours_equal_to_max_lead_hours() -> None:
 
     icon = _fetch_forecast_params(_req(model="icon_global", max_lead_hours=180))
     assert icon["forecast_hours"] == "180"
-
-
-def test_historical_previous_runs_day_count_capped_at_seven() -> None:
-    """``_historical_hourly_names`` requests
-    ``min(7, max_lead_hours // 24)`` previous-run days.
-
-    - A capped feed (217h -> 217 // 24 == 9): the request must still cap
-      at 7, not 9 -- a mutant that dropped the ``min(7, ...)`` clamp would
-      request day8/day9 columns here.
-    - ``icon_global`` (180h -> 180 // 24 == 7 exactly): the cap does not
-      engage, so this also pins the boundary against an off-by-one (a
-      mutant using ``range(1, req.max_lead_hours // 24)``, exclusive,
-      would request only days 1-6).
-    - A genuinely uncapped feed (72h -> 72 // 24 == 3): proves the ``min``
-      reflects the real value below the cap rather than a hardcoded 7.
-    """
-
-    def _days(req: ForecastRequest) -> list[int]:
-        names = _historical_hourly_names(req)
-        return sorted({int(name.rsplit("day", 1)[1]) for name in names})
-
-    assert _days(_req(model="ecmwf_ifs", max_lead_hours=217)) == [1, 2, 3, 4, 5, 6, 7]
-    assert _days(_req(model="icon_global", max_lead_hours=180)) == [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-    ]
-    assert _days(_req(model="meteofrance_arpege_world", max_lead_hours=72)) == [
-        1,
-        2,
-        3,
-    ]
 
 
 # ---------------------------------------------------------------------------

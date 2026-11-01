@@ -40,7 +40,6 @@ from wxverify.worker.processor import (  # noqa: PLC2701 -- private, exercised d
     _persist_poll_result_clearing,
 )
 from wxverify.worker.wind_days import (  # noqa: PLC2701 -- private, exercised directly
-    _derive_days,
     run_wind_days,
 )
 
@@ -498,87 +497,6 @@ def test_rs5_poll_dedup_and_offline_poll_stores_no_raw_row(
     assert _raw_current_obs_count() == 2, (
         "the same new-instant poll with the station enabled adds a row --"
         " the suppression above is not vacuous"
-    )
-
-
-# =============================================================================
-# RS6 -- the lane reads only five_minute wind and tolerates NULL: M32.
-# =============================================================================
-
-
-def test_rs6_derive_days_reads_only_five_minute_wind() -> None:
-    """Plan 14.5 RS6: the lane's pair-max records come only from
-    ``five_minute`` rows with a speed -- a ``current_obs`` wind reading in
-    the same hour is never mixed in, and a ``five_minute`` row with NULL
-    wind raises no error."""
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    run_migrations(conn)
-    site_id, station_id = _make_plain_site(conn, pws_id="ISTATION05")
-
-    hour = datetime(2024, 6, 5, 3, 0, 0, tzinfo=UTC)
-    other_hour = datetime(2024, 6, 5, 9, 0, 0, tzinfo=UTC)
-
-    def _insert_raw(
-        obs_at: datetime,
-        source: str,
-        *,
-        speed_kmh: float | None = None,
-        temp_c: float | None = None,
-    ) -> None:
-        conn.execute(
-            "INSERT INTO station_wind_records"
-            " (station_id, obs_at, source, local_date, speed_kmh, temp_c,"
-            "  precip_total_mm, fetched_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
-            (
-                station_id,
-                isoformat_utc(obs_at),
-                source,
-                obs_at.date().isoformat(),
-                speed_kmh,
-                temp_c,
-                isoformat_utc(obs_at),
-            ),
-        )
-
-    _insert_raw(hour + timedelta(minutes=2), "five_minute", speed_kmh=5.0)
-    _insert_raw(hour + timedelta(minutes=4), "current_obs", speed_kmh=100.0)
-    _insert_raw(hour + timedelta(minutes=7), "five_minute", speed_kmh=6.0)
-    _insert_raw(other_hour + timedelta(minutes=2), "five_minute", temp_c=8.0)
-    conn.commit()
-
-    _derive_days(
-        conn,
-        site_id=site_id,
-        station_id=station_id,
-        local_date=date(2024, 6, 5),
-        tz_name="UTC",
-        today=date(2024, 6, 10),
-        now_utc=datetime(2024, 6, 10, 0, 0, tzinfo=UTC),
-    )
-
-    row = conn.execute(
-        "SELECT source_raw FROM station_observations"
-        " WHERE station_id = ? AND variable = 'wind' AND valid_at = ?",
-        (station_id, isoformat_utc(hour)),
-    ).fetchone()
-    assert row is not None and row["source_raw"] == "pair-max 5.5 km/h", (
-        "mutant -> at this assertion: correct = 'pair-max 5.5 km/h' (only"
-        " the two five_minute readings, 300s apart, pair), mutant"
-        " (_read_records reads every source, so the current_obs 100.0"
-        " km/h reading also pairs, 120s and 180s apart, producing a"
-        " larger pair) = " + repr(None if row is None else row["source_raw"])
-    )
-
-    other_row = conn.execute(
-        "SELECT 1 FROM station_observations"
-        " WHERE station_id = ? AND variable = 'wind' AND valid_at = ?",
-        (station_id, isoformat_utc(other_hour)),
-    ).fetchone()
-    assert other_row is None, (
-        "a lone five_minute reading with NULL wind has no partner to pair"
-        " with, and must not raise on the NULL speed_kmh"
     )
 
 

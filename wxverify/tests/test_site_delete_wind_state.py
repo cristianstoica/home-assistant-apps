@@ -38,7 +38,6 @@ from wxverify.db.runtime_state import (
     set_runtime_state,
 )
 from wxverify.db.switch import ensure_site_generation, site_generation_id
-from wxverify.db.wind_basis import auth_hold_key
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.verification.record import (
     SNAPSHOT_TIME_KEY,
@@ -154,7 +153,8 @@ def test_delete_site_drops_all_site_state_and_a_reused_id_starts_fresh(
         set_setting(conn, f"{SNAPSHOT_TIME_KEY}:{site}", snap)
 
     set_setting(conn, SNAPSHOT_TIME_KEY, "05:00")
-    hold_key = auth_hold_key("history_all")
+    # A neutral literal key, untouched by the delete (the untouched-key control).
+    hold_key = "wind_history_auth_hold:history_all"
     set_runtime_state(conn, hold_key, "held")
 
     app = _make_app(monkeypatch)

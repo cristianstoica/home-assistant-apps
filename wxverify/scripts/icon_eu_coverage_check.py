@@ -7,9 +7,6 @@ For one enabled site, in this order:
    PASS.
 2. One forward request through ``OpenMeteoAdapter.fetch_forecast``: the same
    request a regular fetch of the feed sends.
-3. One previous-runs request through ``OpenMeteoAdapter.fetch_historical``:
-   the same request setup backfill sends, for the UTC day two days before
-   now. No retry, no second window.
 
 Run from the add-on directory (``uv sync`` does not install the package), once
 for every enabled site, inside a test window (01:00-02:30, 07:00-08:30,
@@ -21,8 +18,8 @@ for every enabled site, inside a test window (01:00-02:30, 07:00-08:30,
 ``--site-id`` may be left out only when exactly one site is enabled.
 
 Only the owner runs this script: its requests carry the site's location, so
-agents never run it. One run costs 3 Open-Meteo calls against the provider
-allowance, and those calls are not recorded in the add-on's ledger. The
+agents never run it. One run costs 1 Open-Meteo call against the provider
+allowance, and that call is not recorded in the add-on's ledger. The
 database is a Database Export copy, opened read-only; nothing is written to it
 or anywhere else, and no job, budget reservation or backfill state is touched.
 
@@ -43,7 +40,7 @@ import sqlite3
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from itertools import pairwise
 from pathlib import Path
@@ -51,15 +48,10 @@ from typing import Final, Literal, cast
 
 import httpx
 
-from wxverify.collection.forecast_validation import FORECAST_VALUE_RANGES
 from wxverify.config import OPEN_METEO_MAX_LEAD_HOURS
 from wxverify.core.timeutil import floor_hour, parse_utc, utc_now
-from wxverify.feeds.open_meteo import (
-    VARIABLE_MAP,
-    OpenMeteoAdapter,
-    previous_run_lead_hours,
-)
-from wxverify.feeds.seam import ForecastRequest, NormalizedSample
+from wxverify.feeds.open_meteo import VARIABLE_MAP, OpenMeteoAdapter
+from wxverify.feeds.seam import ForecastRequest
 
 
 class Verdict(StrEnum):
@@ -102,34 +94,12 @@ MIN_FORWARD_STEPS: Final = 120
 MIN_FORWARD_VALUES: Final = 96
 
 _MAX_LEAD_HOURS: Final = OPEN_METEO_MAX_LEAD_HOURS[MODEL]
-#: (name, provider name) for each previous-runs column the adapter requests,
-#: in the adapter's order (variables in ``VARIABLE_MAP`` order, then days
-#: 1 to ``min(7, horizon days)``), mirroring
-#: ``feeds.open_meteo._historical_hourly_names`` through public names only.
-_PREVIOUS_RUN_COLUMNS: Final[tuple[tuple[str, str], ...]] = tuple(
-    (f"{provider_name}_previous_day{day}", provider_name)
-    for variable, provider_name in VARIABLE_MAP.items()
-    if variable in VARIABLES
-    for day in range(1, min(7, _MAX_LEAD_HOURS // 24) + 1)
-)
-PREVIOUS_RUN_NAMES: Final[tuple[str, ...]] = tuple(
-    name for name, _ in _PREVIOUS_RUN_COLUMNS
-)
-#: The units the adapter's normalization assumes, per provider name.
-_PREVIOUS_RUN_UNITS: Final[Mapping[str, str]] = {
-    "temperature_2m": "°C",
-    "wind_speed_10m": "km/h",
-    "precipitation": "mm",
-}
-_PREVIOUS_RUN_ROWS: Final = 48
-_REQUIRED_PREVIOUS_DAYS: Final = (1, 2, 3)
 
 _HOUR: Final = timedelta(hours=1)
 _WINDOW_START_HOURS: Final = (1, 7, 13, 19)
 _WINDOW_LENGTH: Final = timedelta(minutes=90)
 _FORWARD: Final = "forward"
-_PREVIOUS_RUNS: Final = "previous-runs"
-_REQUEST_LABELS: Final = (_FORWARD, _PREVIOUS_RUNS)
+_REQUEST_LABELS: Final = (_FORWARD,)
 
 
 @dataclass(frozen=True)
@@ -360,54 +330,6 @@ def verdict(
     return Verdict.PASS, "ok"
 
 
-def previous_runs_verdict(
-    payload: object, samples: Sequence[NormalizedSample], day: date
-) -> tuple[Verdict, Reason]:
-    """The previous-runs verdict for day ``D``: PR1 to PR4 in order."""
-    body = _as_dict(payload)
-    hourly = _as_dict(body.get("hourly")) if body is not None else None
-    units = _as_dict(body.get("hourly_units")) if body is not None else None
-    times = _as_list(hourly.get("time")) if hourly is not None else None
-    if hourly is None or units is None or times is None:
-        return Verdict.FAIL, "bad shape"
-    for name in PREVIOUS_RUN_NAMES:
-        values = _as_list(hourly.get(name))
-        if values is None or len(values) != len(times):
-            return Verdict.FAIL, "bad shape"
-
-    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
-    if len(times) != _PREVIOUS_RUN_ROWS or any(
-        _parse_stamp(entry) != day_start + index * _HOUR
-        for index, entry in enumerate(times)
-    ):
-        return Verdict.FAIL, "wrong times"
-
-    if units.get("time") != "iso8601" or any(
-        units.get(name) != _PREVIOUS_RUN_UNITS[provider_name]
-        for name, provider_name in _PREVIOUS_RUN_COLUMNS
-    ):
-        return Verdict.FAIL, "wrong units"
-
-    for sample in samples:
-        bounds = FORECAST_VALUE_RANGES.get(sample.variable)
-        if bounds is None or not bounds[0] <= sample.value <= bounds[1]:
-            return Verdict.FAIL, "implausible value"
-
-    expected = [day_start + hour * _HOUR for hour in range(24)]
-    for variable in VARIABLES:
-        for previous_day in _REQUIRED_PREVIOUS_DAYS:
-            found = [
-                _parse_stamp(sample.valid_at)
-                for sample in samples
-                if sample.variable == variable
-                and sample.lead_hours == previous_run_lead_hours(variable, previous_day)
-            ]
-            stamps = sorted(stamp for stamp in found if stamp is not None)
-            if len(found) != len(stamps) or stamps != expected:
-                return Verdict.FAIL, "too few values"
-    return Verdict.PASS, "ok"
-
-
 def exit_code(verdicts: Iterable[Verdict]) -> int:
     """Worst of the printed verdicts: any FAIL 1, else any CAN'T TELL 3, else 0."""
     seen = set(verdicts)
@@ -443,20 +365,6 @@ def _emit_forward_details(summary: Summary) -> None:
         _emit(f"forward nulls {name}: {summary.nulls[name]}")
     _emit(f"forward first valid time: {stamp(summary.first_valid)}")
     _emit(f"forward last valid time: {stamp(summary.last_valid)}")
-
-
-def _emit_previous_run_details(payload: object) -> None:
-    body = _as_dict(payload)
-    hourly = _as_dict(body.get("hourly")) if body is not None else None
-    times = _as_list(hourly.get("time")) if hourly is not None else None
-    if hourly is None or times is None:
-        return
-    _emit(f"previous-runs steps: {len(times)}")
-    for name in PREVIOUS_RUN_NAMES:
-        values = _as_list(hourly.get(name))
-        if values is not None:
-            non_null = sum(1 for value in values if value is not None)
-            _emit(f"previous-runs non-null {name}: {non_null}")
 
 
 def _body_json(record: Mapping[str, object]) -> object:
@@ -503,7 +411,7 @@ async def _request_phase(
     now: datetime,
     run: _Run,
 ) -> None:
-    """Steps 6 to 8: one client, the forward request, then previous runs."""
+    """Steps 6 and 7: one client, then the forward request."""
     record: dict[str, object] = {}
 
     async def _record(response: httpx.Response) -> None:
@@ -533,25 +441,6 @@ async def _request_phase(
         if summary is not None:
             _emit_forward_details(summary)
         _emit_verdict(run, _FORWARD, verdict(forward_error, summary, floor_hour(now)))
-
-        day = now.date() - timedelta(days=2)
-        record.clear()
-        try:
-            result = await adapter.fetch_historical(
-                req,
-                window_start=f"{day}T00:00:00Z",
-                window_end=f"{day + timedelta(days=1)}T00:00:00Z",
-            )
-        except Exception as exc:
-            _emit_verdict(run, _PREVIOUS_RUNS, classify(exc))
-            return
-        payload = _body_json(record)
-        _emit_previous_run_details(payload)
-        if result is None:
-            outcome: tuple[Verdict, Reason] = (Verdict.FAIL, "bad shape")
-        else:
-            outcome = previous_runs_verdict(payload, result.samples, day)
-        _emit_verdict(run, _PREVIOUS_RUNS, outcome)
 
 
 def _check(

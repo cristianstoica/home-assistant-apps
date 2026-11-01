@@ -42,8 +42,6 @@ from wxverify.worker.processor import run_worker
 class _NoOpAdapter:
     """Builds, meters one call, returns no samples: the FetchFeedNoOp path."""
 
-    supports_historical = False
-
     def estimate_cost(self, req: Any) -> CostEstimate:
         return CostEstimate(calls=1)
 

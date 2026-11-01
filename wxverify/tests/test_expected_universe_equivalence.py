@@ -39,7 +39,6 @@ from wxverify.scoring.leaderboard import _expected_active_feed_ids, resolve_wind
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import _scoring_feeds
-from wxverify.worker.backfill import BACKFILL_VARIABLES
 
 _FAR_VALID_ATS = ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z")
 _FAR_LEAD_HOURS = (1, 2)
@@ -433,7 +432,6 @@ def test_cell_grid_covers_every_variable_the_pairing_writers_emit() -> None:
     produces."""
     assert set(FORECAST_VARIABLES) == set(FORECAST_SERVICE_VARIABLES)
     assert set(FORECAST_VARIABLES) == set(TARGET_VARIABLES)
-    assert set(FORECAST_VARIABLES) == set(BACKFILL_VARIABLES)
 
 
 def test_cell_grid_lead_bound_matches_schema_check() -> None:

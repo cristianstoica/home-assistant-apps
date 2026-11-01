@@ -37,9 +37,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.helpers import (
-    _W8_PAYLOAD,
-    _decisions,
-    _drive_chain,
     _make_verification_site,
     asof_conn,
     asof_insert_pair,
@@ -86,6 +83,7 @@ from wxverify.verification.runs import (
     capture_config_snapshot,
     fail_incomplete_attempts,
     input_fingerprint,
+    publish_run,
     published_run_id,
     result_basis_fingerprint,
     start_run,
@@ -242,65 +240,6 @@ def test_o18d_create_schema_alone_produces_the_table_without_any_gate() -> None:
 
     assert _run_inputs_shape(fresh) != []
     assert _run_inputs_shape(fresh) == _run_inputs_shape(migrated)
-
-
-# ---------------------------------------------------------------------------
-# O19 -- the import neutralizer's presence gate is unchanged (D15).
-# ---------------------------------------------------------------------------
-
-
-def test_o19_pre_manifest_export_is_still_neutralized_on_import(
-    tmp_path: Path,
-) -> None:
-    """O19 -> at ``state == 'failed'``: a staged upload carrying the five
-    legacy verification tables and NO ``verification_run_inputs`` still
-    has its running chain neutralized. Mutant M16 (adding the new table to
-    ``_VERIFICATION_RUN_TABLES``) fails the all-of gate for every
-    pre-manifest export, so the run stays ``running``."""
-    from wxverify.api.routes.db_transfer import _neutralize_imported_verification_chains
-    from wxverify.worker.verification_run import verification_job_key
-
-    donor_path = tmp_path / "donor-o19.db"
-    conn = _pre_manifest_db(str(donor_path))
-    site_id = _insert_site(conn)
-    gen = ensure_site_generation(conn, site_id)
-    running_id = _insert_run_row(conn, site_id, state="running", tz_generation_id=gen)
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'pending')",
-        (site_id, verification_job_key(site_id)),
-    )
-    conn.commit()
-    names = _table_names(conn)
-    conn.close()
-    # The five tables the gate has always required, spelled out rather than
-    # read from the tuple, so the assertion below is on behaviour.
-    assert {
-        "verification_runs",
-        "verification_evidence",
-        "verification_day_context",
-        "verification_results",
-        "verification_verdicts",
-    } <= names
-    assert "verification_run_inputs" not in names
-
-    _neutralize_imported_verification_chains(donor_path)
-
-    check = sqlite3.connect(str(donor_path))
-    check.row_factory = sqlite3.Row
-    try:
-        run = check.execute(
-            "SELECT state FROM verification_runs WHERE id = ?", (running_id,)
-        ).fetchone()
-        assert run is not None
-        assert str(run["state"]) == "failed"
-        job = check.execute(
-            "SELECT status FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert job is not None
-        assert str(job["status"]) == "failed"
-    finally:
-        check.close()
 
 
 # ---------------------------------------------------------------------------
@@ -523,13 +462,23 @@ _FORECAST_ARRIVALS_PROSE = "new forecast rows inside the scored dates"
 
 
 def _chain_published_run(conn: sqlite3.Connection) -> tuple[int, list[int], int]:
-    """Drive the production chain to a published, manifest-bearing run.
+    """A published, manifest-bearing run over ``_make_verification_site``'s
+    period, built directly through the write path (``start_run`` /
+    ``write_run_manifest`` / ``publish_run``) -- never the retired replay
+    chain.
 
     Returns ``(site_id, feed_ids, run_id)``. The manifest is complete and
     its arrivals horizon is ``[_HORIZON_START, _HORIZON_END)``.
     """
     site_id, feeds = _make_verification_site(conn)
-    _drive_chain(conn, site_id, dict(_W8_PAYLOAD))
+    snapshot = capture_config_snapshot(conn, site_id)
+    fingerprint = input_fingerprint(conn, site_id, snapshot)
+    cfg = start_run(
+        conn, site_id, snapshot=snapshot, fingerprint=fingerprint, now=_RUN_NOW
+    )
+    assert cfg is not None
+    write_run_manifest(conn, cfg)
+    publish_run(conn, site_id, cfg.run_id)
     conn.commit()
     run_id = published_run_id(conn, site_id)
     assert run_id is not None
@@ -1143,29 +1092,6 @@ def test_o21c_the_notice_names_the_moved_input_in_prose_not_by_identifier(
         "Current inputs no longer match the basis pinned for this run ("
     )
     assert text.endswith(") — results reflect that pinned basis, not current data.")
-
-
-# ---------------------------------------------------------------------------
-# O23 (b) -- the no-change gate still fires with a manifest in the database.
-# ---------------------------------------------------------------------------
-
-
-def test_o23b_an_unchanged_night_still_takes_no_change_skip_with_a_manifest() -> None:
-    """O23 (b) -> at ``decision == 'no_change_skip'`` on the second trigger:
-    the gate still reads ``input_fingerprint`` (D14); a gate migrated onto
-    the manifest would start a run every night."""
-    conn = asof_conn()
-    site_id, _feeds, run_id = _chain_published_run(conn)
-    assert len(_manifest_rows(conn, run_id)) == 3
-    before = len(_decisions(conn, site_id))
-
-    payload = dict(_W8_PAYLOAD)
-    payload["trigger_date"] = "2026-06-07"
-    _drive_chain(conn, site_id, payload)
-
-    rows = _decisions(conn, site_id)[before:]
-    assert rows[-1]["decision"] == "no_change_skip"
-    assert published_run_id(conn, site_id) == run_id
 
 
 # ---------------------------------------------------------------------------

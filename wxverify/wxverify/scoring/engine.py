@@ -78,8 +78,8 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
     """Run the full scoring pipeline monolithically on one connection.
 
     HTTP routes and the CLI call this inside a single write transaction.
-    The worker's ``pair_and_score`` dispatch and catchup's rescore lane
-    instead run ``SPLIT_PAIR_PHASES`` through
+    The worker's ``pair_and_score`` dispatch instead runs
+    ``SPLIT_PAIR_PHASES`` through
     ``worker/score_batches.run_split_pair_phases``, computing each phase
     outside the write lock and applying it in chunks under the input-epoch
     compare-and-set, and then the batched scoring orchestrator

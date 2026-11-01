@@ -348,178 +348,6 @@ def asof_insert_pair(
     )
 
 
-# ---------------------------------------------------------------------------
-# Synthetic verification-site builder (write-lock-fix plan §5.2).
-# Shared by the day-pipeline / day-differential / write-lock-starvation
-# tests and by the one-shot T5 golden script. All values are synthetic.
-# ---------------------------------------------------------------------------
-
-_SYNTH_TRUTH_DAYS = [
-    f"2026-01-{d:02d}" for d in range(1, 25)
-]  # 2026-01-01 .. 2026-01-24
-_SYNTH_TRUTH_QUANTITIES = {
-    "temperature_high": 15.0,
-    "temperature_low": 15.0,
-    "wind_max": 5.0,
-    "precip_total": 0.0,
-    "precip_occurrence": 0.0,
-}
-_SYNTH_FEED_OFFSETS = {"synthetic-a": 0.5, "synthetic-b": 1.0, "synthetic-c": 1.5}
-_SYNTH_ANOMALY_CUTOFF = datetime(2026, 1, 16, tzinfo=UTC)
-_SYNTH_ANOMALY_VALUES = {"temperature": 45.5, "wind": 35.5, "precip": 2.0}
-_SYNTH_BASE_VALUES = {"temperature": 15.0, "wind": 5.0, "precip": 0.0}
-
-
-def build_synthetic_verification_site(
-    conn: sqlite3.Connection,
-) -> tuple[int, list[int], int]:
-    """Build the write-lock-fix plan's §5.2 synthetic verification site.
-
-    Runs in one ``BEGIN ... COMMIT`` and rolls back on error. Returns
-    ``(site_id, [feed_a, feed_b, feed_c], station_id)``.
-    """
-    if conn.in_transaction:
-        conn.commit()
-    conn.execute("BEGIN")
-    try:
-        cur = conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('site-synthetic', 0.0, 0.0, 0.0, 'UTC')
-            """
-        )
-        assert cur.lastrowid is not None
-        site_id = int(cur.lastrowid)
-
-        feeds: list[int] = []
-        for model in ("synthetic-a", "synthetic-b", "synthetic-c"):
-            fcur = conn.execute(
-                """
-                INSERT INTO feeds
-                    (source, model, default_subscribed,
-                     fetch_interval_minutes, max_lead_hours)
-                VALUES ('synthetic-src', ?, 1, 360, 216)
-                """,
-                (model,),
-            )
-            assert fcur.lastrowid is not None
-            feeds.append(int(fcur.lastrowid))
-        feed_a, feed_b, feed_c = feeds
-
-        generation_id = ensure_site_generation(conn, site_id)
-
-        scur = conn.execute(
-            """
-            INSERT INTO stations
-                (site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-            VALUES (?, 'SYNTH-LOCKFIX-01', 0.0, 0.0, 0.0, 1)
-            """,
-            (site_id,),
-        )
-        assert scur.lastrowid is not None
-        station_id = int(scur.lastrowid)
-
-        # Truth.
-        for day in _SYNTH_TRUTH_DAYS:
-            for quantity, value in _SYNTH_TRUTH_QUANTITIES.items():
-                is_precip = quantity.startswith("precip")
-                conn.execute(
-                    """
-                    INSERT INTO daily_truth
-                        (site_id, local_date, quantity, value, eligible,
-                         covered_hours, expected_slots, wet_hours, dry_hours,
-                         rain_threshold_mm, day_start_utc, day_end_utc, timezone,
-                         tz_generation_id)
-                    VALUES (?, ?, ?, ?, 1, 24, 24, ?, ?, 0.2, ?, ?, 'UTC', ?)
-                    """,
-                    (
-                        site_id,
-                        day,
-                        quantity,
-                        value,
-                        0 if is_precip else None,
-                        24 if is_precip else None,
-                        f"{day}T00:00:00Z",
-                        f"{day}T23:59:59Z",
-                        generation_id,
-                    ),
-                )
-
-        # Samples: one issuance per snapshot day S, hourly out to 192h.
-        for feed_id, model in zip(
-            feeds, ("synthetic-a", "synthetic-b", "synthetic-c"), strict=True
-        ):
-            offset = _SYNTH_FEED_OFFSETS[model]
-            for day in _SYNTH_TRUTH_DAYS:
-                snapshot_date = datetime.fromisoformat(day + "T00:00:00+00:00")
-                issued = snapshot_date - timedelta(hours=6)  # (S-1)T18:00:00Z
-                for hour in range(1, 193):
-                    valid_at = issued + timedelta(hours=hour)
-                    for variable, base in _SYNTH_BASE_VALUES.items():
-                        if model == "synthetic-a" and valid_at >= _SYNTH_ANOMALY_CUTOFF:
-                            value = _SYNTH_ANOMALY_VALUES[variable]
-                        else:
-                            value = base + offset
-                        conn.execute(
-                            """
-                            INSERT INTO forecast_samples
-                                (site_id, feed_id, variable, issued_at, valid_at,
-                                 lead_hours, value, source_raw, model_run_id,
-                                 fetched_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'run-synthetic', ?)
-                            """,
-                            (
-                                site_id,
-                                feed_id,
-                                variable,
-                                issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                valid_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                hour,
-                                value,
-                                issued.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            ),
-                        )
-
-        # Pairs: temperature, every 6h from 2025-12-02T00:00Z to
-        # 2026-01-24T18:00Z, day_ahead 1..7.
-        persistence_feed_id = asof_persistence_feed_id(conn)
-        pair_feeds = {
-            feed_a: _SYNTH_FEED_OFFSETS["synthetic-a"],
-            feed_b: _SYNTH_FEED_OFFSETS["synthetic-b"],
-            feed_c: _SYNTH_FEED_OFFSETS["synthetic-c"],
-            persistence_feed_id: 2.0,
-        }
-        pair_start = datetime(2025, 12, 2, tzinfo=UTC)
-        pair_end = datetime(2026, 1, 24, 18, tzinfo=UTC)
-        valid_at = pair_start
-        while valid_at <= pair_end:
-            for day_ahead in range(1, 8):
-                lead_hours = 24 * day_ahead + 6
-                issued_at = valid_at - timedelta(hours=lead_hours)
-                first_known_at = valid_at + timedelta(hours=1)
-                for feed_id, feed_offset in pair_feeds.items():
-                    asof_insert_pair(
-                        conn,
-                        site_id=site_id,
-                        feed_id=feed_id,
-                        valid_at=valid_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        issued_at=issued_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        forecast=15.0 + feed_offset,
-                        observed=15.0,
-                        first_known_at=first_known_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        day_ahead=day_ahead,
-                        lead_hours=lead_hours,
-                        generation_id=generation_id,
-                    )
-            valid_at += timedelta(hours=6)
-
-        conn.commit()
-        return site_id, feeds, station_id
-    except Exception:
-        conn.rollback()
-        raise
-
-
 def evidence_digest(conn: sqlite3.Connection, run_id: int) -> str:
     """sha256 over every ``verification_evidence`` and
     ``verification_day_context`` row for ``run_id`` (plan §5.2).
@@ -1288,11 +1116,8 @@ def disable_station_pacing(monkeypatch: pytest.MonkeyPatch) -> None:
 _NON_CLOSE_ENQUEUERS: Final[tuple[str, ...]] = (
     "enqueue_due_round_tries",
     "enqueue_due_daytime_downloads",
-    "_enqueue_due_obs",
     "_enqueue_due_wind_days",
     "_enqueue_due_forecast_records",
-    "_enqueue_due_verification_runs",
-    "_enqueue_due_score_refresh",
 )
 
 
@@ -1300,12 +1125,14 @@ def disable_other_enqueuers(
     monkeypatch: pytest.MonkeyPatch, *, keep: Sequence[str] = ()
 ) -> None:
     """No-op every one of ``scheduler_tick``'s non-close enqueuers except
-    those named in ``keep`` (plan §15.1 "Other job kinds."; DO1/DO2 keep
-    ``_enqueue_due_verification_runs``/``_enqueue_due_score_refresh``,
-    TL7 keeps ``_enqueue_due_forecast_records``). Without this, the first
-    tick of a standard night would also queue a ``fetch_feed`` job per
-    seeded open-meteo feed and a ``fetch_obs`` ``obs`` job for the site,
-    which ``run_due_jobs`` would then claim.
+    those named in ``keep`` (plan §15.1 "Other job kinds."; TL7 keeps
+    ``_enqueue_due_forecast_records``). ``_enqueue_due_obs``,
+    ``_enqueue_due_verification_runs`` and ``_enqueue_due_score_refresh``
+    (the routine download's clock, the nightly replay trigger and the score
+    backstop) are retired (R1, R12, R17) and no longer exist to no-op.
+    Without this, the first tick of a standard night would also queue a
+    ``fetch_feed`` job per seeded open-meteo feed, which ``run_due_jobs``
+    would then claim.
     """
     for name in _NON_CLOSE_ENQUEUERS:
         if name in keep:
@@ -1651,8 +1478,6 @@ class _StandInAdapter:
     """One ``ForecastAdapter`` for one ``source``, answering from
     :class:`ProviderStandIn`'s queue for that source (P4 §18.1)."""
 
-    supports_historical = False
-
     def __init__(self, standin: ProviderStandIn, source: str) -> None:
         self._standin = standin
         self._source = source
@@ -1682,16 +1507,6 @@ class _StandInAdapter:
         if isinstance(outcome, ProviderConnectError):
             raise httpx.ConnectError("synthetic connect error")
         raise AssertionError(f"ProviderStandIn: unknown outcome {outcome!r}")
-
-    async def fetch_historical(
-        self, req: object, *, window_start: str, window_end: str
-    ) -> FetchResult | None:
-        return None
-
-    def estimate_historical_cost(
-        self, req: object, *, window_start: str, window_end: str
-    ) -> CostEstimate:
-        return CostEstimate(calls=1)
 
 
 class ProviderStandIn:
@@ -1775,178 +1590,14 @@ def install_test_source_domains(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 # P4 §18.1
 #
-# Shared fixtures for the daily-close P4 round-B tests: WC7 (the replay
-# chain's publish -> cleanup transition, tests/test_worksheet_cleanup.py)
-# and PD4's cleanup-after-a-replay-publish half, and PD1's record half
-# (tests/test_p4_dormant.py). Append-only: nothing above this line changes.
+# Shared fixture for PD1's record half (tests/test_p4_dormant.py). The
+# replay-chain drivers that used to live here (``build_verification_replay_site``,
+# ``drive_verification_chain``, ``drive_verification_chain_until_phase``) left
+# with their last users, WC7 (tests/test_worksheet_cleanup.py) and PD4's
+# cleanup-after-a-replay-publish half (tests/test_p4_dormant.py), when R12
+# retired the replay chain (``worker/verification_run.py``). Append-only:
+# nothing above this line changes.
 # ---------------------------------------------------------------------------
-
-_REPLAY_PERIOD_DAYS = [
-    "2026-07-01",
-    "2026-07-02",
-    "2026-07-03",
-    "2026-07-04",
-    "2026-07-05",
-]
-_REPLAY_QUANTITY_VALUES = {
-    "temperature_high": 21.0,
-    "temperature_low": 9.0,
-    "wind_max": 6.0,
-    "precip_total": 0.0,
-    "precip_occurrence": 0.0,
-}
-
-
-def build_verification_replay_site(conn: sqlite3.Connection) -> tuple[int, list[int]]:
-    """A small real verification site for driving the REAL sync chain
-    (``wxverify.worker.verification_run.advance_verification``) to and past
-    its ``publish`` phase -- the fixture WC7 (the replay chain's
-    publish -> cleanup transition) and PD4's cleanup-after-a-replay-publish
-    half share. Mirrors ``tests/test_verification_no_change_oracles.py``'s
-    own ``_make_site`` (a 5-day truth period, two real feeds, hourly
-    samples out to 13 days), trimmed and duplicated here rather than
-    imported, since that file belongs to another agent's batch and this
-    fixture is needed by two files in this one. Synthetic data only: site
-    name ``Replay Town``, model names ``model-p4-x``/``model-p4-y``, zone
-    UTC. Returns ``(site_id, [feed_x, feed_y])``.
-    """
-    cur = conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)"
-        " VALUES ('Replay Town', 40.0, -105.0, 900.0, 'UTC')"
-    )
-    assert cur.lastrowid is not None
-    site_id = int(cur.lastrowid)
-    feeds = [
-        asof_make_real_feed(conn, "model-p4-x"),
-        asof_make_real_feed(conn, "model-p4-y"),
-    ]
-    generation_id = ensure_site_generation(conn, site_id)
-    for day in _REPLAY_PERIOD_DAYS:
-        for quantity, value in _REPLAY_QUANTITY_VALUES.items():
-            is_precip = quantity.startswith("precip")
-            conn.execute(
-                "INSERT INTO daily_truth"
-                " (site_id, local_date, quantity, value, eligible,"
-                "  covered_hours, expected_slots, wet_hours, dry_hours,"
-                "  rain_threshold_mm, day_start_utc, day_end_utc, timezone,"
-                "  tz_generation_id)"
-                " VALUES (?, ?, ?, ?, 1, 24, 24, ?, ?, 0.2, ?, ?, 'UTC', ?)",
-                (
-                    site_id,
-                    day,
-                    quantity,
-                    value,
-                    0 if is_precip else None,
-                    24 if is_precip else None,
-                    f"{day}T00:00:00Z",
-                    f"{day}T23:59:59Z",
-                    generation_id,
-                ),
-            )
-    values = {"temperature": 15.0, "wind": 5.0, "precip": 0.0}
-    issued = "2026-06-30T05:00:00Z"
-    for feed_index, feed_id in enumerate(feeds):
-        for variable, base in values.items():
-            for day_offset in range(len(_REPLAY_PERIOD_DAYS) + 8):
-                for hour in range(24):
-                    total_hours = day_offset * 24 + hour
-                    valid = (
-                        datetime(2026, 7, 1, tzinfo=UTC) + timedelta(hours=total_hours)
-                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
-                    conn.execute(
-                        "INSERT INTO forecast_samples"
-                        " (site_id, feed_id, variable, issued_at, valid_at,"
-                        "  lead_hours, value, source_raw, model_run_id,"
-                        "  fetched_at)"
-                        " VALUES (?, ?, ?, ?, ?, 6, ?, '{}', 'run-p4-replay', ?)",
-                        (
-                            site_id,
-                            feed_id,
-                            variable,
-                            issued,
-                            valid,
-                            base + 0.5 * feed_index,
-                            issued,
-                        ),
-                    )
-    conn.commit()
-    return site_id, feeds
-
-
-def drive_verification_chain(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    *,
-    resamples: int = 40,
-    max_steps: int = 300,
-) -> None:
-    """Drive the REAL sync verification chain
-    (``wxverify.worker.verification_run.advance_verification``) to
-    completion, emulating the ``bootstrap`` phase the same way the async
-    orchestrator's two calls do (duplicated from
-    ``tests/test_verification_no_change_oracles.py``'s own ``_drive_chain``
-    -- that file is another agent's and is left untouched)."""
-    from wxverify.verification.engine import prepare_bootstrap_inputs
-    from wxverify.verification.runs import run_config_from_row
-    from wxverify.worker.verification_run import (
-        _compute_verdicts,  # noqa: SLF001
-        _load_state,  # noqa: SLF001
-        _persist_verdicts,  # noqa: SLF001
-        advance_verification,
-    )
-
-    for _ in range(max_steps):
-        blob = _load_state(conn, site_id)
-        if blob is not None and blob.get("phase") == "bootstrap":
-            run_id = blob["run_id"]
-            assert isinstance(run_id, int)
-            cfg = run_config_from_row(conn, run_id)
-            inputs = prepare_bootstrap_inputs(conn, cfg)
-            verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
-            _persist_verdicts(conn, site_id, cfg, verdicts)
-            continue
-        if not advance_verification(conn, site_id, payload):
-            return
-    raise AssertionError("verification chain did not terminate")
-
-
-def drive_verification_chain_until_phase(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    phase: str,
-    *,
-    resamples: int = 40,
-    max_steps: int = 300,
-) -> None:
-    """As :func:`drive_verification_chain`, but STOPS once the chain's
-    saved phase equals ``phase`` -- BEFORE that phase's own chunk runs.
-    WC7 needs this to observe the ``publish`` phase's own transition (to
-    ``cleanup``), not just the chain's end state."""
-    from wxverify.verification.engine import prepare_bootstrap_inputs
-    from wxverify.verification.runs import run_config_from_row
-    from wxverify.worker.verification_run import (
-        _compute_verdicts,  # noqa: SLF001
-        _load_state,  # noqa: SLF001
-        _persist_verdicts,  # noqa: SLF001
-        advance_verification,
-    )
-
-    for _ in range(max_steps):
-        blob = _load_state(conn, site_id)
-        if blob is not None and blob.get("phase") == phase:
-            return
-        if blob is not None and blob.get("phase") == "bootstrap":
-            run_id = blob["run_id"]
-            assert isinstance(run_id, int)
-            cfg = run_config_from_row(conn, run_id)
-            inputs = prepare_bootstrap_inputs(conn, cfg)
-            verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
-            _persist_verdicts(conn, site_id, cfg, verdicts)
-            continue
-        assert advance_verification(conn, site_id, payload)
-    raise AssertionError(f"verification chain never reached phase {phase!r}")
 
 
 def build_record_site_with_sample(
@@ -2313,17 +1964,11 @@ def seed_closed_pairs(
 # ---------------------------------------------------------------------------
 # Moved from ``tests/test_verification_run.py`` (0.16.14 Part 6, Step 4
 # piece 2/3: that file's subject, the replay chain, is removed whole in
-# piece 5, but ``tests/test_result_basis_fingerprint.py`` and
-# ``tests/test_run_input_manifest.py`` import these names from it for kept
-# behaviour). ``ensure_published_generation`` is swapped for
+# piece 5, but ``tests/test_run_input_manifest.py`` imports this name from
+# it for kept behaviour). ``ensure_published_generation`` is swapped for
 # ``ensure_site_generation`` per the switch-over plan's rule 2; every other
 # name and value is unchanged.
 # ---------------------------------------------------------------------------
-
-_W8_PAYLOAD: dict[str, object] = {
-    "trigger_date": "2026-06-06",
-    "snapshot_days_per_chunk": 2,
-}
 
 _VR_PERIOD_DAYS = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]
 _VR_QUANTITY_VALUES = {
@@ -2402,137 +2047,6 @@ def _make_verification_site(conn: sqlite3.Connection) -> tuple[int, list[int]]:
                     )
     conn.commit()
     return site_id, feeds
-
-
-def _drive_chain(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    *,
-    resamples: int = 40,
-    max_steps: int = 300,
-) -> None:
-    """Run the sync chain to completion, emulating the async bootstrap phase."""
-    from wxverify.verification.engine import (
-        prepare_bootstrap_inputs,
-        preskipped_verdicts,
-    )
-    from wxverify.verification.runs import run_config_from_row
-    from wxverify.worker.verification_run import (
-        _compute_verdicts,  # noqa: SLF001
-        _load_state,  # noqa: SLF001
-        _persist_verdicts,  # noqa: SLF001
-        advance_verification,
-    )
-
-    for _ in range(max_steps):
-        blob = _load_state(conn, site_id)
-        if blob is not None and blob.get("phase") == "bootstrap":
-            run_id = blob["run_id"]
-            assert isinstance(run_id, int)
-            cfg = run_config_from_row(conn, run_id)
-            inputs = prepare_bootstrap_inputs(conn, cfg)
-            verdicts = _compute_verdicts(inputs, cfg.bootstrap_seed, resamples)
-            # Mirror the async worker exactly (§15/F-3): out-of-range
-            # incumbents get explicit 'skipped' verdicts appended.
-            verdicts.extend(preskipped_verdicts(cfg))
-            _persist_verdicts(conn, site_id, cfg, verdicts)
-            continue
-        if not advance_verification(conn, site_id, payload):
-            return
-    raise AssertionError("verification chain did not terminate")
-
-
-def _decisions(conn: sqlite3.Connection, site_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        """
-        SELECT * FROM verification_trigger_decisions
-        WHERE site_id = ? ORDER BY id
-        """,
-        (site_id,),
-    ).fetchall()
-
-
-def _w8_step(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    calls: list[dict[str, object]],
-) -> bool:
-    """One chain step against a COPY of the payload, as `_continuation` does.
-
-    The copy matters: `_decide_phase` records `decision_fingerprint` by
-    mutating the payload in place, so a shared dict would let a later
-    re-decide round overwrite what the first round recorded.
-    """
-    from wxverify.verification.engine import (
-        prepare_bootstrap_inputs,
-        preskipped_verdicts,
-    )
-    from wxverify.verification.runs import run_config_from_row
-    from wxverify.worker.verification_run import (
-        _compute_verdicts,  # noqa: SLF001
-        _load_state,  # noqa: SLF001
-        _persist_verdicts,  # noqa: SLF001
-        advance_verification,
-    )
-
-    blob = _load_state(conn, site_id)
-    if blob is not None and blob.get("phase") == "bootstrap":
-        run_id = blob["run_id"]
-        assert isinstance(run_id, int)
-        cfg = run_config_from_row(conn, run_id)
-        verdicts = _compute_verdicts(prepare_bootstrap_inputs(conn, cfg), 7, 20)
-        verdicts.extend(preskipped_verdicts(cfg))
-        _persist_verdicts(conn, site_id, cfg, verdicts)
-        return True
-    call = dict(payload)
-    calls.append(call)
-    return advance_verification(conn, site_id, call)
-
-
-def _drive_to_phase(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    phase: str,
-    calls: list[dict[str, object]],
-) -> dict[str, object]:
-    from wxverify.worker.verification_run import _load_state  # noqa: SLF001
-
-    for _ in range(60):
-        blob = _load_state(conn, site_id)
-        if blob is not None and str(blob.get("phase")) == phase:
-            return blob
-        assert _w8_step(conn, site_id, payload, calls)
-    raise AssertionError(f"chain never reached {phase!r}")
-
-
-def _drive_fixed(
-    conn: sqlite3.Connection,
-    site_id: int,
-    payload: dict[str, object],
-    calls: list[dict[str, object]],
-    steps: int,
-) -> int:
-    """Advance a FIXED number of steps; returns max `redecide_attempts` seen.
-
-    Fixed rather than loop-until-stopped on purpose: the dev dependency
-    group carries no pytest-timeout, so a live-locked chain written as a
-    termination assertion would hang the suite with no diagnostic.
-    """
-    from wxverify.worker.verification_run import _load_state  # noqa: SLF001
-
-    seen = 0
-    for _ in range(steps):
-        blob = _load_state(conn, site_id)
-        if blob is not None:
-            attempts = blob.get("redecide_attempts")
-            if isinstance(attempts, int):
-                seen = max(seen, attempts)
-        if not _w8_step(conn, site_id, payload, calls):
-            break
-    return seen
 
 
 def _advance_samples(conn: sqlite3.Connection, site_id: int, feed_id: int) -> None:

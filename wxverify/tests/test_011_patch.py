@@ -492,8 +492,6 @@ def test_fetch_feed_connect_error_refunds_budget(tmp_path: Path) -> None:
     db = get_db()
 
     class _ConnectErrorAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -544,8 +542,6 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
     _resp = httpx.Response(429, headers={"Retry-After": "120"}, request=_req)
 
     class _Http429Adapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -588,8 +584,6 @@ def test_fetch_feed_read_timeout_keeps_budget(tmp_path: Path) -> None:
     db = get_db()
 
     class _ReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -628,8 +622,6 @@ def test_fetch_feed_success_consumes_budget_exactly_once(tmp_path: Path) -> None
     db = get_db()
 
     class _SuccessAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -690,8 +682,6 @@ def test_fetch_feed_readtimeout_total_calls_capped_at_max_retries_plus_one(
     db = get_db()
 
     class _GoogleReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -782,8 +772,6 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
     db = get_db()
 
     class _GoogleReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
