@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.16.14
+
+Each day is now closed and scored once, after it ends (the daily
+close). Just after local midnight the close checks the day for gaps in
+the station readings, fills them, and scores the day against the
+forecasts made for it. If that fails, it is retried once, 1 hour later;
+a day not closed by then is marked missed and is never scored. A stored
+score is final: it is never redone, even when a reading changes later.
+Rankings, winners and wind weights are built from the stored day scores
+and published once a day, after the close. The nightly verification
+run, which re-scored every past day each night, is gone.
+
+For each feed, the first forecast it downloads on a local day is the
+one scored, for that day and the 7 days after it; normally that is the
+download just after local midnight. Later downloads refresh the
+Forecast page only.
+
+Station readings are now stored as they arrive, and wxverify builds
+each hour's values from them. The 5-minute readings are downloaded
+through the day, every `obs_interval_minutes` (default 180) until
+23:00 and then at fixed slots from 23:00 to 23:59, and every
+current-conditions poll is kept. Temperature is the hour's average,
+rain the rise in the running total, and wind the highest mean of two
+neighbouring readings, which may now be up to 20 minutes apart (was
+10). After a day ends, only hours with no reading from any source are
+filled from weather.com's hourly download. A closed or missed day is
+never downloaded again.
+
+At the first start of this version the switch to the daily close runs
+by itself. It builds each site's first publication from the stored
+history, then turns the close on, normally within minutes. Every day
+before the switch keeps the scores it had, as the starting history: it
+stays in the rankings until it ages out of the window, and it is never
+scored again. The install day is never closed: closing starts with the
+next local day, and the install day's hours after the install are not
+scored.
+
+After each publication, the worksheets (the hour-by-hour working) of
+verification runs older than the published one are deleted, a little
+at a time. The database file keeps its size, and the freed space is
+reused.
+
+The time-zone correction is removed, with its Ops panel and the
+`timezone correct` and `timezone status` commands. A site's zone is now
+changed only with `timezone change`, from the next full local day; the
+changeover day is flagged and not scored. Days already closed keep the
+zone they were scored under.
+
+On the Ops page the Catch up and Backfill buttons are retired, and
+their panel now shows each site's recent days: state, retry time,
+failure and publication (Close Status). The routes behind the two
+buttons answer 410, so the Home Assistant integration's Backfill and
+Catch up buttons get an error until a later integration release
+removes them. The Nightly Verification Run Hold now holds nothing:
+arming it changes only its panel and banner. The Verification page
+keeps the last nightly run as it stood, marked as having stale inputs.
+
+The Overlay page draws today's readings as a provisional line, and
+shows one lead time at a time, picked on the page (1 day ahead by
+default).
+
+The health monitor now checks that each day closed and published on
+time. New warnings: `close_day_missed`, `close_day_thin`,
+`close_stage_failed`, `publication_late`, `station_nothing_usable`,
+`provider_down`, `daytime_download_missed` (no 5-minute readings stored
+for two download intervals) and `station_silent_today` (a station's
+poll finds it offline). Once the close is on, `obs_stale`,
+`fetch_obs_live`, `pair_score_live`, `obs_station_history_failing` and
+`wind_history` are no longer reported.
+
+The new command `wind-history prune` deletes, once, the 5-minute wind
+readings stored before this version that the daily close no longer
+needs. The install never runs it. Run it with `--dry-run` first; a run
+that deletes needs `--restored-backup`, naming a backup from before
+this version whose restore you have checked.
+
+A database exported before this version is imported as it stands,
+without rebuilding its pairs and scores, and the daily close turns on
+for it from the next full local day. The option `obs_jitter_minutes`
+is no longer used.
+
+The first start moves the database to schema version 15, which 0.16.13
+cannot open. Make a backup before upgrading: the only way back is to
+restore that backup with 0.16.13, which loses everything recorded
+since.
+
 ## 0.16.13
 
 When weather.com refuses access (HTTP 401 or 403), only the kind of
