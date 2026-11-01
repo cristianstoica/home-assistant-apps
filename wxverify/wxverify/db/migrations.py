@@ -6,30 +6,19 @@ import functools
 import logging
 import sqlite3
 import time
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Final
 
 from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-from wxverify.core.timeutil import isoformat_utc, utc_now
-from wxverify.db.queue import enqueue_if_absent
-from wxverify.db.runtime_state import (
-    delete_runtime_state,
-    get_runtime_state,
-    set_runtime_state,
-)
-from wxverify.db.tz_generations import (
-    correction_heartbeat_key,
-    correction_job_key,
-    correction_state_key,
-    invalid_published_pointers,
-    repair_dangling_published_pointers,
-)
+from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, utc_now
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.switch import migrate_v15_switch
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 10
+TARGET_USER_VERSION = 15
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -82,7 +71,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             history_next_attempt_at TEXT,
             history_last_error TEXT,
-            history_error_count INTEGER NOT NULL DEFAULT 0
+            history_error_count INTEGER NOT NULL DEFAULT 0,
+            retired_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS station_observations (
@@ -100,8 +90,19 @@ def create_tables(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS station_wind_records (
             station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
             obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
-            speed_kmh REAL NOT NULL CHECK (speed_kmh >= 0),
-            PRIMARY KEY (station_id, obs_at)
+            source TEXT NOT NULL
+                CHECK (source IN ('five_minute','current_obs','hourly')),
+            -- the reading's own local date, YYYY-MM-DD
+            local_date TEXT,
+            speed_kmh REAL CHECK (speed_kmh IS NULL OR speed_kmh >= 0),
+            temp_c REAL,
+            precip_total_mm REAL
+                CHECK (precip_total_mm IS NULL OR precip_total_mm >= 0),
+            -- canonical; NULL for rows from before 0.16.14
+            fetched_at TEXT,
+            CHECK (speed_kmh IS NOT NULL OR temp_c IS NOT NULL
+                   OR precip_total_mm IS NOT NULL),
+            PRIMARY KEY (station_id, obs_at, source)
         ) WITHOUT ROWID;
 
         CREATE TABLE IF NOT EXISTS station_wind_days (
@@ -120,6 +121,7 @@ def create_tables(conn: sqlite3.Connection) -> None:
             refetch_at TEXT,                 -- reconcile refetch due time
             refetched INTEGER NOT NULL DEFAULT 0 CHECK (refetched IN (0, 1)),
             updated_at TEXT NOT NULL,
+            refused_at TEXT,
             PRIMARY KEY (station_id, local_date)
         );
 
@@ -306,6 +308,10 @@ def create_tables(conn: sqlite3.Connection) -> None:
             leaderboard_status TEXT,
             created_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+            -- the publication the record used: plain values with no foreign key
+            publication_id INTEGER,
+            publication_cutoff TEXT,
+            publication_age_days INTEGER,
             CHECK(
                 (status = 'missed'
                  AND missed_reason IS NOT NULL AND write_path IS NULL)
@@ -357,7 +363,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
                     type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                              'pair_and_score','backfill_site',
                              'forecast_record','record_gap_scan',
-                             'verification_run','timezone_correction')
+                             'verification_run','timezone_correction',
+                             'day_close','day_publish')
                     AND site_id IS NOT NULL
                 )
             )
@@ -385,7 +392,8 @@ def create_tables(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
                 DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             published_at TEXT,
-            result_basis_fingerprint TEXT
+            result_basis_fingerprint TEXT,
+            worksheet_kept INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS verification_evidence (
@@ -539,6 +547,368 @@ def create_tables(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
+
+        CREATE TABLE IF NOT EXISTS site_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            state TEXT NOT NULL
+                CHECK(state IN ('open','closing','retry_due','closed','missed')),
+            day_start_utc TEXT NOT NULL,
+            day_end_utc TEXT NOT NULL,
+            timezone TEXT NOT NULL,
+            zone_changeover INTEGER NOT NULL DEFAULT 0
+                CHECK(zone_changeover IN (0,1)),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 2),
+            retry_at TEXT,
+            last_failure TEXT,
+            missed_reason TEXT
+                CHECK(missed_reason IS NULL OR missed_reason IN
+                      ('never_attempted','retry_failed','retry_not_run',
+                       'zone_changeover')),
+            created_at TEXT NOT NULL,
+            state_changed_at TEXT NOT NULL,
+            done_at TEXT,
+            PRIMARY KEY (site_id, local_date),
+            CHECK((state IN ('closed','missed')) = (done_at IS NOT NULL)),
+            CHECK((state = 'missed') = (missed_reason IS NOT NULL)),
+            CHECK(state <> 'open' OR attempts = 0),
+            CHECK(state NOT IN ('closing','closed') OR attempts >= 1),
+            CHECK(state <> 'retry_due' OR attempts = 1),
+            CHECK((retry_at IS NOT NULL) =
+                  (attempts = 2 OR state = 'retry_due'
+                   OR missed_reason IS 'retry_not_run')),
+            CHECK(zone_changeover = 0 OR state IN ('open','missed')),
+            CHECK(missed_reason IS NOT 'zone_changeover' OR zone_changeover = 1)
+        );
+
+        CREATE TABLE IF NOT EXISTS station_changes (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            change TEXT NOT NULL
+                CHECK(change IN ('added','turned_on','turned_off','retired')),
+            effective_date TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            changed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS site_day_stations (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            PRIMARY KEY (site_id, local_date, station_id),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS site_zone_changes (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            timezone TEXT NOT NULL,
+            effective_date TEXT NOT NULL,
+            entered_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS close_attempts (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK(attempt IN (1,2)),
+            started_at TEXT NOT NULL,
+            last_stage INTEGER NOT NULL DEFAULT 1 CHECK(last_stage BETWEEN 1 AND 6),
+            last_progress_at TEXT NOT NULL,
+            outcome TEXT NOT NULL DEFAULT 'running'
+                CHECK(outcome IN ('running','closed','failed')),
+            failed_stage INTEGER CHECK(failed_stage BETWEEN 2 AND 6),
+            failure_reason TEXT,
+            ended_at TEXT,
+            truth_version TEXT,
+            PRIMARY KEY (site_id, local_date, attempt),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE,
+            CHECK((outcome = 'running') = (ended_at IS NULL)),
+            CHECK((outcome = 'failed') = (failed_stage IS NOT NULL)),
+            CHECK(outcome <> 'closed' OR (last_stage = 6 AND truth_version IS NOT NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_station_days (
+            site_id INTEGER NOT NULL,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            five_minute INTEGER NOT NULL CHECK(five_minute >= 0),
+            current_obs INTEGER NOT NULL CHECK(current_obs >= 0),
+            hourly INTEGER NOT NULL CHECK(hourly >= 0),
+            answered INTEGER NOT NULL CHECK(answered IN (0,1)),
+            refused_lost INTEGER NOT NULL CHECK(refused_lost IN (0,1)),
+            paused INTEGER NOT NULL CHECK(paused IN (0,1)),
+            PRIMARY KEY (site_id, local_date, station_id),
+            FOREIGN KEY (site_id, local_date)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS close_publications (
+            site_id INTEGER NOT NULL,
+            cutoff TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1 CHECK(attempt IN (1,2)),
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
+                ('pending','building','published','retry_due','failed','superseded')),
+            opened_at TEXT NOT NULL,
+            started_at TEXT,
+            retry_at TEXT,
+            finished_at TEXT,
+            publication_id TEXT,
+            last_failure TEXT,
+            PRIMARY KEY (site_id, cutoff),
+            FOREIGN KEY (site_id, cutoff)
+                REFERENCES site_days(site_id, local_date) ON DELETE CASCADE,
+            CHECK((state = 'published') = (publication_id IS NOT NULL)),
+            CHECK((state = 'retry_due') = (retry_at IS NOT NULL AND attempt = 1
+                                           AND finished_at IS NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_stage_log (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL CHECK(attempt IN (1,2)),
+            stage INTEGER NOT NULL CHECK(stage BETWEEN 1 AND 8),
+            job_id INTEGER,
+            enqueued_at TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            queue_wait_s REAL NOT NULL,
+            duration_s REAL NOT NULL,
+            outcome TEXT NOT NULL
+                CHECK(outcome IN ('completed','failed','superseded','skipped')),
+            reason TEXT,
+            detail TEXT NOT NULL DEFAULT '{}',
+            CHECK((stage = 1) = (job_id IS NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS close_try_log (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            station_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('five_minute','hourly')),
+            slot TEXT NOT NULL,
+            close_attempt INTEGER CHECK(close_attempt IN (1,2)),
+            tried_at TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            detail TEXT,
+            readings_kept INTEGER NOT NULL CHECK(readings_kept >= 0),
+            readings_refused INTEGER NOT NULL CHECK(readings_refused >= 0),
+            CHECK((slot = 'gap_fill') = (kind = 'hourly')),
+            CHECK((slot = 'gap_fill') = (close_attempt IS NOT NULL))
+        );
+
+        -- Daily-close scores and publications (P4). Dates are YYYY-MM-DD,
+        -- stamps canonical UTC ...Z text. No table here has a foreign key to
+        -- site_days, and none carries a tz_generation_id.
+
+        CREATE TABLE IF NOT EXISTS forecast_downloads (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            local_date TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            round_date TEXT,
+            round_try INTEGER,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            fetched_at TEXT,
+            outcome TEXT NOT NULL,
+            reason TEXT,
+            usable INTEGER NOT NULL,
+            inserted INTEGER NOT NULL,
+            labels TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS forecast_value_changes (
+            download_id INTEGER NOT NULL
+                REFERENCES forecast_downloads(id) ON DELETE CASCADE,
+            previous_download_id INTEGER,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            hours_compared INTEGER NOT NULL,
+            hours_changed INTEGER NOT NULL,
+            max_abs_change REAL,
+            first_changed_valid_at TEXT,
+            labels_changed INTEGER NOT NULL,
+            PRIMARY KEY (download_id, feed_id, variable)
+        );
+
+        CREATE TABLE IF NOT EXISTS close_pairs (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            valid_at TEXT NOT NULL,
+            lead_hours INTEGER NOT NULL,
+            forecast REAL NOT NULL,
+            observed REAL NOT NULL,
+            error REAL,
+            abs_error REAL,
+            sq_error REAL,
+            cat_hit INTEGER,
+            cat_false INTEGER,
+            cat_miss INTEGER,
+            cat_correct_neg INTEGER,
+            rain_threshold_mm REAL,
+            ref_sq_error REAL,
+            download_id INTEGER,
+            download_date TEXT,
+            issued_at TEXT,
+            fetched_at TEXT,
+            contributors INTEGER,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead,
+                         valid_at, lead_hours)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS day_scores (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            status TEXT NOT NULL,
+            download_id INTEGER,
+            download_date TEXT,
+            fetched_at TEXT,
+            n INTEGER NOT NULL,
+            err_n INTEGER NOT NULL,
+            err_sum REAL,
+            abs_sum REAL,
+            sq_sum REAL,
+            hits INTEGER,
+            false_alarms INTEGER,
+            misses INTEGER,
+            correct_negs INTEGER,
+            skill_n INTEGER,
+            skill_sq_sum REAL,
+            skill_ref_sq_sum REAL,
+            wind_fc_high REAL,
+            wind_fc_hours INTEGER,
+            wind_obs_high REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS close_records (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            attempt INTEGER NOT NULL,
+            truth_version TEXT NOT NULL,
+            scoring_rule TEXT NOT NULL,
+            scored_at TEXT NOT NULL,
+            PRIMARY KEY (site_id, local_date)
+        );
+
+        CREATE TABLE IF NOT EXISTS close_record_downloads (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            download_id INTEGER,
+            download_source TEXT,
+            download_date TEXT,
+            fetched_at TEXT,
+            labels TEXT,
+            PRIMARY KEY (site_id, local_date, feed_id, day_ahead)
+        );
+
+        CREATE TABLE IF NOT EXISTS starting_scores (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            n INTEGER NOT NULL,
+            err_n INTEGER NOT NULL,
+            err_sum REAL,
+            abs_sum REAL,
+            sq_sum REAL,
+            hits INTEGER,
+            false_alarms INTEGER,
+            misses INTEGER,
+            correct_negs INTEGER,
+            skill_n INTEGER,
+            skill_sq_sum REAL,
+            skill_ref_sq_sum REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, variable, day_ahead)
+        ) WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS starting_wind_days (
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            local_date TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            forecast_high REAL,
+            observed_high REAL,
+            PRIMARY KEY (site_id, local_date, feed_id, day_ahead)
+        );
+
+        CREATE TABLE IF NOT EXISTS publications (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+            cutoff TEXT NOT NULL,
+            first_record_date TEXT NOT NULL,
+            window_days INTEGER NOT NULL,
+            window_start_date TEXT NOT NULL,
+            wind_start_date TEXT NOT NULL,
+            settings TEXT NOT NULL,
+            methodology_version INTEGER NOT NULL,
+            scoring_rule TEXT NOT NULL,
+            wind_method TEXT NOT NULL,
+            wind_constants TEXT NOT NULL,
+            build_started_at TEXT NOT NULL,
+            published_at TEXT NOT NULL,
+            UNIQUE(site_id, cutoff)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_rankings (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            window_key TEXT NOT NULL,
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            n INTEGER NOT NULL,
+            bias REAL,
+            mae REAL,
+            rmse REAL,
+            pod REAL,
+            far REAL,
+            csi REAL,
+            ets REAL,
+            hss REAL,
+            skill_score REAL,
+            PRIMARY KEY (publication_id, variable, day_ahead, window_key, feed_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_wind_weights (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            mae_ms REAL NOT NULL,
+            days INTEGER NOT NULL,
+            weight REAL NOT NULL,
+            PRIMARY KEY (publication_id, day_ahead, feed_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS publication_coverage (
+            publication_id INTEGER NOT NULL
+                REFERENCES publications(id) ON DELETE CASCADE,
+            variable TEXT NOT NULL,
+            window_key TEXT NOT NULL,
+            day_ahead INTEGER NOT NULL CHECK(day_ahead BETWEEN 0 AND 7),
+            feed_id INTEGER NOT NULL REFERENCES feeds(id) ON DELETE RESTRICT,
+            scored INTEGER NOT NULL,
+            expected INTEGER NOT NULL,
+            starting_days INTEGER NOT NULL,
+            PRIMARY KEY (publication_id, variable, window_key, day_ahead, feed_id)
+        );
         """,
     )
 
@@ -614,6 +984,28 @@ def create_indexes(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_verification_trigger_site_date
             ON verification_trigger_decisions(site_id, trigger_date, id);
+
+        CREATE INDEX IF NOT EXISTS idx_site_days_state
+            ON site_days(site_id, state, local_date);
+        CREATE INDEX IF NOT EXISTS idx_station_changes_station
+            ON station_changes(station_id, effective_date);
+        CREATE INDEX IF NOT EXISTS idx_site_zone_changes_site
+            ON site_zone_changes(site_id, effective_date);
+        CREATE INDEX IF NOT EXISTS idx_site_days_writable
+            ON site_days(site_id, local_date)
+            WHERE state IN ('open','closing');
+
+        CREATE INDEX IF NOT EXISTS idx_close_stage_log_day
+            ON close_stage_log(site_id, local_date, stage);
+        CREATE INDEX IF NOT EXISTS idx_close_stage_log_ended
+            ON close_stage_log(ended_at);
+        CREATE INDEX IF NOT EXISTS idx_close_try_log_day
+            ON close_try_log(site_id, local_date, station_id);
+        CREATE INDEX IF NOT EXISTS idx_close_try_log_tried
+            ON close_try_log(tried_at);
+
+        CREATE INDEX IF NOT EXISTS idx_forecast_downloads_day
+            ON forecast_downloads(site_id, feed_id, local_date, ended_at, id);
         """,
     )
     _sync_forecast_sample_index(conn, "idx_samples_invalid", invalid_sample_index_ddl())
@@ -832,56 +1224,6 @@ def bootstrap_publish_hold(
         conn.execute("RELEASE bootstrap_publish_hold")
         raise
     conn.execute("RELEASE bootstrap_publish_hold")
-
-
-def repair_published_pointers(conn: sqlite3.Connection) -> None:
-    """Repair dangling published time zone pointers and log the other bad ones.
-
-    Runs on every open, after the seeds and before `bootstrap_publish_hold`,
-    which stays the last step. Process start and an import's reopen both
-    come through here, so an imported file is repaired before the
-    post-import rebuild reads it.
-
-    Best-effort, like the sanitize pass in `Database._open`: an Exception is
-    logged and the open continues with every pointer as it was. One
-    SAVEPOINT makes the repair all-or-nothing. On the writer, executescript
-    has already committed the outer BEGIN IMMEDIATE (see
-    `bootstrap_publish_hold`), so the savepoint is the whole transaction
-    and its RELEASE commits it; nothing here calls commit(). SQLite ends
-    the whole transaction by itself on some errors (disk full, I/O error),
-    which also drops the savepoint, hence the in_transaction check before
-    ROLLBACK TO. A BaseException that is not an Exception unwinds the
-    savepoint and propagates.
-    """
-    conn.execute("SAVEPOINT repair_published_pointers")
-    try:
-        repaired = repair_dangling_published_pointers(conn)
-        invalid = invalid_published_pointers(conn)
-        conn.execute("RELEASE repair_published_pointers")
-    except BaseException as exc:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO repair_published_pointers")
-            conn.execute("RELEASE repair_published_pointers")
-        if not isinstance(exc, Exception):
-            raise
-        logger.exception("published-pointer repair failed; continuing open")
-        return
-    if repaired:
-        logger.warning(
-            "published-pointer repair: re-created the time zone generation of "
-            "site(s) %s; each was re-added on an earlier version and its "
-            "pointer named a generation that no longer exists. Other state it "
-            "inherited is unchanged; delete and re-add the site to reset it "
-            "fully",
-            repaired,
-        )
-    if invalid:
-        logger.warning(
-            "published-pointer repair: site(s) %s have a time zone pointer "
-            "that does not name their own published generation; left "
-            "unchanged. Delete and re-add the site to reset it",
-            invalid,
-        )
 
 
 def seed_default_settings(conn: sqlite3.Connection) -> None:
@@ -1129,90 +1471,35 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
     below the same second without them. With no such row the boundary is
     the `1970-01-01T00:00:00Z` sentinel. No clock is read.
 
-    Then, in order: delete those feeds' and the multimodel mean's rain
-    pairs in every generation, since the pairer never revisits a pair that
-    exists; restart each building timezone-correction generation (state
-    and heartbeat deleted, job re-queued), so its chain rebuilds under the
-    new gate; delete the rain `score_cache` rows and queue scoring for each
-    enabled site. The key is written last. No `forecast_samples` row
-    changes.
+    Only the key is written: no pair, `score_cache`, job or
+    `forecast_samples` row changes, so a file from before the boundary
+    keeps its stored pairs and scores as they stand, like any other file.
 
     Gated on the key, not on `user_version`, whose number depends on which
     release ships first; an older backup imported later carries no key and
     gets a boundary from its own stamps. Deleting the key by hand is a
     reset: the next open records the newest stored stamp.
 
-    One SAVEPOINT makes the step all-or-nothing. On the writer,
-    executescript has already committed the outer BEGIN IMMEDIATE (see
-    `bootstrap_publish_hold`), so the savepoint is the whole transaction.
-    SQLite ends the whole transaction by itself on some errors (disk full,
-    I/O error), which also drops the savepoint, hence the in_transaction
-    check before ROLLBACK TO. Unlike `repair_published_pointers`, nothing
-    is swallowed: the open fails before the `user_version` write and the
-    next open retries.
+    The key is the step's one write, so no SAVEPOINT is needed. Nothing is
+    swallowed: a failure fails the open before the `user_version` write and
+    the next open retries.
     """
     if get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY) is not None:
         return
-    conn.execute("SAVEPOINT migrate_precip_hour_start_boundary")
-    try:
-        newest = conn.execute(
-            """
-            SELECT fs.fetched_at
-            FROM forecast_samples fs JOIN feeds f ON f.id = fs.feed_id
-            WHERE fs.variable = 'precip'
-              AND f.source IN ('open-meteo', 'meteoblue') AND f.is_virtual = 0
-              AND julianday(fs.fetched_at) IS NOT NULL
-            ORDER BY julianday(fs.fetched_at) DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        boundary = "1970-01-01T00:00:00Z" if newest is None else str(newest[0])
-        deleted_pairs = conn.execute(
-            """
-            DELETE FROM forecast_pairs
-            WHERE variable = 'precip'
-              AND feed_id IN (
-                  SELECT id FROM feeds
-                  WHERE (source IN ('open-meteo', 'meteoblue') AND is_virtual = 0)
-                     OR (source = 'virtual' AND model = '_multimodel_mean')
-              )
-            """
-        ).rowcount
-        for row in conn.execute(
-            "SELECT id, site_id FROM timezone_generations "
-            "WHERE mode = 'retrospective_correction' AND state = 'building'"
-        ).fetchall():
-            generation_id = int(row[0])
-            delete_runtime_state(
-                conn,
-                correction_state_key(generation_id),
-                correction_heartbeat_key(generation_id),
-            )
-            enqueue_if_absent(
-                conn,
-                "timezone_correction",
-                int(row[1]),
-                correction_job_key(generation_id),
-                {"generation_id": generation_id},
-            )
-        conn.execute("DELETE FROM score_cache WHERE variable = 'precip'")
-        for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
-            site_id = int(row[0])
-            enqueue_if_absent(
-                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-            )
-        set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, boundary)
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO migrate_precip_hour_start_boundary")
-            conn.execute("RELEASE migrate_precip_hour_start_boundary")
-        raise
-    conn.execute("RELEASE migrate_precip_hour_start_boundary")
-    logger.info(
-        "precip hour-start boundary recorded at %s; %d rain pair(s) deleted",
-        boundary,
-        deleted_pairs,
-    )
+    newest = conn.execute(
+        """
+        SELECT fs.fetched_at
+        FROM forecast_samples fs JOIN feeds f ON f.id = fs.feed_id
+        WHERE fs.variable = 'precip'
+          AND f.source IN ('open-meteo', 'meteoblue') AND f.is_virtual = 0
+          AND julianday(fs.fetched_at) IS NOT NULL
+        ORDER BY julianday(fs.fetched_at) DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    boundary = "1970-01-01T00:00:00Z" if newest is None else str(newest[0])
+    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, boundary)
+    logger.info("precip hour-start boundary recorded at %s", boundary)
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -1253,6 +1540,21 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 9:
         logger.debug("migrations applying v9 old wind state removal")
         migrate_v9_drop_old_wind_state(conn)
+    if current < 11:
+        logger.debug("migrations applying v11 daily-close days")
+        migrate_v11_daily_close_days(conn)
+    if current < 12:
+        logger.debug("migrations applying v12 widened raw readings")
+        migrate_v12_widen_raw_readings(conn)
+    if current < 13:
+        logger.debug("migrations applying v13 daily-close job kinds")
+        migrate_v13_close_jobs(conn)
+    if current < 14:
+        logger.debug("migrations applying v14 daily-close scores")
+        migrate_v14_daily_close_scores(conn)
+    if current < 15:
+        logger.debug("migrations applying v15 switch to the daily close")
+        migrate_v15_switch(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1263,7 +1565,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_feeds(conn)
     seed_default_settings(conn)
     logger.debug("migrations seeded sources+feeds+settings")
-    repair_published_pointers(conn)
     record_precip_hour_start_boundary(conn)
     bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
@@ -1375,7 +1676,8 @@ def migrate_v3(conn: sqlite3.Connection) -> None:
                         type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                                  'pair_and_score','backfill_site',
                                  'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction')
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
                         AND site_id IS NOT NULL
                     )
                 )
@@ -1489,7 +1791,8 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
                         type IN ('fetch_feed','fetch_obs','fetch_current_obs',
                                  'pair_and_score','backfill_site',
                                  'forecast_record','record_gap_scan',
-                                 'verification_run','timezone_correction')
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
                         AND site_id IS NOT NULL
                     )
                 )
@@ -1512,10 +1815,11 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
                 ON jobs(type, job_key, site_id, id)
             """
         )
-        # Seed the initial published generation per existing site, then the
-        # published-pointer runtime_state row. Mirrors
-        # wxverify.db.tz_generations.ensure_published_generation's seed shape
-        # (kept in SQL here so the whole step stays inside this savepoint).
+        # Seed the initial published generation per existing site (the row
+        # `wxverify.db.switch.ensure_site_generation` makes), then the
+        # published-pointer runtime_state row, which A1 of `migrate_v15_switch` reads
+        # and A4 deletes. Kept in SQL here so the whole step stays inside this
+        # savepoint.
         now = isoformat_utc(utc_now())
         conn.execute(
             """
@@ -1832,6 +2136,303 @@ def migrate_v9_drop_old_wind_state(conn: sqlite3.Connection) -> None:
             deleted,
             "dropped" if dropped else "already gone",
             int((time.perf_counter() - started) * 1000),
+        )
+
+
+# Starts ``station_changes`` in step with today's ``stations.enabled`` flags:
+# one row per station that has no change yet, ``added`` when enabled and
+# ``turned_off`` otherwise. ``:effective_date`` is ``date.min``, earlier than
+# any record's date, so the seed row decides a station's list membership
+# until a route records a change. ``:changed_at`` is one fixed-width stamp
+# for the whole seed. Idempotent through ``NOT EXISTS``; on a fresh database
+# there are no stations and it writes nothing.
+SEED_STATION_CHANGES_SQL: Final[str] = """
+    INSERT INTO station_changes
+        (site_id, station_id, change, effective_date, reason, changed_at)
+    SELECT s.site_id, s.id,
+           CASE WHEN s.enabled = 1 THEN 'added' ELSE 'turned_off' END,
+           :effective_date, 'switch_seed', :changed_at
+    FROM stations AS s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM station_changes AS c WHERE c.station_id = s.id
+    )
+    ORDER BY s.id
+"""
+
+
+def migrate_v11_daily_close_days(conn: sqlite3.Connection) -> None:
+    """Add ``stations.retired_at`` and seed ``station_changes``.
+
+    :func:`create_tables` makes the four daily-close tables (``site_days``,
+    ``station_changes``, ``site_day_stations``, ``site_zone_changes``) before
+    the gates and :func:`create_indexes` their indexes after them, so this
+    step only adds the column and runs :data:`SEED_STATION_CHANGES_SQL`. It
+    creates no ``site_days`` row and seeds no zone change, and it changes no
+    existing row beyond the new NULL column.
+
+    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a crash in between leaves user_version below 11 and the next
+    boot re-enters the ``current < 11`` gate. The column probe skips a column
+    already there -- on a fresh database :func:`create_tables` made it, last
+    in its table, so a fresh and a migrated database agree on column order --
+    and the seed's ``NOT EXISTS`` skips every station already seeded.
+    ``changed_at`` reads the clock through this module's ``utc_now``.
+    """
+    if "retired_at" not in _table_columns(conn, "stations"):
+        conn.execute("ALTER TABLE stations ADD COLUMN retired_at TEXT")
+    conn.execute(
+        SEED_STATION_CHANGES_SQL,
+        {
+            "effective_date": date.min.isoformat(),
+            "changed_at": isoformat_utc_micro(utc_now()),
+        },
+    )
+
+
+def migrate_v12_widen_raw_readings(conn: sqlite3.Connection) -> None:
+    """Widen ``station_wind_records`` and add ``station_wind_days.refused_at``.
+
+    ``station_wind_records`` becomes the one table of raw station readings:
+    wind, temperature and the rain running total, from the 5-minute
+    download, the current-conditions poll and the hourly download. SQLite
+    cannot drop ``speed_kmh``'s ``NOT NULL`` with ``ALTER TABLE``, and
+    ``source`` joins the ``WITHOUT ROWID`` primary key, so the table is
+    rebuilt in :func:`create_tables`' shape. Every existing row is copied
+    with ``source`` ``'five_minute'`` and its speed, the new columns NULL;
+    nothing is backfilled. ``refused_at`` (NULL) is the latest time a
+    5-minute try for the station-day was held or refused.
+
+    Steps, all inside one savepoint, following :func:`migrate_v4`:
+
+    1. the re-run guard: the rebuild is skipped when ``station_wind_records``
+       already has ``source`` -- a fresh file :func:`create_tables` made, or
+       a rebuild already committed. ``run_migrations`` writes ``PRAGMA
+       user_version`` only after this returns, so a crash in between leaves
+       user_version below 12 and the next boot re-enters the ``current < 12``
+       gate;
+    2. the rebuild (:func:`_rebuild_station_wind_records`);
+    3. ``ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT`` when the
+       column is absent. On a fresh file :func:`create_tables` made it, last
+       among the columns, so a fresh and a migrated database agree on column
+       order.
+
+    As in :func:`record_precip_hour_start_boundary`, the savepoint is the
+    whole transaction on the writer, and the in_transaction check covers an
+    error that has already ended it. Any failure, a failed foreign key check
+    included, rolls every step back and is re-raised, so the open fails
+    before the ``user_version`` write and the next open retries. One INFO
+    line is logged only when the table was rebuilt.
+    """
+    started = time.perf_counter()
+    copied: int | None = None
+    conn.execute("SAVEPOINT migrate_v12")
+    try:
+        if "source" not in _table_columns(conn, "station_wind_records"):
+            copied = _rebuild_station_wind_records(conn)
+        if "refused_at" not in _table_columns(conn, "station_wind_days"):
+            conn.execute("ALTER TABLE station_wind_days ADD COLUMN refused_at TEXT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_v12")
+            conn.execute("RELEASE migrate_v12")
+        raise
+    conn.execute("RELEASE migrate_v12")
+    if copied is not None:
+        logger.info(
+            "station_wind_records rebuilt for version 12: %d rows copied, %d ms",
+            copied,
+            int((time.perf_counter() - started) * 1000),
+        )
+
+
+def _rebuild_station_wind_records(conn: sqlite3.Connection) -> int:
+    """Rebuild ``station_wind_records`` in the widened shape.
+
+    Step 2 of :func:`migrate_v12_widen_raw_readings`, run inside its
+    savepoint. The new table's statement must stay identical to the one in
+    :func:`create_tables` but for the name and ``IF NOT EXISTS``, indentation
+    included, so a rebuilt and a fresh table agree column for column. No
+    table references ``station_wind_records``, so the drop and the rename
+    touch no other table's keys. Raises ``RuntimeError`` when ``PRAGMA
+    foreign_key_check`` then reports any row. Returns the rows copied.
+    """
+    conn.execute(
+        """
+        CREATE TABLE station_wind_records_v12 (
+            station_id INTEGER NOT NULL REFERENCES stations(id) ON DELETE CASCADE,
+            obs_at TEXT NOT NULL,            -- canonical YYYY-MM-DDTHH:MM:SSZ
+            source TEXT NOT NULL
+                CHECK (source IN ('five_minute','current_obs','hourly')),
+            -- the reading's own local date, YYYY-MM-DD
+            local_date TEXT,
+            speed_kmh REAL CHECK (speed_kmh IS NULL OR speed_kmh >= 0),
+            temp_c REAL,
+            precip_total_mm REAL
+                CHECK (precip_total_mm IS NULL OR precip_total_mm >= 0),
+            -- canonical; NULL for rows from before 0.16.14
+            fetched_at TEXT,
+            CHECK (speed_kmh IS NOT NULL OR temp_c IS NOT NULL
+                   OR precip_total_mm IS NOT NULL),
+            PRIMARY KEY (station_id, obs_at, source)
+        ) WITHOUT ROWID
+        """
+    )
+    copied = conn.execute(
+        "INSERT INTO station_wind_records_v12 (station_id, obs_at, source, speed_kmh)"
+        " SELECT station_id, obs_at, 'five_minute', speed_kmh"
+        " FROM station_wind_records"
+    ).rowcount
+    conn.execute("DROP TABLE station_wind_records")
+    conn.execute("ALTER TABLE station_wind_records_v12 RENAME TO station_wind_records")
+    violation = conn.execute(
+        "PRAGMA foreign_key_check(station_wind_records)"
+    ).fetchone()
+    if violation is not None:
+        raise RuntimeError("station_wind_records rebuild failed its foreign key check")
+    return copied
+
+
+def migrate_v13_close_jobs(conn: sqlite3.Connection) -> None:
+    """Widen the ``jobs`` type CHECK for ``day_close`` and ``day_publish``.
+
+    The daily close's two job kinds must pass the CHECK, and
+    :func:`create_tables` leaves an existing ``jobs`` table as it is, so a
+    file at version 12 keeps the narrow CHECK until this rebuild widens it.
+    The new table's column list and CHECK must stay identical to
+    :func:`create_tables`' and to the ``jobs_new`` of :func:`migrate_v3` and
+    :func:`migrate_v4`. The rebuild copies :func:`migrate_v4`'s: every row is
+    copied as it is, retired kinds included, and the two ``jobs`` indexes
+    are made again here; every other index comes back from
+    :func:`create_indexes`. The five daily-close tables come from
+    :func:`create_tables`, so this step does not name them.
+
+    The re-run guard returns at once when the ``jobs`` statement already
+    holds ``'day_publish'``: a fresh file, whose ``jobs`` :func:`migrate_v3`
+    rebuilt from its own widened text, or a rebuild already committed.
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a stop in between leaves user_version below 13 and the next
+    open re-enters the ``current < 13`` gate and returns here.
+
+    As in :func:`migrate_v12_widen_raw_readings`, one savepoint holds the
+    rebuild, and the in_transaction check covers an error that has already
+    ended it. Any failure rolls the rebuild back, leaving the old ``jobs``
+    and no ``jobs_new``, and is re-raised, so the open fails before the
+    ``user_version`` write and the next open runs the step again.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
+    ).fetchone()
+    if row is not None and "'day_publish'" in str(row[0]):
+        return
+    conn.execute("SAVEPOINT migrate_v13")
+    try:
+        conn.execute(
+            """
+            CREATE TABLE jobs_new (
+                id INTEGER PRIMARY KEY,
+                type TEXT NOT NULL,
+                site_id INTEGER REFERENCES sites(id) ON DELETE CASCADE,
+                job_key TEXT,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','running','completed','failed')),
+                next_attempt_at TEXT,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 5,
+                last_error TEXT,
+                result TEXT,
+                created_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                updated_at TEXT NOT NULL
+                    DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                CHECK (
+                    (type = 'catchup' AND site_id IS NULL)
+                    OR (
+                        type IN ('fetch_feed','fetch_obs','fetch_current_obs',
+                                 'pair_and_score','backfill_site',
+                                 'forecast_record','record_gap_scan',
+                                 'verification_run','timezone_correction',
+                                 'day_close','day_publish')
+                        AND site_id IS NOT NULL
+                    )
+                )
+            )
+            """
+        )
+        conn.execute("INSERT INTO jobs_new SELECT * FROM jobs")
+        conn.execute("DROP TABLE jobs")
+        conn.execute("ALTER TABLE jobs_new RENAME TO jobs")
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_active_dedupe
+                ON jobs(type, COALESCE(site_id, -1), job_key)
+                WHERE status IN ('pending','running') AND job_key IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_jobs_type_key_site
+                ON jobs(type, job_key, site_id, id)
+            """
+        )
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK TO migrate_v13")
+            conn.execute("RELEASE migrate_v13")
+        raise
+    conn.execute("RELEASE migrate_v13")
+
+
+# Value: when the download record (``forecast_downloads``) starts, a
+# canonical whole-second UTC ``...Z`` stamp. Downloads before it are
+# inferred from ``forecast_samples`` and the job rows instead.
+DOWNLOAD_RECORD_SINCE_KEY: Final = "download_record_since"
+
+
+def migrate_v14_daily_close_scores(conn: sqlite3.Connection) -> None:
+    """Add the four P4 columns and start the download record.
+
+    :func:`create_tables` makes P4's twelve tables before the gates and
+    :func:`create_indexes` the ``forecast_downloads`` index after them, so
+    this step only adds ``verification_runs.worksheet_kept`` (1 for every
+    existing run) and ``forecast_of_record``'s ``publication_id``,
+    ``publication_cutoff`` and ``publication_age_days`` (NULL for every
+    existing record), then writes :data:`DOWNLOAD_RECORD_SINCE_KEY` with
+    the migration's time when the key is absent. It changes no existing row
+    beyond the new columns.
+
+    Re-entry, following :func:`migrate_v8_last_usable_fetch_at`:
+    ``run_migrations`` writes ``PRAGMA user_version`` only after this
+    returns, so a stop in between leaves user_version below 14 and the next
+    open re-enters the ``current < 14`` gate. Each column probe skips a
+    column already there -- on a fresh database :func:`create_tables` made
+    it, last in its table, so a fresh and a migrated database agree on
+    column order -- and the key is written only when absent, so a re-entry
+    keeps the first time. The clock is read through this module's
+    ``utc_now``, truncated to whole seconds.
+    """
+    if "worksheet_kept" not in _table_columns(conn, "verification_runs"):
+        conn.execute(
+            "ALTER TABLE verification_runs"
+            " ADD COLUMN worksheet_kept INTEGER NOT NULL DEFAULT 1"
+        )
+    record_columns = _table_columns(conn, "forecast_of_record")
+    if "publication_id" not in record_columns:
+        conn.execute("ALTER TABLE forecast_of_record ADD COLUMN publication_id INTEGER")
+    if "publication_cutoff" not in record_columns:
+        conn.execute(
+            "ALTER TABLE forecast_of_record ADD COLUMN publication_cutoff TEXT"
+        )
+    if "publication_age_days" not in record_columns:
+        conn.execute(
+            "ALTER TABLE forecast_of_record ADD COLUMN publication_age_days INTEGER"
+        )
+    if get_runtime_state(conn, DOWNLOAD_RECORD_SINCE_KEY) is None:
+        set_runtime_state(
+            conn,
+            DOWNLOAD_RECORD_SINCE_KEY,
+            isoformat_utc(utc_now().replace(microsecond=0)),
         )
 
 

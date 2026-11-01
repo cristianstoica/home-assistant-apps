@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
-from wxverify.db.tz_generations import published_generation_clause
+from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.site_days import daily_close_on
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import MetricResult, strategy_for
 from wxverify.scoring.multimodel import (
@@ -77,8 +78,8 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
     """Run the full scoring pipeline monolithically on one connection.
 
     HTTP routes and the CLI call this inside a single write transaction.
-    The worker's ``pair_and_score`` dispatch and catchup's rescore lane
-    instead run ``SPLIT_PAIR_PHASES`` through
+    The worker's ``pair_and_score`` dispatch instead runs
+    ``SPLIT_PAIR_PHASES`` through
     ``worker/score_batches.run_split_pair_phases``, computing each phase
     outside the write lock and applying it in chunks under the input-epoch
     compare-and-set, and then the batched scoring orchestrator
@@ -86,7 +87,14 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
     never held for a whole rebuild — see the convergence-invariant comment
     at the worker dispatch site (worker/processor.py).
     ``PAIR_AND_SCORE_PHASES`` remains for this monolithic path only.
+
+    With the daily close on it returns at once, writing nothing: the close's
+    stage 5 scores each closed day and stage 7 publishes (daily-close P4
+    plan, section 10).
     """
+    if daily_close_on(conn):
+        logger.debug("pair_and_score skipped site=%s: daily close on", site_id)
+        return
     logger.debug("pair_and_score start site=%s", site_id)
     cells = 0
     for phase in PAIR_AND_SCORE_PHASES:
@@ -99,6 +107,24 @@ def pair_and_score(conn: sqlite3.Connection, site_id: int | None = None) -> None
         "all" if site_id is None else site_id,
         cells,
     )
+
+
+def enqueue_scoring_run(conn: sqlite3.Connection, site_id: int) -> bool:
+    """Queue a ``pair_and_score`` run for ``site_id`` unless the close is on.
+
+    The one switch for every scoring enqueue site (daily-close P4 plan,
+    section 10): with the daily close on it enqueues nothing, since only the
+    close's stage 5 scores; with it off it makes today's deduped enqueue.
+    Returns whether a new job row was inserted (False when the close is on or
+    a pending or running run already exists), for the fetch score gate's log
+    line.
+    """
+    if daily_close_on(conn):
+        logger.debug("scoring enqueue skipped site=%s: daily close on", site_id)
+        return False
+    return enqueue_if_absent(
+        conn, "pair_and_score", site_id, "score", {"site_id": site_id}
+    ).created
 
 
 def discover_score_inputs(conn: sqlite3.Connection, site_id: int | None) -> ScoreInputs:
@@ -318,13 +344,12 @@ def _distinct_cells(
     if site_id is None:
         params = ()
     else:
-        where = "AND site_id = ?"
+        where = "WHERE site_id = ?"
         params = (site_id,)
     rows = conn.execute(
         f"""
         SELECT DISTINCT site_id, feed_id, variable, day_ahead
         FROM forecast_pairs
-        WHERE {published_generation_clause("forecast_pairs")}
         {where}
         """,
         params,

@@ -6,7 +6,8 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Final
 
-from wxverify.db.tz_generations import published_generation_clause
+from wxverify.core.timeutil import utc_now
+from wxverify.db.site_days import open_day_clause
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import (
@@ -38,8 +39,12 @@ class _ExistingMean:
     first_known_at: str | None
 
 
-def existing_mean_rows_sql(*, site_scoped: bool) -> str:
-    """The published mean rows of one feed: ``(feed_id,)`` or ``(feed_id, site_id)``."""
+def existing_mean_rows_sql(*, site_scoped: bool, day_clause: str) -> str:
+    """The published mean rows of one feed: ``(feed_id,)`` or ``(feed_id, site_id)``.
+
+    ``day_clause`` is a SQL predicate over ``forecast_pairs`` that keeps the
+    rows on days taking pairs (``open_day_clause``; ``"1"`` keeps every row).
+    """
     site_filter = "AND site_id = ?" if site_scoped else ""
     return f"""
         SELECT id, site_id, variable, issued_at, valid_at, lead_hours, day_ahead,
@@ -48,8 +53,7 @@ def existing_mean_rows_sql(*, site_scoped: bool) -> str:
                rain_threshold_mm, contributors, first_known_at
         FROM forecast_pairs
         WHERE feed_id = ?
-          AND {published_generation_clause("forecast_pairs")}
-          {site_filter}
+          {site_filter} AND {day_clause}
         """
 
 
@@ -57,7 +61,7 @@ def materialize_multimodel_mean(
     conn: sqlite3.Connection, site_id: int | None = None
 ) -> int:
     """Refresh the published mean rows; return the number of distinct mean keys."""
-    return apply_delta(conn, compute_multimodel_mean(conn, site_id))
+    return apply_delta(conn, compute_multimodel_mean(conn, site_id), now_utc=utc_now())
 
 
 def compute_multimodel_mean(
@@ -72,6 +76,9 @@ def compute_multimodel_mean(
     ones are ignored. X rows no D group matched become ``DeleteOp``s, in
     ascending id order, ahead of the D-ordered writes. ``count`` is the
     number of distinct D keys; the seed sites are every D group's site.
+    While the daily close is on, both reads keep only the days that take
+    pairs (``open_day_clause``, built at call time), so no op is proposed
+    for a done day.
     """
     feed = conn.execute(
         "SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'"
@@ -79,14 +86,16 @@ def compute_multimodel_mean(
     if feed is None:
         return PairDelta((), (), _MEAN_INSERT_SQL, count=0)
     feed_id = int(feed["id"])
-    # The X read and the diff are scoped to the PUBLISHED generation (§13): a
-    # building correction generation's mean rows belong to the correction
-    # chain (scoring.tz_rebuild derives them per rebuilt day) and are never
-    # read or written here; retired rows are removed by the chain's
-    # post-flip cleanup, not here.
     existing: dict[tuple[int, str, str, str], _ExistingMean | None] = {}
+    existing_day_clause = open_day_clause(
+        conn,
+        site_expr="forecast_pairs.site_id",
+        instant_expr="forecast_pairs.valid_at",
+    )
     for row in conn.execute(
-        existing_mean_rows_sql(site_scoped=site_id is not None),
+        existing_mean_rows_sql(
+            site_scoped=site_id is not None, day_clause=existing_day_clause
+        ),
         (feed_id,) if site_id is None else (feed_id, site_id),
     ):
         key = (
@@ -97,8 +106,8 @@ def compute_multimodel_mean(
         )
         if key in existing:
             # UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
-            # tz_generation_id) makes this impossible under a correct
-            # published clause and key.
+            # tz_generation_id) makes this impossible: every row of a site
+            # carries the site's one generation.
             raise RuntimeError(f"duplicate published mean key {key!r}")
         existing[key] = _ExistingMean(
             row_id=int(row["id"]),
@@ -133,6 +142,9 @@ def compute_multimodel_mean(
     else:
         params = ()
         site_filter = ""
+    groups_day_clause = open_day_clause(
+        conn, site_expr="fp.site_id", instant_expr="fp.valid_at"
+    )
     groups = conn.execute(
         f"""
         SELECT fp.site_id, fp.variable, fp.issued_at, fp.valid_at, fp.lead_hours,
@@ -145,7 +157,7 @@ def compute_multimodel_mean(
           ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
         WHERE f.is_virtual = 0
           AND {active_competitor_clause(site_expr="fp.site_id")}
-          AND {published_generation_clause("fp")}
+          AND {groups_day_clause}
           {site_filter}
         GROUP BY fp.site_id, fp.variable, fp.issued_at, fp.valid_at, fp.lead_hours,
                  fp.day_ahead, fp.observed, s.rain_threshold_mm
@@ -195,7 +207,7 @@ def compute_multimodel_mean(
         if key not in existing:
             existing[key] = None
             count += 1
-            writes.append(InsertOp(row_site_id, values))
+            writes.append(InsertOp(row_site_id, values, str(row["valid_at"])))
             continue
         current = existing[key]
         if current is None:
@@ -211,12 +223,14 @@ def compute_multimodel_mean(
                 current.row_id,
                 row_site_id,
                 (row_site_id, feed_id, *current.key[1:], *values[5:]),
+                current.key[3],
             )
         )
     deletes = [
-        DeleteOp(row_id)
-        for row_id in sorted(
-            leftover.row_id for leftover in existing.values() if leftover is not None
+        DeleteOp(leftover.row_id, leftover.key[0], leftover.key[3])
+        for leftover in sorted(
+            (leftover for leftover in existing.values() if leftover is not None),
+            key=lambda leftover: leftover.row_id,
         )
     ]
     return PairDelta(tuple(seeds), (*deletes, *writes), _MEAN_INSERT_SQL, count)

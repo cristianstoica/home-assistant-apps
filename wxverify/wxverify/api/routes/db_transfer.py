@@ -11,8 +11,9 @@ import sqlite3
 import time
 import uuid
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -24,7 +25,13 @@ from starlette.responses import JSONResponse
 from wxverify import config
 from wxverify.api.errors import ApiError
 from wxverify.core.error_sanitize import safe_detail, sanitized_exception
-from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, utc_now
+from wxverify.core.timeutil import (
+    is_canonical_utc_stamp,
+    isoformat_utc,
+    isoformat_utc_micro,
+    parse_utc,
+    utc_now,
+)
 from wxverify.db.connection import get_db
 from wxverify.db.migrations import TARGET_USER_VERSION, schema_table_names
 from wxverify.db.queue import reclaim_all_stale
@@ -35,6 +42,12 @@ from wxverify.db.runtime_state import (
     set_runtime_state_now,
 )
 from wxverify.db.sanitize import sanitize_wedge_prone_timestamps, table_exists
+from wxverify.db.site_days import (
+    WriteKind,
+    daily_close_on,
+    filter_day_writes,
+    writable_pairs_clause,
+)
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.scoring.engine import pair_and_score
 
@@ -77,6 +90,14 @@ _BLOB_GUARDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("forecast_samples", "variable"),
     ("forecast_pairs", "variable"),
     ("score_cache", "variable"),
+    # The daily-close scores and publications (P4); each `variable` is in
+    # its table's primary key.
+    ("forecast_value_changes", "variable"),
+    ("close_pairs", "variable"),
+    ("day_scores", "variable"),
+    ("starting_scores", "variable"),
+    ("publication_rankings", "variable"),
+    ("publication_coverage", "variable"),
 )
 # The forecast identity stamps, checked by VALUE at import. Downstream they
 # are string keys (the UNIQUE constraint, the pairing join, the latest-run
@@ -93,6 +114,67 @@ _CANONICAL_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
     ("station_observations", "valid_at"),
     ("observations", "valid_at"),
     ("station_wind_records", "obs_at"),
+    # A day record's bounds: the guard parses them and `open_day_clause`
+    # compares them with julianday, so one bad stamp breaks or hides a day.
+    ("site_days", "day_start_utc"),
+    ("site_days", "day_end_utc"),
+    # The daily-close scores and publications (P4): a download's order, a
+    # pair's hour, and the instants a close and a publication were made,
+    # which readers compare as text. The four `fetched_at` columns are not
+    # listed: they copy `persist_fetch_result`'s stamp, which keeps its
+    # microseconds, as `forecast_samples.fetched_at` does.
+    ("forecast_downloads", "started_at"),
+    ("forecast_downloads", "ended_at"),
+    ("close_pairs", "valid_at"),
+    ("close_records", "scored_at"),
+    ("publications", "build_started_at"),
+    ("publications", "published_at"),
+)
+# Nullable stamps of the same tables, checked apart because the check above
+# refuses NULL.
+_NULLABLE_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("forecast_value_changes", "first_changed_valid_at"),
+    ("close_pairs", "issued_at"),
+)
+# The daily-close tables' dates, checked by VALUE at import: each is a key
+# (a day record, a station-list or zone change's first day) compared as text,
+# so only the canonical `YYYY-MM-DD` spelling may come in.
+_CANONICAL_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("site_days", "local_date"),
+    ("station_changes", "effective_date"),
+    ("site_zone_changes", "effective_date"),
+    # The close's two logs. Its three records are not listed: each has a
+    # foreign key to `site_days`, so the foreign key check refuses their dates.
+    ("close_stage_log", "local_date"),
+    ("close_try_log", "local_date"),
+    # The daily-close scores and publications (P4). None has a foreign key
+    # to `site_days`, so every date of theirs is listed here or, when it may
+    # be NULL, in `_NULLABLE_DATE_COLUMNS`.
+    ("forecast_downloads", "local_date"),
+    ("close_pairs", "local_date"),
+    ("day_scores", "local_date"),
+    ("close_records", "local_date"),
+    ("close_record_downloads", "local_date"),
+    ("starting_scores", "local_date"),
+    ("starting_wind_days", "local_date"),
+    ("publications", "cutoff"),
+    ("publications", "first_record_date"),
+    ("publications", "window_start_date"),
+    ("publications", "wind_start_date"),
+)
+# Nullable dates of the same tables, checked apart because the check above
+# refuses NULL.
+_NULLABLE_DATE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("forecast_downloads", "round_date"),
+    ("close_pairs", "download_date"),
+    ("day_scores", "download_date"),
+    ("close_record_downloads", "download_date"),
+)
+# The daily-close tables' change stamps, which the station-list and zone
+# rules order as text, so only the fixed-width microsecond form may come in.
+_MICRO_STAMP_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("station_changes", "changed_at"),
+    ("site_zone_changes", "entered_at"),
 )
 # What `_flag_invalid_utf8` returns in place of text that is not valid UTF-8.
 # A bare object equals no value a row can hold, so a row test finds only it.
@@ -621,7 +703,7 @@ async def import_db(request: Request) -> JSONResponse:
                 raise ApiError(422, "empty upload")
             _validate_upload(tmp)
             _stage_pending_rebuild_state(tmp)
-            _neutralize_imported_verification_chains(tmp)
+            _settle_imported_closes(tmp)
             backup = _new_backup_path(db_dir)
             # COMMIT POINT: past a successful replace_from the live DB has
             # been overwritten, so the success response must go out
@@ -805,6 +887,34 @@ def _guarded_table_present(conn: sqlite3.Connection, table: str) -> bool:
     raise ApiError(422, f"not a table: {table}")
 
 
+def _guarded_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    """The lowercased column names of guarded ``table``; empty when absent.
+
+    For a check of a column a later release added to an existing table: a
+    file from before that release has the table without the column, and the
+    open migrates it, so there is no value to check. The table is confirmed
+    by ``_guarded_table_present`` first. The names come from the PRAGMA
+    statement ``main.table_xinfo``, never the table-valued form, for the
+    reason ``_guarded_table_present`` gives for ``table_list``; ``table_xinfo``
+    also lists generated columns, which a ``SELECT`` reads like any other.
+    SQLite matches column names ASCII-case-insensitively, so the names are
+    lowercased. ``table`` is always a code-owned name.
+    """
+    if not _guarded_table_present(conn, table):
+        return set()
+    literal = "'" + table.replace("'", "''") + "'"
+    try:
+        cursor = conn.execute(f"PRAGMA main.table_xinfo({literal})")
+        columns = [column[0] for column in cursor.description or ()]
+        if "name" not in columns:
+            # Routed to the same invalid-database refusal as any other error.
+            raise sqlite3.DatabaseError("PRAGMA table_xinfo returned no name")
+        name_at = columns.index("name")
+        return {str(name_row[name_at]).lower() for name_row in cursor}
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+
+
 def _flag_invalid_utf8(raw: bytes) -> object:
     """A text factory that marks undecodable text instead of raising.
 
@@ -852,6 +962,64 @@ def _refuse_invalid_text(conn: sqlite3.Connection, table: str, sql: str) -> None
         raise ApiError(422, "not a valid SQLite database") from exc
     finally:
         conn.text_factory = str
+
+
+def _is_null_or_canonical_stamp(value: object) -> bool:
+    """Whether ``value`` is NULL or ``isoformat_utc``'s own UTC stamp."""
+    return value is None or is_canonical_utc_stamp(value)
+
+
+def _is_canonical_date(value: object) -> bool:
+    """Whether ``value`` is a ``str`` in the canonical ``YYYY-MM-DD`` form."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return date.fromisoformat(value).isoformat() == value
+    except ValueError:
+        return False
+
+
+def _is_null_or_canonical_date(value: object) -> bool:
+    """Whether ``value`` is NULL or a canonical ``YYYY-MM-DD`` date."""
+    return value is None or _is_canonical_date(value)
+
+
+def _is_canonical_micro_stamp(value: object) -> bool:
+    """Whether ``value`` is ``isoformat_utc_micro``'s own UTC stamp."""
+    if not isinstance(value, str):
+        return False
+    try:
+        return isoformat_utc_micro(parse_utc(value)) == value
+    except ValueError:
+        return False
+
+
+def _refuse_bad_values(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    is_valid: Callable[[object], bool],
+    message: str,
+) -> None:
+    """Refuse the upload with ``message`` if any ``table.column`` value fails.
+
+    Skipped when ``table`` is absent (``_guarded_table_present``). Both names
+    are code-owned. Distinct values are compared byte for byte, so every
+    spelling is checked.
+    """
+    if not _guarded_table_present(conn, table):
+        return
+    try:
+        bad = any(
+            not is_valid(value_row[0])
+            for value_row in conn.execute(
+                f"SELECT DISTINCT {column} COLLATE BINARY FROM {table}"
+            )
+        )
+    except sqlite3.DatabaseError as exc:
+        raise ApiError(422, "not a valid SQLite database") from exc
+    if bad:
+        raise ApiError(422, message)
 
 
 def _validate_upload(tmp: Path) -> None:
@@ -952,6 +1120,72 @@ def _validate_upload(tmp: Path) -> None:
                     f"invalid timestamp in {table}.{column}: "
                     "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
                 )
+        # The daily-close tables (10.6). `retry_at` is checked on its own
+        # because the stamp check above refuses NULL, which it may hold.
+        _refuse_bad_values(
+            conn,
+            "site_days",
+            "retry_at",
+            _is_null_or_canonical_stamp,
+            "invalid timestamp in site_days.retry_at: "
+            "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+        )
+        for table, column in _NULLABLE_STAMP_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_null_or_canonical_stamp,
+                f"invalid timestamp in {table}.{column}: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+            )
+        for table, column in _CANONICAL_DATE_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_canonical_date,
+                f"invalid date in {table}.{column}: expected YYYY-MM-DD",
+            )
+        for table, column in _NULLABLE_DATE_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_null_or_canonical_date,
+                f"invalid date in {table}.{column}: expected YYYY-MM-DD",
+            )
+        for table, column in _MICRO_STAMP_COLUMNS:
+            _refuse_bad_values(
+                conn,
+                table,
+                column,
+                _is_canonical_micro_stamp,
+                f"invalid timestamp in {table}.{column}: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SS.ffffffZ",
+            )
+        # The raw readings' two nullable columns, checked on their own because
+        # the stamp check above refuses NULL. A file from before 0.16.14 has
+        # the table without them, and the open rebuilds it, so each check is
+        # skipped when its column is absent as well as when the table is.
+        raw_columns = _guarded_column_names(conn, "station_wind_records")
+        if "fetched_at" in raw_columns:
+            _refuse_bad_values(
+                conn,
+                "station_wind_records",
+                "fetched_at",
+                _is_null_or_canonical_stamp,
+                "invalid timestamp in station_wind_records.fetched_at: "
+                "expected UTC form YYYY-MM-DDTHH:MM:SSZ",
+            )
+        if "local_date" in raw_columns:
+            _refuse_bad_values(
+                conn,
+                "station_wind_records",
+                "local_date",
+                _is_null_or_canonical_date,
+                "invalid date in station_wind_records.local_date: expected YYYY-MM-DD",
+            )
     finally:
         conn.close()
 
@@ -1006,69 +1240,39 @@ def _stage_pending_rebuild_state(tmp: Path) -> None:
         conn.close()
 
 
-_VERIFICATION_RUN_TABLES = (
-    "verification_runs",
-    "verification_evidence",
-    "verification_day_context",
-    "verification_results",
-    "verification_verdicts",
+_CLOSE_TABLES = (
+    "close_attempts",
+    "close_station_days",
+    "close_publications",
+    "close_stage_log",
+    "close_try_log",
 )
 
 
-def _neutralize_imported_verification_chains(tmp: Path) -> None:
-    """Neutralize an imported active verification chain before promotion (D13).
+def _settle_imported_closes(tmp: Path) -> None:
+    """Settle the staged upload's interrupted closes before promotion (12.6).
 
-    An import does not enqueue, so the hold (which gates the enqueue) never
-    sees a chain that arrives already ``pending``/``running`` inside the
-    imported ``jobs`` table. Run on the staged file, before promotion, so
-    the promoted database carries the neutralized state by construction --
-    ``replace_from``'s rename is atomic, exactly the precedent
-    ``_stage_pending_rebuild_state`` above already establishes.
-
-    The ``verification_*`` cleanups are conditional on their tables being
-    present in the staged file; ``runtime_state`` is ensured-then-written,
-    so a legacy (pre-verification) upload carrying none of the
-    ``verification_*`` tables still imports successfully rather than 500ing.
-    ``_validate_upload`` requires only ``sites``, ``stations`` and
-    ``station_observations``, so such an upload is legitimate.
+    Acts only when the staged file has the daily close's five tables and its
+    close is on (``daily_close_on``); then ``settle_interrupted_closes`` runs
+    with the import's time, so a ``closing`` day is failed as of the
+    exporting add-on's last known run, its ``day_close`` jobs are completed
+    without running and a ``building`` publication record is settled (plan
+    5.5, 9.4). One ``BEGIN IMMEDIATE`` transaction on its own connection,
+    rolled back and re-raised on any exception, so the import aborts before
+    the swap and the live database is untouched; committed and checkpointed
+    as ``_stage_pending_rebuild_state`` does. Runs after
+    ``_stage_pending_rebuild_state``, which ensures ``runtime_state``.
     """
-    from wxverify.verification.runs import (
-        IMPORT_SUPPRESSED_REASON,
-        fail_incomplete_attempts,
-    )
-    from wxverify.worker.verification_run import (
-        verification_heartbeat_key,
-        verification_state_key,
-    )
+    from wxverify.worker.close_chain import settle_interrupted_closes
 
     conn = sqlite3.connect(str(tmp))
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if table_exists(conn, "jobs"):
-                conn.execute(
-                    """
-                    UPDATE jobs SET status = 'failed', last_error = ?,
-                        updated_at = ?
-                    WHERE type = 'verification_run'
-                      AND status IN ('pending', 'running')
-                    """,
-                    (IMPORT_SUPPRESSED_REASON, isoformat_utc()),
-                )
-            if all(table_exists(conn, table) for table in _VERIFICATION_RUN_TABLES):
-                for site_row in conn.execute("SELECT id FROM sites").fetchall():
-                    fail_incomplete_attempts(
-                        conn, int(site_row["id"]), error=IMPORT_SUPPRESSED_REASON
-                    )
-            ensure_runtime_state_table(conn)
-            for site_row in conn.execute("SELECT id FROM sites").fetchall():
-                site_id = int(site_row["id"])
-                delete_runtime_state(
-                    conn,
-                    verification_state_key(site_id),
-                    verification_heartbeat_key(site_id),
-                )
+            has_tables = all(table_exists(conn, table) for table in _CLOSE_TABLES)
+            if has_tables and daily_close_on(conn):
+                settle_interrupted_closes(conn, now_utc=utc_now())
         except BaseException:
             conn.rollback()
             raise
@@ -1117,7 +1321,7 @@ async def _rebuild_derived_and_release(backup: Path) -> None:
 
 
 async def run_rebuild_all() -> None:
-    """Run ``_rebuild_all``, committing ``done`` or -- on failure --
+    """Run ``_rebuild_or_keep``, committing ``done`` or -- on failure --
     separately committing ``failed`` plus a sanitized reason.
 
     Shared by the post-import background task and the boot-time resume: a
@@ -1129,7 +1333,7 @@ async def run_rebuild_all() -> None:
     """
     db = get_db()
     try:
-        await db.write(_rebuild_all)
+        await db.write(_rebuild_or_keep)
     except Exception as exc:
         logger.exception("import: derived rebuild failed")
 
@@ -1151,20 +1355,48 @@ async def run_rebuild_all() -> None:
             logger.exception("import: recording rebuild failure failed")
 
 
+def _rebuild_or_keep(conn: sqlite3.Connection) -> None:
+    """Rebuild a file whose daily close is on; keep one without the key.
+
+    ``daily_close_on`` is read first (switch-over plan 11.2, R18). A file
+    without the key, from before the daily close, is not rebuilt: its pairs,
+    truth and scores are its starting history as they stand, so only
+    ``import_rebuild_state`` = ``done`` is written, with one INFO line. A
+    file with the key goes through ``_rebuild_all`` (P1 7.5).
+    """
+    if not daily_close_on(conn):
+        set_runtime_state(conn, "import_rebuild_state", "done")
+        logger.info(
+            "import: file from before the daily close; its history is kept as it stands"
+        )
+        return
+    _rebuild_all(conn)
+
+
 def _rebuild_all(conn: sqlite3.Connection) -> None:
     """Rebuild consensus, pairs, and scores from the imported station data.
 
     One write transaction, honoring the convergence invariant
     (worker/processor.py): observation-changing work runs the MONOLITHIC
     ``pair_and_score`` inline — never enqueued.
+
+    Called only while the imported file's daily close is on
+    (``_rebuild_or_keep``): only days that still take writes are rebuilt
+    (7.5); done days keep their pairs and consensus, and their cells are
+    skipped, not refused.
     """
+    now = utc_now()
     # From-scratch clear: per-cell dependent invalidation only reaches cells
     # present in station_observations or observations, so a forecast_pairs
     # row whose anchor observation is absent from BOTH tables would survive
-    # stale. The unconditional delete guarantees none does — by construction.
-    # score_cache needs no separate delete: the monolithic pair_and_score
-    # clears the whole table itself.
-    conn.execute("DELETE FROM forecast_pairs")
+    # stale. The delete guarantees none does — by construction — on every
+    # day that takes pairs (writable_pairs_clause). score_cache needs no
+    # separate delete: the monolithic pair_and_score clears the whole table
+    # itself.
+    conn.execute(
+        "DELETE FROM forecast_pairs"
+        f" WHERE {writable_pairs_clause(conn, None, now_utc=now)}"
+    )
     # UNION of both tables: an observations row whose cell has no surviving
     # station rows is an orphan, and materializing its cell deletes it.
     # Per-cell calls are mandatory — they honor the load-bearing invalidation
@@ -1179,12 +1411,35 @@ def _rebuild_all(conn: sqlite3.Connection) -> None:
         SELECT site_id, variable, valid_at FROM observations
         """
     ).fetchall()
+    instants_by_site: dict[int, set[str]] = {}
     for cell in cells:
+        instants_by_site.setdefault(int(cell["site_id"]), set()).add(
+            str(cell["valid_at"])
+        )
+    writable = {
+        site_id: filter_day_writes(
+            conn, site_id, sorted(instants), WriteKind.HOURLY, now_utc=now
+        )
+        for site_id, instants in instants_by_site.items()
+    }
+    kept = [
+        cell
+        for cell in cells
+        if str(cell["valid_at"]) in writable[int(cell["site_id"])]
+    ]
+    logger.info(
+        "import: consensus rebuild kept %d cells, skipped %d on days that"
+        " take no writes",
+        len(kept),
+        len(cells) - len(kept),
+    )
+    for cell in kept:
         materialize_consensus(
             conn,
             site_id=int(cell["site_id"]),
             variable=str(cell["variable"]),
             valid_at=str(cell["valid_at"]),
+            now_utc=now,
         )
     pair_and_score(conn, site_id=None)
     set_runtime_state_now(conn, "import_rebuild_done_at")

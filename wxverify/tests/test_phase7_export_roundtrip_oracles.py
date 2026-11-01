@@ -17,10 +17,11 @@ A second oracle drives the SHIPPED transfer path instead of hand-built
 bytes — POST /api/export/begin -> /export/status -> /export/download
 (VACUUM INTO + gzip) -> POST /api/import/db — and adds the two §18.10
 artifacts a payload comparison cannot see: truth generations
-(``timezone_generations`` + ``daily_truth``) and survival of the
-post-import derived rebuild, which DELETEs and re-materializes
-``forecast_pairs``/``observations``/``score_cache`` and must leave every
-verification artifact and the published-run pointer untouched.
+(``timezone_generations`` + ``daily_truth``), and the import's rule for a
+file without the daily-close key (switch-over plan 11.2, R18): nothing is
+rebuilt, so ``observations`` stays as the file holds it, the rebuild
+state reads ``done``, and every verification artifact and the
+published-run pointer survive.
 
 Synthetic fixtures only: invented town names, UTC, fake fingerprints, an
 invented PWS station id.
@@ -266,9 +267,9 @@ def test_round_trip_serves_identical_api_state(
 # export that failed to carry the 0.11.0 tables would go unnoticed there.
 # This one runs the shipped loop end to end and adds the two §18.10 artifacts
 # the byte-comparison above cannot see: truth generations (timezone_
-# generations + daily_truth) and survival of the post-import derived
-# rebuild, which DELETEs and regenerates forecast_pairs/score_cache and must
-# leave every verification artifact and the published-run pointer untouched.
+# generations + daily_truth) and the import of a file without the close key,
+# which rebuilds nothing (R18) and must leave every verification artifact
+# and the published-run pointer untouched.
 # ---------------------------------------------------------------------------
 
 _EXPORT_BASE = "/api/export"
@@ -335,10 +336,9 @@ def test_shipped_export_download_restores_full_0_11_0_state(
     set_setting(conn_a, depth_override_key("precip"), "5")
     run_id = _seed_published_run(conn_a, site_id)
     generation_id, truth_date = _seed_truth_generation(conn_a, site_id)
-    # Station data so the post-import derived rebuild has real work to do:
-    # `_rebuild_all` DELETEs forecast_pairs and re-materializes consensus
-    # from these rows. Without them the rebuild is a no-op and "the rebuild
-    # did not destroy the verification state" would be vacuously true.
+    # Station rows with no consensus rows: a rebuild of this file, which has
+    # no close key, would materialize 24 observations from them, so the
+    # count below tells kept-as-it-stands (R18) from rebuilt.
     station_id = int(
         conn_a.execute(
             """
@@ -388,7 +388,7 @@ def test_shipped_export_download_restores_full_0_11_0_state(
         }
         resp = client_b.post("/api/import/db", content=payload, headers=headers)
         assert resp.status_code == 200
-        # The derived rebuild is a post-response background task; the
+        # The post-import background task marks the rebuild done; the
         # capture below re-enters the loop and lets it finish first.
         dest_api = _capture(client_b, site_id, run_id)
     close_db()
@@ -423,19 +423,22 @@ def test_shipped_export_download_restores_full_0_11_0_state(
             "SELECT tz_generation_id FROM verification_runs WHERE id = ?", (run_id,)
         ).fetchone()
         assert int(run_gen["tz_generation_id"]) == generation_id
-        # Published-run pointer survived the rebuild.
+        # Published-run pointer survived the import.
         pointer = conn_b.execute(
             "SELECT value FROM runtime_state WHERE key = ?",
             (f"verification_published_run:{site_id}",),
         ).fetchone()
         assert pointer is not None and int(pointer["value"]) == run_id
-        # The rebuild genuinely ran: consensus was materialized from the
-        # imported station rows (so the survival assertions above are not
-        # vacuous).
+        # No rebuild for a file without the close key (R18, switch-over plan
+        # 11.2): the 24 imported station rows were never materialized into
+        # consensus, and the import keeps that as it stands.
         obs = conn_b.execute(
             "SELECT COUNT(*) AS n FROM observations WHERE site_id = ?", (site_id,)
         ).fetchone()
-        assert int(obs["n"]) == 24
+        assert int(obs["n"]) == 0, (
+            "R18: correct = 0 (the source file held no observations rows),"
+            " mutant (a keyless file rebuilt) = 24"
+        )
         rebuild = conn_b.execute(
             "SELECT value FROM runtime_state WHERE key = 'import_rebuild_state'"
         ).fetchone()

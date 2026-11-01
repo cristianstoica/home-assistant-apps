@@ -14,7 +14,6 @@ from wxverify.scoring.rescore import schedule_score_rescore
 from wxverify.settings.depth import effective_blend_depths
 from wxverify.web.context import (
     SiteView,
-    load_backfill,
     load_dashboard,
     load_ops,
     load_overlay,
@@ -228,6 +227,7 @@ async def overlay_page(
     site: int | None = None,
     variable: str = "temperature",
     feed_id: int | None = None,
+    lead: str = "D+1",
 ) -> HTMLResponse:
     context = await get_db().read(
         lambda conn: load_overlay(
@@ -235,6 +235,7 @@ async def overlay_page(
             site_id=site,
             variable=variable,
             feed_id=feed_id,
+            lead=lead,
         )
     )
     return render(request, "overlay/show.html", **context)
@@ -274,11 +275,6 @@ async def render_feed_toggles(
     return render_fragment(
         request, "sites/_feed_toggles.html", site=site, toggle_notice=toggle_notice
     )
-
-
-async def render_backfill(request: Request) -> HTMLResponse:
-    rows = await get_db().read(load_backfill)
-    return render_fragment(request, "ops/_backfill.html", rows=rows)
 
 
 def wants_html_fragment(request: Request) -> bool:

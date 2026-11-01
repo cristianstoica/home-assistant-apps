@@ -17,7 +17,7 @@ from dataclasses import asdict
 from typing import cast
 
 from fastapi import APIRouter, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 
 from wxverify.api.errors import ApiError
@@ -31,8 +31,11 @@ from wxverify.verification.contract import (
 from wxverify.verification.freshness import published_basis_report
 from wxverify.verification.publish_hold import read_publish_hold, set_publish_hold
 from wxverify.verification.read_cache import (
+    DetailsDeleted,
     cached_daily_rank_conclusions,
     cached_observed_wet_precip_mae,
+    details_deleted,
+    is_details_deleted,
 )
 from wxverify.verification.runs import published_run_id, trigger_status
 from wxverify.web.render import ingress_url
@@ -92,6 +95,21 @@ def _run_row(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
     if row is None:
         raise ApiError(404, "verification run not found")
     return row
+
+
+def _worksheet_deleted(row: sqlite3.Row) -> bool:
+    """Whether the worksheet cleanup deleted this run's evidence (plan 14.3)."""
+    return int(row["worksheet_kept"]) == 0
+
+
+def _conclusion(
+    conclusions: dict[str, dict[str, object]] | DetailsDeleted, variable: str
+) -> object:
+    """One verdict's daily-rank conclusion; the deleted marker for every
+    verdict of a run whose worksheet the cleanup deleted (plan 14.3)."""
+    if is_details_deleted(conclusions):
+        return details_deleted()
+    return conclusions.get(variable)
 
 
 def _site_status(conn: sqlite3.Connection, site_id: int) -> dict[str, object]:
@@ -173,27 +191,19 @@ async def set_publish_hold_route(body: PublishHoldIn) -> dict[str, object]:
 
     Behind the existing ``MutationGuard`` (same-origin, JSON content type,
     CSRF double-submit) by construction -- this route adds no exemption.
-    Release is refused with 409 while any site has a queued or running
-    verification chain; arming is never refused (D5).
     """
     if body.confirm is not True:
         raise ApiError(400, "confirmation required")
 
     def _write(conn: sqlite3.Connection) -> dict[str, object]:
         from wxverify.worker.scheduler import verification_publish_held
-        from wxverify.worker.verification_run import any_verification_chain_active
 
         was_held = verification_publish_held(conn)
-        chain_active = any_verification_chain_active(conn)
-        if not body.held and chain_active:
-            raise ApiError(409, "a verification run is active; release refused")
         set_publish_hold(conn, held=body.held, source="ops")
         logger.info(
-            "publish-hold transition old_held=%s new_held=%s source=ops "
-            "chain_active=%s",
+            "publish-hold transition old_held=%s new_held=%s source=ops",
             was_held,
             body.held,
-            chain_active,
         )
         state = read_publish_hold(conn)
         return cast("dict[str, object]", asdict(state))
@@ -287,7 +297,9 @@ async def run_verdicts(run_id: int) -> dict[str, object]:
                     else int(row["recommended_depth"]),
                     "incumbent_depth": int(row["incumbent_depth"]),
                     "tested_family": _parse_json(row["tested_family"]),
-                    "ranking_redesign_indicated": conclusions.get(str(row["variable"])),
+                    "ranking_redesign_indicated": _conclusion(
+                        conclusions, str(row["variable"])
+                    ),
                 }
                 for row in rows
             ],
@@ -335,7 +347,7 @@ def _evidence_filters(
     return sql, params
 
 
-@router.get("/runs/{run_id}/evidence")
+@router.get("/runs/{run_id}/evidence", response_model=None)
 async def run_evidence(
     run_id: int,
     variable: str | None = None,
@@ -346,15 +358,16 @@ async def run_evidence(
     eligibility: str | None = None,
     limit: int = _EVIDENCE_PAGE_DEFAULT,
     offset: int = 0,
-) -> dict[str, object]:
+) -> dict[str, object] | JSONResponse:
     bounded = max(1, min(limit, _EVIDENCE_PAGE_MAX))
     bounded_offset = max(0, offset)
     where, params = _evidence_filters(
         variable, lead, quantity, entity_type, entity_key, eligibility
     )
 
-    def _read(conn: sqlite3.Connection) -> dict[str, object]:
-        _run_row(conn, run_id)
+    def _read(conn: sqlite3.Connection) -> dict[str, object] | None:
+        if _worksheet_deleted(_run_row(conn, run_id)):
+            return None
         rows = conn.execute(
             f"""
             SELECT * FROM verification_evidence
@@ -371,7 +384,13 @@ async def run_evidence(
             "evidence": [dict(row) for row in rows],
         }
 
-    return await get_db().read(_read)
+    page = await get_db().read(_read)
+    if page is None:
+        # Plan 14.3: a deleted worksheet is a 410, never an empty page.
+        return JSONResponse(
+            {"detail": "details deleted", "run_id": run_id}, status_code=410
+        )
+    return page
 
 
 @router.get("/runs/{run_id}/diagnostics")

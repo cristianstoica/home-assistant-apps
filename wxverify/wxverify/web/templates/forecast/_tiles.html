@@ -54,11 +54,12 @@
                 {% endif %}
               </div>
             </div>
-            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.fetch_unknown or tile.partial %}
+            {% if tile.confidence_state == 'low_confidence' or tile.confidence_state == 'rebuilding' or tile.stale or tile.substitute or tile.fetch_unknown or tile.partial %}
               <div class="tile-badges">
                 {% if tile.confidence_state == 'low_confidence' %}<span class="badge warn">low confidence</span>{% endif %}
                 {% if tile.confidence_state == 'rebuilding' %}<span class="badge muted">ranking updating</span>{% endif %}
                 {% if tile.stale %}<span class="badge warn" title="At least one feed used for this day has gone more than twice its scheduled fetch interval without a usable download, or its fetch interval is unknown. The age of the forecast itself doesn't count.">stale</span>{% endif %}
+                {% if tile.substitute %}<span class="badge muted" title="A feed this day would normally use has stopped updating, so the next-ranked feed stands in.">substitute</span>{% endif %}
                 {% if tile.fetch_unknown and not tile.stale %}<span class="badge muted" title="The app has no recorded time yet for a usable download from at least one feed used for this day. Each feed's time is recorded after its next usable download.">fetch time unknown</span>{% endif %}
                 {% if tile.partial %}<span class="badge muted">partial</span>{% endif %}
               </div>

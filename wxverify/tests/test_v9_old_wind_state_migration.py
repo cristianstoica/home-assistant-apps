@@ -24,9 +24,9 @@ from tests.helpers import make_v8_wind_state
 from wxverify.db.migrations import TARGET_USER_VERSION, create_tables, run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 
-_KEPT_KEYS = (
+_KEPT_KEYS = ("wind_backfill_calls",)
+_A4_RETIRED_KEYS = (
     "wind_history_auth_hold:history_all",
-    "wind_backfill_calls",
     "verification_state:1",
 )
 _DECOY_KEYS = ("wind-basis:1", "WIND_BASIS:1", "wind_basis_extra:1")
@@ -82,6 +82,8 @@ def _v8_fixture_conn() -> sqlite3.Connection:
             set_runtime_state(conn, f"{kind}:{site}", f"leftover-{site}")
     for key in _KEPT_KEYS:
         set_runtime_state(conn, key, "keep")
+    for key in _A4_RETIRED_KEYS:
+        set_runtime_state(conn, key, "keep")
     for key in _DECOY_KEYS:
         set_runtime_state(conn, key, "decoy")
     conn.commit()
@@ -115,15 +117,21 @@ def test_d17_v9_step_deletes_only_the_twelve_leftover_keys() -> None:
             f" mutant (a kind left out of the DELETE's IN list) = {key!r} still"
             " present"
         )
+    for key in _A4_RETIRED_KEYS:
+        assert key not in after, (
+            "mutant -> at this assertion: correct = the switch's A4 step"
+            f" deletes {key!r} too, mutant (A4 not reached or its prefix"
+            f" list missing this one) = {key!r} still present"
+        )
     for key, value in before.items():
-        if key in removed_keys:
+        if key in removed_keys or key in _A4_RETIRED_KEYS:
             continue
         assert after.get(key) == value, (
             "mutant -> at this assertion: correct = every kept key unchanged,"
             f" mutant (LIKE 'wind_%' or a per-kind LIKE) = {key!r} altered or"
             " gone"
         )
-    assert set(after) == set(before) - removed_keys
+    assert set(after) == set(before) - removed_keys - set(_A4_RETIRED_KEYS)
 
 
 def test_d18_v9_step_drops_legacy_hours_matching_a_fresh_database() -> None:
@@ -171,9 +179,9 @@ def test_d18_v9_step_drops_legacy_hours_matching_a_fresh_database() -> None:
         assert after_row["updated_at"] == before_row["updated_at"]
 
     row = conn.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == TARGET_USER_VERSION == 10, (
-        "mutant -> at this assertion: correct = user_version 10, mutant"
-        " (TARGET_USER_VERSION left at 9) = user_version 9"
+    assert int(row[0]) == TARGET_USER_VERSION == 15, (
+        "mutant -> at this assertion: correct = user_version 15, mutant"
+        " (TARGET_USER_VERSION left at 14) = user_version 14"
     )
 
     empty = sqlite3.connect(":memory:")
@@ -274,7 +282,7 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
     for key in (*_KEPT_KEYS, *_DECOY_KEYS):
         assert key in after_column_first
     row = column_already_dropped.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 10
+    assert int(row[0]) == 15
 
     caplog.clear()
     keys_already_deleted = _v8_fixture_conn()
@@ -317,6 +325,22 @@ def test_d20_v9_step_converges_whichever_half_already_ran(
         " removed) = a line logged anyway"
     )
     row = both_already_done.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 10
-    assert _all_runtime_state(both_already_done) == before_keys
-    assert _wind_days_rows(both_already_done) == before_rows
+    assert int(row[0]) == 15
+    assert _all_runtime_state(both_already_done) == {
+        key: value for key, value in before_keys.items() if key not in _A4_RETIRED_KEYS
+    }, (
+        "mutant -> at this assertion: correct = the switch's A4 step still"
+        " deletes the retired keys on this reconvergence path too, mutant"
+        " (A4 not reached or its prefix list missing one) = a retired key"
+        " still present"
+    )
+    before_columns = before_rows[0].keys()
+    after_rows = _wind_days_rows(both_already_done)
+    before_restricted = [{col: r[col] for col in before_columns} for r in before_rows]
+    after_restricted = [{col: r[col] for col in before_columns} for r in after_rows]
+    assert after_restricted == before_restricted, (
+        "mutant -> at this assertion: correct = every pre-existing column"
+        " unchanged when both halves already ran, mutant (a migration step"
+        " altering an existing station_wind_days value) = a restricted row"
+        " diverges from its before-snapshot"
+    )

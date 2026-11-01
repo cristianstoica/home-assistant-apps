@@ -23,7 +23,7 @@ from typing import cast
 import pytest
 
 from tests.helpers import asof_conn, asof_make_site
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.decision import (
     CandidateSeries,
     ContinuousLead,
@@ -267,7 +267,7 @@ def test_o1_case_a_persisted_row_names_the_candidate_endpoint() -> None:
 
     conn = asof_conn()
     site_id = asof_make_site(conn, "oracle-precip-attribution-town")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(

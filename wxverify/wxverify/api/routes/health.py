@@ -18,9 +18,11 @@ from wxverify.core.secrets import key_status
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import runtime_status
+from wxverify.db.site_days import daily_close_on
 from wxverify.forecast.wind_blend import wind_weights_cache_stats
 from wxverify.monitor import build_verdict, error_verdict
 from wxverify.provider_ops import provider_health
+from wxverify.scoring.publication import latest_published_at
 from wxverify.verification.read_cache import warm_outcome
 
 router = APIRouter(prefix="/api", tags=["health"])
@@ -276,8 +278,8 @@ async def observations_current(
     row (non-null obs) with ``health_state="offline"`` — the LEFT JOIN returns
     the retained row, so null-obs and ``offline`` are separate cases. The
     diagnostic fields (``health_state``, ``next_poll_at``, ``last_error``) come
-    from ``station_poll_state``, never ``stations.last_error`` (which the hourly
-    stream resets on success). Obs values are the stored native ``units:"m"``
+    from ``station_poll_state``, never ``stations.last_error``. Obs values are
+    the stored native ``units:"m"``
     form (km/h wind, hPa, mm) — no conversion in the route. Optional
     ``?station=<id>`` filter; empty registry → ``[]``.
 
@@ -375,6 +377,12 @@ async def worker_status(counts: str = Query("")) -> dict[str, object]:
             status[f"last_completed_{job_type}_at"] = (
                 None if row is None else row["completed_at"]
             )
+        # With the daily close on no pair_and_score run completes, so the key
+        # Home Assistant's last-score sensor reads carries the newest
+        # published_at over the sites' active publications instead, or null
+        # before the first (daily-close plan P5, 9.6).
+        if daily_close_on(conn):
+            status["last_completed_pair_and_score_at"] = latest_published_at(conn)
         # Exact, not estimated, and opt-in: forecast_pairs has five delete
         # paths (multimodel rematerialization on every scoring run among
         # them), so its rowid watermark is not a valid row-count estimate,

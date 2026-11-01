@@ -23,6 +23,7 @@
             <th title="Rank among feeds with enough data to compare">#</th>
             <th>Feed</th>
             <th title="Number of forecast/observation pairs verified">Samples</th>
+            {% if coverage %}<th title="Forecasts scored of those expected at this day ahead, in this window">Scored</th>{% endif %}
             <th title="{% if variable == 'precip' %}0-100: how much better than chance at predicting rain days (ETS). Higher is better.{% else %}0-100: how much better than a naive 'same as yesterday' forecast. Higher is better.{% endif %}">Skill</th>
             <th class="col-extra" title="Mean absolute error (lower is better)">MAE</th>
             <th class="col-extra" title="Root mean squared error (lower is better)">RMSE</th>
@@ -34,6 +35,7 @@
               <td>{% if row.confident %}{% set ns.rank = ns.rank + 1 %}{{ ns.rank }}{% else %}—{% endif %}</td>
               <td>{{ row.label }}</td>
               <td>{{ row.n }}</td>
+              {% if coverage %}<td>{{ coverage.selected[row.feed_id] }}</td>{% endif %}
               <td>
                 {% if row.confident %}
                   <span class="badge {{ 'warn' if row.below_baseline else 'ok' }}">{{ row.badge }}</span>

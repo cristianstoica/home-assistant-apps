@@ -7,6 +7,7 @@ import os
 import sqlite3
 import traceback
 from collections.abc import Awaitable
+from datetime import datetime
 from typing import Final, Literal
 
 import httpx
@@ -17,12 +18,15 @@ from wxverify.api.errors import ApiError
 from wxverify.api.schemas import StationCreate, StationOut, StationUpdate
 from wxverify.collection.budget import reserve_budget
 from wxverify.core.secrets import resolve_secret
+from wxverify.core.timeutil import isoformat_utc_micro, utc_now
 from wxverify.db.connection import FencedWriter, get_db
-from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.site_days import (
+    StationChange,
+    current_day_has_other_station,
+    record_station_change,
+)
 from wxverify.obs.elevation import lookup_elevation_m
 from wxverify.obs.pws_adapter import UpstreamPayloadError, validate_station
-from wxverify.scoring.consensus import materialize_consensus
-from wxverify.scoring.engine import pair_and_score
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
@@ -41,6 +45,13 @@ router = APIRouter(prefix="/api/sites/{site_id}/stations", tags=["stations"])
 # timeouts; the ingress proxy's own timeout is not verified. Read at call time
 # from the module, never bound as a default argument, so tests can shorten it.
 ADD_STATION_CALL_WAIT_SECONDS: Final = 30.0
+
+# The answer to an add of an id held at another site, removed there or not.
+# It names no workaround: a station cannot move between sites.
+_ANOTHER_SITE_TEXT: Final = (
+    "station belongs to another site: a station stays with the site it was "
+    "first added to, even after it is removed"
+)
 
 _Provider = Literal["weathercom", "open-meteo"]
 _FailureReason = Literal[
@@ -247,7 +258,8 @@ async def list_stations(site_id: int) -> list[StationOut]:
         return [
             _station_out(row)
             for row in conn.execute(
-                "SELECT * FROM stations WHERE site_id=? ORDER BY pws_station_id",
+                "SELECT * FROM stations WHERE site_id=? AND retired_at IS NULL"
+                " ORDER BY pws_station_id",
                 (site_id,),
             )
         ]
@@ -319,22 +331,57 @@ async def create_station(
             is None
         ):
             raise ApiError(404, "site not found")
-        cur = conn.execute(
-            """
-            INSERT INTO stations
-                (site_id, pws_station_id, lat, lon, dem_elevation_m)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (site_id, pws.station_id, pws.lat, pws.lon, dem),
-        )
+        # The id is unique across all sites, and a removed station keeps its
+        # row, so the id stays taken after a remove.
+        held = conn.execute(
+            "SELECT id, site_id, retired_at FROM stations WHERE pws_station_id=?",
+            (pws.station_id,),
+        ).fetchone()
+        if held is not None:
+            if int(held["site_id"]) != site_id:
+                raise ApiError(409, _ANOTHER_SITE_TEXT)
+            if held["retired_at"] is None:
+                raise ApiError(409, "station already exists")
+        now = utc_now()
+        if held is None:
+            cur = conn.execute(
+                """
+                INSERT INTO stations
+                    (site_id, pws_station_id, lat, lon, dem_elevation_m)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (site_id, pws.station_id, pws.lat, pws.lon, dem),
+            )
+            if cur.lastrowid is None:
+                raise RuntimeError("station insert failed")
+            station_id = int(cur.lastrowid)
+            record_station_change(
+                conn, site_id, station_id, "added", reason="create_station", now_utc=now
+            )
+        else:
+            # Re-add of a station removed at this site: bring it back. It
+            # counts from the next local day; no past day changes, and no job
+            # is queued.
+            station_id = int(held["id"])
+            conn.execute(
+                "UPDATE stations SET enabled=1, retired_at=NULL"
+                " WHERE id=? AND site_id=?",
+                (station_id, site_id),
+            )
+            record_station_change(
+                conn,
+                site_id,
+                station_id,
+                "turned_on",
+                reason="create_station",
+                now_utc=now,
+            )
         clear_domain_backoff(conn, source_domain("weathercom"))
         clear_domain_backoff(conn, source_domain("open-meteo"))
-        enqueue_if_absent(
-            conn, "backfill_site", site_id, f"backfill:{site_id}", {"site_id": site_id}
-        )
-        enqueue_if_absent(conn, "fetch_obs", site_id, "obs", {})
+        # No job is queued: a new station counts from its next full local day
+        # and is collected by the daily schedule (switch-over plan 7.2, R2).
         row = conn.execute(
-            "SELECT * FROM stations WHERE id=?", (cur.lastrowid,)
+            "SELECT * FROM stations WHERE id=?", (station_id,)
         ).fetchone()
         if row is None:
             raise RuntimeError("station insert failed")
@@ -354,18 +401,21 @@ async def update_station(
 ) -> StationOut | HTMLResponse:
     def _write(conn: sqlite3.Connection) -> StationOut:
         row = _get_station(conn, site_id, station_id)
-        if (
-            not body.enabled
-            and _enabled_station_count(conn, site_id) <= 1
-            and row["enabled"]
-        ):
-            raise ApiError(409, "site must retain at least one enabled station")
+        if body.enabled == bool(row["enabled"]):
+            return _station_out(row)
+        now = utc_now()
+        if body.enabled:
+            change: StationChange = "turned_on"
+        else:
+            _refuse_removal(conn, site_id, station_id, row, now)
+            change = "turned_off"
         conn.execute(
             "UPDATE stations SET enabled=? WHERE id=? AND site_id=?",
             (1 if body.enabled else 0, station_id, site_id),
         )
-        _rematerialize_station_hours(conn, site_id, station_id)
-        pair_and_score(conn, site_id)
+        record_station_change(
+            conn, site_id, station_id, change, reason="update_station", now_utc=now
+        )
         updated = _get_station(conn, site_id, station_id)
         return _station_out(updated)
 
@@ -381,29 +431,19 @@ async def update_station(
 async def delete_station(
     request: Request, site_id: int, station_id: int
 ) -> dict[str, bool] | HTMLResponse:
+    # A remove is a retire: the row, its readings and its wind days stay, so
+    # no cascade runs and no past day changes.
     def _write(conn: sqlite3.Connection) -> None:
         row = _get_station(conn, site_id, station_id)
-        if bool(row["enabled"]) and _enabled_station_count(conn, site_id) <= 1:
-            raise ApiError(409, "site must retain at least one enabled station")
-        keys = conn.execute(
-            """
-            SELECT DISTINCT variable, valid_at
-            FROM station_observations
-            WHERE station_id=?
-            """,
-            (station_id,),
-        ).fetchall()
+        now = utc_now()
+        _refuse_removal(conn, site_id, station_id, row, now)
         conn.execute(
-            "DELETE FROM stations WHERE id=? AND site_id=?", (station_id, site_id)
+            "UPDATE stations SET enabled=0, retired_at=? WHERE id=? AND site_id=?",
+            (isoformat_utc_micro(now), station_id, site_id),
         )
-        for key in keys:
-            materialize_consensus(
-                conn,
-                site_id=site_id,
-                variable=str(key["variable"]),
-                valid_at=str(key["valid_at"]),
-            )
-        pair_and_score(conn, site_id)
+        record_station_change(
+            conn, site_id, station_id, "retired", reason="delete_station", now_utc=now
+        )
 
     await get_db().write(_write)
     if _wants_html(request):
@@ -416,8 +456,10 @@ async def delete_station(
 def _get_station(
     conn: sqlite3.Connection, site_id: int, station_id: int
 ) -> sqlite3.Row:
+    # A retired station is gone to the station routes.
     row = conn.execute(
-        "SELECT * FROM stations WHERE id=? AND site_id=?", (station_id, site_id)
+        "SELECT * FROM stations WHERE id=? AND site_id=? AND retired_at IS NULL",
+        (station_id, site_id),
     ).fetchone()
     if row is None:
         raise ApiError(404, "station not found")
@@ -431,24 +473,25 @@ def _enabled_station_count(conn: sqlite3.Connection, site_id: int) -> int:
     return 0 if row is None else int(row["n"])
 
 
-def _rematerialize_station_hours(
-    conn: sqlite3.Connection, site_id: int, station_id: int
+def _refuse_removal(
+    conn: sqlite3.Connection,
+    site_id: int,
+    station_id: int,
+    row: sqlite3.Row,
+    now: datetime,
 ) -> None:
-    keys = conn.execute(
-        """
-        SELECT DISTINCT variable, valid_at
-        FROM station_observations
-        WHERE station_id=?
-        """,
-        (station_id,),
-    ).fetchall()
-    for key in keys:
-        materialize_consensus(
-            conn,
-            site_id=site_id,
-            variable=str(key["variable"]),
-            valid_at=str(key["valid_at"]),
-        )
+    """Refuse a turn-off or remove with 409 when it would leave the site short.
+
+    Two checks, both before any write. First, the station is enabled and no
+    other enabled station remains: the flag is the list of the next local
+    day and every later one. Second, while the daily close is on, the
+    station is the only one in the current local day's list (a station
+    added today counts only from tomorrow).
+    """
+    if bool(row["enabled"]) and _enabled_station_count(conn, site_id) <= 1:
+        raise ApiError(409, "site must retain at least one enabled station")
+    if not current_day_has_other_station(conn, site_id, station_id, now_utc=now):
+        raise ApiError(409, "site must keep at least one station counting today")
 
 
 def _wants_html(request: Request) -> bool:

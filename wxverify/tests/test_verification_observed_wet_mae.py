@@ -30,7 +30,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.helpers import asof_conn
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.diagnostics import (
     INCUMBENT_NOT_SIMULATED,
     NO_OBSERVED_WET_DAYS,
@@ -137,7 +137,7 @@ def _make_run(
             ).lastrowid,
         )
     )
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     depths = {v: _DEPTH for v in SIM_VARIABLES}
     depths["precip"] = precip_depth

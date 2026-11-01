@@ -24,7 +24,7 @@ from typing import cast
 import pytest
 
 from tests.helpers import asof_conn, occurrence_baseline_set
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.decision import (
     CandidateSeries,
     ContinuousLead,
@@ -1023,7 +1023,7 @@ def test_aggregate_strict_common_core_and_availability_floor() -> None:
     )
     assert cur.lastrowid is not None
     site_id = int(cur.lastrowid)
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run_row(conn, site_id, generation)
 
     # Depths (all 4 days eligible). Incumbent depth 2 errors: 2, -4, 6, 8.

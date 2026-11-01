@@ -30,7 +30,7 @@ from fastapi.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.methodology import METHODOLOGY_VERSION
 from wxverify.verification.runs import (
     capture_config_snapshot,
@@ -74,7 +74,7 @@ def _make_site(conn: sqlite3.Connection) -> int:
             """,
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -149,7 +149,7 @@ def _seed_rich_run(
     fixture's version is a deliberate choice a reader can see at the call
     site, not an accident of the INSERT literal it used to be.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(
@@ -780,7 +780,7 @@ def _run_with_verdicts(
     core-era oracles (O-V1/O-V2/B4), which need runs on either side of
     ``PAIRWISE_DECISION_CORE_SINCE`` and above this build's own version.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(

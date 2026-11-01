@@ -16,8 +16,9 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.verification.coverage import (
     EXCLUDE_BELOW_NEAR_COMPLETE,
@@ -28,13 +29,9 @@ from wxverify.verification.coverage import (
     evaluate_temperature,
     evaluate_variable,
     evaluate_wind,
+    local_day_bounds,
 )
-from wxverify.verification.truth import (
-    load_daily_truth,
-    mark_daily_truth_stale,
-    materialize_daily_truth,
-    regenerate_marked_truth,
-)
+from wxverify.verification.truth import evaluate_day_window, mark_daily_truth_stale
 
 _TZ_ATHENS = "Europe/Athens"
 
@@ -103,6 +100,45 @@ def _truth_rows(
             (site_id, local_date),
         )
     }
+
+
+_ALL_QUANTITIES = (
+    "temperature_high",
+    "temperature_low",
+    "wind_max",
+    "precip_total",
+    "precip_occurrence",
+)
+
+
+def _seed_truth_rows(
+    conn: sqlite3.Connection,
+    site_id: int,
+    local_date: str,
+    *,
+    timezone: str = "UTC",
+) -> None:
+    """Plain INSERT seed of every daily_truth row for ``local_date``: the
+    write path (``write_close_truth``) is out of this test's scope, so the
+    precondition is built directly rather than through it. Bounds come from
+    ``local_day_bounds`` itself, since ``mark_daily_truth_stale`` matches on
+    each row's OWN stored bounds, not a re-derivation at mark time."""
+    generation_id = ensure_site_generation(conn, site_id)
+    bounds = local_day_bounds(date.fromisoformat(local_date), timezone)
+    start = isoformat_utc(bounds.start_utc)
+    end = isoformat_utc(bounds.end_utc)
+    for quantity in _ALL_QUANTITIES:
+        conn.execute(
+            """
+            INSERT INTO daily_truth
+                (site_id, local_date, quantity, value, eligible,
+                 covered_hours, expected_slots, day_start_utc, day_end_utc,
+                 timezone, tz_generation_id)
+            VALUES (?, ?, ?, 10.0, 1, 24, 24, ?, ?, ?, ?)
+            """,
+            (site_id, local_date, quantity, start, end, timezone, generation_id),
+        )
+    conn.commit()
 
 
 # --------------------------------------------------------------- O1: 18h gate
@@ -347,7 +383,7 @@ def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, timezone=_TZ_ATHENS)
-    day = "2026-06-10"
+    local_date = date(2026, 6, 10)
     in_window = [f"2026-06-09T{h:02d}:00:00Z" for h in (21, 22, 23)] + [
         f"2026-06-10T{h:02d}:00:00Z" for h in range(21)
     ]
@@ -358,7 +394,14 @@ def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     decoys = [("2026-06-09T20:00:00Z", 99.0), ("2026-06-10T21:00:00Z", -99.0)]
     _seed_obs(conn, site_id, "temperature", rows + decoys)
 
-    outcomes = materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    evaluation = evaluate_day_window(
+        conn,
+        site_id=site_id,
+        local_date=local_date,
+        timezone=_TZ_ATHENS,
+        bounds=local_day_bounds(local_date, _TZ_ATHENS),
+    )
+    outcomes = evaluation.outcomes
 
     high = outcomes["temperature_high"]
     low = outcomes["temperature_low"]
@@ -367,10 +410,9 @@ def test_materialize_uses_local_day_bounds_with_boundary_decoys() -> None:
     assert low.value == 2.0  # -99 decoy excluded (end is exclusive)
     assert high.eligible and low.eligible
 
-    persisted = _truth_rows(conn, site_id, day)["temperature_high"]
-    assert persisted["day_start_utc"] == "2026-06-09T21:00:00Z"
-    assert persisted["day_end_utc"] == "2026-06-10T21:00:00Z"
-    assert persisted["timezone"] == _TZ_ATHENS
+    assert isoformat_utc(evaluation.bounds.start_utc) == "2026-06-09T21:00:00Z"
+    assert isoformat_utc(evaluation.bounds.end_utc) == "2026-06-10T21:00:00Z"
+    assert evaluation.timezone == _TZ_ATHENS
 
 
 def test_hourly_slot_window_is_half_open_at_both_ends() -> None:
@@ -437,11 +479,11 @@ def test_stale_marking_boundary_adjacency_variable_and_site_scope() -> None:
         "temperature",
         [(f"2026-06-10T{h:02d}:00:00Z", 10.0) for h in range(24)],
     )
-    materialize_daily_truth(conn, site_id=site_a, local_date="2026-06-10")
-    materialize_daily_truth(conn, site_id=site_a, local_date="2026-06-11")
+    _seed_truth_rows(conn, site_a, "2026-06-10")
+    _seed_truth_rows(conn, site_a, "2026-06-11")
     # Site B's local day 2026-06-11 (21:00Z June 10 .. 21:00Z June 11)
     # CONTAINS the mutated instant — only the site filter keeps it clean.
-    materialize_daily_truth(conn, site_id=site_b, local_date="2026-06-11")
+    _seed_truth_rows(conn, site_b, "2026-06-11", timezone=_TZ_ATHENS)
 
     marked = mark_daily_truth_stale(
         conn,
@@ -471,7 +513,7 @@ def test_stale_marking_compares_instants_not_spellings() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, timezone="UTC")
-    materialize_daily_truth(conn, site_id=site_id, local_date="2026-06-11")
+    _seed_truth_rows(conn, site_id, "2026-06-11")
 
     marked = mark_daily_truth_stale(
         conn,
@@ -504,7 +546,7 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
         "temperature",
         [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
     )
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
+    _seed_truth_rows(conn, site_id, day)
     for i in range(3):
         cur = conn.execute(
             """
@@ -542,170 +584,6 @@ def test_consensus_marks_on_upsert_and_delete_branches() -> None:
     assert rows["temperature_high"]["stale"] == 1
     assert rows["temperature_low"]["stale"] == 1
     assert rows["wind_max"]["stale"] == 0
-
-
-# --------------------------------------- O10/O11: generation ownership + reads
-
-
-def _building_generation(conn: sqlite3.Connection, site_id: int) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'UTC', 'retrospective_correction', 'building')
-        """,
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def test_regeneration_rebuilds_only_under_the_rows_own_generation() -> None:
-    """A marked building-generation day regenerates as BUILDING rows.
-
-    Kills M24 (regeneration re-materializes under the published pointer:
-    the published rows would flip to the new value while the building rows
-    stay stale forever).
-    """
-    conn = _conn()
-    site_id = _make_site(conn, timezone="UTC")
-    day = "2026-06-10"
-    _seed_obs(
-        conn,
-        site_id,
-        "temperature",
-        [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
-    )
-    published = ensure_published_generation(conn, site_id)
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    building = _building_generation(conn, site_id)
-    materialize_daily_truth(
-        conn, site_id=site_id, local_date=day, tz_generation_id=building
-    )
-
-    conn.execute(
-        "UPDATE observations SET value=31.0 WHERE valid_at=?",
-        (f"{day}T14:00:00Z",),
-    )
-    marked = mark_daily_truth_stale(
-        conn, site_id=site_id, variable="temperature", valid_at=f"{day}T14:00:00Z"
-    )
-    assert marked == 4  # high + low in BOTH generations (own stored bounds)
-    # Constructed precondition: only the building generation's day remains
-    # marked, so regeneration has exactly one group to rebuild.
-    conn.execute(
-        "UPDATE daily_truth SET stale=0 WHERE tz_generation_id=?", (published,)
-    )
-
-    regenerated = regenerate_marked_truth(conn, site_id=site_id)
-
-    assert regenerated == 1
-    by_generation = {
-        int(row["tz_generation_id"]): row
-        for row in conn.execute(
-            "SELECT * FROM daily_truth WHERE quantity='temperature_high'"
-        )
-    }
-    assert set(by_generation) == {published, building}
-    assert by_generation[building]["value"] == 31.0  # rebuilt in place
-    assert by_generation[building]["stale"] == 0
-    assert by_generation[published]["value"] == 10.0  # untouched
-    remaining_stale = conn.execute(
-        "SELECT COUNT(*) AS n FROM daily_truth WHERE stale=1"
-    ).fetchone()
-    assert remaining_stale["n"] == 0
-
-
-def test_load_daily_truth_returns_published_values_not_building() -> None:
-    """Reads are generation-bound with VALUE-level discrimination.
-
-    The building generation's rows carry a different truth value (44.0),
-    so a generation-unbound read is loud even when row counts alone would
-    pass. Kills M25 (published_generation_clause dropped from the load).
-    """
-    conn = _conn()
-    site_id = _make_site(conn, timezone="UTC")
-    day = "2026-06-10"
-    _seed_obs(
-        conn,
-        site_id,
-        "temperature",
-        [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
-    )
-    published = ensure_published_generation(conn, site_id)
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    conn.execute("UPDATE observations SET value=44.0")
-    building = _building_generation(conn, site_id)
-    materialize_daily_truth(
-        conn, site_id=site_id, local_date=day, tz_generation_id=building
-    )
-    # Decoy exists on disk with the diverged value.
-    decoy = conn.execute(
-        """
-        SELECT value FROM daily_truth
-        WHERE tz_generation_id=? AND quantity='temperature_high'
-        """,
-        (building,),
-    ).fetchone()
-    assert decoy["value"] == 44.0
-
-    rows = load_daily_truth(conn, site_id=site_id, local_date=day)
-
-    assert len(rows) == 5
-    assert {int(row["tz_generation_id"]) for row in rows} == {published}
-    by_quantity = {str(row["quantity"]): row for row in rows}
-    assert by_quantity["temperature_high"]["value"] == 10.0
-
-
-# ------------------------------------------ O12: all five rows always written
-
-
-def test_sparse_day_persists_all_five_rows_with_diagnostics() -> None:
-    """Ineligible outcomes are stored, labeled, and re-materialization is
-    idempotent.
-
-    Kills M26 (writer filters to eligible outcomes only: zero rows would
-    land for this all-excluded day).
-    """
-    conn = _conn()
-    site_id = _make_site(conn, timezone="UTC")
-    day = "2026-06-10"
-    _seed_obs(
-        conn,
-        site_id,
-        "temperature",
-        [(f"{day}T{h:02d}:00:00Z", float(h)) for h in range(5)],
-    )
-
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    rows = _truth_rows(conn, site_id, day)
-
-    assert len(rows) == 5
-    high = rows["temperature_high"]
-    assert high["eligible"] == 0
-    assert high["exclusion_reason"] == EXCLUDE_INSUFFICIENT_COVERAGE
-    assert high["value"] == 4.0  # diagnostic retained
-    assert high["covered_hours"] == 5
-    assert rows["temperature_low"]["value"] == 0.0
-    wind = rows["wind_max"]
-    assert wind["eligible"] == 0
-    assert wind["exclusion_reason"] == EXCLUDE_BELOW_NEAR_COMPLETE
-    assert wind["value"] is None
-    assert wind["covered_hours"] == 0
-    total = rows["precip_total"]
-    assert total["value"] is None
-    assert total["wet_hours"] == 0 and total["dry_hours"] == 0
-    occurrence = rows["precip_occurrence"]
-    assert occurrence["eligible"] == 0
-    assert occurrence["exclusion_reason"] == EXCLUDE_DRY_WITHOUT_NEAR_COMPLETE
-    assert occurrence["value"] is None
-    assert occurrence["rain_threshold_mm"] == 0.2
-
-    # Delete-and-recreate: a second run replaces, never duplicates.
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    count = conn.execute(
-        "SELECT COUNT(*) AS n FROM daily_truth WHERE site_id=?", (site_id,)
-    ).fetchone()
-    assert count["n"] == 5
 
 
 # ---------------------------------------------------- O13: dispatcher fidelity

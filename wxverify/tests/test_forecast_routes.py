@@ -34,7 +34,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.settings.keys import set_setting
 
@@ -341,7 +341,7 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
                 feed_id,
                 valid_at,
                 i + 1,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     for i, valid_at in enumerate(
@@ -366,7 +366,7 @@ def test_forecast_degrades_to_rebuilding_without_score_cache_no_enqueue(
                 persistence_id,
                 valid_at,
                 i + 1,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     # Deliberately NO upsert_score_cache call -- the point of this fixture.
@@ -491,7 +491,7 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
                 feed_id,
                 valid_at,
                 i + 1,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     for i, valid_at in enumerate(
@@ -511,7 +511,7 @@ def test_forecast_partial_coverage_rebuilding_agrees_across_both_surfaces(
                 persistence_id,
                 valid_at,
                 i + 1,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     # Deliberately NO upsert_score_cache call, same as the fixture above.

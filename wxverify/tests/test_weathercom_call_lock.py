@@ -17,11 +17,9 @@ Out of scope here (plan §14.2):
 
 Adaptation from the plan's literal wording: every K2/K5 case that the plan
 describes via ``run_claimed_job`` (a commit-5 name) is instead driven
-through today's entry points -- ``processor._fetch_obs``,
-``catchup._fetch_missing_station_history``,
-``backfill.fetch_station_history_window``, ``processor._fetch_current_obs``
-and the add-station route -- because ``run_claimed_job`` is not introduced
-until commit 5 (plan §16.1 row 5, and confirmed absent from
+through today's entry points -- ``processor._fetch_current_obs`` and the
+add-station route -- because ``run_claimed_job`` is not introduced until
+commit 5 (plan §16.1 row 5, and confirmed absent from
 ``worker/processor.py`` at this commit). The plan's own §14.2 test-sm3
 precedent (``test_disabled_site_station_does_not_starve_main_claim``)
 documents the same substitution for D0. The plan's §6.3.10 line-number
@@ -66,23 +64,11 @@ from starlette.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import Database, FencedWriter, close_db
-from wxverify.db.queue import (
-    claim_next_current_obs_job,
-    claim_next_job,
-    enqueue_if_absent,
-)
-from wxverify.obs.pws_adapter import PwsObservation, PwsStation
+from wxverify.obs.pws_adapter import PwsStation
 from wxverify.worker import processor as processor_module
-from wxverify.worker.backfill import fetch_station_history_window
-from wxverify.worker.catchup import (
-    CatchupSite,
-    _fetch_missing_station_history,  # noqa: PLC2701 - exercising directly, no claimed job at this commit
-)
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.processor import (
     _fetch_current_obs,  # noqa: PLC2701
-    _fetch_obs,  # noqa: PLC2701
-    run_claimed_job,
 )
 from wxverify.worker.station_pacing import acquire_within, weathercom_call_lock
 
@@ -231,114 +217,6 @@ def _create_site(client: TestClient, headers: dict[str, str], name: str) -> int:
 # ---------------------------------------------------------------------------
 # K2 -- scope: every call site holds the lock while calling the provider
 # ---------------------------------------------------------------------------
-
-
-def test_k2_lock_held_at_history_catchup_and_backfill_call_sites(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K2 (scope): history (``_fetch_obs``), catchup
-    (``_fetch_missing_station_history``) and backfill
-    (``fetch_station_history_window``), each driven through its existing
-    entry point once.
-
-    Mutant (backfill): drop the lock from the backfill call site --
-    ``async with weathercom_call_lock():`` replaced by no lock at all.
-    Killed by ``locked_at["backfill"]`` being False instead of True.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "secret-weather")
-    db = Database(str(db_path))
-
-    async def _run() -> None:
-        try:
-            lock = weathercom_call_lock()
-            locked_at: dict[str, bool] = {}
-
-            history_site = _seed_site(db._conn, "History Site")  # noqa: SLF001
-            _seed_station(db._conn, history_site, "ISTATION-HIST")
-            catchup_site = _seed_site(db._conn, "Catchup Site")  # noqa: SLF001
-            _seed_station(db._conn, catchup_site, "ISTATION-CATCH")
-            backfill_site = _seed_site(db._conn, "Backfill Site")  # noqa: SLF001
-            _seed_station(db._conn, backfill_site, "ISTATION-BACK")
-
-            async def fake_history(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                hours: int = 0,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                locked_at["history"] = lock.locked()
-                return []
-
-            async def fake_history_range_catchup(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                window_start: str,
-                window_end: str,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                locked_at["catchup"] = lock.locked()
-                return []
-
-            async def fake_history_range_backfill(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                window_start: str,
-                window_end: str,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                locked_at["backfill"] = lock.locked()
-                return []
-
-            monkeypatch.setattr(
-                "wxverify.worker.processor.fetch_hourly_history", fake_history
-            )
-            monkeypatch.setattr(
-                "wxverify.worker.catchup.fetch_hourly_history_range",
-                fake_history_range_catchup,
-            )
-            monkeypatch.setattr(
-                "wxverify.worker.backfill.fetch_hourly_history_range",
-                fake_history_range_backfill,
-            )
-
-            await _fetch_obs(db, FencedWriter(db, db.generation), history_site)
-
-            await _fetch_missing_station_history(
-                db,
-                FencedWriter(db, db.generation),
-                CatchupSite(site_id=catchup_site, lat=40.0, lon=-105.0, timezone="UTC"),
-                window_start="2026-06-01T00:00:00Z",
-                window_end="2026-06-01T06:00:00Z",
-            )
-
-            await fetch_station_history_window(
-                db,
-                FencedWriter(db, db.generation),
-                backfill_site,
-                window_start="2026-06-01T00:00:00Z",
-                window_end="2026-06-01T06:00:00Z",
-                timezone="UTC",
-            )
-
-            assert locked_at == {
-                "history": True,
-                "catchup": True,
-                "backfill": True,
-            }
-        finally:
-            db.close()
-
-    asyncio.run(_run())
 
 
 def test_k2_lock_held_at_current_obs_call_site_and_outcome_writes(
@@ -497,121 +375,6 @@ def test_k2_lock_held_at_add_station_route(
 # ---------------------------------------------------------------------------
 # K1 -- one shared lock serializes both lanes
 # ---------------------------------------------------------------------------
-
-
-def test_k1_shared_lock_serializes_both_lanes_calls(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """K1: the current-obs lane's call site and the main lane's history call
-    site share the *same* process-wide lock, so running one claimed job of
-    each type concurrently through ``run_claimed_job`` never overlaps their
-    weather.com calls -- even though the two claims come from different
-    partitions (§6.3.4) and could otherwise run truly in parallel.
-
-    Mutant: restore a per-job ``station_call_limiter()`` at either call site
-    in place of the shared lock -- killed by ``max_in_flight`` rising to 2.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "secret-weather")
-    db = Database(str(db_path))
-
-    async def _run() -> None:
-        try:
-            site_id = _seed_site(db._conn, "K1 Site")  # noqa: SLF001
-            station_a = _seed_station(db._conn, site_id, "ISTATION-K1-A")
-            _seed_station(db._conn, site_id, "ISTATION-K1-B")
-            enqueue_if_absent(db._conn, "fetch_obs", site_id, "obs", {})  # noqa: SLF001
-            enqueue_if_absent(  # noqa: SLF001
-                db._conn,
-                "fetch_current_obs",
-                site_id,
-                f"curobs:{station_a}",
-                {"station_id": station_a},
-            )
-
-            job_main = await db.write(claim_next_job)
-            job_current_obs = await db.write(claim_next_current_obs_job)
-            assert job_main is not None
-            assert job_current_obs is not None
-
-            in_flight = {"n": 0, "max": 0}
-            called: dict[str, bool] = {}
-
-            async def fake_current_obs(
-                pws_station_id: str,
-                api_key: str,
-                *,
-                client: httpx.AsyncClient | None = None,
-                timeout_seconds: float = 10.0,
-            ) -> httpx.Response:
-                called["current_obs"] = True
-                in_flight["n"] += 1
-                in_flight["max"] = max(in_flight["max"], in_flight["n"])
-                await asyncio.sleep(0.05)
-                in_flight["n"] -= 1
-                return _online_response()
-
-            async def fake_history(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                hours: int = 0,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                called["history"] = True
-                in_flight["n"] += 1
-                in_flight["max"] = max(in_flight["max"], in_flight["n"])
-                await asyncio.sleep(0.05)
-                in_flight["n"] -= 1
-                return []
-
-            async def fake_history_range(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                window_start: str,
-                window_end: str,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                called["range"] = True
-                in_flight["n"] += 1
-                in_flight["max"] = max(in_flight["max"], in_flight["n"])
-                await asyncio.sleep(0.05)
-                in_flight["n"] -= 1
-                return []
-
-            monkeypatch.setattr(
-                "wxverify.worker.processor.fetch_current_observation",
-                fake_current_obs,
-            )
-            monkeypatch.setattr(
-                "wxverify.worker.processor.fetch_hourly_history", fake_history
-            )
-            monkeypatch.setattr(
-                "wxverify.worker.catchup.fetch_hourly_history_range",
-                fake_history_range,
-            )
-            monkeypatch.setattr(
-                "wxverify.worker.backfill.fetch_hourly_history_range",
-                fake_history_range,
-            )
-
-            await asyncio.gather(
-                run_claimed_job(db, job_main, lane="main"),
-                run_claimed_job(db, job_current_obs, lane="current_obs"),
-            )
-
-            assert in_flight["max"] == 1
-            assert called == {"current_obs": True, "history": True}
-        finally:
-            db.close()
-
-    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

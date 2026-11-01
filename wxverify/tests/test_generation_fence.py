@@ -28,6 +28,7 @@ from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import (
     Database,
     FencedWriter,
@@ -36,14 +37,8 @@ from wxverify.db.connection import (
     get_db,
 )
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
-from wxverify.obs.pws_adapter import PwsObservation, PwsStation
-from wxverify.worker.backfill import (
-    SiteBackfillTarget,
-    _fetch_historical_forecasts,  # noqa: SLF001 - the reservation unit under test
-    fetch_station_history_window,
-)
-from wxverify.worker.catchup import run_catchup
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.obs.pws_adapter import PwsStation
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 
 async def _idle_worker(db: object) -> None:
@@ -106,8 +101,6 @@ class _BlockingAdapter:
     """A forecast adapter whose fetch blocks until released, so a test can
     land a replace_from while a fetch is in flight."""
 
-    supports_historical = False
-
     def __init__(self, entered: asyncio.Event, release: asyncio.Event) -> None:
         self._entered = entered
         self._release = release
@@ -116,35 +109,6 @@ class _BlockingAdapter:
         return CostEstimate(calls=1)
 
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
-        self._entered.set()
-        await self._release.wait()
-        return FetchResult(samples=[])
-
-
-class _BlockingHistoricalAdapter:
-    """A historical-replay adapter whose fetch blocks until released, so a
-    test can land a replace_from while a backfill feed fetch is in flight."""
-
-    supports_historical = True
-
-    def __init__(self, entered: asyncio.Event, release: asyncio.Event) -> None:
-        self._entered = entered
-        self._release = release
-
-    def estimate_cost(self, req: ForecastRequest) -> CostEstimate:
-        return CostEstimate(calls=1)
-
-    def estimate_historical_cost(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> CostEstimate:
-        return CostEstimate(calls=1)
-
-    async def fetch_forecast(self, req: ForecastRequest) -> FetchResult:
-        raise AssertionError("backfill should use historical replay")
-
-    async def fetch_historical(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> FetchResult | None:
         self._entered.set()
         await self._release.wait()
         return FetchResult(samples=[])
@@ -187,6 +151,12 @@ def test_fetch_feed_fence_discards_a_write_after_a_replace(
                     feed_id,
                     writer=writer,
                     adapter_builder=_adapter_builder,
+                    slot=DownloadSlot(
+                        slot="unscheduled",
+                        round_date=None,
+                        round_try=None,
+                        started_at=utc_now(),
+                    ),
                 )
             )
             await asyncio.wait_for(entered.wait(), timeout=5.0)
@@ -329,246 +299,3 @@ def test_create_station_fence_rejects_a_write_after_a_replace(
             "no station row may land against the replacement database's "
             "site of the same id"
         )
-
-
-def test_backfill_station_history_fence_discards_a_write_after_a_replace(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The weathercom reservation in ``fetch_station_history_window`` pays
-    for the call before the database swap can be known about -- a replace
-    landing while the request is in flight must still surface the same
-    discard warning as the forward-fetch path, naming weathercom specifically.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "secret-weather")
-    db = Database(str(db_path))
-
-    async def _run() -> None:
-        try:
-            site_id = await db.write(lambda conn: _make_site(conn, "Original Site"))
-            await db.write(lambda conn: _make_station(conn, site_id, "SYN1"))
-            writer = FencedWriter(db, db.generation)
-
-            entered = asyncio.Event()
-            release = asyncio.Event()
-
-            async def _blocked_history_range(
-                station_id_arg: str,
-                api_key: str,
-                *,
-                window_start: str,
-                window_end: str,
-                timezone: str | None = None,
-                client: httpx.AsyncClient | None = None,
-            ) -> list[PwsObservation]:
-                entered.set()
-                await release.wait()
-                return [
-                    PwsObservation(
-                        variable="temperature",
-                        valid_at="2026-06-23T00:00:00Z",
-                        value=10.0,
-                        source_raw="10.0 C",
-                    )
-                ]
-
-            monkeypatch.setattr(
-                "wxverify.worker.backfill.fetch_hourly_history_range",
-                _blocked_history_range,
-            )
-
-            task = asyncio.create_task(
-                fetch_station_history_window(
-                    db,
-                    writer,
-                    site_id,
-                    window_start="2026-06-22T00:00:00Z",
-                    window_end="2026-06-24T00:00:00Z",
-                    timezone="UTC",
-                )
-            )
-            await asyncio.wait_for(entered.wait(), timeout=5.0)
-
-            new_path = _build_replacement_db(
-                tmp_path, "replacement.db", "Different Site"
-            )
-            backup_path = tmp_path / "backup.db.bak"
-
-            with caplog.at_level(logging.WARNING, logger="wxverify.collection.budget"):
-                await db.replace_from(new_path, backup_path)
-                release.set()
-                with pytest.raises(StaleGenerationError):
-                    await asyncio.wait_for(task, timeout=5.0)
-
-            obs_count = await db.read(
-                lambda conn: conn.execute(
-                    "SELECT COUNT(*) AS n FROM station_observations"
-                ).fetchone()["n"]
-            )
-            assert obs_count == 0, (
-                "the discarded fetch's observation must never land in the "
-                "replacement database"
-            )
-
-            discard_warnings = [
-                r
-                for r in caplog.records
-                if r.levelno == logging.WARNING
-                and "discarding result of a completed provider call" in r.getMessage()
-            ]
-            assert len(discard_warnings) == 1, (
-                f"expected exactly one discard warning; got: "
-                f"{[r.getMessage() for r in caplog.records]}"
-            )
-            msg = discard_warnings[0].getMessage()
-            assert "source=weathercom" in msg
-            assert "calls=1" in msg
-        finally:
-            db.close()
-
-    asyncio.run(_run())
-
-
-def test_run_catchup_propagates_stale_generation_and_stops_remaining_sites(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A stale generation surfacing mid-site must abandon the catchup job
-    outright rather than being treated like any other per-site failure --
-    continuing on to the remaining sites would keep paying their pacing
-    delays while quietly losing the fenced write's outcome.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    db = Database(str(db_path))
-
-    monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-    attempted: list[int] = []
-
-    async def _fake_catchup_site(*args: Any, **kwargs: Any) -> bool:
-        site = args[2]
-        attempted.append(site.site_id)
-        if len(attempted) == 1:
-            raise StaleGenerationError(1, 2)
-        return True
-
-    monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-    async def _run() -> None:
-        try:
-            site_a = await db.write(lambda conn: _make_site(conn, "Site A"))
-            site_b = await db.write(lambda conn: _make_site(conn, "Site B"))
-            writer = FencedWriter(db, db.generation)
-
-            with pytest.raises(StaleGenerationError):
-                await run_catchup(db, writer, {})
-
-            assert attempted == [site_a], (
-                f"expected only the first site attempted before the stale "
-                f"generation aborted the job; got {attempted} (second site "
-                f"id {site_b} must not appear)"
-            )
-        finally:
-            db.close()
-
-    asyncio.run(_run())
-
-
-def test_backfill_historical_feed_fence_discards_a_write_after_a_replace(
-    tmp_path: Path,
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The open-meteo reservation in backfill's historical-replay fetch pays
-    for the call before the swap can be known about -- a replace landing
-    while the request is in flight must still surface the discard warning,
-    naming open-meteo specifically, distinct from the weathercom path above.
-    """
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    db = Database(str(db_path))
-
-    async def _run() -> None:
-        try:
-            site_id = await db.write(lambda conn: _make_site(conn, "Original Site"))
-            writer = FencedWriter(db, db.generation)
-            target = SiteBackfillTarget(
-                site_id=site_id,
-                lat=40.0,
-                lon=-105.0,
-                timezone="UTC",
-                backfill_status="in_progress",
-                backfill_through=None,
-            )
-
-            entered = asyncio.Event()
-            release = asyncio.Event()
-            adapter = _BlockingHistoricalAdapter(entered, release)
-
-            def _adapter_builder(
-                source: str, client: httpx.AsyncClient
-            ) -> _BlockingHistoricalAdapter:
-                return adapter
-
-            monkeypatch.setattr(
-                "wxverify.worker.backfill.build_adapter", _adapter_builder
-            )
-
-            task = asyncio.create_task(
-                _fetch_historical_forecasts(
-                    db,
-                    writer,
-                    target,
-                    window_start="2026-06-22T00:00:00Z",
-                    window_end="2026-06-24T00:00:00Z",
-                )
-            )
-            await asyncio.wait_for(entered.wait(), timeout=5.0)
-
-            new_path = _build_replacement_db(
-                tmp_path, "replacement.db", "Different Site"
-            )
-            backup_path = tmp_path / "backup.db.bak"
-
-            with caplog.at_level(logging.WARNING, logger="wxverify.collection.budget"):
-                await db.replace_from(new_path, backup_path)
-                release.set()
-                with pytest.raises(StaleGenerationError):
-                    await asyncio.wait_for(task, timeout=5.0)
-
-            sample_count = await db.read(
-                lambda conn: conn.execute(
-                    "SELECT COUNT(*) AS n FROM forecast_samples"
-                ).fetchone()["n"]
-            )
-            assert sample_count == 0, (
-                "the discarded fetch's samples must never land in the "
-                "replacement database"
-            )
-
-            discard_warnings = [
-                r
-                for r in caplog.records
-                if r.levelno == logging.WARNING
-                and "discarding result of a completed provider call" in r.getMessage()
-            ]
-            assert len(discard_warnings) == 1, (
-                f"expected exactly one discard warning; got: "
-                f"{[r.getMessage() for r in caplog.records]}"
-            )
-            msg = discard_warnings[0].getMessage()
-            assert "source=open-meteo" in msg
-            assert "calls=1" in msg
-        finally:
-            db.close()
-
-    asyncio.run(_run())

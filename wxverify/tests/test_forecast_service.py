@@ -30,7 +30,7 @@ from wxverify.collection.forecast_fetcher import register_feed_if_needed
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
 from wxverify.db.migrations import pause_dropped_meteoblue_members, run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast import wind_blend
 from wxverify.forecast.service import (
     RAIN_GLYPH_MIN_WET_HOURS,
@@ -150,7 +150,7 @@ def _insert_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

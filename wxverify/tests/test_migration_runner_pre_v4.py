@@ -992,7 +992,7 @@ def test_o2_pre_v4_inputs_converge_to_one_schema() -> None:
 
     assert versions == [TARGET_USER_VERSION] * 3
     assert masters[0] == masters[1] == masters[2]
-    assert len(masters[0]) == 46
+    assert len(masters[0]) == 76
 
 
 @pytest.mark.parametrize(
@@ -1044,7 +1044,7 @@ def _assert_v2_seed_state(conn: sqlite3.Connection) -> None:
     assert conn.execute("SELECT COUNT(*) FROM sites").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM stations").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM forecast_pairs").fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 4
+    assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
 
     settings = {
         row["key"]: row["value"]
@@ -1072,12 +1072,7 @@ def _assert_v2_seed_state(conn: sqlite3.Connection) -> None:
     jobs = conn.execute(
         "SELECT id, type, site_id, job_key FROM jobs ORDER BY id"
     ).fetchall()
-    assert [tuple(r) for r in jobs] == [
-        (1, "fetch_feed", 1, "k1"),
-        (2, "catchup", None, None),
-        (3, "pair_and_score", 1, "score"),
-        (4, "pair_and_score", 2, "score"),
-    ]
+    assert [tuple(r) for r in jobs] == [(1, "fetch_feed", 1, "k1")]
 
 
 def test_o5_seeded_rows_survive_v4_backfill() -> None:
@@ -1103,7 +1098,7 @@ def test_o1_split_is_a_partition_of_the_composite() -> None:
     table_rows = conn.execute(
         "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
-    assert len(table_rows) == 29
+    assert len(table_rows) == 50
     assert all(row["type"] == "table" for row in table_rows)
 
     create_indexes(conn)
@@ -1111,7 +1106,14 @@ def test_o1_split_is_a_partition_of_the_composite() -> None:
         "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
     index_rows = [row for row in all_rows if row["type"] == "index"]
-    assert len(index_rows) == 14
+    # The query's `NOT LIKE 'sqlite_%'` filter drops SQLite's automatic
+    # indexes too (`sqlite_autoindex_...` matches the pattern, since `_` is
+    # a single-char LIKE wildcard), so the three composite-primary-key
+    # autoindexes close_attempts, close_station_days and close_publications
+    # pick up (12.6) are never counted here -- only the five explicit
+    # CREATE INDEX statements of 12.4 and 15.2 (the new one on
+    # `forecast_downloads`) move this number.
+    assert len(index_rows) == 23
 
     split_master = _master(conn)
 
@@ -1317,12 +1319,7 @@ def test_o9_interrupted_v2_boot_inside_create_indexes_converges_no_reseed(
     jobs = conn.execute(
         "SELECT id, type, site_id, job_key FROM jobs ORDER BY id"
     ).fetchall()
-    assert [tuple(row) for row in jobs] == [
-        (1, "fetch_feed", 1, "k1"),
-        (2, "catchup", None, None),
-        (3, "pair_and_score", 1, "score"),
-        (4, "pair_and_score", 2, "score"),
-    ]
+    assert [tuple(row) for row in jobs] == [(1, "fetch_feed", 1, "k1")]
 
 
 def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> None:
@@ -1351,4 +1348,4 @@ def test_o10_run_migrations_on_empty_matches_create_schema_plus_triggers() -> No
     }
 
     assert fresh_names == composite_names | _TRIGGERS
-    assert len(fresh_names) == 46
+    assert len(fresh_names) == 76

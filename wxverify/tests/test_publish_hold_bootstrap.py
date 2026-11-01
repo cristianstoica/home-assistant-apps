@@ -1,20 +1,19 @@
 """Publish-hold bootstrap/migration/import oracles (0.11.3, plan §8 O1-O5,
-O13, O14, O17).
+O13b, O14, O17d).
 
 Covers: the migration-time bootstrap that arms the operator kill switch on
 upgrade and leaves it untouched on fresh install (D1-D3); the presence-gated
 marker's spine invariant across restarts; atomicity of the bootstrap's own
 four writes under its own SAVEPOINT -- NOT atomicity of the whole migration,
 which `create_schema`'s `executescript()` call has already committed by that
-point; parity of the two extractions this release performs
-(``verification_chain_active`` out of ``scheduler.py``,
-``fail_incomplete_attempts`` out of ``start_run``); and the import path's
-promotion-time neutralization of an in-flight verification chain (D13).
+point; parity of the ``fail_incomplete_attempts`` extraction out of
+``start_run``; and the import path's legacy-donor migration path (O17d),
+the one O17 case not retired with the nightly verification chain.
 
 Isolation: in-memory ``sqlite3`` connections for the pure migration oracles
-(O1-O4b, O13, O13b); ``tmp_path``-backed files plus a direct ``Database()``
+(O1-O4b, O13b); ``tmp_path``-backed files plus a direct ``Database()``
 construction for the seam oracles that drive ``run_migrations`` through a
-real re-open or ``Database.replace_from`` (O5, O14, O17a-d) -- mirrors
+real re-open or ``Database.replace_from`` (O5, O14, O17d) -- mirrors
 ``tests/test_db_transfer.py``'s ``_build_replacement_db`` idiom.
 
 Synthetic data only (public repo): ``site-alpha`` / ``America/Denver``,
@@ -32,7 +31,6 @@ from starlette.testclient import TestClient
 
 from wxverify import config
 from wxverify.api.app import create_app
-from wxverify.api.routes import db_transfer
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.migrations import (
     PUBLISH_HOLD_BOOTSTRAP_KEY,
@@ -40,30 +38,20 @@ from wxverify.db.migrations import (
     create_schema,
     run_migrations,
 )
-from wxverify.db.queue import claim_next_job, reclaim_all_stale
 from wxverify.db.runtime_state import (
     get_runtime_state,
     set_runtime_state,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.verification.publish_hold import (
     PUBLISH_HOLD_LAST_SOURCE_KEY,
     PUBLISH_HOLD_LAST_STATE_KEY,
 )
-from wxverify.verification.runs import (
-    IMPORT_SUPPRESSED_REASON,
-    fail_incomplete_attempts,
-    published_run_key,
-)
+from wxverify.verification.runs import fail_incomplete_attempts
 from wxverify.worker.scheduler import (
     VERIFICATION_PUBLISH_HOLD_KEY,
     verification_publish_held,
-)
-from wxverify.worker.verification_run import (
-    verification_heartbeat_key,
-    verification_job_key,
-    verification_state_key,
 )
 
 _SITE_NAME = "site-alpha"
@@ -444,73 +432,6 @@ def test_bootstrap_marker_write_failure_rolls_back_on_a_non_exception_baseexcept
 
 
 # ---------------------------------------------------------------------------
-# O13 - Extraction parity: verification_chain_active vs. the pre-0.11.3
-# inline SQL, frozen here as the oracle (never updated to match the code).
-# ---------------------------------------------------------------------------
-
-_LEGACY_VERIFICATION_CHAIN_ACTIVE_SQL = """
-    SELECT 1 FROM jobs
-    WHERE type = 'verification_run' AND job_key = ? AND site_id IS ?
-      AND status IN ('pending','running')
-    LIMIT 1
-"""
-
-
-def _legacy_chain_active(conn: sqlite3.Connection, site_id: int) -> bool:
-    row = conn.execute(
-        _LEGACY_VERIFICATION_CHAIN_ACTIVE_SQL, (verification_job_key(site_id), site_id)
-    ).fetchone()
-    return row is not None
-
-
-def test_verification_chain_active_extraction_matches_the_legacy_inline_sql() -> None:
-    from wxverify.worker.verification_run import verification_chain_active
-
-    conn = _fresh_db()
-    create_schema(conn)
-    site_a = _insert_site(conn, "site-alpha", enabled=1)
-    site_b = _insert_site(conn, "site-beta", enabled=1)
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'pending')",
-        (site_a, verification_job_key(site_a)),
-    )
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'running')",
-        (site_b, verification_job_key(site_b)),
-    )
-    # A different site with a completed run and a failed run -- neither active.
-    site_c = _insert_site(conn, "site-gamma", enabled=1)
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'completed')",
-        (site_c, verification_job_key(site_c)),
-    )
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, 'other:key', 'failed')",
-        (site_c,),
-    )
-    # A different job type for a fourth site -- must not read as active.
-    site_d = _insert_site(conn, "site-delta", enabled=1)
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, status) VALUES "
-        "('forecast_record', ?, 'pending')",
-        (site_d,),
-    )
-
-    for site_id in (site_a, site_b, site_c, site_d):
-        assert verification_chain_active(conn, site_id) == _legacy_chain_active(
-            conn, site_id
-        ), f"parity mismatch for site {site_id}"
-    assert verification_chain_active(conn, site_a) is True
-    assert verification_chain_active(conn, site_b) is True
-    assert verification_chain_active(conn, site_c) is False
-    assert verification_chain_active(conn, site_d) is False
-
-
-# ---------------------------------------------------------------------------
 # O13b - fail_incomplete_attempts extraction parity.
 # ---------------------------------------------------------------------------
 
@@ -520,8 +441,8 @@ def test_fail_incomplete_attempts_extraction_parity() -> None:
     create_schema(conn)
     site_id = _insert_site(conn)
     other_site = _insert_site(conn, "site-other")
-    gen = ensure_published_generation(conn, site_id)
-    other_gen = ensure_published_generation(conn, other_site)
+    gen = ensure_site_generation(conn, site_id)
+    other_gen = ensure_site_generation(conn, other_site)
 
     published = _insert_run(conn, site_id, state="published", tz_generation_id=gen)
     running = _insert_run(conn, site_id, state="running", tz_generation_id=gen)
@@ -687,243 +608,6 @@ def _csrf_headers(client: TestClient) -> dict[str, str]:
     }
 
 
-def _build_o17_shared_donor(tmp_path: Path, filename: str) -> Path:
-    """The shared O17 donor: an in-flight chain plus two anti-over-reach
-    controls (a published run, an other-type job)."""
-    path = tmp_path / filename
-    conn = _emulated_0_11_0_donor(path)
-    site_id = _insert_site(conn, enabled=1)
-    gen = ensure_published_generation(conn, site_id)
-
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'pending')",
-        (site_id, verification_job_key(site_id)),
-    )
-    running = _insert_run(conn, site_id, state="running", tz_generation_id=gen)
-    _insert_evidence_all_tables(conn, running)
-    set_runtime_state(conn, verification_state_key(site_id), '{"phase":"scoring"}')
-    set_runtime_state(conn, verification_heartbeat_key(site_id), "2026-06-01T02:05:00Z")
-
-    published = _insert_run(conn, site_id, state="published", tz_generation_id=gen)
-    _insert_evidence_all_tables(conn, published)
-    set_runtime_state(conn, published_run_key(site_id), str(published))
-
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, status) "
-        "VALUES ('forecast_record', ?, 'pending')",
-        (site_id,),
-    )
-    conn.commit()
-    conn.close()
-    return path
-
-
-def test_o17a_imported_active_chain_neutralized_before_promotion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    donor_path = _build_o17_shared_donor(tmp_path, "donor-o17a.db")
-    payload = donor_path.read_bytes()
-
-    close_db()
-    config.db_path = str(tmp_path / "live-o17a.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    init_db(config.db_path)
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        resp = client.post(
-            "/api/import/db", content=payload, headers=_csrf_headers(client)
-        )
-        assert resp.status_code == 200, resp.text
-        conn = get_db()._conn  # noqa: SLF001
-
-        job = conn.execute(
-            "SELECT status, last_error FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert job is not None
-        assert str(job["status"]) == "failed"
-        assert str(job["last_error"]) == IMPORT_SUPPRESSED_REASON
-
-        site_id = int(conn.execute("SELECT id FROM sites LIMIT 1").fetchone()["id"])
-        running_id, published_id = [
-            int(r["id"])
-            for r in conn.execute(
-                "SELECT id FROM verification_runs ORDER BY id"
-            ).fetchall()
-        ]
-        assert _run_state(conn, running_id)[0] == "failed"
-        assert _evidence_row_counts(conn, running_id) == {
-            "verification_evidence": 0,
-            "verification_day_context": 0,
-            "verification_results": 0,
-            "verification_verdicts": 0,
-        }
-
-        assert get_runtime_state(conn, verification_state_key(site_id)) is None
-        assert get_runtime_state(conn, verification_heartbeat_key(site_id)) is None
-
-        assert _run_state(conn, published_id)[0] == "published"
-        assert _evidence_row_counts(conn, published_id) == {
-            "verification_evidence": 1,
-            "verification_day_context": 1,
-            "verification_results": 1,
-            "verification_verdicts": 1,
-        }
-        assert get_runtime_state(conn, published_run_key(site_id)) == str(published_id)
-
-        other_job = conn.execute(
-            "SELECT status FROM jobs WHERE type = 'forecast_record'"
-        ).fetchone()
-        assert other_job is not None
-        assert str(other_job["status"]) == "pending"
-    close_db()
-
-
-def test_o17b_neutralized_state_already_present_at_replace_from_entry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    donor_path = _build_o17_shared_donor(tmp_path, "donor-o17b.db")
-    payload = donor_path.read_bytes()
-
-    close_db()
-    config.db_path = str(tmp_path / "live-o17b.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    init_db(config.db_path)
-
-    captured: dict[str, object] = {}
-    real_replace_from = Database.replace_from
-
-    async def _wrapper(self: Database, new_db: Path, backup: Path) -> None:
-        # Capture-only: no assertion here -- an exception raised inside this
-        # wrapper is caught by import_db's `except BaseException` and turns
-        # into a 500, which would fail the test for the wrong reason.
-        staged = sqlite3.connect(f"file:{new_db}?mode=ro", uri=True)
-        staged.row_factory = sqlite3.Row
-        try:
-            site_row = staged.execute("SELECT id FROM sites LIMIT 1").fetchone()
-            site_id = int(site_row["id"])
-            job_row = staged.execute(
-                "SELECT status, last_error FROM jobs WHERE type = 'verification_run'"
-            ).fetchone()
-            captured["job_status"] = str(job_row["status"])
-            captured["job_last_error"] = (
-                None if job_row["last_error"] is None else str(job_row["last_error"])
-            )
-            run_row = staged.execute(
-                "SELECT state FROM verification_runs WHERE state != 'published'"
-            ).fetchone()
-            captured["run_state"] = str(run_row["state"])
-            state_present = staged.execute(
-                "SELECT 1 FROM runtime_state WHERE key = ?",
-                (verification_state_key(site_id),),
-            ).fetchone()
-            captured["state_key_present"] = state_present is not None
-        finally:
-            staged.close()
-        await real_replace_from(self, new_db, backup)
-
-    monkeypatch.setattr(Database, "replace_from", _wrapper)
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        resp = client.post(
-            "/api/import/db", content=payload, headers=_csrf_headers(client)
-        )
-        assert resp.status_code == 200, resp.text
-
-    assert captured, "replace_from was never entered"
-    assert captured["job_status"] == "failed"
-    assert captured["job_last_error"] == IMPORT_SUPPRESSED_REASON
-    assert captured["run_state"] == "failed"
-    assert captured["state_key_present"] is False
-    close_db()
-
-
-def test_o17b2_no_claimable_verification_run_survives_the_import(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """End-state confirmation, claims no unique kill (see O17a for the
-    discriminating assertions)."""
-    donor_path = _build_o17_shared_donor(tmp_path, "donor-o17b2.db")
-    payload = donor_path.read_bytes()
-
-    close_db()
-    config.db_path = str(tmp_path / "live-o17b2.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    init_db(config.db_path)
-    app = _make_app(monkeypatch)
-    with TestClient(app) as client:
-        resp = client.post(
-            "/api/import/db", content=payload, headers=_csrf_headers(client)
-        )
-        assert resp.status_code == 200, resp.text
-        conn = get_db()._conn  # noqa: SLF001
-        reclaim_all_stale(conn)
-        claimed = claim_next_job(conn)
-        assert claimed is None or claimed.type != "verification_run"
-        job = conn.execute(
-            "SELECT status FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert job is not None
-        assert str(job["status"]) == "failed"
-    close_db()
-
-
-def test_o17c_neutralizer_failure_leaves_the_live_database_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    donor_path = _build_o17_shared_donor(tmp_path, "donor-o17c.db")
-    payload = donor_path.read_bytes()
-
-    close_db()
-    config.db_path = str(tmp_path / "live-o17c.db")
-    config.options_path = str(tmp_path / "missing-options.json")
-    init_db(config.db_path)
-    live_conn = get_db()._conn  # noqa: SLF001
-    own_site = _insert_site(live_conn, "site-own", enabled=1)
-    live_conn.commit()
-
-    def _explode(*_a: object, **_k: object) -> None:
-        raise RuntimeError("simulated neutralizer failure")
-
-    # _neutralize_imported_verification_chains imports fail_incomplete_attempts
-    # LOCALLY (inside its own function body, at call time) rather than at
-    # db_transfer module scope, so the module has no such attribute to patch --
-    # patch the real owning module instead, which the local `from ... import`
-    # resolves against on every call.
-    monkeypatch.setattr("wxverify.verification.runs.fail_incomplete_attempts", _explode)
-    app = _make_app(monkeypatch)
-    # raise_server_exceptions=False: the neutralizer failure must surface as a
-    # real ASGI 500 response (what a live server would return), not re-raise
-    # into the test process the way TestClient's default strict mode would.
-    with TestClient(app, raise_server_exceptions=False) as client:
-        resp = client.post(
-            "/api/import/db", content=payload, headers=_csrf_headers(client)
-        )
-        assert resp.status_code == 500
-
-        conn = get_db()._conn  # noqa: SLF001
-        own_row = conn.execute(
-            "SELECT 1 FROM sites WHERE id = ?", (own_site,)
-        ).fetchone()
-        assert own_row is not None, "live database's own site must survive"
-        rebuild_state = conn.execute(
-            "SELECT value FROM runtime_state WHERE key = 'import_rebuild_state'"
-        ).fetchone()
-        assert rebuild_state is None or str(rebuild_state["value"]) != "pending", (
-            "no swap occurred -- the staged pending marker must not appear live"
-        )
-
-        staged_leftovers = list(Path(config.db_path).parent.glob("*.wxverify-import-*"))
-        assert staged_leftovers == [], "the staged temp file must be cleaned up"
-
-        # The guard was released: a second import is admitted, not 409.
-        second_resp = client.post(
-            "/api/import/db", content=payload, headers=_csrf_headers(client)
-        )
-        assert second_resp.status_code != 409
-    close_db()
-
-
 def _build_o17d_legacy_donor(
     tmp_path: Path, filename: str, *, drop_runtime_state: bool
 ) -> Path:
@@ -971,45 +655,11 @@ def _build_o17d_legacy_donor(
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
         "('verification_run', ?, ?, 'pending')",
-        (site_id, verification_job_key(site_id)),
+        (site_id, f"verification:{site_id}"),
     )
     conn.commit()
     conn.close()
     return path
-
-
-def test_o17d_part1_legacy_donor_with_no_verification_tables_is_skipped_not_raised(
-    tmp_path: Path,
-) -> None:
-    from wxverify.api.routes.db_transfer import _neutralize_imported_verification_chains
-
-    donor_path = _build_o17d_legacy_donor(
-        tmp_path, "donor-o17d-part1.db", drop_runtime_state=False
-    )
-
-    _neutralize_imported_verification_chains(donor_path)  # must not raise
-
-    conn = sqlite3.connect(str(donor_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        names = {
-            str(r[0])
-            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        }
-        assert not any(name.startswith("verification_") for name in names), (
-            "the neutralizer skips a table-absent donor; it must not create tables"
-        )
-        job = conn.execute(
-            "SELECT status, last_error FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert str(job["status"]) == "failed"
-        assert str(job["last_error"]) == IMPORT_SUPPRESSED_REASON
-        record_job = conn.execute(
-            "SELECT status FROM jobs WHERE type = 'forecast_record'"
-        ).fetchone()
-        assert str(record_job["status"]) == "pending"
-    finally:
-        conn.close()
 
 
 def test_o17d_part2_legacy_donor_imports_end_to_end_and_is_armed(
@@ -1054,145 +704,3 @@ def test_o17d_part2_legacy_donor_imports_end_to_end_and_is_armed(
         ).fetchone()
         assert str(record_job["status"]) == "pending"
     close_db()
-
-
-def test_o17d_companion_runtime_state_table_is_created_not_skipped(
-    tmp_path: Path,
-) -> None:
-    from wxverify.api.routes.db_transfer import _neutralize_imported_verification_chains
-
-    donor_path = _build_o17d_legacy_donor(
-        tmp_path, "donor-o17d-companion.db", drop_runtime_state=True
-    )
-
-    _neutralize_imported_verification_chains(donor_path)  # must not raise
-
-    conn = sqlite3.connect(str(donor_path))
-    try:
-        row = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_state'"
-        ).fetchone()
-        assert row is not None, (
-            "ensure_runtime_state_table must CREATE the table when it is absent "
-            "(this is the one guard that is create-if-absent, not skip)"
-        )
-    finally:
-        conn.close()
-
-
-# ---------------------------------------------------------------------------
-# S6 (0.16.2 plan 2026-09-23-db-import-schema-checks.md): the neutralizer's
-# table-presence gates (jobs / _VERIFICATION_RUN_TABLES) must resolve
-# case-insensitively via table_exists, D2.
-# ---------------------------------------------------------------------------
-
-
-def test_s6_case_variant_active_chain_neutralized_before_promotion(
-    tmp_path: Path,
-) -> None:
-    """S6: a donor whose ``jobs`` and ``verification_runs`` tables were
-    renamed to mixed case (``Jobs``/``Verification_Runs``) still gets its
-    in-flight chain neutralized exactly as the ordinary-case O17a donor does
-    -- pins that the neutralizer's own gates use the same case-insensitive
-    ``table_exists`` the rest of D2 does, not an exact-name lookup.
-    """
-    donor_path = tmp_path / "donor-case-variant.db"
-    conn = _emulated_0_11_0_donor(donor_path)
-    site_id = int(
-        conn.execute(
-            "INSERT INTO sites"
-            " (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)"
-            " VALUES ('site-synthetic', 0.0, 0.0, 100.0, 'UTC', 1)"
-        ).lastrowid
-    )
-    gen = ensure_published_generation(conn, site_id)
-
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'pending')",
-        (site_id, verification_job_key(site_id)),
-    )
-    running = _insert_run(conn, site_id, state="running", tz_generation_id=gen)
-    _insert_evidence_all_tables(conn, running)
-    set_runtime_state(conn, verification_state_key(site_id), '{"phase":"scoring"}')
-    set_runtime_state(conn, verification_heartbeat_key(site_id), "2026-06-01T02:05:00Z")
-
-    published = _insert_run(conn, site_id, state="published", tz_generation_id=gen)
-    _insert_evidence_all_tables(conn, published)
-    set_runtime_state(conn, published_run_key(site_id), str(published))
-
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, status) "
-        "VALUES ('forecast_record', ?, 'pending')",
-        (site_id,),
-    )
-    conn.commit()
-
-    # SQLite refuses a case-ONLY rename, so each goes through a temp name.
-    conn.execute("ALTER TABLE jobs RENAME TO jobs_case_tmp")
-    conn.execute("ALTER TABLE jobs_case_tmp RENAME TO Jobs")
-    conn.execute("ALTER TABLE verification_runs RENAME TO verification_runs_case_tmp")
-    conn.execute("ALTER TABLE verification_runs_case_tmp RENAME TO Verification_Runs")
-    conn.commit()
-    conn.close()
-
-    # Precondition, on a fresh connection.
-    check_conn = sqlite3.connect(str(donor_path))
-    try:
-        names = {
-            str(row[0])
-            for row in check_conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
-        assert "Jobs" in names and "Verification_Runs" in names, (
-            "fixture: both tables must be stored under mixed-case names"
-        )
-        assert "jobs" not in names and "verification_runs" not in names, (
-            "fixture: the ordinary-case names must not exist"
-        )
-        fk_violations = check_conn.execute("PRAGMA foreign_key_check").fetchall()
-        assert fk_violations == [], (
-            "fixture: the case-only rename must not break a foreign key"
-        )
-    finally:
-        check_conn.close()
-
-    db_transfer._neutralize_imported_verification_chains(donor_path)  # noqa: SLF001
-
-    conn = sqlite3.connect(str(donor_path))
-    conn.row_factory = sqlite3.Row
-    try:
-        job = conn.execute(
-            "SELECT status, last_error FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert job is not None
-        assert str(job["status"]) == "failed"
-        assert str(job["last_error"]) == IMPORT_SUPPRESSED_REASON
-
-        assert _run_state(conn, running)[0] == "failed"
-        assert _evidence_row_counts(conn, running) == {
-            "verification_evidence": 0,
-            "verification_day_context": 0,
-            "verification_results": 0,
-            "verification_verdicts": 0,
-        }
-        assert get_runtime_state(conn, verification_state_key(site_id)) is None
-        assert get_runtime_state(conn, verification_heartbeat_key(site_id)) is None
-
-        assert _run_state(conn, published)[0] == "published"
-        assert _evidence_row_counts(conn, published) == {
-            "verification_evidence": 1,
-            "verification_day_context": 1,
-            "verification_results": 1,
-            "verification_verdicts": 1,
-        }
-        assert get_runtime_state(conn, published_run_key(site_id)) == str(published)
-
-        other_job = conn.execute(
-            "SELECT status FROM jobs WHERE type = 'forecast_record'"
-        ).fetchone()
-        assert other_job is not None
-        assert str(other_job["status"]) == "pending"
-    finally:
-        conn.close()

@@ -1,30 +1,22 @@
 """Item 8 (§1.2/§6.14): the Ops page carries controls, not documentation.
 
-Two scripted deletions removed explanatory prose from the timezone-
-correction and publish-hold panels (`ops/_timezone_correction.html`,
-`ops/_publish_hold.html`); the publish-hold heading was renamed from
+A scripted deletion removed explanatory prose from the publish-hold panel
+(`ops/_publish_hold.html`); the publish-hold heading was renamed from
 "Nightly Verification Publishing" to "Nightly Verification Run Hold"; and
 the one fact the deleted prose carried -- that a run already in progress
 continues and may publish while the hold is armed -- was moved into the
-arm confirmation dialog in `app.js`.
+arm confirmation dialog in `app.js`. The Ops timezone-correction panel
+this file's O42/O43 tests once covered was removed in 0.16.14 Part 6; its
+own coverage went with it.
 
-O42-O45 assert on rendered `/ops` output (and, for the rename sweep,
+O44-O45 assert on rendered `/ops` output (and, for the rename sweep,
 `README.md`) wherever the branch can be driven, never on template source.
 
 Isolation: HTTP-route oracles drive a real app over `TestClient` against a
 file-backed `tmp_path` database with an idle worker stand-in, mirroring
-`tests/test_publish_hold_control.py`. O43's five State-cell branches are
-driven by monkeypatching `wxverify.web.routes.load_ops` to substitute a
-directly-constructed `timezone_correction` row list into the real loader's
-own output -- an injected precondition into the real render path (Jinja
-templates, real HTTP response), not a template-source read. The building /
-failed / cleanup-stalled branches also have full-pipeline coverage in
-`tests/test_timezone_correction_control.py`; this file adds the two
-branches with none there (published, none) and the ones this item's
-concern (deleted prose, surviving ids) actually needs checked together.
+`tests/test_publish_hold_control.py`.
 
-Synthetic data only (public repo): `Etc/GMT+7` for the correction target,
-no real station or device identifiers.
+Synthetic data only (public repo): no real station or device identifiers.
 """
 
 from __future__ import annotations
@@ -44,7 +36,6 @@ from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, get_db
 from wxverify.db.runtime_state import set_runtime_state
 from wxverify.web import context as context_module
-from wxverify.web.context import TimezoneCorrectionRow
 from wxverify.worker.access_hold import access_hold_key
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,267 +61,6 @@ def _boot(tmp_path: Path, name: str, monkeypatch: pytest.MonkeyPatch) -> object:
 def _norm(text: str) -> str:
     """Collapse the template's line-wrapped whitespace for substring checks."""
     return " ".join(text.split())
-
-
-def _override_timezone_correction(
-    monkeypatch: pytest.MonkeyPatch, rows: list[TimezoneCorrectionRow]
-) -> None:
-    """Substitute `rows` for the real loader's `timezone_correction` key,
-    leaving every other `/ops` panel on its real (empty-DB) production
-    output -- an injected precondition into the real render path, not a
-    template-source read."""
-    real_load_ops = context_module.load_ops
-
-    def _wrapped(conn: object) -> dict[str, object]:
-        ctx = real_load_ops(conn)  # type: ignore[arg-type]
-        ctx["timezone_correction"] = rows
-        return ctx
-
-    monkeypatch.setattr("wxverify.web.routes.load_ops", _wrapped)
-
-
-def _row(
-    *,
-    site_id: int = 1,
-    site_name: str = "site-alpha",
-    current_timezone: str = "UTC",
-    published_generation_id: int | None = None,
-    building_generation_id: int | None = None,
-    building_timezone: str | None = None,
-    failed_generation_id: int | None = None,
-    failed_timezone: str | None = None,
-    cleanup_stalled_generation_id: int | None = None,
-    examined: int | None = None,
-    changed: int | None = None,
-    unchanged: int | None = None,
-    excluded: int | None = None,
-    last_published_at: str | None = None,
-    applicable: bool = True,
-    blocked_reason: str | None = None,
-) -> TimezoneCorrectionRow:
-    return TimezoneCorrectionRow(
-        site_id=site_id,
-        site_name=site_name,
-        current_timezone=current_timezone,
-        published_generation_id=published_generation_id,
-        building_generation_id=building_generation_id,
-        building_timezone=building_timezone,
-        failed_generation_id=failed_generation_id,
-        failed_timezone=failed_timezone,
-        cleanup_stalled_generation_id=cleanup_stalled_generation_id,
-        examined=examined,
-        changed=changed,
-        unchanged=unchanged,
-        excluded=excluded,
-        last_published_at=last_published_at,
-        applicable=applicable,
-        blocked_reason=blocked_reason,
-    )
-
-
-# ---------------------------------------------------------------------------
-# O42 -- the deleted prose is gone from the rendered page; both panels
-# still render, 200.
-# ---------------------------------------------------------------------------
-
-_DELETED_PHRASES = (
-    "Retrospective timezone correction",
-    "What the flip changes",
-    "What happens to verification runs",
-    "If it goes wrong",
-    "Kill switch",
-    "Held blocks NEW runs",
-)
-
-
-def test_o42_deleted_prose_is_absent_and_both_panels_still_render(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o42.db", monkeypatch)
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = resp.text
-
-    for phrase in _DELETED_PHRASES:
-        assert phrase not in html, f"deleted prose {phrase!r} still renders"
-
-    assert 'id="timezone-correction-panel"' in html
-    assert 'id="publish-hold-panel"' in html
-    close_db()
-
-
-# ---------------------------------------------------------------------------
-# O43 -- the timezone-correction panel still does its job: five State-cell
-# branches, the input/button, the result placeholder, and the no-sites case.
-# ---------------------------------------------------------------------------
-
-
-def test_o43_building_branch_renders_its_progress_text(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-building.db", monkeypatch)
-    _override_timezone_correction(
-        monkeypatch,
-        [
-            _row(
-                building_generation_id=7,
-                building_timezone="Etc/GMT+7",
-                examined=3,
-                changed=1,
-                unchanged=2,
-                excluded=0,
-                applicable=False,
-                blocked_reason="a correction is already building (generation 7)",
-            )
-        ],
-    )
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = _norm(resp.text)
-    assert "building (generation 7" in html
-    assert "examined 3" in html
-    assert "a correction is already building" in html
-    close_db()
-
-
-def test_o43_published_branch_renders_the_generation_and_timestamp(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-published.db", monkeypatch)
-    _override_timezone_correction(
-        monkeypatch,
-        [
-            _row(
-                published_generation_id=4,
-                last_published_at="2026-07-01T00:00:00Z",
-                applicable=True,
-            )
-        ],
-    )
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = _norm(resp.text)
-    assert "published generation 4" in html
-    assert "2026-07-01T00:00:00Z" in html
-    close_db()
-
-
-def test_o43_none_branch_renders_the_no_published_generation_text(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-none.db", monkeypatch)
-    _override_timezone_correction(monkeypatch, [_row(applicable=True)])
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = _norm(resp.text)
-    assert "no published generation yet" in html
-    close_db()
-
-
-def test_o43_failed_branch_renders_the_abandonment_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-failed.db", monkeypatch)
-    _override_timezone_correction(
-        monkeypatch,
-        [
-            _row(
-                failed_generation_id=9,
-                failed_timezone="Etc/GMT+7",
-                applicable=True,
-            )
-        ],
-    )
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = _norm(resp.text)
-    assert "generation 9" in html
-    assert "failed and was abandoned" in html
-    close_db()
-
-
-def test_o43_cleanup_stalled_branch_renders_the_stall_notice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-stalled.db", monkeypatch)
-    _override_timezone_correction(
-        monkeypatch,
-        [
-            _row(
-                published_generation_id=11,
-                last_published_at="2026-07-05T00:00:00Z",
-                cleanup_stalled_generation_id=11,
-                applicable=True,
-            )
-        ],
-    )
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = _norm(resp.text)
-    assert "Generation 11 published" in html
-    assert "background cleanup stopped" in html
-    assert "failed and was abandoned" not in html
-    close_db()
-
-
-def test_o43_applicable_row_renders_input_and_button_not_blocked_reason(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Paired positive to the blocked-branch assertion in the building
-    test above: an applicable row must render the control, not prose."""
-    app = _boot(tmp_path, "o43-applicable.db", monkeypatch)
-    _override_timezone_correction(monkeypatch, [_row(site_id=3, applicable=True)])
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = resp.text
-    assert 'id="tz-correct-input-3"' in html
-    assert "Start correction" in html
-    assert 'id="tz-correct-result"' in html
-    close_db()
-
-
-def test_o43_blocked_row_renders_the_reason_not_the_control(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-blocked.db", monkeypatch)
-    _override_timezone_correction(
-        monkeypatch,
-        [
-            _row(
-                site_id=5,
-                applicable=False,
-                blocked_reason="a verification run is active for this site",
-            )
-        ],
-    )
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = resp.text
-    assert 'id="tz-correct-input-5"' not in html
-    assert "a verification run is active for this site" in html
-    close_db()
-
-
-def test_o43_no_sites_branch_still_renders_the_panel_heading(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o43-nosites.db", monkeypatch)
-    with TestClient(app) as client:
-        resp = client.get("/ops")
-    assert resp.status_code == 200, resp.text
-    html = resp.text
-    assert "No sites configured." in html
-    assert 'id="timezone-correction-panel"' in html
-    assert 'id="tz-correct-result"' in html
-    close_db()
 
 
 # ---------------------------------------------------------------------------

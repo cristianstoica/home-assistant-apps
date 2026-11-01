@@ -17,15 +17,13 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import (
-    day_ahead as issue_day_ahead,
-)
-from wxverify.core.timeutil import (
     isoformat_utc,
     local_day_start,
     parse_utc,
     utc_now,
 )
 from wxverify.core.units import ms_to_kmh
+from wxverify.db.site_days import daily_close_on
 from wxverify.forecast import wind_blend
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
@@ -47,10 +45,12 @@ from wxverify.forecast.data import (
     forecast_ranking_with_status,
     load_feed_freshness,
     load_future_samples,
+    sample_day_ahead,
 )
 from wxverify.forecast.selection import (
     CellCandidate,
     CellSelection,
+    confident_order_key,
     representative_day_ahead,
     select_cell_feeds,
 )
@@ -103,6 +103,12 @@ class CellMeta:
     any of them is stale; ``fetch_unknown`` is True if any of them has no
     usable fetch on record. A wind cell has no clearing subset, so its
     contributors are all of its chosen feeds.
+
+    ``substitute`` (11.3) is True when a substitute serves: a feed of the
+    cell's choice is stale and not in the cell's blend set. The choice is the
+    first blend-depth confident rows at the cell's representative day ahead,
+    in the ladder's order; for weighted wind, every feed with a published
+    weight there. Always False with the daily close off.
     """
 
     state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
@@ -113,6 +119,7 @@ class CellMeta:
     extrema_state: str  # "normal" | "low_confidence" | "rebuilding" | "not_available"
     contributor_ids: tuple[int, ...]
     fetch_unknown: bool
+    substitute: bool
 
     @property
     def available(self) -> bool:
@@ -161,6 +168,8 @@ class DayTile:
     stale: bool
     partial: bool
     fetch_unknown: bool
+    #: True when any populated cell's ``substitute`` is (11.3).
+    substitute: bool
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,9 @@ def build_forecast(
     }
     depths = effective_blend_depths(conn)
     rank_cache: _RankCache = {}
+    # One switch per read (9.1): the substitute flag is computed only with
+    # the close on, and stays False otherwise (11.3).
+    close_on = daily_close_on(conn)
 
     tz = ZoneInfo(timezone)
     today = at.astimezone(tz).date()
@@ -234,6 +246,7 @@ def build_forecast(
         wind_note: str | None = None
         for variable in VARIABLES:
             feeds_samples = grouped.get(variable, {}).get(day, {})
+            cell_k = _cell_day_ahead(feeds_samples, timezone) if close_on else None
             if variable == "wind":
                 choice = _select_wind(
                     conn,
@@ -249,6 +262,12 @@ def build_forecast(
                     feeds_samples=feeds_samples,
                     stale_ids=stale_ids,
                     unknown_ids=unknown_ids,
+                    substitute=cell_k is not None
+                    and _substitute_serves(
+                        [feed for feed, k in serving.weights if k == cell_k],
+                        choice.selection,
+                        stale_ids,
+                    ),
                 )
                 cells[variable] = (meta, choice.selection, values)
                 wind_weights, wind_note = choice.weights, choice.note
@@ -269,6 +288,19 @@ def build_forecast(
                 stale_ids=stale_ids,
                 unknown_ids=unknown_ids,
                 rebuilding_by_feed=rebuilding_by_feed,
+                substitute=cell_k is not None
+                and _substitute_serves(
+                    _ranked_choice(
+                        conn,
+                        site_id=site_id,
+                        variable=variable,
+                        day_ahead=cell_k,
+                        blend_depth=depths[variable].depth,
+                        rank_cache=rank_cache,
+                    ),
+                    selection,
+                    stale_ids,
+                ),
             )
             cells[variable] = (meta, selection, values)
         day_cells.append((cells, wind_weights, wind_note))
@@ -621,7 +653,9 @@ def _candidates(
 
     Returns ``(candidates, rebuilding_by_feed, rep_k)``; ``rep_k`` maps each
     feed to the representative day-ahead of its samples, the lead its ranking
-    row (and, for weighted wind, its weight) is looked up at.
+    row (and, for weighted wind, its weight) is looked up at. Each sample's
+    day ahead is :func:`sample_day_ahead`'s: from its download date with the
+    daily close on, else from its run label (9.5).
     """
     covers = covers_local_day_exactly if variable == "precip" else covers_local_day
     candidates: list[CellCandidate] = []
@@ -629,10 +663,7 @@ def _candidates(
     rep_k: dict[int, int] = {}
     for feed_id, feed_samples in feeds_samples.items():
         rep = representative_day_ahead(
-            [
-                issue_day_ahead(sample.issued_at, sample.valid_at, timezone)
-                for sample in feed_samples
-            ]
+            [sample_day_ahead(sample, timezone) for sample in feed_samples]
         )
         rep_k[feed_id] = rep
         key = (variable, rep)
@@ -686,19 +717,65 @@ def _select_wind(
     return wind_blend.choose_wind_feeds(candidates, rep_k, weights)
 
 
+def _cell_day_ahead(
+    feeds_samples: dict[int, list[FutureSampleRow]], timezone: str
+) -> int | None:
+    """The cell's representative day ahead over every sample in it, or None
+    for a cell with no sample (11.3)."""
+    leads = [
+        sample_day_ahead(sample, timezone)
+        for samples in feeds_samples.values()
+        for sample in samples
+    ]
+    return representative_day_ahead(leads) if leads else None
+
+
+def _ranked_choice(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    day_ahead: int,
+    blend_depth: int,
+    rank_cache: _RankCache,
+) -> list[int]:
+    """The cell's choice (11.3): the first ``blend_depth`` confident rows of
+    the ranking at ``day_ahead``, in the ladder's order."""
+    key = (variable, day_ahead)
+    if key not in rank_cache:
+        rank_cache[key] = forecast_ranking_with_status(
+            conn, site_id=site_id, variable=variable, day_ahead=day_ahead
+        )
+    confident = sorted(
+        (row for row in rank_cache[key].rows.values() if row.confident),
+        key=lambda row: confident_order_key(row.skill_score, row.source, row.model),
+    )
+    return [row.feed_id for row in confident[:blend_depth]]
+
+
+def _substitute_serves(
+    chosen: list[int], selection: CellSelection, stale_ids: set[int]
+) -> bool:
+    """Whether a feed of the cell's choice is stale and out of its blend set."""
+    served = {candidate.feed_id for candidate in selection.feeds}
+    return any(feed_id in stale_ids and feed_id not in served for feed_id in chosen)
+
+
 def _wind_meta_and_values(
     selection: CellSelection,
     *,
     feeds_samples: dict[int, list[FutureSampleRow]],
     stale_ids: set[int],
     unknown_ids: set[int],
+    substitute: bool,
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Weighted wind cell: every chosen feed contributes, none is dropped.
 
     Wind does not use the clearing-subset path: the values come from all of
     ``selection.feeds`` (each already has at least ``MIN_RUN_HOURS`` hours),
     so ``partial`` is never set, and the ranking rebuild does not move the
-    state because the leaderboard does not choose these feeds.
+    state because the leaderboard does not choose these feeds. ``substitute``
+    is the caller's (11.3); an unavailable cell has none serving, so False.
     """
     if not selection.available:
         return (
@@ -711,6 +788,7 @@ def _wind_meta_and_values(
                 extrema_state="not_available",
                 contributor_ids=(),
                 fetch_unknown=False,
+                substitute=False,
             ),
             {},
         )
@@ -740,6 +818,7 @@ def _wind_meta_and_values(
         extrema_state="not_available",
         contributor_ids=contributor_ids,
         fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
+        substitute=substitute,
     )
     return meta, values
 
@@ -751,6 +830,7 @@ def _cell_meta_and_values(
     stale_ids: set[int],
     unknown_ids: set[int],
     rebuilding_by_feed: dict[int, bool],
+    substitute: bool,
 ) -> tuple[CellMeta, dict[int, list[float]]]:
     """Apply the coverage rules; return cell meta + per-feed value lists.
 
@@ -768,7 +848,8 @@ def _cell_meta_and_values(
     outside the clearing subset, for both variables ``stale`` also covers
     every extrema feed, and ``extrema_state`` is the extrema set's own verdict
     under :func:`_state_of`'s precedence. ``fetch_unknown`` covers the same
-    contributor feeds as ``stale``.
+    contributor feeds as ``stale``. ``substitute`` is the caller's (11.3);
+    an unavailable cell has none serving, so False.
     """
     if not selection.available:
         return (
@@ -781,6 +862,7 @@ def _cell_meta_and_values(
                 extrema_state="not_available",
                 contributor_ids=(),
                 fetch_unknown=False,
+                substitute=False,
             ),
             {},
         )
@@ -828,6 +910,7 @@ def _cell_meta_and_values(
         extrema_state=extrema_state,
         contributor_ids=contributor_ids,
         fetch_unknown=any(feed_id in unknown_ids for feed_id in contributor_ids),
+        substitute=substitute,
     )
     return meta, values
 
@@ -894,6 +977,7 @@ def _build_tile(
         stale=any(meta.stale for meta in populated),
         partial=any(meta.partial for meta in populated),
         fetch_unknown=any(meta.fetch_unknown for meta in populated),
+        substitute=any(meta.substitute for meta in populated),
     )
 
 

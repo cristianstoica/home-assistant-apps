@@ -67,12 +67,22 @@ def test_a_cli_under_capsys(
         lg = logging.getLogger(name)
         BEFORE[f"{name}_snapshot"] = (lg.level, list(lg.filters))
 
-    rc = main(["--db", str(db_path), "timezone", "status"])
+    rc = main(
+        [
+            "--db",
+            str(db_path),
+            "jobs",
+            "purge",
+            "--dry-run",
+            "--failed-older-than-hours",
+            "1",
+        ]
+    )
     out = capsys.readouterr().out
 
     assert rc == 0, f"CLI must exit 0; got {rc}"
-    assert "no timezone generations" in out, (
-        f"expected the empty-generations message; got: {out!r}"
+    assert "would_purge failed_jobs=0 older_than_hours=1" in out, (
+        f"expected the empty-purge message; got: {out!r}"
     )
 
     # Premise checks: basicConfig(force=True) actually ran and actually

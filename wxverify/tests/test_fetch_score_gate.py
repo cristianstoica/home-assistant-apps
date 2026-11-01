@@ -8,7 +8,6 @@ in 2035 (plan §11).
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import types
@@ -17,16 +16,15 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-import httpx
 import pytest
 
 import wxverify.core.timeutil as timeutil_module
 from wxverify import config
-from wxverify.core.timeutil import day_ahead, isoformat_utc
+from wxverify.core.timeutil import day_ahead, utc_now
 from wxverify.db import queue as queue_module
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.queue import Job, claim_next_job, complete, enqueue_if_absent
+from wxverify.db.queue import claim_next_job, complete, enqueue_if_absent
 from wxverify.feeds.seam import CostEstimate, FetchResult, NormalizedSample
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import leaderboard_with_status
@@ -40,12 +38,12 @@ from wxverify.settings.service import set_rolling_window_days_sync
 from wxverify.worker import feed_fetch as feed_fetch_module
 from wxverify.worker import scheduler as scheduler_module
 from wxverify.worker.feed_fetch import (
+    DownloadSlot,
     FeedFetchTarget,
     _persist_fetch_success,
     fetch_feed_once,
 )
-from wxverify.worker.processor import dispatch, run_claimed_job
-from wxverify.worker.scheduler import scheduler_tick
+from wxverify.worker.processor import run_claimed_job
 
 _SITE_NAME = "Testsite"
 _LAT = 12.3456
@@ -140,9 +138,9 @@ def _seed_obs(
 
 
 def _published_generation_id(conn: sqlite3.Connection, site_id: int) -> int:
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
-    return ensure_published_generation(conn, site_id)
+    return ensure_site_generation(conn, site_id)
 
 
 def _seed_pair(
@@ -263,29 +261,6 @@ def test_probe_already_published_pair_returns_false() -> None:
         tz_generation_id=tz_gen,
     )
     assert real_model_pair_pending(conn, (sample_id,)) is False
-
-
-def test_probe_pair_under_unpublished_generation_still_pends() -> None:
-    conn = _conn()
-    _seed_site(conn)
-    sample_id, feed_id = _candidate(conn)
-    # A second, NOT-published generation for the same site.
-    cur = conn.execute(
-        "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-        " VALUES (1, 'UTC', 'initial', 'building')"
-    )
-    other_gen = cur.lastrowid
-    assert other_gen is not None
-    _seed_pair(
-        conn,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2035-03-01T00:00:00Z",
-        valid_at="2035-03-02T00:30:00Z",
-        lead_hours=1,
-        tz_generation_id=int(other_gen),
-    )
-    assert real_model_pair_pending(conn, (sample_id,)) is True
 
 
 @pytest.mark.parametrize(
@@ -712,8 +687,6 @@ def test_gate_live_path_injected_enqueue_failure_rolls_back_fetch(
     writer = FencedWriter(db, db.generation) if fenced else None
 
     class _PairableAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -728,11 +701,23 @@ def test_gate_live_path_injected_enqueue_failure_rolls_back_fetch(
     def _raise_enqueue(*args: Any, **kwargs: Any) -> None:
         raise sqlite3.OperationalError("synthetic enqueue failure")
 
-    monkeypatch.setattr(feed_fetch_module, "enqueue_if_absent", _raise_enqueue)
+    monkeypatch.setattr("wxverify.scoring.engine.enqueue_if_absent", _raise_enqueue)
 
     with pytest.raises(sqlite3.OperationalError):
         asyncio.run(
-            fetch_feed_once(db, site_id, feed_id, writer=writer, adapter_builder=_build)
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                writer=writer,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
         )
 
     assert (
@@ -766,8 +751,6 @@ def test_gate_live_path_probe_error_rolls_back_fetch(
     writer = FencedWriter(db, db.generation) if fenced else None
 
     class _PairableAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -789,7 +772,19 @@ def test_gate_live_path_probe_error_rolls_back_fetch(
 
     with pytest.raises(sqlite3.DatabaseError) as excinfo:
         asyncio.run(
-            fetch_feed_once(db, site_id, feed_id, writer=writer, adapter_builder=_build)
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                writer=writer,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
         )
 
     assert excinfo.value is exc
@@ -1267,231 +1262,15 @@ def test_window_boot_rollback_restores_setting_jobs_and_cache() -> None:
     assert _cache_count("w:all") == before_wall
 
 
-# ---------------------------------------------------------------------------
-# 11.4 Backstop (T-backstop-*)
-# ---------------------------------------------------------------------------
-
-
 def _freeze(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
     """Patch both name-imported ``utc_now`` call sites to the same instant."""
     monkeypatch.setattr(queue_module, "utc_now", lambda: moment)
     monkeypatch.setattr(scheduler_module, "utc_now", lambda: moment)
 
 
-def _seed_resolved_score_job(
-    conn: sqlite3.Connection,
-    site_id: int,
-    at: datetime,
-    status: str,
-    *,
-    result: str | None = None,
-) -> int:
-    """Hand-seed a pair_and_score job already resolved to ``status`` at
-    instant ``at``, in the exact row shape ``complete()``/``fail()`` write
-    (status + updated_at; ``result`` NULL unless given). Hand-seeding, not a
-    call through ``complete()``/``fail()``, because those write ``updated_at``
-    via ``isoformat_utc()``'s own default, which reads ``utc_now`` from
-    ``wxverify.core.timeutil``'s namespace -- a third name-import this
-    helper would otherwise have to patch on top of the two the backstop
-    due-check itself reads."""
-    stamp = at.isoformat().replace("+00:00", "Z")
-    cur = conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, result,"
-        " updated_at) VALUES ('pair_and_score', ?, 'score', '{}', ?, ?, ?)",
-        (site_id, status, result, stamp),
-    )
-    conn.commit()
-    job_id = cur.lastrowid
-    assert job_id is not None
-    return job_id
-
-
-_T = datetime(2035, 3, 10, 0, 0, 0, tzinfo=UTC)
-
-
-def test_backstop_no_prior_score_job_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-
-    _freeze(monkeypatch, _T)
-    scheduler_tick(conn)
-
-    assert _score_jobs_for_site(conn, 1) == []
-
-
-def test_backstop_fresh_completion_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=6) - timedelta(seconds=1))
-    scheduler_tick(conn)
-
-    # No NEW pair_and_score row beyond the one already resolved.
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
-
-
-def test_backstop_due_refresh_queues_one_job_via_the_full_tick(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=6))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[0]["status"] == "completed"
-    assert rows[1]["status"] == "pending"
-
-
-def test_backstop_recent_failure_stays_in_cooldown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "failed")
-
-    _freeze(monkeypatch, _T + timedelta(minutes=59))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "failed"
-
-
-def test_backstop_old_failure_is_retried(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "failed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=1))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[0]["status"] == "failed"
-    assert rows[1]["status"] == "pending"
-
-
-def test_backstop_unreadable_stamp_queues_once_and_warns_once(
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _freeze(monkeypatch, _T)
-    seeded = enqueue_if_absent(conn, "pair_and_score", 1, "score", {"site_id": 1})
-    assert seeded.job_id is not None
-    conn.execute(
-        "UPDATE jobs SET status='completed', updated_at='not-a-stamp' WHERE id=?",
-        (seeded.job_id,),
-    )
-    conn.commit()
-
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
-        scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[1]["status"] == "pending"
-    warnings = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "score refresh: unreadable updated_at" in r.getMessage()
-    ]
-    assert len(warnings) == 1
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
-        scheduler_tick(conn)
-
-    # The bad-stamp row is untouched (still status='completed' with the same
-    # bad stamp) and the new pending row dedupes the second tick, so no new
-    # row and no new warning.
-    assert len(_score_jobs_for_site(conn, 1)) == 2
-    assert [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "score refresh: unreadable updated_at" in r.getMessage()
-    ] == []
-
-
-def test_backstop_active_row_dedupes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _freeze(monkeypatch, _T)
-    seeded = enqueue_if_absent(conn, "pair_and_score", 1, "score", {"site_id": 1})
-    assert seeded.job_id is not None
-
-    _freeze(monkeypatch, _T + timedelta(hours=7))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["id"] == seeded.job_id
-    assert rows[0]["status"] == "pending"
-
-
-def test_backstop_disabled_site_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn, enabled=0)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=7))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
-
-
-def test_backstop_cancelled_completion_counts_as_fresh(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-    # The helper's complete() call leaves result=NULL already (a "cancelled
-    # completion" per the backstop's own docstring); assert that precondition
-    # before relying on it.
-    row = _score_jobs_for_site(conn, 1)[0]
-    assert (
-        conn.execute("SELECT result FROM jobs WHERE id = ?", (row["id"],)).fetchone()[
-            "result"
-        ]
-        is None
-    )
-
-    _freeze(monkeypatch, _T + timedelta(hours=5))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
-
-
 # ---------------------------------------------------------------------------
 # 11.3 Obs (T-obs-1, T-obs-2, T-obs-3)
 # ---------------------------------------------------------------------------
-
-_OBS_API_KEY = "0123456789abcdef0123456789abcdef"
 
 
 def _init_tmp_obs_db(tmp_path: Path) -> sqlite3.Connection:
@@ -1501,209 +1280,6 @@ def _init_tmp_obs_db(tmp_path: Path) -> sqlite3.Connection:
     config.options_path = str(tmp_path / "missing-options.json")
     db = init_db(str(db_path))
     return db._conn  # noqa: SLF001 -- tests inspect the real writer connection
-
-
-def _seed_obs_site_and_stations(
-    conn: sqlite3.Connection, station_ids: list[str]
-) -> tuple[int, dict[str, int]]:
-    site_id = int(
-        conn.execute(
-            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-            " timezone) VALUES (?, ?, ?, 100.0, 'UTC')",
-            (_SITE_NAME, _LAT, _LON),
-        ).lastrowid
-    )
-    ids: dict[str, int] = {}
-    for pws_id in station_ids:
-        ids[pws_id] = int(
-            conn.execute(
-                "INSERT INTO stations"
-                " (site_id, pws_station_id, lat, lon, dem_elevation_m)"
-                " VALUES (?, ?, ?, ?, 100.0)",
-                (site_id, pws_id, _LAT, _LON),
-            ).lastrowid
-        )
-    return site_id, ids
-
-
-def _obs_payload_response(readings: list[tuple[str, float]]) -> httpx.Response:
-    """A 200 whose body decodes to one temperature observation per reading
-    (only ``metric.temp`` is populated)."""
-    body = {
-        "observations": [
-            {"obsTimeUtc": stamp, "metric": {"temp": value}}
-            for stamp, value in readings
-        ]
-    }
-    return httpx.Response(
-        200,
-        content=json.dumps(body).encode(),
-        headers={"content-type": "application/json"},
-    )
-
-
-def _empty_obs_response() -> httpx.Response:
-    return httpx.Response(200, content=b'{"observations": []}')
-
-
-def _run_fetch_obs(
-    db: object, writer: FencedWriter, site_id: int, handler: object
-) -> None:
-    real_client = httpx.AsyncClient
-    with patch(
-        "wxverify.worker.processor.httpx.AsyncClient",
-        lambda *a, **kw: real_client(transport=httpx.MockTransport(handler)),  # type: ignore[arg-type]
-    ):
-        asyncio.run(
-            dispatch(
-                db,  # type: ignore[arg-type]
-                writer,
-                Job(
-                    id=1,
-                    type="fetch_obs",
-                    site_id=site_id,
-                    job_key="obs",
-                    payload={},
-                    status="running",
-                    retry_count=0,
-                    max_retries=5,
-                ),
-            )
-        )
-
-
-def test_obs_abort_after_a_changed_station_still_queues_that_stations_pair_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Regression pin for §3's lost trigger: a later station's transport
-    error must not drop the score-run trigger a changed earlier station
-    already queued (``_persist_station_observations``'s own per-station
-    enqueue, see M12)."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        if station == "ISTATION01":
-            return _obs_payload_response([("2035-03-01T11:00:00Z", 10.0)])
-        if station == "ISTATION02":
-            return _empty_obs_response()
-        raise httpx.ConnectError("synthetic", request=request)
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-    with pytest.raises(httpx.ConnectError):
-        _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT status FROM jobs WHERE type='pair_and_score' AND site_id=?",
-        (site_id,),
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["status"] == "pending"
-
-
-def test_obs_no_change_across_every_station_queues_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every station reports only a reading already stored byte-for-byte --
-    not an empty payload, which `_persist_station_observations` would never
-    even reach the `changed` computation for. Seed via a real fetch cycle
-    first (so the stored row has the exact value/qc_flag/source_raw the
-    repeat response will be compared against), retire that cycle's job, then
-    replay the identical payload and confirm nothing new is queued."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    # Freeze "now" inside every reading's RECENT_REFRESH_HOURS window so the
-    # replay cycle below doesn't park a station for "no recent history" --
-    # that park check runs off the real wall clock otherwise, and would
-    # skip every station on the second cycle regardless of the gate under
-    # test, hiding the mutant this test must kill.
-    moment = datetime(2035, 3, 1, 13, 30, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.processor.utc_now", lambda: moment)
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        return _obs_payload_response([(f"2035-03-01T1{station[-1]}:00:00Z", 10.0)])
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    # Seed: a first cycle stores each station's reading (and does queue a
-    # score run -- that is the paired positive this test leans on: the gate
-    # fires on real change). Retire that job so the dedupe check below can't
-    # mask the second cycle's own enqueue decision.
-    _run_fetch_obs(db, writer, site_id, handler)
-    stored_before = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations"
-    ).fetchone()["n"]
-    assert stored_before > 0
-    seeded_job = conn.execute(
-        "SELECT id FROM jobs WHERE type='pair_and_score' AND site_id=?", (site_id,)
-    ).fetchone()
-    assert seeded_job is not None
-    conn.execute("UPDATE jobs SET status='completed' WHERE id=?", (seeded_job["id"],))
-    conn.commit()
-
-    # Replay: every station now reports exactly what's already on file.
-    _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT 1 FROM jobs WHERE type='pair_and_score' AND site_id=?"
-        " AND status IN ('pending', 'running')",
-        (site_id,),
-    ).fetchall()
-    assert rows == []
-    stored_after = conn.execute(
-        "SELECT COUNT(*) AS n FROM station_observations"
-    ).fetchone()["n"]
-    assert stored_after == stored_before
-
-
-def test_obs_full_success_queues_exactly_one_deduped_pair_job(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every station reports a new observation: the per-station enqueue
-    (M12) and ``_complete_obs_cycle``'s cycle-end enqueue must dedupe to one
-    row, not stack."""
-    conn = _init_tmp_obs_db(tmp_path)
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", _OBS_API_KEY)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.pace_station_call",
-        lambda site_id, station_id, ordinal: asyncio.sleep(0),
-    )
-    site_id, ids = _seed_obs_site_and_stations(
-        conn, ["ISTATION01", "ISTATION02", "ISTATION03"]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        station = str(request.url.params["stationId"])
-        return _obs_payload_response([(f"2035-03-01T1{station[-1]}:00:00Z", 10.0)])
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-    _run_fetch_obs(db, writer, site_id, handler)
-
-    rows = conn.execute(
-        "SELECT status FROM jobs WHERE type='pair_and_score' AND site_id=?",
-        (site_id,),
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["status"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -1829,38 +1405,6 @@ async def _run_queued_pair_and_score(db: object) -> None:
     await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
 
 
-def _claim_pair_and_score_only(conn: sqlite3.Connection, site_id: int) -> Job | None:
-    """Claim the pending ``pair_and_score`` row for ``site_id`` directly,
-    the same status transition ``claim_next_job``'s ``_claim`` performs,
-    but filtered to this type and site. ``scheduler_tick`` also queues an
-    unrelated daily ``forecast_record`` job once the site's local snapshot
-    time has passed (§14), and that job type claims ahead of everything
-    else by design -- ``claim_next_job`` would hand back that job instead
-    of the one this test means to run, and (in this fixture, with no
-    station/network stub) that job fails and is re-claimed every tick."""
-    row = conn.execute(
-        "UPDATE jobs SET status = 'running', updated_at = ?"
-        " WHERE id = (SELECT id FROM jobs WHERE type = 'pair_and_score'"
-        " AND site_id = ? AND status = 'pending' ORDER BY created_at, id"
-        " LIMIT 1)"
-        " RETURNING id, type, site_id, job_key, payload, status,"
-        " retry_count, max_retries",
-        (isoformat_utc(), site_id),
-    ).fetchone()
-    if row is None:
-        return None
-    return Job(
-        id=row["id"],
-        type=row["type"],
-        site_id=row["site_id"],
-        job_key=row["job_key"],
-        payload=json.loads(row["payload"]),
-        status=row["status"],
-        retry_count=row["retry_count"],
-        max_retries=row["max_retries"],
-    )
-
-
 def _rank_skill_scores(
     conn: sqlite3.Connection, site_id: int, feed_a: int, feed_b: int
 ) -> tuple[str, float, float]:
@@ -1881,14 +1425,12 @@ def _rank_skill_scores(
     return result.status, skill_a, skill_b
 
 
-def test_rank_order_follows_real_pairing_then_backstop_recomputes(
+def test_rank_order_follows_real_pairing_then_stale_cache_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T-rank steps 1, 2 and 4: the real job path's leaderboard order at
-    T0, a stale-cache read 4h later that leaves it unchanged, and the time
-    backstop's recompute 6h later that flips it (matching the twin
-    fixture's order in
-    ``test_rank_twin_fixture_confirms_the_order_is_not_vacuous``)."""
+    """T-rank steps 1 and 2: the real job path's leaderboard order at T0,
+    and a stale-cache read 4h later (a future-only, unpairable sample) that
+    leaves it unchanged."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
     site_id, feed_a, feed_b = _seed_rank_fixture(conn, _RANK_T0)
@@ -1947,55 +1489,6 @@ def test_rank_order_follows_real_pairing_then_backstop_recomputes(
         "the stale cache must still serve O0 unchanged"
     )
 
-    # Step 4: the backstop queues nothing at T0+6h-1s, one job at T0+6h;
-    # running it recomputes and must flip the order (matching the twin's
-    # O1 below).
-    before_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score' AND site_id = ?",
-        (site_id,),
-    ).fetchone()["n"]
-
-    almost_due = _RANK_T0 + timedelta(hours=6) - timedelta(seconds=1)
-    _freeze_rank(monkeypatch, almost_due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score'"
-            " AND site_id = ?",
-            (site_id,),
-        ).fetchone()["n"]
-        == before_count
-    )
-
-    due = _RANK_T0 + timedelta(hours=6)
-    _freeze_rank(monkeypatch, due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score'"
-            " AND site_id = ?",
-            (site_id,),
-        ).fetchone()["n"]
-        == before_count + 1
-    )
-
-    async def _run_backstop() -> None:
-        job = await db.write(  # type: ignore[attr-defined]
-            lambda c: _claim_pair_and_score_only(c, site_id)
-        )
-        assert job is not None and job.type == "pair_and_score", job
-        await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
-
-    asyncio.run(_run_backstop())
-
-    with patch.object(timeutil_module, "utc_now", lambda: due):
-        status2, skill_a2, skill_b2 = _rank_skill_scores(conn, site_id, feed_a, feed_b)
-    assert status2 == "hit"
-    assert skill_b2 > skill_a2, (
-        "the backstop's recompute must flip the order: B above A, as in"
-        " the twin fixture's O1"
-    )
-
 
 def test_rank_twin_fixture_confirms_the_order_is_not_vacuous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2003,7 +1496,7 @@ def test_rank_twin_fixture_confirms_the_order_is_not_vacuous(
     """T-rank step 3, the non-vacuity guard: the identical fixture, scored
     at T1 instead of T0, must give the opposite order. If it did not, O0's
     assertions in
-    ``test_rank_order_follows_real_pairing_then_backstop_recomputes`` would
+    ``test_rank_order_follows_real_pairing_then_stale_cache_unchanged`` would
     hold for a fixture-independent reason and the test would be vacuous."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
@@ -2065,13 +1558,11 @@ def _seed_sweep_fixture(conn: sqlite3.Connection, t0: datetime) -> tuple[int, in
     return site_id, feed_a, feed_c
 
 
-def test_sweep_stale_feed_set_rebuilds_then_the_backstop_clears_its_cache_rows(
+def test_sweep_stale_feed_set_marks_the_cache_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T-sweep: a feed whose only pairs fall out of the rolling window
-    between T0 and T1 makes the cached feed set stale (``rebuilding``), and
-    the backstop's recompute at T0+6h drops its rolling-window
-    ``score_cache`` rows, restoring ``hit``."""
+    between T0 and T1 makes the cached feed set stale (``rebuilding``)."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
     site_id, feed_a, feed_c = _seed_sweep_fixture(conn, _RANK_T0)
@@ -2111,44 +1602,3 @@ def test_sweep_stale_feed_set_rebuilds_then_the_backstop_clears_its_cache_rows(
         )
     assert result1.status == "rebuilding"
     assert result1.rows == []
-
-    due = _RANK_T0 + timedelta(hours=6)
-    _freeze_rank(monkeypatch, due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT 1 FROM jobs WHERE type = 'pair_and_score' AND site_id = ?"
-            " AND status = 'pending'",
-            (site_id,),
-        ).fetchone()
-        is not None
-    )
-
-    async def _run_backstop() -> None:
-        job = await db.write(  # type: ignore[attr-defined]
-            lambda c: _claim_pair_and_score_only(c, site_id)
-        )
-        assert job is not None and job.type == "pair_and_score", job
-        await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
-
-    asyncio.run(_run_backstop())
-
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM score_cache WHERE feed_id = ?"
-            " AND window_key = 'w:30'",
-            (feed_c,),
-        ).fetchone()["n"]
-        == 0
-    ), "the backstop's recompute must drop C's stale rolling-window row"
-
-    with patch.object(timeutil_module, "utc_now", lambda: due):
-        result2 = leaderboard_with_status(
-            conn,
-            site_id=site_id,
-            variable="temperature",
-            day_ahead=1,
-            window="rolling",
-        )
-    assert result2.status == "hit"
-    assert feed_c not in {r.feed_id for r in result2.rows}

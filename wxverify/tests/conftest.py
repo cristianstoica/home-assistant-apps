@@ -47,6 +47,13 @@ and its known limits are in the fixture's own docstring.
 ``tests/test_cli_logging_isolation.py`` run its regression check in a
 separate pytest subprocess, so the CLI's ``basicConfig(force=True)`` fires
 in a fresh session instead of against this session's own root handlers.
+
+``_check_day_close_records`` (autouse; plan 2026-10-20-daily-close-day-
+state-and-guard.md §13.1) calls ``tests.helpers.check_day_close_records``
+after every test. With no connection registered by
+``tests.helpers.day_close_site`` it does nothing, so the existing suite is
+untouched; a daily-close test that forgets ``note_day_clock`` for a later
+clock fails here instead of silently passing on a wrong one.
 """
 
 import asyncio
@@ -85,6 +92,20 @@ def _reset_export_sweeper_death() -> None:
 def _deny_network() -> Iterator[None]:
     """Fail any test that tries to leave the process over a socket."""
     yield from deny_network_scope()
+
+
+@pytest.fixture(autouse=True)
+def _check_day_close_records() -> Iterator[None]:
+    """Check daily-close ``site_days`` records stop at the clock a test used.
+
+    Imported inside the fixture body rather than at module top, since the
+    module it comes from (``tests.helpers``) imports ``wxverify.db.site_days``
+    lazily, from inside ``day_close_site``, before that module exists.
+    """
+    yield
+    from tests.helpers import check_day_close_records
+
+    check_day_close_records()
 
 
 @pytest.fixture(autouse=True)

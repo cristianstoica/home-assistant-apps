@@ -25,8 +25,8 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
-from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX, PAIR_MAX_WIND_SQL
+from wxverify.db.switch import ensure_site_generation
+from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX
 from wxverify.scoring.consensus import (
     insert_station_observation,
     write_station_observation,
@@ -34,7 +34,6 @@ from wxverify.scoring.consensus import (
 from wxverify.scoring.engine import _distinct_cells  # noqa: PLC2701 - direct unit test
 from wxverify.scoring.pairing import compute_real_model_pairs
 from wxverify.scoring.persistence import compute_persistence_pairs
-from wxverify.worker.processor import _enabled_stations  # noqa: PLC2701
 
 
 def _make_db() -> sqlite3.Connection:
@@ -424,7 +423,7 @@ def test_persistence_pairing_reader_ignores_wind_basis_state(
 
 
 def _seed_published_wind_pair(conn: sqlite3.Connection, site: int, feed: int) -> None:
-    generation = ensure_published_generation(conn, site)
+    generation = ensure_site_generation(conn, site)
     conn.execute(
         "INSERT INTO forecast_pairs"
         " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
@@ -445,7 +444,7 @@ def test_distinct_cells_reader_ignores_wind_basis_state(state: str | None) -> No
     _seed_published_wind_pair(conn, site, feed)
     # Also a temperature cell: the reader returns wind's cell alongside the
     # other variables', not in place of them.
-    generation = ensure_published_generation(conn, site)
+    generation = ensure_site_generation(conn, site)
     conn.execute(
         "INSERT INTO forecast_pairs (site_id, feed_id, variable, issued_at,"
         " valid_at, lead_hours, day_ahead, forecast, observed, error,"
@@ -461,56 +460,11 @@ def test_distinct_cells_reader_ignores_wind_basis_state(state: str | None) -> No
     assert "temperature" in variables
 
 
-# --- T27 -----------------------------------------------------------------
-
-
-def test_watermark_excludes_wind_written_rows() -> None:
-    """A lane-written wind row later than the site's last temperature row
-    must not move the watermark the live fetch path uses to decide what's
-    new. mutant_filter_dropped -> at this assertion: correct =
-    '2026-07-01T03:00:00Z' (the temperature row), mutant (the
-    ``variable != 'wind'`` filter dropped from the subselect) = the later
-    wind timestamp."""
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    conn.execute(
-        "INSERT INTO station_observations (station_id, variable, valid_at,"
-        " value, qc_flag, source_raw, fetched_at) VALUES"
-        " (?, 'temperature', '2026-07-01T03:00:00Z', 15.0, 'ok', '15.0', ?)",
-        (station, isoformat_utc()),
-    )
-    conn.execute(
-        "INSERT INTO station_observations (station_id, variable, valid_at,"
-        " value, qc_flag, source_raw, fetched_at) VALUES"
-        " (?, 'wind', '2026-07-01T09:00:00Z', 12.0, 'ok', 'pair-max 12.0', ?)",
-        (station, isoformat_utc()),
-    )
-    targets = _enabled_stations(conn, site)
-    assert len(targets) == 1
-    assert targets[0].obs_watermark_at == "2026-07-01T03:00:00Z"
-
-
-def test_watermark_is_none_when_only_wind_rows_exist() -> None:
-    conn = _make_db()
-    site = _make_site(conn)
-    station = _make_station(conn, site, "KTEST001")
-    conn.execute(
-        "INSERT INTO station_observations (station_id, variable, valid_at,"
-        " value, qc_flag, source_raw, fetched_at) VALUES"
-        " (?, 'wind', '2026-07-01T09:00:00Z', 12.0, 'ok', 'pair-max 12.0', ?)",
-        (station, isoformat_utc()),
-    )
-    targets = _enabled_stations(conn, site)
-    assert targets[0].obs_watermark_at is None
-
-
 # --- T28 -----------------------------------------------------------------
 
 
 def test_pair_max_source_prefix_is_nine_chars_and_in_the_sql_fragment() -> None:
     assert len(PAIR_MAX_SOURCE_PREFIX) == 9
-    assert PAIR_MAX_SOURCE_PREFIX in PAIR_MAX_WIND_SQL
 
 
 # --- T110 --------------------------------------------------------------
@@ -555,12 +509,13 @@ class _WriteStationObservationCallFinder(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def test_write_station_observation_called_only_from_the_two_allowed_sites() -> None:
+def test_write_station_observation_called_only_from_the_allowed_sites() -> None:
     """mutant_new_caller -> at this assertion: correct = every call site is
-    inside ``scoring/consensus.py`` (``insert_station_observation``) or
-    ``worker/wind_days.py``; mutant (a third module calls it directly,
-    bypassing the guard) adds a file this assertion does not allow."""
-    allowed_files = {"consensus.py", "wind_days.py"}
+    inside ``scoring/consensus.py`` (``insert_station_observation``),
+    ``worker/wind_days.py``, or ``worker/day_values.py``; mutant (a
+    fourth module calls it directly, bypassing the guard) adds a file
+    this assertion does not allow."""
+    allowed_files = {"consensus.py", "wind_days.py", "day_values.py"}
     violations: list[str] = []
     for path in sorted(_WXVERIFY_SRC.rglob("*.py")):
         if path.name == "consensus.py":

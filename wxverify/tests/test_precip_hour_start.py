@@ -2,14 +2,13 @@
 
 Open-Meteo and meteoblue document rain by the END of the hour; wxverify's
 other feeds already label by the start. ``precip_hour_start`` converts a
-raw end-of-hour label to wxverify's start-of-hour convention, and
-``previous_run_lead_hours`` gives the previous-runs lead for a variable/day
-pair under that convention. Both are new symbols, imported inside each
-test body so a missing or misnamed symbol fails only that test.
+raw end-of-hour label to wxverify's start-of-hour convention. It is a new
+symbol, imported inside each test body so a missing or misnamed symbol
+fails only that test.
 
-Every new symbol is tried first at ``wxverify.feeds.open_meteo`` (where the
-forward and historical normalization that calls it both live); if the
-implementation lands elsewhere this import line is the one place to fix.
+The new symbol is tried first at ``wxverify.feeds.open_meteo`` (where the
+forward normalization that calls it lives); if the implementation lands
+elsewhere this import line is the one place to fix.
 
 Synthetic data only: no place name, coordinate, or non-UTC zone appears.
 """
@@ -74,13 +73,6 @@ def test_open_meteo_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_lab
     assert temperature["2026-07-15T03:00:00Z"].lead_hours == 3
 
 
-def test_previous_run_lead_hours_precip_is_one_less_than_temperature() -> None:
-    from wxverify.feeds.open_meteo import previous_run_lead_hours
-
-    assert previous_run_lead_hours("precip", 2) == 47
-    assert previous_run_lead_hours("temperature", 2) == 48
-
-
 def test_meteoblue_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_label() -> (
     None
 ):
@@ -127,46 +119,6 @@ def test_meteoblue_forward_precip_dropped_at_lead_zero_shifted_to_the_prior_labe
     assert "2026-07-15T03:00:00Z" not in precip
     assert temperature["2026-07-15T03:00:00Z"].value == 12.0
     assert temperature["2026-07-15T03:00:00Z"].lead_hours == 3
-
-
-def test_historical_window_filter_runs_on_the_converted_precip_time() -> None:
-    # The historical window is [window_start, window_end). A raw precip
-    # hour exactly AT window_start converts to one hour BEFORE window_start
-    # and must be excluded; the next raw hour converts to exactly
-    # window_start and must be kept -- the filter must act on the converted
-    # label, not the raw one.
-    from wxverify.core.timeutil import parse_utc
-    from wxverify.feeds.open_meteo import _historical_series_samples
-    from wxverify.feeds.seam import ForecastRequest
-
-    req = ForecastRequest(
-        lat=0.0, lon=0.0, model="icon_eu", variables=("precip",), max_lead_hours=72
-    )
-    start = parse_utc("2026-07-10T00:00:00Z")
-    end = parse_utc("2026-07-11T00:00:00Z")
-
-    excluded = _historical_series_samples(
-        req=req,
-        variable="precip",
-        day=2,
-        times=["2026-07-10T00:00:00Z"],
-        values=[5.0],
-        start=start,
-        end=end,
-    )
-    assert excluded == []
-
-    kept = _historical_series_samples(
-        req=req,
-        variable="precip",
-        day=2,
-        times=["2026-07-10T01:00:00Z"],
-        values=[5.0],
-        start=start,
-        end=end,
-    )
-    assert len(kept) == 1
-    assert kept[0].valid_at == "2026-07-10T00:00:00Z"
 
 
 def test_open_meteo_forward_temperature_and_wind_columns_unchanged() -> None:

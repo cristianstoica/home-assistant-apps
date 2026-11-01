@@ -3,8 +3,8 @@
 Ported from py-weather's ``pyweather/cadence.py`` (the sibling add-on) with one
 deliberate adaptation: py-weather jitters the learned interval with an injected
 ``random.uniform``-backed ``JitterSource``; wxverify replaces that RNG seam with
-a deterministic blake2b hash-jitter (mirroring ``core.hashing.obs_jitter_minutes``)
-so scheduling is reproducible in tests with no RNG injection.
+a deterministic blake2b hash-jitter so scheduling is reproducible in tests with
+no RNG injection.
 
 The derivation is: parsed obstime gaps → median → ``* FACTOR`` → clamp to
 ``[min_interval, MAX_INTERVAL_SECONDS]`` → deterministic ±``JITTER_FRACTION``
@@ -38,7 +38,7 @@ STALE_FACTOR = 3
 # The deterministic jitter half-width as a fraction of the base interval:
 # the scheduled value lands in ``base * [1 - f, 1 + f]`` (py-weather's ±15%).
 JITTER_FRACTION = 0.15
-# blake2b keying seed, matching core.hashing.obs_jitter_minutes' construction.
+# blake2b keying seed.
 _JITTER_SEED = 1729
 
 
@@ -107,15 +107,14 @@ def obs_cadence_jitter(station_id: int, cycle_bucket: int, base_interval: int) -
     The wxverify adaptation of py-weather's ``JitterSource`` (``random.uniform(
     base*0.85, base*1.15)``): instead of live RNG, derive a signed offset in
     ``[-span, +span]`` where ``span = round(JITTER_FRACTION * base_interval)``,
-    keyed deterministically on ``(station_id, cycle_bucket)`` via blake2b — the
-    same construction as ``core.hashing.obs_jitter_minutes``. Returns the OFFSET
-    (add it to ``base_interval`` to get the scheduled value); a zero ``base_interval``
-    yields ``0``.
+    keyed deterministically on ``(station_id, cycle_bucket)`` via blake2b.
+    Returns the OFFSET (add it to ``base_interval`` to get the scheduled value);
+    a zero ``base_interval`` yields ``0``.
 
     ``cycle_bucket`` is a monotonic poll-cycle counter the caller supplies
-    (e.g. ``int(last_obs_epoch // base_interval)``, as ``scheduler._enqueue_due_obs``
-    already derives it): successive polls of the SAME station fall in different
-    buckets and so draw different offsets, spreading load without an RNG seam.
+    (e.g. ``int(last_obs_epoch // base_interval)``): successive polls of the
+    SAME station fall in different buckets and so draw different offsets,
+    spreading load without an RNG seam.
     """
     span = round(JITTER_FRACTION * base_interval)
     if span <= 0:

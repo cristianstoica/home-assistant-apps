@@ -25,7 +25,7 @@ import sqlite3
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
 from wxverify.obs.qc import TARGET_VARIABLES
 from wxverify.scoring.cache import upsert_score_cache
@@ -39,7 +39,6 @@ from wxverify.scoring.leaderboard import _expected_active_feed_ids, resolve_wind
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import get_number_setting, set_setting
 from wxverify.web.context import _scoring_feeds
-from wxverify.worker.backfill import BACKFILL_VARIABLES
 
 _FAR_VALID_ATS = ("2035-06-30T00:00:00Z", "2035-06-30T01:00:00Z")
 _FAR_LEAD_HOURS = (1, 2)
@@ -120,7 +119,7 @@ def _add_pair(
             valid_at,
             lead_hours,
             day_ahead,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -409,7 +408,10 @@ def test_scoring_feeds_match_distinct_form_including_order() -> None:
             lead_hours=_FAR_LEAD_HOURS[0],
         )
 
-    actual = [(ft.id, ft.source, ft.model) for ft in _scoring_feeds(conn, 1, "wind")]
+    actual = [
+        (ft.id, ft.source, ft.model)
+        for ft in _scoring_feeds(conn, 1, "wind", close_on=False)
+    ]
     expected = _reference_scoring_feeds(conn, site_id=1, variable="wind")
     assert actual == expected
     # Non-vacuous: source-alphabetical order actually differs from insertion
@@ -430,7 +432,6 @@ def test_cell_grid_covers_every_variable_the_pairing_writers_emit() -> None:
     produces."""
     assert set(FORECAST_VARIABLES) == set(FORECAST_SERVICE_VARIABLES)
     assert set(FORECAST_VARIABLES) == set(TARGET_VARIABLES)
-    assert set(FORECAST_VARIABLES) == set(BACKFILL_VARIABLES)
 
 
 def test_cell_grid_lead_bound_matches_schema_check() -> None:
@@ -521,7 +522,7 @@ def _seed_persistence_and_feed_pairs(
                 persistence_error,
                 abs(persistence_error),
                 persistence_sq_error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
         conn.execute(
@@ -542,7 +543,7 @@ def _seed_persistence_and_feed_pairs(
                 feed_error,
                 abs(feed_error),
                 feed_sq_error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 

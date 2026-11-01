@@ -4,13 +4,13 @@ Two families:
 
 - R1-R4: the leaderboard route's fire-and-forget rescore scheduling no
   longer blocks the read behind a held write lock.
-- E1-E8: ``run_batched_scoring`` (a read-side compute and bounded batch
-  applies under the input-epoch CAS) reaches the same end state as the
-  monolithic ``_score_all_windows`` run it
+- E1, E1b, E2, E3, E5-E7: ``run_batched_scoring`` (a read-side compute and
+  bounded batch applies under the input-epoch CAS) reaches the same end
+  state as the monolithic ``_score_all_windows`` run it
   replaces, never exposes a half-populated cache mid-run, and survives a
-  mid-run crash, site-disable, or an in-flight concurrent writer.
+  mid-run site-disable or an in-flight concurrent writer.
 
-R5 (cooldown) and the E1-E8 composite_with_status cross-check are out
+R5 (cooldown) and the composite_with_status cross-check are out
 of scope for this file.
 """
 
@@ -31,8 +31,7 @@ from wxverify import config
 from wxverify.api.routes.dashboard import leaderboard
 from wxverify.core.timeutil import isoformat_utc_micro
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
-from wxverify.db.queue import Job
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring import rescore as rescore_module
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.engine import (
@@ -44,9 +43,7 @@ from wxverify.scoring.leaderboard import leaderboard_with_status
 from wxverify.scoring.metrics import MetricResult
 from wxverify.scoring.rescore import drain_pending_rescores
 from wxverify.settings.keys import set_setting
-from wxverify.worker.catchup import run_catchup
 from wxverify.worker.control import JobCancelled
-from wxverify.worker.processor import run_worker
 from wxverify.worker.score_batches import run_batched_scoring
 
 _FROZEN_NOW = datetime(2035, 6, 15, 12, 0, 0, tzinfo=UTC)
@@ -131,7 +128,7 @@ def _seed_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -168,15 +165,6 @@ def _job_count(conn: sqlite3.Connection, site_id: int) -> int:
     return int(row["n"])
 
 
-def _insert_pair_and_score_job(conn: sqlite3.Connection, *, site_id: int) -> int:
-    cur = conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload) "
-        "VALUES ('pair_and_score', ?, 'score', '{}')",
-        (site_id,),
-    )
-    return int(cur.lastrowid)
-
-
 def _dump_score_cache(conn: sqlite3.Connection) -> list[dict[str, object]]:
     """Full ``score_cache`` snapshot excluding ``computed_at`` (the only
     column two independent runs may legitimately differ on)."""
@@ -201,49 +189,6 @@ async def _start_write_hold(db: Any, seconds: float) -> asyncio.Task[None]:
             raise TimeoutError("write lock was never observed held")
         await asyncio.sleep(0.01)
     return task
-
-
-class _StopLoop(Exception):
-    """Stops ``run_worker``'s loop after exactly one claimed job."""
-
-
-def _claim_once(job: Job) -> Any:
-    calls: list[int] = []
-
-    def _claim(conn: sqlite3.Connection) -> Job:
-        calls.append(1)
-        if len(calls) == 1:
-            return job
-        raise _StopLoop()
-
-    return _claim
-
-
-async def _idle_poller(db: object, *, run_job: object) -> None:
-    """A current-obs lane that never claims anything (plan §6.3.6)."""
-    await asyncio.Event().wait()
-
-
-def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Silence heartbeats, scheduler, and purge in worker loop tests.
-
-    Also idles the current-obs lane (plan §6.3.6): the one caller of this
-    helper (E4) pins an exact mid-run crash/retry sequence and an exact
-    ``score_cache`` row count via a patched ``claim_next_job``. A real
-    current-obs lane running concurrently against the same real ``db``
-    would add unrelated claim/write activity this test never seeded for
-    and was never written to tolerate.
-    """
-    monkeypatch.setattr(
-        "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
-    )
-    monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
-    monkeypatch.setattr(
-        "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
-    )
-    monkeypatch.setattr(
-        "wxverify.worker.processor.run_current_obs_poller", _idle_poller
-    )
 
 
 # --------------------------------------------------------------------------
@@ -861,133 +806,6 @@ def test_batched_scoring_mid_run_leaderboard_reads_never_partial_e3(
 
 
 # --------------------------------------------------------------------------
-# E4: crash/resume convergence
-# --------------------------------------------------------------------------
-
-
-def test_batched_scoring_crash_mid_run_marks_job_retry_then_converges_e4(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        _freeze_now(monkeypatch)
-        set_setting(conn, "min_n", "1")
-        set_setting(conn, "rolling_window_days", "14")
-
-        site_id = _make_site(conn, "e4-site")
-        feed_ids = _open_meteo_feed_ids(conn, 4)
-        for i, feed_id in enumerate(feed_ids):
-            _seed_pair(
-                conn,
-                site_id=site_id,
-                feed_id=feed_id,
-                variable="temperature",
-                day_ahead=1,
-                valid_at=f"2035-06-15T0{i}:00:00Z",
-            )
-        job_id = _insert_pair_and_score_job(conn, site_id=site_id)
-
-        clean_path = tmp_path / "e4_clean.db"
-        conn.execute("VACUUM INTO ?", (str(clean_path),))
-
-        monkeypatch.setattr("wxverify.worker.score_batches.SCORE_BATCH_CELLS", 2)
-        _patch_worker_infra(monkeypatch)
-
-        job = Job(
-            id=job_id,
-            type="pair_and_score",
-            site_id=site_id,
-            job_key="score",
-            payload={},
-            status="running",
-            retry_count=0,
-            max_retries=5,
-        )
-        db = get_db()
-        batches_seen = 0
-
-        async def _crashing_run_batched_scoring(inner_db: Any, sid: int) -> None:
-            nonlocal batches_seen
-
-            async def _hook() -> None:
-                nonlocal batches_seen
-                batches_seen += 1
-                if batches_seen == 1:
-                    raise RuntimeError("synthetic mid-run crash")
-
-            await run_batched_scoring(inner_db, sid, _hook)
-
-        monkeypatch.setattr(
-            "wxverify.worker.processor.run_batched_scoring",
-            _crashing_run_batched_scoring,
-        )
-        monkeypatch.setattr(
-            "wxverify.worker.processor.claim_next_job", _claim_once(job)
-        )
-
-        # _claim_once skips the real claim's status flip (queue.py:298).
-        conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
-        with pytest.raises(_StopLoop):
-            await run_worker(db)
-
-        # First batch (2 of 4 cells, w:14 only) committed for real before
-        # the crash; identity of the two cells is non-deterministic
-        # (_distinct_cells has no ORDER BY) so only count + window are pinned.
-        rows = conn.execute(
-            "SELECT window_key FROM score_cache WHERE site_id=?", (site_id,)
-        ).fetchall()
-        assert len(rows) == 2
-        assert {r["window_key"] for r in rows} == {"w:14"}
-
-        job_row = conn.execute(
-            "SELECT status, retry_count, next_attempt_at FROM jobs WHERE id=?",
-            (job_id,),
-        ).fetchone()
-        assert job_row["status"] == "pending"
-        assert job_row["retry_count"] == 1
-        assert job_row["next_attempt_at"] is not None
-        assert not db._write_lock.locked()  # noqa: SLF001 - lock cleanly released
-
-        # Retry: un-crash, re-claim, run to completion.
-        monkeypatch.setattr(
-            "wxverify.worker.processor.run_batched_scoring", run_batched_scoring
-        )
-        retry_job = Job(
-            id=job_id,
-            type="pair_and_score",
-            site_id=site_id,
-            job_key="score",
-            payload={},
-            status="running",
-            retry_count=1,
-            max_retries=5,
-        )
-        monkeypatch.setattr(
-            "wxverify.worker.processor.claim_next_job", _claim_once(retry_job)
-        )
-        # _claim_once skips the real claim's status flip (queue.py:298).
-        conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
-        with pytest.raises(_StopLoop):
-            await run_worker(db)
-
-        job_row2 = conn.execute(
-            "SELECT status FROM jobs WHERE id=?", (job_id,)
-        ).fetchone()
-        assert job_row2["status"] == "completed"
-
-        end_after_resume = _dump_score_cache(conn)
-        close_db()
-
-        db_clean = init_db(str(clean_path))
-        await db_clean.write(lambda c: _score_all_windows(c, None))
-        end_clean = _dump_score_cache(db_clean._conn)  # noqa: SLF001
-
-        assert end_after_resume == end_clean
-
-    asyncio.run(_run())
-
-
-# --------------------------------------------------------------------------
 # E5: same-day relaxation is bounded
 # --------------------------------------------------------------------------
 
@@ -1242,79 +1060,5 @@ def test_batched_scoring_discovery_blocks_on_inline_writer_e7(
         expected_cas_miss = f"score discovery site={site_id} cas_miss attempt=1"
         cas_miss_lines = [m for m in messages if m == expected_cas_miss]
         assert len(cas_miss_lines) == 1, f"got: {messages}"
-
-    asyncio.run(_run())
-
-
-# --------------------------------------------------------------------------
-# E8: catchup routes through the batched lane
-# --------------------------------------------------------------------------
-
-
-def test_catchup_routes_scoring_through_batched_lane_e8(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        _freeze_now(monkeypatch)
-        site_a = _make_site(conn, "e8-site-a")
-        site_b = _make_site(conn, "e8-site-b")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
-            calls.append(sid)
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        db = get_db()
-        await run_catchup(db, FencedWriter(db, db.generation), {})
-
-        assert sorted(calls) == sorted([site_a, site_b])
-
-    asyncio.run(_run())
-
-
-def test_catchup_continues_other_sites_after_one_cancelled_e8b(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        _freeze_now(monkeypatch)
-        site_a = _make_site(conn, "e8b-site-a")
-        site_b = _make_site(conn, "e8b-site-b")
-
-        monkeypatch.setattr("wxverify.worker.catchup.scheduler_tick", lambda c: None)
-
-        async def _fake_catchup_site(*args: Any, **kwargs: Any) -> bool:
-            return True
-
-        monkeypatch.setattr("wxverify.worker.catchup._catchup_site", _fake_catchup_site)
-
-        calls: list[int] = []
-
-        async def _spy_run_batched_scoring(writer: Any, sid: int) -> None:
-            calls.append(sid)
-            if sid == site_a:
-                raise JobCancelled()
-
-        monkeypatch.setattr(
-            "wxverify.worker.catchup.run_batched_scoring", _spy_run_batched_scoring
-        )
-
-        db = get_db()
-        await run_catchup(db, FencedWriter(db, db.generation), {})
-
-        # Both sites were attempted despite site_a's cancellation.
-        assert set(calls) == {site_a, site_b}
 
     asyncio.run(_run())

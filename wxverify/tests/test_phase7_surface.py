@@ -32,7 +32,7 @@ from wxverify.api.app import create_app
 from wxverify.core.options import RuntimeOptions, load_runtime_options
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.depth import (
     DEPTH_VARIABLES,
     EffectiveDepth,
@@ -96,7 +96,7 @@ def _make_site(conn: sqlite3.Connection, name: str = "Verify Town") -> int:
             (name,),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -159,7 +159,7 @@ def _seed_published_run(
     (still on the pre-pairwise methodology). Pass 2 for O-V3's matching-
     version arm.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = (
         input_fingerprint(conn, site_id, snapshot) if fresh_fingerprint else "0" * 64
@@ -490,7 +490,7 @@ def test_run_config_incumbent_depth_per_variable() -> None:
 def test_daily_rank_order_excludes_post_asof_revised_truth() -> None:
     conn = asof_conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     run_id = int(
         conn.execute(
             """
@@ -641,7 +641,7 @@ def test_api_status_stale_and_failed_warnings(
              bootstrap_resamples, input_fingerprint, error)
         VALUES (?, ?, 1, 'test', 'failed', 2, '{}', 1, 100, 'fp2', 'boom')
         """,
-        (site_id, ensure_published_generation(conn, site_id)),
+        (site_id, ensure_site_generation(conn, site_id)),
     )
     conn.commit()
 
@@ -704,17 +704,17 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
 
         # O-V3, v1 arm: this fixture's run was scored under methodology
         # version 1 (the shape of the live published run today), which does
-        # not match this build's version 4 -- so the endpoint refuses to
+        # not match this build's version 5 -- so the endpoint refuses to
         # answer with the current constants/contract rather than describing
         # a run under a version it does not carry. See
         # test_api_methodology_matches_the_build_version_it_was_scored_under
-        # for the matching-version (v4) arm.
+        # for the matching-version (v5) arm.
         meth = client.get(f"/api/verification/runs/{run_id}/methodology").json()
         assert meth["contract"] is None
         assert meth["constants"] is None
         assert meth["contract_unavailable_reason"] is not None
         assert "methodology version 1" in meth["contract_unavailable_reason"]
-        assert "methodology version 4" in meth["contract_unavailable_reason"]
+        assert "methodology version 5" in meth["contract_unavailable_reason"]
         assert meth["provenance"]["run_id"] == run_id
 
         latest = client.get(
@@ -736,14 +736,14 @@ def test_api_verdicts_evidence_diagnostics_methodology_latest(
 def test_api_methodology_matches_the_build_version_it_was_scored_under(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """O-V3, v4 arm: a run scored under this build's own methodology
+    """O-V3, v5 arm: a run scored under this build's own methodology
     version gets the real contract/constants, paired with the v1 refusal
     arm above (`_seed_published_run`'s default) so a mutant that always
     refuses -- or always answers -- is caught by whichever arm it breaks.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn)
-    run_id = _seed_published_run(conn, site_id, methodology_version=4)
+    run_id = _seed_published_run(conn, site_id, methodology_version=5)
     conn.commit()
 
     app = _make_app(monkeypatch)
@@ -752,7 +752,7 @@ def test_api_methodology_matches_the_build_version_it_was_scored_under(
         assert meth["contract_unavailable_reason"] is None
         assert meth["contract"] is not None
         assert meth["constants"] is not None
-        assert meth["constants"]["methodology_version"] == 4
+        assert meth["constants"]["methodology_version"] == 5
         assert meth["constants"]["bootstrap_resamples"] == 10_000
         assert meth["constants"]["simulated_depths"] == [1, 2, 3, 4]
         assert meth["contract"]["units"]["wind_max"] == "m/s"

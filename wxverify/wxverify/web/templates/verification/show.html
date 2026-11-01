@@ -135,8 +135,7 @@
         'not_recorded': 'this run did not record what its results were based on, so there is nothing to check it against.',
         'algorithm_changed': 'this check has changed since the basis for this run was pinned, so what the run recorded can no longer be compared.',
         'malformed_record': 'the record of what this run was based on is damaged and cannot be read.',
-        'period_unknown': 'this run did not record which dates it covered, so there is no range to compare over.',
-        'no_published_generation': 'this site has no published daily history to compare against yet.'
+        'period_unknown': 'this run did not record which dates it covered, so there is no range to compare over.'
       } -%}
       <p class="notice" data-v16="16.1.freshness_unknown">Whether current inputs still match the basis pinned for this run cannot be determined — {{ freshness_reasons.get(result_basis.reason, 'the cause is not one this page can explain.') }}</p>
     {% endif %}

@@ -15,8 +15,6 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
 
-import pytest
-
 from tests.helpers import asof_conn, asof_make_site
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.methodology import CONSENSUS_LAG_HOURS
@@ -26,11 +24,7 @@ from wxverify.verification.runs import (
     record_trigger_decision,
     trigger_decision_blocks,
 )
-from wxverify.worker import scheduler as scheduler_module
-from wxverify.worker.scheduler import (
-    VERIFICATION_TRIGGER_LOCAL_TIME,
-    _enqueue_due_verification_runs,  # noqa: SLF001
-)
+from wxverify.worker.scheduler import VERIFICATION_TRIGGER_LOCAL_TIME
 
 _TZ = "America/Denver"
 _FIXED_TZ = "Etc/GMT+7"
@@ -130,44 +124,3 @@ def test_trigger_decision_blocks_a_second_run_for_an_already_fired_date() -> Non
     )
 
     assert trigger_decision_blocks(conn, site_id, "2026-06-15", held=False) is True
-
-
-# ---------------------------------------------------------------------------
-# Behavior oracle: the scheduler itself, driven at real local instants
-# straddling the configured trigger — not the arithmetic that produces it.
-# ---------------------------------------------------------------------------
-
-
-def test_scheduler_fires_at_the_configured_local_time_and_not_before(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Drives `_enqueue_due_verification_runs` through the real (unpatched)
-    `VERIFICATION_TRIGGER_LOCAL_TIME`. America/Denver is UTC-6 in June:
-    05:01 local on 2026-06-15 is 11:01Z (past the 05:00 trigger); 02:01
-    local the same day is 08:01Z (before it). A production edit that
-    reverts the trigger to '02:00' makes the second tick enqueue too --
-    exactly M29 -- and this fails independently of `_margin`'s arithmetic,
-    because it never calls `_margin` at all."""
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "site-alpha")
-    conn.execute("UPDATE sites SET timezone = ? WHERE id = ?", (_TZ, site_id))
-    conn.commit()
-
-    before_trigger_utc = datetime(2026, 6, 15, 8, 1, tzinfo=UTC)
-    monkeypatch.setattr(scheduler_module, "utc_now", lambda: before_trigger_utc)
-    _enqueue_due_verification_runs(conn)
-    jobs_before = conn.execute(
-        "SELECT payload FROM jobs WHERE type = 'verification_run' AND site_id = ?",
-        (site_id,),
-    ).fetchall()
-    assert jobs_before == []
-
-    after_trigger_utc = datetime(2026, 6, 15, 11, 1, tzinfo=UTC)
-    monkeypatch.setattr(scheduler_module, "utc_now", lambda: after_trigger_utc)
-    _enqueue_due_verification_runs(conn)
-    jobs_after = conn.execute(
-        "SELECT payload FROM jobs WHERE type = 'verification_run' AND site_id = ?",
-        (site_id,),
-    ).fetchall()
-    assert len(jobs_after) == 1
-    assert "2026-06-15" in str(jobs_after[0]["payload"])

@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum, auto
-from math import ceil
 from typing import Final, Literal, NoReturn
 
 import httpx
@@ -42,29 +41,33 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
+from wxverify.db.site_days import daily_close_on
+from wxverify.db.station_readings import store_readings
 from wxverify.feeds.registry import build_adapter
-from wxverify.obs.config import RECENT_REFRESH_HOURS
+from wxverify.obs.hourly_values import StationReading
 from wxverify.obs.pws_adapter import (
-    PwsObservation,
+    CurrentObservation,
     fetch_current_observation,
-    fetch_hourly_history,
-    is_hourly_history_no_content,
 )
-from wxverify.scoring.consensus import insert_station_observation
 from wxverify.settings.keys import get_number_setting
 from wxverify.verification.record import (
     compute_forecast_record_readonly,
     persist_forecast_record,
     run_record_gap_scan,
 )
+from wxverify.worker import cutover as cutover_module
 from wxverify.worker.access_hold import (
     AccessHeld,
     check_access_hold,
     clear_access_refused,
     record_access_refused,
 )
-from wxverify.worker.backfill import run_backfill_site
-from wxverify.worker.catchup import run_catchup
+from wxverify.worker.close_chain import (
+    fail_day_close_job,
+    fail_day_publish_job,
+    run_day_close,
+    run_day_publish,
+)
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.current_obs import (
     Health,
@@ -73,21 +76,25 @@ from wxverify.worker.current_obs import (
     persist_poll_result,
 )
 from wxverify.worker.current_obs_poller import run_current_obs_poller
+from wxverify.worker.cutover import Cutover, CutoverStep
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
-    clear_domain_backoff,
     record_http_backoff,
     source_domain,
 )
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
+    DownloadOutcome,
+    DownloadSlot,
     Ineligible,
     Unavailable,
     fetch_feed_once,
     fetch_feed_retry_floor_seconds,
     mark_feed_unavailable,
+    record_download_try,
 )
+from wxverify.worker.round import round_try_stale
 from wxverify.worker.scheduler import scheduler_tick
 from wxverify.worker.score_batches import (
     SCORING_CAS_ATTEMPTS,
@@ -95,16 +102,7 @@ from wxverify.worker.score_batches import (
     run_batched_scoring,
     run_split_pair_phases,
 )
-from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
-from wxverify.worker.tz_correction import (
-    advance_correction,
-    build_continuation,
-    mark_correction_failed,
-)
-from wxverify.worker.verification_run import (
-    mark_verification_failed,
-    run_verification_chunk,
-)
+from wxverify.worker.station_pacing import weathercom_call_lock
 from wxverify.worker.wind_days import WIND_DAYS_JOB_KEY, run_wind_days
 
 POLL_INTERVAL = 1.0
@@ -116,42 +114,6 @@ JOB_HOUSEKEEPING_INTERVAL_SECONDS = 3600
 _SCORING_BUSY_DEFER: Final = timedelta(seconds=60)
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class StationFetchTarget:
-    id: int
-    pws_station_id: str
-    history_next_attempt_at: str | None
-    obs_watermark_at: str | None
-
-
-@dataclass(frozen=True)
-class HistoryPark:
-    """The ladder rung a park landed on, for the caller to log."""
-
-    error_count: int
-    next_attempt_at: str
-    reason: str
-
-
-@dataclass(frozen=True)
-class StationPersistOutcome:
-    """What one station's persisted payload proved about this cycle.
-
-    Three independent facts, never inferred from one another:
-    ``changed`` gates the ``pair_and_score`` enqueue, ``newest_valid_at``
-    gates site freshness and ``parked`` carries history recovery --
-    ``None`` when a reading no older than ``RECENT_REFRESH_HOURS`` before
-    the persist clock and not after it arrived, the rung otherwise.
-    ``parked`` and ``newest_valid_at`` disagree in one direction only: a
-    station can be parked while supplying a newest time, but a station
-    that is not parked always supplies one.
-    """
-
-    changed: bool
-    newest_valid_at: str | None
-    parked: HistoryPark | None
 
 
 async def run_worker(db: Database) -> None:
@@ -299,15 +261,33 @@ def _raise_lane_outcome(
 
 
 async def _run_main_lane(db: Database) -> None:
-    """Tick the scheduler and run main-lane jobs one at a time, forever."""
+    """Tick the scheduler and run main-lane jobs one at a time, forever.
+
+    While the daily close is off the lane runs the cutover and nothing else
+    (switch-over plan 6.2): one unit per loop, right after the worker
+    heartbeat, with no tick, purge or claim until the cutover writes the
+    key. After a failed unit the attempt is dropped and the lane waits
+    ``CUTOVER_RETRY_SECONDS``; the next attempt is a new ``Cutover``.
+    """
     last_housekeeping_at = 0.0
     last_worker_heartbeat_at = 0.0
     last_scheduler_heartbeat_at = 0.0
+    cutover: Cutover | None = None
     while True:
         now = time.monotonic()
         last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
             db, "worker_last_loop_at", last_worker_heartbeat_at, now
         )
+        if not await db.read(daily_close_on):
+            cutover = cutover or Cutover(db)
+            step = await cutover.advance()
+            if step is CutoverStep.MORE:
+                continue
+            cutover = None
+            if step is CutoverStep.WAIT:
+                # Read through the module at each wait, not bound here.
+                await asyncio.sleep(cutover_module.CUTOVER_RETRY_SECONDS)
+                continue
         # Exempt: scheduler_tick, the housekeeping purge, and the claim
         # itself all run once per loop iteration with no job-scoped read
         # behind them yet -- there is no generation to fence any of this
@@ -324,11 +304,23 @@ async def _run_main_lane(db: Database) -> None:
                 )
             )
             last_housekeeping_at = now
-        job = await db.write(claim_next_job)
+        job = await db.write(_claim_if_on)
         if job is None:
             await asyncio.sleep(POLL_INTERVAL)
             continue
         await run_claimed_job(db, job, lane="main")
+
+
+def _claim_if_on(conn: sqlite3.Connection) -> Job | None:
+    """Claim the next main-lane job; None while the daily close is off.
+
+    The key is read in the claim's own transaction (switch-over plan 6.2),
+    so an import that replaced the file after the loop's gate read is seen
+    here and nothing is claimed from a file without the key.
+    """
+    if not daily_close_on(conn):
+        return None
+    return claim_next_job(conn)
 
 
 async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
@@ -548,22 +540,30 @@ def _complete_and_continue(
 
 
 def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition | None:
-    """Record the failure; on a TERMINAL disposition of a chain job, mark
-    the chain's carrier failed in the same transaction (§14: a mid-chain
-    chunk failure fails the run under the existing retry rules).
+    """Record the failure.
+
+    A ``day_close`` or ``day_publish`` job records its failure in the same
+    transaction, but before ``fail()``: its stage-log row copies the job
+    row's claim stamp, ``updated_at``, which ``fail()`` overwrites. Both
+    kinds are enqueued with ``max_retries`` 0, so every failure of theirs is
+    terminal (daily-close P3 9.1, 9.4).
+
+    A ``fetch_feed`` job writes its try's ``failed`` download row there too,
+    before ``fail()`` overwrites the claim stamp it takes as the try's start
+    (daily-close P4 4.2).
     """
-    disposition = fail(
+    if job.type == "day_close":
+        fail_day_close_job(conn, job, error, now_utc=utc_now())
+    elif job.type == "day_publish":
+        fail_day_publish_job(conn, job, error, now_utc=utc_now())
+    elif job.type == "fetch_feed":
+        _record_failed_fetch(conn, job, error)
+    return fail(
         conn,
         job.id,
         error,
         min_delay_seconds=fetch_feed_retry_floor_seconds(conn, job),
     )
-    if disposition is not None and disposition.terminal:
-        if job.type == "timezone_correction":
-            mark_correction_failed(conn, job)
-        elif job.type == "verification_run":
-            mark_verification_failed(conn, job)
-    return disposition
 
 
 async def _maybe_stamp_runtime_heartbeat(
@@ -625,11 +625,7 @@ async def dispatch(
         #       disjoint from every table the split pair_and_score reads.
         #       The current-obs lane's writer is epoch-exempt for exactly
         #       that disjoint write set; T-E4a/T-E4b
-        #       (tests/test_current_obs_poller.py) pin it.
-        #       Catchup's rescore lane shares the same orchestrator
-        #       (worker/score_batches.run_batched_scoring) and runs as a
-        #       main-lane job too, so leg (a) serializes the two rescore lanes
-        #       against each other; and
+        #       (tests/test_current_obs_poller.py) pin it; and
         #   (b) every HTTP route that writes observations (station PUT /
         #       DELETE, site rain-threshold PUT) runs the monolithic
         #       pair_and_score INLINE in its own write transaction — it never
@@ -687,14 +683,13 @@ async def dispatch(
             )
             raise JobDeferred(isoformat_utc(utc_now() + _SCORING_BUSY_DEFER)) from exc
         return None
-    if job.type == "fetch_obs":
+    if job.type == "fetch_obs" and job.job_key == WIND_DAYS_JOB_KEY:
+        # The wind lane is the one fetch_obs job left; any other key is the
+        # retired routine download and ends at the raise below.
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        if job.job_key == WIND_DAYS_JOB_KEY:
-            await run_wind_days(db, writer, site_id)
-            return None
-        await _fetch_obs(db, writer, site_id)
+        await run_wind_days(db, writer, site_id)
         return None
     if job.type == "fetch_current_obs":
         site_id = job.site_id
@@ -712,26 +707,8 @@ async def dispatch(
         feed_id = _payload_int(job.payload, "feed_id")
         if feed_id is None:
             raise JobCancelled()
-        await _fetch_feed(db, writer, site_id, feed_id)
+        await _fetch_feed(db, writer, site_id, feed_id, payload=job.payload)
         return None
-    if job.type == "backfill_site":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        return await run_backfill_site(db, writer, site_id, job.payload)
-    if job.type == "catchup":
-        return await run_catchup(db, writer, job.payload)
-    if job.type == "timezone_correction":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        # One chunk = one write transaction (chain state persisted inside
-        # it); the continuation re-enqueues the chain, and claim_next_job's
-        # priority tier lets other job types interleave between chunks.
-        more = await writer.write(
-            lambda conn: advance_correction(conn, site_id, job.payload)
-        )
-        return build_continuation(site_id, job.payload) if more else None
     if job.type == "forecast_record":
         site_id = job.site_id
         if site_id is None:
@@ -762,14 +739,12 @@ async def dispatch(
         return JobContinuation(
             "record_gap_scan", site_id, f"gapscan:cont:{site_id}", remainder
         )
-    if job.type == "verification_run":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        # One chunk per claim, chain state in runtime_state (same shape as
-        # timezone_correction); the simulate/baseline days and the bootstrap
-        # run their heavy work outside any write transaction.
-        return await run_verification_chunk(db, writer, site_id, job.payload)
+    if job.type == "day_close":
+        await run_day_close(db, writer, job)
+        return None
+    if job.type == "day_publish":
+        await run_day_publish(db, writer, job)
+        return None
     raise RuntimeError(f"unknown job type {job.type}")
 
 
@@ -797,189 +772,17 @@ async def _run_forecast_record(
     await writer.write(_persist)
 
 
-async def _fetch_obs(db: Database, writer: FencedWriter, site_id: int) -> None:
-    api_key = resolve_secret("weathercom")
-    if not api_key:
-        raise RuntimeError("weathercom key is not configured")
-    timezone = await db.read(lambda conn: _site_timezone(conn, site_id))
-    if timezone is None:
-        raise JobCancelled()
-    stations = await db.read(lambda conn: _enabled_stations(conn, site_id))
-    if not stations:
-        raise JobCancelled()
-    logger.debug("fetch_obs site=%s stations=%s", site_id, len(stations))
-    changed = False
-    newest_obs_at: str | None = None
-    skipped_parked = 0
-    # Stations whose call was granted (a 2xx reply) before the cycle stopped.
-    fetched = 0
-    # Set when the hourly refused-access hold stops the cycle: the hold's end.
-    held_until: str | None = None
-    async with httpx.AsyncClient() as client:
-        now = utc_now()
-        for index, station in enumerate(stations):
-            if _history_parked(station.history_next_attempt_at, now):
-                skipped_parked += 1
-                logger.debug(
-                    "fetch_obs station parked site=%s station=%s until=%s",
-                    site_id,
-                    station.id,
-                    station.history_next_attempt_at,
-                )
-                continue
-            await pace_station_call(site_id, station.id, index)
-            logger.debug(
-                "fetch_obs station attempt site=%s station=%s index=%s",
-                site_id,
-                station.id,
-                index,
-            )
-            async with weathercom_call_lock():
-                try:
-                    reservation = await writer.write(
-                        lambda conn, station_id=station.id: _reserve_obs_call(
-                            conn, site_id, station_id
-                        )
-                    )
-                except AccessHeld as held:
-                    # A held try: the reservation write rolled back, so no
-                    # call, no budget and no station write. No later station
-                    # is tried either.
-                    held_until = held.until
-                    break
-                try:
-                    observations = await fetch_hourly_history(
-                        station.pws_station_id,
-                        api_key,
-                        hours=_retention_hours(station.obs_watermark_at, now),
-                        timezone=timezone,
-                        client=client,
-                    )
-                except httpx.HTTPStatusError as exc:
-                    # 401 / 403: weather.com refused access. Hold the hourly
-                    # kind for every station and stop the cycle. The call was
-                    # made, so the reservation is not refunded; the station's
-                    # error, its history park and the domain backoff are not
-                    # written.
-                    if exc.response.status_code in (401, 403):
-                        status = exc.response.status_code
-                        held_until = await write_after_reservation(
-                            db,
-                            writer,
-                            lambda conn, s=status: record_access_refused(
-                                conn, "hourly", s
-                            ),
-                            reservation,
-                        )
-                        break
-                    error = sanitized_exception(exc)
-                    response = exc.response
-                    next_attempt_at = await write_after_reservation(
-                        db,
-                        writer,
-                        lambda conn, station_id=station.id, err=error, resp=response: (
-                            _mark_station_error_and_backoff(conn, station_id, err, resp)
-                        ),
-                        reservation,
-                    )
-                    if next_attempt_at is not None:
-                        raise JobDeferred(next_attempt_at) from exc
-                    exc.add_note(
-                        f"station={station.pws_station_id} "
-                        f"progress={index + 1}/{len(stations)}"
-                    )
-                    raise
-                except Exception as exc:
-                    if is_hourly_history_no_content(exc):
-                        error = sanitized_exception(exc)
-                        park = await write_after_reservation(
-                            db,
-                            writer,
-                            lambda conn, station_id=station.id, err=error: (
-                                _park_station_history_clearing(conn, station_id, err)
-                            ),
-                            reservation,
-                        )
-                        _log_history_park(site_id, station, park)
-                        fetched += 1
-                        continue
-                    error = sanitized_exception(exc)
-                    refund = reservation if is_refundable_transport_error(exc) else None
-                    await write_after_reservation(
-                        db,
-                        writer,
-                        lambda conn, station_id=station.id, err=error, res=refund: (
-                            _mark_station_error_and_refund(conn, station_id, err, res)
-                        ),
-                        reservation,
-                    )
-                    exc.add_note(
-                        f"station={station.pws_station_id} "
-                        f"progress={index + 1}/{len(stations)}"
-                    )
-                    raise
-                outcome = await write_after_reservation(
-                    db,
-                    writer,
-                    lambda conn, station_id=station.id, rows=observations: (
-                        _persist_station_observations(conn, site_id, station_id, rows)
-                    ),
-                    reservation,
-                )
-                if outcome.parked is not None:
-                    _log_history_park(site_id, station, outcome.parked)
-                fetched += 1
-                logger.debug(
-                    "fetch_obs station result site=%s station=%s changed=%s",
-                    site_id,
-                    station.id,
-                    outcome.changed,
-                )
-                changed = changed or outcome.changed
-                if outcome.newest_valid_at is not None and (
-                    newest_obs_at is None or outcome.newest_valid_at > newest_obs_at
-                ):
-                    newest_obs_at = outcome.newest_valid_at
-    logger.debug(
-        "fetch_obs cycle done site=%s changed=%s newest_obs_at=%s skipped_parked=%s",
-        site_id,
-        changed,
-        newest_obs_at,
-        skipped_parked,
-    )
-    await writer.write(
-        lambda conn: _complete_obs_cycle(
-            conn,
-            site_id,
-            changed=changed,
-            newest_obs_at=newest_obs_at,
-        )
-    )
-    if held_until is not None:
-        # The cycle is stamped above, so the next try is the next scheduled
-        # cycle. Completing through the cancelled branch, without the success
-        # marker, means a held cycle resolves no earlier failure.
-        logger.info(
-            "fetch_obs held site=%s kind=hourly until=%s fetched=%d of %d",
-            site_id,
-            held_until,
-            fetched,
-            len(stations),
-        )
-        raise JobCancelled()
-
-
 async def _fetch_current_obs(
     db: Database, writer: FencedWriter, site_id: int, station_id: int
 ) -> None:
     """Poll ``/observations/current`` for one station, learn cadence, snapshot.
 
-    Independent of the hourly ``_fetch_obs`` stream: touches only
-    ``station_poll_state`` (diagnostics + cadence) and ``station_current_obs``
-    (last-good snapshot), never ``stations``. One station per job, one
-    provider call. On 429/>=500 the shared ``api.weather.com`` domain backoff is
-    recorded and the job is deferred; on transport failure the poll is marked
-    transient and deferred to the floor. On 401/403 the ``current_obs``
+    Touches only ``station_poll_state`` (diagnostics + cadence) and
+    ``station_current_obs`` (last-good snapshot), never ``stations``. One
+    station per job, one provider call. On 429/>=500 the shared
+    ``api.weather.com`` domain backoff is recorded and the job is deferred;
+    on transport failure the poll is marked transient and deferred to the
+    floor. On 401/403 the ``current_obs``
     refused-access hold (``worker.access_hold``) is recorded in place of any
     poll state and the job is deferred to the hold's end, as is a try that
     meets the hold; a 2xx reply clears it.
@@ -1003,12 +806,11 @@ async def _fetch_current_obs(
     # The shared weather.com call lock covers the reserve, the call and the
     # outcome write (see worker.station_pacing.weathercom_call_lock).
     async with weathercom_call_lock():
-        # Reserve in the SAME order and transaction as _reserve_obs_call: backoff
-        # gate first (raises JobDeferred if active), then the current_obs
-        # refused-access hold (raises AccessHeld), then budget (raises JobDeferred
-        # if exhausted). A single station ⇒ ordinal 0 ⇒ no station pacing
-        # (station_pacing returns 0.0 at ordinal 0), so no pace_station_call here by
-        # design.
+        # Reserve in one transaction: backoff gate first (raises JobDeferred
+        # if active), then the current_obs refused-access hold (raises
+        # AccessHeld), then budget (raises JobDeferred if exhausted). A single
+        # station ⇒ ordinal 0 ⇒ no station pacing (station_pacing returns 0.0
+        # at ordinal 0), so no pace_station_call here by design.
         try:
             reservation = await writer.write(
                 lambda conn: _reserve_current_obs_call(conn, site_id, station_id)
@@ -1063,7 +865,7 @@ async def _fetch_current_obs(
             raise JobDeferred(until)
 
         # 429 / >=500: record the shared domain backoff (single write with the
-        # transient poll-state) and defer, exactly as the hourly stream does.
+        # transient poll-state) and defer.
         # Classification already returned TRANSIENT for these codes.
         if status == 429 or status >= 500:
             next_attempt_at = await write_after_reservation(
@@ -1090,14 +892,13 @@ async def _fetch_current_obs(
 def _reserve_current_obs_call(
     conn: sqlite3.Connection, site_id: int, station_id: int
 ) -> Reservation:
-    """Domain-backoff gate then budget reservation (mirrors _reserve_obs_call).
+    """Domain-backoff gate then budget reservation.
 
     Raises ``JobDeferred`` if the shared weather.com backoff is active or the
     daily budget is exhausted; ``AccessHeld`` if the ``current_obs``
     refused-access hold is in force; ``JobCancelled`` if the station is
     gone/disabled.
-    Returns the ``Reservation`` so a refundable transport failure can refund it
-    (mirrors ``_fetch_obs``'s pattern; this call site previously discarded it).
+    Returns the ``Reservation`` so a refundable transport failure can refund it.
     """
     row = conn.execute(
         """
@@ -1122,14 +923,77 @@ def _persist_poll_result_clearing(
     outcome: PollOutcome,
     status: int,
 ) -> None:
-    """Persist the poll-state and, on a 2xx reply, clear the current_obs hold.
+    """Persist the poll-state, store an online reply's raw reading, and, on a
+    2xx reply, clear the current_obs hold.
 
-    One transaction, so the clear and the persist land together. A granted
-    call clears its own kind only; the other kinds' holds are left as they are.
+    One transaction, so the clear, the persist and the raw reading land
+    together. A granted call clears its own kind only; the other kinds' holds
+    are left as they are. The raw reading is stored only when the poll-state
+    was saved (not for a station deleted, disabled or moved meanwhile), and
+    it cannot fail the poll's own write: its values passed the per-value check
+    when the reply was parsed, and ``store_readings`` drops whatever a CHECK
+    of its table would refuse. An offline reply stores none.
     """
-    persist_poll_result(conn, site_id, station_id, outcome)
+    saved = persist_poll_result(conn, site_id, station_id, outcome)
+    if saved and outcome.health is Health.ONLINE and outcome.obs is not None:
+        _store_current_obs_reading(conn, station_id, outcome.obs)
     if 200 <= status < 300:
         clear_access_refused(conn, "current_obs")
+
+
+def _store_current_obs_reading(
+    conn: sqlite3.Connection, station_id: int, obs: CurrentObservation
+) -> None:
+    """Store one online poll reply as a raw reading, source ``current_obs``.
+
+    The instant is ``obsTimeUtc`` in whole seconds and the local date
+    ``obsTimeLocal``'s, or none. The values are ``obs``' ``reading_*`` fields:
+    the reply's own ``metric.temp``, ``metric.precipTotal`` and
+    ``metric.windSpeed`` checked by ``reading_value`` in
+    ``current_obs_from_payload``. A rejected value is stored NULL and counted
+    in a DEBUG line. A reply with no valid value, or whose instant does not
+    parse, stores nothing. A poll repeating the stored reading adds no row
+    (``store_readings``' upsert on the instant).
+    """
+    if obs.obs_time_utc is None:
+        return
+    try:
+        obs_at = parse_utc(obs.obs_time_utc).replace(microsecond=0)
+    except ValueError:
+        return
+    if obs.reading_unusable:
+        logger.debug(
+            "current_obs reading values unusable station=%s"
+            " temperature=%d precip=%d wind=%d",
+            station_id,
+            *(
+                int(quantity in obs.reading_unusable)
+                for quantity in ("temperature", "precip", "wind")
+            ),
+        )
+    temp_c = obs.reading_temp_c
+    precip_total_mm = obs.reading_precip_total_mm
+    speed_kmh = obs.reading_speed_kmh
+    if temp_c is None and precip_total_mm is None and speed_kmh is None:
+        return
+    now = utc_now()
+    store_readings(
+        conn,
+        station_id=station_id,
+        source="current_obs",
+        readings=[
+            StationReading(
+                obs_at=obs_at,
+                source="current_obs",
+                local_date=obs.local_date,
+                temp_c=temp_c,
+                precip_total_mm=precip_total_mm,
+                speed_kmh=speed_kmh,
+            )
+        ],
+        fetched_at=now,
+        now_utc=now,
+    )
 
 
 def _persist_poll_result_and_refund(
@@ -1173,17 +1037,61 @@ def _pws_station_id(
 
 
 async def _fetch_feed(
-    db: Database, writer: FencedWriter, site_id: int, feed_id: int
+    db: Database,
+    writer: FencedWriter,
+    site_id: int,
+    feed_id: int,
+    *,
+    payload: dict[str, object],
 ) -> None:
+    """Run one ``fetch_feed`` try and record its download row (P4 plan 4.2).
+
+    The slot comes from ``payload``; a payload with no ``slot`` runs
+    ``unscheduled``. A persisted reply's row is written with its samples
+    (``fetch_feed_once``); ``budget``, ``backoff``, ``ineligible`` and
+    ``unavailable`` are written here before the job is deferred or
+    cancelled, and ``failed`` by ``_fail_job`` for a raised error.
+
+    A round try (P4 plan 4.4) is cancelled before any call, with no row, at
+    or after its round's bound or once the feed has a ``stored`` round row
+    for the date. Its ``budget`` or ``backoff`` row is followed by
+    ``JobCancelled``, not ``JobDeferred``: a deferred try would run again
+    later, past the bound.
+    """
     logger.debug("fetch_feed dispatch site=%s feed=%s", site_id, feed_id)
+    slot = _download_slot(payload, started_at=utc_now())
+    round_date = slot.round_date if slot.slot == "round" else None
+    if round_date is not None and await db.read(
+        lambda conn: round_try_stale(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            round_date=round_date,
+            now_utc=slot.started_at,
+        )
+    ):
+        logger.info(
+            "fetch_feed round try cancelled site=%s feed=%s round_date=%s",
+            site_id,
+            feed_id,
+            round_date.isoformat(),
+        )
+        raise JobCancelled()
     outcome = await fetch_feed_once(
-        db, site_id, feed_id, writer=writer, adapter_builder=build_adapter
+        db, site_id, feed_id, writer=writer, adapter_builder=build_adapter, slot=slot
     )
     if isinstance(outcome, BudgetExhausted):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "budget")
+        if round_date is not None:
+            raise JobCancelled()
         raise JobDeferred(outcome.next_window)
     if isinstance(outcome, BackoffActive):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "backoff")
+        if round_date is not None:
+            raise JobCancelled()
         raise JobDeferred(outcome.next_attempt)
     if isinstance(outcome, Ineligible):
+        await _record_fetch_try(writer, site_id, feed_id, slot, "ineligible")
         raise JobCancelled()
     if isinstance(outcome, Unavailable):
         logger.warning(
@@ -1194,8 +1102,8 @@ async def _fetch_feed(
             outcome.error,
         )
         await writer.write(
-            lambda conn, result=outcome: mark_feed_unavailable(
-                conn, result.target, result.error
+            lambda conn, result=outcome: _mark_feed_unavailable_and_record(
+                conn, result, slot
             )
         )
         # Complete through the cancelled branch, without the success marker:
@@ -1204,298 +1112,139 @@ async def _fetch_feed(
         raise JobCancelled()
 
 
-def _enabled_stations(
-    conn: sqlite3.Connection, site_id: int
-) -> list[StationFetchTarget]:
-    rows = conn.execute(
-        """
-        SELECT st.id,
-               st.pws_station_id,
-               st.history_next_attempt_at,
-               (SELECT MAX(o.valid_at)
-                  FROM station_observations o
-                 WHERE o.station_id = st.id
-                   AND o.variable != 'wind') AS obs_watermark_at
-        FROM stations st
-        JOIN sites s ON s.id = st.site_id
-        WHERE s.id = ?
-          AND s.enabled = 1
-          AND st.enabled = 1
-        ORDER BY st.pws_station_id
-        """,
-        (site_id,),
-    ).fetchall()
-    targets: list[StationFetchTarget] = []
-    for row in rows:
-        parked_until = row["history_next_attempt_at"]
-        watermark = row["obs_watermark_at"]
-        targets.append(
-            StationFetchTarget(
-                id=int(row["id"]),
-                pws_station_id=str(row["pws_station_id"]),
-                history_next_attempt_at=(
-                    None if parked_until is None else str(parked_until)
-                ),
-                obs_watermark_at=None if watermark is None else str(watermark),
-            )
-        )
-    return targets
+# A daytime slot in a fetch_feed payload: local "HH:MM" (P4 plan 5.1).
+_DAYTIME_SLOT_RE: Final = re.compile(r"(?:[01]\d|2[0-3]):[0-5]\d")
 
 
-def _site_timezone(conn: sqlite3.Connection, site_id: int) -> str | None:
-    row = conn.execute(
-        "SELECT timezone FROM sites WHERE id=? AND enabled=1", (site_id,)
-    ).fetchone()
-    return None if row is None else str(row["timezone"])
+def _download_slot(payload: dict[str, object], *, started_at: datetime) -> DownloadSlot:
+    """The try's slot from a ``fetch_feed`` payload (P4 plan 4.2, 4.4, 5.1).
 
-
-def _reserve_obs_call(
-    conn: sqlite3.Connection, site_id: int, station_id: int
-) -> Reservation:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM stations st
-        JOIN sites s ON s.id = st.site_id
-        WHERE s.id = ?
-          AND st.id = ?
-          AND s.enabled = 1
-          AND st.enabled = 1
-        """,
-        (site_id, station_id),
-    ).fetchone()
-    if row is None:
-        raise JobCancelled()
-    check_domain_backoff(conn, source_domain("weathercom"))
-    check_access_hold(conn, "hourly")
-    return reserve_budget(conn, "weathercom", 1)
-
-
-_HISTORY_BACKOFF_BASE: Final = timedelta(hours=1)
-_HISTORY_BACKOFF_MAX: Final = timedelta(hours=24)
-_HISTORY_BACKOFF_MAX_SHIFT: Final = 5
-_HISTORY_RETENTION_MAX_HOURS: Final = 168  # the provider's seven-day path
-_HISTORY_RETENTION_OVERLAP_HOURS: Final = 1
-_NO_RECENT_HISTORY_REASON: Final = (
-    f"hourly history returned no observation from the last {RECENT_REFRESH_HOURS} hours"
-)
-
-
-def _history_parked(next_attempt_at: str | None, now: datetime) -> bool:
-    if next_attempt_at is None:
-        return False
-    try:
-        return parse_utc(next_attempt_at) > now
-    except ValueError:
-        # Unreadable marker: fail open and attempt the station, same rationale
-        # as the scheduler's unreadable-timestamp guard.
-        return False
-
-
-def _retention_hours(watermark: str | None, now: datetime) -> int:
-    """How much of the downloaded payload to keep for this station now."""
-    if watermark is None:
-        return _HISTORY_RETENTION_MAX_HOURS
-    try:
-        covered_through = parse_utc(watermark)
-    except ValueError:
-        # Unreadable watermark: keep everything, same fail-open rationale
-        # as the parked-station guard.
-        return _HISTORY_RETENTION_MAX_HOURS
-    gap_hours = ceil((now - covered_through) / timedelta(hours=1))
-    return max(
-        RECENT_REFRESH_HOURS,
-        min(gap_hours + _HISTORY_RETENTION_OVERLAP_HOURS, _HISTORY_RETENTION_MAX_HOURS),
-    )
-
-
-def _log_history_park(
-    site_id: int, station: StationFetchTarget, park: HistoryPark
-) -> None:
-    logger.warning(
-        "fetch_obs station history parked site=%s station=%s errors=%s until=%s: %s",
-        site_id,
-        station.id,
-        park.error_count,
-        park.next_attempt_at,
-        park.reason,
-    )
-
-
-def _park_station_history(
-    conn: sqlite3.Connection, station_id: int, error: str
-) -> HistoryPark:
-    row = conn.execute(
-        "SELECT history_error_count FROM stations WHERE id=? AND enabled=1",
-        (station_id,),
-    ).fetchone()
-    if row is None:
-        raise JobCancelled()
-    count = int(row["history_error_count"] or 0) + 1
-    shift = min(count - 1, _HISTORY_BACKOFF_MAX_SHIFT)
-    delay = min(_HISTORY_BACKOFF_BASE * (2**shift), _HISTORY_BACKOFF_MAX)
-    next_attempt_at = isoformat_utc(utc_now() + delay)
-    conn.execute(
-        """
-        UPDATE stations
-        SET history_error_count=?, history_last_error=?, history_next_attempt_at=?
-        WHERE id=?
-        """,
-        (count, error, next_attempt_at, station_id),
-    )
-    return HistoryPark(error_count=count, next_attempt_at=next_attempt_at, reason=error)
-
-
-def _park_station_history_clearing(
-    conn: sqlite3.Connection, station_id: int, error: str
-) -> HistoryPark:
-    """Park the station's history after a 2xx reply with no observations.
-
-    Such a reply is still a granted call, so it also clears the hourly hold, in
-    the same transaction as the park.
+    No ``slot`` key gives ``unscheduled``: the enable-time and command-line
+    fetches, and any job queued before the upgrade. ``"round"`` needs a
+    ``round_date`` (``YYYY-MM-DD``) and a ``round_try``; a daytime slot is
+    local ``"HH:MM"``. A slot that does not read is logged and recorded as
+    ``unscheduled``, so the try still has its row.
     """
-    park = _park_station_history(conn, station_id, error)
-    clear_access_refused(conn, "hourly")
-    return park
-
-
-def _persist_station_observations(
-    conn: sqlite3.Connection,
-    site_id: int,
-    station_id: int,
-    observations: list[PwsObservation],
-) -> StationPersistOutcome:
-    row = conn.execute(
-        """
-        SELECT 1
-        FROM stations
-        WHERE id = ? AND site_id = ? AND enabled = 1
-        """,
-        (station_id, site_id),
-    ).fetchone()
-    if row is None:
-        raise JobCancelled()
-    now = utc_now().replace(microsecond=0)
-    now_stamp = isoformat_utc(now)
-    fresh_since = isoformat_utc(now - timedelta(hours=RECENT_REFRESH_HOURS))
-    recent = any(fresh_since <= o.valid_at <= now_stamp for o in observations)
-    newest_valid_at = max(
-        (o.valid_at for o in observations if o.valid_at <= now_stamp), default=None
-    )
-    changed = False
-    for observation in observations:
-        changed = (
-            insert_station_observation(
-                conn,
-                station_id=station_id,
-                variable=observation.variable,
-                valid_at=observation.valid_at,
-                value=observation.value,
-                source_raw=observation.source_raw,
+    value = payload.get("slot")
+    if value is None or value == "unscheduled":
+        return DownloadSlot(
+            slot="unscheduled", round_date=None, round_try=None, started_at=started_at
+        )
+    if value == "round":
+        round_date = _payload_date(payload, "round_date")
+        round_try = _payload_int(payload, "round_try")
+        if round_date is not None and round_try is not None:
+            return DownloadSlot(
+                slot="round",
+                round_date=round_date,
+                round_try=round_try,
+                started_at=started_at,
             )
-            or changed
+    elif isinstance(value, str) and _DAYTIME_SLOT_RE.fullmatch(value):
+        return DownloadSlot(
+            slot=value, round_date=None, round_try=None, started_at=started_at
         )
-    # Queue the score run with this station's observations, so a later
-    # station's failure in the same obs cycle cannot drop the trigger.
-    # _complete_obs_cycle's own enqueue stays and dedupes against this one.
-    if changed:
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
-    clear_domain_backoff(conn, source_domain("weathercom"))
-    clear_access_refused(conn, "hourly")
-    conn.execute(
-        """
-        UPDATE stations
-        SET last_run_at=?, last_error=NULL, error_count=0
-        WHERE id=?
-        """,
-        (isoformat_utc(), station_id),
+    logger.warning(
+        "fetch_feed payload slot does not read; the try is recorded as unscheduled"
     )
-    if recent:
-        conn.execute(
-            """
-            UPDATE stations
-            SET history_next_attempt_at=NULL, history_last_error=NULL,
-                history_error_count=0
-            WHERE id=?
-            """,
-            (station_id,),
-        )
-        parked = None
-    else:
-        parked = _park_station_history(conn, station_id, _NO_RECENT_HISTORY_REASON)
-    return StationPersistOutcome(
-        changed=changed,
-        newest_valid_at=newest_valid_at,
-        parked=parked,
+    return DownloadSlot(
+        slot="unscheduled", round_date=None, round_try=None, started_at=started_at
     )
 
 
-def _mark_station_error_and_backoff(
-    conn: sqlite3.Connection,
-    station_id: int,
-    error: str,
-    response: httpx.Response,
-) -> str | None:
-    _mark_station_error(conn, station_id, error)
-    return record_http_backoff(conn, response)
+def _payload_date(payload: dict[str, object], key: str) -> date | None:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.isoformat() == value else None
 
 
-def _complete_obs_cycle(
-    conn: sqlite3.Connection,
+async def _record_fetch_try(
+    writer: FencedWriter,
     site_id: int,
-    *,
-    changed: bool,
-    newest_obs_at: str | None,
+    feed_id: int,
+    slot: DownloadSlot,
+    outcome: DownloadOutcome,
 ) -> None:
-    cur = conn.execute(
-        """
-        UPDATE sites
-        SET last_obs_cycle_at=?
-        WHERE id=? AND enabled=1
-        """,
-        (isoformat_utc(), site_id),
-    )
-    if cur.rowcount != 1:
-        raise JobCancelled()
-    if newest_obs_at is not None:
-        conn.execute(
-            """
-            UPDATE sites
-            SET last_obs_at=?
-            WHERE id=? AND enabled=1
-              AND (last_obs_at IS NULL OR last_obs_at < ?)
-            """,
-            (newest_obs_at, site_id, newest_obs_at),
+    """Write the download row of a try that ended without a reply (4.2)."""
+    await writer.write(
+        lambda conn: record_download_try(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            slot=slot,
+            outcome=outcome,
+            ended_at=utc_now(),
         )
-    if changed:
-        enqueue_if_absent(
-            conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-        )
-
-
-def _mark_station_error(conn: sqlite3.Connection, station_id: int, error: str) -> None:
-    conn.execute(
-        """
-        UPDATE stations
-        SET last_error=?, error_count=error_count + 1
-        WHERE id=?
-        """,
-        (error, station_id),
     )
 
 
-def _mark_station_error_and_refund(
-    conn: sqlite3.Connection,
-    station_id: int,
-    error: str,
-    reservation: Reservation | None,
+def _mark_feed_unavailable_and_record(
+    conn: sqlite3.Connection, result: Unavailable, slot: DownloadSlot
 ) -> None:
-    """Record the station failure and, atomically, refund a phantom reservation."""
-    _mark_station_error(conn, station_id, error)
-    if reservation is not None:
-        refund_budget(conn, reservation)
+    """Stamp the unavailable feed's state and write the try's row, in one
+    transaction."""
+    mark_feed_unavailable(conn, result.target, result.error)
+    record_download_try(
+        conn,
+        site_id=result.target.site_id,
+        feed_id=result.target.feed_id,
+        slot=slot,
+        outcome="unavailable",
+        ended_at=utc_now(),
+    )
+
+
+def _record_failed_fetch(conn: sqlite3.Connection, job: Job, error: str) -> None:
+    """``_fail_job``'s ``fetch_feed`` branch: the try's ``failed`` download
+    row, with ``error`` (already sanitized) as its reason (P4 plan 4.2).
+
+    The try started when the job was claimed: the row's ``updated_at`` holds
+    the claim stamp until ``fail()`` overwrites it, so this runs first.
+    """
+    site_id = job.site_id
+    feed_id = _payload_int(job.payload, "feed_id")
+    if site_id is None or feed_id is None:
+        return
+    try:
+        record_download_try(
+            conn,
+            site_id=site_id,
+            feed_id=feed_id,
+            slot=_download_slot(job.payload, started_at=_claim_instant(conn, job.id)),
+            outcome="failed",
+            ended_at=utc_now(),
+            reason=error,
+        )
+    except Exception:
+        # Broad on purpose, as fetch_feed_retry_floor_seconds is: this runs
+        # inside fail()'s failure-recording write, and anything escaping
+        # aborts that write before retry_count advances, so the job would be
+        # re-pended at the same count and crash-loop. A missing download row
+        # is the smaller loss. CancelledError is BaseException and still
+        # propagates.
+        logger.warning(
+            "fetch_feed failure: download row not written job=%s",
+            job.id,
+            exc_info=True,
+        )
+
+
+def _claim_instant(conn: sqlite3.Connection, job_id: int) -> datetime:
+    """The job row's claim stamp (its ``updated_at`` while running), or now
+    when it does not read."""
+    row = conn.execute("SELECT updated_at FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    stamp: object = None if row is None else row["updated_at"]
+    if isinstance(stamp, str):
+        try:
+            return parse_utc(stamp)
+        except ValueError:
+            pass
+    return utc_now()
 
 
 def _payload_int(payload: dict[str, object], key: str) -> int | None:

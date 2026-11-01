@@ -20,7 +20,7 @@ import httpx
 
 from wxverify.core.timeutil import floor_hour, isoformat_utc, parse_utc, utc_now
 from wxverify.obs.config import RECENT_REFRESH_HOURS
-from wxverify.obs.wind_pairs import WindRecord
+from wxverify.obs.hourly_values import Quantity, Source, StationReading
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,15 @@ class CurrentObservation:
     to ``None`` (a NULL column), never a fabricated zero. ``obs_time_utc`` is the
     full-precision ISO-``Z`` instant from ``_obs_instant`` (never hour-floored),
     or ``None`` when the payload's timestamp is missing/unparseable.
+    ``local_date`` is the reading's own local date from ``obsTimeLocal``, or
+    ``None`` when the reply carries none.
+
+    The ``reading_*`` fields are the raw store's values (plan 5.5), read from
+    the reply's own ``metric.temp``, ``metric.precipTotal`` and
+    ``metric.windSpeed`` through ``reading_value``: ``None`` when absent or
+    rejected. ``reading_unusable`` names the quantities whose value was
+    present but rejected (``null`` included). The snapshot fields above are
+    unaffected by them.
     """
 
     obs_time_utc: str | None
@@ -71,6 +80,27 @@ class CurrentObservation:
     precip_total: float | None
     uv: float | None
     neighborhood: str | None
+    local_date: date | None = None
+    reading_temp_c: float | None = None
+    reading_precip_total_mm: float | None = None
+    reading_speed_kmh: float | None = None
+    reading_unusable: tuple[Quantity, ...] = ()
+
+
+@dataclass(frozen=True)
+class ParsedReadings:
+    """The readings of one payload, from ``readings_from_payload``.
+
+    ``readings`` are sorted by ``obs_at``; of two equal instants the first in
+    the payload is kept. ``dropped`` counts the items left out: no instant, no
+    valid value, or a repeat instant. ``unusable`` counts, per quantity, the
+    values present but rejected by ``reading_value`` (``null`` included) over
+    the items that have an instant; every quantity has a key, zero included.
+    """
+
+    readings: tuple[StationReading, ...]
+    dropped: int
+    unusable: dict[Quantity, int]
 
 
 PayloadErrorKind = Literal[
@@ -85,7 +115,6 @@ _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 
 HOURLY_HISTORY_URL: Final = "https://api.weather.com/v2/pws/observations/hourly/7day"
 HOURLY_HISTORY_PATH: Final = "/v2/pws/observations/hourly/7day"
-HISTORY_ALL_PATH: Final = "/v2/pws/history/all"
 ALL_1DAY_PATH: Final = "/v2/pws/observations/all/1day"
 _WEATHERCOM_BASE: Final = "https://api.weather.com"
 
@@ -159,16 +188,15 @@ def is_hourly_history_no_content(exc: BaseException) -> bool:
 
 
 def is_wind_history_no_content(exc: BaseException) -> bool:
-    """True only for a 204 from one of the two wind-history endpoints.
+    """True only for a 204 from today's 5-minute endpoint (``ALL_1DAY_PATH``).
 
     The same allowlist shape as ``is_hourly_history_no_content``: the type,
-    the ``no_content`` kind and an endpoint in ``{HISTORY_ALL_PATH,
-    ALL_1DAY_PATH}`` must all match.
+    the ``no_content`` kind and the endpoint must all match.
     """
     return (
         isinstance(exc, UpstreamPayloadError)
         and exc.diagnostics.kind == "no_content"
-        and exc.diagnostics.endpoint in {HISTORY_ALL_PATH, ALL_1DAY_PATH}
+        and exc.diagnostics.endpoint == ALL_1DAY_PATH
     )
 
 
@@ -321,10 +349,6 @@ class WeathercomRateLimiter:
         self._requests.append((now, backfill))
         return 0.0
 
-    def wait_seconds(self, *, backfill: bool) -> float:
-        """The seconds until a request would fit, recording nothing."""
-        return self._wait_seconds(self._clock(), backfill=backfill)
-
     async def acquire(self, *, backfill: bool) -> None:
         """Wait until the request fits, then record it."""
         while (wait := self.try_acquire(backfill=backfill)) > 0:
@@ -350,13 +374,6 @@ def weathercom_rate_limiter() -> WeathercomRateLimiter:
         _rate_limiter = WeathercomRateLimiter()
         _rate_limiter_loop = weakref.ref(loop)
     return _rate_limiter
-
-
-async def wait_for_backfill_slot() -> None:
-    """Wait until a backfill request would fit, without recording one."""
-    limiter = weathercom_rate_limiter()
-    while (wait := limiter.wait_seconds(backfill=True)) > 0:
-        await asyncio.sleep(wait)
 
 
 async def _get_with_deadline(
@@ -435,6 +452,33 @@ async def validate_station(
     )
 
 
+async def fetch_hourly_history_payload(
+    station_id: str, api_key: str, *, client: httpx.AsyncClient
+) -> dict[str, object]:
+    """One station's decoded 7-day hourly payload, nothing dropped by age.
+
+    The one request of the 7-day hourly product; ``fetch_hourly_history``
+    applies its age cutoff on top. Raises ``httpx.HTTPStatusError`` on a
+    non-2xx and ``UpstreamPayloadError`` on a 2xx without ``observations`` (a
+    204 included).
+    """
+    response = await _get_with_deadline(
+        client,
+        HOURLY_HISTORY_URL,
+        params={
+            "stationId": station_id,
+            "format": "json",
+            "units": "m",
+            "numericPrecision": "decimal",
+            "apiKey": api_key,
+        },
+        read_seconds=10.0,
+        backfill=False,
+    )
+    response.raise_for_status()
+    return decode_observations_payload(response, station_id=station_id)
+
+
 async def fetch_hourly_history(
     station_id: str,
     api_key: str,
@@ -453,27 +497,11 @@ async def fetch_hourly_history(
                 client=owned_client,
             )
     logger.debug("pws hourly_history request station=%s hours=%s", station_id, hours)
-    response = await _get_with_deadline(
-        client,
-        HOURLY_HISTORY_URL,
-        params={
-            "stationId": station_id,
-            "format": "json",
-            "units": "m",
-            "numericPrecision": "decimal",
-            "apiKey": api_key,
-        },
-        read_seconds=10.0,
-        backfill=False,
-    )
-    response.raise_for_status()
+    payload = await fetch_hourly_history_payload(station_id, api_key, client=client)
     cutoff = utc_now() - timedelta(hours=hours)
     observations = [
         observation
-        for observation in observations_from_payload(
-            decode_observations_payload(response, station_id=station_id),
-            timezone=timezone,
-        )
+        for observation in observations_from_payload(payload, timezone=timezone)
         if parse_utc(observation.valid_at) >= cutoff
     ]
     logger.debug(
@@ -484,116 +512,19 @@ async def fetch_hourly_history(
     return observations
 
 
-async def fetch_hourly_history_range(
-    station_id: str,
-    api_key: str,
-    *,
-    window_start: str,
-    window_end: str,
-    timezone: str | None = None,
-    client: httpx.AsyncClient | None = None,
-) -> list[PwsObservation]:
-    start = parse_utc(window_start)
-    end = parse_utc(window_end)
-    if end <= start:
-        return []
-    start_date, end_date = _history_date_range(start, end, timezone)
-    if client is None:
-        async with httpx.AsyncClient() as owned_client:
-            return await fetch_hourly_history_range(
-                station_id,
-                api_key,
-                window_start=window_start,
-                window_end=window_end,
-                timezone=timezone,
-                client=owned_client,
-            )
-    logger.debug(
-        "pws history_range request station=%s window=%s..%s",
-        station_id,
-        window_start,
-        window_end,
-    )
-    response = await _get_with_deadline(
-        client,
-        "https://api.weather.com/v2/pws/history/hourly",
-        params={
-            "stationId": station_id,
-            "format": "json",
-            "units": "m",
-            "startDate": start_date,
-            "endDate": end_date,
-            "numericPrecision": "decimal",
-            "apiKey": api_key,
-        },
-        read_seconds=20.0,
-        backfill=False,
-    )
-    response.raise_for_status()
-    observations = observations_from_payload(
-        decode_observations_payload(response, station_id=station_id),
-        timezone=timezone,
-    )
-    filtered = [
-        observation
-        for observation in observations
-        if start <= parse_utc(observation.valid_at) < end
-    ]
-    logger.debug(
-        "pws history_range response station=%s samples=%s", station_id, len(filtered)
-    )
-    return filtered
-
-
-async def fetch_history_all(
-    station_id: str,
-    api_key: str,
-    *,
-    local_date: date,
-    client: httpx.AsyncClient,
-    backfill: bool,
-) -> list[WindRecord]:
-    """One past local day's raw records from ``/v2/pws/history/all``.
-
-    Raises ``httpx.HTTPStatusError`` on a non-2xx and ``UpstreamPayloadError``
-    on a 2xx without ``observations`` (a 204 included).
-    """
-    logger.debug("pws history_all request station=%s date=%s", station_id, local_date)
-    response = await _get_with_deadline(
-        client,
-        f"{_WEATHERCOM_BASE}{HISTORY_ALL_PATH}",
-        params={
-            "stationId": station_id,
-            "format": "json",
-            "units": "m",
-            "date": local_date.strftime("%Y%m%d"),
-            "numericPrecision": "decimal",
-            "apiKey": api_key,
-        },
-        read_seconds=20.0,
-        backfill=backfill,
-    )
-    response.raise_for_status()
-    records = wind_records_from_payload(
-        decode_observations_payload(response, station_id=station_id)
-    )
-    logger.debug(
-        "pws history_all response station=%s records=%s", station_id, len(records)
-    )
-    return records
-
-
 async def fetch_all_1day(
     station_id: str,
     api_key: str,
     *,
     client: httpx.AsyncClient,
     backfill: bool,
-) -> list[WindRecord]:
-    """Today's raw records since the station's local midnight, from
-    ``/v2/pws/observations/all/1day``.
+) -> ParsedReadings:
+    """Today's raw readings since the station's local midnight, from
+    ``/v2/pws/observations/all/1day``, parsed by ``readings_from_payload``
+    with source ``five_minute``: every quantity, not only wind.
 
-    Raises as ``fetch_history_all`` does.
+    Raises ``httpx.HTTPStatusError`` on a non-2xx and ``UpstreamPayloadError``
+    on a 2xx without ``observations`` (a 204 included).
     """
     logger.debug("pws all_1day request station=%s", station_id)
     response = await _get_with_deadline(
@@ -610,13 +541,16 @@ async def fetch_all_1day(
         backfill=backfill,
     )
     response.raise_for_status()
-    records = wind_records_from_payload(
-        decode_observations_payload(response, station_id=station_id)
+    parsed = readings_from_payload(
+        decode_observations_payload(response, station_id=station_id),
+        source="five_minute",
     )
     logger.debug(
-        "pws all_1day response station=%s records=%s", station_id, len(records)
+        "pws all_1day response station=%s records=%s",
+        station_id,
+        len(parsed.readings),
     )
-    return records
+    return parsed
 
 
 def _wind_record_instant(row: dict[str, object]) -> datetime | None:
@@ -634,60 +568,130 @@ def _wind_record_instant(row: dict[str, object]) -> datetime | None:
     return parsed.replace(microsecond=0)
 
 
-def _wind_record_speed(row: dict[str, object]) -> float | None:
-    metric_obj = row.get("metric")
-    if not isinstance(metric_obj, dict):
-        return None
-    value = cast(dict[str, object], metric_obj).get("windspeedAvg")
-    speed: float
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int | float):
-        speed = float(value)
-    elif isinstance(value, str):
-        try:
-            speed = float(value)
-        except ValueError:
-            return None
-    else:
-        return None
-    if not math.isfinite(speed) or speed < 0:
-        return None
-    return speed
+def reading_value(value: object, quantity: Quantity) -> float | None:
+    """One raw reading value checked on its own, else ``None``.
 
-
-def wind_records_from_payload(payload: dict[str, object]) -> list[WindRecord]:
-    """The raw wind records of a decoded all-records payload, an allowlist.
-
-    Each item must be an object with a parseable instant (``valid_time_gmt``,
-    then ``epoch``, then the ``obsTimeUtc`` normalization; a bool epoch drops
-    the record) and a finite, non-negative ``metric.windspeedAvg`` (a number
-    or a numeric string). Anything else drops the record. The result is
-    sorted by ``obs_at``, whole seconds, keeping the first of each duplicate
-    instant.
+    Accepts a real number or a numeric string that is finite; for ``precip``
+    and ``wind`` the value must also be at least 0. A bool, ``nan``, an
+    infinity, a non-numeric string, ``None`` or any other type gives ``None``.
+    The one check behind ``readings_from_payload`` and the poll's storage.
     """
-    observations_obj = payload.get("observations")
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        return None
+    if not math.isfinite(number):
+        return None
+    if quantity != "temperature" and number < 0:
+        return None
+    return number
+
+
+def _checked_metric(
+    metric: dict[str, object],
+    quantity: Quantity,
+    keys: tuple[str, ...],
+    unusable: dict[Quantity, int],
+) -> float | None:
+    """The first of ``keys`` whose value passes ``reading_value``, else ``None``.
+
+    An absent key is skipped. When no key gives a value but one is present,
+    the quantity's count in ``unusable`` goes up by one.
+    """
+    present = False
+    for key in keys:
+        if key not in metric:
+            continue
+        value = reading_value(metric[key], quantity)
+        if value is not None:
+            return value
+        present = True
+    if present:
+        unusable[quantity] += 1
+    return None
+
+
+def _reading_local_date(row: dict[str, object], *keys: str) -> date | None:
+    """The first valid date in ``keys`` of the item, else ``None``.
+
+    The same date match as ``_local_day_from_payload``; never derived from the
+    UTC instant.
+    """
+    for key in keys:
+        value = row.get(key)
+        if not isinstance(value, str):
+            continue
+        match = re.search(r"(\d{4})-?(\d{2})-?(\d{2})", value)
+        if match is None:
+            continue
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        except ValueError:
+            continue
+    return None
+
+
+def readings_from_payload(payload: object, *, source: Source) -> ParsedReadings:
+    """The raw readings of a decoded observations payload, an allowlist.
+
+    Each item is read on its own; a bad item drops only itself and nothing
+    raises. The instant is ``_wind_record_instant``'s, whole seconds; the
+    local date is ``obsTimeLocal``'s, then ``validTimeLocal``'s, else ``None``.
+    Temperature is ``metric.tempAvg``, then ``metric.temp``, never
+    ``tempHigh`` or ``tempLow``; rain is ``metric.precipTotal``, the running
+    total; wind is ``metric.windspeedAvg``. A present value that
+    ``reading_value`` rejects is ``None`` and counted in ``unusable``; an
+    absent field is ``None`` and not counted. Either leaves the reading's other
+    values; a reading with no valid value is dropped. Sorted by ``obs_at``,
+    keeping the first of each duplicate instant.
+    """
+    unusable: dict[Quantity, int] = {"temperature": 0, "precip": 0, "wind": 0}
+    if not isinstance(payload, dict):
+        return ParsedReadings(readings=(), dropped=0, unusable=unusable)
+    observations_obj = cast(dict[str, object], payload).get("observations")
     if not isinstance(observations_obj, list):
-        return []
-    parsed: list[WindRecord] = []
+        return ParsedReadings(readings=(), dropped=0, unusable=unusable)
+    dropped = 0
+    parsed: list[StationReading] = []
     for item in cast(list[object], observations_obj):
         if not isinstance(item, dict):
+            dropped += 1
             continue
         row = cast(dict[str, object], item)
         obs_at = _wind_record_instant(row)
         if obs_at is None:
+            dropped += 1
             continue
-        speed = _wind_record_speed(row)
-        if speed is None:
+        metric_obj = row.get("metric")
+        metric: dict[str, object] = (
+            cast(dict[str, object], metric_obj) if isinstance(metric_obj, dict) else {}
+        )
+        temp_c = _checked_metric(metric, "temperature", ("tempAvg", "temp"), unusable)
+        precip_total_mm = _checked_metric(metric, "precip", ("precipTotal",), unusable)
+        speed_kmh = _checked_metric(metric, "wind", ("windspeedAvg",), unusable)
+        if temp_c is None and precip_total_mm is None and speed_kmh is None:
+            dropped += 1
             continue
-        parsed.append(WindRecord(obs_at=obs_at, speed_kmh=speed))
-    parsed.sort(key=lambda record: record.obs_at)
-    records: list[WindRecord] = []
-    for record in parsed:
-        if records and records[-1].obs_at == record.obs_at:
+        parsed.append(
+            StationReading(
+                obs_at=obs_at,
+                source=source,
+                local_date=_reading_local_date(row, "obsTimeLocal", "validTimeLocal"),
+                temp_c=temp_c,
+                precip_total_mm=precip_total_mm,
+                speed_kmh=speed_kmh,
+            )
+        )
+    parsed.sort(key=lambda reading: reading.obs_at)
+    readings: list[StationReading] = []
+    for reading in parsed:
+        if readings and readings[-1].obs_at == reading.obs_at:
+            dropped += 1
             continue
-        records.append(record)
-    return records
+        readings.append(reading)
+    return ParsedReadings(readings=tuple(readings), dropped=dropped, unusable=unusable)
 
 
 def observations_from_payload(
@@ -789,7 +793,7 @@ def _valid_at(row: dict[str, object]) -> str | None:
     """Hourly-stream timestamp: shared normalization, then hour-floored ISO-``Z``.
 
     Behaviour is unchanged from before the ``_obs_datetime`` extraction — the
-    hourly history/backfill path depends on the ``floor_hour`` bucketing.
+    7-day hourly path depends on the ``floor_hour`` bucketing.
     """
     parsed = _obs_datetime(row)
     if parsed is None:
@@ -813,13 +817,17 @@ def _obs_instant(row: dict[str, object]) -> str | None:
 def current_obs_from_payload(data: object) -> CurrentObservation | None:
     """Map ``observations[0]`` of a ``/observations/current`` payload to columns.
 
-    Reads the top-level ``humidity``, ``winddir``, ``uv``, ``obsTimeUtc`` and
-    ``neighborhood`` alongside the ``metric`` sub-object (``temp``, ``windSpeed``,
-    ``windGust``, ``pressure``, ``precipRate``, ``precipTotal``, ``dewpt``). Values
+    Reads the top-level ``humidity``, ``winddir``, ``uv``, ``obsTimeUtc``,
+    ``obsTimeLocal`` (its date only) and ``neighborhood`` alongside the
+    ``metric`` sub-object (``temp``, ``windSpeed``, ``windGust``, ``pressure``,
+    ``precipRate``, ``precipTotal``, ``dewpt``). Values
     are km/h / mm / hPa in the station's native ``units:"m"`` form — this is the
     raw display snapshot table, NOT the SI-normalized scoring path, so no unit
     conversion is applied. Returns ``None`` when the payload has no first
     observation row (the caller treats that as OFFLINE). Missing fields → ``None``.
+    The raw store's ``reading_*`` values pass ``reading_value`` on the same
+    three raw ``metric`` values (a bool, ``nan`` or a negative rain or wind is
+    ``None`` there), leaving the snapshot fields as they are.
     """
     if not isinstance(data, dict):
         return None
@@ -835,6 +843,10 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
     metric = cast(dict[str, object], metric_obj) if isinstance(metric_obj, dict) else {}
     neighborhood_obj = row.get("neighborhood")
     neighborhood = str(neighborhood_obj) if isinstance(neighborhood_obj, str) else None
+    unusable: dict[Quantity, int] = {"temperature": 0, "precip": 0, "wind": 0}
+    reading_temp_c = _checked_metric(metric, "temperature", ("temp",), unusable)
+    reading_precip = _checked_metric(metric, "precip", ("precipTotal",), unusable)
+    reading_speed = _checked_metric(metric, "wind", ("windSpeed",), unusable)
     return CurrentObservation(
         obs_time_utc=_obs_instant(row),
         temp=_number(metric, "temp"),
@@ -848,6 +860,13 @@ def current_obs_from_payload(data: object) -> CurrentObservation | None:
         precip_total=_number(metric, "precipTotal"),
         uv=_number(row, "uv"),
         neighborhood=neighborhood,
+        local_date=_reading_local_date(row, "obsTimeLocal"),
+        reading_temp_c=reading_temp_c,
+        reading_precip_total_mm=reading_precip,
+        reading_speed_kmh=reading_speed,
+        reading_unusable=tuple(
+            quantity for quantity, count in unusable.items() if count
+        ),
     )
 
 
@@ -948,12 +967,3 @@ def _local_day_from_payload(row: dict[str, object]) -> str | None:
         if match is not None:
             return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
     return None
-
-
-def _history_date_range(
-    start: datetime, end: datetime, timezone: str | None
-) -> tuple[str, str]:
-    tz = UTC if timezone is None else ZoneInfo(timezone)
-    local_start = start.astimezone(tz)
-    local_end = (end - timedelta(microseconds=1)).astimezone(tz)
-    return local_start.strftime("%Y%m%d"), local_end.strftime("%Y%m%d")

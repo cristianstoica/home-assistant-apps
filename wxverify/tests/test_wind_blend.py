@@ -14,7 +14,7 @@ import sqlite3
 from datetime import date, timedelta
 
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.selection import CellCandidate
 from wxverify.forecast.wind_blend import (
     FLOOR_MS,
@@ -64,18 +64,6 @@ def _make_feed(conn: sqlite3.Connection, model: str, *, is_virtual: int = 0) -> 
         VALUES ('example-src', ?, 1, 360, 192, ?)
         """,
         (model, is_virtual),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def _unpublished_generation(conn: sqlite3.Connection, site_id: int) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'UTC', 'retrospective_correction', 'building')
-        """,
-        (site_id,),
     )
     assert cur.lastrowid is not None
     return int(cur.lastrowid)
@@ -361,7 +349,7 @@ def test_t52_latest_run_with_enough_hours_wins_over_earlier_and_short_later() ->
     conn = _conn()
     site_id = _make_site(conn)
     feed_id = _make_feed(conn, "m1")
-    gen_id = ensure_published_generation(conn, site_id)
+    gen_id = ensure_site_generation(conn, site_id)
     target = _day(10)
     _insert_run(
         conn,
@@ -501,7 +489,7 @@ def test_t54_pair_side_knowable_predicate_compares_instants_not_strings() -> Non
     conn = _conn()
     site_id = _make_site(conn)
     feed_id = _make_feed(conn, "m1")
-    gen_id = ensure_published_generation(conn, site_id)
+    gen_id = ensure_site_generation(conn, site_id)
     target = _day(10)
     as_of = f"{target.isoformat()}T22:59:00Z"
     # Equal instant, non-canonical (offset) form.
@@ -526,7 +514,7 @@ def test_t54_pair_side_knowable_predicate_compares_instants_not_strings() -> Non
     conn2 = _conn()
     site_id2 = _make_site(conn2)
     feed_id2 = _make_feed(conn2, "m1")
-    gen_id2 = ensure_published_generation(conn2, site_id2)
+    gen_id2 = ensure_site_generation(conn2, site_id2)
     later = f"{target.isoformat()}T23:00:01Z"  # genuinely 1s after as_of
     _insert_run(
         conn2,
@@ -685,52 +673,6 @@ def test_t58_fewer_than_min_feeds_is_unavailable_with_note() -> None:
 # --- Training filters: not plan T-rows, pinned alongside T49-T58 --------
 
 
-def test_published_generation_filters_training_pairs() -> None:
-    """Pairs under a non-published generation never train; the same pairs
-    under the published generation do.
-
-    mutant_drop_generation_clause -> at the assertion: correct =
-    {20 days} (only the published-generation feed's matched days), mutant
-    (removing ``AND {published_generation_clause("fp")}`` from
-    ``training_pairs_query``) = {25 days} (the 5 unpublished-generation
-    days leak in too). The fixture's unpublished days are matched with
-    observations as well, so the mutant's extra 5 days show up in the
-    weight's own ``days`` count, not just in an unused side table.
-    """
-    conn = _conn()
-    site_id = _make_site(conn)
-    feed_id = _make_feed(conn, "m1")
-    published_id = ensure_published_generation(conn, site_id)
-    other_id = _unpublished_generation(conn, site_id)
-
-    published_days = _days_from(1, MIN_TRAINING_DAYS)
-    other_days = _days_from(1 + MIN_TRAINING_DAYS, 5)
-    _insert_obs_training_days(conn, site_id=site_id, days=published_days + other_days)
-    _insert_feed_training_days(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        tz_generation_id=published_id,
-        day_ahead=0,
-        days=published_days,
-    )
-    _insert_feed_training_days(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        tz_generation_id=other_id,
-        day_ahead=0,
-        days=other_days,
-    )
-
-    training = load_wind_training(
-        conn, site_id=site_id, timezone="UTC", today=_TODAY, as_of=None
-    )
-    assert set(training.feed_highs[(feed_id, 0)]) == set(published_days)
-    weights = compute_wind_weights(training)
-    assert weights[(feed_id, 0)].days == MIN_TRAINING_DAYS
-
-
 def test_excluded_feeds_sql_drops_virtual_feeds_from_training() -> None:
     """A virtual feed's full training history is absent from the weights;
     an otherwise-identical real feed's is present.
@@ -745,7 +687,7 @@ def test_excluded_feeds_sql_drops_virtual_feeds_from_training() -> None:
     site_id = _make_site(conn)
     real_feed_id = _make_feed(conn, "real-model", is_virtual=0)
     virtual_feed_id = _make_feed(conn, "virtual-model", is_virtual=1)
-    gen_id = ensure_published_generation(conn, site_id)
+    gen_id = ensure_site_generation(conn, site_id)
 
     shared_days = _days_from(1, MIN_TRAINING_DAYS)
     _insert_obs_training_days(conn, site_id=site_id, days=shared_days)

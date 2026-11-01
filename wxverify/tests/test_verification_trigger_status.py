@@ -25,18 +25,22 @@ from tests.helpers import asof_conn, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import set_setting
 from wxverify.verification.runs import (
     PUBLISH_HOLD_REASON,
+    SUPERSEDED_REASON_PREFIX,
     expected_trigger_date,
     latest_trigger_decision,
     record_trigger_decision,
     trigger_status,
 )
-from wxverify.worker import scheduler as scheduler_module
-from wxverify.worker.scheduler import _enqueue_due_verification_runs  # noqa: SLF001
-from wxverify.worker.verification_run import SUPERSEDED_REASON
+
+# Rule 2: the removed `wxverify.worker.verification_run` module used to carry
+# a concrete `SUPERSEDED_REASON` string. These tests only need A value with
+# the live prefix the reader matches on (`runs.py:958`), so they keep their
+# own plain test value built from that prefix.
+_SUPERSEDED_REASON = f"{SUPERSEDED_REASON_PREFIX}newer_run_started"
 
 # `America/Denver` is UTC-6 in June, so the 05:00 local trigger instant for
 # local day D is D 11:00Z.
@@ -88,7 +92,7 @@ def _make_site(
             (name, timezone, enabled),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     conn.commit()
     return site_id
 
@@ -235,7 +239,7 @@ def test_the_w8_three_row_sequence_reports_triggered_and_surfaces_the_supersede(
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn, "site-alpha")
     _seed(conn, site_id, "2026-06-06", "run_started", None)
-    _seed(conn, site_id, "2026-06-06", "skipped", SUPERSEDED_REASON)
+    _seed(conn, site_id, "2026-06-06", "skipped", _SUPERSEDED_REASON)
     _seed(conn, site_id, "2026-06-06", "run_started", None)
     _freeze(monkeypatch, _AFTER_TRIGGER)
 
@@ -245,9 +249,9 @@ def test_the_w8_three_row_sequence_reports_triggered_and_surfaces_the_supersede(
 
     assert trigger["status"] == "triggered"
     assert trigger["superseded_count"] == 1
-    assert trigger["superseded_reason"] == SUPERSEDED_REASON
+    assert trigger["superseded_reason"] == _SUPERSEDED_REASON
     assert _page_status(html) == "triggered"
-    assert SUPERSEDED_REASON in html
+    assert _SUPERSEDED_REASON in html
 
 
 def test_a_corrupt_timezone_is_contained_to_its_own_site(
@@ -350,7 +354,7 @@ def test_latest_trigger_decision_is_scoped_to_the_exact_date() -> None:
     site_id = asof_make_site(conn, "site-alpha")
     for decision, reason in (
         ("run_started", None),
-        ("skipped", SUPERSEDED_REASON),
+        ("skipped", _SUPERSEDED_REASON),
         ("run_started", None),
     ):
         record_trigger_decision(
@@ -373,7 +377,7 @@ def test_latest_trigger_decision_is_scoped_to_the_exact_date() -> None:
     assert read is not None
     assert read.decision == "run_started"
     assert read.superseded_count == 1
-    assert read.superseded_reason == SUPERSEDED_REASON
+    assert read.superseded_reason == _SUPERSEDED_REASON
     assert latest_trigger_decision(conn, site_id, "2026-06-01") is None
 
 
@@ -414,69 +418,3 @@ def test_without_the_hold_key_neither_surface_claims_a_hold(
 
     assert trigger["publish_hold"] == {"held": False, "reason": None}
     assert "Publishing is held by the operator" not in html
-
-
-def test_the_hold_row_and_the_read_side_carry_the_one_shared_constant(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``PUBLISH_HOLD_REASON`` is the single definition, imported by both
-    sides, so this is an identity assertion rather than a spelling pin: it
-    fails if the scheduler ever writes some *other* reason on the hold path,
-    and cannot be made to pass by editing two literals in step.
-
-    Kills: the 0.11.0-era arrangement this replaced, in which the writer and
-    the read side each carried their own ``"publish_hold"`` literal. Any
-    divergence between them — the scheduler stamping a different reason on
-    the hold path, or the read side reporting one — fails here. Note the
-    honest limit: two literals that agree are behaviourally equivalent to
-    one shared constant, so this oracle pins the *agreement*, not the
-    de-duplication; the single definition is what removes the drift, and
-    only a drifted pair is observable from outside."""
-    conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn, "site-alpha")
-    set_setting(conn, "verification_publish_hold", "1")
-    monkeypatch.setattr(scheduler_module, "utc_now", lambda: _AFTER_TRIGGER)
-
-    _enqueue_due_verification_runs(conn)
-
-    row = conn.execute(
-        "SELECT reason FROM verification_trigger_decisions WHERE site_id = ?",
-        (site_id,),
-    ).fetchone()
-    assert str(row["reason"]) == PUBLISH_HOLD_REASON
-    assert trigger_status(conn, site_id, _AFTER_TRIGGER)["reason"] == (
-        PUBLISH_HOLD_REASON
-    )
-
-
-# ---------------------------------------------------------------------------
-# The writer side keeps its own, fail-closed rule.
-# ---------------------------------------------------------------------------
-
-
-def test_the_scheduler_still_gates_on_its_own_trigger_instant(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The reader resolves to the PREVIOUS local date before the trigger
-    time; the scheduler must never enqueue for it. One tick before, one
-    after, on the same fixture."""
-    conn = _init_tmp_db(tmp_path)
-    site_id = _make_site(conn, "site-alpha")
-
-    monkeypatch.setattr(scheduler_module, "utc_now", lambda: _BEFORE_TRIGGER)
-    _enqueue_due_verification_runs(conn)
-    assert expected_trigger_date(conn, site_id, _BEFORE_TRIGGER) == "2026-06-05"
-    jobs = conn.execute(
-        "SELECT payload FROM jobs WHERE type = 'verification_run' AND site_id = ?",
-        (site_id,),
-    ).fetchall()
-    assert jobs == []
-
-    monkeypatch.setattr(scheduler_module, "utc_now", lambda: _AFTER_TRIGGER)
-    _enqueue_due_verification_runs(conn)
-    jobs = conn.execute(
-        "SELECT payload FROM jobs WHERE type = 'verification_run' AND site_id = ?",
-        (site_id,),
-    ).fetchall()
-    assert len(jobs) == 1
-    assert "2026-06-06" in str(jobs[0]["payload"])

@@ -20,7 +20,7 @@ derivation).
 Every fixture value is synthetic: invented site names, a hand-made 'UTC'
 timezone, and ids that identify nothing. The site/truth builders come from
 ``tests.test_result_basis_fingerprint`` and the chain driver from
-``tests.test_verification_run``, which already follow that convention.
+``tests.helpers``, which already follow that convention.
 """
 
 from __future__ import annotations
@@ -36,7 +36,12 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import asof_conn, asof_insert_pair, asof_insert_sample
+from tests.helpers import (
+    _make_verification_site,
+    asof_conn,
+    asof_insert_pair,
+    asof_insert_sample,
+)
 from tests.test_phase7_surface import _make_app, _make_site, _seed_published_run
 from tests.test_phase8_section18_oracles import (
     _by_v16,
@@ -55,20 +60,10 @@ from tests.test_result_basis_fingerprint import (
     _site_with_period,
     _status,
 )
-from tests.test_verification_run import (
-    _W8_PAYLOAD,
-    _decisions,
-    _drive_chain,
-    _make_verification_site,
-)
 from wxverify.collection.forecast_fetcher import persist_fetch_result
 from wxverify.db.connection import Database
 from wxverify.db.migrations import TARGET_USER_VERSION, create_schema, run_migrations
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_id,
-    published_pointer_key,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.verification import manifest
 from wxverify.verification.freshness import published_input_freshness
@@ -88,6 +83,7 @@ from wxverify.verification.runs import (
     capture_config_snapshot,
     fail_incomplete_attempts,
     input_fingerprint,
+    publish_run,
     published_run_id,
     result_basis_fingerprint,
     start_run,
@@ -219,7 +215,7 @@ def test_o18c_migrating_a_database_with_published_runs_adds_an_empty_table() -> 
     file is not on the next bump's edit list."""
     conn = _pre_manifest_db()
     site_id = _insert_site(conn)
-    gen = ensure_published_generation(conn, site_id)
+    gen = ensure_site_generation(conn, site_id)
     _insert_run_row(conn, site_id, state="published", tz_generation_id=gen)
     conn.commit()
     assert "verification_run_inputs" not in _table_names(conn)
@@ -244,65 +240,6 @@ def test_o18d_create_schema_alone_produces_the_table_without_any_gate() -> None:
 
     assert _run_inputs_shape(fresh) != []
     assert _run_inputs_shape(fresh) == _run_inputs_shape(migrated)
-
-
-# ---------------------------------------------------------------------------
-# O19 -- the import neutralizer's presence gate is unchanged (D15).
-# ---------------------------------------------------------------------------
-
-
-def test_o19_pre_manifest_export_is_still_neutralized_on_import(
-    tmp_path: Path,
-) -> None:
-    """O19 -> at ``state == 'failed'``: a staged upload carrying the five
-    legacy verification tables and NO ``verification_run_inputs`` still
-    has its running chain neutralized. Mutant M16 (adding the new table to
-    ``_VERIFICATION_RUN_TABLES``) fails the all-of gate for every
-    pre-manifest export, so the run stays ``running``."""
-    from wxverify.api.routes.db_transfer import _neutralize_imported_verification_chains
-    from wxverify.worker.verification_run import verification_job_key
-
-    donor_path = tmp_path / "donor-o19.db"
-    conn = _pre_manifest_db(str(donor_path))
-    site_id = _insert_site(conn)
-    gen = ensure_published_generation(conn, site_id)
-    running_id = _insert_run_row(conn, site_id, state="running", tz_generation_id=gen)
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
-        "('verification_run', ?, ?, 'pending')",
-        (site_id, verification_job_key(site_id)),
-    )
-    conn.commit()
-    names = _table_names(conn)
-    conn.close()
-    # The five tables the gate has always required, spelled out rather than
-    # read from the tuple, so the assertion below is on behaviour.
-    assert {
-        "verification_runs",
-        "verification_evidence",
-        "verification_day_context",
-        "verification_results",
-        "verification_verdicts",
-    } <= names
-    assert "verification_run_inputs" not in names
-
-    _neutralize_imported_verification_chains(donor_path)
-
-    check = sqlite3.connect(str(donor_path))
-    check.row_factory = sqlite3.Row
-    try:
-        run = check.execute(
-            "SELECT state FROM verification_runs WHERE id = ?", (running_id,)
-        ).fetchone()
-        assert run is not None
-        assert str(run["state"]) == "failed"
-        job = check.execute(
-            "SELECT status FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()
-        assert job is not None
-        assert str(job["status"]) == "failed"
-    finally:
-        check.close()
 
 
 # ---------------------------------------------------------------------------
@@ -525,13 +462,23 @@ _FORECAST_ARRIVALS_PROSE = "new forecast rows inside the scored dates"
 
 
 def _chain_published_run(conn: sqlite3.Connection) -> tuple[int, list[int], int]:
-    """Drive the production chain to a published, manifest-bearing run.
+    """A published, manifest-bearing run over ``_make_verification_site``'s
+    period, built directly through the write path (``start_run`` /
+    ``write_run_manifest`` / ``publish_run``) -- never the retired replay
+    chain.
 
     Returns ``(site_id, feed_ids, run_id)``. The manifest is complete and
     its arrivals horizon is ``[_HORIZON_START, _HORIZON_END)``.
     """
     site_id, feeds = _make_verification_site(conn)
-    _drive_chain(conn, site_id, dict(_W8_PAYLOAD))
+    snapshot = capture_config_snapshot(conn, site_id)
+    fingerprint = input_fingerprint(conn, site_id, snapshot)
+    cfg = start_run(
+        conn, site_id, snapshot=snapshot, fingerprint=fingerprint, now=_RUN_NOW
+    )
+    assert cfg is not None
+    write_run_manifest(conn, cfg)
+    publish_run(conn, site_id, cfg.run_id)
     conn.commit()
     run_id = published_run_id(conn, site_id)
     assert run_id is not None
@@ -783,7 +730,7 @@ def test_o8_a_legacy_run_whose_basis_moved_is_still_changed(
     site_id = _make_site(conn, "o8-legacy-site")
     run_id = _seed_published_run(conn, site_id)
     assert _manifest_rows(conn, run_id) == {}
-    gen = published_generation_id(conn, site_id)
+    gen = site_generation_id(conn, site_id)
     assert gen is not None
     _insert_truth_day(conn, site_id, gen, "2026-05-10")
     conn.commit()
@@ -1023,20 +970,20 @@ def test_o14_a_run_published_through_the_production_path_is_fresh_untouched(
 # ---------------------------------------------------------------------------
 
 
-def test_o15_run_input_freshness_never_writes_even_without_a_generation_pointer() -> (
-    None
-):
-    """O15 -> at every call returning under ``PRAGMA query_only=ON`` on a
-    site whose published-generation pointer is gone: (a) a manifest-bearing
-    run, (b) a legacy run, (c) a manifest-bearing run whose
+def test_o15_run_input_freshness_never_writes_even_under_query_only() -> None:
+    """O15 -> at every call returning under ``PRAGMA query_only=ON``: (a) a
+    manifest-bearing run, (b) a legacy run, (c) a manifest-bearing run whose
     ``forecast_arrivals`` scope is not JSON -- the branch mutant M15 turns
     into a live horizon recompute through ``capture_config_snapshot``, a
     seeding WRITE that raises 'attempt to write a readonly database' here.
-    (c) is anchored on ``unknown``/``malformed_record`` for that component,
-    not merely on not raising."""
+    (a) and (b) are each evaluated once before ``_read_only(conn)``
+    (``conn.total_changes`` must not move across that call) and once after
+    (the same ``(state, reason)`` as the first call). (c) is anchored on
+    ``unknown``/``malformed_record`` for that component, not merely on not
+    raising."""
     conn = asof_conn()
     site_id = _make_site(conn, "o15-site")
-    gen = published_generation_id(conn, site_id)
+    gen = site_generation_id(conn, site_id)
     assert gen is not None
     snapshot = capture_config_snapshot(conn, site_id)
     basis = result_basis_fingerprint(
@@ -1062,12 +1009,7 @@ def test_o15_run_input_freshness_never_writes_even_without_a_generation_pointer(
     _insert_manifest_row(
         conn, bad_scope, MANIFEST_COMPONENT_FORECAST_ARRIVALS, "fs1:0", "not json"
     )
-    conn.execute(
-        "DELETE FROM runtime_state WHERE key = ?", (published_pointer_key(site_id),)
-    )
     conn.commit()
-    assert published_generation_id(conn, site_id) is None
-    _read_only(conn)
 
     def evaluate(run_id: int) -> manifest.RunInputFreshness:
         return run_input_freshness(
@@ -1079,10 +1021,20 @@ def test_o15_run_input_freshness_never_writes_even_without_a_generation_pointer(
             period_end="2026-06-03",
         )
 
-    a = evaluate(with_manifest)
-    assert (a.state, a.reason) == ("unknown", "no_published_generation")
-    b = evaluate(legacy)
-    assert (b.state, b.reason) == ("unknown", "no_published_generation")
+    changes_before_a = conn.total_changes
+    a_first = evaluate(with_manifest)
+    assert conn.total_changes == changes_before_a
+    changes_before_b = conn.total_changes
+    b_first = evaluate(legacy)
+    assert conn.total_changes == changes_before_b
+
+    _read_only(conn)
+
+    a_second = evaluate(with_manifest)
+    assert (a_second.state, a_second.reason) == (a_first.state, a_first.reason)
+    b_second = evaluate(legacy)
+    assert (b_second.state, b_second.reason) == (b_first.state, b_first.reason)
+
     c = evaluate(bad_scope)
     assert c.state == "unknown"
     forecast = {x.component: x for x in c.components}[
@@ -1140,29 +1092,6 @@ def test_o21c_the_notice_names_the_moved_input_in_prose_not_by_identifier(
         "Current inputs no longer match the basis pinned for this run ("
     )
     assert text.endswith(") — results reflect that pinned basis, not current data.")
-
-
-# ---------------------------------------------------------------------------
-# O23 (b) -- the no-change gate still fires with a manifest in the database.
-# ---------------------------------------------------------------------------
-
-
-def test_o23b_an_unchanged_night_still_takes_no_change_skip_with_a_manifest() -> None:
-    """O23 (b) -> at ``decision == 'no_change_skip'`` on the second trigger:
-    the gate still reads ``input_fingerprint`` (D14); a gate migrated onto
-    the manifest would start a run every night."""
-    conn = asof_conn()
-    site_id, _feeds, run_id = _chain_published_run(conn)
-    assert len(_manifest_rows(conn, run_id)) == 3
-    before = len(_decisions(conn, site_id))
-
-    payload = dict(_W8_PAYLOAD)
-    payload["trigger_date"] = "2026-06-07"
-    _drive_chain(conn, site_id, payload)
-
-    rows = _decisions(conn, site_id)[before:]
-    assert rows[-1]["decision"] == "no_change_skip"
-    assert published_run_id(conn, site_id) == run_id
 
 
 # ---------------------------------------------------------------------------

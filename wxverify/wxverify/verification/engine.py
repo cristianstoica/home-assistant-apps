@@ -52,7 +52,6 @@ from wxverify.verification.stats import (
     mae,
     rmse,
 )
-from wxverify.verification.truth import divergent_truth_in_horizon
 
 EntityId = tuple[str, str]
 _CellRows = dict[EntityId, dict[str, sqlite3.Row]]
@@ -762,14 +761,8 @@ def finalize_verdicts(
 def publish_verified_run(conn: sqlite3.Connection, cfg: RunConfig) -> None:
     """Integrity-check then atomically publish the run (§14).
 
-    Two checks, and the second is about data rather than about this run's
-    own output: the run's truth values were pinned at ``start_run`` and
-    every phase since has consumed them, so a value that changed in the
-    meantime would be published as scores computed against the superseded
-    value — silent divergence. Rebuilding here cannot fix that (the phases
-    that consumed the old values have already run), so the run is discarded
-    instead; the next night's chain regenerates the marked days before it
-    scores, and publishes numbers that do reflect the late observation.
+    The check is on this run's own output: one verdict per simulated
+    variable and at least one result row.
     """
     verdicts = conn.execute(
         "SELECT COUNT(*) AS n FROM verification_verdicts WHERE run_id = ?",
@@ -783,18 +776,5 @@ def publish_verified_run(conn: sqlite3.Connection, cfg: RunConfig) -> None:
         raise RuntimeError(
             f"verification run {cfg.run_id} failed integrity: "
             f"verdicts={int(verdicts['n'])} results={int(results['n'])}"
-        )
-    divergent = divergent_truth_in_horizon(
-        conn,
-        site_id=cfg.site_id,
-        tz_generation_id=cfg.tz_generation_id,
-        period_start=cfg.period_start,
-        period_end=cfg.period_end,
-    )
-    if divergent:
-        raise RuntimeError(
-            f"verification run {cfg.run_id} failed integrity: "
-            "truth diverged after inputs were pinned: "
-            + ", ".join(f"{day}/{quantity}" for day, quantity in divergent)
         )
     publish_run(conn, cfg.site_id, cfg.run_id)

@@ -56,9 +56,8 @@ def _job_from_row(row: sqlite3.Row) -> Job:
     if not isinstance(payload_obj, dict):
         # Same "can't trust this payload" class as a JSON parse failure below:
         # a syntactically valid but wrong-shaped payload must not silently run
-        # as {} (e.g. it would walk backfill_site straight into a window
-        # clamp that can skip days). Raise so claim_next_job's disposition
-        # catches it instead of substituting a default.
+        # as {}. Raise so claim_next_job's disposition catches it instead of
+        # substituting a default.
         raise TypeError("job payload is not a JSON object")
     payload = cast(dict[str, object], payload_obj)
     return Job(
@@ -261,12 +260,29 @@ _CURRENT_OBS_LANE_CLAUSE: Final = "AND +type = 'fetch_current_obs'"
 CHAIN_PROMOTION_AGE: Final = timedelta(minutes=5)
 
 #: The resumable chain types: the claim's tier-2 rule and the reclaim stamp.
-_CHAIN_TYPES_SQL: Final = "('verification_run','timezone_correction')"
+#: Empty since the nightly replay was retired (switch-over plan R12; the
+#: time-zone rebuild went with R14), so both match no row. SQLite accepts an
+#: empty IN list.
+_CHAIN_TYPES_SQL: Final = "()"
 
+# Tier 0 also holds the wind lane's job (``fetch_obs`` keyed ``wind-days``,
+# daily-close P2 4.6), so an evening slot is claimed before any waiting
+# tier-1 job. The key is written out: worker/wind_days.py (its
+# WIND_DAYS_JOB_KEY) imports this module, so this module cannot import it.
+# The daily close's two kinds, ``day_close`` and ``day_publish`` (daily-close
+# P3 4.3), are tier 0 too, written out because worker/close_chain.py imports
+# this module. They are not chain types, so they never drop to tier 2 and
+# reclaim_all_stale leaves their next_attempt_at alone.
+# The scored round's tries (``fetch_feed`` keyed ``round:{feed_id}``,
+# daily-close P4 4.4) are tier 0 as well, so a quick retry is not queued
+# behind the night's other work; worker/round.py enqueues them and imports
+# this module.
 _CLAIM_ORDER_BY: Final = f"""
     ORDER BY
         CASE
-            WHEN type IN ('forecast_record','record_gap_scan') THEN 0
+            WHEN type IN ('forecast_record','record_gap_scan','day_close','day_publish')
+                 OR (type = 'fetch_obs' AND job_key = 'wind-days')
+                 OR (type = 'fetch_feed' AND job_key LIKE 'round:%') THEN 0
             WHEN type IN {_CHAIN_TYPES_SQL}
                  AND COALESCE(next_attempt_at, updated_at) > ? THEN 2
             ELSE 1
@@ -303,16 +319,14 @@ def _claim(conn: sqlite3.Connection, type_clause: str) -> Job | None:
 
     Ordering is a type-priority tier, then FIFO by ``created_at, id`` within
     the tier (§14; the SQL is ``_CLAIM_ORDER_BY``). ``forecast_record`` /
-    ``record_gap_scan`` (tier 0) still claim ahead of everything. A resumable
-    chain chunk (``verification_run`` / ``timezone_correction``) claims after
-    all other work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in
-    tier 1, FIFO by ``created_at`` with the rest. Its age runs from
-    ``COALESCE(next_attempt_at, updated_at)``: a new continuation's insert
-    time, a retried or deferred chunk's due time, or the reclaim time
-    (``reclaim_all_stale``). Each chunk re-enqueues its continuation as a
-    fresh row, so every chunk starts its wait in tier 2 again: other work
-    still interleaves between chunks, and a chunk no longer waits for as
-    long as any tier-1 job is pending.
+    ``record_gap_scan``, the daily close's ``day_close`` / ``day_publish``,
+    the wind lane's ``fetch_obs`` job keyed ``wind-days`` and the scored
+    round's ``fetch_feed`` tries keyed ``round:{feed_id}`` (tier 0) still
+    claim ahead of everything. A resumable chain chunk (a kind listed in
+    ``_CHAIN_TYPES_SQL``, which is empty today) would claim after all other
+    work for its first ``CHAIN_PROMOTION_AGE`` (5 minutes), then in tier 1,
+    FIFO by ``created_at`` with the rest, its age running from
+    ``COALESCE(next_attempt_at, updated_at)``.
     """
     claim_at = timeutil.utc_now()  # module attribute, the clock isoformat_utc() reads
     now = isoformat_utc(claim_at)
@@ -473,9 +487,9 @@ def purge_failed_jobs_older_than(conn: sqlite3.Connection, hours: int) -> int:
 def reclaim_all_stale(conn: sqlite3.Connection) -> int:
     """Re-pend every running row.
 
-    A chain row's next_attempt_at becomes now, so it waits in tier 2 like a
-    new continuation (see _claim). Besides status and updated_at, nothing
-    else changes: created_at, retry_count and every other type's
+    A chain row's next_attempt_at becomes now, so it waits in tier 2 (see
+    _claim; no kind is a chain kind today). Besides status and updated_at,
+    nothing else changes: created_at, retry_count and every other type's
     next_attempt_at stay as they were.
     """
     now = isoformat_utc()

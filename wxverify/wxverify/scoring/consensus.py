@@ -7,13 +7,20 @@ import math
 import sqlite3
 import statistics
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Final
 
 from pydantic import BaseModel, ConfigDict
 
-from wxverify.core.timeutil import isoformat_utc, parse_utc
-from wxverify.db.tz_generations import published_generation_clause
+from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
+from wxverify.db.day_guard_log import warn_refused_instants
+from wxverify.db.site_days import (
+    WriteKind,
+    check_day_write,
+    daily_close_on,
+    day_for_instant,
+    day_station_ids,
+)
 from wxverify.obs.qc import TARGET_VARIABLES, qc_flag
 from wxverify.verification.truth import mark_daily_truth_stale
 
@@ -170,15 +177,18 @@ def insert_station_observation(
     valid_at: str,
     value: float,
     source_raw: str | None,
+    now_utc: datetime | None = None,
 ) -> bool:
     """Write one station reading and re-materialize its consensus hour.
 
     Wind rows are never written here: the wind lane derives and writes them
-    through ``write_station_observation``.
+    through ``write_station_observation``. ``now_utc`` is the clock the
+    closed-day guard uses; it defaults to ``utc_now()``.
     """
     if variable == "wind":
         logger.debug("wind station row skipped station=%s", station_id)
         return False
+    now = utc_now() if now_utc is None else now_utc
     if not write_station_observation(
         conn,
         station_id=station_id,
@@ -186,6 +196,7 @@ def insert_station_observation(
         valid_at=valid_at,
         value=value,
         source_raw=source_raw,
+        now_utc=now,
     ):
         return False
     site_row = conn.execute(
@@ -193,7 +204,11 @@ def insert_station_observation(
     ).fetchone()
     if site_row is not None:
         materialize_consensus(
-            conn, site_id=int(site_row["site_id"]), variable=variable, valid_at=valid_at
+            conn,
+            site_id=int(site_row["site_id"]),
+            variable=variable,
+            valid_at=valid_at,
+            now_utc=now,
         )
     return True
 
@@ -206,15 +221,30 @@ def write_station_observation(
     valid_at: str,
     value: float,
     source_raw: str | None,
+    now_utc: datetime | None = None,
 ) -> bool:
     """Upsert one ``station_observations`` row; True when it changed.
 
-    The unguarded write body: it does not materialize. Callers are
+    The write body: it does not materialize. Callers are
     ``insert_station_observation``, which never writes wind, and the wind
-    lane, which derives every wind row and writes it through here.
+    lane, which derives every wind row and writes it through here. The
+    closed-day guard checks the row (``HOURLY``) as a backstop behind the
+    callers' batch cuts: a refused row is not written, returns False and is
+    logged at DEBUG only. ``now_utc`` defaults to ``utc_now()``.
     """
     if variable in TARGET_VARIABLES and not source_raw:
         raise ValueError("target observation writes require source_raw")
+    station = conn.execute(
+        "SELECT site_id FROM stations WHERE id = ?", (station_id,)
+    ).fetchone()
+    if station is not None and not check_day_write(
+        conn,
+        int(station["site_id"]),
+        valid_at,
+        WriteKind.HOURLY,
+        now_utc=utc_now() if now_utc is None else now_utc,
+    ):
+        return False
     previous = conn.execute(
         """
         SELECT value FROM station_observations
@@ -261,7 +291,12 @@ def write_station_observation(
 
 
 def materialize_consensus(
-    conn: sqlite3.Connection, *, site_id: int, variable: str, valid_at: str
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    variable: str,
+    valid_at: str,
+    now_utc: datetime | None = None,
 ) -> None:
     """Recompute the consensus observation for one (site, variable, hour).
 
@@ -274,24 +309,46 @@ def materialize_consensus(
     what makes its pair-count-equality skip sound. Bypassing the
     invalidation step makes the incremental materializer silently retain
     stale pairs.
+
+    The closed-day guard (``HOURLY``) checks the hour after the site
+    lookup: a refused hour returns before anything is invalidated, marked
+    or written, and logs the refusal WARNING. ``now_utc`` defaults to
+    ``utc_now()``.
     """
     site = conn.execute(
         "SELECT elevation_m FROM sites WHERE id = ?", (site_id,)
     ).fetchone()
     if site is None:
         return
+    if not check_day_write(
+        conn,
+        site_id,
+        valid_at,
+        WriteKind.HOURLY,
+        now_utc=utc_now() if now_utc is None else now_utc,
+    ):
+        warn_refused_instants(
+            logger,
+            conn,
+            WriteKind.HOURLY,
+            writer="materialize_consensus",
+            site_id=site_id,
+            instants=[valid_at],
+        )
+        return
+    station_filter, station_params = _consensus_station_filter(conn, site_id, valid_at)
     rows = conn.execute(
-        """
+        f"""
         SELECT so.station_id, s.dem_elevation_m, so.variable, so.valid_at, so.value
         FROM station_observations so
         JOIN stations s ON s.id = so.station_id
         WHERE s.site_id = ?
-          AND s.enabled = 1
+          AND {station_filter}
           AND so.variable = ?
           AND so.valid_at = ?
           AND so.qc_flag = 'ok'
         """,
-        (site_id, variable, valid_at),
+        (site_id, *station_params, variable, valid_at),
     ).fetchall()
     readings = [
         StationReading(
@@ -312,10 +369,10 @@ def materialize_consensus(
     _invalidate_consensus_dependents(
         conn, site_id=site_id, variable=variable, valid_at=valid_at
     )
-    # Plan §4: every consensus mutation (rescore, catch-up, backfill — all
-    # of which funnel through here, the sole `observations` writer) marks
-    # the affected local day's daily_truth rows for regeneration. Runs for
-    # BOTH the upsert and the delete branch below.
+    # Plan §4: every consensus mutation (all of which funnel through here,
+    # the sole `observations` writer) marks the affected local day's
+    # daily_truth rows stale. Runs for BOTH the upsert and the delete branch
+    # below.
     mark_daily_truth_stale(conn, site_id=site_id, variable=variable, valid_at=valid_at)
     if result is None:
         conn.execute(
@@ -347,6 +404,29 @@ def materialize_consensus(
     )
 
 
+def _consensus_station_filter(
+    conn: sqlite3.Connection, site_id: int, valid_at: str
+) -> tuple[str, tuple[int, ...]]:
+    """The stations ``materialize_consensus`` reads for the hour (6.3).
+
+    While the close is off, the site's enabled stations, as today. While it
+    is on, the saved station list of the day that holds the hour; no record
+    or an empty list reads no station.
+    """
+    if not daily_close_on(conn):
+        return "s.enabled = 1", ()
+    record = day_for_instant(conn, site_id, valid_at)
+    station_ids = (
+        ()
+        if record is None
+        else tuple(sorted(day_station_ids(conn, site_id, record.local_date)))
+    )
+    if not station_ids:
+        return "0", ()
+    placeholders = ", ".join("?" for _ in station_ids)
+    return f"so.station_id IN ({placeholders})", station_ids
+
+
 def _invalidate_consensus_dependents(
     conn: sqlite3.Connection, *, site_id: int, variable: str, valid_at: str
 ) -> None:
@@ -355,18 +435,10 @@ def _invalidate_consensus_dependents(
     # persistence pairs where the hour is the pair's SOURCE (issued_at), plus
     # the affected score-cache rows. Part of the load-bearing contract
     # documented on materialize_consensus.
-    #
-    # PUBLISHED generation only (§13): a building correction generation's
-    # rows are owned by the correction chain — deleting them here mid-chain
-    # would corrupt the rebuild; the chain's rescan phase (and the final
-    # in-flip check) re-derives any day whose observations mutated during
-    # the build, so building rows made stale by this mutation are rebuilt,
-    # not leaked. Retired rows are removed by the chain's post-flip cleanup.
     conn.execute(
-        f"""
+        """
         DELETE FROM forecast_pairs
         WHERE site_id=? AND variable=? AND valid_at=?
-          AND {published_generation_clause("forecast_pairs")}
         """,
         (site_id, variable, valid_at),
     )
@@ -396,7 +468,7 @@ def _delete_future_persistence_pairs(
     for lead in range(1, int(feed["max_lead_hours"]) + 1):
         target_valid_at = isoformat_utc(source_valid + timedelta(hours=lead))
         conn.execute(
-            f"""
+            """
             DELETE FROM forecast_pairs
             WHERE site_id=?
               AND feed_id=?
@@ -404,7 +476,6 @@ def _delete_future_persistence_pairs(
               AND issued_at=?
               AND valid_at=?
               AND lead_hours=?
-              AND {published_generation_clause("forecast_pairs")}
             """,
             (site_id, feed_id, variable, source_valid_at, target_valid_at, lead),
         )

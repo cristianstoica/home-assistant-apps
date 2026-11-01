@@ -42,12 +42,10 @@ hold across the run's life, and neither is absolute:
   hashed here, so an intervening consensus change only marks rows stale
   and leaves this digest alone. Excluding ``stale`` from the digest is a
   hashing choice and not a claim that a marked day still re-derives to
-  what it stored, so ``divergent_truth_in_horizon`` supplies that
-  enforcement instead — re-deriving every marked day of the run's
-  generation inside the horizon before publish and failing the run when
-  one no longer matches. Administrative paths — database import/replace,
-  repair tooling, migrations — have not been traced against an active run
-  and are outside this claim.
+  what it stored; the pre-publish re-derivation that enforced that was
+  retired with the nightly replay (switch-over plan G16). Administrative
+  paths — database import/replace, repair tooling, migrations — have not
+  been traced against an active run and are outside this claim.
 
 Pinning at ``start_run`` does not DEPEND on absolute immutability. What
 matters is that the recorded fingerprint accurately describes the basis
@@ -69,10 +67,7 @@ from typing import Final, Literal, cast
 from wxverify import __version__
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.settings.depth import DEPTH_VARIABLES, effective_blend_depths
 from wxverify.settings.keys import get_number_setting
@@ -186,13 +181,12 @@ def capture_config_snapshot(
 ) -> dict[str, object]:
     """The run's pinned configuration + roster, as one canonical JSON-able dict.
 
-    WRITE PATH ONLY: seeds the site's initial timezone generation when the
-    published pointer is absent, so it needs a write connection. The
-    read-only freshness check uses
-    :func:`current_result_basis_fingerprint`.
+    WRITE PATH ONLY: makes the site's time zone generation when it has
+    none, so it needs a write connection. The read-only freshness check
+    uses :func:`current_result_basis_fingerprint`.
     """
     return _config_snapshot(
-        conn, site_id, tz_generation_id=ensure_published_generation(conn, site_id)
+        conn, site_id, tz_generation_id=ensure_site_generation(conn, site_id)
     )
 
 
@@ -387,18 +381,18 @@ def result_basis_fingerprint(
 
 def current_result_basis_fingerprint(
     conn: sqlite3.Connection, site_id: int, *, period_start: str, period_end: str
-) -> str | None:
+) -> str:
     """Today's result basis over a published run's horizon — READ PATH.
 
     Resolves the timezone generation with the non-seeding
-    :func:`published_generation_id`, so the request path cannot INSERT on a
-    read-pool connection no matter what the pointer state is. Returns None
-    when the site has no published generation yet: the comparison is then
-    unknown rather than changed, and the caller says so instead of guessing.
+    ``site_generation_id``, so the request path cannot INSERT on a
+    read-pool connection. Raises ``ValueError`` when the site does not
+    exist or has no time zone generation; every site has one from the
+    database open on (``keep_read_generations``) and from ``create_site``.
     """
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     if generation_id is None:
-        return None
+        raise ValueError(f"site {site_id} has no time zone generation")
     snapshot = _config_snapshot(conn, site_id, tz_generation_id=generation_id)
     return result_basis_fingerprint(
         conn, site_id, snapshot, period_start=period_start, period_end=period_end
@@ -481,8 +475,6 @@ def result_basis_freshness(
     current = current_result_basis_fingerprint(
         conn, site_id, period_start=period_start, period_end=period_end
     )
-    if current is None:
-        return ResultBasisFreshness(state="unknown", reason="no_published_generation")
     return ResultBasisFreshness(
         state="fresh" if current == recorded else "changed", reason=None
     )
@@ -761,18 +753,20 @@ def assert_inputs_unchanged_readonly(conn: sqlite3.Connection, cfg: RunConfig) -
     """READ PATH twin of :func:`assert_inputs_unpinned_unchanged`.
 
     Runs inside a read snapshot under ``PRAGMA query_only``: it never seeds
-    a timezone generation. A missing published pointer is itself a
+    a timezone generation. A site with no time zone generation is itself a
     mismatch (the write-path check would seed a new generation whose id
     differs from the pinned one and fail the same way).
     """
-    pointer = published_generation_id(conn, cfg.site_id)
+    generation_id = site_generation_id(conn, cfg.site_id)
     current = _config_snapshot(
         conn,
         cfg.site_id,
-        tz_generation_id=cfg.tz_generation_id if pointer is None else pointer,
+        tz_generation_id=(
+            cfg.tz_generation_id if generation_id is None else generation_id
+        ),
     )
     mismatches = _input_mismatches(current, cfg)
-    if pointer is None:
+    if generation_id is None:
         mismatches.append("tz_generation_id")
     _raise_if_inputs_changed(cfg, mismatches)
 
@@ -877,11 +871,6 @@ SUPERSEDED_REASON_PREFIX = "superseded:"
 #: publish hold suppressed the nightly enqueue, mirrored here for the two
 #: reader surfaces. The scheduler owns the write; this is the read-side name.
 PUBLISH_HOLD_REASON = "publish_hold"
-
-#: §D13 reason recorded on a `verification_run` job/run neutralized because it
-#: arrived via import while still active in the donor. One definition, used by
-#: `db_transfer.py` and by the tests — no caller may spell the string literally.
-IMPORT_SUPPRESSED_REASON = "suppressed: imported active verification chain"
 
 #: §12 trigger-status values carried on both the API status payload and the
 #: /verification page context.

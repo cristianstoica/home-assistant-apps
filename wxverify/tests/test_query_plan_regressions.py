@@ -52,6 +52,9 @@ from wxverify.scoring.pairing import (
     _CANDIDATE_PAIRS_SQL,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
     REAL_MODEL_PAIR_PROBE_SQL,
 )
+from wxverify.scoring.publication import (
+    _SEED_SKILL_SUMS_SQL,  # noqa: PLC2701 -- the SQL IS the plan input under test
+)
 from wxverify.scoring.winrate import winrate_sql
 
 
@@ -281,33 +284,6 @@ def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
         ("abs_error", 0),
         ("tz_generation_id", 0),
     ]
-
-
-def test_winrate_published_pointer_resolves_as_a_runtime_state_key_probe() -> None:
-    # The published-generation binding embeds a correlated scalar subquery on
-    # runtime_state ('tz_generation_published:' || fp.site_id). It runs once
-    # per candidate pairs row, so it must stay a key probe of runtime_state's
-    # primary key -- a per-row SCAN of runtime_state would make every
-    # pairs-reading statement O(pairs x runtime_state). Asserted as a
-    # structural relationship (probe present, scan absent), not exact EQP
-    # phrasing, which is build-specific.
-    conn = _fresh_conn()
-    sql = winrate_sql("")
-    params = (1, 1, 1, "temperature", 1)
-    plan = _plan(conn, sql, params)
-    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
-    assert not any("SCAN rs" in line for line in plan), plan
-
-    # Negative control: defeat the key probe (CAST strips the equality from
-    # the primary key) and the very same statement degrades to SCAN rs --
-    # proving the healthy assertion above is discriminating, not vacuous.
-    degraded_sql = sql.replace(
-        "rs.key = 'tz_generation_published:' || fp.site_id",
-        "CAST(rs.key AS TEXT) = 'tz_generation_published:' || fp.site_id",
-    )
-    assert degraded_sql != sql, "clause text drifted; update this control"
-    degraded_plan = _plan(conn, degraded_sql, params)
-    assert any("SCAN rs" in line for line in degraded_plan), degraded_plan
 
 
 def test_worker_status_count_statements_stay_index_only_scans() -> None:
@@ -851,10 +827,9 @@ def test_fingerprint_sql_still_matches_the_pinned_text() -> None:
         "        WHERE site_id = ? AND tz_generation_id = ?\n"
         "        ORDER BY local_date, quantity" in source
     )
-    # The pointer probe reaches the request path through
-    # published_generation_id -> get_runtime_state.
-    assert _TZ_POINTER_SQL in inspect.getsource(wxverify.db.runtime_state)
-    assert "published_generation_id(conn, site_id)" in source
+    # The generation resolution reaches the request path through
+    # site_generation_id's own SELECT on timezone_generations.
+    assert "site_generation_id(conn, site_id)" in source
 
 
 def test_fingerprint_observation_count_seeks_by_site_never_scans() -> None:
@@ -1291,23 +1266,20 @@ def test_eqp_claim_partition_clauses_keep_todays_claim_plan() -> None:
 def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
     """EQP -- the multimodel diff's site-scoped X read (``scoring/split.py``
     apply, ``scoring/multimodel.py:compute_multimodel_mean``) must seek
-    ``forecast_pairs`` on ``(site_id, feed_id)`` and the published-generation
-    pointer probe on ``runtime_state``'s key, never a bare table scan of
-    either -- the same shape the winrate query pins above.
+    ``forecast_pairs`` on ``(site_id, feed_id)``, never a bare table scan.
     """
     conn = _fresh_conn()
-    plan = _plan(conn, existing_mean_rows_sql(site_scoped=True), (1, 1))
-    assert any(
-        "SEARCH forecast_pairs" in line and "site_id=?" in line for line in plan
-    ), plan
-    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
-    assert not any("SCAN forecast_pairs" in line for line in plan), plan
-    assert not any("SCAN rs" in line for line in plan), plan
+    plan = _plan(conn, existing_mean_rows_sql(site_scoped=True, day_clause="1"), (1, 1))
+    assert plan == [
+        "SEARCH forecast_pairs USING INDEX idx_pairs_cell (site_id=? AND feed_id=?)"
+    ], plan
 
     # Negative control: the site-unscoped form has no equality predicate to
     # seek forecast_pairs on, so it degrades to a bare scan -- proving the
     # healthy assertion above is discriminating, not vacuously true.
-    degraded_plan = _plan(conn, existing_mean_rows_sql(site_scoped=False), (1,))
+    degraded_plan = _plan(
+        conn, existing_mean_rows_sql(site_scoped=False, day_clause="1"), (1,)
+    )
     assert any("SCAN forecast_pairs" in line for line in degraded_plan), degraded_plan
 
 
@@ -1490,8 +1462,10 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
     including the ``CORRELATED SCALAR SUBQUERY`` and ``SCALAR SUBQUERY``
     headers, in the order the planner prints them. The rain-label boundary
-    clause (``precip_label_eligible_sql``) adds ``SCALAR SUBQUERY 3`` with its
-    ``runtime_state`` lookup and moves the ``f`` seek ahead of ``obs``.
+    clause (``precip_label_eligible_sql``) adds ``SCALAR SUBQUERY 2`` with its
+    ``runtime_state`` lookup and moves the ``f`` seek ahead of ``obs``. The
+    generation-pointer lookup that the dedup subquery's ``NOT EXISTS`` once
+    nested is gone, leaving the dedup check itself with the daily close.
     Measured in the add-on's dev venv (SQLite 3.53.1), where the previous
     pin, without the clause, also matched line for line; CI's shipping-SQLite
     job (``WXV_EQP_SHIPPING=1``) runs it. The pin is fresh-schema only: after
@@ -1501,16 +1475,14 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
     assert plan == [
         "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)",
-        # NOT EXISTS (forecast_pairs ...), with published_generation_clause's
-        # runtime_state pointer lookup (alias rs) nested inside it.
-        "CORRELATED SCALAR SUBQUERY 2",
+        # NOT EXISTS (forecast_pairs ...) dedup check; no generation-pointer
+        # lookup nested in it any more.
+        "CORRELATED SCALAR SUBQUERY 1",
         "SEARCH fp USING COVERING INDEX sqlite_autoindex_forecast_pairs_1"
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
-        "CORRELATED SCALAR SUBQUERY 1",
-        "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
         "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         # precip_label_eligible_sql's boundary-key lookup in runtime_state.
-        "SCALAR SUBQUERY 3",
+        "SCALAR SUBQUERY 2",
         "SEARCH runtime_state USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
         "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
         " (site_id=? AND variable=? AND valid_at=?)",
@@ -1538,3 +1510,119 @@ def test_candidate_pairs_sql_site_scoped_does_not_rowid_seek() -> None:
     plan = _plan(conn, _CANDIDATE_PAIRS_SQL + " AND fs.site_id = ?", (1,))
     fs_line = _fs_row(plan)
     assert fs_line != "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)", plan
+
+
+def test_open_day_clause_seeks_idx_site_days_writable() -> None:
+    """QP1 (daily-close plan §16): ``open_day_clause``'s correlated
+    ``site_days`` lookup must seek the partial index
+    ``idx_site_days_writable``, not scan ``site_days``. No
+    ``WXV_EQP_SHIPPING`` skip -- plan §16 requires this pin in both the
+    7-gate suite and the shipping-sqlite CI job.
+
+    Imported inside the test body, not at module top, so the rest of this
+    file's tests keep collecting while ``wxverify.db.site_days`` does not
+    exist yet.
+    """
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY, open_day_clause
+
+    conn = _fresh_conn()
+    wxverify.db.runtime_state.set_runtime_state(
+        conn, DAILY_CLOSE_ON_KEY, "2024-06-10T00:00:00Z"
+    )
+    site_id = int(
+        conn.execute(
+            "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
+            " timezone) VALUES ('QueryPlanOpenDay', 40, -105, 900, 'UTC')"
+        ).lastrowid
+    )
+    conn.execute(
+        "INSERT INTO observations (site_id, variable, valid_at, value,"
+        " n_stations) VALUES (?, 'temperature', '2024-06-10T06:00:00Z', 1.0, 1)",
+        (site_id,),
+    )
+
+    clause = open_day_clause(
+        conn, site_expr="observations.site_id", instant_expr="observations.valid_at"
+    )
+    sql = f"SELECT 1 FROM observations WHERE {clause}"
+    plan = _plan(conn, sql, ())
+    assert any(
+        "site_days" in line and "USING INDEX idx_site_days_writable" in line
+        for line in plan
+    ), plan
+
+    conn.execute("DROP INDEX idx_site_days_writable")
+    with pytest.raises(sqlite3.OperationalError, match="no such index"):
+        conn.execute(sql).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# SH6 -- daily-close switch-over plan (2026-10-22-daily-close-switch-over.md,
+# test ID SH6 of 17.12; step 7a, 9.4).
+#
+# Background: the skill join's WHERE clause lets SQLite carry the bound
+# ``fp.valid_at < ?`` across the join's ``pp.valid_at = fp.valid_at``
+# equality, so ``pp`` is sought on ``valid_at<?`` too -- walking the
+# persistence feed's whole history for every pair instead of the single row
+# the join predicate actually names. Relational, not a whole-plan pin, so it
+# runs in the seven gates and in the shipping-SQLite job with no
+# ``WXV_EQP_SHIPPING`` skip.
+# ---------------------------------------------------------------------------
+
+
+def test_sh6_seed_skill_sums_sql_seeks_both_sides_with_no_transitive_valid_at() -> None:
+    """SH6: ``_SEED_SKILL_SUMS_SQL``'s plan must seek both ``fp`` and ``pp``
+    (``SEARCH``, never ``SCAN``), with ``pp`` bound by ``valid_at=?`` --
+    never a transitively-derived ``valid_at<?``/``valid_at>?`` range carried
+    over from ``fp.valid_at < ?`` through the join's
+    ``pp.valid_at = fp.valid_at`` equality.
+
+    M74 -> at the "exactly two loop lines, both SEARCH" / "no transitive
+    valid_at range" assertions below: correct = two ``SEARCH`` lines (``fp``
+    then ``pp``), neither carrying ``valid_at<``/``valid_at>``, mutant M74
+    (the as-built statement on ``76a22dc``, with no leading ``+`` on
+    ``fp.valid_at < ?``) = the optimizer applies that bound to ``pp`` too,
+    walking it on ``valid_at<?``/``valid_at>?`` instead of seeking the
+    single row the join predicate actually names.
+    """
+    conn = _fresh_conn()
+    params = (1, 1, "2024-06-11T00:00:00Z", 1, 1)
+    plan = _plan(conn, _SEED_SKILL_SUMS_SQL, params)
+
+    loop_lines = [line for line in plan if line.startswith(("SEARCH", "SCAN"))]
+    assert len(loop_lines) == 2 and all(
+        line.startswith("SEARCH") for line in loop_lines
+    ), (
+        "M74 -> at this assertion: correct = exactly two loop lines over fp"
+        f" and pp, both SEARCH, mutant M74 (as built on 76a22dc) = {plan}"
+    )
+    assert not any("valid_at<" in line or "valid_at>" in line for line in plan), (
+        "M74 -> at this assertion: correct = no plan line holds valid_at<"
+        f" or valid_at>, mutant M74 (as built on 76a22dc) = {plan}"
+    )
+    assert "valid_at=?" in loop_lines[1], (
+        "M74 -> at this assertion: correct = the second loop line (pp)"
+        " holds valid_at=?, mutant M74 (as built on 76a22dc) ="
+        f" {loop_lines[1]!r}"
+    )
+
+    # Control: the statement with its "+fp.valid_at < ?" guard stripped back
+    # to a bare "fp.valid_at < ?" -- the exact edit that lets SQLite carry
+    # the bound transitively onto pp. Checked AFTER the statement's own
+    # assertions above: on 76a22dc the statement has no "+" at all, so this
+    # precondition would fail there first if it ran before them.
+    assert _SEED_SKILL_SUMS_SQL.count("+fp.valid_at < ?") == 1, (
+        "setup check: the statement must carry the leading + exactly once"
+        " for the control's replace below to be meaningful"
+    )
+    control = _SEED_SKILL_SUMS_SQL.replace("+fp.valid_at < ?", "fp.valid_at < ?")
+    control_plan = _plan(conn, control, params)
+    control_loop_lines = [
+        line for line in control_plan if line.startswith(("SEARCH", "SCAN"))
+    ]
+    assert any(
+        "valid_at<" in line or "valid_at>" in line for line in control_loop_lines
+    ), (
+        "control: the bare fp.valid_at < ? form must show the transitive"
+        f" valid_at walk this statement exists to avoid, got {control_plan}"
+    )

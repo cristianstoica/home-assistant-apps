@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import datetime, timedelta
-from typing import ClassVar, Final
+from typing import Final
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -132,8 +132,6 @@ class GoogleResponse(BaseModel):
 
 
 class GoogleAdapter:
-    supports_historical: ClassVar[bool] = False
-
     def __init__(self, api_key: str, client: httpx.AsyncClient) -> None:
         self._api_key = api_key
         self._client = client
@@ -195,16 +193,6 @@ class GoogleAdapter:
             len(result.samples),
         )
         return result
-
-    async def fetch_historical(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> FetchResult | None:
-        return None
-
-    def estimate_historical_cost(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> CostEstimate:
-        raise NotImplementedError("supports_historical is False")
 
 
 def _check_page(

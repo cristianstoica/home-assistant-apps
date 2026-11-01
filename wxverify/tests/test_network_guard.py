@@ -1,10 +1,7 @@
 """Oracles for ``tests/network_guard.py`` (plan: network-denial-guard, §9).
 
 Every target here is RFC 2606 / RFC 5737: ``HOST`` is a reserved ``.invalid``
-name, ``LITERAL`` is a TEST-NET-1 address. Provider hostnames appear only in
-O7, which exercises the real production swallow path under the guard -- the
-guard denies the connection before any provider is ever reached, from any
-mutant of this module.
+name, ``LITERAL`` is a TEST-NET-1 address.
 
 Every raw socket used here is bounded and closed; every httpx call passes an
 explicit ``timeout``. Under a mutant that lets a call through, the run still
@@ -18,7 +15,6 @@ import asyncio
 import contextlib
 import socket
 import sqlite3
-from pathlib import Path
 
 import httpx
 import pytest
@@ -37,21 +33,10 @@ from tests.network_guard import (
     is_locally_resolvable,
     render,
 )
-from wxverify import config
-from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.worker.processor import _is_process_fatal_permission_error
 
 HOST = "wxverify-network-guard.invalid"
 LITERAL = ("192.0.2.1", 9)
-
-
-def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    config.options_path = str(tmp_path / "missing-options.json")
-    db = init_db(str(db_path))
-    return db._conn  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -217,49 +202,6 @@ def test_swallowed_trip_fails_at_teardown() -> None:
         ):
             assert f" in {guard_frame_name}" not in message
         assert attempt_count() == 0
-    finally:
-        scope.close()
-
-
-# ---------------------------------------------------------------------------
-# O7 -- the production swallow path, test 2's shape
-# ---------------------------------------------------------------------------
-
-
-def test_catchup_swallows_denied_open_meteo_requests(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    conn.execute(
-        """
-        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('guard-site', 0.0, 0.0, 0.0, 'UTC')
-        """
-    )
-    conn.commit()
-    monkeypatch.setenv("WXV_WEATHERCOM_KEY", "SYNTHETIC-KEY")
-
-    from wxverify.worker.catchup import run_catchup  # noqa: PLC0415
-
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    scope = deny_network_scope()
-    next(scope)
-    try:
-        asyncio.run(run_catchup(db, writer, {}))
-        with pytest.raises(pytest.fail.Exception) as ei:
-            next(scope)
-        message = ei.value.msg
-        assert message is not None
-        assert (
-            message.count(
-                "getaddrinfo(host='previous-runs-api.open-meteo.com', port=443"
-            )
-            == 8
-        )
-        assert "host='api.open-meteo.com'" not in message
-        assert "[Errno 1]" not in message
     finally:
         scope.close()
 

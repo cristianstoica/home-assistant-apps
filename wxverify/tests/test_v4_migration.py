@@ -22,7 +22,6 @@ from wxverify import config
 from wxverify.db.connection import close_db, init_db
 from wxverify.db.migrations import TARGET_USER_VERSION
 from wxverify.db.queue import enqueue_if_absent
-from wxverify.db.tz_generations import published_pointer_key
 
 # ---------------------------------------------------------------------------
 # v3-era DDL — the shapes migrate_v4 must find on disk.
@@ -390,10 +389,11 @@ def test_v3_to_v4_seeds_one_published_initial_generation_per_site(
 
         pointer = conn.execute(
             "SELECT value FROM runtime_state WHERE key=?",
-            (published_pointer_key(site_id),),
+            (f"tz_generation_published:{site_id}",),
         ).fetchone()
-        assert pointer is not None, f"site {site_id} must get a published pointer"
-        assert int(pointer["value"]) == int(generation["id"])
+        assert pointer is None, (
+            f"site {site_id} must not get a published pointer key (A4 deletes it)"
+        )
 
     # Pre-existing unrelated runtime_state row untouched by the pointer upsert.
     unrelated = conn.execute(

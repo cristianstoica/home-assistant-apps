@@ -44,9 +44,9 @@ _T = "2035-01-02T12:00:00Z"
 
 
 def test_post_t_injections_leave_asof_ranking_bit_identical() -> None:
-    """Core §18.1 statement: inject post-T pairs, a post-T roster entry, a
-    post-T observation, and a non-published-generation decoy — the as-of
-    ranking at T must be bit-identical before and after.
+    """Core §18.1 statement: inject post-T pairs, a post-T roster entry, and
+    a post-T observation — the as-of ranking at T must be bit-identical
+    before and after.
 
     Kills: the knowability clause dropped from `_live_leaderboard` feed
     discovery (the injected post-T feed would APPEAR — roster leakage), and
@@ -154,28 +154,6 @@ def test_post_t_injections_leave_asof_ranking_bit_identical() -> None:
         value=4.0,
         computed_at="2035-01-02T15:00:00Z",
     )
-    # (e) A fully-knowable, sq_error-0 alpha pair under a NON-published
-    # generation: outside every read path, not an as-of exclusion.
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'UTC', 'retrospective_correction', 'building')
-        """,
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=alpha,
-        valid_at="2035-01-02T03:00:00Z",
-        issued_at=i1,
-        forecast=4.0,
-        observed=4.0,
-        first_known_at="2035-01-02T04:00:00Z",
-        generation_id=int(cur.lastrowid),
-    )
-
     after = forecast_ranking(
         conn,
         site_id=site_id,
@@ -617,112 +595,6 @@ def test_exclusion_reasons_count_each_row_exactly_once() -> None:
         .n
         == 1
     )
-
-
-def test_knowability_and_exclusions_are_published_generation_bound() -> None:
-    """Both the as-of aggregate and the exclusion accounting see ONLY the
-    site's published generation: retired-generation rows are outside every
-    read path, not an as-of exclusion.
-
-    Under the retired initial generation: a fully-knowable decoy (abs error
-    0 — would drag mae down) and an unknowable decoy (would inflate the
-    exclusion count). Under the published generation: one knowable pair
-    (abs error 3) and one unknowable pair.
-
-    Kills: `published_generation_clause` dropped from the
-    `pair_knowability_exclusions` statement (count would become 2).
-    """
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "Generation Bound Site")
-    feed_id = asof_make_real_feed(conn, "model-gen")
-    from wxverify.db.runtime_state import set_runtime_state
-    from wxverify.db.tz_generations import (
-        ensure_published_generation,
-        published_pointer_key,
-    )
-
-    gen_a = ensure_published_generation(conn, site_id)
-    # Decoys under generation A (to be retired).
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at="2035-01-02T05:00:00Z",
-        issued_at="2035-01-01T23:00:00Z",
-        forecast=4.0,
-        observed=4.0,
-        first_known_at="2035-01-02T06:00:00Z",
-        generation_id=gen_a,
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at="2035-01-02T06:00:00Z",
-        issued_at="2035-01-01T23:00:00Z",
-        forecast=4.0,
-        observed=4.0,
-        first_known_at="2035-01-02T14:00:00Z",
-        generation_id=gen_a,
-    )
-    # Publish generation B and retire A.
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations
-            (site_id, timezone, mode, state, published_at)
-        VALUES (?, 'UTC', 'retrospective_correction', 'published',
-                '2035-01-01T00:00:00Z')
-        """,
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    gen_b = int(cur.lastrowid)
-    conn.execute("UPDATE timezone_generations SET state='retired' WHERE id=?", (gen_a,))
-    set_runtime_state(conn, published_pointer_key(site_id), str(gen_b))
-    # Published-generation rows: one knowable (abs error 3), one unknowable.
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at="2035-01-02T05:00:00Z",
-        issued_at="2035-01-01T23:00:00Z",
-        forecast=7.0,
-        observed=4.0,
-        first_known_at="2035-01-02T06:00:00Z",
-        generation_id=gen_b,
-    )
-    asof_insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        valid_at="2035-01-02T06:00:00Z",
-        issued_at="2035-01-01T23:00:00Z",
-        forecast=5.0,
-        observed=4.0,
-        first_known_at="2035-01-02T13:00:00Z",
-        generation_id=gen_b,
-    )
-
-    assert pair_knowability_exclusions(
-        conn, site_id=site_id, variable="temperature", day_ahead=1, as_of=_T
-    ) == PairKnowabilityExclusions(
-        null_first_known_at=0,
-        first_known_after_t=1,
-        consensus_lag_after_t=0,
-        computed_at_after_t=0,
-    )
-    result = strategy_for("temperature").aggregate(
-        conn,
-        site_id=site_id,
-        feed_id=feed_id,
-        variable="temperature",
-        day_ahead=1,
-        window_cutoff=None,
-        min_n=1,
-        as_of=_T,
-    )
-    assert result.n == 1
-    assert result.mae is not None and abs(result.mae - 3.0) < 1e-12
 
 
 def test_persistence_pair_with_post_t_source_observation_is_absent() -> None:

@@ -15,7 +15,7 @@ import pytest
 import wxverify.verification.record as record_mod
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import set_setting
 from wxverify.verification.record import (
     MISSED_WINDOW_CLOSED,
@@ -204,7 +204,7 @@ def test_snapshot_wall_clock_resolution_order() -> None:
 def test_record_job_writes_full_grid() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _insert_full_grid(
         conn,
@@ -270,7 +270,7 @@ def test_record_skips_cells_with_no_samples() -> None:
     # from a real all-feeds-agree-on-nothing day. Only sampled identities land.
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _insert_temp_day(
         conn,
@@ -301,7 +301,7 @@ def test_record_leaves_out_paused_feed(pause_kind: str) -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = _make_feed(conn, "model-a")
     feed_b = _make_feed(conn, "model-b")
     _seed_grid_for(conn, site_id=site_id, feed_id=feed_a, day=_DAY)
@@ -349,7 +349,7 @@ def test_record_day_with_only_paused_samples(pause_kind: str) -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_b = _make_feed(conn, "model-b")
     _seed_grid_for(conn, site_id=site_id, feed_id=feed_b, day=_DAY)
 
@@ -378,7 +378,7 @@ def test_record_day_with_only_paused_samples(pause_kind: str) -> None:
 def test_record_retry_is_idempotent() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _insert_temp_day(
         conn,
@@ -420,7 +420,7 @@ def test_record_retry_is_idempotent() -> None:
 def test_record_excludes_samples_fetched_after_t() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _insert_temp_day(
         conn,
@@ -457,7 +457,7 @@ def test_record_excludes_samples_fetched_after_t() -> None:
 def test_record_before_t_defers_and_beyond_window_cancels() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     t = _snapshot_t()
     with pytest.raises(JobDeferred) as deferred:
         build_forecast_record(
@@ -485,7 +485,7 @@ def test_record_disabled_site_cancels() -> None:
 def test_gap_scan_fresh_site_is_noop() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     assert run_record_gap_scan(conn, site_id, {}) is None
     assert _row_count(conn, site_id) == 0
 
@@ -493,7 +493,7 @@ def test_gap_scan_fresh_site_is_noop() -> None:
 def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     # One grid per snapshot day, issued that morning before T, so every day the
     # scan visits has a full 3 x 8 identity set knowable as of its own T.
@@ -531,7 +531,7 @@ def test_gap_scan_missed_beyond_window_reconstructs_inside() -> None:
 def test_gap_scan_chunks_with_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     for offset in range(7):
         _seed_grid_for(
@@ -585,7 +585,7 @@ def test_scheduler_skips_record_when_rows_exist() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
     set_setting(conn, "record_snapshot_local_time", "00:00")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     today = datetime.now(UTC).date()
     # The scheduler now gates on COMPLETENESS, not on presence, so the day has
@@ -619,7 +619,7 @@ def test_scheduler_skips_record_when_rows_exist() -> None:
 def test_sites_with_record_gap() -> None:
     conn = _conn()
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     now = _snapshot_t(_DAY) + timedelta(hours=2)
     # Log not begun: never counted as a gap.
     assert sites_with_record_gap(conn, now) == 0

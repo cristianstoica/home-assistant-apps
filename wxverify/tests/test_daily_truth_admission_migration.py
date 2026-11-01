@@ -37,7 +37,7 @@ from wxverify.db.migrations import (
     seed_default_sources,
 )
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.completeness import ADMISSION_COMPLETE, ADMISSION_DEADLINE
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.runs import (
@@ -111,7 +111,7 @@ def _seed_site(conn: sqlite3.Connection, name: str = "o14-site") -> int:
             (name,),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -268,9 +268,9 @@ def test_o14b_migration_from_v5_is_idempotent() -> None:
     conn = _v5_db()
     _assert_pregate_absent(conn)
     run_migrations(conn)
-    assert TARGET_USER_VERSION == 10
+    assert TARGET_USER_VERSION == 15
     user_version_after_first = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    assert user_version_after_first == 10
+    assert user_version_after_first == 15
     cols_after_first = _column_list(conn, "daily_truth")
     assert cols_after_first.count("admission_basis") == 1
 
@@ -327,7 +327,7 @@ def test_o14c_check_constraint_rejects_invalid_and_accepts_valid(
         run_migrations(conn)
 
     site_id = _seed_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
 
     with pytest.raises(sqlite3.IntegrityError) as excinfo:
         _insert_daily_truth_row(
@@ -391,7 +391,7 @@ def test_o15_fingerprints_byte_identical_across_migration() -> None:
     silently-adapted fixture."""
     conn = _v5_db()
     site_id = _seed_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _seed_pre_gate_horizon(conn, site_id, generation_id)
 
     snapshot = capture_config_snapshot(conn, site_id)
@@ -439,7 +439,7 @@ def test_o15b_fingerprints_unchanged_when_admission_basis_populated() -> None:
     merely because every row happened to read NULL."""
     conn = _v5_db()
     site_id = _seed_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _seed_pre_gate_horizon(conn, site_id, generation_id)
 
     snapshot = capture_config_snapshot(conn, site_id)

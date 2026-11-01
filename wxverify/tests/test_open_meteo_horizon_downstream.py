@@ -1,8 +1,8 @@
 """Downstream consequences of the obs-204 Open-Meteo horizon change.
 
-Covers the request-shape side (``OpenMeteoAdapter.fetch_forecast`` /
-``_historical_hourly_names`` in ``wxverify/feeds/open_meteo.py``) and the
-pairing/display side (``wxverify.scoring.pairing.pair_real_models`` and
+Covers the request-shape side (``OpenMeteoAdapter.fetch_forecast`` in
+``wxverify/feeds/open_meteo.py``) and the pairing/display side
+(``wxverify.scoring.pairing.pair_real_models`` and
 ``wxverify.core.timeutil.day_ahead`` vs. ``wxverify.forecast.aggregate.
 display_day_index``) of raising each feed's ``max_lead_hours``.
 
@@ -21,18 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, date, datetime
 
 import httpx
 
 from tests.helpers import asof_conn, asof_make_site
 from wxverify.core.timeutil import day_ahead
-from wxverify.db.tz_generations import start_retrospective_correction
-from wxverify.feeds.open_meteo import OpenMeteoAdapter, _historical_hourly_names
+from wxverify.feeds.open_meteo import OpenMeteoAdapter
 from wxverify.feeds.seam import ForecastRequest
-from wxverify.forecast.aggregate import display_day_index
 from wxverify.scoring.pairing import pair_real_models
-from wxverify.scoring.tz_rebuild import rebuild_generation_day
 
 _UTC = "UTC"
 
@@ -86,42 +82,6 @@ def test_fetch_forecast_sends_forecast_hours_equal_to_max_lead_hours() -> None:
 
     icon = _fetch_forecast_params(_req(model="icon_global", max_lead_hours=180))
     assert icon["forecast_hours"] == "180"
-
-
-def test_historical_previous_runs_day_count_capped_at_seven() -> None:
-    """``_historical_hourly_names`` requests
-    ``min(7, max_lead_hours // 24)`` previous-run days.
-
-    - A capped feed (217h -> 217 // 24 == 9): the request must still cap
-      at 7, not 9 -- a mutant that dropped the ``min(7, ...)`` clamp would
-      request day8/day9 columns here.
-    - ``icon_global`` (180h -> 180 // 24 == 7 exactly): the cap does not
-      engage, so this also pins the boundary against an off-by-one (a
-      mutant using ``range(1, req.max_lead_hours // 24)``, exclusive,
-      would request only days 1-6).
-    - A genuinely uncapped feed (72h -> 72 // 24 == 3): proves the ``min``
-      reflects the real value below the cap rather than a hardcoded 7.
-    """
-
-    def _days(req: ForecastRequest) -> list[int]:
-        names = _historical_hourly_names(req)
-        return sorted({int(name.rsplit("day", 1)[1]) for name in names})
-
-    assert _days(_req(model="ecmwf_ifs", max_lead_hours=217)) == [1, 2, 3, 4, 5, 6, 7]
-    assert _days(_req(model="icon_global", max_lead_hours=180)) == [
-        1,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-    ]
-    assert _days(_req(model="meteofrance_arpege_world", max_lead_hours=72)) == [
-        1,
-        2,
-        3,
-    ]
 
 
 # ---------------------------------------------------------------------------
@@ -319,106 +279,6 @@ def test_day_ahead_bucket_rule_holds_across_dst_transitions() -> None:
     for tz, issued_at, valid_180, valid_204 in cases:
         assert day_ahead(issued_at, valid_180, tz) == 7
         assert day_ahead(issued_at, valid_204, tz) == 8
-
-
-# ---------------------------------------------------------------------------
-# 13. Two origins, not one
-# ---------------------------------------------------------------------------
-
-
-def test_display_day_and_pairing_bucket_diverge_for_a_stale_issuance() -> None:
-    """A sample that is DISPLAY day 7 (measured from ``now``) but
-    PAIRING/REBUILD ``day_ahead`` 8 (measured from issuance, outside the
-    0-7 bucket both pairing paths share): issued 2026-01-01T00:00, valid
-    2026-01-09T03:00 (lead 195h). Rendered on tile 7 when ``now`` is
-    2026-01-02 -- an implementation that measured display from issuance
-    instead (matching pairing) would place it on day 8, past
-    ``DAY_COUNT`` (8, indices 0-7), and it would never render at all
-    rather than rendering on tile 7 as it actually does. The two
-    measurements genuinely diverge here.
-
-    Excluded from BOTH paths that share the ``_MAX_DAY_AHEAD``/bucket-7
-    rule: the live path (``compute_real_model_pairs``' bucket filter) and the
-    timezone-rebuild path (``tz_rebuild.rebuild_generation_day`` ->
-    ``_rebuild_real_pairs``, ``_MAX_DAY_AHEAD`` at ``tz_rebuild.py:31``,
-    applied at ``:218``). A paired admitted sample (lead 180h, bucket 7,
-    same issuance) proves each path's guard is live rather than vacuously
-    dropping everything it sees.
-    """
-    issued_at = "2026-01-01T00:00:00Z"
-    valid_admitted = "2026-01-08T00:00:00Z"  # issued_at + 180h, bucket 7
-    valid_excluded = "2026-01-09T03:00:00Z"  # issued_at + 195h, bucket 8
-    now = "2026-01-02T00:00:00Z"
-    now_dt = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(UTC)
-
-    assert day_ahead(issued_at, valid_admitted, _UTC) == 7
-    assert day_ahead(issued_at, valid_excluded, _UTC) == 8
-    assert display_day_index(valid_excluded, timezone=_UTC, now=now_dt) == 7
-
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "site-alpha")
-    ecmwf_id = _feed_id(conn, source="open-meteo", model="ecmwf_ifs")
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_admitted,
-        lead_hours=180,
-    )
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_excluded,
-        lead_hours=195,
-    )
-
-    # -- live pairing path: pair_real_models -------------------------------
-    written = pair_real_models(conn, site_id=site_id)
-    assert written == 1
-    live_valid_ats = {
-        str(row["valid_at"])
-        for row in conn.execute(
-            "SELECT valid_at FROM forecast_pairs WHERE site_id = ?", (site_id,)
-        ).fetchall()
-    }
-    assert live_valid_ats == {valid_admitted}
-
-    # -- timezone-rebuild path: rebuild_generation_day / _MAX_DAY_AHEAD ----
-    generation_id = start_retrospective_correction(conn, site_id, _UTC)
-    rebuild_generation_day(
-        conn,
-        site_id=site_id,
-        generation_id=generation_id,
-        timezone=_UTC,
-        day=date(2026, 1, 8),
-        count=False,
-    )
-    rebuild_generation_day(
-        conn,
-        site_id=site_id,
-        generation_id=generation_id,
-        timezone=_UTC,
-        day=date(2026, 1, 9),
-        count=False,
-    )
-    # Scoped to the real ecmwf_ifs feed: the rebuild also derives
-    # persistence pairs (virtual feed) from the lagged observations these
-    # two samples happen to seed, which is unrelated to the guard under
-    # test here.
-    rebuilt_valid_ats = {
-        str(row["valid_at"])
-        for row in conn.execute(
-            """
-            SELECT valid_at FROM forecast_pairs
-            WHERE tz_generation_id = ? AND feed_id = ?
-            """,
-            (generation_id, ecmwf_id),
-        ).fetchall()
-    }
-    assert rebuilt_valid_ats == {valid_admitted}
 
 
 # ---------------------------------------------------------------------------

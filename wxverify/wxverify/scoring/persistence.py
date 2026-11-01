@@ -25,8 +25,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo
 
-from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc
-from wxverify.db.tz_generations import published_generation_clause
+from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc, utc_now
+from wxverify.db.site_days import open_day_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, PairValues, apply_delta
 
@@ -58,7 +58,9 @@ def materialize_persistence(
     conn: sqlite3.Connection, site_id: int | None = None
 ) -> int:
     """Insert the missing persistence pairs; return the number inserted."""
-    return apply_delta(conn, compute_persistence_pairs(conn, site_id))
+    return apply_delta(
+        conn, compute_persistence_pairs(conn, site_id), now_utc=utc_now()
+    )
 
 
 def compute_persistence_pairs(
@@ -68,7 +70,9 @@ def compute_persistence_pairs(
 
     The seed sites are every observation group's site, in group order,
     whether or not the group yields a pair. No persistence feed or no
-    observations gives an empty delta with no seed sites.
+    observations gives an empty delta with no seed sites. While the daily
+    close is on, only observations on days that take pairs are targets
+    (``open_day_clause``); every observation stays a source.
     """
     feed = conn.execute(
         """
@@ -83,10 +87,14 @@ def compute_persistence_pairs(
     max_lead = int(feed["max_lead_hours"])
     where = "" if site_id is None else "WHERE site_id = ?"
     params: tuple[object, ...] = () if site_id is None else (site_id,)
+    target_open = open_day_clause(
+        conn, site_expr="o.site_id", instant_expr="o.valid_at"
+    )
     observations = conn.execute(
         f"""
         SELECT o.site_id, o.variable, o.valid_at, o.value, o.computed_at,
-               s.timezone, s.rain_threshold_mm
+               s.timezone, s.rain_threshold_mm,
+               {target_open} AS target_open
         FROM observations o
         JOIN sites s ON s.id = o.site_id
         {where}
@@ -128,7 +136,6 @@ def _existing_pair_counts(
         SELECT site_id, variable, valid_at, COUNT(*) AS n
         FROM forecast_pairs
         WHERE feed_id = ? {count_where}
-          AND {published_generation_clause("forecast_pairs")}
         GROUP BY site_id, variable, valid_at
         """,
         count_params,
@@ -160,7 +167,8 @@ def _group_observations(
             )
             groups[key] = group
         epoch = int(dt.timestamp())
-        group.targets.append((epoch, valid_at, float(obs["value"]), canonical))
+        if obs["target_open"] == 1:  # a day that takes pairs (7.3)
+            group.targets.append((epoch, valid_at, float(obs["value"]), canonical))
         if canonical:
             computed_at = (
                 None if obs["computed_at"] is None else str(obs["computed_at"])
@@ -246,6 +254,7 @@ def _group_ops(
                         rain_threshold=rain_threshold,
                         first_known_at=source_computed_at,
                     ),
+                    valid_at,
                 )
             )
 
@@ -299,6 +308,7 @@ def _fallback_ops(
                         else str(lagged["computed_at"])
                     ),
                 ),
+                valid_at,
             )
         )
 
@@ -341,51 +351,3 @@ def persistence_pair_values(
         rain_threshold,
         first_known_at,
     )
-
-
-def insert_persistence_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead: int,
-    bucket: int,
-    forecast: float,
-    observed: float,
-    rain_threshold: float | None,
-    first_known_at: str | None,
-    generation_id: int,
-) -> int:
-    """Insert one persistence pair.
-
-    Public: also the insert primitive for the timezone-correction rebuild
-    (``scoring.tz_rebuild``), which re-derives persistence pairs under a
-    building generation.
-
-    ``first_known_at`` is the SOURCE observation's ``computed_at`` — the
-    lagged observation serving as the persistence forecast defines when this
-    pair became knowable. A source without ``computed_at`` stays NULL (never
-    invented); downstream as-of reads exclude it with a recorded reason.
-    """
-    return conn.execute(
-        _PERSISTENCE_INSERT_SQL,
-        (
-            *persistence_pair_values(
-                site_id=site_id,
-                feed_id=feed_id,
-                variable=variable,
-                issued_at=issued_at,
-                valid_at=valid_at,
-                lead=lead,
-                bucket=bucket,
-                forecast=forecast,
-                observed=observed,
-                rain_threshold=rain_threshold,
-                first_known_at=first_known_at,
-            ),
-            generation_id,
-        ),
-    ).rowcount

@@ -44,10 +44,7 @@ from wxverify.core.timeutil import (
 )
 from wxverify.db.connection import FencedWriter, close_db, init_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.consensus import insert_station_observation, materialize_consensus
 from wxverify.scoring.engine import pair_and_score
@@ -130,7 +127,7 @@ def _ref_pair_real_models(conn: sqlite3.Connection, site_id: int | None = None) 
                 miss,
                 correct_neg,
                 rain_threshold,
-                ensure_published_generation(conn, int(row["site_id"])),
+                ensure_site_generation(conn, int(row["site_id"])),
             ),
         )
         written += cur.rowcount
@@ -223,7 +220,7 @@ def _ref_materialize_persistence(
                     miss,
                     correct_neg,
                     rain_threshold,
-                    ensure_published_generation(conn, int(obs["site_id"])),
+                    ensure_site_generation(conn, int(obs["site_id"])),
                 ),
             )
             written += cur.rowcount
@@ -599,17 +596,17 @@ def _assert_end_state_equal(
     ``tz_generation_id`` is not compared directly between the two snapshots:
     the live path and the reference seed generations in different orders, so
     the ids themselves can legitimately differ. Instead each arm's own pair
-    rows are checked against that arm's own ``published_generation_id``.
+    rows are checked against that arm's own ``site_generation_id``.
     """
     for conn, which in ((actual, "actual"), (expected, "expected")):
         for row in conn.execute(
             "SELECT id, site_id, tz_generation_id FROM forecast_pairs"
         ).fetchall():
-            expected_generation = published_generation_id(conn, int(row["site_id"]))
+            expected_generation = site_generation_id(conn, int(row["site_id"]))
             assert row["tz_generation_id"] == expected_generation, (
                 f"{label}: {which} pair id={row['id']} site={row['site_id']}"
                 f" tz_generation_id={row['tz_generation_id']!r},"
-                f" published_generation_id={expected_generation!r}"
+                f" site_generation_id={expected_generation!r}"
             )
 
     expected_pairs = _pairs_snapshot(expected)

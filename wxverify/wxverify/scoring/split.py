@@ -1,11 +1,15 @@
 """Pair phases split into a read-only compute and a write-only apply.
 
 Each pair phase's compute reads its inputs and returns a ``PairDelta``: the
-sites whose published generation must exist, and the ordered ``forecast_pairs``
-operations. The apply side here only writes: it seeds each site's published
-generation (``ensure_published_generation``), then runs the operations. The
+sites whose time zone generation must exist, and the ordered ``forecast_pairs``
+operations. The apply side here only writes: it seeds each site's time zone
+generation (``ensure_site_generation``), then runs the operations. The
 monolithic phase functions are ``apply_delta(conn, compute(conn, site_id))``
 in their caller's single transaction.
+
+Each operation names the site and the ``valid_at`` of the pair it writes,
+so the apply can ask the closed-day guard (``PAIRS``) per operation and
+skip one whose day takes no pair writes.
 """
 
 from __future__ import annotations
@@ -13,9 +17,12 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Final
 
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.core.timeutil import utc_now
+from wxverify.db.site_days import WriteKind, check_day_write
+from wxverify.db.switch import ensure_site_generation
 
 type SqlValue = str | int | float | bytes | None
 # The 18 insert values of one pair, tz_generation_id excluded.
@@ -31,22 +38,32 @@ class InsertOp:
 
     site_id: int
     values: PairValues
+    valid_at: str
 
 
 @dataclass(frozen=True, slots=True)
 class DeleteOp:
-    """Delete the pair row ``row_id``, which the compute read."""
+    """Delete the pair row ``row_id``, which the compute read.
+
+    ``site_id`` and ``valid_at`` are that row's.
+    """
 
     row_id: int
+    site_id: int
+    valid_at: str
 
 
 @dataclass(frozen=True, slots=True)
 class ReplaceOp:
-    """Delete the pair row ``row_id``, then insert ``values`` in its place."""
+    """Delete the pair row ``row_id``, then insert ``values`` in its place.
+
+    ``valid_at`` is the replaced row's, which the new row keeps.
+    """
 
     row_id: int
     site_id: int
     values: PairValues
+    valid_at: str
 
 
 type PairOp = InsertOp | DeleteOp | ReplaceOp
@@ -73,7 +90,7 @@ class GenerationResolver:
         """Ensure every seed site's published generation, in seed order."""
         for site_id in self._seed_sites:
             if site_id not in self._ids:
-                self._ids[site_id] = ensure_published_generation(conn, site_id)
+                self._ids[site_id] = ensure_site_generation(conn, site_id)
 
     def generation_id(self, site_id: int) -> int:
         """The seeded published generation id of ``site_id``."""
@@ -111,10 +128,23 @@ def apply_pair_ops(
     delta: PairDelta,
     ops: Sequence[PairOp],
     resolver: GenerationResolver,
+    *,
+    now_utc: datetime | None = None,
 ) -> int:
-    """Apply ``ops`` in order; return the summed INSERT rowcounts."""
+    """Apply ``ops`` in order; return the summed INSERT rowcounts.
+
+    Each op first asks the closed-day guard (``PAIRS``, at its ``valid_at``);
+    a refused op is skipped. This is the backstop behind the computes'
+    day filter, so a refusal is logged at DEBUG only. ``now_utc`` defaults
+    to ``utc_now()``.
+    """
+    now = utc_now() if now_utc is None else now_utc
     inserted = 0
     for op in ops:
+        if not check_day_write(
+            conn, op.site_id, op.valid_at, WriteKind.PAIRS, now_utc=now
+        ):
+            continue
         if isinstance(op, InsertOp):
             inserted += conn.execute(
                 delta.insert_sql, (*op.values, resolver.generation_id(op.site_id))
@@ -129,9 +159,11 @@ def apply_pair_ops(
     return inserted
 
 
-def apply_delta(conn: sqlite3.Connection, delta: PairDelta) -> int:
+def apply_delta(
+    conn: sqlite3.Connection, delta: PairDelta, *, now_utc: datetime | None = None
+) -> int:
     """Whole-delta apply in the caller's transaction (the monolithic path)."""
     resolver = GenerationResolver(delta.seed_sites)
     resolver.seed(conn)
-    inserted = apply_pair_ops(conn, delta, delta.ops, resolver)
+    inserted = apply_pair_ops(conn, delta, delta.ops, resolver, now_utc=now_utc)
     return inserted if delta.count is None else delta.count

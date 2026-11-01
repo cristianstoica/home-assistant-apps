@@ -1,18 +1,15 @@
-"""Pairing and parsing of the raw station wind figure (plan §7, §15.1 T1-T7).
+"""Pairing of the raw station wind figure (plan §7, §15.1 T1-T7).
 
-``pair_max_by_hour`` (``wxverify.obs.wind_pairs``) and
-``wind_records_from_payload`` (``wxverify.obs.pws_adapter``) are both pure:
-no database, no clock, no network. T8 (the stored window / record_count) is
-NOT in this file -- it needs the lane's ``_persist_day`` and a full
+``pair_max_by_hour`` (``wxverify.obs.wind_pairs``) is pure: no database, no
+clock, no network. T8 (the stored window / record_count) is NOT in this
+file -- it needs the lane's ``_persist_day`` and a full
 ``station_wind_days`` fixture (plan §8.5) and is tracked separately.
 """
 
 from __future__ import annotations
 
-import math
 from datetime import UTC, datetime, timedelta
 
-from wxverify.obs.pws_adapter import wind_records_from_payload
 from wxverify.obs.wind_pairs import MAX_PAIR_GAP_SECONDS, WindRecord, pair_max_by_hour
 
 
@@ -80,33 +77,59 @@ def test_pair_max_by_hour_takes_max_not_min_of_competing_pairs() -> None:
 # --- T2 ------------------------------------------------------------------
 
 
-def test_pair_gap_exactly_600s_pairs_601s_does_not() -> None:
-    """A 0 < gap <= 600 s pair counts; a 601 s gap does not pair at all.
+def test_wp1_pair_gap_exactly_1200s_pairs_1201s_does_not() -> None:
+    """WP1 (plan 14.2): a 0 < gap <= 1200 s pair counts; a 1201 s gap does
+    not pair at all (the 20-minute widening, K28, 7.4).
 
-    mutant_lt -> at this assertion: correct = {_hour(3): 12.5} (both pairs
-    present, including the exact-600s one), mutant (`<` for `<=`) drops the
-    exact-600s pair, leaving `_hour(3)` absent from the mutant's result
-    entirely (there is no other pair to fill it) -- the fixture's SOLE
-    candidate pair sits exactly at the boundary.
-    mutant_const_660 -> at the second assertion: correct = {} (the 601s gap
-    never pairs), mutant (a constant 660s cutoff) would pair it, so
+    mutant_const_600 -> at the first assertion: correct = 1200, mutant
+    (``MAX_PAIR_GAP_SECONDS`` left at 600) = 600; the two literals differ at
+    this one read of the constant.
+    mutant_lt -> at the second assertion: correct = {_hour(3): 12.5} (both
+    pairs present, including the exact-1200s one), mutant (`<` for `<=`)
+    drops the exact-1200s pair, leaving `_hour(3)` absent from the mutant's
+    result entirely (there is no other pair to fill it) -- the fixture's
+    SOLE candidate pair sits exactly at the boundary.
+    mutant_const_1260 -> at the third assertion: correct = {} (the 1201s gap
+    never pairs), mutant (a constant 1260s cutoff) would pair it, so
     `_hour(4)` would appear in the mutant's result but is absent from the
     correct one.
     """
+    assert MAX_PAIR_GAP_SECONDS == 1200
     boundary = [
-        WindRecord(obs_at=_dt(2, 50), speed_kmh=15.0),
-        WindRecord(obs_at=_dt(3, 0, 0), speed_kmh=10.0),  # exactly 600s later
+        WindRecord(obs_at=_dt(2, 40), speed_kmh=15.0),
+        WindRecord(obs_at=_dt(3, 0, 0), speed_kmh=10.0),  # exactly 1200s later
     ]
-    assert MAX_PAIR_GAP_SECONDS == 600
     result = pair_max_by_hour(boundary, hours=[_hour(3)])
     assert result == {_hour(3): 12.5}
 
     over = [
-        WindRecord(obs_at=_dt(2, 50, 0), speed_kmh=15.0),
-        WindRecord(obs_at=_dt(3, 0, 1), speed_kmh=10.0),  # 601s later
+        WindRecord(obs_at=_dt(2, 40, 0), speed_kmh=15.0),
+        WindRecord(obs_at=_dt(3, 0, 1), speed_kmh=10.0),  # 1201s later
     ]
     result_over = pair_max_by_hour(over, hours=[_hour(3)])
     assert result_over == {}
+
+
+def test_wp2_fifteen_minute_station_pairs_within_widened_gap() -> None:
+    """WP2 (plan 14.2): D's 15-minute cadence (900 s gaps) pairs under the
+    widened 1200 s rule, where it never paired under 600 s.
+
+    mutant_still_600 -> at this assertion: correct = {_hour(3): 14.0,
+    _hour(4): 18.0} (every 900s-apart neighbour pairs: three pairs inside
+    hour 3, one straddling into hour 4), mutant (the 600s cutoff left in
+    place, M1) = {} (every gap here is 900s > 600s, so nothing pairs at
+    all) -- the fixture's readings are all exactly 900s apart, so the two
+    literals diverge on every pair.
+    """
+    readings = [
+        WindRecord(obs_at=_dt(3, 0), speed_kmh=4.0),
+        WindRecord(obs_at=_dt(3, 15), speed_kmh=8.0),
+        WindRecord(obs_at=_dt(3, 30), speed_kmh=12.0),
+        WindRecord(obs_at=_dt(3, 45), speed_kmh=16.0),
+        WindRecord(obs_at=_dt(4, 0), speed_kmh=20.0),
+    ]
+    result = pair_max_by_hour(readings, hours=[_hour(3), _hour(4)])
+    assert result == {_hour(3): 14.0, _hour(4): 18.0}
 
 
 def test_pair_gap_must_be_strictly_positive() -> None:
@@ -138,75 +161,6 @@ def test_calm_zero_pair_is_present_not_falsy_skipped() -> None:
     result = pair_max_by_hour(records, hours=[_hour(3)])
     assert _hour(3) in result
     assert result[_hour(3)] == 0.0
-
-
-# --- T4 ----------------------------------------------------------------
-
-
-def _payload(*observations: dict[str, object]) -> dict[str, object]:
-    return {"observations": list(observations)}
-
-
-def test_wind_records_from_payload_drops_non_finite_and_invalid_values() -> None:
-    good = {"epoch": 1700000000, "metric": {"windspeedAvg": 12.0}}
-    nan_row = {"epoch": 1700000001, "metric": {"windspeedAvg": math.nan}}
-    inf_row = {"epoch": 1700000002, "metric": {"windspeedAvg": math.inf}}
-    bool_row = {"epoch": 1700000003, "metric": {"windspeedAvg": True}}
-    negative_row = {"epoch": 1700000004, "metric": {"windspeedAvg": -1.0}}
-    nonnumeric_row = {"epoch": 1700000005, "metric": {"windspeedAvg": "gusty"}}
-    missing_row = {"epoch": 1700000006, "metric": {}}
-    wind_speed_only_row = {"epoch": 1700000007, "metric": {"windSpeed": 9.0}}
-
-    payload = _payload(
-        good,
-        nan_row,
-        inf_row,
-        bool_row,
-        negative_row,
-        nonnumeric_row,
-        missing_row,
-        wind_speed_only_row,
-    )
-    result = wind_records_from_payload(payload)
-    assert [r.speed_kmh for r in result] == [12.0]
-
-
-def test_wind_records_from_payload_drops_bool_epoch() -> None:
-    """A bool epoch is dropped even though ``_obs_datetime`` would accept it.
-
-    mutant_accepts_bool_epoch -> at this assertion: correct = [] (the only
-    row has a bool epoch and is dropped), mutant (omitting the
-    ``isinstance(raw_epoch, bool)`` guard before calling ``_obs_datetime``)
-    = [the row] (``datetime.fromtimestamp(True, ...)`` succeeds, since
-    ``True == 1``). The fixture's sole row has no other reason to be kept
-    or dropped, so the two literals diverge on this row alone.
-    """
-    payload = _payload({"epoch": True, "metric": {"windspeedAvg": 5.0}})
-    assert wind_records_from_payload(payload) == []
-
-
-def test_wind_records_from_payload_truncates_float_epoch_to_whole_second() -> None:
-    payload = _payload({"epoch": 1700000000.9, "metric": {"windspeedAvg": 3.0}})
-    result = wind_records_from_payload(payload)
-    assert len(result) == 1
-    assert result[0].obs_at.microsecond == 0
-    assert result[0].obs_at == datetime.fromtimestamp(1700000000, tz=UTC)
-
-
-def test_wind_records_from_payload_keeps_first_of_duplicate_obs_at() -> None:
-    payload = _payload(
-        {"epoch": 1700000000, "metric": {"windspeedAvg": 11.0}},
-        {"epoch": 1700000000, "metric": {"windspeedAvg": 22.0}},
-    )
-    result = wind_records_from_payload(payload)
-    assert len(result) == 1
-    assert result[0].speed_kmh == 11.0
-
-
-def test_wind_records_from_payload_accepts_numeric_string_speed() -> None:
-    payload = _payload({"epoch": 1700000000, "metric": {"windspeedAvg": "7.5"}})
-    result = wind_records_from_payload(payload)
-    assert [r.speed_kmh for r in result] == [7.5]
 
 
 # --- T5 ----------------------------------------------------------------

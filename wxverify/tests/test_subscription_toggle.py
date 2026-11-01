@@ -28,7 +28,7 @@ from wxverify.api.app import create_app
 from wxverify.api.routes.feeds import update_subscription
 from wxverify.api.schemas import SubscriptionUpdate
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.provider_ops import SubscriptionResult, set_site_subscription
 from wxverify.scoring.engine import pair_and_score as _real_pair_and_score
 from wxverify.web.context import feed_label
@@ -103,7 +103,7 @@ def _add_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

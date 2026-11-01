@@ -757,10 +757,10 @@ def test_o10_bracket_adds_exactly_two_statements(
         site_id = asof_make_site(conn, "snapshot-site")
         # Minimal published-but-legacy run, mirroring _seed_published_run's
         # shape without needing the full app/HTTP harness.
-        from wxverify.db.tz_generations import ensure_published_generation
+        from wxverify.db.switch import ensure_site_generation
         from wxverify.verification.runs import publish_run
 
-        gen_id = ensure_published_generation(conn, site_id)
+        gen_id = ensure_site_generation(conn, site_id)
         cur = conn.execute(
             """
             INSERT INTO verification_runs

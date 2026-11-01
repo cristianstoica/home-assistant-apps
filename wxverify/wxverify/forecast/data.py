@@ -18,17 +18,21 @@ The sample loader adds one more: feeds not served at the site, through
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Literal
+from datetime import date, datetime, timedelta
+from typing import Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from wxverify.collection.forecast_validation import (
     FORECAST_VARIABLES,
     invalid_forecast_sample_sql,
 )
 from wxverify.collection.precip_labels import precip_label_eligible_sql
+from wxverify.core.timeutil import day_ahead as issue_day_ahead
 from wxverify.core.timeutil import parse_utc
+from wxverify.db.site_days import daily_close_on
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import (
     LeaderboardRow,
@@ -50,7 +54,12 @@ SAMPLE_EXCLUDE_NULL_FETCHED_AT = "null_fetched_at"
 
 @dataclass(frozen=True)
 class FutureSampleRow:
-    """One validated, latest-run forecast sample with feed identity attached."""
+    """One validated, latest-run forecast sample with feed identity attached.
+
+    ``download_date`` (9.5) is the local date of the latest download that
+    brought the sample's run label, set only with the daily close on; None
+    keeps the issue-time day ahead (:func:`sample_day_ahead`).
+    """
 
     feed_id: int
     source: str
@@ -59,6 +68,7 @@ class FutureSampleRow:
     issued_at: str
     valid_at: str
     value: float
+    download_date: date | None = None
 
 
 FetchState = Literal["fresh", "stale", "unknown"]
@@ -154,6 +164,11 @@ def load_future_samples(
     True, rows whose feed is not in :func:`served_feed_ids` are dropped after
     the read, in Python, leaving the statement untouched. The simulation
     passes False because it filters to its pinned roster.
+
+    With the daily close on (9.5) each row also carries ``download_date``
+    (:func:`_download_dates`), read with ``as_of`` as the read time; the
+    statement then also selects ``fetched_at``. With the close off the
+    statement is unchanged and ``download_date`` stays None.
     """
     invalid = invalid_forecast_sample_sql("fs")
     eligible = precip_label_eligible_sql("fs", "f")
@@ -167,12 +182,15 @@ def load_future_samples(
             "AND julianday(fs.issued_at) <= julianday(?)"
         )
         asof_params = (as_of, as_of)
+    close_on = daily_close_on(conn)
+    outer_extra = ", fetched_at" if close_on else ""
+    inner_extra = ", fs.fetched_at" if close_on else ""
     rows = conn.execute(
         f"""
-        SELECT feed_id, source, model, variable, issued_at, valid_at, value
+        SELECT feed_id, source, model, variable, issued_at, valid_at, value{outer_extra}
         FROM (
             SELECT fs.feed_id, f.source, f.model, fs.variable, fs.issued_at,
-                   fs.valid_at, fs.value,
+                   fs.valid_at, fs.value{inner_extra},
                    ROW_NUMBER() OVER (
                        PARTITION BY fs.feed_id, fs.variable, fs.valid_at
                        ORDER BY fs.issued_at DESC
@@ -193,6 +211,12 @@ def load_future_samples(
         (site_id, since_valid_at, *asof_params),
     ).fetchall()
     served = served_feed_ids(conn, site_id=site_id) if served_only else None
+    kept = [row for row in rows if served is None or int(row["feed_id"]) in served]
+    download_dates = (
+        _download_dates(conn, site_id=site_id, rows=kept, as_of=as_of)
+        if close_on
+        else [None] * len(kept)
+    )
     return [
         FutureSampleRow(
             feed_id=int(row["feed_id"]),
@@ -202,10 +226,132 @@ def load_future_samples(
             issued_at=str(row["issued_at"]),
             valid_at=str(row["valid_at"]),
             value=float(row["value"]),
+            download_date=download_date,
         )
-        for row in rows
-        if served is None or int(row["feed_id"]) in served
+        for row, download_date in zip(kept, download_dates, strict=True)
     ]
+
+
+def sample_day_ahead(sample: FutureSampleRow, timezone: str) -> int:
+    """The day ahead a sample is looked up at (9.5).
+
+    From its ``download_date`` when it has one (the close on): the days from
+    that date to the sample's local valid date in ``timezone``. Otherwise the
+    issue-time day ahead, from its run label. The served forecast and the
+    record share it.
+    """
+    if sample.download_date is None:
+        return issue_day_ahead(sample.issued_at, sample.valid_at, timezone)
+    valid_day = parse_utc(sample.valid_at).astimezone(ZoneInfo(timezone)).date()
+    return (valid_day - sample.download_date).days
+
+
+def _download_dates(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    rows: list[sqlite3.Row],
+    as_of: str | None,
+) -> list[date | None]:
+    """Each row's download date (9.5), in ``rows``' order.
+
+    The ``local_date`` of the latest ``stored`` ``forecast_downloads`` row of
+    the site (by ``ended_at``, then ``id``) whose labels for the sample's
+    feed include its ``issued_at``; a meteoblue member's labels sit in its
+    package's row under the member's key, so every row of the site is
+    looked at. With ``as_of`` set only rows that ended by then count; with
+    ``as_of`` None no row ends after the read, so no upper bound is needed.
+    No download can carry a label before its run was issued, so rows that
+    ended before the earliest ``issued_at`` are not read. A label no row
+    carries counts from the local date of the sample's ``fetched_at`` in the
+    site's zone; a NULL ``fetched_at`` (or a zone that does not load) gives
+    None, the issue-time day ahead.
+    """
+    if not rows:
+        return []
+    pending: dict[str, set[str]] = {}
+    for row in rows:
+        pending.setdefault(str(int(row["feed_id"])), set()).add(str(row["issued_at"]))
+    earliest = min(str(row["issued_at"]) for row in rows)
+    upper_clause = "" if as_of is None else "AND julianday(ended_at) <= julianday(?)"
+    params: tuple[object, ...] = (
+        (site_id, earliest) if as_of is None else (site_id, earliest, as_of)
+    )
+    downloads = conn.execute(
+        f"""
+        SELECT local_date, labels
+        FROM forecast_downloads
+        WHERE site_id = ?
+          AND outcome = 'stored'
+          AND julianday(ended_at) >= julianday(?)
+          {upper_clause}
+        ORDER BY ended_at DESC, id DESC
+        """,
+        params,
+    ).fetchall()
+    found: dict[tuple[str, str], date] = {}
+    for download in downloads:
+        try:
+            local_date = date.fromisoformat(str(download["local_date"]))
+        except ValueError:
+            continue
+        for key, labels in _download_labels(download["labels"]).items():
+            wanted = pending.get(key)
+            if not wanted:
+                continue
+            for label in labels:
+                if label in wanted:
+                    wanted.discard(label)
+                    found[(key, label)] = local_date
+        if not any(pending.values()):
+            break
+    zone = _site_zone(conn, site_id)
+    return [
+        found.get((str(int(row["feed_id"])), str(row["issued_at"])))
+        or _local_fetch_date(row["fetched_at"], zone)
+        for row in rows
+    ]
+
+
+def _download_labels(raw: object) -> dict[str, list[str]]:
+    """A download record's ``labels`` JSON object; ``{}`` for anything else.
+
+    Keys that are not strings, values that are not lists and list items
+    that are not strings are dropped, as the scoring side reads them.
+    """
+    if not isinstance(raw, str):
+        return {}
+    try:
+        parsed: object = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    labels: dict[str, list[str]] = {}
+    for key, value in cast(dict[object, object], parsed).items():
+        if isinstance(key, str) and isinstance(value, list):
+            items = cast(list[object], value)
+            labels[key] = [item for item in items if isinstance(item, str)]
+    return labels
+
+
+def _site_zone(conn: sqlite3.Connection, site_id: int) -> ZoneInfo | None:
+    row = conn.execute("SELECT timezone FROM sites WHERE id = ?", (site_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        return ZoneInfo(str(row["timezone"]))
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def _local_fetch_date(fetched_at: object, zone: ZoneInfo | None) -> date | None:
+    if fetched_at is None or zone is None:
+        return None
+    try:
+        return parse_utc(str(fetched_at)).astimezone(zone).date()
+    except ValueError:
+        return None
 
 
 def count_null_availability_samples(
@@ -370,6 +516,10 @@ def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
     parseable stamp the token is :func:`samples_fingerprint` alone, so a site
     with no samples and no stamps stays ``"0"``. An unchanged token lets the
     tiles fragment answer 204 and leave the open drill-down untouched.
+
+    With the daily close on the token ends in ``-p<id>``, the active
+    publication's id (``0`` for none), so an open page swaps its tiles when
+    a publication lands (9.5). With the close off it is unchanged.
     """
     samples = samples_fingerprint(conn, site_id=site_id)
     rows = conn.execute(
@@ -389,8 +539,19 @@ def forecast_fingerprint(conn: sqlite3.Connection, *, site_id: int) -> str:
         total += int(fetched.timestamp())
         parsed_any = True
     if not parsed_any:
-        return samples
-    return f"{samples}-{total}"
+        return samples + _publication_token(conn, site_id=site_id)
+    return f"{samples}-{total}" + _publication_token(conn, site_id=site_id)
+
+
+def _publication_token(conn: sqlite3.Connection, *, site_id: int) -> str:
+    """``-p<id>`` of the active publication with the close on, else empty."""
+    if not daily_close_on(conn):
+        return ""
+    # Deferred: the publication module imports this one.
+    from wxverify.scoring.publication import active_publication
+
+    pub = active_publication(conn, site_id=site_id, at_utc=None)
+    return f"-p{0 if pub is None else pub.id}"
 
 
 def forecast_ranking(

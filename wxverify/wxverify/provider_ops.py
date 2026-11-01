@@ -19,9 +19,10 @@ from wxverify.collection.forecast_validation import (
 )
 from wxverify.core.options import SECRET_ENV
 from wxverify.core.secrets import key_status
-from wxverify.core.timeutil import window_cutoff
+from wxverify.core.timeutil import utc_now, window_cutoff
 from wxverify.db.migrations import seed_default_feeds, seed_default_sources
 from wxverify.db.queue import enqueue_if_absent
+from wxverify.db.site_days import writable_pairs_clause
 from wxverify.scoring.engine import pair_and_score
 from wxverify.worker.feed_fetch import feed_fetch_target
 
@@ -880,8 +881,11 @@ def _invalidate_mean_for_site(conn: sqlite3.Connection, site_id: int) -> None:
     feed_id = _mean_feed_id(conn)
     if feed_id is None:
         return
+    # While the daily close is on, done days keep their mean pairs.
+    day_clause = writable_pairs_clause(conn, site_id, now_utc=utc_now())
     conn.execute(
-        "DELETE FROM forecast_pairs WHERE site_id=? AND feed_id=?", (site_id, feed_id)
+        f"DELETE FROM forecast_pairs WHERE site_id=? AND feed_id=? AND {day_clause}",
+        (site_id, feed_id),
     )
     conn.execute(
         "DELETE FROM score_cache WHERE site_id=? AND feed_id=?", (site_id, feed_id)

@@ -1,6 +1,6 @@
 <section class="panel wide" id="wind-history-panel">
   <h2>Wind History</h2>
-  <p class="panel-hint">The lane that fetches station wind history and keeps today's wind current. Headroom and calls are for the shared weather.com key.</p>
+  <p class="panel-hint">The lane that keeps today's station wind current. Headroom and calls are for the shared weather.com key.</p>
   <div class="status-stack">
     <span class="badge {{ 'ok' if wind_history.headroom is not none and wind_history.headroom > 0 else 'warn' }}" id="wind-history-headroom">
       Headroom today: {{ wind_history.headroom if wind_history.headroom is not none else 'unknown' }}
@@ -12,22 +12,6 @@
       Live wind calls today: {{ wind_history.live_calls_today if wind_history.live_calls_today is not none else '—' }}
     </span>
   </div>
-
-  {% for hold in wind_history.holds %}
-    <div class="subsection" id="wind-auth-hold-{{ hold.endpoint }}">
-      <p>
-        <strong>{{ hold.title }}</strong>
-        <span class="badge warn" data-field="hold-status">{{ 'Check queued' if hold.status == 'probing' else 'Held' }}</span>
-      </p>
-      <div class="button-row">
-        <button type="button"
-                data-wind-auth-hold-url="{{ url('/api/wind-history/auth-hold') }}"
-                data-endpoint="{{ hold.endpoint }}">Try again</button>
-        {% if hold.error %}<span class="muted" data-field="hold-error">{{ hold.error }}</span>{% endif %}
-      </div>
-    </div>
-  {% endfor %}
-  <p class="empty" id="wind-auth-hold-result" hidden></p>
 
   {% for site in wind_history.sites %}
     <div class="subsection" data-site-id="{{ site.site_id }}">

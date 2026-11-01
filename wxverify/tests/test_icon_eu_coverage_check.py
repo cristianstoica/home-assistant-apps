@@ -19,7 +19,7 @@ import re
 import signal
 import sqlite3
 import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -28,7 +28,6 @@ import pytest
 from scripts.icon_eu_coverage_check import (
     FORWARD_NAMES,
     MODEL,
-    PREVIOUS_RUN_NAMES,
     VARIABLES,
     Summary,
     Verdict,
@@ -38,19 +37,16 @@ from scripts.icon_eu_coverage_check import (
     in_side_window,
     main,
     next_window_start,
-    previous_runs_verdict,
     summarize,
     verdict,
 )
 from tests.test_011_patch import _init_tmp_db
-from wxverify import config
 from wxverify.config import OPEN_METEO_MAX_LEAD_HOURS
-from wxverify.db.connection import FencedWriter, close_db, get_db
+from wxverify.db.connection import close_db, get_db
 from wxverify.db.migrations import create_schema
-from wxverify.feeds.open_meteo import OpenMeteoAdapter, _historical_hourly_names
-from wxverify.feeds.seam import ForecastRequest, NormalizedSample
-from wxverify.worker.backfill import SiteBackfillTarget, _fetch_historical_forecasts
-from wxverify.worker.feed_fetch import fetch_feed_once
+from wxverify.feeds.open_meteo import OpenMeteoAdapter
+from wxverify.feeds.seam import ForecastRequest
+from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 
 # ---------------------------------------------------------------------------
 # Synthetic fixture coordinates (plan §8.3: in-box, open North Atlantic,
@@ -389,281 +385,6 @@ def test_verdict_r4_three_hourly_axis_fails_wrong_times_not_too_few_steps() -> N
     assert verdict(None, summarize(body), fetch_hour) == (Verdict.FAIL, "wrong times")
 
 
-# ---------------------------------------------------------------------------
-# previous_runs_verdict: PR1-PR4 ordering. Samples are driven through the
-# real adapter path (MockTransport -> OpenMeteoAdapter.fetch_historical),
-# never hand-built, so the normalization is production's (plan line 659).
-# ---------------------------------------------------------------------------
-
-
-def _pr_payload(day: date, *, rows: int = 48, **overrides: object) -> dict[str, object]:
-    start = datetime(day.year, day.month, day.day, tzinfo=UTC)
-    times = [(start + timedelta(hours=i)).isoformat() for i in range(rows)]
-    hourly: dict[str, object] = {"time": times}
-    units: dict[str, object] = {"time": "iso8601"}
-    for name in PREVIOUS_RUN_NAMES:
-        hourly[name] = [1.0] * rows
-        provider = name.rsplit("_previous_day", 1)[0]
-        units[name] = (
-            "°C"
-            if provider == "temperature_2m"
-            else "km/h"
-            if provider == "wind_speed_10m"
-            else "mm"
-        )
-    body: dict[str, object] = {
-        "latitude": _IN_BOX_LAT,
-        "longitude": _IN_BOX_LON,
-        "hourly": hourly,
-        "hourly_units": units,
-    }
-    body.update(overrides)
-    return body
-
-
-def test_previous_runs_pr1_bad_shape() -> None:
-    assert previous_runs_verdict({}, [], date(2026, 6, 1)) == (
-        Verdict.FAIL,
-        "bad shape",
-    )
-
-
-def test_previous_runs_pr2_wrong_times() -> None:
-    day = date(2026, 6, 1)
-    payload = _pr_payload(day, rows=47)  # one row short, symmetrically
-    assert previous_runs_verdict(payload, [], day) == (Verdict.FAIL, "wrong times")
-
-
-def test_previous_runs_pr3_wrong_units_checked_before_pr4_values() -> None:
-    day = date(2026, 6, 1)
-    payload = _pr_payload(day)
-    units = payload["hourly_units"]
-    assert isinstance(units, dict)
-    units["temperature_2m_previous_day1"] = "K"  # wrong unit
-    # No samples at all would also fail PR4 ("too few values"); PR3 must win.
-    assert previous_runs_verdict(payload, [], day) == (Verdict.FAIL, "wrong units")
-
-
-def _historical_samples_via_adapter(
-    day: date, *, body_overrides: dict[str, object] | None = None
-) -> list[NormalizedSample]:
-    """Drive a synthetic 200 through the real adapter path, returning the
-    samples the adapter actually normalized (plan line 659)."""
-    payload = _pr_payload(day)
-    if body_overrides:
-        payload = {**payload, **body_overrides}
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload, request=request)
-
-    async def _run() -> list[NormalizedSample]:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as client:
-            adapter = OpenMeteoAdapter(client)
-            req = ForecastRequest(
-                lat=_IN_BOX_LAT,
-                lon=_IN_BOX_LON,
-                model=MODEL,
-                variables=VARIABLES,
-                max_lead_hours=OPEN_METEO_MAX_LEAD_HOURS[MODEL],
-            )
-            result = await adapter.fetch_historical(
-                req,
-                window_start=f"{day}T00:00:00Z",
-                window_end=f"{day + timedelta(days=1)}T00:00:00Z",
-            )
-            assert result is not None
-            return list(result.samples)
-
-    return asyncio.run(_run())
-
-
-def test_previous_runs_implausible_value_temperature() -> None:
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(
-        day,
-        body_overrides={
-            "hourly": {
-                **_pr_payload(day)["hourly"],  # type: ignore[dict-item]
-                "temperature_2m_previous_day1": [71.0] * 48,
-            }
-        },
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (
-        Verdict.FAIL,
-        "implausible value",
-    )
-
-
-def test_previous_runs_too_few_values_when_a_required_day_is_missing() -> None:
-    day = date(2026, 6, 1)
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, [], day) == (
-        Verdict.FAIL,
-        "too few values",
-    )
-
-
-def _hand_built_previous_run_samples(
-    day: date, *, precip_lead_offset: int
-) -> list[NormalizedSample]:
-    """One sample per (variable, required previous day, hour-of-day), built
-    directly rather than through the adapter -- a pure test of the matching
-    rule in ``previous_runs_verdict`` itself. The adapter path
-    (``_historical_samples_via_adapter``) applies the new precip lead itself,
-    so it could never produce a sample at the OLD, pre-rework lead -- only a
-    hand-built sample can show that case. Every variable's ``valid_at``
-    covers the day's 24 hourly labels; ``lead_hours`` is ``24 * previous_day``
-    for temperature/wind, and ``24 * previous_day - precip_lead_offset`` for
-    precip, so the offset alone selects which rule the fixture pins.
-    """
-    day_start = datetime(day.year, day.month, day.day, tzinfo=UTC)
-    samples: list[NormalizedSample] = []
-    for variable in VARIABLES:
-        for previous_day in (1, 2, 3):
-            offset = precip_lead_offset if variable == "precip" else 0
-            lead = 24 * previous_day - offset
-            for hour in range(24):
-                valid_at = day_start + hour * timedelta(hours=1)
-                issued_at = valid_at - timedelta(hours=lead)
-                samples.append(
-                    NormalizedSample(
-                        model=MODEL,
-                        variable=variable,
-                        issued_at=issued_at.isoformat(),
-                        valid_at=valid_at.isoformat(),
-                        lead_hours=lead,
-                        value=1.0,
-                        source_raw="1.0",
-                        model_run_id=f"{MODEL}:{issued_at.isoformat()}",
-                    )
-                )
-    return samples
-
-
-def test_previous_runs_too_few_values_when_precip_still_lands_on_the_raw_lead() -> None:
-    # Every variable's sample sits at lead 24*N (precip_lead_offset=0), the
-    # rule used before the rain-label-start rework. Precip is now expected
-    # one hour earlier (lead 24*N - 1), so these precip samples no longer
-    # match and the day is reported as missing precip coverage.
-    day = date(2026, 6, 1)
-    payload = _pr_payload(day)
-    samples = _hand_built_previous_run_samples(day, precip_lead_offset=0)
-    assert previous_runs_verdict(payload, samples, day) == (
-        Verdict.FAIL,
-        "too few values",
-    )
-
-
-def test_previous_runs_pass_with_precip_one_hour_earlier_than_temperature_and_wind() -> (  # noqa: E501
-    None
-):
-    # Paired positive: precip's sample sits at lead 24*N - 1, one hour
-    # earlier than temperature/wind's 24*N, matching the rain-label-start
-    # rule -- every variable is now found and the day passes.
-    day = date(2026, 6, 1)
-    payload = _pr_payload(day)
-    samples = _hand_built_previous_run_samples(day, precip_lead_offset=1)
-    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
-
-
-def test_previous_runs_pass_with_every_required_sample_present() -> None:
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(day)
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
-
-
-def test_previous_runs_pass_with_day_4_null_and_day_5_all_null() -> None:
-    # Days 4 and 5 are not required (_REQUIRED_PREVIOUS_DAYS = (1, 2, 3)): a
-    # null day 4 and an entirely-null day 5 must still PASS.
-    day = date(2026, 6, 1)
-    hourly_overrides: dict[str, object] = dict(_pr_payload(day)["hourly"])  # type: ignore[arg-type]
-    for name in PREVIOUS_RUN_NAMES:
-        if name.endswith("_previous_day4"):
-            values = list(hourly_overrides[name])  # type: ignore[arg-type]
-            values[0] = None
-            hourly_overrides[name] = values
-        if name.endswith("_previous_day5"):
-            hourly_overrides[name] = [None] * 48
-    samples = _historical_samples_via_adapter(
-        day, body_overrides={"hourly": hourly_overrides}
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
-
-
-def test_previous_runs_wind_540_kmh_passes_at_the_exact_bound() -> None:
-    # 540 km/h == 150.0 m/s exactly, the FORECAST_VALUE_RANGES upper bound.
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(
-        day,
-        body_overrides={
-            "hourly": {
-                **_pr_payload(day)["hourly"],  # type: ignore[dict-item]
-                "wind_speed_10m_previous_day1": [540.0] * 48,
-            }
-        },
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
-
-
-def test_previous_runs_wind_541_kmh_fails_implausible_value() -> None:
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(
-        day,
-        body_overrides={
-            "hourly": {
-                **_pr_payload(day)["hourly"],  # type: ignore[dict-item]
-                "wind_speed_10m_previous_day1": [541.0] * 48,
-            }
-        },
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (
-        Verdict.FAIL,
-        "implausible value",
-    )
-
-
-def test_previous_runs_precip_minus_point_05_passes_floored_to_zero() -> None:
-    # Within TRACE_NEGATIVE_PRECIP_MIN (-0.1, 0): floored to 0.0 -> PASS.
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(
-        day,
-        body_overrides={
-            "hourly": {
-                **_pr_payload(day)["hourly"],  # type: ignore[dict-item]
-                "precipitation_previous_day1": [-0.05] * 48,
-            }
-        },
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (Verdict.PASS, "ok")
-
-
-def test_previous_runs_precip_minus_point_2_fails_implausible_value() -> None:
-    # A mutant that checks value bounds before normalization would floor
-    # this too; the real path leaves it below -0.1, so it stays negative and
-    # falls outside [0, 500].
-    day = date(2026, 6, 1)
-    samples = _historical_samples_via_adapter(
-        day,
-        body_overrides={
-            "hourly": {
-                **_pr_payload(day)["hourly"],  # type: ignore[dict-item]
-                "precipitation_previous_day1": [-0.2] * 48,
-            }
-        },
-    )
-    payload = _pr_payload(day)
-    assert previous_runs_verdict(payload, samples, day) == (
-        Verdict.FAIL,
-        "implausible value",
-    )
-
-
 @pytest.mark.parametrize(
     ("verdicts", "expected"),
     [
@@ -678,21 +399,6 @@ def test_exit_code_worst_of(verdicts: list[Verdict], expected: int) -> None:
     assert exit_code(verdicts) == expected
 
 
-def test_previous_run_names_match_icon_eus_adapter_names_exactly() -> None:
-    # Full tuple equality, not just length: the script's own copy must match
-    # the adapter's public-name builder element for element, in order.
-    req = ForecastRequest(
-        lat=0.0,
-        lon=0.0,
-        model="icon_eu",
-        variables=("temperature", "wind", "precip"),
-        max_lead_hours=OPEN_METEO_MAX_LEAD_HOURS["icon_eu"],
-    )
-    expected = tuple(_historical_hourly_names(req))
-    assert len(expected) == len(VARIABLES) * 5
-    assert expected == PREVIOUS_RUN_NAMES
-
-
 # ---------------------------------------------------------------------------
 # Import allowlist (§4.7): stdlib + httpx + exactly five wxverify modules.
 # ---------------------------------------------------------------------------
@@ -702,7 +408,6 @@ _ALLOWED_WXVERIFY_MODULES = {
     "wxverify.feeds.open_meteo",
     "wxverify.feeds.seam",
     "wxverify.core.timeutil",
-    "wxverify.collection.forecast_validation",
 }
 
 
@@ -838,6 +543,12 @@ def test_d1_t6_forward_request_matches_production_fetch_feed_once(
                 site_id,
                 feed_id,
                 adapter_builder=lambda _source, _c: OpenMeteoAdapter(mock_client),
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=now,
+                ),
             )
 
     asyncio.run(_run_production())
@@ -848,9 +559,6 @@ def test_d1_t6_forward_request_matches_production_fetch_feed_once(
 
     def _script_handler(request: httpx.Request) -> httpx.Response:
         nonlocal script_request
-        if "previous-runs-api" in str(request.url):
-            day = now.date() - timedelta(days=2)
-            return httpx.Response(200, json=_historical_body(day), request=request)
         script_request = request
         return httpx.Response(200, json=_forward_body(now), request=request)
 
@@ -883,173 +591,6 @@ def test_d1_t6_forward_request_matches_production_fetch_feed_once(
 
 
 # ---------------------------------------------------------------------------
-# D1-T8: the previous-runs request equals setup backfill's, and the script
-# changes nothing.
-# ---------------------------------------------------------------------------
-
-
-def _hash_file(path: Path) -> str:
-    import hashlib
-
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def test_d1_t8_previous_runs_request_matches_backfill_and_writes_nothing(
-    tmp_path: Path,
-) -> None:
-    script_dir = tmp_path / "script"
-    prod_dir = tmp_path / "prod"
-    script_dir.mkdir()
-    prod_dir.mkdir()
-
-    # --- Script database first ---
-    conn = _init_tmp_db(script_dir)
-    conn.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone, enabled) VALUES ('In-Box Synthetic', ?, ?, 0.0, 'UTC', 1)",
-        (_IN_BOX_LAT, _IN_BOX_LON),
-    )
-    conn.commit()
-    site_id = int(conn.execute("SELECT id FROM sites").fetchone()["id"])
-    from tests.test_open_meteo_metering import _isolate_open_meteo_feed
-
-    _isolate_open_meteo_feed(conn, site_id, "icon_eu")
-    conn.commit()
-    close_db()
-
-    script_db_path = Path(config.db_path)
-    before_hash = _hash_file(script_db_path)
-    ro = sqlite3.connect(script_db_path.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
-        before_jobs = ro.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-        before_budget = ro.execute("SELECT COUNT(*) FROM api_budget").fetchone()[0]
-        before_samples = ro.execute("SELECT COUNT(*) FROM forecast_samples").fetchone()[
-            0
-        ]
-        before_status = ro.execute(
-            "SELECT backfill_status FROM sites WHERE id = ?", (site_id,)
-        ).fetchone()[0]
-    finally:
-        ro.close()
-
-    now = _in_window_now()
-    day = now.date() - timedelta(days=2)
-
-    prod_request: httpx.Request | None = None
-
-    def _prod_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal prod_request
-        prod_request = request
-        return httpx.Response(200, json=_historical_body(day), request=request)
-
-    # --- Production database second ---
-    conn2 = _init_tmp_db(prod_dir)
-    conn2.execute(
-        "INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m,"
-        " timezone, enabled) VALUES ('In-Box Synthetic', ?, ?, 0.0, 'UTC', 1)",
-        (_IN_BOX_LAT, _IN_BOX_LON),
-    )
-    conn2.commit()
-    prod_site_id = int(conn2.execute("SELECT id FROM sites").fetchone()["id"])
-    _isolate_open_meteo_feed(conn2, prod_site_id, "icon_eu")
-    conn2.commit()
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    import wxverify.worker.backfill as backfill_module
-
-    original_build_adapter = backfill_module.build_adapter
-
-    async def _run_production() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(_prod_handler)
-        ) as mock_client:
-            backfill_module.build_adapter = lambda _source, _c: OpenMeteoAdapter(
-                mock_client
-            )
-            try:
-                target = SiteBackfillTarget(
-                    site_id=prod_site_id,
-                    lat=0.0,
-                    lon=0.0,
-                    timezone="UTC",
-                    backfill_status="pending",
-                    backfill_through=None,
-                )
-                await _fetch_historical_forecasts(
-                    db,
-                    writer,
-                    target,
-                    window_start=f"{day}T00:00:00Z",
-                    window_end=f"{day + timedelta(days=1)}T00:00:00Z",
-                )
-            finally:
-                backfill_module.build_adapter = original_build_adapter
-
-    asyncio.run(_run_production())
-    assert prod_request is not None
-    close_db()
-
-    # --- Script side ---
-    forward_calls = 0
-    previous_calls = 0
-    script_previous_request: httpx.Request | None = None
-
-    def _script_handler(request: httpx.Request) -> httpx.Response:
-        nonlocal forward_calls, previous_calls, script_previous_request
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            script_previous_request = request
-            return httpx.Response(200, json=_historical_body(day), request=request)
-        forward_calls += 1
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code = main(
-        ["--db", str(script_db_path), "--site-id", str(site_id)],
-        transport=httpx.MockTransport(_script_handler),
-        now=now,
-    )
-    assert code == 0
-    assert forward_calls == 1
-    assert previous_calls == 1
-    assert script_previous_request is not None
-    assert prod_request is not None
-
-    assert script_previous_request.url.scheme == prod_request.url.scheme
-    assert script_previous_request.url.host == prod_request.url.host
-    assert script_previous_request.url.host == "previous-runs-api.open-meteo.com"
-    assert script_previous_request.url.path == prod_request.url.path
-    assert sorted(script_previous_request.url.params.multi_items()) == sorted(
-        prod_request.url.params.multi_items()
-    )
-    expected_timeout = {"connect": 5.0, "read": 15.0, "write": 15.0, "pool": 15.0}
-    assert script_previous_request.extensions["timeout"] == expected_timeout
-    assert prod_request.extensions["timeout"] == expected_timeout
-
-    # Nothing changed on the script's own database.
-    assert _hash_file(script_db_path) == before_hash
-    ro2 = sqlite3.connect(script_db_path.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
-        assert ro2.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == before_jobs
-        assert (
-            ro2.execute("SELECT COUNT(*) FROM api_budget").fetchone()[0]
-            == before_budget
-        )
-        assert (
-            ro2.execute("SELECT COUNT(*) FROM forecast_samples").fetchone()[0]
-            == before_samples
-        )
-        assert (
-            ro2.execute(
-                "SELECT backfill_status FROM sites WHERE id = ?", (site_id,)
-            ).fetchone()[0]
-            == before_status
-        )
-    finally:
-        ro2.close()
-
-
-# ---------------------------------------------------------------------------
 # End-to-end main(): MockTransport, tmp "Database Export" copy, no writes.
 # ---------------------------------------------------------------------------
 
@@ -1071,10 +612,6 @@ _OUTPUT_TEMPLATES = [
         r"forward first valid time: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}|none)",
         r"forward last valid time: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}|none)",
         rf"forward verdict: (PASS|FAIL|CAN'T TELL) \(({_REASON})\)",
-        r"previous-runs steps: \d+",
-        r"previous-runs non-null "
-        r"(temperature_2m|wind_speed_10m|precipitation)_previous_day[1-5]: \d+",
-        rf"previous-runs verdict: (PASS|FAIL|CAN'T TELL) \(({_REASON})\)",
         r"error: database unreadable",
         r"error: no enabled site",
         r"error: \d+ enabled sites; pass --site-id",
@@ -1225,10 +762,6 @@ def _forward_body(now: datetime) -> dict[str, object]:
     }
 
 
-def _historical_body(day: date) -> dict[str, object]:
-    return _pr_payload(day)
-
-
 def _in_window_now() -> datetime:
     return datetime(2026, 6, 2, 1, 15, tzinfo=UTC)
 
@@ -1246,11 +779,8 @@ def test_main_pass_path_hits_every_rule_and_touches_no_db_row(
     _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
     before = db_path.read_bytes()
     now = _in_window_now()
-    day = now.date() - timedelta(days=2)
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        if "previous-runs-api" in str(request.url):
-            return httpx.Response(200, json=_historical_body(day), request=request)
         return httpx.Response(200, json=_forward_body(now), request=request)
 
     code, out, err = _run_main_checked(
@@ -1263,7 +793,6 @@ def test_main_pass_path_hits_every_rule_and_touches_no_db_row(
     assert code == 0
     assert "applicability: PASS" in out
     assert f"forward verdict: {Verdict.PASS} (ok)" in out
-    assert f"previous-runs verdict: {Verdict.PASS} (ok)" in out
     # Read-only export: not one byte changed.
     assert db_path.read_bytes() == before
 
@@ -1534,14 +1063,8 @@ def test_main_forward_http_error_is_classified(
     db_path = _marker_db_path(tmp_path)
     _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
     now = _in_window_now()
-    previous_calls = 0
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            day = now.date() - timedelta(days=2)
-            return httpx.Response(200, json=_historical_body(day), request=request)
         return httpx.Response(
             status, content=str(request.url).encode(), request=request
         )
@@ -1555,11 +1078,9 @@ def test_main_forward_http_error_is_classified(
     )
     if status == 404:
         assert f"forward verdict: {Verdict.FAIL} (http 4xx)" in out
-        assert previous_calls == 1  # forward failure does not skip previous-runs
-        assert code == 1  # FAIL outranks a PASS previous-runs verdict
+        assert code == 1
     else:
         assert f"forward verdict: {Verdict.CANT_TELL} (http 5xx)" in out
-        assert previous_calls == 1
         assert code == 3
 
 
@@ -1571,9 +1092,6 @@ def test_main_forward_connect_error_is_cant_tell_network(
     now = _in_window_now()
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        if "previous-runs-api" in str(request.url):
-            day = now.date() - timedelta(days=2)
-            return httpx.Response(200, json=_historical_body(day), request=request)
         raise httpx.ConnectError(f"boom {request.url}", request=request)
 
     code, out, err = _run_main_checked(
@@ -1586,147 +1104,6 @@ def test_main_forward_connect_error_is_cant_tell_network(
     assert f"forward verdict: {Verdict.CANT_TELL} (network)" in out
 
 
-def test_main_previous_runs_404_after_forward_pass(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-    previous_calls = 0
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            return httpx.Response(
-                404, content=str(request.url).encode(), request=request
-            )
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert f"forward verdict: {Verdict.PASS} (ok)" in out
-    assert f"previous-runs verdict: {Verdict.FAIL} (http 4xx)" in out
-    assert code == 1
-    assert previous_calls == 1  # no retry on a previous-runs error
-
-
-def test_main_previous_runs_500_after_forward_pass(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-    previous_calls = 0
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            return httpx.Response(500, request=request)
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert f"previous-runs verdict: {Verdict.CANT_TELL} (http 5xx)" in out
-    assert code == 3
-    assert previous_calls == 1  # no retry on a previous-runs error
-
-
-def test_main_previous_runs_connect_error_after_forward_pass(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-    previous_calls = 0
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            raise httpx.ConnectError(f"boom {request.url}", request=request)
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert f"previous-runs verdict: {Verdict.CANT_TELL} (network)" in out
-    assert code == 3
-    assert previous_calls == 1  # no retry on a previous-runs error
-
-
-def test_main_forward_500_still_sends_previous_runs_request_exactly_once(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-    previous_calls = 0
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            day = now.date() - timedelta(days=2)
-            return httpx.Response(200, json=_historical_body(day), request=request)
-        return httpx.Response(500, request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert previous_calls == 1
-    assert f"forward verdict: {Verdict.CANT_TELL} (http 5xx)" in out
-    assert f"previous-runs verdict: {Verdict.PASS} (ok)" in out
-    assert code == 3
-
-
-def test_main_previous_runs_200_without_latitude_is_adapter_rejected(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-    day = now.date() - timedelta(days=2)
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        if "previous-runs-api" in str(request.url):
-            body = _historical_body(day)
-            body = {k: v for k, v in body.items() if k != "latitude"}
-            return httpx.Response(200, json=body, request=request)
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert f"previous-runs verdict: {Verdict.FAIL} (adapter rejected)" in out
-    assert "previous-runs steps" not in out
-    assert "previous-runs non-null" not in out
-    assert code == 1
-
-
 # ---------------------------------------------------------------------------
 # KeyboardInterrupt (plan §8.3 "Mechanics (load-bearing)"): the interrupting
 # MockTransport handler is ASYNC and does signal.raise_signal(SIGINT) then
@@ -1737,19 +1114,14 @@ def test_main_previous_runs_200_without_latitude_is_adapter_rejected(
 # ---------------------------------------------------------------------------
 
 
-def test_main_keyboard_interrupt_during_forward_marks_both_requests_interrupted(
+def test_main_keyboard_interrupt_during_forward_marks_the_request_interrupted(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
 ) -> None:
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
     db_path = _marker_db_path(tmp_path)
     _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    previous_calls = 0
 
     async def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal previous_calls
-        if "previous-runs-api" in str(request.url):
-            previous_calls += 1
-            return httpx.Response(200, json={}, request=request)
         signal.raise_signal(signal.SIGINT)
         await asyncio.sleep(0)
         return httpx.Response(200, json={}, request=request)  # pragma: no cover
@@ -1762,35 +1134,5 @@ def test_main_keyboard_interrupt_during_forward_marks_both_requests_interrupted(
         now=_in_window_now(),
     )
     assert code == 3
-    assert previous_calls == 0
     assert "applicability: PASS" in out
     assert f"forward verdict: {Verdict.CANT_TELL} (interrupted)" in out
-    assert f"previous-runs verdict: {Verdict.CANT_TELL} (interrupted)" in out
-
-
-def test_main_keyboard_interrupt_during_previous_runs_keeps_the_forward_pass(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
-) -> None:
-    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
-    db_path = _marker_db_path(tmp_path)
-    _export_db(db_path, lat=_IN_BOX_LAT, lon=_IN_BOX_LON)
-    now = _in_window_now()
-
-    async def _handler(request: httpx.Request) -> httpx.Response:
-        if "previous-runs-api" in str(request.url):
-            signal.raise_signal(signal.SIGINT)
-            await asyncio.sleep(0)
-            return httpx.Response(200, json={}, request=request)  # pragma: no cover
-        return httpx.Response(200, json=_forward_body(now), request=request)
-
-    code, out, err = _run_main_checked(
-        caplog,
-        capsys,
-        ["--db", str(db_path)],
-        transport=httpx.MockTransport(_handler),
-        now=now,
-    )
-    assert code == 3
-    assert "applicability: PASS" in out
-    assert f"forward verdict: {Verdict.PASS} (ok)" in out
-    assert f"previous-runs verdict: {Verdict.CANT_TELL} (interrupted)" in out

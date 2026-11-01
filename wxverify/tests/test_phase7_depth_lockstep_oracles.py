@@ -39,7 +39,7 @@ from tests.helpers import (
 from wxverify.core.options import RuntimeOptions
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.depth import (
     EffectiveDepth,
     depth_override_key,
@@ -328,7 +328,7 @@ def _record_policy(
 def test_record_and_run_snapshot_pin_depths_flip_moves_only_post_flip() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Lockstep Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     set_setting(conn, depth_override_key("precip"), "1")
     _seed_record_samples(conn, site_id, _DAY1)
     _seed_record_samples(conn, site_id, _DAY2)
@@ -377,7 +377,7 @@ def test_parse_blend_depths_pre_015_snapshot_inherits_pinned_global() -> None:
     # inherits the PINNED global (4), not the current live setting (2).
     conn = asof_conn()
     site_id = asof_make_site(conn, "Legacy Run Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     legacy = {
         "timezone": "UTC",
         "rain_threshold_mm": 0.2,
@@ -426,7 +426,7 @@ def test_preskipped_verdicts_boundary_four_in_five_six_out() -> None:
 def test_prepare_bootstrap_inputs_skips_out_of_range_variable_only() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Skip Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run(conn, site_id, generation, aggregate_state="{}")
     cfg = _make_run_config(
         site_id=site_id,
@@ -448,7 +448,7 @@ def test_prepare_bootstrap_inputs_skips_out_of_range_variable_only() -> None:
 def test_verdicts_check_constraint_accepts_skipped_rejects_unknown() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Check Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run(conn, site_id, generation)
 
     def insert(outcome: str, variable: str) -> None:
@@ -663,7 +663,7 @@ def _wind_result(conn: sqlite3.Connection, run_id: int, entity_key: str) -> sqli
 def test_aggregate_out_of_range_incumbent_keeps_delta_null_never_zero() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Fail Closed Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run(conn, site_id, generation)
     _seed_wind_evidence(conn, run_id)
     conn.commit()
@@ -688,7 +688,7 @@ def test_aggregate_out_of_range_incumbent_keeps_delta_null_never_zero() -> None:
 def test_aggregate_in_range_incumbent_defines_delta_paired_positive() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Fail Closed Control Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run(conn, site_id, generation)
     _seed_wind_evidence(conn, run_id)
     conn.commit()
@@ -708,7 +708,7 @@ def test_aggregate_in_range_incumbent_defines_delta_paired_positive() -> None:
 def test_aggregate_occurrence_absent_incumbent_ets_defined_delta_null() -> None:
     conn = asof_conn()
     site_id = asof_make_site(conn, "Occ Fail Closed Town")
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run(conn, site_id, generation)
     # Hand-derived candidate table over 3 days: hit, correct_negative, hit
     # -> h=2 cn=1, hits_random = 2*2/3, denominator = 2 - 4/3 = 2/3,

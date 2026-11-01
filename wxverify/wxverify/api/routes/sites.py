@@ -2,41 +2,27 @@
 
 from __future__ import annotations
 
-import logging
 import sqlite3
+from datetime import timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
 from wxverify.api.errors import ApiError
-from wxverify.api.schemas import (
-    SiteCreate,
-    SiteOut,
-    SiteUpdate,
-    TimezoneCorrectionIn,
-)
+from wxverify.api.schemas import SiteCreate, SiteOut, SiteUpdate
+from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import get_db
 from wxverify.db.runtime_state import delete_runtime_state
-from wxverify.db.tz_generations import (
-    CorrectionAlreadyBuilding,
-    TimezoneSiteNotFound,
-    UnknownTimezone,
-    correction_heartbeat_key,
-    correction_state_key,
-    ensure_published_generation,
-    published_generation_clause,
-    published_pointer_key,
-    start_retrospective_correction,
+from wxverify.db.site_days import (
+    daily_close_on,
+    start_site_days,
+    writable_pairs_clause,
 )
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.engine import pair_and_score
 from wxverify.verification.record import SNAPSHOT_TIME_KEY, gap_scan_failures_key
 from wxverify.verification.runs import published_run_key
-from wxverify.worker.verification_run import (
-    verification_heartbeat_key,
-    verification_state_key,
-)
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sites", tags=["sites"])
 
@@ -91,14 +77,18 @@ async def create_site(request: Request, body: SiteCreate) -> SiteOut | HTMLRespo
         if row is None:
             raise RuntimeError("site insert failed")
         site_id = int(row["id"])
-        # A reused id may still carry keys a pre-0.16.7 delete left behind;
-        # clear them BEFORE seeding, because ensure_published_generation
-        # trusts any existing pointer.
-        _clear_site_state(conn, site_id, [])
-        # New sites get their initial published timezone generation and
-        # published-pointer row immediately — the same seed migrate_v4
-        # applies to pre-existing sites.
-        ensure_published_generation(conn, site_id)
+        # A reused id may still carry keys a pre-0.16.7 delete left behind.
+        _clear_site_state(conn, site_id)
+        # The site's one time zone generation, which every pair, truth and
+        # 07:00 record row of the site carries as its key.
+        ensure_site_generation(conn, site_id)
+        # While the daily close is on, a new site starts fresh at its next
+        # local date. It has no record yet, so its current local date is
+        # today's date in its own zone.
+        if daily_close_on(conn):
+            now = utc_now()
+            today = now.astimezone(ZoneInfo(str(row["timezone"]))).date()
+            start_site_days(conn, site_id, today + timedelta(days=1), now_utc=now)
         return _site_out(row)
 
     site = await get_db().write(_write)
@@ -140,23 +130,14 @@ async def update_site(
                 "UPDATE sites SET rain_threshold_mm=? WHERE id=?",
                 (body.rain_threshold_mm, site_id),
             )
-            # Published generation only (§13): a building correction
-            # generation's precip pairs belong to the correction chain;
-            # deleting them here mid-chain would corrupt the rebuild.
-            # Known limitation: a threshold change landing DURING a
-            # correction build leaves already-rebuilt building days on the
-            # old threshold. The post-flip rescore does NOT heal them:
-            # pair_and_score's real-pair lane is INSERT OR IGNORE, so
-            # existing generation-tagged pairs keep their stale cat_*
-            # flags into the published generation (only the
-            # multimodel-mean lane recomputes). They stay stale until the
-            # next threshold edit's published-scoped delete-and-recreate
-            # here, or a consensus mutation of those specific hours.
+            # While the daily close is on, done days keep their pairs and
+            # the threshold they were scored with (writable_pairs_clause).
+            day_clause = writable_pairs_clause(conn, site_id, now_utc=utc_now())
             conn.execute(
                 f"""
                 DELETE FROM forecast_pairs
                 WHERE site_id=? AND variable='precip'
-                  AND {published_generation_clause("forecast_pairs")}
+                  AND {day_clause}
                 """,
                 (site_id,),
             )
@@ -178,32 +159,16 @@ async def update_site(
     return site
 
 
-def _clear_site_state(
-    conn: sqlite3.Connection, site_id: int, generation_ids: list[int]
-) -> None:
-    """Drop every runtime_state/settings row keyed by ``site_id``, plus the
-    correction-chain keys of each id in ``generation_ids``.
+def _clear_site_state(conn: sqlite3.Connection, site_id: int) -> None:
+    """Drop every runtime_state/settings row keyed by ``site_id``.
 
-    Site and generation ids are reused (INTEGER PRIMARY KEY, no
-    AUTOINCREMENT) and neither table has a foreign key, so the sites
-    cascade never reaches these rows.
+    Site ids are reused (INTEGER PRIMARY KEY, no AUTOINCREMENT) and neither
+    table has a foreign key, so the sites cascade never reaches these rows.
     """
-    correction_keys = [
-        key
-        for generation_id in generation_ids
-        for key in (
-            correction_state_key(generation_id),
-            correction_heartbeat_key(generation_id),
-        )
-    ]
     delete_runtime_state(
         conn,
-        published_pointer_key(site_id),
-        verification_state_key(site_id),
-        verification_heartbeat_key(site_id),
         published_run_key(site_id),
         gap_scan_failures_key(site_id),
-        *correction_keys,
     )
     conn.execute(
         "DELETE FROM settings WHERE key = ?", (f"{SNAPSHOT_TIME_KEY}:{site_id}",)
@@ -213,18 +178,10 @@ def _clear_site_state(
 @router.delete("/{site_id}", response_model=None)
 async def delete_site(request: Request, site_id: int) -> dict[str, bool] | HTMLResponse:
     def _write(conn: sqlite3.Connection) -> None:
-        # Read before the DELETE: the cascade removes the generation rows
-        # whose ids key the correction-chain state.
-        generation_ids = [
-            int(row["id"])
-            for row in conn.execute(
-                "SELECT id FROM timezone_generations WHERE site_id = ?", (site_id,)
-            )
-        ]
         cur = conn.execute("DELETE FROM sites WHERE id=?", (site_id,))
         if cur.rowcount == 0:
             raise ApiError(404, "site not found")
-        _clear_site_state(conn, site_id, generation_ids)
+        _clear_site_state(conn, site_id)
 
     await get_db().write(_write)
     if _wants_html(request):
@@ -232,60 +189,6 @@ async def delete_site(request: Request, site_id: int) -> dict[str, bool] | HTMLR
 
         return await render_site_cards(request)
     return {"deleted": True}
-
-
-@router.post("/{site_id}/timezone-correction", response_model=None)
-async def start_timezone_correction(
-    site_id: int, body: TimezoneCorrectionIn
-) -> dict[str, object]:
-    """Start a retrospective timezone correction for one site.
-
-    Behind the app-level ``MutationGuard`` by construction; this route adds
-    no exemption. ``confirm`` mitigates accidental activation and is not
-    authorization -- see ADR-0003, which classifies this action tier (c),
-    HTTP-eligible.
-
-    Refusals are mapped by exception TYPE, never by message text, and there
-    is deliberately no ``except ValueError`` catch-all: a refusal this route
-    has not reasoned about surfaces as a 500 rather than being guessed at.
-    """
-    if body.confirm is not True:
-        raise ApiError(400, "confirmation required")
-
-    def _write(conn: sqlite3.Connection) -> dict[str, object]:
-        from wxverify.worker.verification_run import verification_chain_active
-
-        # Route-owned refusal (ADR-0003 clause 1(b)): a correction's flip
-        # invalidates a verification run pinned to the generation it started
-        # on, so refuse while one is queued or running for this site. Runs
-        # inside the same write transaction as the domain call, so it cannot
-        # go stale. The CLI path is deliberately NOT subject to it.
-        if verification_chain_active(conn, site_id):
-            raise ApiError(
-                409, "a verification run is active for this site; correction refused"
-            )
-        try:
-            generation_id = start_retrospective_correction(conn, site_id, body.timezone)
-        except UnknownTimezone as exc:
-            raise ApiError(400, str(exc)) from exc
-        except TimezoneSiteNotFound as exc:
-            raise ApiError(404, str(exc)) from exc
-        except CorrectionAlreadyBuilding as exc:
-            raise ApiError(409, str(exc)) from exc
-        logger.info(
-            "timezone correction started site=%s generation=%s timezone=%s source=ops",
-            site_id,
-            generation_id,
-            body.timezone,
-        )
-        return {
-            "site_id": site_id,
-            "generation_id": generation_id,
-            "timezone": body.timezone,
-            "state": "building",
-        }
-
-    return await get_db().write(_write)
 
 
 def _wants_html(request: Request) -> bool:

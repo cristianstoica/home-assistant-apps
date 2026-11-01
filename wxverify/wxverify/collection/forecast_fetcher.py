@@ -41,11 +41,18 @@ class PersistOutcome:
     ``inserted_count == len(inserted_sample_ids)``. The forward fetch path
     gates its score enqueue on these ids
     (``worker.feed_fetch._persist_fetch_success``).
+
+    ``labels`` maps each feed whose samples the reply carried (a meteoblue
+    package's members under their own feed ids) to the sorted, distinct run
+    labels (``issued_at``) of its usable samples; a feed the reply carried
+    with no usable sample maps to an empty tuple. The download record
+    stores it (daily-close P4 plan 4.2).
     """
 
     usable_sample_count: int
     inserted_count: int
     inserted_sample_ids: tuple[int, ...]
+    labels: dict[int, tuple[str, ...]]
 
 
 def register_feed_if_needed(
@@ -86,12 +93,15 @@ def persist_fetch_result(
     inserted_ids: list[int] = []
     usable = 0
     has_valid = False
+    labels: dict[int, set[str]] = {}
     fetched_at = fetched_at or isoformat_utc()
     for sample in result.samples:
         feed_id = _feed_id_for_sample(conn, source, fetch_feed_id, sample)
+        feed_labels = labels.setdefault(feed_id, set())
         if sample.lead_hours < 1:
             continue
         usable += 1
+        feed_labels.add(sample.issued_at)
         cur = conn.execute(
             """
             INSERT OR IGNORE INTO forecast_samples
@@ -152,6 +162,7 @@ def persist_fetch_result(
         usable_sample_count=usable,
         inserted_count=inserted,
         inserted_sample_ids=tuple(inserted_ids),
+        labels={feed_id: tuple(sorted(issued)) for feed_id, issued in labels.items()},
     )
 
 

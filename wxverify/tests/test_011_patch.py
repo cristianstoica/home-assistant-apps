@@ -44,6 +44,7 @@ from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.domain_backoff import record_http_backoff
 from wxverify.worker.feed_fetch import (
     BackoffActive,
+    DownloadSlot,
     fetch_feed_once,
     fetch_feed_retry_floor_seconds,
 )
@@ -266,6 +267,7 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
+    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
     )
@@ -490,8 +492,6 @@ def test_fetch_feed_connect_error_refunds_budget(tmp_path: Path) -> None:
     db = get_db()
 
     class _ConnectErrorAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -502,7 +502,20 @@ def test_fetch_feed_connect_error_refunds_budget(tmp_path: Path) -> None:
         return _ConnectErrorAdapter()
 
     with pytest.raises(httpx.ConnectError):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"
@@ -529,8 +542,6 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
     _resp = httpx.Response(429, headers={"Retry-After": "120"}, request=_req)
 
     class _Http429Adapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -540,7 +551,20 @@ def test_fetch_feed_429_consumes_budget_and_writes_backoff(tmp_path: Path) -> No
     def _build(source: str, client: httpx.AsyncClient) -> _Http429Adapter:
         return _Http429Adapter()
 
-    result = asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+    result = asyncio.run(
+        fetch_feed_once(
+            db,
+            site_id,
+            feed_id,
+            adapter_builder=_build,
+            slot=DownloadSlot(
+                slot="unscheduled",
+                round_date=None,
+                round_try=None,
+                started_at=utc_now(),
+            ),
+        )
+    )
     assert isinstance(result, BackoffActive)
 
     budget = conn.execute(
@@ -560,8 +584,6 @@ def test_fetch_feed_read_timeout_keeps_budget(tmp_path: Path) -> None:
     db = get_db()
 
     class _ReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -572,7 +594,20 @@ def test_fetch_feed_read_timeout_keeps_budget(tmp_path: Path) -> None:
         return _ReadTimeoutAdapter()
 
     with pytest.raises(httpx.ReadTimeout):
-        asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+        asyncio.run(
+            fetch_feed_once(
+                db,
+                site_id,
+                feed_id,
+                adapter_builder=_build,
+                slot=DownloadSlot(
+                    slot="unscheduled",
+                    round_date=None,
+                    round_try=None,
+                    started_at=utc_now(),
+                ),
+            )
+        )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"
@@ -587,8 +622,6 @@ def test_fetch_feed_success_consumes_budget_exactly_once(tmp_path: Path) -> None
     db = get_db()
 
     class _SuccessAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -598,7 +631,20 @@ def test_fetch_feed_success_consumes_budget_exactly_once(tmp_path: Path) -> None
     def _build(source: str, client: httpx.AsyncClient) -> _SuccessAdapter:
         return _SuccessAdapter()
 
-    asyncio.run(fetch_feed_once(db, site_id, feed_id, adapter_builder=_build))
+    asyncio.run(
+        fetch_feed_once(
+            db,
+            site_id,
+            feed_id,
+            adapter_builder=_build,
+            slot=DownloadSlot(
+                slot="unscheduled",
+                round_date=None,
+                round_try=None,
+                started_at=utc_now(),
+            ),
+        )
+    )
 
     budget = conn.execute(
         "SELECT calls FROM api_budget WHERE source='open-meteo'"
@@ -621,6 +667,11 @@ def test_fetch_feed_readtimeout_total_calls_capped_at_max_retries_plus_one(
     test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor, below.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
@@ -631,8 +682,6 @@ def test_fetch_feed_readtimeout_total_calls_capped_at_max_retries_plus_one(
     db = get_db()
 
     class _GoogleReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -708,6 +757,11 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
     second retry onward, so a single-cycle test cannot observe it either.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
@@ -718,8 +772,6 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
     db = get_db()
 
     class _GoogleReadTimeoutAdapter:
-        supports_historical = False
-
         def estimate_cost(self, req: Any) -> CostEstimate:
             return CostEstimate(calls=1)
 
@@ -914,6 +966,11 @@ def test_fetch_feed_astronomically_large_feed_id_does_not_crash_worker(
     apart.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     huge_feed_id = int("9" * 400)
 
@@ -1053,18 +1110,28 @@ def test_fetch_feed_retry_floor_seconds_accepts_exact_integral_real(
 
 
 def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A fetch_feed job that failed minutes ago must not be re-enqueued by
     the next scheduler tick -- the same cooldown that already protects
-    fetch_obs/fetch_current_obs must also protect fetch_feed.
+    fetch_obs/fetch_current_obs must also protect fetch_feed. Under the
+    slot rule (plan §5.1) no daytime slot is due between local midnight
+    and 06:10 for a 360-minute feed, so the clock is fixed at 06:15Z,
+    when the 06:10 slot is due, and the failed job is stamped 5 minutes
+    before it (06:10Z) so the cooldown applies.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
     job_key = f"fetch:{feed_id}"
-    recent_failure = isoformat_utc(utc_now() - timedelta(minutes=5))
+
+    clock = _FakeClock(datetime(2026, 1, 1, 6, 15, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.worker.scheduler")
+    clock.patch(monkeypatch, "wxverify.db.queue")
+    clock.patch(monkeypatch, "wxverify.core.timeutil")
+
+    recent_failure = isoformat_utc(clock.now - timedelta(minutes=5))
     conn.execute(
         """
         INSERT INTO jobs (type, site_id, job_key, payload, status, updated_at)
@@ -1072,6 +1139,11 @@ def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
         """,
         (site_id, job_key, recent_failure),
     )
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(clock.now))
 
     scheduler_tick(conn)
 
@@ -1084,16 +1156,28 @@ def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
 
 
 def test_scheduler_tick_enqueues_fetch_feed_with_reduced_retry_cap(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The scheduler's automatic due-feed path must cap fetch_feed retries at
+    """The scheduler's daytime-download path must cap fetch_feed retries at
     3, not the schema default of 5 -- a metered provider job that keeps
-    failing must not fall back to the longer generic retry cap.
+    failing must not fall back to the longer generic retry cap. Under the
+    slot rule (plan §5.1) the clock is fixed at 06:15Z, when the 06:10
+    slot of the 360-minute feed is due.
     """
     conn = _init_tmp_db(tmp_path)
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
+
+    clock = _FakeClock(datetime(2026, 1, 1, 6, 15, tzinfo=UTC))
+    clock.patch(monkeypatch, "wxverify.worker.scheduler")
+    clock.patch(monkeypatch, "wxverify.db.queue")
+    clock.patch(monkeypatch, "wxverify.core.timeutil")
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(clock.now))
 
     scheduler_tick(conn)
 

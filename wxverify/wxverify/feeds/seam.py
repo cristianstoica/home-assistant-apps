@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import ClassVar, Protocol
+from typing import Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -56,19 +56,9 @@ class CostEstimate(BaseModel):
 
 
 class ForecastAdapter(Protocol):
-    supports_historical: ClassVar[bool]
-
     async def fetch_forecast(self, req: ForecastRequest) -> FetchResult: ...
 
     def estimate_cost(self, req: ForecastRequest) -> CostEstimate: ...
-
-    async def fetch_historical(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> FetchResult | None: ...
-
-    def estimate_historical_cost(
-        self, req: ForecastRequest, *, window_start: str, window_end: str
-    ) -> CostEstimate: ...
 
 
 def precip_hour_start(hour_end: str) -> str:

@@ -53,7 +53,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import (
     _live_leaderboard,  # noqa: F401 - referenced by qualified monkeypatch path only
@@ -157,7 +157,7 @@ def _add_temperature_cell(
             feed_id,
             valid_at,
             day_ahead,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

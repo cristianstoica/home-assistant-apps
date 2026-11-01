@@ -2,7 +2,7 @@
   <h2>Composite</h2>
   <p class="panel-hint">An overall ranking. Each feed's score is the average of its
     per-variable skill, and each variable is averaged over the leads that feed has
-    data for — so feeds with different horizons are not averaged over the same leads.</p>
+    data for — so feeds with different horizons are not averaged over the same leads.{% if coverage %} Coverage per day ahead is in the table above.{% endif %}</p>
   {% if composite %}
     <div class="table-wrap">
       <table>

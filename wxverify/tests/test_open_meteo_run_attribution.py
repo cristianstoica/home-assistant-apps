@@ -34,7 +34,7 @@ import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed
 from wxverify.collection.forecast_fetcher import persist_fetch_result
-from wxverify.core.timeutil import isoformat_utc, parse_utc
+from wxverify.core.timeutil import parse_utc
 from wxverify.db.migrations import (
     OPEN_METEO_INTERVAL_CORRECTION_KEY,
     correct_open_meteo_fetch_intervals,
@@ -45,15 +45,14 @@ from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.feeds.open_meteo import (
     RUN_AVAILABILITY_LAG_MINUTES,
     RUN_CADENCE_HOURS,
-    _historical_series_samples,  # noqa: SLF001
     _run_shape,  # noqa: SLF001
     _samples_from_hourly,  # noqa: SLF001
     _snap_run,  # noqa: SLF001
 )
-from wxverify.feeds.seam import FetchResult, ForecastRequest, NormalizedSample
+from wxverify.feeds.seam import FetchResult, NormalizedSample
 from wxverify.forecast.data import samples_fingerprint
 from wxverify.verification.runs import capture_config_snapshot, input_fingerprint
-from wxverify.worker.scheduler import _enqueue_due_feeds  # noqa: SLF001
+from wxverify.worker.round import enqueue_due_daytime_downloads
 
 _OPEN_METEO_MODELS = (
     "ecmwf_ifs",
@@ -347,45 +346,6 @@ def test_e_t5_revised_payload_for_the_same_run_is_not_stored() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T6 -- path fence: the previous-runs path is untouched by this item.
-# ---------------------------------------------------------------------------
-
-
-def test_e_t6_historical_path_issued_at_is_not_a_run_boundary() -> None:
-    """``_snap_run`` is not on the historical/previous-runs path; that path
-    keeps deriving ``issued_at`` from ``valid_at - day * 24h`` after the
-    cadence correction, with ``lead_hours == day * 24``.
-    """
-    req = ForecastRequest(
-        lat=0.0,
-        lon=0.0,
-        model="gem_global",
-        variables=("temperature",),
-        max_lead_hours=168,
-    )
-    day = 2
-    times: list[object] = ["2026-06-10T05:00:00Z"]
-    values: list[object] = [12.3]
-    start = parse_utc("2026-06-01T00:00:00Z")
-    end = parse_utc("2026-06-30T00:00:00Z")
-
-    samples = _historical_series_samples(
-        req=req,
-        variable="temperature",
-        day=day,
-        times=times,
-        values=values,
-        start=start,
-        end=end,
-    )
-    assert len(samples) == 1
-    sample = samples[0]
-    valid_dt = parse_utc(sample.valid_at)
-    assert sample.issued_at == isoformat_utc(valid_dt - timedelta(days=day))
-    assert sample.lead_hours == day * 24
-
-
-# ---------------------------------------------------------------------------
 # E-T7 -- issuance is provably clock-only: no other input matters.
 # ---------------------------------------------------------------------------
 
@@ -660,20 +620,17 @@ def test_e_t15_lead_hours_end_to_end_against_the_12_hour_label() -> None:
 
 
 # ---------------------------------------------------------------------------
-# E-T16 (plan C3-T18) -- scheduling arithmetic at the 690-minute lead
-# boundary for a 720-minute-cadence feed. A 720-minute interval is pulled
-# back to 690 (worker.cadence.effective_due_minutes) so the fetch starts
-# before the feed reads as stale -- 719/721 is no longer the boundary this
-# feed is due at; 689/690 is. Catches the helper being wired into catchup
-# only and never reaching the scheduler.
+# E-T16 (plan C3-T18) -- the slot rule (plan §5.1): a 720-minute-cadence
+# feed's only daytime slot is the round's local time (00:10 default) plus
+# one interval, 12:10; before that instant the slot is not due, at or after
+# it the slot is due exactly once. Catches the slot arithmetic being wired
+# into catchup only and never reaching the scheduler.
 # ---------------------------------------------------------------------------
 
 
-def test_e_t16_scheduling_arithmetic_at_the_690_minute_lead_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_e_t16_scheduling_arithmetic_at_the_690_minute_lead_boundary() -> None:
     conn = asof_conn()
-    site_id = _make_site(conn, "ISTATION01")
+    _make_site(conn, "ISTATION01")
     cur = conn.execute(
         """
         INSERT INTO feeds
@@ -686,39 +643,30 @@ def test_e_t16_scheduling_arithmetic_at_the_690_minute_lead_boundary(
     feed_id = int(cur.lastrowid)
     conn.commit()
 
-    fixed_now = parse_utc("2026-06-02T12:00:00Z")
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: fixed_now)
+    slot_instant = parse_utc("2026-06-02T12:10:00Z")
 
-    conn.execute(
-        "INSERT INTO site_feed_state (site_id, feed_id, last_run_at) VALUES (?, ?, ?)",
-        (site_id, feed_id, isoformat_utc(fixed_now - timedelta(minutes=689))),
-    )
-    conn.commit()
-    _enqueue_due_feeds(conn)
+    # Not yet due: one second before the 12:10 slot.
+    enqueue_due_daytime_downloads(conn, now_utc=slot_instant - timedelta(seconds=1))
     conn.commit()
     # asof_conn() seeds the eight default open-meteo feeds too, each
     # never-run and therefore unconditionally due -- scope to THIS feed's
     # job_key ("fetch:<feed_id>") so those siblings' jobs cannot mask the
     # assertion.
-    jobs_689 = conn.execute(
+    jobs_before = conn.execute(
         "SELECT * FROM jobs WHERE type = 'fetch_feed' AND job_key = ?",
         (f"fetch:{feed_id}",),
     ).fetchall()
-    assert jobs_689 == []
+    assert jobs_before == []
 
-    conn.execute(
-        "UPDATE site_feed_state SET last_run_at = ? WHERE site_id = ? AND feed_id = ?",
-        (isoformat_utc(fixed_now - timedelta(minutes=690)), site_id, feed_id),
-    )
+    # Due: exactly at the 12:10 slot instant.
+    enqueue_due_daytime_downloads(conn, now_utc=slot_instant)
     conn.commit()
-    _enqueue_due_feeds(conn)
-    conn.commit()
-    jobs_690 = conn.execute(
+    jobs_due = conn.execute(
         "SELECT * FROM jobs WHERE type = 'fetch_feed' AND job_key = ?",
         (f"fetch:{feed_id}",),
     ).fetchall()
-    assert len(jobs_690) == 1
-    payload = json.loads(str(jobs_690[0]["payload"]))
+    assert len(jobs_due) == 1
+    payload = json.loads(str(jobs_due[0]["payload"]))
     assert payload["feed_id"] == feed_id
 
 

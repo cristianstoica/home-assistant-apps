@@ -5,7 +5,7 @@ success marker ``result='ok'`` -- resolves an aged terminal failure of
 the same ``(type, site_id, job_key)`` scope, for the single-row job
 types only. Every fixture here is synthetic: one site named ``'S'`` at
 the test suite's placeholder coordinates, job keys such as ``fetch:1``,
-``obs`` and ``catchup``, and a fixed clock of 2026-07-09T12:00:00Z.
+``obs`` and ``gapscan``, and a fixed clock of 2026-07-09T12:00:00Z.
 
 This module carries the §6.3 harness and O1-O10, O12, O13 and O17.
 """
@@ -404,19 +404,20 @@ def test_null_scope_columns_are_scopes() -> None:
     assert cond_a2["count"] == 1
 
     conn_b = asof_conn()
+    site_b = asof_make_site(conn_b, "S")
     _insert_job(
         conn_b,
-        job_type="catchup",
-        site_id=None,
-        job_key="catchup",
+        job_type="record_gap_scan",
+        site_id=site_b,
+        job_key="gapscan",
         status="failed",
         updated_at=_AGED,
     )
     _insert_job(
         conn_b,
-        job_type="catchup",
-        site_id=None,
-        job_key="catchup",
+        job_type="record_gap_scan",
+        site_id=site_b,
+        job_key="gapscan",
         status="completed",
         updated_at=_LATER,
         result="ok",
@@ -534,10 +535,6 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
     ("job_type", "site_scoped", "job_key", "expected_count", "expected_ok"),
     [
         pytest.param(
-            "verification_run", True, "verify:1", 1, False, id="verification_run"
-        ),
-        pytest.param("backfill_site", True, "backfill:1", 1, False, id="backfill_site"),
-        pytest.param(
             "timezone_correction",
             True,
             "tzcorr:1",
@@ -548,7 +545,6 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
         pytest.param(
             "record_gap_scan", True, "gapscan:cont:1", 1, False, id="record_gap_scan"
         ),
-        pytest.param("catchup", False, "catchup", 1, False, id="catchup"),
         pytest.param("fetch_feed", True, "fetch:1", 0, True, id="fetch_feed"),
         pytest.param("fetch_obs", True, "obs", 0, True, id="fetch_obs"),
         pytest.param(
@@ -562,6 +558,22 @@ def test_alternating_failure_and_success_never_leaves_unresolved_row() -> None:
             0,
             True,
             id="forecast_record",
+        ),
+        pytest.param(
+            "day_close",
+            True,
+            "close:1:2026-07-06:3",
+            0,
+            True,
+            id="day_close",
+        ),
+        pytest.param(
+            "day_publish",
+            True,
+            "publish:1:8",
+            0,
+            True,
+            id="day_publish",
         ),
     ],
 )

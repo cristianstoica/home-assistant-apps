@@ -42,7 +42,6 @@ from wxverify.feeds.seam import ForecastRequest
 from wxverify.scoring.multimodel import materialize_multimodel_mean
 from wxverify.scoring.pairing import pair_real_models
 from wxverify.web.context import feed_description
-from wxverify.worker.scheduler import scheduler_tick
 
 # The seven models seeded before D1 added icon_eu.
 # (test_open_meteo_horizon_correction.py:28-42)
@@ -243,46 +242,6 @@ def test_d1_t4_operator_values_survive_remigration_even_with_markers_deleted() -
 # ---------------------------------------------------------------------------
 
 
-def _due_jobs(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM jobs WHERE type='fetch_feed' AND job_key=?",
-        (f"fetch:{feed_id}",),
-    ).fetchall()
-
-
-def test_d1_t5_scheduling_arithmetic_at_the_365_minute_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fixed_now = parse_utc("2026-06-02T12:00:00Z")
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: fixed_now)
-
-    # Case 1: last_run_at = now - 365 min -> exactly one job.
-    conn1 = asof_conn()
-    site1 = asof_make_site(conn1, "D1-T5 site A")
-    feed1 = _icon_eu_feed_id(conn1)
-    conn1.execute(
-        "INSERT INTO site_feed_state (site_id, feed_id, last_run_at) VALUES (?, ?, ?)",
-        (site1, feed1, isoformat_utc(fixed_now - timedelta(minutes=365))),
-    )
-    conn1.commit()
-    scheduler_tick(conn1)
-    conn1.commit()
-    assert len(_due_jobs(conn1, feed1)) == 1
-
-    # Case 2: a separate fresh database, so case 1's job cannot leak in.
-    conn2 = asof_conn()
-    site2 = asof_make_site(conn2, "D1-T5 site B")
-    feed2 = _icon_eu_feed_id(conn2)
-    conn2.execute(
-        "INSERT INTO site_feed_state (site_id, feed_id, last_run_at) VALUES (?, ?, ?)",
-        (site2, feed2, isoformat_utc(fixed_now - timedelta(minutes=355))),
-    )
-    conn2.commit()
-    scheduler_tick(conn2)
-    conn2.commit()
-    assert _due_jobs(conn2, feed2) == []
-
-
 def test_d1_t5_cost_estimate_uses_the_seeded_max_lead_hours() -> None:
     conn = asof_conn()
     seeded_max_lead_hours = int(_icon_eu_row(conn)["max_lead_hours"])
@@ -297,22 +256,6 @@ def test_d1_t5_cost_estimate_uses_the_seeded_max_lead_hours() -> None:
     )
     adapter = OpenMeteoAdapter(httpx.AsyncClient())
     assert adapter.estimate_cost(req).calls == 1
-    assert (
-        adapter.estimate_historical_cost(
-            req,
-            window_start="2026-06-01T00:00:00Z",
-            window_end="2026-06-08T00:00:00Z",
-        ).calls
-        == 2
-    )
-    assert (
-        adapter.estimate_historical_cost(
-            req,
-            window_start="2026-06-01T00:00:00Z",
-            window_end="2026-07-01T00:00:00Z",
-        ).calls
-        == 4
-    )
 
 
 # ---------------------------------------------------------------------------

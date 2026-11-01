@@ -1,25 +1,15 @@
-"""Publish-hold Ops-control-surface oracles (0.11.3, plan §8 O6-O12, O15, O16).
+"""Publish-hold Ops-control-surface oracles (0.11.3, plan §8 O8-O12, O15).
 
 Covers the `PUT /api/verification/publish-hold` handler's refusal/permission
 asymmetry (D5), its `MutationGuard` exposure, the one-derivation invariant
 between the route and the scheduler's own gate (D10), the startup option
-sync's inability to smuggle a publish-hold add-on option (D9), the two
-pages' banner rendering including the D14 chain-active copy, and the D12
-trigger-decision predicate driving next-tick release semantics.
+sync's inability to smuggle a publish-hold add-on option (D9), and the two
+pages' banner rendering including the D14 chain-active copy.
 
-O16b ("repeated held ticks stay deduplicated") is intentionally NOT
-duplicated here: it is already the shape of
-``test_publish_hold_is_idempotent_via_the_trigger_decision_early_out`` in
-``tests/test_verification_run.py`` (three ticks while held -> one decision
-row, no jobs) -- confirmed present and correctly shaped, so authoring it a
-second time here would only be a near-duplicate.
-
-Isolation: HTTP-route oracles (O6-O11, O12a-c, O15) drive a real app over
+Isolation: HTTP-route oracles (O8-O11, O12a-c, O15) drive a real app over
 ``TestClient`` against a file-backed ``tmp_path`` database, mirroring
 ``tests/test_ops_feed_health.py``'s pattern (idle worker stand-in,
-``close_db``/``config.db_path`` reset per test). O16's four cases drive
-``_enqueue_due_verification_runs`` directly against an in-memory connection,
-mirroring the existing shape at ``tests/test_verification_run.py:828-847``.
+``close_db``/``config.db_path`` reset per test).
 
 Synthetic data only (public repo): ``site-alpha`` / ``America/Denver``, no
 real station or device identifiers.
@@ -29,11 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable
 from dataclasses import fields
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import TypeVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -42,7 +30,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.options import RuntimeOptions
 from wxverify.db.connection import close_db, get_db
-from wxverify.db.migrations import create_schema, run_migrations
+from wxverify.db.migrations import create_schema
 from wxverify.db.runtime_state import get_runtime_state, get_runtime_state_entry
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.settings.service import apply_plain_settings
@@ -54,12 +42,8 @@ from wxverify.verification.publish_hold import (
 )
 from wxverify.worker.scheduler import (
     VERIFICATION_PUBLISH_HOLD_KEY,
-    _enqueue_due_verification_runs,
     verification_publish_held,
 )
-from wxverify.worker.verification_run import verification_job_key
-
-T = TypeVar("T")
 
 _SITE_NAME = "site-alpha"
 _SITE_TZ = "America/Denver"
@@ -108,7 +92,7 @@ def _insert_job(conn: sqlite3.Connection, site_id: int, *, status: str) -> None:
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
         "('verification_run', ?, ?, ?)",
-        (site_id, verification_job_key(site_id), status),
+        (site_id, f"verification:{site_id}", status),
     )
 
 
@@ -130,72 +114,6 @@ def _seed_armed_site_and_job(conn: sqlite3.Connection, *, job_status: str) -> in
     _insert_job(conn, site_id, status=job_status)
     conn.commit()
     return site_id
-
-
-# ---------------------------------------------------------------------------
-# O6 - Release is refused while a chain is active (paired, non-vacuous).
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("job_status", "expect_status", "expect_hold_after"),
-    [
-        ("running", 409, "1"),
-        ("pending", 409, "1"),
-        ("completed", 200, "0"),
-    ],
-)
-def test_o6_release_refused_only_while_a_chain_is_actually_active(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    job_status: str,
-    expect_status: int,
-    expect_hold_after: str,
-) -> None:
-    app = _boot(tmp_path, f"o6-{job_status}.db", monkeypatch)
-    with TestClient(app) as client:
-        db = get_db()
-        db.write_sync(
-            lambda conn: _seed_armed_site_and_job(conn, job_status=job_status)
-        )
-        headers = _csrf_headers(client)
-
-        resp = client.put(
-            _PUT_PATH, json={"held": False, "confirm": True}, headers=headers
-        )
-
-        assert resp.status_code == expect_status, resp.text
-        held = db.read_sync(
-            lambda conn: get_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY)
-        )
-        assert held == expect_hold_after
-    close_db()
-
-
-# ---------------------------------------------------------------------------
-# O7 - Arming is permitted during an active chain.
-# ---------------------------------------------------------------------------
-
-
-def test_o7_arming_is_permitted_while_a_chain_is_active(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o7.db", monkeypatch)
-    with TestClient(app) as client:
-        db = get_db()
-        db.write_sync(lambda conn: _seed_armed_site_and_job(conn, job_status="running"))
-        headers = _csrf_headers(client)
-
-        resp = client.put(
-            _PUT_PATH, json={"held": True, "confirm": True}, headers=headers
-        )
-
-        assert resp.status_code == 200, resp.text
-        held = db.read_sync(
-            lambda conn: get_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY)
-        )
-        assert held == "1"
-    close_db()
 
 
 # ---------------------------------------------------------------------------
@@ -570,30 +488,6 @@ def test_o12c_banner_reflects_chain_active_state_truthfully(
     close_db()
 
 
-def test_o12c_banner_reflects_chain_active_state_truthfully_when_active(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app = _boot(tmp_path, "o12c-chain.db", monkeypatch)
-    with TestClient(app) as client:
-        db = get_db()
-
-        def _seed(conn: sqlite3.Connection) -> None:
-            site_id = _insert_site(conn, enabled=1)
-            _insert_job(conn, site_id, status="running")
-
-        db.write_sync(_seed)
-        db.write_sync(
-            lambda conn: set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "1")
-        )
-
-        active_resp = client.get("/verification")
-        assert active_resp.status_code == 200
-        assert _CHAIN_ACTIVE_TEXT in active_resp.text
-        assert _NO_CHAIN_TEXT not in active_resp.text
-        assert _OVER_PROMISE_TEXT not in active_resp.text
-    close_db()
-
-
 # ---------------------------------------------------------------------------
 # O15 - The HTTP release preserves the bootstrap marker.
 # ---------------------------------------------------------------------------
@@ -677,160 +571,3 @@ def test_o15_http_release_preserves_the_bootstrap_marker_exactly(
     )
     assert still_released == "0"
     close_db()
-
-
-# ---------------------------------------------------------------------------
-# O16 - Releasing the hold takes effect on the next tick, same local day.
-# ---------------------------------------------------------------------------
-
-
-class _RealDb:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-
-    async def write(self, fn: Callable[[sqlite3.Connection], T]) -> T:
-        return fn(self._conn)
-
-
-def _make_verification_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    return conn
-
-
-def _o16_site(conn: sqlite3.Connection) -> int:
-    cur = conn.execute(
-        """
-        INSERT INTO sites
-            (name, forecast_lat, forecast_lon, elevation_m, timezone, enabled)
-        VALUES (?, 39.7, -104.9, 1600.0, ?, 1)
-        """,
-        (_SITE_NAME, _SITE_TZ),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def _decision_rows(
-    conn: sqlite3.Connection, site_id: int
-) -> list[tuple[str, str, str]]:
-    return [
-        (
-            str(r["trigger_date"]),
-            str(r["decision"]),
-            "" if r["reason"] is None else str(r["reason"]),
-        )
-        for r in conn.execute(
-            "SELECT trigger_date, decision, reason FROM verification_trigger_decisions "
-            "WHERE site_id = ? ORDER BY id",
-            (site_id,),
-        ).fetchall()
-    ]
-
-
-def _job_count(conn: sqlite3.Connection) -> int:
-    return int(
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type = 'verification_run'"
-        ).fetchone()["n"]
-    )
-
-
-def test_o16a_same_day_release_enqueues_and_preserves_history(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _make_verification_conn()
-    site_id = _o16_site(conn)
-    tick_time = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: tick_time)
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "1")
-
-    _enqueue_due_verification_runs(conn)
-    assert _job_count(conn) == 0
-    assert _decision_rows(conn, site_id) == [("2026-06-06", "skipped", "publish_hold")]
-    first_row = conn.execute(
-        "SELECT id, decided_at FROM verification_trigger_decisions WHERE site_id = ?",
-        (site_id,),
-    ).fetchone()
-
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "0")
-    _enqueue_due_verification_runs(conn)
-
-    assert _job_count(conn) == 1
-    rows = conn.execute(
-        "SELECT id, decided_at FROM verification_trigger_decisions WHERE site_id = ?",
-        (site_id,),
-    ).fetchall()
-    assert len(rows) == 1, "the hold-skip row must survive release, not be deleted"
-    assert int(rows[0]["id"]) == int(first_row["id"])
-    assert str(rows[0]["decided_at"]) == str(first_row["decided_at"])
-
-
-@pytest.mark.parametrize(
-    ("decision", "reason", "expect_jobs_after_release"),
-    [
-        ("no_change_skip", "no change", 0),
-        ("run_started", None, 0),
-        ("suppressed_because_active", "verification chain already active", 0),
-        ("skipped", "no change", 0),  # load-bearing: a non-hold `skipped` row
-    ],
-)
-def test_o16c_a_prior_non_hold_decision_stays_terminal(
-    monkeypatch: pytest.MonkeyPatch,
-    decision: str,
-    reason: str | None,
-    expect_jobs_after_release: int,
-) -> None:
-    conn = _make_verification_conn()
-    site_id = _o16_site(conn)
-    tick_time = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: tick_time)
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "1")
-    _enqueue_due_verification_runs(conn)
-    assert _job_count(conn) == 0
-
-    conn.execute(
-        "INSERT INTO verification_trigger_decisions "
-        "(site_id, trigger_date, decision, reason, decided_at) "
-        "VALUES (?, '2026-06-06', ?, ?, '2026-06-06T12:00:01Z')",
-        (site_id, decision, reason),
-    )
-
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "0")
-    _enqueue_due_verification_runs(conn)
-
-    assert _job_count(conn) == expect_jobs_after_release
-    rows = _decision_rows(conn, site_id)
-    assert ("2026-06-06", "skipped", "publish_hold") in rows
-    assert ("2026-06-06", decision, "" if reason is None else reason) in rows
-    assert len(rows) == 2, "both rows must survive; no redeciding of a terminal date"
-
-
-def test_o16d_a_null_reason_skip_also_stays_terminal(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _make_verification_conn()
-    site_id = _o16_site(conn)
-    tick_time = datetime(2026, 6, 6, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: tick_time)
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "1")
-    _enqueue_due_verification_runs(conn)
-    assert _job_count(conn) == 0
-
-    conn.execute(
-        "INSERT INTO verification_trigger_decisions "
-        "(site_id, trigger_date, decision, reason, decided_at) "
-        "VALUES (?, '2026-06-06', 'skipped', NULL, '2026-06-06T12:00:01Z')",
-        (site_id,),
-    )
-
-    set_setting(conn, VERIFICATION_PUBLISH_HOLD_KEY, "0")
-    _enqueue_due_verification_runs(conn)
-
-    assert _job_count(conn) == 0
-    rows = _decision_rows(conn, site_id)
-    assert ("2026-06-06", "skipped", "publish_hold") in rows
-    assert ("2026-06-06", "skipped", "") in rows
-    assert len(rows) == 2

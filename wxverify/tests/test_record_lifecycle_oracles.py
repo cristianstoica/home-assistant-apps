@@ -56,7 +56,7 @@ from wxverify.db.queue import (
     enqueue_if_absent_with_cooldown,
 )
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.monitor import build_verdict
 from wxverify.verification.methodology import LATE_WRITE_WINDOW_HOURS
 from wxverify.verification.record import (
@@ -161,7 +161,7 @@ def test_a_partial_day_completes_on_an_in_window_reconstruction() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-partial")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _begin_the_log(conn, site_id, feed_id)
     assert len(_rows(conn, site_id, _DAY)) == _GRID
@@ -220,7 +220,7 @@ def test_window_close_writes_the_full_identity_set_with_per_identity_reasons() -
     """
     conn = _conn()
     site_id = _make_site(conn, "site-reasons")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _begin_the_log(conn, site_id, feed_id)
 
@@ -274,7 +274,7 @@ def test_gap_scan_visits_a_partial_day_behind_a_later_complete_day() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-behind")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _begin_the_log(conn, site_id, feed_id)
 
@@ -306,7 +306,7 @@ def test_gap_scan_enters_an_old_log_at_the_capped_origin() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-old-log")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     origin = _DAY - timedelta(days=GAP_SCAN_LOOKBACK_DAYS + 10)
     _seed_grid_for(conn, site_id=site_id, feed_id=feed_id, day=origin)
@@ -353,7 +353,7 @@ def test_a_generation_with_no_rows_is_still_not_scanned() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-fresh")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     now = _snapshot_t(_DAY) + timedelta(hours=LATE_WRITE_WINDOW_HOURS + 1)
     assert run_record_gap_scan(conn, site_id, {}, now=now) is None
     assert _row_count(conn, site_id) == 0
@@ -448,7 +448,7 @@ def test_the_record_enqueue_holds_for_an_hour_after_a_successful_run(
     """
     conn = _conn()
     site_id = _make_site(conn, "site-cadence")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     today = datetime.now(UTC).date()
     # One variable only: the day is written but never complete, so the
@@ -579,7 +579,7 @@ def test_a_day_closed_as_missed_is_not_an_operator_gap() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn, "site-closed-day")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _begin_the_log(conn, site_id, feed_id)
 
@@ -657,7 +657,7 @@ def _degraded_condition(conn: sqlite3.Connection, now: datetime) -> dict[str, ob
 
 def _two_gap_days(conn: sqlite3.Connection) -> tuple[int, date, date, datetime]:
     site_id = _make_site(conn, "site-contained")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _make_feed(conn, "model-a")
     _begin_the_log(conn, site_id, feed_id)
     first = _DAY + timedelta(days=1)

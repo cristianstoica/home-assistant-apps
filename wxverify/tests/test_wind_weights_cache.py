@@ -39,10 +39,7 @@ from wxverify.db.connection import (
 )
 from wxverify.db.runtime_state import set_runtime_state, set_runtime_state_now
 from wxverify.db.snapshot import SnapshotNestingError, read_snapshot
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_pointer_key,
-)
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast import wind_blend
 from wxverify.forecast.wind_blend import (
     MIN_OBS_HOURS,
@@ -176,7 +173,7 @@ def _forecast_b(i: int) -> float:
 
 def _seed_all(conn: sqlite3.Connection) -> tuple[int, int, int, int, int, int, int]:
     site_id = _seed_site(conn)
-    gen_id = ensure_published_generation(conn, site_id)
+    gen_id = ensure_site_generation(conn, site_id)
     feed_a = _seed_feed(conn, "feed-a")
     feed_b = _seed_feed(conn, "feed-b")
     virtual_feed = _seed_feed(conn, "feed-virtual", is_virtual=1)
@@ -536,96 +533,6 @@ def test_t119_counts_read_before_training_statements(
     assert served.weights != fresh_uncached
 
 
-# --- T120: the published-generation filter ---------------------------------
-
-
-def test_t120_published_generation_filter(fx: _Fixture, tmp_path: Path) -> None:
-    """A second, unpublished generation's pairs are excluded until published.
-
-    Plan T120. mutant_drop_published_clause -> at ``assert still_hit.weights
-    == g1_weights``: correct = G1's own weights (inserting G2 bumps the
-    epoch regardless, so this is a genuine miss on both arms, but
-    ``published_generation_clause`` still excludes G2's unpublished rows
-    from the recompute, matching ``g1_weights``), mutant (dropping
-    ``published_generation_clause`` from ``training_pairs_query``) = a
-    different MAE, because G2's ``forecast + 1.0`` rows for every training
-    day now also enter the recompute and change ``MAX(forecast)`` per day.
-    Observed directly; the earlier ``served_g1.weights == g1_weights``
-    assertion does NOT discriminate this mutant (G2 does not exist yet at
-    that point, so the clause has nothing to exclude either way).
-
-    mutant_hit_after_pointer_move: dropping ``entry.epoch == epoch`` from
-    the cache key (the same code change as ``mutant_drop_epoch_from_key``)
-    also fails this test, but -- observed directly -- it is caught by the
-    earlier ``wind_weights_cache_stats()["misses"] == 2`` assertion (1
-    instead of 2: the G2-insert write no longer registers as a miss at
-    all), not by the final ``served_g2.weights == g2_uncached`` assertion
-    the plan names; this test does not isolate which of the two assertions
-    would catch a mutant that dropped ONLY the pointer-write's own
-    invalidation while leaving the general epoch key intact.
-    """
-    db = fx.db
-    g1_weights = _uncached(db, fx)
-    served_g1 = _serve(db, fx)
-    assert served_g1.weights == g1_weights
-
-    def _make_g2(conn: sqlite3.Connection) -> int:
-        cur = conn.execute(
-            "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-            " VALUES (?, 'UTC', 'retrospective_correction', 'building')",
-            (fx.site_id,),
-        )
-        assert cur.lastrowid is not None
-        g2 = int(cur.lastrowid)
-        rows = conn.execute(
-            "SELECT feed_id, issued_at, valid_at, lead_hours, day_ahead,"
-            " forecast, observed, first_known_at FROM forecast_pairs"
-            " WHERE site_id = ? AND variable = 'wind' AND tz_generation_id = ?",
-            (fx.site_id, fx.gen_id),
-        ).fetchall()
-        for row in rows:
-            conn.execute(
-                "INSERT INTO forecast_pairs (site_id, feed_id, variable,"
-                " issued_at, valid_at, lead_hours, day_ahead, forecast,"
-                " observed, tz_generation_id, first_known_at)"
-                " VALUES (?, ?, 'wind', ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    fx.site_id,
-                    row["feed_id"],
-                    row["issued_at"],
-                    row["valid_at"],
-                    row["lead_hours"],
-                    row["day_ahead"],
-                    row["forecast"] + 1.0,
-                    row["observed"],
-                    g2,
-                    row["first_known_at"],
-                ),
-            )
-        return g2
-
-    g2 = asyncio.run(db.write(_make_g2))
-
-    # Inserting G2's generation row and its copied forecast_pairs rows
-    # changes rows on fx.db, so this IS a genuine miss (confirmed via
-    # wind_weights_cache_stats()["misses"] moving 1 -> 2 here) -- the
-    # published-generation filter, not an untouched cache entry, is what
-    # keeps the recomputed value equal to g1_weights.
-    still_hit = _serve(db, fx)
-    assert still_hit.weights == g1_weights
-    assert wind_blend.wind_weights_cache_stats()["misses"] == 2
-
-    asyncio.run(
-        db.write(
-            lambda c: set_runtime_state(c, published_pointer_key(fx.site_id), str(g2))
-        )
-    )
-    g2_uncached = _uncached(db, fx)
-    assert g2_uncached != g1_weights
-    served_g2 = _serve(db, fx)
-    assert served_g2.weights == g2_uncached
-
-
 # --- T121: the excluded feeds ----------------------------------------------
 
 
@@ -953,7 +860,7 @@ def _build_other_db(path: Path, *, offset_days: int) -> None:
 
     def _seed(conn: sqlite3.Connection) -> None:
         site_id = _seed_site(conn)
-        gen_id = ensure_published_generation(conn, site_id)
+        gen_id = ensure_site_generation(conn, site_id)
         feed_a = _seed_feed(conn, "feed-a")
         feed_b = _seed_feed(conn, "feed-b")
         for i, target in enumerate(_DAYS):
@@ -2642,13 +2549,7 @@ def test_t134a_write_if_current_sees_heartbeat_exemption(fx: _Fixture) -> None:
     assert marker == []
 
     epoch2, _ = asyncio.run(writer.read_at_epoch(lambda c: None, label="t134a-2"))
-    asyncio.run(
-        db.write(
-            lambda c: set_runtime_state(
-                c, published_pointer_key(fx.site_id), str(fx.gen_id)
-            )
-        )
-    )
+    asyncio.run(db.write(lambda c: set_runtime_state(c, "t134a_epoch_probe", "1")))
     result3 = asyncio.run(writer.write_if_current(_marker, epoch=epoch2))
     assert result3 is EPOCH_MOVED
     assert marker == []

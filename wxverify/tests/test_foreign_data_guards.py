@@ -15,7 +15,7 @@ import sqlite3
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,8 @@ from wxverify.db.queue import (
 )
 from wxverify.worker.processor import run_worker
 from wxverify.worker.scheduler import enqueue_due_current_obs, scheduler_tick
+
+_SLOT_NOW = datetime(2026, 1, 1, 6, 15, tzinfo=UTC)
 
 
 def _init_tmp_db(tmp_path: Path) -> sqlite3.Connection:
@@ -163,11 +165,10 @@ def _setup_site_feed_state_last_run_at_boundary_offset(
     conn: sqlite3.Connection,
 ) -> _ExpectedJobs:
     """A well-formed near-``datetime.max`` stamp with a non-UTC offset in
-    last_run_at: the scheduler's narrow ``except ValueError`` fail-open only
-    holds if ``parse_utc`` normalizes the UTC-conversion overflow to
-    ``ValueError`` -- otherwise the exception escapes ``scheduler_tick``
-    entirely and halts the worker. The default-subscribed control feed
-    (open-meteo/ecmwf_ifs, no site_feed_state row) must still be scheduled."""
+    last_run_at: the slot rule (plan 5.1) reads no last_run_at, so this value
+    is inert carrier data, not a trigger for the scheduler to parse. The
+    default-subscribed control feed (open-meteo/ecmwf_ifs, no site_feed_state
+    row) must still be scheduled."""
     site_id = _insert_site(conn)
     control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     bad_feed_id = _feed_id(conn, "google", "blend")
@@ -228,8 +229,9 @@ def _setup_fetch_interval_minutes_hostile_null_last_run_at(
 ) -> _ExpectedJobs:
     """A never-run feed (site_feed_state row with last_run_at NULL) must not
     be treated as due unconditionally when its cadence is hostile -- the
-    cadence guard has to run BEFORE the due decision, not only inside the
-    elapsed-time branch that a NULL last_run_at never reaches."""
+    cadence guard has to run BEFORE the due decision. The slot rule (plan
+    5.1) reads no last_run_at at all, so there is no elapsed-time branch
+    left for this column to reach."""
     site_id = _insert_site(conn)
     control_feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     bad_feed_id = _feed_id(conn, "meteoblue", "multimodel")
@@ -304,15 +306,6 @@ def _setup_fetch_interval_minutes_non_integral_large_in_range_null_last_run_at(
     return _setup_fetch_interval_minutes_hostile_null_last_run_at(conn, "43199.5")
 
 
-def _setup_sites_last_obs_cycle_at_blob(conn: sqlite3.Connection) -> _ExpectedJobs:
-    site_id = _insert_site(conn)
-    _insert_station(conn, site_id, "PWS-CASE-OBS")
-    conn.execute(
-        "UPDATE sites SET last_obs_cycle_at = x'0001' WHERE id = ?", (site_id,)
-    )
-    return _ExpectedJobs(must_exist=(("fetch_obs", site_id, "obs"),))
-
-
 def _setup_stations_site_id_hostile(
     conn: sqlite3.Connection, literal: str
 ) -> _ExpectedJobs:
@@ -351,18 +344,6 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         logger_name="wxverify.db.queue",
         warning_substring="updated_at",
         setup=_setup_jobs_updated_at_boundary_offset,
-    ),
-    _TickCarrierCase(
-        case_id="site_feed_state_last_run_at_boundary_offset",
-        logger_name="wxverify.worker.scheduler",
-        warning_substring="last_run_at",
-        setup=_setup_site_feed_state_last_run_at_boundary_offset,
-    ),
-    _TickCarrierCase(
-        case_id="site_feed_state_last_run_at_blob",
-        logger_name="wxverify.worker.scheduler",
-        warning_substring="last_run_at",
-        setup=_setup_site_feed_state_last_run_at_blob,
     ),
     _TickCarrierCase(
         case_id="feeds_fetch_interval_minutes_real_infinity",
@@ -435,12 +416,6 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
         ),
     ),
     _TickCarrierCase(
-        case_id="sites_last_obs_cycle_at_blob",
-        logger_name="wxverify.worker.scheduler",
-        warning_substring="last_obs_cycle_at",
-        setup=_setup_sites_last_obs_cycle_at_blob,
-    ),
-    _TickCarrierCase(
         case_id="stations_site_id_real_infinity",
         logger_name="wxverify.worker.scheduler",
         warning_substring="site_id",
@@ -459,10 +434,19 @@ _TICK_CARRIER_CASES: tuple[_TickCarrierCase, ...] = (
     "case", _TICK_CARRIER_CASES, ids=[c.case_id for c in _TICK_CARRIER_CASES]
 )
 def test_scheduler_tick_survives_hostile_reader_values(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, case: _TickCarrierCase
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    case: _TickCarrierCase,
 ) -> None:
     conn = _init_tmp_db(tmp_path)
     expected = case.setup(conn)
+    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
 
     with caplog.at_level(logging.WARNING, logger=case.logger_name):
         scheduler_tick(conn)  # must not raise
@@ -488,7 +472,9 @@ def test_scheduler_tick_survives_hostile_reader_values(
 
 
 def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression pin: a whole-number cadence written via a REAL literal
     (e.g. 360.0) -- stored as the integer 360 by this INTEGER-affinity
@@ -511,6 +497,12 @@ def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
     conn.execute(
         "UPDATE feeds SET fetch_interval_minutes = 360.0 WHERE id = ?", (feed_id,)
     )
+    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
 
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
         scheduler_tick(conn)  # must not raise
@@ -518,6 +510,48 @@ def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
     assert _pending_job_exists(conn, "fetch_feed", site_id, f"fetch:{feed_id}"), (
         "an exact-integral REAL cadence must still schedule the feed"
     )
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert not warnings, (
+        f"expected no warnings, got: {[r.getMessage() for r in warnings]}"
+    )
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        _setup_site_feed_state_last_run_at_boundary_offset,
+        _setup_site_feed_state_last_run_at_blob,
+    ],
+    ids=[
+        "site_feed_state_last_run_at_boundary_offset",
+        "site_feed_state_last_run_at_blob",
+    ],
+)
+def test_scheduler_tick_ignores_hostile_last_run_at(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    setup: Callable[[sqlite3.Connection], _ExpectedJobs],
+) -> None:
+    """The slot rule (plan 5.1) reads no last_run_at, so a hostile value in
+    that column is inert carrier data: the feed is scheduled on the same
+    slot basis as a clean row, with no WARNING."""
+    conn = _init_tmp_db(tmp_path)
+    expected = setup(conn)
+    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+
+    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
+        scheduler_tick(conn)  # must not raise
+
+    for job_type, site_id, job_key in expected.must_exist:
+        assert _pending_job_exists(conn, job_type, site_id, job_key), (
+            f"expected a pending {job_type} job for key={job_key!r}"
+        )
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert not warnings, (
         f"expected no warnings, got: {[r.getMessage() for r in warnings]}"
@@ -803,6 +837,10 @@ def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
     without dispositioning the row, which the helper-level test alone
     cannot distinguish."""
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
     )
@@ -860,6 +898,10 @@ def test_worker_loop_dispositions_below_range_retry_count_without_a_crash_loop(
     dispatch-failure handler and killing the worker task with the row left
     'running', where every restart reclaims it and dies again."""
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
     )
