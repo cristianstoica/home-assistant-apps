@@ -33,7 +33,6 @@ from zoneinfo import ZoneInfo
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc, utc_now
 from wxverify.db.connection import Database, InputCounts, current_db
 from wxverify.db.snapshot import read_only_snapshot, read_snapshot
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.forecast.aggregate import EXTREMA_COVERAGE_NOT_EVALUATED
 from wxverify.forecast.data import EXCLUDED_FEEDS_SQL, served_feed_ids
 from wxverify.forecast.selection import CellCandidate, CellSelection
@@ -145,7 +144,6 @@ def training_pairs_query(
         FROM forecast_pairs fp INDEXED BY idx_pairs_leaderboard
         JOIN feeds f ON f.id = fp.feed_id
         WHERE fp.site_id = ? AND fp.variable = 'wind'
-          AND {published_generation_clause("fp")}
           AND {EXCLUDED_FEEDS_SQL}
           AND fp.day_ahead IN ({day_aheads})
           AND fp.valid_at >= ? AND fp.valid_at < ?

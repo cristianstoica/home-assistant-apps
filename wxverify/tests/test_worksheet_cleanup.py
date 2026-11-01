@@ -28,7 +28,7 @@ import json
 import pytest
 
 from wxverify.db.connection import FencedWriter, close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.runs import (
     capture_config_snapshot,
     input_fingerprint,
@@ -50,7 +50,7 @@ def _make_site(conn, name: str) -> int:
             (name,),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -59,7 +59,7 @@ def _seed_run(conn, site_id: int, *, evidence_rows: int, publish: bool) -> int:
     day-context row and ``evidence_rows`` evidence rows -- ``published``
     when ``publish``, else left ``running`` (18.11's run 5).
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     basis = result_basis_fingerprint(

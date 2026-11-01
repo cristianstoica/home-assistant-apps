@@ -22,7 +22,7 @@ import json
 import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed, asof_make_site
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.runs import (
     RosterFeed,
     RunConfig,
@@ -82,7 +82,7 @@ def test_run_config_from_row_pre_0_12_0_snapshot_does_not_raise() -> None:
     §8's acceptance criterion "no pre-0.12.0 run fails to load."."""
     conn = asof_conn()
     site_id = asof_make_site(conn, "site-alpha")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     pre_0_12_0_snapshot = {
         "timezone": "UTC",
         "rain_threshold_mm": 0.2,
@@ -146,7 +146,7 @@ def test_assert_inputs_unpinned_unchanged_flags_max_lead_hours_only_roster_chang
     conn = asof_conn()
     site_id = asof_make_site(conn, "site-alpha")
     feed_id = asof_make_real_feed(conn, "model-alpha")  # max_lead_hours=48
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     # asof_conn() is fully migrated and seeds every default-subscribed feed,
     # so the live roster is the WHOLE active-competitor set, not just our

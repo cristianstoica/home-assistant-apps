@@ -36,6 +36,7 @@ from wxverify.db.runtime_state import (
 )
 from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     blend_mean,
@@ -263,41 +264,19 @@ def _site_row(conn: sqlite3.Connection, site_id: int) -> sqlite3.Row:
 def _current_generation(
     conn: sqlite3.Connection, site_id: int, instant_utc: str
 ) -> int:
-    from wxverify.db.tz_generations import (
-        ensure_published_generation,
-        resolve_generation_for_instant,
-    )
+    """The site's one time zone generation, made when absent (write path).
 
-    pointer = ensure_published_generation(conn, site_id)
-    resolved = resolve_generation_for_instant(conn, site_id, instant_utc)
-    return pointer if resolved is None else resolved
+    ``instant_utc`` is not read: every instant the record reads or writes
+    falls under the site's one generation.
+    """
+    return ensure_site_generation(conn, site_id)
 
 
 def current_generation_readonly(
     conn: sqlite3.Connection, site_id: int, instant_utc: str
 ) -> int | None:
-    """READ PATH twin of ``_current_generation``: never seeds a generation."""
-    from wxverify.db.tz_generations import (
-        published_generation_id,
-        resolve_generation_for_instant,
-    )
-
-    pointer = published_generation_id(conn, site_id)
-    if pointer is None:
-        return None
-    resolved = resolve_generation_for_instant(conn, site_id, instant_utc)
-    return pointer if resolved is None else resolved
-
-
-def _rebuild_in_progress(conn: sqlite3.Connection, site_id: int) -> int:
-    row = conn.execute(
-        """
-        SELECT 1 FROM timezone_generations
-        WHERE site_id = ? AND state = 'building' LIMIT 1
-        """,
-        (site_id,),
-    ).fetchone()
-    return 0 if row is None else 1
+    """READ PATH twin of ``_current_generation``: never makes a generation."""
+    return site_generation_id(conn, site_id)
 
 
 def _group_samples(
@@ -827,7 +806,6 @@ def compute_forecast_record(
         }
     )
     latency = int((at - snapshot_utc).total_seconds())
-    rebuild_flag = _rebuild_in_progress(conn, site_id)
     # The three publication columns: NULL with the close off, and with no
     # publication at T.
     publication_columns: tuple[int | None, str | None, int | None] = (
@@ -1032,7 +1010,7 @@ def compute_forecast_record(
                     site_id,
                     generation_id,
                     timezone,
-                    rebuild_flag,
+                    0,  # tz_rebuild_in_progress: no rebuild exists
                     snapshot_local_date,
                     wall_clock,
                     as_of,
@@ -1391,17 +1369,15 @@ def sites_with_record_gap(
     The expected snapshot day is today once local time is past T plus a
     short slack (mirroring the monitor's pending-overdue allowance so the
     condition doesn't flap while the on-time job is still queued), else
-    yesterday. Sites whose record log has not begun (no published pointer
+    yesterday. Sites whose record log has not begun (no time zone generation
     or no rows at all) are skipped — read-only safe.
     """
-    from wxverify.db.tz_generations import published_generation_id
-
     gaps = 0
     rows = conn.execute("SELECT id, timezone FROM sites WHERE enabled = 1").fetchall()
     for row in rows:
         site_id = int(row["id"])
         timezone = str(row["timezone"])
-        generation_id = published_generation_id(conn, site_id)
+        generation_id = site_generation_id(conn, site_id)
         if generation_id is None:
             continue
         any_row = conn.execute(

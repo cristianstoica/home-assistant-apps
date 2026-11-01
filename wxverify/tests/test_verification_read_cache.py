@@ -56,7 +56,7 @@ from fastapi.testclient import TestClient
 from tests.helpers import asof_conn
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification import read_cache as rc
 from wxverify.verification.diagnostics import observed_wet_precip_mae
 from wxverify.verification.ranking import DAILY_RANK_ENTITY_TYPE, daily_rank_conclusions
@@ -113,7 +113,7 @@ def _site(
 def _new_run(conn: sqlite3.Connection, site_id: int, *, state: str = "running") -> int:
     global _fp_counter
     _fp_counter += 1
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     depths = {v: _DEPTH for v in SIM_VARIABLES}
     snapshot["blend_depth"] = _DEPTH
@@ -1402,7 +1402,7 @@ def _o19_make_site(conn: sqlite3.Connection, name: str = "oracle-town") -> int:
     from datetime import timedelta as _td
 
     from tests.helpers import asof_make_real_feed
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
     cur = conn.execute(
         """
@@ -1417,7 +1417,7 @@ def _o19_make_site(conn: sqlite3.Connection, name: str = "oracle-town") -> int:
         asof_make_real_feed(conn, "model-gamma"),
         asof_make_real_feed(conn, "model-delta"),
     ]
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     for day in _O19_PERIOD_DAYS:
         for quantity, value in _O19_QUANTITY_VALUES.items():
             conn.execute(

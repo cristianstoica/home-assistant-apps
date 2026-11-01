@@ -59,7 +59,7 @@ from wxverify.db.site_days import (
     mark_missed,
 )
 from wxverify.db.station_readings import prune_raw_readings
-from wxverify.db.tz_generations import published_generation_id
+from wxverify.db.switch import site_generation_id
 from wxverify.verification.completeness import close_admission_basis
 from wxverify.verification.coverage import DayBounds, local_day_bounds
 from wxverify.verification.truth import evaluate_day_window, write_close_truth
@@ -1067,14 +1067,14 @@ def _hourly_values_stage(conn: sqlite3.Connection, raw: Job, job: _StageJob) -> 
 def _truth_version(conn: sqlite3.Connection, site_id: int, local_date: date) -> str:
     """SHA-256 of the day's ``daily_truth`` rows as JSON (plan 11.4).
 
-    The rows as stage 4 wrote them: those of the site's published
-    generation, read through ``published_generation_id`` as
+    The rows as stage 4 wrote them: those of the site's one time zone
+    generation, read through ``site_generation_id`` as
     ``write_close_truth`` reads it, so another generation's rows of the
     same date never enter the version. One JSON array of the rows in
     ``quantity`` order, each an object of the 13 columns, with sorted keys
     and no spaces.
     """
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     if generation_id is None:
         raise RuntimeError("the site has no published timezone generation")
     rows = conn.execute(

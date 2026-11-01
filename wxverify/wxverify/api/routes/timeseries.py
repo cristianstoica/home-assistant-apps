@@ -30,7 +30,6 @@ from wxverify.db.site_days import (
     day_record,
 )
 from wxverify.db.snapshot import read_snapshot
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.provisional_line import DaySpan, day_spans, provisional_site_hours
 from wxverify.scoring.publication import ClosedPair, closed_day_pairs
 
@@ -229,12 +228,7 @@ def _stored_pairs(
     as instants (a fraction sorts after the whole-second form as text):
     the first run issued on the local date that day ahead counts from.
     """
-    clauses = [
-        "site_id=?",
-        "variable=?",
-        "feed_id=?",
-        published_generation_clause("forecast_pairs"),
-    ]
+    clauses = ["site_id=?", "variable=?", "feed_id=?"]
     params: list[object] = [site, variable, feed_id]
     columns = "valid_at, forecast, observed"
     if day_ahead is not None:

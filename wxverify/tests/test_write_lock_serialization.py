@@ -32,7 +32,7 @@ from wxverify.api.routes.dashboard import leaderboard
 from wxverify.core.timeutil import isoformat_utc_micro
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import Job
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring import rescore as rescore_module
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.engine import (
@@ -131,7 +131,7 @@ def _seed_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

@@ -1,7 +1,7 @@
 """Phase 8 Round C — the §18 named oracle families for 0.11.0.
 
-Five families live here, each pinned against the mutation it exists to kill
-(named in the test docstring, not just in a report):
+Four families live here, each pinned against the mutation it exists to kill
+(named in the test docstring, not just in a report).
 
 * **NB-4** — the canonical depth/variable roster. ``DEPTH_VARIABLES`` and its
   four derived aliases, plus ``depth_option_values()``'s key set, pinned with
@@ -12,9 +12,6 @@ Five families live here, each pinned against the mutation it exists to kill
 * **NB-9** — ``current_result_basis_fingerprint`` is a pure read: proven
   against a connection with SQLite's ``query_only`` pragma engaged, where
   any write raises.
-* **NB-5** — the retrospective-correction pointer flip, page leg: the
-  ``/verification`` surface never shows a half-flipped state, plus
-  ``generation_status()``'s persisted reconciliation tally.
 * **§18.11** — the §16 element-presence oracle. The required element list is
   transcribed from §16 of the specification (quoted per entry below), NOT
   read off the template — an oracle derived from the page it checks cannot
@@ -28,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import sqlite3
 from html.parser import HTMLParser
 from pathlib import Path
@@ -37,27 +33,14 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import (
-    asof_conn,
-    asof_insert_observation,
-    asof_insert_sample,
-    asof_make_real_feed,
-    asof_make_site,
-)
+from tests.helpers import asof_conn, asof_insert_observation, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.options import RuntimeOptions, depth_option_values
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    generation_status,
-    published_generation_id,
-    start_retrospective_correction,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.forecast.service import VARIABLES as FORECAST_SERVICE_VARIABLES
-from wxverify.scoring.pairing import pair_real_models
-from wxverify.scoring.persistence import materialize_persistence
 from wxverify.settings.depth import DEPTH_VARIABLES
 from wxverify.verification.engine import (  # noqa: PLC2701
     _contingency,
@@ -73,12 +56,6 @@ from wxverify.verification.runs import (
 )
 from wxverify.verification.simulate import SIM_VARIABLES
 from wxverify.verification.stats import Contingency
-from wxverify.worker.tz_correction import advance_correction, correction_state_key
-
-# Correction target: a fixed +03:00 offset with no DST, obviously synthetic
-# next to the fixtures' 'UTC' sites.
-NEW_TZ = "Etc/GMT-3"
-
 
 # ===========================================================================
 # Family 1 — NB-4: the depth roster is ONE tuple, pinned by equality.
@@ -311,7 +288,7 @@ def _read_only(conn: sqlite3.Connection) -> None:
 
 class TestReadPathNeverWrites:
     def test_current_result_basis_fingerprint_is_pure_under_query_only(self) -> None:
-        """Kills: reintroducing ``ensure_published_generation`` (or any other
+        """Kills: reintroducing ``ensure_site_generation`` (or any other
         write) into ``current_result_basis_fingerprint`` — the seeding INSERT
         raises 'attempt to write a readonly database' against this
         connection.
@@ -322,7 +299,7 @@ class TestReadPathNeverWrites:
         """
         conn = asof_conn()
         site_id = asof_make_site(conn, "nb9-site")
-        generation_id = ensure_published_generation(conn, site_id)
+        generation_id = ensure_site_generation(conn, site_id)
         asof_insert_observation(
             conn,
             site_id=site_id,
@@ -347,23 +324,23 @@ class TestReadPathNeverWrites:
         assert actual is not None and actual.startswith("rb1:")
 
         conn.execute("PRAGMA query_only=OFF")
-        assert published_generation_id(conn, site_id) == generation_id
+        assert site_generation_id(conn, site_id) == generation_id
 
-    def test_site_without_a_published_generation_reads_none_and_seeds_nothing(
+    def test_site_without_a_time_zone_generation_raises_and_seeds_nothing(
         self,
     ) -> None:
         """Paired negative with an INJECTED precondition: the site is created
-        and the pointer is asserted absent before the call, so the None is
-        never ambient coincidence.
+        and its generation is asserted absent before the call, so the raise
+        is never ambient coincidence.
 
         Kills: (a) resolving the generation with the seeding helper — that
-        INSERT raises here; (b) returning a fingerprint (or raising) instead
-        of None when staleness is simply unknown.
+        INSERT raises here; (b) returning a fingerprint instead of raising
+        when the site has no time zone generation.
         """
         conn = asof_conn()
         site_id = asof_make_site(conn, "nb9-unseeded")
         # Injected, not inherited: prove the precondition holds.
-        assert published_generation_id(conn, site_id) is None
+        assert site_generation_id(conn, site_id) is None
         before = int(
             conn.execute("SELECT COUNT(*) AS n FROM timezone_generations").fetchone()[
                 "n"
@@ -371,12 +348,10 @@ class TestReadPathNeverWrites:
         )
         _read_only(conn)
 
-        assert (
+        with pytest.raises(ValueError, match="has no time zone generation"):
             current_result_basis_fingerprint(
                 conn, site_id, period_start="2026-05-01", period_end="2026-05-01"
             )
-            is None
-        )
 
         conn.execute("PRAGMA query_only=OFF")
         after = int(
@@ -385,7 +360,7 @@ class TestReadPathNeverWrites:
             ]
         )
         assert after == before
-        assert published_generation_id(conn, site_id) is None
+        assert site_generation_id(conn, site_id) is None
 
     def test_query_only_really_blocks_the_write_path(self) -> None:
         """Negative control for the harness itself: the write-path sibling
@@ -394,7 +369,7 @@ class TestReadPathNeverWrites:
         """
         conn = asof_conn()
         site_id = asof_make_site(conn, "nb9-control")
-        assert published_generation_id(conn, site_id) is None
+        assert site_generation_id(conn, site_id) is None
         _read_only(conn)
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             capture_config_snapshot(conn, site_id)
@@ -567,287 +542,6 @@ def _headline_row(html: str, **key: str) -> tuple[dict[str, str], _Cells]:
     ]
     assert len(matches) == 1, (key, [row[0] for row in scan.rows])
     return matches[0]
-
-
-# ===========================================================================
-# Family 4 — NB-5: pointer flip, page leg + generation_status.
-# ===========================================================================
-
-# (issued, valid, lead) — UTC vs Etc/GMT-3 bucket transitions, hand-derived.
-_CORRECTION_SAMPLES = (
-    ("2026-06-10T00:00:00Z", "2026-06-10T22:00:00Z", 22),
-    ("2026-06-10T00:00:00Z", "2026-06-10T23:00:00Z", 23),
-    ("2026-06-09T12:00:00Z", "2026-06-10T23:00:00Z", 35),
-    ("2026-06-10T12:00:00Z", "2026-06-10T18:00:00Z", 6),
-)
-_CORRECTION_OBS = (
-    "2026-06-10T18:00:00Z",
-    "2026-06-10T22:00:00Z",
-    "2026-06-10T23:00:00Z",
-    "2026-06-11T00:00:00Z",
-)
-
-
-def _seed_correction_history(conn: sqlite3.Connection) -> int:
-    """Two synthetic local days of paired history under the UTC generation."""
-    site_id = asof_make_site(conn, "Flip Ridge")
-    feed_id = asof_make_real_feed(conn, "model-flip")
-    for index, hour in enumerate(_CORRECTION_OBS):
-        asof_insert_observation(
-            conn,
-            site_id=site_id,
-            valid_at=hour,
-            value=10.0 + index,
-            computed_at="2026-06-11T01:00:00Z",
-        )
-    for issued, valid, lead in _CORRECTION_SAMPLES:
-        asof_insert_sample(
-            conn,
-            site_id=site_id,
-            feed_id=feed_id,
-            issued_at=issued,
-            valid_at=valid,
-            lead_hours=lead,
-            value=11.5,
-            fetched_at=issued,
-        )
-    ensure_published_generation(conn, site_id)
-    pair_real_models(conn, site_id)
-    materialize_persistence(conn, site_id)
-    return site_id
-
-
-def _publish_minimal_run(conn: sqlite3.Connection, site_id: int) -> int:
-    """A published run pinned to whatever generation is current right now.
-
-    The result basis is seeded to match the state at write time (not left
-    NULL), so a later mutation actually moves the recomputed basis away from
-    the recorded one -- a NULL/unrecorded basis would read as `unknown`
-    rather than `changed` and could never exercise the stale-inputs warning.
-    """
-    snapshot = capture_config_snapshot(conn, site_id)
-    fingerprint = input_fingerprint(conn, site_id, snapshot)
-    basis = result_basis_fingerprint(
-        conn, site_id, snapshot, period_start="2026-06-10", period_end="2026-06-11"
-    )
-    run_id = int(
-        conn.execute(
-            """
-            INSERT INTO verification_runs
-                (site_id, tz_generation_id, methodology_version, app_version,
-                 state, attempt, config_snapshot, period_start, period_end,
-                 settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint, result_basis_fingerprint)
-            VALUES (?, ?, 1, '0.11.0-test', 'running', 1, ?, '2026-06-10',
-                    '2026-06-11', '2026-06-11', 77, 10000, ?, ?)
-            """,
-            (
-                site_id,
-                int(str(snapshot["tz_generation_id"])),
-                json.dumps(snapshot),
-                fingerprint,
-                basis,
-            ),
-        ).lastrowid
-    )
-    publish_run(conn, site_id, run_id)
-    conn.commit()
-    return run_id
-
-
-def _chain_phase(conn: sqlite3.Connection, generation_id: int) -> str | None:
-    row = conn.execute(
-        "SELECT value FROM runtime_state WHERE key = ?",
-        (correction_state_key(generation_id),),
-    ).fetchone()
-    if row is None:
-        return None
-    blob: dict[str, object] = json.loads(str(row["value"]))
-    return str(blob.get("phase"))
-
-
-def _advance_to_flip(
-    conn: sqlite3.Connection, site_id: int, generation_id: int, payload: Any
-) -> None:
-    for _ in range(200):
-        if _chain_phase(conn, generation_id) == "flip":
-            return
-        assert advance_correction(conn, site_id, payload)
-        conn.commit()
-    raise AssertionError("chain never reached the flip phase")
-
-
-def _drive_to_completion(conn: sqlite3.Connection, site_id: int, payload: Any) -> None:
-    for _ in range(400):
-        if not advance_correction(conn, site_id, payload):
-            conn.commit()
-            return
-        conn.commit()
-    raise AssertionError("correction chain did not terminate")
-
-
-def _rendered_generation(page: str) -> tuple[int, str]:
-    """The banner's timezone generation as ``(generation_id, timezone)``.
-
-    Parsed rather than string-compared so the assertion pins the FACTS §16.1
-    requires, not the surrounding label's whitespace.
-    """
-    cells = [
-        text
-        for tag in ("div", "dd", "p", "span", "td", "li")
-        for attrs, text in _elements(page, tag)
-        if attrs.get("data-v16") == "16.1.tz_generation"
-    ]
-    assert len(cells) == 1, "the banner must show exactly one timezone generation"
-    match = re.search(r"#(\d+)\s*\(([^)]+)\)", cells[0])
-    assert match is not None, cells[0]
-    return int(match.group(1)), match.group(2)
-
-
-class TestCorrectionFlipPageLeg:
-    """§13/§20: the pointer flips only on a reconciling rebuild, and the
-    operator surface never shows a half-flipped state.
-    """
-
-    def test_page_and_pointer_move_together_across_the_flip(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Kills, in one construction:
-
-        * removing the reconciliation-identity guard from ``_flip`` — the
-          tampered chain would publish and the page would jump to the new
-          generation while the counts disagree;
-        * flipping the pointer without retiring/publishing the generation
-          states (or vice versa) — the page's rendered generation and the
-          pointer are asserted equal on both sides of the flip;
-        * dropping the staleness comparison on the page — the published run
-          stays pinned to the OLD generation after a successful flip, which
-          MUST raise the stale-inputs warning rather than reading as current.
-        """
-        conn = _open_app_db(tmp_path, monkeypatch)
-        site_id = _seed_correction_history(conn)
-        old_gen = published_generation_id(conn, site_id)
-        assert old_gen is not None
-        _publish_minimal_run(conn, site_id)
-
-        # Baseline: pointer, run and page all agree, nothing stale.
-        page = _fetch_page(monkeypatch, site_id)
-        assert _rendered_generation(page) == (old_gen, "UTC")
-        assert "16.1.warn_stale" not in _v16_markers(page)
-
-        conn = _reopen_app_db()
-        generation_id = start_retrospective_correction(conn, site_id, NEW_TZ)
-        conn.commit()
-        payload: dict[str, object] = {
-            "generation_id": generation_id,
-            "days_per_chunk": 1000,
-        }
-        _advance_to_flip(conn, site_id, generation_id, payload)
-
-        # --- Leg 1: a NON-reconciling rebuild must not move anything. ---
-        conn.execute(
-            "UPDATE timezone_generations SET examined_count = examined_count + 1"
-            " WHERE id = ?",
-            (generation_id,),
-        )
-        conn.commit()
-        with pytest.raises(RuntimeError, match="reconciliation mismatch"):
-            advance_correction(conn, site_id, payload)
-        conn.rollback()
-
-        assert published_generation_id(conn, site_id) == old_gen
-        page = _fetch_page(monkeypatch, site_id)
-        assert _rendered_generation(page) == (old_gen, "UTC")
-
-        # --- Leg 2: restore the tally; the flip completes and the surface
-        # follows the pointer, not the half-built generation. ---
-        conn = _reopen_app_db()
-        conn.execute(
-            "UPDATE timezone_generations SET examined_count = examined_count - 1"
-            " WHERE id = ?",
-            (generation_id,),
-        )
-        conn.commit()
-        _drive_to_completion(conn, site_id, payload)
-        assert published_generation_id(conn, site_id) == generation_id
-
-        # The OLD run is now provably stale: it is still pinned to the old
-        # generation, and the page says so instead of implying currency.
-        page = _fetch_page(monkeypatch, site_id)
-        assert _rendered_generation(page) == (old_gen, "UTC")
-        assert "16.1.warn_stale" in _v16_markers(page)
-
-        # A run published AFTER the flip renders the new pointer, unstale.
-        conn = _reopen_app_db()
-        _publish_minimal_run(conn, site_id)
-        page = _fetch_page(monkeypatch, site_id)
-        assert _rendered_generation(page) == (generation_id, NEW_TZ)
-        assert "16.1.warn_stale" not in _v16_markers(page)
-        close_db()
-
-    def test_generation_status_reports_the_persisted_reconciliation_tally(
-        self,
-    ) -> None:
-        """``generation_status`` is §20's "verify the counts" surface.
-
-        Kills: (a) reading ``published_pointer`` as 'a pointer row exists'
-        rather than 'the pointer equals THIS generation' — both rows would
-        then read published; (b) mapping any of the four count columns to the
-        wrong field, or dropping them to None, since the tally is compared
-        against the raw row AND required to reconcile over a non-zero
-        examined count.
-        """
-        conn = asof_conn()
-        site_id = _seed_correction_history(conn)
-        old_gen = published_generation_id(conn, site_id)
-        generation_id = start_retrospective_correction(conn, site_id, NEW_TZ)
-        payload: dict[str, object] = {
-            "generation_id": generation_id,
-            "days_per_chunk": 1000,
-        }
-        _drive_to_completion(conn, site_id, payload)
-        assert published_generation_id(conn, site_id) == generation_id
-
-        rows = generation_status(conn, site_id)
-        assert [row["generation_id"] for row in rows] == sorted(
-            [old_gen, generation_id]
-        )
-        pointers = [row for row in rows if row["published_pointer"]]
-        assert [row["generation_id"] for row in pointers] == [generation_id]
-
-        corrected = next(row for row in rows if row["generation_id"] == generation_id)
-        assert corrected["mode"] == "retrospective_correction"
-        assert corrected["timezone"] == NEW_TZ
-        raw = conn.execute(
-            """
-            SELECT examined_count, changed_count, unchanged_count, excluded_count
-            FROM timezone_generations WHERE id = ?
-            """,
-            (generation_id,),
-        ).fetchone()
-        assert corrected["examined"] == int(raw["examined_count"])
-        assert corrected["changed"] == int(raw["changed_count"])
-        assert corrected["unchanged"] == int(raw["unchanged_count"])
-        assert corrected["excluded"] == int(raw["excluded_count"])
-        # Non-vacuity: a tally of all zeros reconciles trivially.
-        assert int(str(corrected["examined"])) > 0
-        assert corrected["examined"] == (
-            int(str(corrected["changed"]))
-            + int(str(corrected["unchanged"]))
-            + int(str(corrected["excluded"]))
-        )
-
-    def test_generation_status_rejects_an_unknown_site(self) -> None:
-        """Kills: dropping the site-existence probe — an unknown id would
-        silently return an empty list, which reads as 'no generations' rather
-        than 'no such site'. Paired positive: a real site returns rows.
-        """
-        conn = asof_conn()
-        site_id = asof_make_site(conn, "status-site")
-        ensure_published_generation(conn, site_id)
-        assert len(generation_status(conn, site_id)) == 1
-        with pytest.raises(ValueError, match="does not exist"):
-            generation_status(conn, site_id + 999)
 
 
 # ===========================================================================
@@ -1148,12 +842,12 @@ def _seed_v16_site(conn: sqlite3.Connection) -> int:
             """,
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
 def _seed_v16_run(conn: sqlite3.Connection, site_id: int) -> int:
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     # Seeded to match at write time, so a genuine post-publish config change

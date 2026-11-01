@@ -141,9 +141,9 @@ def _seed_obs(
 
 
 def _published_generation_id(conn: sqlite3.Connection, site_id: int) -> int:
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
-    return ensure_published_generation(conn, site_id)
+    return ensure_site_generation(conn, site_id)
 
 
 def _seed_pair(
@@ -264,29 +264,6 @@ def test_probe_already_published_pair_returns_false() -> None:
         tz_generation_id=tz_gen,
     )
     assert real_model_pair_pending(conn, (sample_id,)) is False
-
-
-def test_probe_pair_under_unpublished_generation_still_pends() -> None:
-    conn = _conn()
-    _seed_site(conn)
-    sample_id, feed_id = _candidate(conn)
-    # A second, NOT-published generation for the same site.
-    cur = conn.execute(
-        "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-        " VALUES (1, 'UTC', 'initial', 'building')"
-    )
-    other_gen = cur.lastrowid
-    assert other_gen is not None
-    _seed_pair(
-        conn,
-        feed_id=feed_id,
-        variable="temperature",
-        issued_at="2035-03-01T00:00:00Z",
-        valid_at="2035-03-02T00:30:00Z",
-        lead_hours=1,
-        tz_generation_id=int(other_gen),
-    )
-    assert real_model_pair_pending(conn, (sample_id,)) is True
 
 
 @pytest.mark.parametrize(

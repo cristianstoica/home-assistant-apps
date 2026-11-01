@@ -43,7 +43,7 @@ from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import get_db
 from wxverify.db.snapshot import SnapshotNestingError
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.composite import CompositeResult, composite_with_status
 from wxverify.scoring.leaderboard import (
@@ -106,7 +106,7 @@ def _writer_w_a(
 ) -> None:
     """W-A: activate feed 2 -- a new in-window cell plus a fresh w:14 cache row."""
     side.execute("BEGIN IMMEDIATE")
-    generation_id = ensure_published_generation(side, site_id)
+    generation_id = ensure_site_generation(side, site_id)
     side.execute(
         """
         INSERT INTO forecast_pairs

@@ -47,7 +47,7 @@ from wxverify import config
 from wxverify.core.timeutil import is_canonical_utc_stamp, isoformat_utc, parse_utc
 from wxverify.db.connection import Database, FencedWriter, close_db, init_db
 from wxverify.db.site_days import begin_close, ensure_site_days, start_site_days
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import set_setting
 
 CUTOFF = D - timedelta(days=1)
@@ -1260,7 +1260,7 @@ def test_pb14_publish_first_builds_the_cutover_publication(tmp_path: Path) -> No
 
         db, writer, conn = _make_db(tmp_path)
         site_id = asof_make_site(conn, "pb14-site")
-        generation_id = ensure_published_generation(conn, site_id)
+        generation_id = ensure_site_generation(conn, site_id)
         feed_x = _make_feed(conn, "X")
         starting_date = D - timedelta(days=4)
         _seed_pair(
@@ -1365,7 +1365,7 @@ def test_pb15_seed_starting_history_sums_only_the_passed_generation(
 
     _db, _writer, conn = _make_db(tmp_path)
     site_id = asof_make_site(conn, "pb15-site")
-    g1 = ensure_published_generation(conn, site_id)
+    g1 = ensure_site_generation(conn, site_id)
     cur = conn.execute(
         "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
         " VALUES (?, 'UTC', 'initial', 'published')",

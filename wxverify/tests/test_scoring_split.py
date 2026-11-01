@@ -17,7 +17,6 @@ import sqlite3
 import threading
 import tracemalloc
 import weakref
-from collections import Counter
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -38,7 +37,6 @@ from wxverify import config
 from wxverify.core.timeutil import parse_utc, utc_now
 from wxverify.db.connection import (
     Database,
-    EpochMoved,
     FencedWriter,
     StaleGenerationError,
     close_db,
@@ -47,11 +45,7 @@ from wxverify.db.connection import (
 )
 from wxverify.db.queue import Job
 from wxverify.db.snapshot import read_only_snapshot
-from wxverify.db.tz_generations import (
-    apply_prospective_change,
-    ensure_published_generation,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.scoring.engine import (
     PAIR_PHASES,
     SPLIT_PAIR_PHASES,
@@ -146,7 +140,7 @@ def test_apply_delta_op_shapes() -> None:
     assert isinstance(delta.ops[0], InsertOp)
 
     assert apply_delta(conn, delta) == 1
-    generation_id = published_generation_id(conn, site)
+    generation_id = site_generation_id(conn, site)
     assert generation_id is not None
     row = conn.execute(
         "SELECT id, tz_generation_id FROM forecast_pairs WHERE site_id=? AND feed_id=?",
@@ -445,7 +439,7 @@ def _insert_precip_pair(
     observed: float,
 ) -> None:
     """Precipitation-flavored pair insert (``asof_insert_pair`` is temperature-only)."""
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     error = forecast - observed
     threshold = conn.execute(
         "SELECT rain_threshold_mm FROM sites WHERE id=?", (site_id,)
@@ -1015,9 +1009,9 @@ def test_persistence_seeds_from_every_group_even_with_no_ops() -> None:
     )
     conn.commit()
 
-    assert published_generation_id(conn, site) is None
+    assert site_generation_id(conn, site) is None
     assert materialize_persistence(conn, site) == 0
-    assert published_generation_id(conn, site) is not None
+    assert site_generation_id(conn, site) is not None
 
 
 # --------------------------------------------------------------------------
@@ -1043,7 +1037,7 @@ def test_computes_never_write_the_published_generation() -> None:
         conn, site_id=site, valid_at="2035-01-01T06:00:00Z", value=4.0, computed_at=None
     )
     conn.commit()
-    assert published_generation_id(conn, site) is None
+    assert site_generation_id(conn, site) is None
 
     with read_only_snapshot(conn, label="t"):
         pairing_delta = compute_real_model_pairs(conn, site)
@@ -1058,7 +1052,7 @@ def test_computes_never_write_the_published_generation() -> None:
         pytest.raises(sqlite3.OperationalError),
         read_only_snapshot(conn, label="t2"),
     ):
-        ensure_published_generation(conn, site)
+        ensure_site_generation(conn, site)
     assert conn.total_changes == total_changes_before
 
 
@@ -1132,7 +1126,7 @@ def test_split_pair_attempt_threads_the_returned_epoch_across_chunks_m6(
         conn = _init_tmp_db(tmp_path)
         site = _make_site(conn, "t-m6-site")
         conn.execute("CREATE TABLE _probe(a, g)")
-        ensure_published_generation(conn, site)
+        ensure_site_generation(conn, site)
 
         monkeypatch.setattr(
             "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
@@ -1159,61 +1153,6 @@ def test_split_pair_attempt_threads_the_returned_epoch_across_chunks_m6(
     asyncio.run(_run())
 
 
-def test_split_pair_attempt_recomputes_after_a_generation_flip_m18(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site = _make_site(conn, "t-flip-site")
-        conn.execute("CREATE TABLE _probe(a, g)")
-        ensure_published_generation(conn, site)
-
-        monkeypatch.setattr(
-            "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
-            (SplitPhase("probe", _probe_compute),),
-        )
-        monkeypatch.setattr("wxverify.worker.score_batches.SCORING_APPLY_CHUNK_ROWS", 2)
-
-        db = get_db()
-
-        class _FlipOnceWriter(FencedWriter):
-            def __init__(self) -> None:
-                super().__init__(db, db.generation)
-                self._flipped = False
-
-            async def write_if_current(self, fn, *, epoch):  # type: ignore[override]
-                result = await super().write_if_current(fn, epoch=epoch)
-                if not self._flipped and not isinstance(result, EpochMoved):
-                    self._flipped = True
-                    await self._db.write(
-                        lambda c: apply_prospective_change(
-                            c, site, "Etc/GMT-3", "2035-01-01T00:00:00Z"
-                        )
-                    )
-                return result
-
-        writer = _FlipOnceWriter()
-
-        with caplog.at_level(logging.INFO, logger="wxverify.worker.score_batches"):
-            await run_split_pair_phases(writer, site, require_enabled=True)
-
-        rows = conn.execute("SELECT a, g FROM _probe").fetchall()
-        assert len(rows) == 5
-        gens = Counter(int(r["g"]) for r in rows)
-        assert sorted(gens.values()) == [2, 3]
-        larger_gen = max(gens, key=lambda g: gens[g])
-        assert larger_gen == published_generation_id(conn, site)
-
-        messages = [r.getMessage() for r in caplog.records]
-        cas_miss = [m for m in messages if "cas_miss" in m]
-        assert cas_miss == [f"score phase=probe site={site} cas_miss attempt=1"]
-        phase_lines = [m for m in messages if "elapsed=" in m]
-        assert len(phase_lines) == 1
-        assert "attempts=2" in phase_lines[0]
-
-    asyncio.run(_run())
-
-
 def test_split_pair_attempt_ops_log_counts_ops_not_insert_rowcount_m20(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1221,7 +1160,7 @@ def test_split_pair_attempt_ops_log_counts_ops_not_insert_rowcount_m20(
         conn = _init_tmp_db(tmp_path)
         site = _make_site(conn, "t-info-site")
         conn.execute("CREATE TABLE _probe_pk(a INTEGER PRIMARY KEY, g)")
-        ensure_published_generation(conn, site)
+        ensure_site_generation(conn, site)
 
         def _compute(c: sqlite3.Connection, site_id: int | None) -> PairDelta:
             ops = tuple(
@@ -1271,7 +1210,7 @@ def test_pair_and_score_dispatch_defers_when_every_cas_attempt_misses_m13(
         site = _make_site(conn, "t-busy-proc-site")
         conn.execute("CREATE TABLE _probe(a, g)")
         conn.execute("CREATE TABLE _probe_bump(x)")
-        ensure_published_generation(conn, site)
+        ensure_site_generation(conn, site)
 
         monkeypatch.setattr(
             "wxverify.worker.score_batches.SPLIT_PAIR_PHASES",
@@ -1331,7 +1270,7 @@ def test_pair_and_score_dispatch_raises_stale_generation_on_db_replacement(
         conn = _init_tmp_db(tmp_path)
         site = _make_site(conn, "t-import-site")
         conn.execute("CREATE TABLE _probe(a, g)")
-        ensure_published_generation(conn, site)
+        ensure_site_generation(conn, site)
 
         db = get_db()
         writer = FencedWriter(db, db.generation)
@@ -1840,7 +1779,7 @@ def _seed_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

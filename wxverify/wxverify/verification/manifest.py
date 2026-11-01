@@ -72,7 +72,6 @@ MANIFEST_NOTE_TOKENS: Final = frozenset(
         "algorithm_changed",
         "malformed_record",
         "period_unknown",
-        "no_published_generation",
     }
 )
 

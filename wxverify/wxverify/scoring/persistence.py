@@ -27,7 +27,6 @@ from zoneinfo import ZoneInfo
 
 from wxverify.core.timeutil import day_ahead, isoformat_utc, parse_utc, utc_now
 from wxverify.db.site_days import open_day_clause
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, PairValues, apply_delta
 
@@ -137,7 +136,6 @@ def _existing_pair_counts(
         SELECT site_id, variable, valid_at, COUNT(*) AS n
         FROM forecast_pairs
         WHERE feed_id = ? {count_where}
-          AND {published_generation_clause("forecast_pairs")}
         GROUP BY site_id, variable, valid_at
         """,
         count_params,
@@ -353,51 +351,3 @@ def persistence_pair_values(
         rain_threshold,
         first_known_at,
     )
-
-
-def insert_persistence_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    variable: str,
-    issued_at: str,
-    valid_at: str,
-    lead: int,
-    bucket: int,
-    forecast: float,
-    observed: float,
-    rain_threshold: float | None,
-    first_known_at: str | None,
-    generation_id: int,
-) -> int:
-    """Insert one persistence pair.
-
-    Public: also the insert primitive for the timezone-correction rebuild
-    (``scoring.tz_rebuild``), which re-derives persistence pairs under a
-    building generation.
-
-    ``first_known_at`` is the SOURCE observation's ``computed_at`` — the
-    lagged observation serving as the persistence forecast defines when this
-    pair became knowable. A source without ``computed_at`` stays NULL (never
-    invented); downstream as-of reads exclude it with a recorded reason.
-    """
-    return conn.execute(
-        _PERSISTENCE_INSERT_SQL,
-        (
-            *persistence_pair_values(
-                site_id=site_id,
-                feed_id=feed_id,
-                variable=variable,
-                issued_at=issued_at,
-                valid_at=valid_at,
-                lead=lead,
-                bucket=bucket,
-                forecast=forecast,
-                observed=observed,
-                rain_threshold=rain_threshold,
-                first_known_at=first_known_at,
-            ),
-            generation_id,
-        ),
-    ).rowcount

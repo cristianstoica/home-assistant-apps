@@ -24,7 +24,7 @@ import pytest
 
 from tests.helpers import asof_conn, asof_make_site
 from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.monitor import build_verdict
 from wxverify.settings.keys import set_setting
 from wxverify.verification.record import build_forecast_record, resolve_snapshot_utc
@@ -128,7 +128,7 @@ def test_due_check_single_snapshot_across_fall_back(
     """
     conn = asof_conn()
     site_id = _make_site_tz(conn, "sched-fallback-site", "America/New_York")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     set_setting(conn, "record_snapshot_local_time", "01:30")
 
     holder = {"now": datetime(2035, 11, 4, 5, 45, tzinfo=UTC)}  # 01:45 EDT
@@ -193,7 +193,7 @@ def test_due_check_spring_forward_first_instant_after_gap(
     """
     conn = asof_conn()
     site_id = _make_site_tz(conn, "sched-springfwd-site", "America/New_York")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     set_setting(conn, "record_snapshot_local_time", "02:30")
     assert resolve_snapshot_utc(
         "America/New_York", date(2035, 3, 11), "02:30"
@@ -231,7 +231,7 @@ def test_gapscan_enqueue_gated_on_any_jobs_row_for_the_day(
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "sched-gapscan-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
 
     day1_t = resolve_snapshot_utc("UTC", _DAY, "07:00")
     holder = {"now": day1_t + timedelta(hours=1)}
@@ -287,7 +287,7 @@ def test_monitor_record_gap_pairs_and_slack_window() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "monitor-gap-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     # The record day needs real samples: a day with nothing knowable at T now
     # writes no rows at all, so without this the log never begins and the
     # condition is vacuously ok in BOTH arms.

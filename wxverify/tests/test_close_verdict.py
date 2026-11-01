@@ -78,7 +78,7 @@ from wxverify.db.site_days import (
     finish_close,
     mark_missed,
 )
-from wxverify.db.tz_generations import published_generation_id
+from wxverify.db.switch import site_generation_id
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.truth import _evaluate_day  # the PRE-split name, still live
 
@@ -121,7 +121,7 @@ def _old_outcome(conn, site_id: int, quantity: str):  # type: ignore[no-untyped-
     every VD row to make against the new ``evaluate_day_window`` entry
     point.
     """
-    gen_id = published_generation_id(conn, site_id)
+    gen_id = site_generation_id(conn, site_id)
     assert gen_id is not None
     old = _evaluate_day(
         conn, site_id=site_id, local_date=D.isoformat(), tz_generation_id=gen_id

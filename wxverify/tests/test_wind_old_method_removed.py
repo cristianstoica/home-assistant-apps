@@ -16,8 +16,8 @@ side), not from the plan table's wording, per plan §10.4's instruction.
 Isolation: most pins drive a plain ``sqlite3.connect(":memory:")`` +
 ``run_migrations`` connection directly against the function under test,
 mirroring ``tests/test_wind_auth_hold.py``. The few that need the live app
-or a real write path (D7, D9, D10, D12) use a ``tmp_path``-backed
-``Database``/``FencedWriter``/``TestClient``, mirroring
+or a real write path (D7, D9, D12) use a ``tmp_path``-backed
+``get_db()``/``TestClient``, mirroring
 ``tests/test_scoring_split.py`` and ``tests/test_phase8_verification_v16.py``.
 
 Synthetic data only (public repo): site name "Testsite", pws station ids
@@ -28,7 +28,6 @@ the reused helpers' own fixtures), timezone "UTC", dates in 2035/2026.
 from __future__ import annotations
 
 import ast
-import asyncio
 import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
@@ -74,8 +73,6 @@ from tests.test_phase8_verification_v16 import (
 from tests.test_phase8_verification_v16 import (
     _seed_rich_run,
 )
-from tests.test_scoring_split import _init_tmp_db
-from tests.test_scoring_split import _make_site as _split_make_site
 from tests.test_wind_auth_hold import (
     _insert_day as _wa_insert_day,
 )
@@ -106,9 +103,8 @@ from tests.test_wind_basis import (
 from tests.test_wind_basis import (
     _seed_real_model_candidate as _wb_seed_real_model_candidate,
 )
-from wxverify.db.connection import FencedWriter, get_db
+from wxverify.db.connection import get_db
 from wxverify.db.migrations import run_migrations
-from wxverify.db.queue import Job
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
 from wxverify.db.wind_basis import write_auth_hold
 from wxverify.forecast.service import build_forecast, build_hourly
@@ -128,7 +124,6 @@ from wxverify.web.context import (
     load_wind_banner,
     load_wind_weights,
 )
-from wxverify.worker.processor import dispatch
 from wxverify.worker.verification_run import _blocking_gate  # noqa: PLC2701
 from wxverify.worker.wind_days import (  # noqa: PLC2701
     _persist_day,
@@ -574,58 +569,6 @@ def test_d9_verification_page_wind_diagnostic_is_unconditional(
     assert response.status_code == 200
 
     assert 'id="verification-wind-diagnostic"' in response.text
-
-
-# ---------------------------------------------------------------------------
-# D10 -- the timezone-correction job's wind-switch defer.
-# ---------------------------------------------------------------------------
-
-
-def test_d10_timezone_correction_is_not_deferred_for_a_switching_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Base's dispatch calls
-    ``_advance_correction_outside_wind_switch``, which raises
-    ``JobDeferred`` while the key reads "switching"/"rescoring" -- before
-    ever calling ``advance_correction``. The removal tree's dispatch calls
-    ``advance_correction`` unconditionally, so the call lands and the job
-    completes."""
-
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site_id = _split_make_site(conn, "t-d10-site")
-        set_runtime_state(conn, f"wind_basis:{site_id}", "switching")
-        conn.commit()
-        calls: list[int] = []
-
-        def _stub_advance_correction(
-            conn: sqlite3.Connection, site_id: int, payload: dict[str, object]
-        ) -> bool:
-            calls.append(site_id)
-            return False
-
-        monkeypatch.setattr(
-            "wxverify.worker.processor.advance_correction", _stub_advance_correction
-        )
-        db = get_db()
-        writer = FencedWriter(db, db.generation)
-        job = Job(
-            id=1,
-            type="timezone_correction",
-            site_id=site_id,
-            job_key="tzc",
-            payload={},
-            status="running",
-            retry_count=0,
-            max_retries=3,
-        )
-
-        result = await dispatch(db, writer, job)
-
-        assert calls == [site_id]
-        assert result is None
-
-    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

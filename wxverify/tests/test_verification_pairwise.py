@@ -26,7 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.helpers import asof_conn, asof_make_real_feed
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.engine import aggregate_run, write_pairwise_comparisons
 from wxverify.verification.runs import (
     RosterFeed,
@@ -71,7 +71,7 @@ def _make_run(conn: sqlite3.Connection) -> tuple[int, int, RunConfig]:
         )
     )
     feed_id = asof_make_real_feed(conn, "model-alpha")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     snapshot["blend_depth"] = _INCUMBENT_DEPTH
     snapshot["blend_depths"] = {v: _INCUMBENT_DEPTH for v in SIM_VARIABLES}

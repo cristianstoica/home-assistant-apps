@@ -45,7 +45,7 @@ from wxverify.db.runtime_state import (
     get_runtime_state,
     set_runtime_state,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import get_setting, set_setting
 from wxverify.verification.publish_hold import (
     PUBLISH_HOLD_LAST_SOURCE_KEY,
@@ -520,8 +520,8 @@ def test_fail_incomplete_attempts_extraction_parity() -> None:
     create_schema(conn)
     site_id = _insert_site(conn)
     other_site = _insert_site(conn, "site-other")
-    gen = ensure_published_generation(conn, site_id)
-    other_gen = ensure_published_generation(conn, other_site)
+    gen = ensure_site_generation(conn, site_id)
+    other_gen = ensure_site_generation(conn, other_site)
 
     published = _insert_run(conn, site_id, state="published", tz_generation_id=gen)
     running = _insert_run(conn, site_id, state="running", tz_generation_id=gen)
@@ -693,7 +693,7 @@ def _build_o17_shared_donor(tmp_path: Path, filename: str) -> Path:
     path = tmp_path / filename
     conn = _emulated_0_11_0_donor(path)
     site_id = _insert_site(conn, enabled=1)
-    gen = ensure_published_generation(conn, site_id)
+    gen = ensure_site_generation(conn, site_id)
 
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, status) VALUES "
@@ -1105,7 +1105,7 @@ def test_s6_case_variant_active_chain_neutralized_before_promotion(
             " VALUES ('site-synthetic', 0.0, 0.0, 100.0, 'UTC', 1)"
         ).lastrowid
     )
-    gen = ensure_published_generation(conn, site_id)
+    gen = ensure_site_generation(conn, site_id)
 
     conn.execute(
         "INSERT INTO jobs (type, site_id, job_key, status) VALUES "

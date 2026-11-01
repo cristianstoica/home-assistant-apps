@@ -30,13 +30,7 @@ from tests.test_forecast_record_offlock import _make_gate, _row_count, _seed
 from tests.test_site_delete_wind_state import _init_tmp_db, _make_site
 from wxverify.db.connection import Database, FencedWriter, close_db, get_db
 from wxverify.db.queue import Job, claim_next_job
-from wxverify.db.runtime_state import delete_runtime_state
-from wxverify.db.tz_generations import (
-    correction_job_key,
-    ensure_published_generation,
-    published_generation_id,
-    published_pointer_key,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.worker.control import JobCancelled, JobContinuation, JobDeferred
 from wxverify.worker.processor import dispatch, run_claimed_job
 
@@ -634,80 +628,6 @@ def test_outcome_lands_when_the_claim_still_stands(
 
 
 # ---------------------------------------------------------------------------
-# E4: terminal hooks never hit a recreated site's generation.
-# ---------------------------------------------------------------------------
-
-
-def test_terminal_hook_never_hits_a_recreated_sites_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    conn = _init_tmp_db(tmp_path)
-    conn.execute("DELETE FROM jobs")
-    _site_y = _make_site(conn, "Testsite Y")
-    site_x = _make_site(conn, "Testsite X")
-    g_old = int(
-        conn.execute(
-            "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-            " VALUES (?, 'UTC', 'retrospective_correction', 'building')",
-            (site_x,),
-        ).lastrowid
-    )
-    conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, max_retries)"
-        " VALUES ('timezone_correction', ?, ?, ?, 0)",
-        (site_x, correction_job_key(g_old), json.dumps({"generation_id": g_old})),
-    )
-    conn.commit()
-    job = claim_next_job(conn)
-    assert job is not None
-    assert job.type == "timezone_correction" and job.site_id == site_x
-
-    try:
-        captured: dict[str, tuple[int, tuple[object, ...]]] = {}
-
-        def _swap(c: sqlite3.Connection) -> tuple[int, tuple[object, ...]]:
-            c.execute("DELETE FROM sites WHERE id = ?", (site_x,))
-            new_site = _make_site(c, "Testsite X")
-            assert new_site == site_x
-            gid = int(
-                c.execute(
-                    "INSERT INTO timezone_generations"
-                    " (site_id, timezone, mode, state)"
-                    " VALUES (?, 'UTC', 'retrospective_correction', 'building')",
-                    (site_x,),
-                ).lastrowid
-            )
-            assert gid == g_old, "generation id was not reused; rebuild, don't weaken"
-            cur = c.execute(
-                "INSERT INTO jobs"
-                " (type, site_id, job_key, payload, status, max_retries)"
-                " VALUES ('timezone_correction', ?, ?, ?, 'pending', 0)",
-                (site_x, correction_job_key(gid), json.dumps({"generation_id": gid})),
-            )
-            rid = int(cur.lastrowid)
-            assert rid == job.id, "job id was not reused; rebuild, don't weaken"
-            result = (rid, tuple(c.execute(_SNAP, (rid,)).fetchone()))
-            captured["before"] = result
-            return result
-
-        monkeypatch.setattr(
-            "wxverify.worker.processor.dispatch",
-            _make_dispatch_stub("error", site_x, _swap),
-        )
-
-        asyncio.run(run_claimed_job(get_db(), job, lane="main"))
-
-        rid, before = captured["before"]
-        assert tuple(conn.execute(_SNAP, (rid,)).fetchone()) == before
-        gen_row = conn.execute(
-            "SELECT state FROM timezone_generations WHERE id = ?", (g_old,)
-        ).fetchone()
-        assert gen_row is not None and gen_row["state"] == "building"
-    finally:
-        close_db()
-
-
-# ---------------------------------------------------------------------------
 # E5: the in-dispatch forecast-record write never persists into a recreated
 # site.
 # ---------------------------------------------------------------------------
@@ -721,7 +641,7 @@ def test_forecast_record_never_persists_into_a_recreated_site(
         conn = _init_tmp_db(tmp_path)
         conn.execute("DELETE FROM jobs")
         site_id, _station_id = _seed(conn)
-        old_gen = published_generation_id(conn, site_id)
+        old_gen = site_generation_id(conn, site_id)
 
         conn.execute(
             "INSERT INTO jobs (type, site_id, job_key, payload)"
@@ -750,9 +670,8 @@ def test_forecast_record_never_persists_into_a_recreated_site(
                     c: sqlite3.Connection,
                 ) -> tuple[int, int, int, int]:
                     c.execute("DELETE FROM sites WHERE id = ?", (site_id,))
-                    delete_runtime_state(c, published_pointer_key(site_id))
                     new_site = _make_site(c, "Testsite X")
-                    new_gen = ensure_published_generation(c, new_site)
+                    new_gen = ensure_site_generation(c, new_site)
                     gen_site = c.execute(
                         "SELECT site_id FROM timezone_generations WHERE id = ?",
                         (new_gen,),

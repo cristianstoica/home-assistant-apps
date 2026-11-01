@@ -24,7 +24,7 @@ from datetime import timedelta
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc, utc_now
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.data import (
     count_null_availability_samples,
     forecast_ranking,
@@ -122,7 +122,7 @@ def _insert_pair(
     lead_hours: int = 6,
 ) -> None:
     """Direct generation-bound pair insert to craft knowability scenarios."""
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     error = forecast - observed
     conn.execute(
         """

@@ -44,7 +44,7 @@ from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.timeutil import utc_now
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.feeds.seam import CostEstimate, FetchResult, ForecastRequest
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
@@ -125,7 +125,7 @@ def _seed_forecast_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

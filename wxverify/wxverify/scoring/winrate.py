@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfoNotFoundError
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.effective import active_feed_cte
 from wxverify.scoring.leaderboard import cutoff_for_window
 from wxverify.scoring.publication import Publication, active_publication
@@ -66,7 +65,6 @@ def winrate_sql(window_clause: str) -> str:
               AND fp.variable = ?
               AND fp.day_ahead = ?
               AND fp.abs_error IS NOT NULL
-              AND {published_generation_clause("fp")}
               {window_clause}
         )
         SELECT c.feed_id, f.source, f.model, c.valid_at, c.abs_error

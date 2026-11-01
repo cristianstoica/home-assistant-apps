@@ -47,7 +47,7 @@ from types import SimpleNamespace
 from tests.helpers import asof_persistence_feed_id
 from wxverify.core.timeutil import isoformat_utc, local_day_slots
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_INSUFFICIENT,
     covers_local_day,
@@ -165,7 +165,7 @@ def _insert_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -818,7 +818,7 @@ def _record_snapshot_t(local_date: date = _RECORD_DAY) -> datetime:
 def test_persisted_row_for_a_suppressed_temperature_cell() -> None:
     conn = _record_conn()
     site_id = _record_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_id = _record_feed(conn, "model-a")
 
     # 10 covered hours: under MIN_COVERAGE_HOURS/TEMP_TRUTH_MIN_HOURS (18)
@@ -887,7 +887,7 @@ def test_candidates_json_carries_extrema_eligible_for_real_and_no_sample_feeds()
     # False.
     conn = _record_conn()
     site_id = _record_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     sampled_id = _record_feed(conn, "model-sampled")
     _record_feed(conn, "model-empty")  # configured (default_subscribed=1),
     # but never gets any forecast_samples row for this cell.
@@ -952,7 +952,7 @@ def test_scored_temperature_entity_is_the_pre_f_clearing_subset_value() -> None:
 
     conn = _record_conn()
     site_id = _record_site(conn, "site-a")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     feed_id = _record_feed(conn, "model-a")
 
     local_date = _RECORD_DAY  # 2035-06-15
@@ -1153,7 +1153,7 @@ def test_three_surfaces_agree_on_a_fully_covered_day() -> None:
     # 2. Record.
     record_conn = _record_conn()
     site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_published_generation(record_conn, site_id)
+    ensure_site_generation(record_conn, site_id)
     record_feed_id = _record_feed(record_conn, "model-a")
     record_valid_ats = [
         datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
@@ -1258,7 +1258,7 @@ def test_three_surfaces_report_unavailability_own_form_on_uncovered_day() -> Non
     # 2. Record: nulls extrema + insufficient.
     record_conn = _record_conn()
     site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_published_generation(record_conn, site_id)
+    ensure_site_generation(record_conn, site_id)
     record_feed_id = _record_feed(record_conn, "model-a")
     record_valid_ats = [
         datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
@@ -1594,7 +1594,7 @@ def test_confident_blend_set_with_unscored_extrema_set() -> None:
     # trap -- the far-future pairs above are invisible to the as-of read).
     record_conn = _record_conn()
     site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_published_generation(record_conn, site_id)
+    ensure_site_generation(record_conn, site_id)
     set_setting(record_conn, "min_n", "3")
     rec_a = _record_feed(record_conn, "model-a")
     rec_b = _record_feed(record_conn, "model-b")
@@ -1689,7 +1689,7 @@ def test_suppressed_extrema_contribute_to_neither_warning() -> None:
     # is None (never resolved -- F.7's guard), high/low suppressed.
     record_conn = _record_conn()
     site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_published_generation(record_conn, site_id)
+    ensure_site_generation(record_conn, site_id)
     set_setting(record_conn, "min_n", "3")
     rec_a = _record_feed(record_conn, "model-a")
     partial_ats = [
@@ -2237,7 +2237,7 @@ def _knowable_pair(
             abs(error),
             error * error,
             first_known_at,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -2303,7 +2303,7 @@ def test_badge_tooltip_and_persisted_metadata_agree_on_confidence() -> None:
         # Record side: same shape, persisted flag.
         record_conn = _record_conn()
         site_id = _record_site(record_conn, "site-a", timezone="UTC")
-        ensure_published_generation(record_conn, site_id)
+        ensure_site_generation(record_conn, site_id)
         set_setting(record_conn, "min_n", "3")
         rec_a = _record_feed(record_conn, "model-a")
         rec_b = _record_feed(record_conn, "model-b")
@@ -2448,7 +2448,7 @@ def test_rebuilding_precedence_on_the_extrema_set() -> None:
     # declared min_n=3 -- unconfident without being simply absent.
     record_conn = _record_conn()
     site_id = _record_site(record_conn, "site-a", timezone="UTC")
-    ensure_published_generation(record_conn, site_id)
+    ensure_site_generation(record_conn, site_id)
     set_setting(record_conn, "min_n", "3")
     rec_a = _record_feed(record_conn, "model-a")
     rec_b = _record_feed(record_conn, "model-b")

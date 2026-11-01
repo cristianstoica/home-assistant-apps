@@ -21,15 +21,7 @@ from typing import Any
 
 import pytest
 
-from tests.helpers import asof_conn, asof_make_real_feed
-from tests.test_phase7_surface import _make_app, _make_site, _seed_published_run
-from tests.test_phase8_section18_oracles import (
-    _fetch_page,
-    _open_app_db,
-    _read_only,
-    _v16_markers,
-)
-from tests.test_verification_run import (
+from tests.helpers import (
     _W8_PAYLOAD,
     _advance_samples,
     _decisions,
@@ -37,13 +29,19 @@ from tests.test_verification_run import (
     _drive_fixed,
     _drive_to_phase,
     _make_verification_site,
+    asof_conn,
+    asof_make_real_feed,
+)
+from tests.test_phase7_surface import _make_app, _make_site, _seed_published_run
+from tests.test_phase8_section18_oracles import (
+    _fetch_page,
+    _open_app_db,
+    _read_only,
+    _v16_markers,
 )
 from wxverify.db.migrations import TARGET_USER_VERSION, create_schema, run_migrations
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.runs import (
     METHODOLOGY_VERSION,
@@ -107,7 +105,7 @@ def _site_with_period(conn: sqlite3.Connection) -> tuple[int, int, list[int]]:
     Returns ``(site_id, generation_id, feed_ids)``.
     """
     site_id = _make_site(conn, "group-a-site")
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     feeds = [
         asof_make_real_feed(conn, "model-alpha"),
@@ -346,7 +344,7 @@ def test_a9_timezone_generation_flip_moves_both_hashes() -> None:
         "UPDATE runtime_state SET value = ? WHERE key = ?",
         (str(new_gen), f"tz_generation_published:{site_id}"),
     )
-    assert published_generation_id(conn, site_id) == new_gen
+    assert site_generation_id(conn, site_id) == new_gen
     after_input, after_basis = _hashes(
         conn, site_id, period_start=start, period_end=end
     )
@@ -638,7 +636,7 @@ def test_c1_legacy_run_reports_unknown_not_recorded(
 
     conn = _open_app_db(tmp_path, monkeypatch)
     site_id = _make_site(conn, "c1-site")
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     snapshot = capture_config_snapshot(conn, site_id)
     _publish_run_row(
@@ -673,7 +671,7 @@ def test_c2_matching_fingerprint_reports_fresh() -> None:
     conn = asof_conn()
     site_id = _make_site(conn, "c2-site")
     run_id = _seed_published_run(conn, site_id, fresh_fingerprint=True)
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     row = conn.execute(
         "SELECT result_basis_fingerprint, period_start, period_end "
@@ -720,7 +718,7 @@ def test_c4_superseded_algorithm_prefix_reports_unknown() -> None:
     equality test."""
     conn = asof_conn()
     site_id = _make_site(conn, "c4-site")
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     run_id = _publish_run_row(
         conn,
@@ -877,7 +875,7 @@ def test_c8_null_period_reports_unknown_period_unknown() -> None:
     ``start_run``, which always fills both."""
     conn = asof_conn()
     site_id = _make_site(conn, "c8-site")
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     run_id = _publish_run_row(
         conn,
@@ -904,66 +902,6 @@ def test_c8_null_period_reports_unknown_period_unknown() -> None:
     assert freshness.state != "changed"  # stale_inputs must not fire on this
 
 
-def test_c9_no_published_generation_reports_unknown() -> None:
-    """c9 -> at ``freshness.reason``: correct = 'no_published_generation',
-    mutant = a crash or a wrong branch if
-    ``current_result_basis_fingerprint``'s None-return stops being
-    threaded through. The site's published-generation pointer is
-    deliberately never set (built without ``ensure_published_generation``
-    or ``_make_site``, both of which seed it)."""
-    conn = asof_conn()
-    site_id = int(
-        conn.execute(
-            """
-            INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-            VALUES ('c9-site', 40.0, -105.0, 900.0, 'UTC')
-            """
-        ).lastrowid
-    )
-    # A real, unpublished generation row -- satisfies the FK without ever
-    # calling ensure_published_generation or setting the pointer.
-    generation_id = int(
-        conn.execute(
-            """
-            INSERT INTO timezone_generations (site_id, timezone, mode, state)
-            VALUES (?, 'UTC', 'initial', 'building')
-            """,
-            (site_id,),
-        ).lastrowid
-    )
-    assert published_generation_id(conn, site_id) is None
-    run_id = int(
-        conn.execute(
-            """
-            INSERT INTO verification_runs
-                (site_id, tz_generation_id, methodology_version, app_version,
-                 state, attempt, config_snapshot, period_start, period_end,
-                 settled_through, bootstrap_seed, bootstrap_resamples,
-                 input_fingerprint, result_basis_fingerprint, published_at)
-            VALUES (?, ?, 1, '0.0.0-test', 'published', 1, '{}', '2026-06-01',
-                    '2026-06-01', '2026-06-01', 1, 10, 'fp-c9', ?,
-                    '2026-06-02T00:00:00Z')
-            """,
-            (site_id, generation_id, "rb1:" + "0" * 64),
-        ).lastrowid
-    )
-    row = conn.execute(
-        "SELECT result_basis_fingerprint, period_start, period_end "
-        "FROM verification_runs WHERE id = ?",
-        (run_id,),
-    ).fetchone()
-    freshness = result_basis_freshness(
-        conn,
-        site_id,
-        recorded=row["result_basis_fingerprint"],
-        period_start=row["period_start"],
-        period_end=row["period_end"],
-    )
-    assert freshness.state == "unknown"
-    assert freshness.reason == "no_published_generation"
-    assert freshness.state != "changed"
-
-
 # ---------------------------------------------------------------------------
 # Group D1 -- result_basis_freshness derivation purity under query_only=ON.
 # ---------------------------------------------------------------------------
@@ -971,12 +909,12 @@ def test_c9_no_published_generation_reports_unknown() -> None:
 
 def test_d1_result_basis_freshness_is_pure_including_no_published_generation() -> None:
     """d1 -> at the ``sqlite3.OperationalError`` NOT being raised despite
-    ``query_only=ON``: correct = every branch (fresh, changed,
-    no_published_generation) returns without writing, mutant = a write
-    (e.g. reintroducing ``ensure_published_generation``) raises against
-    this connection instead. Anchored on the returned state/reason too, so
-    a mutation that avoids writing but returns the wrong branch is still
-    caught."""
+    ``query_only=ON``: correct = the fresh and changed branches return
+    without writing, mutant = a write (e.g. reintroducing
+    ``ensure_site_generation``) raises against this connection
+    instead. A site with no time zone generation makes
+    ``result_basis_freshness`` raise ``ValueError`` instead of writing one
+    in, even under ``query_only=ON``."""
     conn = asof_conn()
     site_id = _make_site(conn, "d1-site")
     run_id = _seed_published_run(conn, site_id, fresh_fingerprint=True)
@@ -1022,16 +960,16 @@ def test_d1_result_basis_freshness_is_pure_including_no_published_generation() -
     )
     conn.commit()
     conn.execute("PRAGMA query_only=ON")
-    assert published_generation_id(conn, other_site) is None
-    no_gen = result_basis_freshness(
-        conn,
-        other_site,
-        recorded="rb1:" + "0" * 64,
-        period_start="2026-06-01",
-        period_end="2026-06-01",
-    )
-    assert no_gen.state == "unknown"
-    assert no_gen.reason == "no_published_generation"
+    assert site_generation_id(conn, other_site) is None
+    with pytest.raises(ValueError, match="has no time zone generation"):
+        result_basis_freshness(
+            conn,
+            other_site,
+            recorded="rb1:" + "0" * 64,
+            period_start="2026-06-01",
+            period_end="2026-06-01",
+        )
+    assert site_generation_id(conn, other_site) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1040,7 @@ def test_e3_migration_preserves_an_existing_v4_run_row() -> None:
             """
         ).lastrowid
     )
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     conn.execute(
         """
         INSERT INTO verification_runs
@@ -1136,10 +1074,10 @@ def test_e4_run_migrations_lands_on_target_user_version() -> None:
     """e4 -> at ``_user_version(conn) == 11``: correct = 11 (the literal),
     mutant = a different literal if ``TARGET_USER_VERSION`` is bumped
     without also bumping the literal every caller of this suite expects."""
-    assert TARGET_USER_VERSION == 14
+    assert TARGET_USER_VERSION == 15
     conn = _bare_db(user_version=4)
     run_migrations(conn)
-    assert _user_version(conn) == 14
+    assert _user_version(conn) == 15
 
 
 # ---------------------------------------------------------------------------
@@ -1385,14 +1323,12 @@ def test_f5_template_freshness_reasons_cover_every_reason_the_source_emits() -> 
         "algorithm_changed",
         "malformed_record",
         "period_unknown",
-        "no_published_generation",
     }, "the regex scope drifted -- update it, don't hardcode the result set"
     assert {
         "not_recorded",
         "algorithm_changed",
         "malformed_record",
         "period_unknown",
-        "no_published_generation",
     } == MANIFEST_NOTE_TOKENS, (
         "the manifest note vocabulary drifted -- update it, "
         "don't hardcode the result set"
@@ -1430,7 +1366,7 @@ def test_f5b_rendered_notice_never_leaks_the_raw_reason_code(
 
     conn = _open_app_db(tmp_path, monkeypatch)
     site_id = _make_site(conn, "f5b-site")
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
     snapshot = capture_config_snapshot(conn, site_id)
     _publish_run_row(

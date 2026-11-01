@@ -8,7 +8,6 @@ from typing import Final
 
 from wxverify.core.timeutil import utc_now
 from wxverify.db.site_days import open_day_clause
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import (
@@ -54,7 +53,6 @@ def existing_mean_rows_sql(*, site_scoped: bool, day_clause: str) -> str:
                rain_threshold_mm, contributors, first_known_at
         FROM forecast_pairs
         WHERE feed_id = ?
-          AND {published_generation_clause("forecast_pairs")}
           {site_filter} AND {day_clause}
         """
 
@@ -88,11 +86,6 @@ def compute_multimodel_mean(
     if feed is None:
         return PairDelta((), (), _MEAN_INSERT_SQL, count=0)
     feed_id = int(feed["id"])
-    # The X read and the diff are scoped to the PUBLISHED generation (§13): a
-    # building correction generation's mean rows belong to the correction
-    # chain (scoring.tz_rebuild derives them per rebuilt day) and are never
-    # read or written here; retired rows are removed by the chain's
-    # post-flip cleanup, not here.
     existing: dict[tuple[int, str, str, str], _ExistingMean | None] = {}
     existing_day_clause = open_day_clause(
         conn,
@@ -113,8 +106,8 @@ def compute_multimodel_mean(
         )
         if key in existing:
             # UNIQUE(site_id, feed_id, variable, issued_at, valid_at,
-            # tz_generation_id) makes this impossible under a correct
-            # published clause and key.
+            # tz_generation_id) makes this impossible: every row of a site
+            # carries the site's one generation.
             raise RuntimeError(f"duplicate published mean key {key!r}")
         existing[key] = _ExistingMean(
             row_id=int(row["id"]),
@@ -164,7 +157,6 @@ def compute_multimodel_mean(
           ON sfs.site_id = fp.site_id AND sfs.feed_id = fp.feed_id
         WHERE f.is_virtual = 0
           AND {active_competitor_clause(site_expr="fp.site_id")}
-          AND {published_generation_clause("fp")}
           AND {groups_day_clause}
           {site_filter}
         GROUP BY fp.site_id, fp.variable, fp.issued_at, fp.valid_at, fp.lead_hours,

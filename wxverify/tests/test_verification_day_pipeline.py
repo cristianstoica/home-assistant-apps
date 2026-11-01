@@ -787,8 +787,6 @@ def _mutate_tz_generation_pointer_reset(
     c: sqlite3.Connection, site_id: int, feeds: list[int]
 ) -> None:
     del feeds
-    from wxverify.db.tz_generations import published_pointer_key
-
     site = c.execute("SELECT timezone FROM sites WHERE id = ?", (site_id,)).fetchone()
     assert site is not None
     cur = c.execute(
@@ -800,10 +798,6 @@ def _mutate_tz_generation_pointer_reset(
         (site_id, str(site["timezone"]), "2026-01-01T00:00:00Z"),
     )
     assert cur.lastrowid is not None
-    new_id = int(cur.lastrowid)
-    verification_run_module.set_runtime_state(
-        c, published_pointer_key(site_id), str(new_id)
-    )
 
 
 _Mutator = Callable[[sqlite3.Connection, int, list[int]], None]
@@ -897,60 +891,6 @@ def test_message_parity_per_key(
         rp = await db.read(_read_path_message)
         assert wp == expected
         assert rp == expected
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# T7e -- missing pointer.
-# ---------------------------------------------------------------------------
-
-
-def test_missing_published_pointer_is_flagged_readonly_only(tmp_path: Path) -> None:
-    async def _run() -> None:
-        conn = _init_tmp_db(tmp_path)
-        site_id, _feeds, _station = build_synthetic_verification_site(conn)
-        db = get_db()
-        writer = FencedWriter(db, db.generation)
-        payload = _payload(days_per_chunk=2)
-        await _drive_to_simulate(db, writer, site_id, payload)
-
-        blob = await db.read(lambda c: _load_state(c, site_id))
-        assert blob is not None
-        run_id = int(blob["run_id"])  # type: ignore[arg-type]
-
-        before = await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM timezone_generations").fetchone()[
-                0
-            ]
-        )
-
-        from wxverify.db.tz_generations import published_pointer_key
-
-        await db.write(
-            lambda c: c.execute(
-                "DELETE FROM runtime_state WHERE key = ?",
-                (published_pointer_key(site_id),),
-            )
-        )
-
-        def _read_path_message(c: sqlite3.Connection) -> str:
-            cfg = run_config_from_row(c, run_id)
-            try:
-                assert_inputs_unchanged_readonly(c, cfg)
-            except RuntimeError as exc:
-                return str(exc)
-            raise AssertionError("expected a RuntimeError")
-
-        message = await db.read(_read_path_message)
-        assert message.endswith("tz_generation_id")
-
-        after = await db.read(
-            lambda c: c.execute("SELECT COUNT(*) FROM timezone_generations").fetchone()[
-                0
-            ]
-        )
-        assert after == before
 
     asyncio.run(_run())
 

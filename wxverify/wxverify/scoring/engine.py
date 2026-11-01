@@ -11,7 +11,6 @@ from typing import Final
 from wxverify.core.timeutil import isoformat_utc_micro, window_cutoff
 from wxverify.db.queue import enqueue_if_absent
 from wxverify.db.site_days import daily_close_on
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import MetricResult, strategy_for
 from wxverify.scoring.multimodel import (
@@ -345,13 +344,12 @@ def _distinct_cells(
     if site_id is None:
         params = ()
     else:
-        where = "AND site_id = ?"
+        where = "WHERE site_id = ?"
         params = (site_id,)
     rows = conn.execute(
         f"""
         SELECT DISTINCT site_id, feed_id, variable, day_ahead
         FROM forecast_pairs
-        WHERE {published_generation_clause("forecast_pairs")}
         {where}
         """,
         params,

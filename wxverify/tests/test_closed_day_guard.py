@@ -54,7 +54,7 @@ from wxverify.db.site_days import (
     enter_zone_change,
     fail_close,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.db.wind_basis import write_auth_hold
 from wxverify.obs.pws_adapter import PwsObservation
 from wxverify.provider_ops import rebuild_mean_for_site
@@ -1370,7 +1370,7 @@ def test_gw11_put_site_rain_threshold_leaves_closed_days_pairs_alone(
     site_id = day_close_site(conn)
     feed_id = asof_make_real_feed(conn, "gw11-model")
     d3, d1 = _d3(), _d1()
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     # D3 (closed) decoys: never reach the real-model recompute path (closed
     # days are excluded by open_day_clause), so a plain hand-planted row is
     # enough to prove the guard leaves them alone.
@@ -1535,7 +1535,7 @@ def test_gw12_rebuild_mean_for_site_leaves_closed_days_mean_alone(
     # row must be hand-planted at D3 for the before/after comparison below to
     # be non-vacuous: without this insert, before_d3_mean == after_d3_mean
     # == [] regardless of whether the guard fires.
-    d3_generation_id = ensure_published_generation(conn, site_id)
+    d3_generation_id = ensure_site_generation(conn, site_id)
     d3_hour = f"{d3.isoformat()}T12:00:00Z"
     conn.execute(
         """
@@ -1597,7 +1597,7 @@ def test_gw13_import_of_a_close_on_file_rebuilds_only_the_open_day(
         station_b = _station_id(b_db._conn, site_b, _STATION_B)  # noqa: SLF001
         d3, d1 = _d3(), _d1()
         feed_id = asof_make_real_feed(b_db._conn, "gw13-model")  # noqa: SLF001
-        generation_id = ensure_published_generation(  # noqa: SLF001
+        generation_id = ensure_site_generation(  # noqa: SLF001
             b_db._conn, site_b
         )
         d3_hour = f"{d3.isoformat()}T12:00:00Z"
@@ -2271,22 +2271,17 @@ _GW17_ALLOWLIST: Final = frozenset(
         ("wxverify.provider_ops", "_invalidate_mean_for_site"),  # 7.3 W13
         ("wxverify.api.routes.db_transfer", "_rebuild_all"),  # 7.5 W14
         ("wxverify.db.site_days", "*"),  # P1 state functions, 4.7 and 6.4
-        ("wxverify.worker.tz_correction", "*"),  # P6 removes
+        # A1's single-generation-per-site keep, only inside migrate_v15_switch
+        # on a file below 15, which holds no closed day (plan 10.1).
+        ("wxverify.db.switch", "keep_read_generations"),
         ("wxverify.verification.runs", "*"),  # verification tables only
         ("wxverify.db.migrations", "SEED_STATION_CHANGES_SQL"),  # migration (v11)
-        # Its rain-pair delete goes with P6 R15; drop this entry then.
-        ("wxverify.db.migrations", "record_precip_hour_start_boundary"),  # migration
         ("wxverify.scoring.consensus", "_invalidate_consensus_dependents"),  # 7.3
         ("wxverify.scoring.consensus", "_delete_future_persistence_pairs"),  # 7.3 notes
         ("wxverify.scoring.multimodel", "_MEAN_INSERT_SQL"),  # 7.3 W10
         ("wxverify.scoring.pairing", "_PAIR_INSERT_SQL"),  # 7.3 W10
-        # Also run unguarded by insert_persistence_pair (tz rebuild only): P6 removes.
         ("wxverify.scoring.persistence", "_PERSISTENCE_INSERT_SQL"),  # 7.3 W10
         ("wxverify.scoring.split", "_DELETE_PAIR_BY_ID_SQL"),  # 7.3 W10
-        ("wxverify.scoring.tz_rebuild", "delete_building_rows"),  # P6 removes (W8)
-        ("wxverify.scoring.tz_rebuild", "rebuild_generation_day"),  # P6 removes (W8)
-        ("wxverify.scoring.tz_rebuild", "_rebuild_real_pairs"),  # P6 removes (W8)
-        ("wxverify.scoring.tz_rebuild", "_rebuild_multimodel_mean"),  # P6 removes (W8)
         # The replay's persist_day_evidence; P6 keeps it, uncalled (N7).
         ("wxverify.verification.simulate", "_EVIDENCE_INSERT_SQL"),  # not a day write
         ("wxverify.verification.truth", "mark_daily_truth_stale"),  # 7.3 notes

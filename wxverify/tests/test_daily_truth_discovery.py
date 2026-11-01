@@ -39,12 +39,8 @@ import wxverify.verification.truth as truth
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
-from wxverify.db.queue import claim_next_job, enqueue_if_absent
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_pointer_key,
-)
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.completeness import AdmissionDecision
 from wxverify.verification.coverage import local_day_bounds
 from wxverify.verification.runs import settled_through
@@ -53,13 +49,10 @@ from wxverify.verification.truth import (
     materialize_missing_truth_days,
     settled_ceiling_local_date,
 )
-from wxverify.worker.processor import _fail_job  # noqa: SLF001
 from wxverify.worker.verification_run import (
     _load_state,  # noqa: SLF001
     _save_state,  # noqa: SLF001
     advance_verification,
-    verification_job_key,
-    verification_state_key,
 )
 
 TZ_DENVER = "America/Denver"
@@ -220,7 +213,7 @@ def test_o4_ceiling_boundary_second_standard_time() -> None:
 
     conn = _conn()
     site_id = _make_site(conn, timezone="UTC")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _seed_obs_day(conn, site_id, "2026-06-10")
     materialize_daily_truth(
         conn, site_id=site_id, local_date="2026-06-10", tz_generation_id=generation_id
@@ -279,7 +272,7 @@ def test_o4_ceiling_boundary_second_dst(
 
     conn = _conn()
     site_id = _make_site(conn, timezone=timezone)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _seed_obs_day(conn, site_id, local_date_str)
     materialize_daily_truth(
         conn, site_id=site_id, local_date=local_date_str, tz_generation_id=generation_id
@@ -345,7 +338,7 @@ def test_o2_forward_gap_past_existing_rows() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     days = [f"2026-06-{n:02d}" for n in range(1, 8)]  # D..D+6, 7 days
     _seed_obs_days(conn, site_id, days)
     for day in days[:3]:  # D..D+2 already materialized
@@ -385,7 +378,7 @@ def test_o2b_older_observations_are_discoverable_after_the_fact() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _seed_obs_days(conn, site_id, ["2026-06-10", "2026-06-11", "2026-06-12"])
     now = datetime(2026, 6, 20, tzinfo=UTC)
 
@@ -442,7 +435,7 @@ def test_o3_interior_hole_is_filled_without_rewriting_neighbors() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     days = ["2026-06-01", "2026-06-02", "2026-06-03"]
     _seed_obs_days(conn, site_id, days)
     materialize_daily_truth(
@@ -485,7 +478,7 @@ def test_o5_ineligible_day_is_not_a_perpetual_hole() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     day = "2026-06-01"
     _seed_obs_day(conn, site_id, day, hour=12)  # a single hour: never eligible
     now = datetime(2026, 6, 10, tzinfo=UTC)
@@ -528,7 +521,7 @@ def test_o6_idempotent_on_a_full_pass() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     days = ["2026-06-01", "2026-06-02", "2026-06-03"]
     _seed_obs_days(conn, site_id, days)
     now = datetime(2026, 6, 20, tzinfo=UTC)
@@ -578,7 +571,6 @@ def test_o7_materializes_under_published_generation_with_its_own_zone() -> None:
         (site_id, TZ_GMT7, isoformat_utc()),
     )
     g1 = int(published_cur.lastrowid or 0)
-    set_runtime_state(conn, published_pointer_key(site_id), str(g1))
     building_cur = conn.execute(
         """
         INSERT INTO timezone_generations (site_id, timezone, mode, state)
@@ -643,7 +635,7 @@ def test_o10_outage_clamps_to_last_observed_day() -> None:
     """
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     days = ["2026-06-01", "2026-06-02", "2026-06-03"]
     _seed_obs_days(conn, site_id, days)
     now = datetime(2026, 6, 20, tzinfo=UTC)  # ceiling is far past day[-1] + 5
@@ -684,7 +676,7 @@ def test_o1_bootstraps_from_empty_daily_truth() -> None:
     payload: dict[str, object] = {"trigger_date": "2026-06-10"}
     _drive_until_decided(conn, site_id, payload)
 
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     rows = conn.execute(
         "SELECT COUNT(*) AS n FROM daily_truth WHERE site_id=?", (site_id,)
     ).fetchone()
@@ -729,7 +721,7 @@ def test_o8_chunking_resumability_and_blob_hygiene() -> None:
     blob3 = _load_state(conn, site_id)
     assert blob3 == {"phase": "regen"}
 
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     assert _truth_local_dates(conn, site_id, generation_id) == set(days)
 
 
@@ -836,7 +828,7 @@ def test_o13_window_recomputed_live_across_chunks(
     monkeypatch.setattr("wxverify.worker.verification_run.utc_now", lambda: fixed_now_1)
     advance_verification(conn, site_id, payload)  # chunk 1: D1, D2
 
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     assert _truth_local_dates(conn, site_id, generation_id) == {early[0], early[1]}
 
     late = ["2026-06-06", "2026-06-07"]  # D6, D7 -- added AFTER chunk 1
@@ -852,74 +844,6 @@ def test_o13_window_recomputed_live_across_chunks(
 # O14-O18 -- D13 failure-boundary oracles, driven through a real
 # file-backed Database (db.write_sync / BEGIN IMMEDIATE / rollback).
 # ---------------------------------------------------------------------------
-
-
-def test_o14_chain_level_fault_propagates_never_silently_cancelled(
-    tmp_path: Path,
-) -> None:
-    """A dangling published-generation pointer is a chain-level fault: it
-    must raise a raw ``ValueError`` (never a swallowed ``JobCancelled``),
-    leave the chain-state blob intact through the raise, and only clear
-    that blob once the job goes terminally failed.
-
-    Kills: a blanket ``except ValueError: raise JobCancelled()`` wrapping
-    the discover phase (would misclassify a real infra/data-integrity
-    fault as an ordinary chain cancellation, silently dropping it from the
-    retry ladder's loud-failure path).
-    """
-    db = _file_db(tmp_path)
-    try:
-
-        def _seed(conn: sqlite3.Connection) -> int:
-            site_id = _make_site(conn)
-            generation_id = ensure_published_generation(conn, site_id)
-            _seed_obs_day(conn, site_id, "2026-06-01")
-            # FK forces daily_truth to be empty under this generation for
-            # the DELETE below to succeed -- true here since nothing has
-            # materialized yet.
-            conn.execute(
-                "DELETE FROM timezone_generations WHERE id = ?", (generation_id,)
-            )
-            _save_state(conn, site_id, {"phase": "discover"})
-            return site_id
-
-        site_id = db.write_sync(_seed)
-
-        payload: dict[str, object] = {"trigger_date": "2026-06-10"}
-        with pytest.raises(ValueError):
-            db.write_sync(lambda conn: advance_verification(conn, site_id, payload))
-
-        blob_after_raise = db.read_sync(
-            lambda conn: get_runtime_state(conn, verification_state_key(site_id))
-        )
-        assert blob_after_raise == '{"phase":"discover"}'
-
-        def _force_terminal_failure(conn: sqlite3.Connection) -> None:
-            enqueue_if_absent(
-                conn, "verification_run", site_id, verification_job_key(site_id), {}
-            )
-            job = claim_next_job(conn)
-            assert job is not None
-            conn.execute("UPDATE jobs SET max_retries = 0 WHERE id = ?", (job.id,))
-            disposition = _fail_job(conn, job, "forced")
-            assert disposition is not None
-            assert disposition.terminal
-
-        db.write_sync(_force_terminal_failure)
-
-        blob_after_fail = db.read_sync(
-            lambda conn: get_runtime_state(conn, verification_state_key(site_id))
-        )
-        assert blob_after_fail is None
-        run_state = db.read_sync(
-            lambda conn: conn.execute(
-                "SELECT status FROM jobs WHERE site_id=? AND type='verification_run'",
-                (site_id,),
-            ).fetchone()
-        )
-        assert str(run_state["status"]) == "failed"
-    finally:
-        db.close()
 
 
 def test_o15_one_unbuildable_day_is_contained_chunk_commits(
@@ -1049,7 +973,7 @@ def test_o15_one_unbuildable_day_is_contained_chunk_commits(
             _drive_to_regen_db(db, site_id, payload)
 
             generation_id = db.read_sync(
-                lambda conn: ensure_published_generation(conn, site_id)
+                lambda conn: ensure_site_generation(conn, site_id)
             )
             present = db.read_sync(
                 lambda conn: _truth_local_dates(conn, site_id, generation_id)

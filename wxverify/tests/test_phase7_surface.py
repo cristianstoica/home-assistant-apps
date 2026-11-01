@@ -32,7 +32,7 @@ from wxverify.api.app import create_app
 from wxverify.core.options import RuntimeOptions, load_runtime_options
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.depth import (
     DEPTH_VARIABLES,
     EffectiveDepth,
@@ -96,7 +96,7 @@ def _make_site(conn: sqlite3.Connection, name: str = "Verify Town") -> int:
             (name,),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -159,7 +159,7 @@ def _seed_published_run(
     (still on the pre-pairwise methodology). Pass 2 for O-V3's matching-
     version arm.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = (
         input_fingerprint(conn, site_id, snapshot) if fresh_fingerprint else "0" * 64
@@ -490,7 +490,7 @@ def test_run_config_incumbent_depth_per_variable() -> None:
 def test_daily_rank_order_excludes_post_asof_revised_truth() -> None:
     conn = asof_conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     run_id = int(
         conn.execute(
             """
@@ -641,7 +641,7 @@ def test_api_status_stale_and_failed_warnings(
              bootstrap_resamples, input_fingerprint, error)
         VALUES (?, ?, 1, 'test', 'failed', 2, '{}', 1, 100, 'fp2', 'boom')
         """,
-        (site_id, ensure_published_generation(conn, site_id)),
+        (site_id, ensure_site_generation(conn, site_id)),
     )
     conn.commit()
 

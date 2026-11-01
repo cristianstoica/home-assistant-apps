@@ -97,7 +97,7 @@ MASK: dict[str, set[str]] = {
     "sites": {"created_at"},
     "stations": {"created_at"},
     # `timezone_generations.created_at`/`published_at`: stamped by
-    # `ensure_published_generation` at builder time.
+    # `ensure_site_generation` at builder time.
     "timezone_generations": {"created_at", "published_at"},
     # `verification_runs.created_at`/`published_at`: stamped by `start_run`
     # and `publish_verified_run` respectively.

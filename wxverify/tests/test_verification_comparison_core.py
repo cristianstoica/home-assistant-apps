@@ -23,7 +23,7 @@ from typing import cast
 import pytest
 
 from tests.helpers import asof_conn, continuous_baseline_set, occurrence_baseline_set
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.contract import CONTRACT, VERIFICATION_SCHEMA
 from wxverify.verification.decision import (
     DECISION_LEADS,
@@ -168,7 +168,7 @@ def _make_run() -> tuple[sqlite3.Connection, int, int]:
     )
     assert cur.lastrowid is not None
     site_id = int(cur.lastrowid)
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run_row(conn, site_id, generation)
     return conn, site_id, run_id
 
@@ -351,7 +351,7 @@ def test_o14_fingerprint_sensitive_to_methodology_version(
     from wxverify.verification import runs as runs_module
 
     conn, site_id, _run_id = _make_run()
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     snapshot: dict[str, object] = {
         "timezone": "UTC",
         "rain_threshold_mm": 0.2,
@@ -471,7 +471,7 @@ def _build_complementary_window_run() -> tuple[sqlite3.Connection, RunConfig]:
                     predicted=20.0,
                 )
     conn.commit()
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     cfg = _base_cfg(run_id=run_id, site_id=site_id, generation=generation)
     return conn, cfg
 
@@ -626,7 +626,7 @@ def test_o6_headline_table_is_the_unchanged_strict_common_core() -> None:
         eligible=False,
     )
     conn.commit()
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     cfg = RunConfig(
         site_id=site_id,
         run_id=run_id,
@@ -1059,7 +1059,7 @@ def test_o21c_decision_summary_reports_the_basis_not_the_own_window(
             """
         ).lastrowid
     )
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(
@@ -1207,7 +1207,7 @@ def test_o21d_resolved_basis_does_not_license_an_unlabelled_number(
             """
         ).lastrowid
     )
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(
@@ -1320,7 +1320,7 @@ def _o21e_run(
             (site_name,),
         ).lastrowid
     )
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     fingerprint = input_fingerprint(conn, site_id, snapshot)
     run_id = int(
@@ -1928,7 +1928,7 @@ def test_o15_tested_family_window_days_reaches_the_verdicts_endpoint(
             """
         ).lastrowid
     )
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     run_id = _insert_run_row(conn, site_id, generation)
     tested_family = {"incumbent": "2", "candidates": verdict.detail["candidates"]}
     conn.execute(

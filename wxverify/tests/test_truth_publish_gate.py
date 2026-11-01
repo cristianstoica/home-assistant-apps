@@ -40,7 +40,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed, seed_pair_max_wind
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import (
     insert_station_observation,
     write_station_observation,
@@ -149,7 +149,7 @@ def _make_site(
         asof_make_real_feed(conn, "gate-model-alpha"),
         asof_make_real_feed(conn, "gate-model-beta"),
     ]
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     overrides = precip_overrides or {}
     for day in _PERIOD_DAYS:
         _seed_day_observations(
@@ -379,7 +379,7 @@ def test_o12_a_retired_generations_stale_day_never_leaks_into_the_published_ones
     )
     assert cur.lastrowid is not None
     site_id = int(cur.lastrowid)
-    published_id = ensure_published_generation(conn, site_id)
+    published_id = ensure_site_generation(conn, site_id)
     day = "2026-06-01"
     _seed_day_observations(conn, site_id, day)
     materialize_daily_truth(
@@ -865,7 +865,7 @@ def test_eligible_only_divergence_isolated_from_covered_hours_is_caught() -> Non
     )
     assert cur.lastrowid is not None
     site_id = int(cur.lastrowid)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     day = "2026-06-10"
 
     max_hour = 21  # outside the high-peak window [12, 18) -- holds the max

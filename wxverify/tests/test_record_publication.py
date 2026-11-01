@@ -410,12 +410,12 @@ def test_rc4_no_publication_at_t_leaves_the_three_columns_null(
 def test_rc5_a_missed_row_leaves_the_three_columns_null(tmp_path: Path) -> None:
     """RC5: a ``missed`` row (the gap scan's own writer) leaves the three
     publication columns NULL too (12)."""
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
     from wxverify.verification.record import _write_missed_rows
 
     conn, site_id, _feed_x = _build_site_with_sample(tmp_path)
     _assert_record_publication_columns(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     reasons = {
         (variable, day): "window_closed"
         for variable in ("temperature", "wind", "precip")

@@ -508,12 +508,12 @@ def test_pd1_record_schema_has_null_publication_columns_available() -> None:
     gives NULL for all three -- the shape a close-off (or close-on,
     missed) record actually writes.
     """
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
     conn = asof_conn()
     site_id = asof_make_site(conn, "Testsite")
     conn.commit()
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
 
     cur = conn.execute(
         """

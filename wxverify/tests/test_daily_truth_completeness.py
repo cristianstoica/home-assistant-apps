@@ -55,7 +55,7 @@ import pytest
 
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.completeness import (
     ADMISSION_COMPLETE,
     ADMISSION_DEADLINE,
@@ -648,7 +648,7 @@ def test_o2_near_complete_23_of_24_defers_though_old_eligibility_gate_passes() -
     eligibility gate."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)  # first nightly pass
@@ -701,7 +701,7 @@ def test_o4_full_coverage_quiesced_admits_complete_with_five_rows() -> None:
     horizon-freezing failure mode this oracle exists to catch."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)
@@ -760,7 +760,7 @@ def test_o9_regeneration_rewrites_a_short_day_ungated_by_admission(
     pinned as unreachable, structurally, from this function."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     initial_computed_at = isoformat_utc(bounds.end_utc + timedelta(hours=1))
@@ -837,7 +837,7 @@ def test_o10_regeneration_preserves_the_complete_basis() -> None:
     admission history on every routine regeneration."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)
@@ -877,7 +877,7 @@ def test_o10_negative_control_pre_gate_null_basis_stays_null_not_complete() -> N
     admission history for a day that was never gated at all."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     _seed_obs_full_day(
@@ -1109,7 +1109,7 @@ def test_o19a_well_formed_z_stamps_admit_complete() -> None:
     contract."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)
@@ -1137,7 +1137,7 @@ def test_o19b_null_computed_at_defers_without_exception() -> None:
     recorded a stamp must defer cleanly, never crash the chunk."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)  # before the 24h deadline
@@ -1174,7 +1174,7 @@ def test_o19c_offset_bearing_stamp_wins_by_instant_not_lexical_string() -> None:
     checked rather than assumed."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     now = datetime(2026, 6, 3, 10, 0, 0, tzinfo=UTC)
     true_stamp = "2026-06-03T02:30:00-07:00"  # == 2026-06-03T09:30:00Z
@@ -1265,7 +1265,7 @@ def test_o19e_max_selection_is_the_true_maximum_not_the_last_processed_row() -> 
     quiesced."""
     conn = _conn()
     site_id = _make_site(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     local_date = "2026-06-02"
     bounds = local_day_bounds(date.fromisoformat(local_date), TZ_DENVER)
     now = bounds.end_utc + timedelta(hours=5)

@@ -17,9 +17,11 @@ from pathlib import Path
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "wxverify"
 _DEFINITION_SITE = "wxverify/db/connection.py"
 _ALLOWED_CALLERS = frozenset({"wxverify/__main__.py"})
-#: Raised 5 -> 6 for `wxverify timezone status`, a genuine new read-only CLI
-#: call site (§20 operator surface).
-_EXPECTED_TOTAL_CALLS = 6
+#: One call site each for `settings list`, `settings get`, `jobs purge
+#: --dry-run`, `providers doctor`, and `providers fetch`/`smoke`'s feed
+#: selection; `timezone status`'s was retired with the daily close (plan
+#: 7.3), dropping the total from 6 back to 5.
+_EXPECTED_TOTAL_CALLS = 5
 
 
 def test_read_sync_is_only_called_from_the_cli_entry_point() -> None:

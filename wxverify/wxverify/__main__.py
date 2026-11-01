@@ -42,12 +42,6 @@ from wxverify.db.site_days import (
     enter_zone_change,
     open_day_on_copy,
 )
-from wxverify.db.tz_generations import (
-    apply_prospective_change,
-    ensure_published_generation,
-    generation_status,
-    start_retrospective_correction,
-)
 from wxverify.provider_ops import (
     NEW_PROVIDER_SOURCES,
     FeedRef,
@@ -86,6 +80,14 @@ logger = logging.getLogger(__name__)
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.command == "timezone" and args.timezone_command in ("correct", "status"):
+        # Retired with the daily close (plan 7.3): the message and exit 1,
+        # before logging is set up and before init_db opens the file.
+        _die(
+            "This control was retired when the daily close turned on. "
+            "Each day is collected and closed once after it ends, "
+            "and past days are not fetched again."
+        )
     if args.command == "serve":
         return _serve(args)
     _configure_logging()
@@ -198,10 +200,10 @@ def _build_parser() -> argparse.ArgumentParser:
     purge.add_argument("--dry-run", action="store_true")
     purge.add_argument("--json", action="store_true")
 
-    # §13/§20 operator surface: the two explicit timezone operations plus the
-    # read-only view of the generations they create. A normal site edit
-    # (PUT /api/sites/{id}) cannot change a timezone by design, so these are
-    # deliberately separate, obviously-named commands.
+    # A normal site edit (PUT /api/sites/{id}) cannot change a timezone by
+    # design; ``change`` enters a zone change (daily-close P1 6.4). The
+    # retired ``status`` and ``correct`` keep their parsers, so a script that
+    # calls them gets the retirement message, not a usage error (plan 7.3).
     timezone = sub.add_parser("timezone")
     timezone_sub = timezone.add_subparsers(dest="timezone_command", required=True)
     tz_status = timezone_sub.add_parser("status")
@@ -216,8 +218,8 @@ def _build_parser() -> argparse.ArgumentParser:
     tz_change = timezone_sub.add_parser("change")
     tz_change.add_argument("--site-id", type=int, required=True)
     tz_change.add_argument("--timezone", required=True)
-    # Not required here: whether it may or must be given depends on the daily
-    # close, which the command reads in its write transaction.
+    # Never accepted: kept so a command that passes it gets the refusal
+    # message rather than a usage error.
     tz_change.add_argument("--effective-from")
     tz_change.add_argument("--json", action="store_true")
 
@@ -416,10 +418,6 @@ def _jobs_purge(args: argparse.Namespace) -> int:
 
 
 def _timezone(args: argparse.Namespace) -> int:
-    if args.timezone_command == "status":
-        return _timezone_status(args)
-    if args.timezone_command == "correct":
-        return _timezone_correct(args)
     if args.timezone_command == "change":
         return _timezone_change(args)
     _die("unknown timezone command")
@@ -436,77 +434,6 @@ def _timezone_error(message: str, *, json_output: bool) -> int:
     else:
         print(f"error {message}")
     return 1
-
-
-def _timezone_status(args: argparse.Namespace) -> int:
-    site_id: int | None = args.site_id
-    try:
-        rows = get_db().read_sync(lambda conn: generation_status(conn, site_id))
-    except ValueError as exc:
-        return _timezone_error(str(exc), json_output=bool(args.json))
-    if args.json:
-        _print_json({"generations": rows})
-        return 0
-    if not rows:
-        print("no timezone generations")
-        return 0
-    for row in rows:
-        published = "yes" if row["published_pointer"] else "no"
-        print(
-            f"site={row['site_id']} generation={row['generation_id']} "
-            f"published={published} timezone={row['timezone']} "
-            f"mode={row['mode']} state={row['state']}"
-        )
-        print(
-            f"  effective_from={_or_dash(row['effective_from'])} "
-            f"effective_to={_or_dash(row['effective_to'])} "
-            f"published_at={_or_dash(row['published_at'])}"
-        )
-        print(
-            f"  examined={_or_dash(row['examined'])} "
-            f"changed={_or_dash(row['changed'])} "
-            f"unchanged={_or_dash(row['unchanged'])} "
-            f"excluded={_or_dash(row['excluded'])}"
-        )
-    return 0
-
-
-def _timezone_correct(args: argparse.Namespace) -> int:
-    site_id = int(args.site_id)
-    timezone = str(args.timezone)
-
-    def _write(conn: sqlite3.Connection) -> int:
-        return start_retrospective_correction(conn, site_id, timezone)
-
-    try:
-        generation_id = get_db().write_sync(_write)
-    except ValueError as exc:
-        return _timezone_error(str(exc), json_output=bool(args.json))
-    if args.json:
-        _print_json(
-            {
-                "site_id": site_id,
-                "generation_id": generation_id,
-                "timezone": timezone,
-                "mode": "retrospective_correction",
-                "state": "building",
-            }
-        )
-        return 0
-    print(
-        f"retrospective correction started site={site_id} "
-        f"generation={generation_id} timezone={timezone}"
-    )
-    print(
-        "  the whole timezone-derived history rebuilds as a background job; "
-        "readers keep serving the previous published generation until the flip"
-    )
-    print(
-        "  published leaderboard and verification values shift retroactively "
-        "once the rebuilt generation is published"
-    )
-    print(f"  progress: wxverify timezone status --site-id {site_id}")
-    return 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,88 +471,40 @@ def _timezone_change(args: argparse.Namespace) -> int:
         None if args.effective_from is None else str(args.effective_from)
     )
 
-    def _write(conn: sqlite3.Connection) -> dict[str, object] | _ZoneChangeEntered:
-        # The daily close is read inside this write transaction, so the path
-        # taken and the write it makes see the same state.
-        if daily_close_on(conn):
-            if effective_from is not None:
-                raise ValueError(
-                    "a zone change applies from the next full local day; "
-                    "leave out --effective-from"
-                )
-            return _enter_zone_change(conn, site_id, timezone)
-        if effective_from is None:
+    def _write(conn: sqlite3.Connection) -> _ZoneChangeEntered:
+        # The daily close is read inside this write transaction, so the
+        # refusal and the write it guards see the same state.
+        if not daily_close_on(conn):
+            raise ValueError("a zone change can be entered once the daily close is on")
+        if effective_from is not None:
             raise ValueError(
-                "--effective-from is required while the daily close is off"
+                "a zone change applies from the next full local day; "
+                "leave out --effective-from"
             )
-        previous_id = ensure_published_generation(conn, site_id)
-        previous = conn.execute(
-            "SELECT timezone, effective_from FROM timezone_generations WHERE id = ?",
-            (previous_id,),
-        ).fetchone()
-        previous_timezone = str(previous["timezone"])
-        previous_from = previous["effective_from"]
-        generation_id = apply_prospective_change(
-            conn, site_id, timezone, effective_from
-        )
-        closed = conn.execute(
-            "SELECT effective_from FROM timezone_generations WHERE id = ?",
-            (generation_id,),
-        ).fetchone()
-        return {
-            "site_id": site_id,
-            "generation_id": generation_id,
-            "timezone": timezone,
-            "effective_from": str(closed["effective_from"]),
-            "previous_generation_id": previous_id,
-            "previous_timezone": previous_timezone,
-            "previous_effective_from": None
-            if previous_from is None
-            else str(previous_from),
-            "previous_effective_to": str(closed["effective_from"]),
-        }
+        return _enter_zone_change(conn, site_id, timezone)
 
     try:
         result = get_db().write_sync(_write)
     except (ValueError, DayStateError) as exc:
         return _timezone_error(str(exc), json_output=bool(args.json))
-    if isinstance(result, _ZoneChangeEntered):
-        changeover = (
-            None
-            if result.changeover_date is None
-            else result.changeover_date.isoformat()
-        )
-        first_full_day = result.first_full_day.isoformat()
-        if args.json:
-            _print_json(
-                {
-                    "site_id": site_id,
-                    "timezone": timezone,
-                    "changeover_date": changeover,
-                    "first_full_day": first_full_day,
-                }
-            )
-            return 0
-        print(f"zone change entered site={site_id} timezone={timezone}")
-        if changeover is not None:
-            print(f"  changeover date: {changeover}")
-        print(f"  first full day under the new zone: {first_full_day}")
-        return 0
+    changeover = (
+        None if result.changeover_date is None else result.changeover_date.isoformat()
+    )
+    first_full_day = result.first_full_day.isoformat()
     if args.json:
-        _print_json(result)
+        _print_json(
+            {
+                "site_id": site_id,
+                "timezone": timezone,
+                "changeover_date": changeover,
+                "first_full_day": first_full_day,
+            }
+        )
         return 0
-    print(
-        f"prospective change applied site={site_id} "
-        f"generation={result['generation_id']} timezone={timezone} "
-        f"effective_from={result['effective_from']}"
-    )
-    print(
-        f"  previous generation {result['previous_generation_id']} "
-        f"({result['previous_timezone']}) now covers "
-        f"[{_or_dash(result['previous_effective_from'])}, "
-        f"{result['previous_effective_to']})"
-    )
-    print("  history before that instant keeps its own generation; no rebuild runs")
+    print(f"zone change entered site={site_id} timezone={timezone}")
+    if changeover is not None:
+        print(f"  changeover date: {changeover}")
+    print(f"  first full day under the new zone: {first_full_day}")
     return 0
 
 

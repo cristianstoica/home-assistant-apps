@@ -34,7 +34,7 @@ from wxverify.db.queue import (
     enqueue_if_absent,
     reclaim_all_stale,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.feeds.meteoblue import MeteoblueAdapter
 from wxverify.feeds.open_meteo import (
     OpenMeteoAdapter,
@@ -308,7 +308,7 @@ def test_migrations_seed_fk_and_not_null_census(tmp_path: Path) -> None:
     feed_id = conn.execute(
         "SELECT id FROM feeds WHERE source='open-meteo' LIMIT 1"
     ).fetchone()["id"]
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     try:
         conn.execute(
             """
@@ -2156,7 +2156,7 @@ def test_skill_uses_shared_persistence_cells_and_virtual_precip_flags(
                 cat_miss,
                 cat_correct_neg,
                 rain_threshold_mm,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2342,7 +2342,7 @@ def test_winrate_uses_latest_issued_ties_and_sparse_denominator(
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2458,7 +2458,7 @@ def test_winrate_applies_window_to_canonical_cells(tmp_path: Path) -> None:
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2576,7 +2576,7 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
                 persistence_error,
                 abs(persistence_error),
                 persistence_sq_error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
         conn.execute(
@@ -2599,7 +2599,7 @@ def test_composite_averages_live_components_and_filters_feeds(tmp_path: Path) ->
                 feed_error,
                 abs(feed_error),
                 feed_sq_error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2684,7 +2684,7 @@ def test_composite_custom_window_computes_live_without_cache(tmp_path: Path) -> 
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2744,7 +2744,7 @@ def test_subscription_rebuilds_multimodel_mean(tmp_path: Path) -> None:
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2859,7 +2859,7 @@ def test_meteoblue_package_gates_members_for_leaderboard_and_mean(
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
 
@@ -2962,7 +2962,7 @@ def test_dashboard_rolling_readthrough_rebuilding_enqueues_and_returns_empty(
                     error,
                     abs(error),
                     error * error,
-                    ensure_published_generation(conn, site_id),
+                    ensure_site_generation(conn, site_id),
                 ),
             )
             return site_id
@@ -3036,7 +3036,7 @@ def test_cached_leaderboard_misses_when_active_feed_cache_is_incomplete(
                 error,
                 abs(error),
                 error * error,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     conn.execute(
@@ -4294,7 +4294,7 @@ def test_button_typed_job_oracle_and_leaderboard_negative(
                     error,
                     abs(error),
                     error * error,
-                    ensure_published_generation(conn, site_id),
+                    ensure_site_generation(conn, site_id),
                 ),
             )
             return site_id

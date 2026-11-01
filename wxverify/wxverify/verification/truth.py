@@ -4,8 +4,7 @@
 generation): value, per-quantity eligibility, exclusion reason, coverage
 counts, wet/dry counts, guard flags, and provenance (timezone, UTC day
 bounds, max source ``computed_at``, generation tag). Rows are regenerable
-from the CURRENT consensus observations — a retrospective timezone
-correction writes a new generation's rows alongside the old, never mutates.
+from the CURRENT consensus observations.
 
 Consensus-mutation contract: every consensus mutation funnels through
 ``scoring.consensus.materialize_consensus`` (the sole ``observations``
@@ -25,19 +24,15 @@ exactly covered and quiesced, or past its deadline — then writes all five
 quantity rows under that basis, or writes nothing at all and leaves the day
 to the next night's set difference. Regeneration
 (:func:`regenerate_marked_truth`, :func:`regenerate_marked_truth_chunk`)
-and the retrospective timezone rebuild are deliberately UNGATED, still
-writing through :func:`materialize_daily_truth`: admission rules on whether
-a day's content has finished ARRIVING, and re-asking that of a rewrite
-would strand a ``stale = 1`` row that nothing would ever rebuild.
+is deliberately UNGATED, still writing through
+:func:`materialize_daily_truth`: admission rules on whether a day's
+content has finished ARRIVING, and re-asking that of a rewrite would
+strand a ``stale = 1`` row that nothing would ever rebuild.
 
 With the daily close on, a day's rows are written by the close's stage 4
 instead, through :func:`write_close_truth`: only for a ``closing`` day,
 from :func:`evaluate_day_window` over the day record's zone and bounds,
 under the basis of ``completeness.close_admission_basis``.
-
-Reads are generation-bound through the shared
-``published_generation_clause`` accessor — a partially built correction
-generation is never read.
 """
 
 from __future__ import annotations
@@ -58,11 +53,7 @@ from wxverify.db.site_days import (
     check_date_write,
     day_record,
 )
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_generation_clause,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation, site_generation_id
 from wxverify.verification.completeness import AdmissionDecision, decide_admission
 from wxverify.verification.coverage import (
     VARIABLE_QUANTITIES,
@@ -206,9 +197,8 @@ def _evaluate_day(
     READ-ONLY by construction, and that property is load-bearing: every
     statement here is a SELECT, and the generation is an ARGUMENT rather
     than something resolved in the body, so this function can never reach
-    ``ensure_published_generation`` — whose seeding branch writes a
-    generation row and the published pointer. A caller may therefore
-    evaluate a day without taking on a write.
+    ``ensure_site_generation`` — whose seeding branch writes a generation
+    row. A caller may therefore evaluate a day without taking on a write.
 
     The zone (the generation's) and the bounds (``local_day_bounds`` of the
     date) are this function's own; the rules are
@@ -247,8 +237,8 @@ def _write_day(
     wins; otherwise the basis already on disk for this day is PRESERVED;
     otherwise NULL. The existing value is read BEFORE the DELETE, on the
     same key the DELETE uses, so a rewrite that provides no basis — every
-    regeneration and every timezone rebuild — can never silently drop the
-    verdict the creating pass recorded.
+    regeneration — can never silently drop the verdict the creating pass
+    recorded.
 
     ``stale`` is written as the literal 0 rather than bound: creating a
     day's rows and regenerating them both produce rows that are, by
@@ -352,17 +342,18 @@ def write_close_truth(
     since it takes ``TRUTH`` for an ``open`` day too); only then is P1's
     guard asked, and its refusal fails the attempt as well (plan 5.3).
 
-    The rows take :func:`_write_day`'s shape, through this function's own
+    The rows take the ``daily_truth`` shape through this function's own
     statements: ``stale`` 0, the evaluation's threshold in
     ``rain_threshold_mm`` (a threshold changed later never reaches the
     day), the record's bounds and zone, and ``admission_basis`` as given —
     ``completeness.close_admission_basis`` (plan 7.1); nothing on disk is
-    preserved. They are keyed by the site's published generation, read
-    here, never by ``evaluation.generation_id``, which
-    :func:`evaluate_day_window` leaves None. A rerun replaces the rows.
-    ``generated_at`` is ``now_utc``, the close's clock.
+    preserved. They are keyed by the site's one time zone generation
+    (``site_generation_id``), read here, never by
+    ``evaluation.generation_id``, which :func:`evaluate_day_window` leaves
+    None. A rerun replaces the rows. ``generated_at`` is ``now_utc``, the
+    close's clock.
 
-    Raises ``ValueError`` when the site has no published generation. Must
+    Raises ``ValueError`` when the site has no time zone generation. Must
     run on a write connection inside the caller's transaction.
     """
     local_date = evaluation.local_date
@@ -378,7 +369,7 @@ def write_close_truth(
         raise DayStateError(
             f"site {site_id} day {local_date}: the guard refused the close truth"
         )
-    generation_id = published_generation_id(conn, site_id)
+    generation_id = site_generation_id(conn, site_id)
     if generation_id is None:
         raise ValueError(f"site {site_id} has no published timezone generation")
     conn.execute(
@@ -440,12 +431,11 @@ def materialize_daily_truth(
     """Delete-and-recreate the five truth rows for one (site, local day).
 
     ``local_date`` is an ISO calendar date in the generation's timezone.
-    When ``tz_generation_id`` is None the site's PUBLISHED generation is
-    used (seeded on first use); regeneration passes the row's own tag so a
-    correction generation's rows stay in their generation. All five
-    quantity rows are always written — an excluded outcome stays visible
-    with its coverage count and exclusion reason (§4). Must run on a write
-    connection inside the caller's transaction.
+    When ``tz_generation_id`` is None the site's one generation is used
+    (``ensure_site_generation``); regeneration passes the row's own tag.
+    All five quantity rows are always written — an excluded outcome stays
+    visible with its coverage count and exclusion reason (§4). Must run on
+    a write connection inside the caller's transaction.
 
     Ungated by construction — it writes whatever :func:`_evaluate_day`
     found. Passing no ``admission_basis`` makes every rewrite through this
@@ -453,7 +443,7 @@ def materialize_daily_truth(
     closed-day guard refuses is left as it is (:func:`_write_day`).
     """
     generation_id = (
-        ensure_published_generation(conn, site_id)
+        ensure_site_generation(conn, site_id)
         if tz_generation_id is None
         else tz_generation_id
     )
@@ -513,10 +503,9 @@ def regenerate_marked_truth(
     if site_id is not None:
         site_clause = "AND dt.site_id = ?"
         params = (site_id,)
-    # Only published/building generations regenerate: a RETIRED (or failed)
-    # generation's stale rows are awaiting the correction chain's chunked
-    # post-flip cleanup — recreating them here would resurrect rows the
-    # cleanup already deleted and waste a full day materialization per row.
+    # Only published/building generations regenerate: no reader reads a
+    # RETIRED (or failed) generation's rows, so recreating them here would
+    # waste a full day materialization per row.
     groups = conn.execute(
         f"""
         SELECT DISTINCT dt.site_id, dt.local_date, dt.tz_generation_id
@@ -548,8 +537,8 @@ def regenerate_marked_truth_chunk(
     verification chain (§14): each chain chunk rebuilds a bounded number of
     marked day-groups in ONE short write transaction instead of holding the
     write lock across every marked day at once. Same generation policy as
-    the full pass (published/building only — retired and failed generations
-    are the correction chain's cleanup problem). Returns the number of
+    the full pass (published/building only — no reader reads a retired or
+    failed generation). Returns the number of
     regenerated groups; a return < ``limit`` means no stale group remains.
     """
     groups = conn.execute(
@@ -612,12 +601,9 @@ def observation_day_extent(
 ) -> tuple[date, date] | None:
     """Inclusive local-day range spanning the site's observations, or None.
 
-    Deliberately NOT ``scoring.tz_rebuild.generation_day_range``, which is
-    otherwise the same shape. That one also spans ``forecast_samples``, whose
-    ``valid_at`` reaches a forecast horizon into the FUTURE, and discovery
-    must be bounded by what has actually been observed. Importing it here
-    would also invert the ``scoring -> verification`` edge — ``tz_rebuild``
-    imports :func:`materialize_daily_truth`.
+    Observations only, never ``forecast_samples``, whose ``valid_at`` reaches
+    a forecast horizon into the FUTURE: discovery must be bounded by what
+    has actually been observed.
     """
     tz = ZoneInfo(timezone)
     stamps: list[str] = []
@@ -721,9 +707,9 @@ def materialize_admitted_day(
     is the whole reason deferral needs no retry state. The recorded
     ``admission_basis`` is the decision's own basis, so a row always says
     which branch created it. Sole caller:
-    :func:`materialize_missing_truth_days`; regeneration and the timezone
-    rebuild keep using the ungated :func:`materialize_daily_truth`, because
-    gating a rewrite would strand a ``stale = 1`` row forever.
+    :func:`materialize_missing_truth_days`; regeneration keeps using the
+    ungated :func:`materialize_daily_truth`, because gating a rewrite would
+    strand a ``stale = 1`` row forever.
 
     ``tz_generation_id`` is REQUIRED, matching :func:`_evaluate_day`: the
     caller resolves the published generation once per chunk, so this
@@ -810,7 +796,7 @@ def materialize_missing_truth_days(
     window, and must reach the retry ladder instead of silently skipping the
     whole window.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     timezone = _generation_timezone(conn, generation_id)
     days = missing_truth_days(
         conn,
@@ -871,27 +857,6 @@ def materialize_missing_truth_days(
     return attempted
 
 
-def load_daily_truth(
-    conn: sqlite3.Connection, *, site_id: int, local_date: str
-) -> list[sqlite3.Row]:
-    """Published-generation truth rows for one (site, local day).
-
-    Generation-bound through the shared accessor — rows of a building or
-    retired generation are never returned.
-    """
-    return conn.execute(
-        f"""
-        SELECT *
-        FROM daily_truth dt
-        WHERE dt.site_id = ?
-          AND dt.local_date = ?
-          AND {published_generation_clause("dt")}
-        ORDER BY dt.quantity
-        """,
-        (site_id, local_date),
-    ).fetchall()
-
-
 def divergent_truth_in_horizon(
     conn: sqlite3.Connection,
     *,
@@ -932,7 +897,7 @@ def divergent_truth_in_horizon(
 
     Read-only by construction: :func:`_evaluate_day` only reads and takes
     the generation as a REQUIRED argument, so this can never reach
-    ``ensure_published_generation`` and never writes. Zero cost on a clean
+    ``ensure_site_generation`` and never writes. Zero cost on a clean
     night — the candidate query is one lookup on the partial index
     ``idx_daily_truth_stale`` and returns nothing.
     """

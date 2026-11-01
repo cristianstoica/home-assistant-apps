@@ -41,7 +41,7 @@ from wxverify import config
 from wxverify.__main__ import main
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 _CLOSE_TABLES = (
     "close_attempts",
@@ -130,7 +130,7 @@ def _build_v12_file(
     # seeds it for pre-existing sites. Seeding it here matches both paths;
     # it is never set by a migration on this file, because the site is
     # inserted after run_migrations already ran.
-    ensure_published_generation(conn, int(site_id))
+    ensure_site_generation(conn, int(site_id))
     stations: dict[str, int] = {}
     for pws_id in ("ISTATION01", "ISTATION02"):
         station_id = conn.execute(

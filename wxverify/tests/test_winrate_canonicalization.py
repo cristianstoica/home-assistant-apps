@@ -27,7 +27,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.effective import active_competitor_clause
 from wxverify.scoring.leaderboard import cutoff_for_window
 from wxverify.scoring.winrate import winrate
@@ -220,7 +220,7 @@ def _add_pair(
             abs_error,
             abs_error,
             abs_error**2,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 

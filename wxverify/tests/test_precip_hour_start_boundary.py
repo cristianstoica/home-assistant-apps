@@ -6,8 +6,7 @@ written under the OLD, end-of-hour label) and stores it as the
 ``PRECIP_HOUR_START_BOUNDARY_KEY`` runtime-state key. Any Open-Meteo/
 meteoblue rain sample fetched at or before that stamp -- including a NULL or
 unparseable stamp -- is excluded from pairing, serving and replay by
-``precip_label_eligible_sql``. The step also deletes stale precip pairs and
-score-cache rows and restarts building timezone-correction generations.
+``precip_label_eligible_sql``.
 
 Every new symbol is imported inside the test body that needs it, so a
 missing or misnamed symbol fails only that test, never the whole module at
@@ -19,7 +18,6 @@ and no internal ticket number appears in a comment.
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from pathlib import Path
 
@@ -30,7 +28,6 @@ from wxverify.db.runtime_state import (
     delete_runtime_state,
     get_runtime_state,
     set_runtime_state,
-    set_runtime_state_now,
 )
 
 # ---------------------------------------------------------------------------
@@ -154,7 +151,7 @@ def _insert_pair(
     observed: float = 10.0,
 ) -> int:
     """A copy of ``test_forecast_extrema_coverage._insert_pair``."""
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
     error = forecast - observed
     cur = conn.execute(
@@ -178,7 +175,7 @@ def _insert_pair(
             error,
             abs(error),
             error * error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
     return int(cur.lastrowid)
@@ -675,7 +672,7 @@ def _build_backup_bytes(path: Path, *, boundary_key_value: str | None) -> bytes:
         valid_at="2026-01-01T13:00:00Z",
         value=0.0,
     )
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
 
     conn.execute(
         """
@@ -686,7 +683,7 @@ def _build_backup_bytes(path: Path, *, boundary_key_value: str | None) -> bytes:
         VALUES (?, ?, 'precip', '2026-01-01T00:00:00Z', '2026-01-01T13:00:00Z',
                 13, 0, 1.0, 0.0, 1.0, 1.0, 1.0, ?)
         """,
-        (site_id, om, ensure_published_generation(conn, site_id)),
+        (site_id, om, ensure_site_generation(conn, site_id)),
     )
     conn.commit()
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -774,144 +771,6 @@ def test_m6_import_recomputes_boundary_for_an_old_backup_but_not_a_new_one(
         assert eligible_count2 == 1
     finally:
         close_db()
-
-
-# ---------------------------------------------------------------------------
-# M7 -- atomicity
-# ---------------------------------------------------------------------------
-
-_INJECT_TRIGGER_SQL = """
-CREATE TEMP TRIGGER inject_failure BEFORE DELETE ON main.score_cache
-WHEN OLD.variable = 'precip'
-BEGIN
-  SELECT RAISE(ABORT, 'injected');
-END
-"""
-
-
-def _snapshot(conn: sqlite3.Connection) -> dict[str, list[tuple]]:
-    tables = (
-        "forecast_samples",
-        "forecast_pairs",
-        "score_cache",
-        "jobs",
-        "runtime_state",
-        "timezone_generations",
-    )
-    snap = {
-        t: [tuple(r) for r in conn.execute(f"SELECT * FROM {t} ORDER BY rowid")]
-        for t in tables
-    }
-    snap["user_version"] = [conn.execute("PRAGMA user_version").fetchone()[0]]
-    return snap
-
-
-def test_m7_boundary_step_rolls_back_atomically_on_failure(tmp_path: Path) -> None:
-    # The boundary step must roll back atomically on failure, leaving every
-    # marker -- user_version, boundary key, pairs, cache -- unchanged.
-    from wxverify.db.migrations import (  # noqa: F401
-        TARGET_USER_VERSION,
-        record_precip_hour_start_boundary,
-    )
-    from wxverify.scoring.cache import upsert_score_cache
-    from wxverify.scoring.metrics import MetricResult
-
-    path = tmp_path / "atomic.db"
-
-    # Settle pass: open and close once so any write-on-every-open step runs
-    # before the snapshot.
-    settle = _connect(str(path))
-    run_migrations(settle)
-    settle.commit()
-    settle.close()
-
-    conn = _connect(str(path))
-    site_id = _make_site(conn, enabled=1)
-    om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    _insert_sample(
-        conn,
-        site_id=site_id,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z",
-        value=1.0,
-        fetched_at="2026-01-01T10:00:00Z",
-    )
-    _insert_observation(
-        conn,
-        site_id=site_id,
-        variable="precip",
-        valid_at="2026-01-01T13:00:00Z",
-        value=0.0,
-    )
-    _insert_pair(
-        conn,
-        site_id=site_id,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z",
-        lead_hours=13,
-        day_ahead=0,
-        forecast=1.0,
-        observed=0.0,
-    )
-    upsert_score_cache(
-        conn,
-        site_id=site_id,
-        feed_id=om,
-        variable="precip",
-        day_ahead=0,
-        window_key="w:7",
-        result=MetricResult(n=1, confident=False),
-        computed_at="2026-01-01T12:00:00Z",
-    )
-    from wxverify.db.tz_generations import start_retrospective_correction
-
-    start_retrospective_correction(conn, site_id, "UTC")
-    conn.commit()
-
-    # (i) every marker present: a reopen changes nothing.
-    before_i = _snapshot(conn)
-    conn.close()
-    reopened = _connect(str(path))
-    run_migrations(reopened)
-    reopened.commit()
-    assert _snapshot(reopened) == before_i
-    reopened.close()
-
-    # (ii) delete the boundary key and roll user_version back to N.
-    conn = _connect(str(path))
-    delete_runtime_state(conn, _BOUNDARY_KEY)
-    conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION - 1}")
-    conn.commit()
-    snapshot_before_failure = _snapshot(conn)
-
-    # (iii) inject the failure and confirm the rollback.
-    conn.execute(_INJECT_TRIGGER_SQL)
-    with pytest.raises(sqlite3.IntegrityError, match="injected"):
-        run_migrations(conn)
-    assert conn.in_transaction is False
-    assert _snapshot(conn) == snapshot_before_failure
-    assert get_runtime_state(conn, _BOUNDARY_KEY) is None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION - 1
-
-    # (iv) drop the trigger and run again: it finishes this time.
-    conn.execute("DROP TRIGGER inject_failure")
-    run_migrations(conn)
-    conn.commit()
-    pair_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM forecast_pairs WHERE variable='precip'"
-    ).fetchone()["n"]
-    cache_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM score_cache WHERE variable='precip'"
-    ).fetchone()["n"]
-    assert pair_count == 0
-    assert cache_count == 0
-    assert get_runtime_state(conn, _BOUNDARY_KEY) is not None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == TARGET_USER_VERSION
-    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1040,373 +899,6 @@ def test_m8_loader_gate_sits_before_the_row_number_pick() -> None:
         since_valid_at="2026-01-01T00:00:00Z",
     )
     assert null_count == 1
-
-
-# ---------------------------------------------------------------------------
-# M9 -- the deletion scope
-# ---------------------------------------------------------------------------
-
-
-def test_m9_affected_pairs_deleted_in_every_generation_others_kept() -> None:
-    # The assertions below require the Open-Meteo, meteoblue and
-    # multimodel-mean precip pairs to be GONE across every generation, so a
-    # no-op step fails them.
-    from wxverify.db.migrations import record_precip_hour_start_boundary
-    from wxverify.db.tz_generations import start_retrospective_correction
-
-    conn = _make_db()
-    _clear_boundary_and_seed(conn)
-    site_id = 1
-    om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    meteoblue = _feed_id(conn, "meteoblue", "multimodel")
-    mean = _feed_id(conn, "virtual", "_multimodel_mean")
-    persistence = _feed_id(conn, "virtual", "_persistence")
-    google = _feed_id(conn, "google", "blend")
-
-    published_pair = _insert_pair(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z",
-        lead_hours=13,
-        day_ahead=0,
-        forecast=1.0,
-    )
-    meteoblue_pair = _insert_pair(
-        conn,
-        feed_id=meteoblue,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z",
-        lead_hours=14,
-        day_ahead=0,
-        forecast=1.0,
-    )
-    mean_pair = _insert_pair(
-        conn,
-        feed_id=mean,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T15:00:00Z",
-        lead_hours=15,
-        day_ahead=0,
-        forecast=1.0,
-    )
-    persistence_pair = _insert_pair(
-        conn,
-        feed_id=persistence,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T16:00:00Z",
-        lead_hours=16,
-        day_ahead=0,
-        forecast=1.0,
-    )
-    google_pair = _insert_pair(
-        conn,
-        feed_id=google,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T17:00:00Z",
-        lead_hours=17,
-        day_ahead=0,
-        forecast=1.0,
-    )
-    temp_pair = _insert_pair(
-        conn,
-        feed_id=om,
-        variable="temperature",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T18:00:00Z",
-        lead_hours=18,
-        day_ahead=0,
-        forecast=10.0,
-    )
-
-    generation_id = start_retrospective_correction(conn, site_id, "UTC")
-    from wxverify.db.queue import enqueue_if_absent
-    from wxverify.db.tz_generations import correction_job_key
-
-    enqueue_if_absent(
-        conn,
-        "timezone_correction",
-        site_id,
-        correction_job_key(generation_id),
-        {"generation_id": generation_id},
-    )
-    building_om_pair = conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours,
-             day_ahead, forecast, observed, error, abs_error, sq_error,
-             tz_generation_id)
-        VALUES (?, ?, 'precip', '2026-01-01T00:00:00Z', '2026-01-01T19:00:00Z',
-                19, 0, 1.0, 0.0, 1.0, 1.0, 1.0, ?)
-        """,
-        (site_id, om, generation_id),
-    ).lastrowid
-
-    record_precip_hour_start_boundary(conn)
-
-    remaining = {
-        int(r["id"]) for r in conn.execute("SELECT id FROM forecast_pairs").fetchall()
-    }
-    assert published_pair not in remaining
-    assert meteoblue_pair not in remaining
-    assert mean_pair not in remaining
-    assert int(building_om_pair) not in remaining
-    assert persistence_pair in remaining
-    assert google_pair in remaining
-    assert temp_pair in remaining
-
-
-# ---------------------------------------------------------------------------
-# M11 -- score cache + rescore jobs
-# ---------------------------------------------------------------------------
-
-
-def test_m11_precip_cache_cleared_and_one_rescore_job_per_enabled_site() -> None:
-    # The step must clear only the precip score-cache rows and enqueue
-    # exactly one rescore job per enabled site.
-    from wxverify.db.migrations import record_precip_hour_start_boundary
-    from wxverify.scoring.cache import upsert_score_cache
-    from wxverify.scoring.metrics import MetricResult
-
-    conn = _make_db()
-    _clear_boundary_and_seed(conn)
-    enabled_site = 1
-    disabled_site = _make_site(conn, site_id=2, name="ISTATIONY1", enabled=0)
-    om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-
-    upsert_score_cache(
-        conn,
-        site_id=enabled_site,
-        feed_id=om,
-        variable="precip",
-        day_ahead=0,
-        window_key="w:7",
-        result=MetricResult(n=1, confident=False),
-        computed_at="2026-01-01T12:00:00Z",
-    )
-    upsert_score_cache(
-        conn,
-        site_id=disabled_site,
-        feed_id=om,
-        variable="precip",
-        day_ahead=0,
-        window_key="w:7",
-        result=MetricResult(n=1, confident=False),
-        computed_at="2026-01-01T12:00:00Z",
-    )
-    upsert_score_cache(
-        conn,
-        site_id=enabled_site,
-        feed_id=om,
-        variable="temperature",
-        day_ahead=0,
-        window_key="w:7",
-        result=MetricResult(n=1, confident=False),
-        computed_at="2026-01-01T12:00:00Z",
-    )
-
-    record_precip_hour_start_boundary(conn)
-
-    precip_rows = conn.execute(
-        "SELECT COUNT(*) AS n FROM score_cache WHERE variable='precip'"
-    ).fetchone()["n"]
-    assert precip_rows == 0
-    other_rows = conn.execute(
-        "SELECT COUNT(*) AS n FROM score_cache WHERE variable='temperature'"
-    ).fetchone()["n"]
-    assert other_rows == 1
-    assert _pending_job_count(conn, "pair_and_score", enabled_site) == 1
-    assert _pending_job_count(conn, "pair_and_score", disabled_site) == 0
-
-
-# ---------------------------------------------------------------------------
-# M12 -- building generations restarted
-# ---------------------------------------------------------------------------
-
-
-def test_m12_building_generations_restarted() -> None:
-    # A building timezone-correction generation must be restarted by the
-    # boundary step.
-    from wxverify.db.migrations import record_precip_hour_start_boundary
-    from wxverify.db.tz_generations import (
-        correction_heartbeat_key,
-        correction_state_key,
-        start_retrospective_correction,
-    )
-    from wxverify.worker.tz_correction import advance_correction
-
-    conn = _make_db()
-    _clear_boundary_and_seed(conn)
-    site_id = 1
-    generation_id = start_retrospective_correction(conn, site_id, "UTC")
-    set_runtime_state(
-        conn,
-        correction_state_key(generation_id),
-        json.dumps({"phase": "days", "attempts": 2}),
-    )
-    set_runtime_state_now(conn, correction_heartbeat_key(generation_id))
-    conn.commit()
-
-    record_precip_hour_start_boundary(conn)
-
-    assert get_runtime_state(conn, correction_state_key(generation_id)) is None
-    assert get_runtime_state(conn, correction_heartbeat_key(generation_id)) is None
-    assert _pending_job_count(conn, "timezone_correction") == 1
-
-    conn.execute("BEGIN IMMEDIATE")
-    advance_correction(conn, site_id, {"generation_id": generation_id})
-    conn.execute("COMMIT")
-    blob = json.loads(
-        get_runtime_state(conn, correction_state_key(generation_id)) or "{}"
-    )
-    assert blob["attempts"] == 1
-
-    # Case (b): complete the start call's own queued job, then run the step
-    # again -- still exactly one pending job (the restart's own enqueue).
-    # 0.16.12: the first call already wrote the boundary key, so without
-    # clearing it a second call returns at the key gate before it ever
-    # reaches the restart logic (plan §19.6).
-    _complete_jobs(conn, "timezone_correction")
-    _clear_boundary_and_seed(conn)
-    record_precip_hour_start_boundary(conn)
-    assert _pending_job_count(conn, "timezone_correction") == 1
-
-
-# ---------------------------------------------------------------------------
-# M13 -- the generation rebuild
-# ---------------------------------------------------------------------------
-
-
-def test_m13_generation_rebuild_writes_pairs_for_the_four_eligible_samples() -> None:
-    # rebuild_generation_day's real-pair rebuild must apply the same
-    # eligibility clause, so only the four eligible M3-style samples pair.
-    from datetime import date
-
-    from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
-    from wxverify.db.tz_generations import start_retrospective_correction
-    from wxverify.scoring.tz_rebuild import rebuild_generation_day
-
-    conn = _make_db()
-    site_id = 1
-    om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    meteoblue = _feed_id(conn, "meteoblue", "multimodel")
-    google = _feed_id(conn, "google", "blend")
-    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, _K)
-    generation_id = start_retrospective_correction(conn, site_id, "UTC")
-
-    valid_ats = [
-        "2026-01-01T13:00:00Z",
-        "2026-01-01T14:00:00Z",
-        "2026-01-01T15:00:00Z",
-        "2026-01-01T16:00:00Z",
-        "2026-01-01T17:00:00Z",
-        "2026-01-01T18:00:00Z",
-        "2026-01-01T19:00:00Z",
-    ]
-    for valid_at in valid_ats:
-        _insert_observation(conn, variable="precip", valid_at=valid_at, value=0.0)
-    _insert_observation(conn, variable="temperature", valid_at=valid_ats[5], value=10.0)
-
-    _insert_sample(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[0],
-        value=1.0,
-        fetched_at=_K,
-    )
-    _insert_sample(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[1],
-        value=1.0,
-        fetched_at="2026-01-01T11:00:00Z",
-    )
-    _insert_sample(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=valid_ats[2],
-        value=1.0,
-        fetched_at=None,
-    )
-    eligible_om_valid_at = valid_ats[3]
-    _insert_sample(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_om_valid_at,
-        value=1.0,
-        fetched_at="2026-01-01T12:00:01Z",
-    )
-    eligible_meteoblue_valid_at = valid_ats[4]
-    _insert_sample(
-        conn,
-        feed_id=meteoblue,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_meteoblue_valid_at,
-        value=1.0,
-        fetched_at="2026-01-01T12:00:01Z",
-    )
-    eligible_temp_valid_at = valid_ats[5]
-    _insert_sample(
-        conn,
-        feed_id=om,
-        variable="temperature",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_temp_valid_at,
-        value=10.0,
-        fetched_at="2026-01-01T11:00:00Z",
-    )
-    eligible_google_valid_at = valid_ats[6]
-    _insert_sample(
-        conn,
-        feed_id=google,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at=eligible_google_valid_at,
-        value=1.0,
-        fetched_at="2026-01-01T11:00:00Z",
-    )
-
-    rebuild_generation_day(
-        conn,
-        site_id=site_id,
-        generation_id=generation_id,
-        timezone="UTC",
-        day=date(2026, 1, 1),
-        count=False,
-    )
-
-    # 0.16.12: a generation also carries the `_persistence` virtual feed's
-    # own lagged pairs, so the real-feed rows must be isolated by excluding
-    # virtual feeds rather than reading valid_at alone (plan §19.6).
-    rows = conn.execute(
-        """
-        SELECT fp.feed_id, fp.variable, fp.valid_at
-        FROM forecast_pairs fp
-        JOIN feeds f ON f.id = fp.feed_id
-        WHERE fp.tz_generation_id = ? AND f.is_virtual = 0
-        """,
-        (generation_id,),
-    ).fetchall()
-    assert {(r["feed_id"], r["variable"], r["valid_at"]) for r in rows} == {
-        (om, "precip", eligible_om_valid_at),
-        (meteoblue, "precip", eligible_meteoblue_valid_at),
-        (om, "temperature", eligible_temp_valid_at),
-        (google, "precip", eligible_google_valid_at),
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1828,98 +1320,6 @@ def test_m17c_one_eligible_hour_never_substitutes_for_the_day() -> None:
     assert tile.precip.total_mm is None
     assert tile.precip.wet_hours is None
     assert tile.precip.meta.feeds == []
-
-
-def test_m17d_mean_pair_drops_the_excluded_contributor_and_keeps_no_group_of_one() -> (
-    None
-):
-    # The step deletes every Open-Meteo rain pair, so at 13:00 only Google is
-    # left and the mean writes no pair (never a group of one); at 14:00 Google
-    # and Visual Crossing give the one remaining mean pair.
-    from wxverify.db.migrations import record_precip_hour_start_boundary
-    from wxverify.scoring.multimodel import materialize_multimodel_mean
-
-    conn = _make_db()
-    _clear_boundary_and_seed(conn)
-    site_id = 1
-    om = _feed_id(conn, "open-meteo", "ecmwf_ifs")
-    google = _feed_id(conn, "google", "blend")
-    vc = _feed_id(conn, "visualcrossing", "blend")
-    _subscribe(conn, site_id, google)
-    _subscribe(conn, site_id, vc)
-
-    _insert_pair(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z",
-        lead_hours=13,
-        day_ahead=0,
-        forecast=3.0,
-        observed=0.0,
-    )
-    _insert_pair(
-        conn,
-        feed_id=google,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T13:00:00Z",
-        lead_hours=13,
-        day_ahead=0,
-        forecast=1.0,
-        observed=0.0,
-    )
-    _insert_pair(
-        conn,
-        feed_id=om,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z",
-        lead_hours=14,
-        day_ahead=0,
-        forecast=3.0,
-        observed=0.0,
-    )
-    _insert_pair(
-        conn,
-        feed_id=google,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z",
-        lead_hours=14,
-        day_ahead=0,
-        forecast=1.0,
-        observed=0.0,
-    )
-    _insert_pair(
-        conn,
-        feed_id=vc,
-        variable="precip",
-        issued_at="2026-01-01T00:00:00Z",
-        valid_at="2026-01-01T14:00:00Z",
-        lead_hours=14,
-        day_ahead=0,
-        forecast=2.0,
-        observed=0.0,
-    )
-
-    record_precip_hour_start_boundary(conn)
-    materialize_multimodel_mean(conn, site_id)
-
-    rows = conn.execute(
-        """
-        SELECT valid_at, forecast, contributors FROM forecast_pairs
-        WHERE feed_id = (
-            SELECT id FROM feeds WHERE source='virtual' AND model='_multimodel_mean'
-        )
-          AND variable = 'precip'
-        """
-    ).fetchall()
-    assert len(rows) == 1
-    assert rows[0]["valid_at"] == "2026-01-01T14:00:00Z"
-    assert rows[0]["forecast"] == 1.5
-    assert rows[0]["contributors"] == 2
 
 
 # ---------------------------------------------------------------------------

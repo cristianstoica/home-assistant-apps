@@ -12,7 +12,6 @@ from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.db.queue import enqueue_if_absent_with_cooldown
 from wxverify.db.site_days import daily_close_on
 from wxverify.db.snapshot import read_snapshot
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.cache import ScoreCacheRow, is_cache_fresh
 from wxverify.scoring.effective import (
     MAX_DAY_AHEAD,
@@ -260,7 +259,6 @@ def _expected_active_cells(
               AND fp.feed_id = a.feed_id
               AND fp.variable = v.variable
               AND fp.day_ahead = l.day_ahead
-              AND {published_generation_clause("fp")}
               {window_clause}
         )
         """,
@@ -386,7 +384,6 @@ def _live_composite(
         WHERE fp.site_id = ?
           {window_clause}
           AND {active_competitor_clause(site_expr="fp.site_id")}
-          AND {published_generation_clause("fp")}
         ORDER BY f.source, f.model, fp.variable, fp.day_ahead
         """,
         params,

@@ -21,18 +21,14 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from datetime import UTC, date, datetime
 
 import httpx
 
 from tests.helpers import asof_conn, asof_make_site
 from wxverify.core.timeutil import day_ahead
-from wxverify.db.tz_generations import start_retrospective_correction
 from wxverify.feeds.open_meteo import OpenMeteoAdapter, _historical_hourly_names
 from wxverify.feeds.seam import ForecastRequest
-from wxverify.forecast.aggregate import display_day_index
 from wxverify.scoring.pairing import pair_real_models
-from wxverify.scoring.tz_rebuild import rebuild_generation_day
 
 _UTC = "UTC"
 
@@ -319,106 +315,6 @@ def test_day_ahead_bucket_rule_holds_across_dst_transitions() -> None:
     for tz, issued_at, valid_180, valid_204 in cases:
         assert day_ahead(issued_at, valid_180, tz) == 7
         assert day_ahead(issued_at, valid_204, tz) == 8
-
-
-# ---------------------------------------------------------------------------
-# 13. Two origins, not one
-# ---------------------------------------------------------------------------
-
-
-def test_display_day_and_pairing_bucket_diverge_for_a_stale_issuance() -> None:
-    """A sample that is DISPLAY day 7 (measured from ``now``) but
-    PAIRING/REBUILD ``day_ahead`` 8 (measured from issuance, outside the
-    0-7 bucket both pairing paths share): issued 2026-01-01T00:00, valid
-    2026-01-09T03:00 (lead 195h). Rendered on tile 7 when ``now`` is
-    2026-01-02 -- an implementation that measured display from issuance
-    instead (matching pairing) would place it on day 8, past
-    ``DAY_COUNT`` (8, indices 0-7), and it would never render at all
-    rather than rendering on tile 7 as it actually does. The two
-    measurements genuinely diverge here.
-
-    Excluded from BOTH paths that share the ``_MAX_DAY_AHEAD``/bucket-7
-    rule: the live path (``compute_real_model_pairs``' bucket filter) and the
-    timezone-rebuild path (``tz_rebuild.rebuild_generation_day`` ->
-    ``_rebuild_real_pairs``, ``_MAX_DAY_AHEAD`` at ``tz_rebuild.py:31``,
-    applied at ``:218``). A paired admitted sample (lead 180h, bucket 7,
-    same issuance) proves each path's guard is live rather than vacuously
-    dropping everything it sees.
-    """
-    issued_at = "2026-01-01T00:00:00Z"
-    valid_admitted = "2026-01-08T00:00:00Z"  # issued_at + 180h, bucket 7
-    valid_excluded = "2026-01-09T03:00:00Z"  # issued_at + 195h, bucket 8
-    now = "2026-01-02T00:00:00Z"
-    now_dt = datetime.fromisoformat(now.replace("Z", "+00:00")).astimezone(UTC)
-
-    assert day_ahead(issued_at, valid_admitted, _UTC) == 7
-    assert day_ahead(issued_at, valid_excluded, _UTC) == 8
-    assert display_day_index(valid_excluded, timezone=_UTC, now=now_dt) == 7
-
-    conn = asof_conn()
-    site_id = asof_make_site(conn, "site-alpha")
-    ecmwf_id = _feed_id(conn, source="open-meteo", model="ecmwf_ifs")
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_admitted,
-        lead_hours=180,
-    )
-    _insert_sample_and_observation(
-        conn,
-        site_id=site_id,
-        feed_id=ecmwf_id,
-        issued_at=issued_at,
-        valid_at=valid_excluded,
-        lead_hours=195,
-    )
-
-    # -- live pairing path: pair_real_models -------------------------------
-    written = pair_real_models(conn, site_id=site_id)
-    assert written == 1
-    live_valid_ats = {
-        str(row["valid_at"])
-        for row in conn.execute(
-            "SELECT valid_at FROM forecast_pairs WHERE site_id = ?", (site_id,)
-        ).fetchall()
-    }
-    assert live_valid_ats == {valid_admitted}
-
-    # -- timezone-rebuild path: rebuild_generation_day / _MAX_DAY_AHEAD ----
-    generation_id = start_retrospective_correction(conn, site_id, _UTC)
-    rebuild_generation_day(
-        conn,
-        site_id=site_id,
-        generation_id=generation_id,
-        timezone=_UTC,
-        day=date(2026, 1, 8),
-        count=False,
-    )
-    rebuild_generation_day(
-        conn,
-        site_id=site_id,
-        generation_id=generation_id,
-        timezone=_UTC,
-        day=date(2026, 1, 9),
-        count=False,
-    )
-    # Scoped to the real ecmwf_ifs feed: the rebuild also derives
-    # persistence pairs (virtual feed) from the lagged observations these
-    # two samples happen to seed, which is unrelated to the guard under
-    # test here.
-    rebuilt_valid_ats = {
-        str(row["valid_at"])
-        for row in conn.execute(
-            """
-            SELECT valid_at FROM forecast_pairs
-            WHERE tz_generation_id = ? AND feed_id = ?
-            """,
-            (generation_id, ecmwf_id),
-        ).fetchall()
-    }
-    assert rebuilt_valid_ats == {valid_admitted}
 
 
 # ---------------------------------------------------------------------------

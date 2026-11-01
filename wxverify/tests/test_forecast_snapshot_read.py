@@ -47,7 +47,7 @@ from wxverify import config
 from wxverify.core.timeutil import floor_hour, isoformat_utc, utc_now
 from wxverify.db.connection import _READ_POOL_SIZE, Database, get_db
 from wxverify.db.snapshot import read_snapshot
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.data import forecast_ranking_with_status
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
@@ -135,7 +135,7 @@ def _seed_s0(conn: sqlite3.Connection) -> Seed:
                     error,
                     abs(error),
                     error * error,
-                    ensure_published_generation(conn, site_id),
+                    ensure_site_generation(conn, site_id),
                 ),
             )
 

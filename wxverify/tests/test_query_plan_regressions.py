@@ -283,33 +283,6 @@ def test_idx_pairs_winrate_column_order_matches_the_query_shape() -> None:
     ]
 
 
-def test_winrate_published_pointer_resolves_as_a_runtime_state_key_probe() -> None:
-    # The published-generation binding embeds a correlated scalar subquery on
-    # runtime_state ('tz_generation_published:' || fp.site_id). It runs once
-    # per candidate pairs row, so it must stay a key probe of runtime_state's
-    # primary key -- a per-row SCAN of runtime_state would make every
-    # pairs-reading statement O(pairs x runtime_state). Asserted as a
-    # structural relationship (probe present, scan absent), not exact EQP
-    # phrasing, which is build-specific.
-    conn = _fresh_conn()
-    sql = winrate_sql("")
-    params = (1, 1, 1, "temperature", 1)
-    plan = _plan(conn, sql, params)
-    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
-    assert not any("SCAN rs" in line for line in plan), plan
-
-    # Negative control: defeat the key probe (CAST strips the equality from
-    # the primary key) and the very same statement degrades to SCAN rs --
-    # proving the healthy assertion above is discriminating, not vacuous.
-    degraded_sql = sql.replace(
-        "rs.key = 'tz_generation_published:' || fp.site_id",
-        "CAST(rs.key AS TEXT) = 'tz_generation_published:' || fp.site_id",
-    )
-    assert degraded_sql != sql, "clause text drifted; update this control"
-    degraded_plan = _plan(conn, degraded_sql, params)
-    assert any("SCAN rs" in line for line in degraded_plan), degraded_plan
-
-
 def test_worker_status_count_statements_stay_index_only_scans() -> None:
     conn = _fresh_conn()
     samples_plan = _plan(conn, FORECAST_SAMPLES_COUNT_SQL, ())
@@ -851,10 +824,9 @@ def test_fingerprint_sql_still_matches_the_pinned_text() -> None:
         "        WHERE site_id = ? AND tz_generation_id = ?\n"
         "        ORDER BY local_date, quantity" in source
     )
-    # The pointer probe reaches the request path through
-    # published_generation_id -> get_runtime_state.
-    assert _TZ_POINTER_SQL in inspect.getsource(wxverify.db.runtime_state)
-    assert "published_generation_id(conn, site_id)" in source
+    # The generation resolution reaches the request path through
+    # site_generation_id's own SELECT on timezone_generations.
+    assert "site_generation_id(conn, site_id)" in source
 
 
 def test_fingerprint_observation_count_seeks_by_site_never_scans() -> None:
@@ -1291,18 +1263,13 @@ def test_eqp_claim_partition_clauses_keep_todays_claim_plan() -> None:
 def test_existing_mean_rows_sql_stays_indexed_site_scoped() -> None:
     """EQP -- the multimodel diff's site-scoped X read (``scoring/split.py``
     apply, ``scoring/multimodel.py:compute_multimodel_mean``) must seek
-    ``forecast_pairs`` on ``(site_id, feed_id)`` and the published-generation
-    pointer probe on ``runtime_state``'s key, never a bare table scan of
-    either -- the same shape the winrate query pins above.
+    ``forecast_pairs`` on ``(site_id, feed_id)``, never a bare table scan.
     """
     conn = _fresh_conn()
     plan = _plan(conn, existing_mean_rows_sql(site_scoped=True, day_clause="1"), (1, 1))
-    assert any(
-        "SEARCH forecast_pairs" in line and "site_id=?" in line for line in plan
-    ), plan
-    assert any("SEARCH rs" in line and "key=?" in line for line in plan), plan
-    assert not any("SCAN forecast_pairs" in line for line in plan), plan
-    assert not any("SCAN rs" in line for line in plan), plan
+    assert plan == [
+        "SEARCH forecast_pairs USING INDEX idx_pairs_cell (site_id=? AND feed_id=?)"
+    ], plan
 
     # Negative control: the site-unscoped form has no equality predicate to
     # seek forecast_pairs on, so it degrades to a bare scan -- proving the
@@ -1503,8 +1470,8 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
     assert plan == [
         "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)",
-        # NOT EXISTS (forecast_pairs ...), with published_generation_clause's
-        # runtime_state pointer lookup (alias rs) nested inside it.
+        # NOT EXISTS (forecast_pairs ...); the generation-pointer lookup
+        # this subquery once nested is gone from the dedup check now.
         "CORRELATED SCALAR SUBQUERY 2",
         "SEARCH fp USING COVERING INDEX sqlite_autoindex_forecast_pairs_1"
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",

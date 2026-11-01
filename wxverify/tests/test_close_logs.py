@@ -62,7 +62,7 @@ from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro
 from wxverify.db.migrations import run_migrations
 from wxverify.db.queue import claim_next_job
 from wxverify.db.site_days import begin_close, fail_close, finish_close, mark_missed
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.close_scores import score_day as _real_score_day
 from wxverify.worker.day_values import GapFillResult, StationFill
 from wxverify.worker.processor import run_claimed_job
@@ -679,7 +679,7 @@ def _build_v12_file(
     # seeds it for pre-existing sites. Seeding it here matches both paths;
     # it is never set by a migration on this file, because the site is
     # inserted after run_migrations already ran.
-    ensure_published_generation(conn, int(site_id))
+    ensure_site_generation(conn, int(site_id))
     stations: dict[str, int] = {}
     for pws_id in ("ISTATION01", "ISTATION02"):
         station_id = conn.execute(
@@ -879,7 +879,7 @@ def test_l2_another_generations_daily_truth_row_never_changes_the_version(
     local_date, tz_generation_id)`` allows it alongside the published
     generation's five rows). ``close_chain._truth_version`` is then called
     again directly: ``_TRUTH_VERSION_SQL`` filters by
-    ``tz_generation_id = published_generation_id(...)`` (``close_chain.py``
+    ``tz_generation_id = site_generation_id(...)`` (``close_chain.py``
     around :1067-1085), so the extra row of the OTHER generation must never
     enter the hash.
 

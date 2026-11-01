@@ -47,7 +47,7 @@ from tests.helpers import (
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.queue import claim_next_job, reclaim_all_stale
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.monitor import FAILED_JOB_AGE_HOURS, FAILED_SCOPES_SQL
 from wxverify.worker.processor import run_claimed_job
 from wxverify.worker.round import (  # P4 piece 3 (plan §4.4, §4.5, §5.1, §16.1)
@@ -872,7 +872,7 @@ def test_rs12_round_without_a_record_uses_the_latest_records_zone(
 
     site_id = asof_make_site(conn, "rs12-site")
     conn.execute("UPDATE sites SET timezone='Etc/GMT-14' WHERE id=?", (site_id,))
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
 
     d_minus_1 = D - timedelta(days=1)
@@ -955,7 +955,7 @@ def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
     db = init_db(str(db_path))
     conn = db._conn  # noqa: SLF001
     site_id = asof_make_site(conn, "rs13-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_ids = seed_round_schedule_feeds(conn, site_id, subscribe=("X", "Y"))
     conn.execute(
         "UPDATE feeds SET fetch_interval_minutes=1440 WHERE id=?", (feed_ids["Y"],)
@@ -1023,7 +1023,7 @@ def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
     db2 = init_db(str(db_path2))
     conn2 = db2._conn  # noqa: SLF001
     site2 = asof_make_site(conn2, "rs13-site-2")
-    ensure_published_generation(conn2, site2)
+    ensure_site_generation(conn2, site2)
     feed2_ids = seed_round_schedule_feeds(conn2, site2, subscribe=("Z", "G"))
     now2 = datetime(2026, 1, 10, 12, tzinfo=UTC)
     stamp = isoformat_utc(now2 - timedelta(hours=49))
@@ -1100,7 +1100,7 @@ def test_rs14_a_changeover_day_with_no_round_slot(
     conn = db._conn  # noqa: SLF001
 
     site_id = asof_make_site(conn, "rs14-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_ids = seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
     _exclude_seeded_feeds_from_the_round(conn)
 
@@ -1185,7 +1185,7 @@ def test_rs14_ii_d_attempt_starts_on_the_r_0000z_tick(
     conn = db._conn  # noqa: SLF001
 
     site_id = asof_make_site(conn, "rs14ii-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
     _exclude_seeded_feeds_from_the_round(conn)
 

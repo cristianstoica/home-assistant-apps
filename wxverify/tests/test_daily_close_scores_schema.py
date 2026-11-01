@@ -31,7 +31,7 @@ from tests.helpers import NOW, D, asof_conn, asof_make_real_feed, asof_make_site
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import TARGET_USER_VERSION, run_migrations
 from wxverify.db.runtime_state import get_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 # ---------------------------------------------------------------------------
 # Shared fixture plumbing
@@ -110,7 +110,7 @@ def _strip_p4_additions(conn: sqlite3.Connection) -> None:
 
 
 def _insert_verification_run(conn: sqlite3.Connection, site_id: int) -> int:
-    gen_id = ensure_published_generation(conn, site_id)
+    gen_id = ensure_site_generation(conn, site_id)
     cur = conn.execute(
         """
         INSERT INTO verification_runs
@@ -192,8 +192,8 @@ def test_sz1_fresh_and_migrated_v13_files_agree_and_old_rows_survive(
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         assert version == TARGET_USER_VERSION, (
             "M116 -> at this assertion: correct = user_version read from"
-            " TARGET_USER_VERSION (14 in this release; P6 raises it"
-            " further), never a literal, mutant M116 (a new column added in"
+            " TARGET_USER_VERSION (15 in this release), never a literal,"
+            " mutant M116 (a new column added in"
             " a different position on migrate) = the migrated file's"
             " PRAGMA table_xinfo diverges from the fresh file's below even"
             " though both reach the same user_version"

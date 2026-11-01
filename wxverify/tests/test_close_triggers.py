@@ -164,7 +164,6 @@ _TR2_ALLOWED_QUALNAMES = frozenset(
         "enqueue_scoring_run",
         "enqueue_score_rescore",
         "dispatch",
-        "record_precip_hour_start_boundary",
         "_enqueue_due_score_refresh",
     }
 )
@@ -229,9 +228,8 @@ def test_tr2_pair_and_score_literal_confined_to_allowed_call_sites() -> None:
     """TR2: an ``ast`` scan of ``wxverify/`` for the string literal
     ``"pair_and_score"`` finds it only inside the allowed call sites
     (``enqueue_scoring_run``, ``enqueue_score_rescore``, ``dispatch``, the
-    monitor, the health route, the scheduler's backstop and
-    ``record_precip_hour_start_boundary``); every OTHER occurrence is a
-    disallowed, unrouted enqueue site (10)."""
+    monitor, the health route and the scheduler's backstop); every OTHER
+    occurrence is a disallowed, unrouted enqueue site (10)."""
     hits = _find_pair_and_score_literals()
     assert hits, "fixture bug: the literal must occur somewhere in wxverify/"
 

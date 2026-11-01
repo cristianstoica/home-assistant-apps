@@ -142,8 +142,8 @@ def test_op1_close_off_shows_todays_panels(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """OP1 (plan §13.10, §10): close off, the Ops page is today's --
-    "Backfill Progress", "Last obs", the time-zone correction panel (M98).
-    PASSES today: with the close off P5 changes nothing on this page."""
+    "Backfill Progress", "Last obs" (M98). PASSES today: with the close
+    off P5 changes nothing on this page."""
     conn = _init_tmp_db(tmp_path)
     day_close_site(conn, close_on=False)
 
@@ -154,7 +154,6 @@ def test_op1_close_off_shows_todays_panels(
     text = response.text
     assert "Backfill Progress" in text
     assert "Last obs" in text
-    assert 'id="timezone-correction-panel"' in text
 
 
 def test_op2_close_status_shows_every_day_state(
@@ -529,31 +528,6 @@ def test_op9_load_close_status_catches_any_exception(
     assert (
         context.get("backfill") is not None
         or context.get("observation_health") is not None
-    )
-
-
-def test_op10_close_on_never_loads_timezone_correction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """OP10 (plan §13.10, §10.3): with the close on, the time-zone
-    correction panel is not loaded (M107)."""
-    monkeypatch.setattr("wxverify.web.context.utc_now", lambda: NOW)
-    called = {"count": 0}
-
-    def _spy(conn: object, sites: object) -> list[object]:  # noqa: ARG001
-        called["count"] += 1
-        return []
-
-    monkeypatch.setattr("wxverify.web.context.load_timezone_correction", _spy)
-    from wxverify.web.context import load_ops
-
-    conn = asof_conn()
-    day_close_site(conn, close_on=True)
-    load_ops(conn)
-    assert called["count"] == 0, (
-        "M107 -> at this assertion: correct = load_timezone_correction"
-        " never called with the close on, mutant = the time-zone"
-        f" correction panel loaded with the close on; called {called['count']} time(s)"
     )
 
 

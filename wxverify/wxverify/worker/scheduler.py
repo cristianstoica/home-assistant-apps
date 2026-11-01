@@ -212,7 +212,7 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
     scan is enqueued once per local day after T; a completed jobs row for
     the day's key gates re-enqueue.
     """
-    from wxverify.db.tz_generations import ensure_published_generation
+    from wxverify.db.switch import ensure_site_generation
     from wxverify.verification.record import (
         record_day_complete,
         resolve_snapshot_utc,
@@ -240,7 +240,7 @@ def _enqueue_due_forecast_records(conn: sqlite3.Connection) -> None:
         if now < snapshot_utc:
             continue
         day_iso = local_today.isoformat()
-        generation_id = ensure_published_generation(conn, site_id)
+        generation_id = ensure_site_generation(conn, site_id)
         # Three conditions, not one: a completeness predicate stays false
         # all day on an ordinary partial day, and scheduler_tick runs once
         # per worker-loop iteration -- so the window guard and the

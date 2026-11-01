@@ -71,7 +71,6 @@ from wxverify.db.site_days import (
     local_clock_utc,
 )
 from wxverify.db.station_readings import StoreResult, store_readings
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.db.wind_basis import (
     PAIR_MAX_WIND_SQL,
     AuthHold,
@@ -2462,14 +2461,13 @@ def _invalidate_unparseable(
         "wind hour with an unusable time invalidated directly site=%s", site_id
     )
     conn.execute(
-        f"""
+        """
         DELETE FROM forecast_pairs
         WHERE site_id = ? AND variable = 'wind'
           AND (valid_at = ?
                OR (issued_at = ? AND feed_id IN (
                    SELECT id FROM feeds
                    WHERE source = 'virtual' AND model = '_persistence')))
-          AND {published_generation_clause("forecast_pairs")}
         """,
         (site_id, valid_at, valid_at),
     )

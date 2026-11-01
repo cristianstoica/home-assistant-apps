@@ -19,7 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.helpers import asof_conn
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.methodology import ADEQUATE_LEAD_MIN_DAYS
 from wxverify.verification.ranking import (
     DAILY_RANK_ENTITY_TYPE,
@@ -49,7 +49,7 @@ def _run(conn: sqlite3.Connection) -> int:
         VALUES (1, 'site-alpha', 40.0, -105.0, 900.0, 'Etc/GMT+7')
         """
     )
-    generation_id = ensure_published_generation(conn, 1)
+    generation_id = ensure_site_generation(conn, 1)
     # The production write path pins a full snapshot; readers rehydrate a
     # RunConfig from it, so an empty object is not a state a run can be in.
     snapshot = json.dumps(capture_config_snapshot(conn, 1), separators=(",", ":"))

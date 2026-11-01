@@ -39,10 +39,7 @@ from wxverify.db.connection import (
     init_db,
 )
 from wxverify.db.queue import Job
-from wxverify.db.tz_generations import (
-    ensure_published_generation,
-    published_pointer_key,
-)
+from wxverify.db.switch import ensure_site_generation
 from wxverify.worker import processor
 from wxverify.worker.control import JobCancelled, JobDeferred
 from wxverify.worker.current_obs import Health, PollOutcome, persist_poll_result
@@ -73,7 +70,7 @@ def _seed(conn: sqlite3.Connection) -> tuple[int, int]:
     """Common setup (§5.5): a site with a published generation, two feeds
     with a full sample grid for ``_DAY``, and a station."""
     site_id = _make_site(conn, "site-a")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     for model in ("model-a", "model-b"):
         feed_id = _make_feed(conn, model)
         _insert_full_grid(
@@ -456,13 +453,19 @@ def test_record_build_cancelled_without_published_generation(
         t = _snapshot_t()
         monkeypatch.setattr(record_mod, "utc_now", lambda: t + timedelta(minutes=5))
 
+        # The read path (`current_generation_readonly` ->
+        # `site_generation_id`) resolves the site's one generation straight
+        # off its `published` row -- there is no pointer key to delete any
+        # more -- so "no published generation" is now constructed by
+        # deleting that row itself.
+        conn.execute(
+            "DELETE FROM timezone_generations"
+            " WHERE site_id = ? AND state = 'published'",
+            (site_id,),
+        )
         gen_count_before = conn.execute(
             "SELECT COUNT(*) FROM timezone_generations"
         ).fetchone()[0]
-        conn.execute(
-            "DELETE FROM runtime_state WHERE key = ?",
-            (published_pointer_key(site_id),),
-        )
 
         caplog.set_level(logging.WARNING, logger="wxverify.verification.record")
         with pytest.raises(JobCancelled):
@@ -479,15 +482,12 @@ def test_record_build_cancelled_without_published_generation(
         ]
         assert record_warnings == [expected_message]
         assert _row_count(conn, site_id) == 0
+        # The cancelled read path must never fall back to the write path's
+        # `ensure_site_generation` and create one.
         gen_count_after = conn.execute(
             "SELECT COUNT(*) FROM timezone_generations"
         ).fetchone()[0]
         assert gen_count_after == gen_count_before
-        pointer_row = conn.execute(
-            "SELECT value FROM runtime_state WHERE key = ?",
-            (published_pointer_key(site_id),),
-        ).fetchone()
-        assert pointer_row is None
 
     asyncio.run(_run())
 
@@ -677,7 +677,7 @@ def test_record_build_partial_day_fills_in_first_write_wins(
     async def _run() -> None:
         conn = _init_tmp_db(tmp_path)
         site_id = _make_site(conn, "site-a")
-        ensure_published_generation(conn, site_id)
+        ensure_site_generation(conn, site_id)
         feed_id = _make_feed(conn, "model-a")
         cur = conn.execute(
             """

@@ -46,7 +46,7 @@ from wxverify.db.site_days import (
     finish_close,
     start_site_days,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 # ---------------------------------------------------------------------------
 # Seed helpers
@@ -319,7 +319,7 @@ def _build_base(
     obs_skip_hours: frozenset[int] = frozenset(),
 ):
     site_id = day_close_site(conn, close_on=True, with_records=False)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     feeds = {"X": _make_feed(conn, "X"), "Y": _make_feed(conn, "Y")}
     for feed_id in feeds.values():
         _subscribe(conn, site_id, feed_id)

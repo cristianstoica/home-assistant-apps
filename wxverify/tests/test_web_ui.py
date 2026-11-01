@@ -38,7 +38,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.lead import parse_day_ahead
 from wxverify.db.connection import close_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.metrics import strategy_for
 from wxverify.settings.keys import set_setting
@@ -167,7 +167,7 @@ def _seed_cell(
             valid_at,
             lead_hours,
             day_ahead,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
     conn.execute(
@@ -850,7 +850,7 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
             VALUES (?, ?, 'temperature', '2035-02-01T00:00:00Z', ?, 24, 1,
                     12.0, 10.0, 2.0, 2.0, 4.0, ?)
             """,
-            (site_id, feed, valid_at, ensure_published_generation(conn, site_id)),
+            (site_id, feed, valid_at, ensure_site_generation(conn, site_id)),
         )
         conn.execute(
             """
@@ -865,7 +865,7 @@ def test_metric_boundary_continuous_persistence_mse_zero_is_neutral(
                 site_id,
                 persistence,
                 valid_at,
-                ensure_published_generation(conn, site_id),
+                ensure_site_generation(conn, site_id),
             ),
         )
     conn.commit()
@@ -942,7 +942,7 @@ def test_metric_boundary_precip_all_dry_all_correct_is_neutral(
             VALUES (?, ?, 'precip', '2035-03-01T00:00:00Z', ?, 24, 1,
                     0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, 1, ?)
             """,
-            (site_id, feed, valid_at, ensure_published_generation(conn, site_id)),
+            (site_id, feed, valid_at, ensure_site_generation(conn, site_id)),
         )
     conn.commit()
 

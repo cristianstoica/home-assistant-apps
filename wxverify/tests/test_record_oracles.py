@@ -34,11 +34,7 @@ from tests.helpers import (
 from tests.test_forecast_service import _hours
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.core.units import ms_to_kmh
-from wxverify.db.tz_generations import (
-    apply_prospective_change,
-    ensure_published_generation,
-    published_generation_id,
-)
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.forecast.wind_blend import FALLBACK_NOT_ENOUGH_FEEDS
 from wxverify.settings.keys import set_setting
@@ -159,7 +155,7 @@ def _seed_base_fixture(conn: sqlite3.Connection) -> tuple[int, int, int]:
     feed B on knowable pair count (the depth-1 scored-rung winner at T).
     """
     site_id = asof_make_site(conn, "record-oracle-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     # Feed C exists on BOTH sides of every comparison and stays sample-less
@@ -415,72 +411,6 @@ def test_retry_after_post_t_data_confirms_never_replaces() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Oracle 3 — generation binding: the record binds the generation resolved AT
-# T, not the published pointer (§18.7-style, via a prospective change).
-# ---------------------------------------------------------------------------
-
-
-def test_generation_binding_resolves_at_t_not_pointer() -> None:
-    """§14: derivation-time resolution is the published generation whose
-    effective interval contains T. After a prospective change the pointer
-    moves to the new generation immediately, but a record for a day whose T
-    precedes the effective boundary must bind the OLD generation.
-
-    Kills: ``_current_generation`` returning the pointer unconditionally
-    (``return pointer`` — dropping ``resolve_generation_for_instant``).
-    """
-    conn = asof_conn()
-    cur = conn.execute(
-        """
-        INSERT INTO sites (name, forecast_lat, forecast_lon, elevation_m, timezone)
-        VALUES ('record-genbind-site', 40.0, -105.0, 900.0, 'Etc/GMT-3')
-        """
-    )
-    assert cur.lastrowid is not None
-    site_id = int(cur.lastrowid)
-    gen_old = ensure_published_generation(conn, site_id)
-    gen_new = apply_prospective_change(
-        conn, site_id, "Etc/GMT-2", "2035-06-20T00:00:00Z"
-    )
-    assert published_generation_id(conn, site_id) == gen_new
-    # Only sampled identities are written now, so each probed day needs data.
-    _seed_full_grid(conn, site_id, date(2035, 6, 15))
-    _seed_full_grid(conn, site_id, date(2035, 6, 25))
-
-    # Day before the boundary: T resolves inside gen_old's interval.
-    build_forecast_record(
-        conn,
-        site_id,
-        "2035-06-15",
-        now=datetime(2035, 6, 15, 6, 0, tzinfo=UTC),
-    )
-    pre_rows = conn.execute(
-        """
-        SELECT DISTINCT tz_generation_id FROM forecast_of_record
-        WHERE site_id = ? AND snapshot_local_date = '2035-06-15'
-        """,
-        (site_id,),
-    ).fetchall()
-    assert [int(r["tz_generation_id"]) for r in pre_rows] == [gen_old]
-
-    # Paired positive: a day past the boundary binds the new generation.
-    build_forecast_record(
-        conn,
-        site_id,
-        "2035-06-25",
-        now=datetime(2035, 6, 25, 6, 0, tzinfo=UTC),
-    )
-    post_rows = conn.execute(
-        """
-        SELECT DISTINCT tz_generation_id FROM forecast_of_record
-        WHERE site_id = ? AND snapshot_local_date = '2035-06-25'
-        """,
-        (site_id,),
-    ).fetchall()
-    assert [int(r["tz_generation_id"]) for r in post_rows] == [gen_new]
-
-
-# ---------------------------------------------------------------------------
 # Oracle 4 — single writer of `missed`: the daily job refuses a closed
 # window and writes NOTHING; the gap scan then writes the full missed grid,
 # exactly once, and a forced revisit leaves it untouched.
@@ -499,7 +429,7 @@ def test_daily_job_never_writes_missed_gap_scan_writes_full_grid_once() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-missed-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     # Seed the log start: a complete on-time record for _DAY, plus the data
     # that makes every identity of the following day knowable at ITS T -- the
     # missed grid's reasons come from that as-of-T assessment.
@@ -587,7 +517,7 @@ def test_late_write_window_boundary_is_inclusive_on_both_paths() -> None:
 
     conn_daily = asof_conn()
     site_daily = asof_make_site(conn_daily, "record-boundary-daily")
-    ensure_published_generation(conn_daily, site_daily)
+    ensure_site_generation(conn_daily, site_daily)
     _seed_full_grid(conn_daily, site_daily, _DAY)
     build_forecast_record(conn_daily, site_daily, _DAY.isoformat(), now=_t() + boundary)
     rows = conn_daily.execute(
@@ -600,7 +530,7 @@ def test_late_write_window_boundary_is_inclusive_on_both_paths() -> None:
 
     conn_scan = asof_conn()
     site_scan = asof_make_site(conn_scan, "record-boundary-scan")
-    ensure_published_generation(conn_scan, site_scan)
+    ensure_site_generation(conn_scan, site_scan)
     _seed_full_grid(conn_scan, site_scan, _DAY)
     _seed_full_grid(conn_scan, site_scan, _DAY + timedelta(days=1))
     build_forecast_record(
@@ -695,7 +625,7 @@ def test_zero_sample_day_writes_no_rows() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-empty-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     build_forecast_record(
         conn, site_id, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
     )
@@ -710,7 +640,7 @@ def test_zero_sample_day_writes_no_rows() -> None:
     # Paired positive, so the assertion above is not vacuously satisfied by a
     # builder that writes nothing at all: the same day WITH samples is written.
     other = asof_make_site(conn, "record-partial-site")
-    ensure_published_generation(conn, other)
+    ensure_site_generation(conn, other)
     _seed_full_grid(conn, other, _DAY, tag="-partial")
     build_forecast_record(
         conn, other, _DAY.isoformat(), now=_t() + timedelta(minutes=5)
@@ -790,7 +720,7 @@ def test_record_displayed_dailies_match_live_page_at_t() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-parity-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     # Feed C exists on BOTH sides of every comparison and stays sample-less
@@ -920,7 +850,7 @@ def test_record_outcomes_score_clearing_subset_hourly_follows_drill_down() -> No
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-w3-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     site = conn.execute(
@@ -1003,7 +933,7 @@ def _insert_wind_training_pair(
     (``as_of=None``) still renders fine off the same rows.
     """
     error = forecast - observed
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     conn.execute(
         """
         INSERT INTO forecast_pairs
@@ -1089,7 +1019,7 @@ def test_t61_pair_max_wind_tile_parity_and_legacy_hourly_uses_clearing_subset() 
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-parity-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     feed_c = asof_make_real_feed(conn, "model-c")
@@ -1187,7 +1117,7 @@ def test_t63_weighted_served_feed_weights_sum_to_one() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-weights-sum-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     conn.commit()
@@ -1253,7 +1183,7 @@ def test_t63_pair_max_one_feed_has_not_enough_feeds() -> None:
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "wind-pair-max-one-feed-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     conn.commit()
 
@@ -1338,7 +1268,7 @@ def _seed_g29_g30_fixture(conn: sqlite3.Connection) -> tuple[int, int, int, int]
     the contributor (extrema) set is ``[A, B]``.
     """
     site_id = asof_make_site(conn, "record-g29-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     feed_c = asof_make_real_feed(conn, "model-c")
@@ -1532,7 +1462,7 @@ def test_record_precip_null_series_and_outcomes_when_no_feed_covers_exactly() ->
     """
     conn = asof_conn()
     site_id = asof_make_site(conn, "record-g31-site")
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     feed_a = asof_make_real_feed(conn, "model-a")
     feed_b = asof_make_real_feed(conn, "model-b")
     site = conn.execute(

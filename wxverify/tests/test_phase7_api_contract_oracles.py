@@ -35,7 +35,7 @@ from tests.test_phase7_surface import (
     _seed_published_run,
 )
 from wxverify.api.routes.verification import VERIFICATION_SCHEMA
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.runs import capture_config_snapshot
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ _ROW_TUPLE = tuple[str, int, str, str, str]
 
 
 def _insert_run(conn: sqlite3.Connection, site_id: int) -> int:
-    generation = ensure_published_generation(conn, site_id)
+    generation = ensure_site_generation(conn, site_id)
     # A full pinned snapshot, as the production write path stores: readers
     # rehydrate a RunConfig from this column, so '{}' is unproducible.
     snapshot = json.dumps(capture_config_snapshot(conn, site_id), separators=(",", ":"))

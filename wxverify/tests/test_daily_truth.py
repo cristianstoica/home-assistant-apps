@@ -13,7 +13,6 @@ import sqlite3
 from datetime import date
 
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.verification.coverage import (
     EXCLUDE_BELOW_NEAR_COMPLETE,
@@ -25,7 +24,6 @@ from wxverify.verification.coverage import (
     local_day_bounds,
 )
 from wxverify.verification.truth import (
-    load_daily_truth,
     mark_daily_truth_stale,
     materialize_daily_truth,
     regenerate_marked_truth,
@@ -380,39 +378,6 @@ def test_mark_ignores_unknown_variable_and_returns_rowcount() -> None:
 
 
 # --------------------------------------------------------- generation binding
-
-
-def test_load_daily_truth_is_published_generation_bound() -> None:
-    conn = _conn()
-    site_id = _make_site(conn)
-    day = "2026-06-10"
-    _seed_obs(conn, site_id, "temperature", _utc_day(day, range(24), [10.0] * 24))
-    published = ensure_published_generation(conn, site_id)
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-
-    # A building correction generation writes rows alongside; reads must
-    # never see them.
-    cur = conn.execute(
-        """
-        INSERT INTO timezone_generations (site_id, timezone, mode, state)
-        VALUES (?, 'Europe/Athens', 'retrospective_correction', 'building')
-        """,
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    building = int(cur.lastrowid)
-    materialize_daily_truth(
-        conn, site_id=site_id, local_date=day, tz_generation_id=building
-    )
-
-    rows = load_daily_truth(conn, site_id=site_id, local_date=day)
-    assert len(rows) == 5
-    assert {int(row["tz_generation_id"]) for row in rows} == {published}
-    # Both generations' rows exist on disk (build-alongside, never in-place).
-    total = conn.execute(
-        "SELECT COUNT(*) AS n FROM daily_truth WHERE local_date=?", (day,)
-    ).fetchone()
-    assert total["n"] == 10
 
 
 def test_regeneration_preserves_the_rows_own_generation() -> None:

@@ -49,7 +49,7 @@ from wxverify.db.migrations import (
     schema_table_names,
 )
 from wxverify.db.runtime_state import set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 _SUPERVISOR_IP = "172.30.32.2"
 _NON_SUPERVISOR_IP = "192.0.2.10"  # RFC-5737 documentation range
@@ -1339,7 +1339,7 @@ def test_import_round_trip_rebuilds_derived_tables(
             VALUES (?, ?, 'wind', '2035-06-02T00:00:00Z', '2035-06-02T00:00:00Z',
                     24, 1, 5.0, 4.0, 1.0, 1.0, 1.0, 1, 0, 0, 0, ?)
             """,
-            (site_b, feed_id, ensure_published_generation(conn_b, site_b)),
+            (site_b, feed_id, ensure_site_generation(conn_b, site_b)),
         )
         conn_b.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         conn_b.commit()
@@ -1608,7 +1608,14 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
             assert row is None, (
                 f"{kind}:{imported_site_id} must be gone after the reopen migrates"
             )
-        for key in _D21_KEPT_KEYS[:2]:
+        hold_row = direct.execute(
+            "SELECT value FROM runtime_state WHERE key = ?",
+            (_D21_KEPT_KEYS[0],),
+        ).fetchone()
+        assert hold_row is None, (
+            f"{_D21_KEPT_KEYS[0]} must be gone after A4 deletes it at the switch"
+        )
+        for key in _D21_KEPT_KEYS[1:2]:
             row = direct.execute(
                 "SELECT value FROM runtime_state WHERE key = ?", (key,)
             ).fetchone()
@@ -1631,7 +1638,7 @@ def test_import_v8_db_with_old_wind_state_migrates_on_reopen(
         }
         assert "legacy_hours" not in live_cols
         live_version = direct.execute("PRAGMA user_version").fetchone()
-        assert int(live_version[0]) == 14
+        assert int(live_version[0]) == 15
     finally:
         direct.close()
 

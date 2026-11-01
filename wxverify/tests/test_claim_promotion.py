@@ -395,52 +395,6 @@ def test_promoted_chain_joins_tier_one_fifo_by_created_at(
 
 
 # =============================================================================
-# T14 -- timezone_correction shares the chain-type promotion rule.
-# =============================================================================
-
-
-def test_timezone_correction_gets_the_same_promotion_as_verification_run(
-    frozen_now: datetime,
-) -> None:
-    """``timezone_correction``'s basis is exactly now minus the plan's
-    5-minute promotion age (the same boundary as the verification_run
-    case above), so it must promote into tier 1 and win the created_at
-    tie-break against a newer fetch, exactly like ``verification_run``
-    does. The age is a literal here, not ``CHAIN_PROMOTION_AGE``, so this
-    test also catches the constant moved off 5 minutes (e.g. to 4 or 6).
-
-    mutant -> at the claim-type assertion: correct =
-    'timezone_correction' (promoted, and its older created_at wins tier-1
-    FIFO), mutant (the age-based promotion rule wired for
-    verification_run only, leaving timezone_correction stuck at tier 2
-    regardless of age) = 'fetch_feed' (tier 1 claims ahead of a tz chunk
-    that never promotes).
-    """
-    conn = _make_db()
-    site_id = _make_site(conn)
-    basis = _stamp(timedelta(minutes=5))
-    _insert_job(
-        conn,
-        "timezone_correction",
-        site_id,
-        created_at=_stamp(timedelta(hours=1)),
-        updated_at=basis,
-        next_attempt_at=basis,
-    )
-    _insert_job(
-        conn,
-        "fetch_feed",
-        site_id,
-        created_at=_stamp(timedelta(minutes=10)),
-        updated_at=_stamp(timedelta(minutes=10)),
-        next_attempt_at=_stamp(timedelta(minutes=1)),
-    )
-
-    claimed = claim_next_job(conn)
-    assert claimed is not None and claimed.type == "timezone_correction"
-
-
-# =============================================================================
 # T15 -- the current-obs lane's own type_clause survives the splice.
 # =============================================================================
 
@@ -506,7 +460,7 @@ def test_promotion_age_and_budget_pinned_under_monitor_thresholds() -> None:
 # =============================================================================
 
 
-@pytest.mark.parametrize("chain_type", ["verification_run", "timezone_correction"])
+@pytest.mark.parametrize("chain_type", ["verification_run"])
 def test_reclaim_gives_a_running_chain_row_a_fresh_basis(
     frozen_now: datetime, chain_type: str
 ) -> None:
@@ -519,9 +473,7 @@ def test_reclaim_gives_a_running_chain_row_a_fresh_basis(
 
     mutant -> at the chain next_attempt_at assertion: correct =
     ``isoformat_utc()`` at the frozen instant, mutant (reclaim left
-    unchanged, the pre-C2 shape -- :454-463 before this change; also
-    killed, on the timezone_correction parametrize case only, by a
-    ``_CHAIN_TYPES_SQL`` narrowed to ``verification_run`` alone) = the
+    unchanged, the pre-C2 shape -- :454-463 before this change) = the
     row's original now-10min next_attempt_at.
     mutant -> at the current-obs next_attempt_at assertion: correct = the
     original now-10min stamp (untouched), mutant (the CASE's type filter

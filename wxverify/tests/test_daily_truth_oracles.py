@@ -17,7 +17,7 @@ import sqlite3
 from datetime import date
 
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.consensus import materialize_consensus
 from wxverify.verification.coverage import (
     EXCLUDE_BELOW_NEAR_COMPLETE,
@@ -30,7 +30,6 @@ from wxverify.verification.coverage import (
     evaluate_wind,
 )
 from wxverify.verification.truth import (
-    load_daily_truth,
     mark_daily_truth_stale,
     materialize_daily_truth,
     regenerate_marked_truth,
@@ -575,7 +574,7 @@ def test_regeneration_rebuilds_only_under_the_rows_own_generation() -> None:
         "temperature",
         [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
     )
-    published = ensure_published_generation(conn, site_id)
+    published = ensure_site_generation(conn, site_id)
     materialize_daily_truth(conn, site_id=site_id, local_date=day)
     building = _building_generation(conn, site_id)
     materialize_daily_truth(
@@ -613,47 +612,6 @@ def test_regeneration_rebuilds_only_under_the_rows_own_generation() -> None:
         "SELECT COUNT(*) AS n FROM daily_truth WHERE stale=1"
     ).fetchone()
     assert remaining_stale["n"] == 0
-
-
-def test_load_daily_truth_returns_published_values_not_building() -> None:
-    """Reads are generation-bound with VALUE-level discrimination.
-
-    The building generation's rows carry a different truth value (44.0),
-    so a generation-unbound read is loud even when row counts alone would
-    pass. Kills M25 (published_generation_clause dropped from the load).
-    """
-    conn = _conn()
-    site_id = _make_site(conn, timezone="UTC")
-    day = "2026-06-10"
-    _seed_obs(
-        conn,
-        site_id,
-        "temperature",
-        [(f"{day}T{h:02d}:00:00Z", 10.0) for h in range(24)],
-    )
-    published = ensure_published_generation(conn, site_id)
-    materialize_daily_truth(conn, site_id=site_id, local_date=day)
-    conn.execute("UPDATE observations SET value=44.0")
-    building = _building_generation(conn, site_id)
-    materialize_daily_truth(
-        conn, site_id=site_id, local_date=day, tz_generation_id=building
-    )
-    # Decoy exists on disk with the diverged value.
-    decoy = conn.execute(
-        """
-        SELECT value FROM daily_truth
-        WHERE tz_generation_id=? AND quantity='temperature_high'
-        """,
-        (building,),
-    ).fetchone()
-    assert decoy["value"] == 44.0
-
-    rows = load_daily_truth(conn, site_id=site_id, local_date=day)
-
-    assert len(rows) == 5
-    assert {int(row["tz_generation_id"]) for row in rows} == {published}
-    by_quantity = {str(row["quantity"]): row for row in rows}
-    assert by_quantity["temperature_high"]["value"] == 10.0
 
 
 # ------------------------------------------ O12: all five rows always written

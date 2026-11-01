@@ -43,7 +43,7 @@ from wxverify.db.site_days import (
     mark_missed,
     start_site_days,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 # ---------------------------------------------------------------------------
 # §13.4/§13.7 fixtures (plan §13.4 lede): T is 07:00 on D in the site's
@@ -194,7 +194,7 @@ def _insert_truth(
 ) -> None:
     record = day_record(conn, site_id, local_date)
     assert record is not None
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     conn.execute(
         "INSERT INTO daily_truth"
         " (site_id, local_date, quantity, value, eligible, exclusion_reason,"

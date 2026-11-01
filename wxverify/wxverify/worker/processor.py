@@ -113,11 +113,6 @@ from wxverify.worker.score_batches import (
     run_split_pair_phases,
 )
 from wxverify.worker.station_pacing import pace_station_call, weathercom_call_lock
-from wxverify.worker.tz_correction import (
-    advance_correction,
-    build_continuation,
-    mark_correction_failed,
-)
 from wxverify.worker.verification_run import (
     mark_verification_failed,
     run_verification_chunk,
@@ -591,11 +586,12 @@ def _fail_job(conn: sqlite3.Connection, job: Job, error: str) -> FailDisposition
         error,
         min_delay_seconds=fetch_feed_retry_floor_seconds(conn, job),
     )
-    if disposition is not None and disposition.terminal:
-        if job.type == "timezone_correction":
-            mark_correction_failed(conn, job)
-        elif job.type == "verification_run":
-            mark_verification_failed(conn, job)
+    if (
+        disposition is not None
+        and disposition.terminal
+        and job.type == "verification_run"
+    ):
+        mark_verification_failed(conn, job)
     return disposition
 
 
@@ -754,17 +750,6 @@ async def dispatch(
         return await run_backfill_site(db, writer, site_id, job.payload)
     if job.type == "catchup":
         return await run_catchup(db, writer, job.payload)
-    if job.type == "timezone_correction":
-        site_id = job.site_id
-        if site_id is None:
-            raise JobCancelled()
-        # One chunk = one write transaction (chain state persisted inside
-        # it); the continuation re-enqueues the chain, and claim_next_job's
-        # priority tier lets other job types interleave between chunks.
-        more = await writer.write(
-            lambda conn: advance_correction(conn, site_id, job.payload)
-        )
-        return build_continuation(site_id, job.payload) if more else None
     if job.type == "forecast_record":
         site_id = job.site_id
         if site_id is None:
@@ -799,9 +784,9 @@ async def dispatch(
         site_id = job.site_id
         if site_id is None:
             raise JobCancelled()
-        # One chunk per claim, chain state in runtime_state (same shape as
-        # timezone_correction); the simulate/baseline days and the bootstrap
-        # run their heavy work outside any write transaction.
+        # One chunk per claim, chain state in runtime_state; the
+        # simulate/baseline days and the bootstrap run their heavy work
+        # outside any write transaction.
         return await run_verification_chunk(db, writer, site_id, job.payload)
     if job.type == "day_close":
         await run_day_close(db, writer, job)

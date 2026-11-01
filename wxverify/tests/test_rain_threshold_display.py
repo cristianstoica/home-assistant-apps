@@ -38,7 +38,7 @@ from fastapi.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.runs import (
     capture_config_snapshot,
     input_fingerprint,
@@ -82,7 +82,7 @@ def _make_site(conn: sqlite3.Connection, *, rain_threshold_mm: float = 0.2) -> i
             (rain_threshold_mm,),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     return site_id
 
 
@@ -104,7 +104,7 @@ def _seed_snapshot_run(
     ``_MISSING`` drops the key entirely, characterizing the field-absent
     path distinctly from a present-but-``None`` value.
     """
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     if rain_threshold_mm is _MISSING:
         del snapshot["rain_threshold_mm"]
@@ -373,7 +373,7 @@ def test_app_written_snapshot_matches_sites_card_for_the_same_site(
 ) -> None:
     conn = _init_tmp_db(tmp_path)
     site_id = _make_site(conn, rain_threshold_mm=0.25)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     snapshot = capture_config_snapshot(conn, site_id)
     assert snapshot["rain_threshold_mm"] == 0.25
     fingerprint = input_fingerprint(conn, site_id, snapshot)

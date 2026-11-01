@@ -28,7 +28,7 @@ from wxverify.db.connection import (  # noqa: SLF001
     close_db,
     get_db,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 
 def _shared_read(conn: sqlite3.Connection) -> int:
@@ -527,7 +527,7 @@ def _seed_one_sample_and_one_pair(conn: sqlite3.Connection) -> None:
         VALUES (?, ?, 'temperature', '2026-01-01T00:00:00Z',
                 '2026-01-01T06:00:00Z', 24, 1, 10.0, 10.0, 0.0, 0.0, 0.0, ?)
         """,
-        (site_id, feed_id, ensure_published_generation(conn, site_id)),
+        (site_id, feed_id, ensure_site_generation(conn, site_id)),
     )
 
 

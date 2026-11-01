@@ -25,7 +25,7 @@ from tests.helpers import asof_conn, asof_make_site
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.settings.keys import set_setting
 from wxverify.verification.runs import (
     PUBLISH_HOLD_REASON,
@@ -88,7 +88,7 @@ def _make_site(
             (name, timezone, enabled),
         ).lastrowid
     )
-    ensure_published_generation(conn, site_id)
+    ensure_site_generation(conn, site_id)
     conn.commit()
     return site_id
 

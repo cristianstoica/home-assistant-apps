@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from wxverify.collection.forecast_validation import FORECAST_VARIABLES
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.db.site_days import DayRecord, WriteKind, check_date_write
-from wxverify.db.tz_generations import published_generation_id
+from wxverify.db.switch import site_generation_id
 from wxverify.scoring.downloads import (
     ScoredDownload,
     StoredSample,
@@ -429,10 +429,10 @@ def score_day(
 def _read_truth(
     conn: sqlite3.Connection, site_id: int, local_date: date
 ) -> dict[str, TruthRow]:
-    """D's five truth rows of the site's published generation, by quantity,
-    as P3's ``_truth_version`` reads them; ``ScoreDayInputMissing`` when any
-    is missing (or the site has no published generation)."""
-    generation_id = published_generation_id(conn, site_id)
+    """D's five truth rows of the site's one time zone generation, by
+    quantity, as P3's ``_truth_version`` reads them; ``ScoreDayInputMissing``
+    when any is missing (or the site has no time zone generation)."""
+    generation_id = site_generation_id(conn, site_id)
     rows: dict[str, TruthRow] = {}
     if generation_id is not None:
         for row in conn.execute(

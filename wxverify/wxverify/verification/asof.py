@@ -30,7 +30,6 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.verification.methodology import CONSENSUS_LAG_HOURS
 
 # Recorded exclusion reasons (plan §6). Persisted verbatim by the run
@@ -104,12 +103,10 @@ def pair_knowability_exclusions(
     as_of: str,
     window_cutoff: str | None = None,
 ) -> PairKnowabilityExclusions:
-    """Count generation-bound pairs excluded from as-of evaluation at T.
+    """Count the site's pairs excluded from as-of evaluation at T.
 
     Classification is by FIRST failing knowability condition so each excluded
-    row is counted under exactly one reason. Only published-generation rows
-    are considered — retired-generation rows are outside every read path, not
-    an as-of exclusion.
+    row is counted under exactly one reason.
     """
     lag = f"julianday(fp.valid_at, '+{CONSENSUS_LAG_HOURS} hours') <= julianday(?)"
     known = "julianday(fp.first_known_at) <= julianday(?)"
@@ -139,7 +136,6 @@ def pair_knowability_exclusions(
                 AS computed_at_after_t
         FROM forecast_pairs fp
         WHERE fp.site_id = ? AND fp.variable = ? AND fp.day_ahead = ?
-          AND {published_generation_clause("fp")}
           {window_clause}
         """,
         (

@@ -25,7 +25,7 @@ from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database
 from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.db.wind_basis import PAIR_MAX_SOURCE_PREFIX, PAIR_MAX_WIND_SQL
 from wxverify.scoring.consensus import (
     insert_station_observation,
@@ -424,7 +424,7 @@ def test_persistence_pairing_reader_ignores_wind_basis_state(
 
 
 def _seed_published_wind_pair(conn: sqlite3.Connection, site: int, feed: int) -> None:
-    generation = ensure_published_generation(conn, site)
+    generation = ensure_site_generation(conn, site)
     conn.execute(
         "INSERT INTO forecast_pairs"
         " (site_id, feed_id, variable, issued_at, valid_at, lead_hours,"
@@ -445,7 +445,7 @@ def test_distinct_cells_reader_ignores_wind_basis_state(state: str | None) -> No
     _seed_published_wind_pair(conn, site, feed)
     # Also a temperature cell: the reader returns wind's cell alongside the
     # other variables', not in place of them.
-    generation = ensure_published_generation(conn, site)
+    generation = ensure_site_generation(conn, site)
     conn.execute(
         "INSERT INTO forecast_pairs (site_id, feed_id, variable, issued_at,"
         " valid_at, lead_hours, day_ahead, forecast, observed, error,"

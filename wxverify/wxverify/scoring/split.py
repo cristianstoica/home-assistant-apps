@@ -1,9 +1,9 @@
 """Pair phases split into a read-only compute and a write-only apply.
 
 Each pair phase's compute reads its inputs and returns a ``PairDelta``: the
-sites whose published generation must exist, and the ordered ``forecast_pairs``
-operations. The apply side here only writes: it seeds each site's published
-generation (``ensure_published_generation``), then runs the operations. The
+sites whose time zone generation must exist, and the ordered ``forecast_pairs``
+operations. The apply side here only writes: it seeds each site's time zone
+generation (``ensure_site_generation``), then runs the operations. The
 monolithic phase functions are ``apply_delta(conn, compute(conn, site_id))``
 in their caller's single transaction.
 
@@ -22,7 +22,7 @@ from typing import Final
 
 from wxverify.core.timeutil import utc_now
 from wxverify.db.site_days import WriteKind, check_day_write
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 type SqlValue = str | int | float | bytes | None
 # The 18 insert values of one pair, tz_generation_id excluded.
@@ -90,7 +90,7 @@ class GenerationResolver:
         """Ensure every seed site's published generation, in seed order."""
         for site_id in self._seed_sites:
             if site_id not in self._ids:
-                self._ids[site_id] = ensure_published_generation(conn, site_id)
+                self._ids[site_id] = ensure_site_generation(conn, site_id)
 
     def generation_id(self, site_id: int) -> int:
         """The seeded published generation id of ``site_id``."""

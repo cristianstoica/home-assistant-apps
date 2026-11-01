@@ -45,7 +45,7 @@ from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import close_db, get_db, init_db
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.composite import (
     _expected_active_cells,
@@ -179,7 +179,7 @@ def _add_continuous_pair(
             persistence_error,
             abs(persistence_error),
             persistence_sq_error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
     conn.execute(
@@ -202,7 +202,7 @@ def _add_continuous_pair(
             feed_error,
             abs(feed_error),
             feed_sq_error,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -240,7 +240,7 @@ def _add_precip_pair(
             cat_false,
             cat_miss,
             cat_correct_neg,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -264,7 +264,7 @@ def _add_temperature_cell(
         VALUES (?, ?, 'temperature', '2035-01-01T00:00:00Z', ?, 24, 1,
                 11.0, 10.0, 1.0, 1.0, 1.0, ?)
         """,
-        (site_id, feed_id, valid_at, ensure_published_generation(conn, site_id)),
+        (site_id, feed_id, valid_at, ensure_site_generation(conn, site_id)),
     )
 
 
@@ -1115,7 +1115,7 @@ def test_api_composite_partial_snapshot_after_consensus_invalidation_is_rebuildi
                         feed_id,
                         variable,
                         f"2035-01-{hour}T00:00:00Z",
-                        ensure_published_generation(conn, site_id),
+                        ensure_site_generation(conn, site_id),
                     ),
                 )
             fresh = isoformat_utc()

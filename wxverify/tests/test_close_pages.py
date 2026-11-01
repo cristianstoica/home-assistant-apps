@@ -51,7 +51,7 @@ from wxverify.db.site_days import (
     mark_missed,
     start_site_days,
 )
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -199,7 +199,7 @@ def test_pg1_closed_day_pairs_replace_forecast_pairs(
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg-feed")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     d_minus_3 = D - timedelta(days=3)
@@ -851,7 +851,7 @@ def test_pg12_issued_at_selects_one_run_closed_days_excluded(
     conn = _init_tmp_db(tmp_path)
     site_id = day_close_site(conn, close_on=True)
     feed_id = asof_make_real_feed(conn, "pg12-feed")
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     before_first_record = D - timedelta(days=10)
@@ -1083,7 +1083,7 @@ def test_pg14_lead_pick_parameter_and_overlay_control(
     site_id = day_close_site(conn, close_on=True)
     feed_x = asof_make_real_feed(conn, "pg14-x")
     feed_p = asof_persistence_feed_id(conn)
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     _patch_clock(monkeypatch, NOW)
 
     d_minus_3 = D - timedelta(days=3)

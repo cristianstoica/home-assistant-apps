@@ -33,7 +33,7 @@ from types import SimpleNamespace
 
 from wxverify.core.timeutil import isoformat_utc, local_day_slots, parse_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.aggregate import (
     EXTREMA_COVERAGE_COMPLETE,
     EXTREMA_COVERAGE_INSUFFICIENT,
@@ -182,7 +182,7 @@ def _insert_pair(
             miss,
             correct_neg,
             first_known_at if first_known_at is not None else issued_at,
-            ensure_published_generation(conn, site_id),
+            ensure_site_generation(conn, site_id),
         ),
     )
 
@@ -1158,7 +1158,7 @@ def _record_insert_day(
 
 def test_persisted_row_complete_day() -> None:
     conn = _record_conn()
-    ensure_published_generation(conn, 1)
+    ensure_site_generation(conn, 1)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     full_ats = [
         datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
@@ -1217,7 +1217,7 @@ def test_persisted_row_complete_day() -> None:
 
 def test_persisted_row_suppressed_day() -> None:
     conn = _record_conn()
-    ensure_published_generation(conn, 1)
+    ensure_site_generation(conn, 1)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
     partial_ats = [
         datetime(_RECORD_DAY.year, _RECORD_DAY.month, _RECORD_DAY.day, h, tzinfo=UTC)
@@ -1261,7 +1261,7 @@ def test_scored_precip_entities_are_the_pre_g_clearing_subset_values() -> None:
     assert METHODOLOGY_VERSION == 5
 
     conn = _record_conn()
-    generation_id = ensure_published_generation(conn, 1)
+    generation_id = ensure_site_generation(conn, 1)
     feed_id = _feed_id(conn, "open-meteo", "ecmwf_ifs")
 
     local_date = _RECORD_DAY
@@ -1615,7 +1615,7 @@ def test_confident_blend_set_with_unscored_precip_extrema_set() -> None:
     assert '<span class="badge muted">ranking updating</span>' not in html
 
     record_conn = _record_conn()
-    ensure_published_generation(record_conn, 1)
+    ensure_site_generation(record_conn, 1)
     set_setting(record_conn, "min_n", "3")
     rec_a = _feed_id(record_conn, "open-meteo", "ecmwf_ifs")
     rec_b = _feed_id(record_conn, "open-meteo", "gfs_global")
@@ -1764,7 +1764,7 @@ def test_rebuilding_precedence_on_the_precip_extrema_set() -> None:
     assert '<span class="badge warn">low confidence</span>' not in html
 
     record_conn = _record_conn()
-    ensure_published_generation(record_conn, 1)
+    ensure_site_generation(record_conn, 1)
     set_setting(record_conn, "min_n", "3")
     rec_a = _feed_id(record_conn, "open-meteo", "ecmwf_ifs")
     rec_b = _feed_id(record_conn, "open-meteo", "gfs_global")

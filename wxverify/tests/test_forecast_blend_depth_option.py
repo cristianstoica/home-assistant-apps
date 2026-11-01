@@ -39,7 +39,7 @@ from pydantic import ValidationError
 from wxverify.core.options import RuntimeOptions, _from_env
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.migrations import run_migrations
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.forecast.service import build_forecast, build_hourly
 from wxverify.scoring.cache import upsert_score_cache
 from wxverify.scoring.leaderboard import resolve_window
@@ -219,7 +219,7 @@ def _seed_two_confident_feeds(conn: sqlite3.Connection) -> None:
                     error,
                     abs(error),
                     error * error,
-                    ensure_published_generation(conn, 1),
+                    ensure_site_generation(conn, 1),
                 ),
             )
 

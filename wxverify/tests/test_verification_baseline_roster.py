@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from tests.helpers import asof_conn, asof_make_real_feed
-from wxverify.db.tz_generations import ensure_published_generation
+from wxverify.db.switch import ensure_site_generation
 from wxverify.verification.engine import (
     PASS1_ROSTER_KEY,
     _stored_aggregate_state,  # noqa: SLF001
@@ -84,7 +84,7 @@ def _make_site(
         asof_make_real_feed(conn, "model-beta"),
         asof_make_real_feed(conn, "model-gamma"),
     ]
-    generation_id = ensure_published_generation(conn, site_id)
+    generation_id = ensure_site_generation(conn, site_id)
     for day in _PERIOD_DAYS:
         for quantity, value in _QUANTITY_VALUES.items():
             conn.execute(

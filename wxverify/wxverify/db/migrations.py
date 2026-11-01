@@ -13,23 +13,12 @@ from wxverify import config
 from wxverify.collection.forecast_validation import invalid_forecast_sample_sql
 from wxverify.collection.precip_labels import PRECIP_HOUR_START_BOUNDARY_KEY
 from wxverify.core.timeutil import isoformat_utc, isoformat_utc_micro, utc_now
-from wxverify.db.queue import enqueue_if_absent
-from wxverify.db.runtime_state import (
-    delete_runtime_state,
-    get_runtime_state,
-    set_runtime_state,
-)
-from wxverify.db.tz_generations import (
-    correction_heartbeat_key,
-    correction_job_key,
-    correction_state_key,
-    invalid_published_pointers,
-    repair_dangling_published_pointers,
-)
+from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.switch import migrate_v15_switch
 
 logger = logging.getLogger(__name__)
 
-TARGET_USER_VERSION = 14
+TARGET_USER_VERSION = 15
 
 # Seed offset applied per station when migrate_v3 backfills station_poll_state,
 # so cold-start polls fan out instead of bursting all at once.
@@ -1237,56 +1226,6 @@ def bootstrap_publish_hold(
     conn.execute("RELEASE bootstrap_publish_hold")
 
 
-def repair_published_pointers(conn: sqlite3.Connection) -> None:
-    """Repair dangling published time zone pointers and log the other bad ones.
-
-    Runs on every open, after the seeds and before `bootstrap_publish_hold`,
-    which stays the last step. Process start and an import's reopen both
-    come through here, so an imported file is repaired before the
-    post-import rebuild reads it.
-
-    Best-effort, like the sanitize pass in `Database._open`: an Exception is
-    logged and the open continues with every pointer as it was. One
-    SAVEPOINT makes the repair all-or-nothing. On the writer, executescript
-    has already committed the outer BEGIN IMMEDIATE (see
-    `bootstrap_publish_hold`), so the savepoint is the whole transaction
-    and its RELEASE commits it; nothing here calls commit(). SQLite ends
-    the whole transaction by itself on some errors (disk full, I/O error),
-    which also drops the savepoint, hence the in_transaction check before
-    ROLLBACK TO. A BaseException that is not an Exception unwinds the
-    savepoint and propagates.
-    """
-    conn.execute("SAVEPOINT repair_published_pointers")
-    try:
-        repaired = repair_dangling_published_pointers(conn)
-        invalid = invalid_published_pointers(conn)
-        conn.execute("RELEASE repair_published_pointers")
-    except BaseException as exc:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO repair_published_pointers")
-            conn.execute("RELEASE repair_published_pointers")
-        if not isinstance(exc, Exception):
-            raise
-        logger.exception("published-pointer repair failed; continuing open")
-        return
-    if repaired:
-        logger.warning(
-            "published-pointer repair: re-created the time zone generation of "
-            "site(s) %s; each was re-added on an earlier version and its "
-            "pointer named a generation that no longer exists. Other state it "
-            "inherited is unchanged; delete and re-add the site to reset it "
-            "fully",
-            repaired,
-        )
-    if invalid:
-        logger.warning(
-            "published-pointer repair: site(s) %s have a time zone pointer "
-            "that does not name their own published generation; left "
-            "unchanged. Delete and re-add the site to reset it",
-            invalid,
-        )
-
-
 def seed_default_settings(conn: sqlite3.Connection) -> None:
     conn.executemany(
         "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
@@ -1532,90 +1471,35 @@ def record_precip_hour_start_boundary(conn: sqlite3.Connection) -> None:
     below the same second without them. With no such row the boundary is
     the `1970-01-01T00:00:00Z` sentinel. No clock is read.
 
-    Then, in order: delete those feeds' and the multimodel mean's rain
-    pairs in every generation, since the pairer never revisits a pair that
-    exists; restart each building timezone-correction generation (state
-    and heartbeat deleted, job re-queued), so its chain rebuilds under the
-    new gate; delete the rain `score_cache` rows and queue scoring for each
-    enabled site. The key is written last. No `forecast_samples` row
-    changes.
+    Only the key is written: no pair, `score_cache`, job or
+    `forecast_samples` row changes, so a file from before the boundary
+    keeps its stored pairs and scores as they stand, like any other file.
 
     Gated on the key, not on `user_version`, whose number depends on which
     release ships first; an older backup imported later carries no key and
     gets a boundary from its own stamps. Deleting the key by hand is a
     reset: the next open records the newest stored stamp.
 
-    One SAVEPOINT makes the step all-or-nothing. On the writer,
-    executescript has already committed the outer BEGIN IMMEDIATE (see
-    `bootstrap_publish_hold`), so the savepoint is the whole transaction.
-    SQLite ends the whole transaction by itself on some errors (disk full,
-    I/O error), which also drops the savepoint, hence the in_transaction
-    check before ROLLBACK TO. Unlike `repair_published_pointers`, nothing
-    is swallowed: the open fails before the `user_version` write and the
-    next open retries.
+    The key is the step's one write, so no SAVEPOINT is needed. Nothing is
+    swallowed: a failure fails the open before the `user_version` write and
+    the next open retries.
     """
     if get_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY) is not None:
         return
-    conn.execute("SAVEPOINT migrate_precip_hour_start_boundary")
-    try:
-        newest = conn.execute(
-            """
-            SELECT fs.fetched_at
-            FROM forecast_samples fs JOIN feeds f ON f.id = fs.feed_id
-            WHERE fs.variable = 'precip'
-              AND f.source IN ('open-meteo', 'meteoblue') AND f.is_virtual = 0
-              AND julianday(fs.fetched_at) IS NOT NULL
-            ORDER BY julianday(fs.fetched_at) DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        boundary = "1970-01-01T00:00:00Z" if newest is None else str(newest[0])
-        deleted_pairs = conn.execute(
-            """
-            DELETE FROM forecast_pairs
-            WHERE variable = 'precip'
-              AND feed_id IN (
-                  SELECT id FROM feeds
-                  WHERE (source IN ('open-meteo', 'meteoblue') AND is_virtual = 0)
-                     OR (source = 'virtual' AND model = '_multimodel_mean')
-              )
-            """
-        ).rowcount
-        for row in conn.execute(
-            "SELECT id, site_id FROM timezone_generations "
-            "WHERE mode = 'retrospective_correction' AND state = 'building'"
-        ).fetchall():
-            generation_id = int(row[0])
-            delete_runtime_state(
-                conn,
-                correction_state_key(generation_id),
-                correction_heartbeat_key(generation_id),
-            )
-            enqueue_if_absent(
-                conn,
-                "timezone_correction",
-                int(row[1]),
-                correction_job_key(generation_id),
-                {"generation_id": generation_id},
-            )
-        conn.execute("DELETE FROM score_cache WHERE variable = 'precip'")
-        for row in conn.execute("SELECT id FROM sites WHERE enabled = 1").fetchall():
-            site_id = int(row[0])
-            enqueue_if_absent(
-                conn, "pair_and_score", site_id, "score", {"site_id": site_id}
-            )
-        set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, boundary)
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK TO migrate_precip_hour_start_boundary")
-            conn.execute("RELEASE migrate_precip_hour_start_boundary")
-        raise
-    conn.execute("RELEASE migrate_precip_hour_start_boundary")
-    logger.info(
-        "precip hour-start boundary recorded at %s; %d rain pair(s) deleted",
-        boundary,
-        deleted_pairs,
-    )
+    newest = conn.execute(
+        """
+        SELECT fs.fetched_at
+        FROM forecast_samples fs JOIN feeds f ON f.id = fs.feed_id
+        WHERE fs.variable = 'precip'
+          AND f.source IN ('open-meteo', 'meteoblue') AND f.is_virtual = 0
+          AND julianday(fs.fetched_at) IS NOT NULL
+        ORDER BY julianday(fs.fetched_at) DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    boundary = "1970-01-01T00:00:00Z" if newest is None else str(newest[0])
+    set_runtime_state(conn, PRECIP_HOUR_START_BOUNDARY_KEY, boundary)
+    logger.info("precip hour-start boundary recorded at %s", boundary)
 
 
 def run_migrations(conn: sqlite3.Connection) -> None:
@@ -1668,6 +1552,9 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     if current < 14:
         logger.debug("migrations applying v14 daily-close scores")
         migrate_v14_daily_close_scores(conn)
+    if current < 15:
+        logger.debug("migrations applying v15 switch to the daily close")
+        migrate_v15_switch(conn)
     create_indexes(conn)
     logger.debug("migrations indexes ensured")
     correct_google_horizon(conn)
@@ -1678,7 +1565,6 @@ def run_migrations(conn: sqlite3.Connection) -> None:
     seed_default_feeds(conn)
     seed_default_settings(conn)
     logger.debug("migrations seeded sources+feeds+settings")
-    repair_published_pointers(conn)
     record_precip_hour_start_boundary(conn)
     bootstrap_publish_hold(conn, pre_migration_user_version=current)
     conn.execute(f"PRAGMA user_version = {TARGET_USER_VERSION}")
@@ -1929,10 +1815,11 @@ def migrate_v4(conn: sqlite3.Connection) -> None:
                 ON jobs(type, job_key, site_id, id)
             """
         )
-        # Seed the initial published generation per existing site, then the
-        # published-pointer runtime_state row. Mirrors
-        # wxverify.db.tz_generations.ensure_published_generation's seed shape
-        # (kept in SQL here so the whole step stays inside this savepoint).
+        # Seed the initial published generation per existing site (the row
+        # `wxverify.db.switch.ensure_site_generation` makes), then the
+        # published-pointer runtime_state row, which A1 of `migrate_v15_switch` reads
+        # and A4 deletes. Kept in SQL here so the whole step stays inside this
+        # savepoint.
         now = isoformat_utc(utc_now())
         conn.execute(
             """

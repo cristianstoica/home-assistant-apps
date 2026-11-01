@@ -10,14 +10,13 @@ from typing import Final
 from wxverify.collection.precip_labels import precip_label_eligible_sql
 from wxverify.core.timeutil import day_ahead, utc_now
 from wxverify.db.site_days import open_day_clause
-from wxverify.db.tz_generations import published_generation_clause
 from wxverify.scoring.pair_flags import precip_flags
 from wxverify.scoring.split import InsertOp, PairDelta, apply_delta
 
 logger = logging.getLogger(__name__)
 
 # The real-model pairing candidates: a sample with a matching observation, a
-# lead in the feed's range, no published pair yet and a rain label past the
+# lead in the feed's range, no pair yet and a rain label past the
 # hour-start boundary (precip_label_eligible_sql). compute_real_model_pairs
 # runs it whole or for one site; real_model_pair_pending runs it for one
 # sample id, so both read the same predicate.
@@ -41,7 +40,6 @@ _CANDIDATE_PAIRS_SQL: Final = f"""
                 AND fp.variable = fs.variable
                 AND fp.issued_at = fs.issued_at
                 AND fp.valid_at = fs.valid_at
-                AND {published_generation_clause("fp")}
           )
           AND {precip_label_eligible_sql("fs", "f")}
         """
@@ -69,7 +67,7 @@ def compute_real_model_pairs(
     """Read-only: the real-model pairs ``pair_real_models`` would insert.
 
     Every candidate sample (a matching observation, a lead in range, no
-    published pair yet) that passes the day-ahead bucket filter becomes one
+    pair yet) that passes the day-ahead bucket filter becomes one
     ``InsertOp``; the seed sites are those rows' sites, in first-row order.
     While the daily close is on, only samples on days that take pairs are
     candidates (``open_day_clause``, built at call time).
