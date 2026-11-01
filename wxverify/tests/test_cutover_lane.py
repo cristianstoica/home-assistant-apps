@@ -197,6 +197,13 @@ def test_ga1_the_gate_runs_before_the_claim(
 
     monkeypatch.setattr(processor_module, "run_claimed_job", _stop_on_claimed_job)
 
+    # The lane's first purge otherwise waits until the host has been up for
+    # an hour (last_housekeeping_at starts at 0.0 against time.monotonic()).
+    # On a younger host no purge would run before the claim: the
+    # every-other-job-pending check and the paired positive below would fail,
+    # and the no-purge-before-the-key check above could not see an early purge.
+    monkeypatch.setattr(processor_module, "JOB_HOUSEKEEPING_INTERVAL_SECONDS", 0)
+
     with pytest.raises(_Stop) as exc_info:
         asyncio.run(processor_module._run_main_lane(db))
 
