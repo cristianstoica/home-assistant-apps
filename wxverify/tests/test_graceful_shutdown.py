@@ -34,6 +34,7 @@ from starlette.testclient import TestClient
 from wxverify import config
 from wxverify.api.app import _cancel_and_reap, create_app, lifespan
 from wxverify.collection.budget import is_refundable_transport_error
+from wxverify.core.timeutil import isoformat_utc, utc_now
 from wxverify.db.connection import Database, close_db, get_db, init_db
 from wxverify.db.queue import (
     claim_next_current_obs_job,
@@ -159,6 +160,11 @@ def test_cancellation_reclaims_claimed_job(
     ``running``.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     _patch_worker_infra(monkeypatch)
     job_id = _insert_job(conn)
     before = _job_row(conn, job_id)
@@ -198,6 +204,11 @@ def test_cancellation_reraises_not_swallowed(
     flip ``_stop_on_worker_done`` onto its harder ``os._exit(1)`` path.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     _patch_worker_infra(monkeypatch)
     job_id = _insert_job(conn)
     db = get_db()
@@ -234,6 +245,11 @@ def test_cancellation_with_no_claimed_job_is_a_noop(
     on the idle path.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     _patch_worker_infra(monkeypatch)
     completed_id = _insert_job(conn, status="completed", job_key="k-completed")
     failed_id = _insert_job(conn, status="failed", job_key="k-failed")
@@ -266,9 +282,9 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     this window.
 
     Construction: wraps ``Database.write`` so that, immediately AFTER the
-    real ``claim_next_job`` write has committed (so the row genuinely reads
+    real ``_claim_if_on`` write has committed (so the row genuinely reads
     ``running`` on disk) but BEFORE control returns to ``run_worker``'s
-    ``job = await db.write(claim_next_job)`` line, the coroutine blocks on a
+    ``job = await db.write(_claim_if_on)`` line, the coroutine blocks on a
     plain ``asyncio.Event``. Cancelling there lands squarely in the claim
     window without needing to hold a sqlite transaction open across threads
     (which would independently and unavoidably fail any second write on the
@@ -277,6 +293,12 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
     Catches: a handler scoped to the per-job block instead of the whole loop.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+    from wxverify.worker.processor import _claim_if_on  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     _patch_worker_infra(monkeypatch)
     job_id = _insert_job(conn)
     db = get_db()
@@ -289,7 +311,7 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
         self: Database, fn: Any, *, epoch_exempt: bool = False
     ) -> Any:
         result = await real_write(self, fn, epoch_exempt=epoch_exempt)
-        if fn is claim_next_job:
+        if fn is _claim_if_on:
             claimed.set()
             await release.wait()
         return result
@@ -300,7 +322,7 @@ def test_cancellation_during_claim_write_leaves_no_running_row(
         task = asyncio.create_task(run_worker(db))
         await asyncio.wait_for(claimed.wait(), timeout=2.0)
         # The row is committed 'running' on disk right now, but run_worker's
-        # coroutine has not yet resumed past `db.write(claim_next_job)` --
+        # coroutine has not yet resumed past `db.write(_claim_if_on)` --
         # `job_id` does not exist in that frame yet.
         assert _job_status(conn, job_id) == "running"
         task.cancel()
@@ -337,7 +359,12 @@ def test_lifespan_shutdown_reclaims_claimed_job(
     therefore uses a DEDICATED side connection to the same file DB; the
     shared writer connection is never touched from this thread.
     """
-    _init_tmp_db(tmp_path)
+    conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
 
     block = asyncio.Event()
 
@@ -417,6 +444,11 @@ def test_cancellation_inside_claim_transaction_reclaims_cleanly_without_a_boot_s
     now absent.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     _patch_worker_infra(monkeypatch)
     job_id = _insert_job(conn)
     db = get_db()
@@ -1151,7 +1183,12 @@ def test_lifespan_shutdown_closes_the_pool_after_reclaim(
     sidecars all the same; what it catches is a close that is called but
     ineffective (refused, or one connection missed).
     """
-    _init_tmp_db(tmp_path)
+    conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
 
     block = asyncio.Event()
 

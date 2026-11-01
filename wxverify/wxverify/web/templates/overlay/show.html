@@ -11,6 +11,10 @@
   </div>
 </section>
 
+{% if starting_history_hint %}
+  <p class="muted" id="starting-history-hint">{{ starting_history_hint }}</p>
+{% endif %}
+
 {% if site and feed_id %}
   {% set lead_query = ('&lead=' ~ (lead|urlencode)) if close_on else '' %}
   <section class="toolbar">

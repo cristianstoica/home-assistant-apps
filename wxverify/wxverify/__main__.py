@@ -63,6 +63,7 @@ from wxverify.worker.close_chain import (
     run_offline_stage,
     stage_log,
 )
+from wxverify.worker.cutover import RETIRED_CONTROL_MESSAGE
 from wxverify.worker.feed_fetch import (
     BackoffActive,
     BudgetExhausted,
@@ -83,11 +84,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "timezone" and args.timezone_command in ("correct", "status"):
         # Retired with the daily close (plan 7.3): the message and exit 1,
         # before logging is set up and before init_db opens the file.
-        _die(
-            "This control was retired when the daily close turned on. "
-            "Each day is collected and closed once after it ends, "
-            "and past days are not fetched again."
-        )
+        _die(RETIRED_CONTROL_MESSAGE)
     if args.command == "serve":
         return _serve(args)
     _configure_logging()

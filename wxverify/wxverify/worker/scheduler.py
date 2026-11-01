@@ -82,8 +82,13 @@ def record_window_open(now: datetime, snapshot_utc: datetime) -> bool:
 
 def scheduler_tick(conn: sqlite3.Connection) -> None:
     logger.debug("scheduler tick")
+    # While the daily close is off the main lane runs only the cutover
+    # (switch-over plan 6.2). The key is read in the tick's own transaction,
+    # so a file an import swapped in after the lane's gate read is seen.
+    if not daily_close_on(conn):
+        return
     # The forward downloads: the scored round and the fixed daytime slots
-    # (daily-close P4 4.4, 5.1), live with the close on or off.
+    # (daily-close P4 4.4, 5.1).
     now = utc_now()
     enqueue_due_round_tries(conn, now_utc=now)
     enqueue_due_daytime_downloads(conn, now_utc=now)

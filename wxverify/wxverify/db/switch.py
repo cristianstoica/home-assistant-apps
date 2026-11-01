@@ -18,12 +18,16 @@ or worker runs. It removes what the release no longer reads or runs:
 The four tables that carry ``tz_generation_id`` keep the column as a key.
 :func:`site_generation_id` reads the site's one ``published`` generation and
 :func:`ensure_site_generation` makes it for a site that has none.
+
+:func:`first_record_date` reads the site's first closed day once the cutover
+has made its first record: every date before it is starting history.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+from datetime import date
 from typing import Final
 
 from wxverify.core.timeutil import isoformat_utc
@@ -74,6 +78,19 @@ def site_generation_id(conn: sqlite3.Connection, site_id: int) -> int | None:
         (site_id,),
     ).fetchone()
     return None if row is None else int(row[0])
+
+
+def first_record_date(conn: sqlite3.Connection, site_id: int) -> date | None:
+    """The date of the site's first ``site_days`` record, or None (plan 5.4).
+
+    The earliest ``local_date`` of the site's records: its first closed day,
+    before which every date is starting history. None while the site has no
+    record. Read-only.
+    """
+    row = conn.execute(
+        "SELECT MIN(local_date) FROM site_days WHERE site_id = ?", (site_id,)
+    ).fetchone()
+    return None if row is None or row[0] is None else date.fromisoformat(str(row[0]))
 
 
 def ensure_site_generation(conn: sqlite3.Connection, site_id: int) -> int:

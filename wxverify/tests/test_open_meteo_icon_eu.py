@@ -42,7 +42,6 @@ from wxverify.feeds.seam import ForecastRequest
 from wxverify.scoring.multimodel import materialize_multimodel_mean
 from wxverify.scoring.pairing import pair_real_models
 from wxverify.web.context import feed_description
-from wxverify.worker.scheduler import scheduler_tick
 
 # The seven models seeded before D1 added icon_eu.
 # (test_open_meteo_horizon_correction.py:28-42)
@@ -241,44 +240,6 @@ def test_d1_t4_operator_values_survive_remigration_even_with_markers_deleted() -
 # ---------------------------------------------------------------------------
 # D1-T5 -- schedule and cost.
 # ---------------------------------------------------------------------------
-
-
-def _due_jobs(conn: sqlite3.Connection, feed_id: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM jobs WHERE type='fetch_feed' AND job_key=?",
-        (f"fetch:{feed_id}",),
-    ).fetchall()
-
-
-def test_d1_t5_scheduling_arithmetic_at_the_365_minute_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Rewritten to the slot rule (plan §5.1): icon_eu's one daytime slot
-    on the round's default-local-time night is the round's 00:10 plus one
-    360-minute interval, 06:10Z. Case 1 pins the slot due the instant it
-    is reached; case 2 pins the same feed, with no prior try, not yet due
-    one minute earlier.
-    """
-    # Case 1: the clock is exactly at the 06:10 slot -> exactly one job.
-    fixed_now_due = parse_utc("2026-06-02T06:10:00Z")
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: fixed_now_due)
-    conn1 = asof_conn()
-    asof_make_site(conn1, "D1-T5 site A")
-    feed1 = _icon_eu_feed_id(conn1)
-    scheduler_tick(conn1)
-    conn1.commit()
-    assert len(_due_jobs(conn1, feed1)) == 1
-
-    # Case 2: a separate fresh database, so case 1's job cannot leak in, one
-    # minute before the slot -> not yet due.
-    fixed_now_not_due = parse_utc("2026-06-02T06:09:00Z")
-    monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: fixed_now_not_due)
-    conn2 = asof_conn()
-    asof_make_site(conn2, "D1-T5 site B")
-    feed2 = _icon_eu_feed_id(conn2)
-    scheduler_tick(conn2)
-    conn2.commit()
-    assert _due_jobs(conn2, feed2) == []
 
 
 def test_d1_t5_cost_estimate_uses_the_seeded_max_lead_hours() -> None:

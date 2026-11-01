@@ -22,7 +22,7 @@ import pytest
 
 import wxverify.core.timeutil as timeutil_module
 from wxverify import config
-from wxverify.core.timeutil import day_ahead, isoformat_utc, utc_now
+from wxverify.core.timeutil import day_ahead, utc_now
 from wxverify.db import queue as queue_module
 from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
 from wxverify.db.migrations import run_migrations
@@ -46,7 +46,6 @@ from wxverify.worker.feed_fetch import (
     fetch_feed_once,
 )
 from wxverify.worker.processor import dispatch, run_claimed_job
-from wxverify.worker.scheduler import scheduler_tick
 
 _SITE_NAME = "Testsite"
 _LAT = 12.3456
@@ -1269,224 +1268,10 @@ def test_window_boot_rollback_restores_setting_jobs_and_cache() -> None:
     assert _cache_count("w:all") == before_wall
 
 
-# ---------------------------------------------------------------------------
-# 11.4 Backstop (T-backstop-*)
-# ---------------------------------------------------------------------------
-
-
 def _freeze(monkeypatch: pytest.MonkeyPatch, moment: datetime) -> None:
     """Patch both name-imported ``utc_now`` call sites to the same instant."""
     monkeypatch.setattr(queue_module, "utc_now", lambda: moment)
     monkeypatch.setattr(scheduler_module, "utc_now", lambda: moment)
-
-
-def _seed_resolved_score_job(
-    conn: sqlite3.Connection,
-    site_id: int,
-    at: datetime,
-    status: str,
-    *,
-    result: str | None = None,
-) -> int:
-    """Hand-seed a pair_and_score job already resolved to ``status`` at
-    instant ``at``, in the exact row shape ``complete()``/``fail()`` write
-    (status + updated_at; ``result`` NULL unless given). Hand-seeding, not a
-    call through ``complete()``/``fail()``, because those write ``updated_at``
-    via ``isoformat_utc()``'s own default, which reads ``utc_now`` from
-    ``wxverify.core.timeutil``'s namespace -- a third name-import this
-    helper would otherwise have to patch on top of the two the backstop
-    due-check itself reads."""
-    stamp = at.isoformat().replace("+00:00", "Z")
-    cur = conn.execute(
-        "INSERT INTO jobs (type, site_id, job_key, payload, status, result,"
-        " updated_at) VALUES ('pair_and_score', ?, 'score', '{}', ?, ?, ?)",
-        (site_id, status, result, stamp),
-    )
-    conn.commit()
-    job_id = cur.lastrowid
-    assert job_id is not None
-    return job_id
-
-
-_T = datetime(2035, 3, 10, 0, 0, 0, tzinfo=UTC)
-
-
-def test_backstop_no_prior_score_job_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-
-    _freeze(monkeypatch, _T)
-    scheduler_tick(conn)
-
-    assert _score_jobs_for_site(conn, 1) == []
-
-
-def test_backstop_fresh_completion_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=6) - timedelta(seconds=1))
-    scheduler_tick(conn)
-
-    # No NEW pair_and_score row beyond the one already resolved.
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
-
-
-def test_backstop_due_refresh_queues_one_job_via_the_full_tick(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=6))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[0]["status"] == "completed"
-    assert rows[1]["status"] == "pending"
-
-
-def test_backstop_recent_failure_stays_in_cooldown(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "failed")
-
-    _freeze(monkeypatch, _T + timedelta(minutes=59))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "failed"
-
-
-def test_backstop_old_failure_is_retried(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "failed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=1))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[0]["status"] == "failed"
-    assert rows[1]["status"] == "pending"
-
-
-def test_backstop_unreadable_stamp_queues_once_and_warns_once(
-    caplog: pytest.LogCaptureFixture,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _freeze(monkeypatch, _T)
-    seeded = enqueue_if_absent(conn, "pair_and_score", 1, "score", {"site_id": 1})
-    assert seeded.job_id is not None
-    conn.execute(
-        "UPDATE jobs SET status='completed', updated_at='not-a-stamp' WHERE id=?",
-        (seeded.job_id,),
-    )
-    conn.commit()
-
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
-        scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 2
-    assert rows[1]["status"] == "pending"
-    warnings = [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "score refresh: unreadable updated_at" in r.getMessage()
-    ]
-    assert len(warnings) == 1
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
-        scheduler_tick(conn)
-
-    # The bad-stamp row is untouched (still status='completed' with the same
-    # bad stamp) and the new pending row dedupes the second tick, so no new
-    # row and no new warning.
-    assert len(_score_jobs_for_site(conn, 1)) == 2
-    assert [
-        r
-        for r in caplog.records
-        if r.levelno == logging.WARNING
-        and "score refresh: unreadable updated_at" in r.getMessage()
-    ] == []
-
-
-def test_backstop_active_row_dedupes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _freeze(monkeypatch, _T)
-    seeded = enqueue_if_absent(conn, "pair_and_score", 1, "score", {"site_id": 1})
-    assert seeded.job_id is not None
-
-    _freeze(monkeypatch, _T + timedelta(hours=7))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["id"] == seeded.job_id
-    assert rows[0]["status"] == "pending"
-
-
-def test_backstop_disabled_site_queues_nothing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn, enabled=0)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-
-    _freeze(monkeypatch, _T + timedelta(hours=7))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
-
-
-def test_backstop_cancelled_completion_counts_as_fresh(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _conn()
-    _seed_site(conn)
-    _seed_resolved_score_job(conn, 1, _T, "completed")
-    # The helper's complete() call leaves result=NULL already (a "cancelled
-    # completion" per the backstop's own docstring); assert that precondition
-    # before relying on it.
-    row = _score_jobs_for_site(conn, 1)[0]
-    assert (
-        conn.execute("SELECT result FROM jobs WHERE id = ?", (row["id"],)).fetchone()[
-            "result"
-        ]
-        is None
-    )
-
-    _freeze(monkeypatch, _T + timedelta(hours=5))
-    scheduler_tick(conn)
-
-    rows = _score_jobs_for_site(conn, 1)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------
@@ -1831,38 +1616,6 @@ async def _run_queued_pair_and_score(db: object) -> None:
     await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
 
 
-def _claim_pair_and_score_only(conn: sqlite3.Connection, site_id: int) -> Job | None:
-    """Claim the pending ``pair_and_score`` row for ``site_id`` directly,
-    the same status transition ``claim_next_job``'s ``_claim`` performs,
-    but filtered to this type and site. ``scheduler_tick`` also queues an
-    unrelated daily ``forecast_record`` job once the site's local snapshot
-    time has passed (§14), and that job type claims ahead of everything
-    else by design -- ``claim_next_job`` would hand back that job instead
-    of the one this test means to run, and (in this fixture, with no
-    station/network stub) that job fails and is re-claimed every tick."""
-    row = conn.execute(
-        "UPDATE jobs SET status = 'running', updated_at = ?"
-        " WHERE id = (SELECT id FROM jobs WHERE type = 'pair_and_score'"
-        " AND site_id = ? AND status = 'pending' ORDER BY created_at, id"
-        " LIMIT 1)"
-        " RETURNING id, type, site_id, job_key, payload, status,"
-        " retry_count, max_retries",
-        (isoformat_utc(), site_id),
-    ).fetchone()
-    if row is None:
-        return None
-    return Job(
-        id=row["id"],
-        type=row["type"],
-        site_id=row["site_id"],
-        job_key=row["job_key"],
-        payload=json.loads(row["payload"]),
-        status=row["status"],
-        retry_count=row["retry_count"],
-        max_retries=row["max_retries"],
-    )
-
-
 def _rank_skill_scores(
     conn: sqlite3.Connection, site_id: int, feed_a: int, feed_b: int
 ) -> tuple[str, float, float]:
@@ -1883,14 +1636,12 @@ def _rank_skill_scores(
     return result.status, skill_a, skill_b
 
 
-def test_rank_order_follows_real_pairing_then_backstop_recomputes(
+def test_rank_order_follows_real_pairing_then_stale_cache_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """T-rank steps 1, 2 and 4: the real job path's leaderboard order at
-    T0, a stale-cache read 4h later that leaves it unchanged, and the time
-    backstop's recompute 6h later that flips it (matching the twin
-    fixture's order in
-    ``test_rank_twin_fixture_confirms_the_order_is_not_vacuous``)."""
+    """T-rank steps 1 and 2: the real job path's leaderboard order at T0,
+    and a stale-cache read 4h later (a future-only, unpairable sample) that
+    leaves it unchanged."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
     site_id, feed_a, feed_b = _seed_rank_fixture(conn, _RANK_T0)
@@ -1949,55 +1700,6 @@ def test_rank_order_follows_real_pairing_then_backstop_recomputes(
         "the stale cache must still serve O0 unchanged"
     )
 
-    # Step 4: the backstop queues nothing at T0+6h-1s, one job at T0+6h;
-    # running it recomputes and must flip the order (matching the twin's
-    # O1 below).
-    before_count = conn.execute(
-        "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score' AND site_id = ?",
-        (site_id,),
-    ).fetchone()["n"]
-
-    almost_due = _RANK_T0 + timedelta(hours=6) - timedelta(seconds=1)
-    _freeze_rank(monkeypatch, almost_due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score'"
-            " AND site_id = ?",
-            (site_id,),
-        ).fetchone()["n"]
-        == before_count
-    )
-
-    due = _RANK_T0 + timedelta(hours=6)
-    _freeze_rank(monkeypatch, due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE type = 'pair_and_score'"
-            " AND site_id = ?",
-            (site_id,),
-        ).fetchone()["n"]
-        == before_count + 1
-    )
-
-    async def _run_backstop() -> None:
-        job = await db.write(  # type: ignore[attr-defined]
-            lambda c: _claim_pair_and_score_only(c, site_id)
-        )
-        assert job is not None and job.type == "pair_and_score", job
-        await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
-
-    asyncio.run(_run_backstop())
-
-    with patch.object(timeutil_module, "utc_now", lambda: due):
-        status2, skill_a2, skill_b2 = _rank_skill_scores(conn, site_id, feed_a, feed_b)
-    assert status2 == "hit"
-    assert skill_b2 > skill_a2, (
-        "the backstop's recompute must flip the order: B above A, as in"
-        " the twin fixture's O1"
-    )
-
 
 def test_rank_twin_fixture_confirms_the_order_is_not_vacuous(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2005,7 +1707,7 @@ def test_rank_twin_fixture_confirms_the_order_is_not_vacuous(
     """T-rank step 3, the non-vacuity guard: the identical fixture, scored
     at T1 instead of T0, must give the opposite order. If it did not, O0's
     assertions in
-    ``test_rank_order_follows_real_pairing_then_backstop_recomputes`` would
+    ``test_rank_order_follows_real_pairing_then_stale_cache_unchanged`` would
     hold for a fixture-independent reason and the test would be vacuous."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
@@ -2067,13 +1769,11 @@ def _seed_sweep_fixture(conn: sqlite3.Connection, t0: datetime) -> tuple[int, in
     return site_id, feed_a, feed_c
 
 
-def test_sweep_stale_feed_set_rebuilds_then_the_backstop_clears_its_cache_rows(
+def test_sweep_stale_feed_set_marks_the_cache_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """T-sweep: a feed whose only pairs fall out of the rolling window
-    between T0 and T1 makes the cached feed set stale (``rebuilding``), and
-    the backstop's recompute at T0+6h drops its rolling-window
-    ``score_cache`` rows, restoring ``hit``."""
+    between T0 and T1 makes the cached feed set stale (``rebuilding``)."""
     conn = _init_tmp_obs_db(tmp_path)
     db = get_db()
     site_id, feed_a, feed_c = _seed_sweep_fixture(conn, _RANK_T0)
@@ -2113,44 +1813,3 @@ def test_sweep_stale_feed_set_rebuilds_then_the_backstop_clears_its_cache_rows(
         )
     assert result1.status == "rebuilding"
     assert result1.rows == []
-
-    due = _RANK_T0 + timedelta(hours=6)
-    _freeze_rank(monkeypatch, due)
-    scheduler_tick(conn)
-    assert (
-        conn.execute(
-            "SELECT 1 FROM jobs WHERE type = 'pair_and_score' AND site_id = ?"
-            " AND status = 'pending'",
-            (site_id,),
-        ).fetchone()
-        is not None
-    )
-
-    async def _run_backstop() -> None:
-        job = await db.write(  # type: ignore[attr-defined]
-            lambda c: _claim_pair_and_score_only(c, site_id)
-        )
-        assert job is not None and job.type == "pair_and_score", job
-        await run_claimed_job(db, job, lane="main")  # type: ignore[arg-type]
-
-    asyncio.run(_run_backstop())
-
-    assert (
-        conn.execute(
-            "SELECT COUNT(*) AS n FROM score_cache WHERE feed_id = ?"
-            " AND window_key = 'w:30'",
-            (feed_c,),
-        ).fetchone()["n"]
-        == 0
-    ), "the backstop's recompute must drop C's stale rolling-window row"
-
-    with patch.object(timeutil_module, "utc_now", lambda: due):
-        result2 = leaderboard_with_status(
-            conn,
-            site_id=site_id,
-            variable="temperature",
-            day_ahead=1,
-            window="rolling",
-        )
-    assert result2.status == "hit"
-    assert feed_c not in {r.feed_id for r in result2.rows}

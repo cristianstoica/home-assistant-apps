@@ -940,7 +940,7 @@ def test_rs12_round_without_a_record_uses_the_latest_records_zone(
 def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """RS13 (i): close off, zone UTC: X's round tries raise ConnectError,
+    """RS13 (i): close on, zone UTC: X's round tries raise ConnectError,
     then its 06:10 download stores; Y (1440-minute interval) has its four
     round tries raise ConnectError. (ii): a fresh database with seeded
     job rows. (iii): EXPLAIN QUERY PLAN of FAILED_SCOPES_SQL."""
@@ -965,6 +965,13 @@ def test_rs13_failed_scopes_resolve_across_round_and_fetch_keys(
     set_runtime_state(
         conn,
         "worker_started_at",
+        isoformat_utc(datetime(D.year, D.month, D.day, 12, tzinfo=UTC)),
+    )
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(
+        conn,
+        DAILY_CLOSE_ON_KEY,
         isoformat_utc(datetime(D.year, D.month, D.day, 12, tzinfo=UTC)),
     )
     conn.commit()

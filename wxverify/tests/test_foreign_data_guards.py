@@ -458,6 +458,11 @@ def test_scheduler_tick_survives_hostile_reader_values(
     expected = case.setup(conn)
     monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
 
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+
     with caplog.at_level(logging.WARNING, logger=case.logger_name):
         scheduler_tick(conn)  # must not raise
         # The current-obs due-scan moved out of scheduler_tick and into the
@@ -509,6 +514,11 @@ def test_scheduler_tick_accepts_exact_integral_real_fetch_interval_minutes(
     )
     monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
 
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
         scheduler_tick(conn)  # must not raise
 
@@ -544,6 +554,11 @@ def test_scheduler_tick_ignores_hostile_last_run_at(
     conn = _init_tmp_db(tmp_path)
     expected = setup(conn)
     monkeypatch.setattr("wxverify.worker.scheduler.utc_now", lambda: _SLOT_NOW)
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
 
     with caplog.at_level(logging.WARNING, logger="wxverify.worker.scheduler"):
         scheduler_tick(conn)  # must not raise
@@ -837,6 +852,10 @@ def test_worker_loop_dispositions_int64_max_retry_count_without_a_crash_loop(
     without dispositioning the row, which the helper-level test alone
     cannot distinguish."""
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
     )
@@ -894,6 +913,10 @@ def test_worker_loop_dispositions_below_range_retry_count_without_a_crash_loop(
     dispatch-failure handler and killing the worker task with the row left
     'running', where every restart reclaims it and dies again."""
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
     monkeypatch.setattr(
         "wxverify.worker.processor.set_runtime_state_now", lambda _c, _k: None
     )

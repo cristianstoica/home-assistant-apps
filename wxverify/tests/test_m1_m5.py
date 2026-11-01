@@ -406,6 +406,9 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
         pass
 
     class FakeDb:
+        async def read(self, fn):  # type: ignore[no-untyped-def]
+            return fn(None)
+
         async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
             return fn(None)
 
@@ -423,6 +426,7 @@ def test_worker_heartbeat_write_failure_logs_and_loop_continues(
         "wxverify.worker.processor.set_runtime_state_now", fail_heartbeat
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda conn: None)
+    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than",
         lambda conn, hours: None,
@@ -466,6 +470,9 @@ def test_worker_permission_error_is_process_fatal(
     class FakeDb:
         generation = 0
 
+        async def read(self, fn):  # type: ignore[no-untyped-def]
+            return fn(None)
+
         async def write(self, fn, *, epoch_exempt: bool = False):  # type: ignore[no-untyped-def]
             return fn(None)
 
@@ -488,6 +495,7 @@ def test_worker_permission_error_is_process_fatal(
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda conn: None)
+    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than",
         lambda conn, hours: None,

@@ -38,6 +38,9 @@
   {% if evidence_through %}
     <p class="muted" id="evidence-through">{% if evidence_before_close %}Rankings use days through {{ evidence_through }}, from before the daily close.{% else %}Rankings use closed days through {{ evidence_through }}.{% endif %}</p>
   {% endif %}
+  {% if starting_history_hint %}
+    <p class="muted" id="starting-history-hint">{{ starting_history_hint }}</p>
+  {% endif %}
   {% for name, values in pending_settings.items() %}
     <p class="muted">Saved {{ name }}: {{ values[1] }}. The rankings use {{ values[0] }} until the next daily publication.</p>
   {% endfor %}

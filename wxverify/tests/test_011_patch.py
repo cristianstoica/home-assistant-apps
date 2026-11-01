@@ -267,6 +267,7 @@ def _patch_worker_infra(monkeypatch: pytest.MonkeyPatch) -> None:
         "wxverify.worker.processor.set_runtime_state_now", lambda c, k: None
     )
     monkeypatch.setattr("wxverify.worker.processor.scheduler_tick", lambda c: None)
+    monkeypatch.setattr("wxverify.worker.processor.daily_close_on", lambda conn: True)
     monkeypatch.setattr(
         "wxverify.worker.processor.purge_failed_jobs_older_than", lambda c, h: None
     )
@@ -674,6 +675,11 @@ def test_fetch_feed_readtimeout_total_calls_capped_at_max_retries_plus_one(
     test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor, below.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
@@ -761,6 +767,11 @@ def test_fetch_feed_readtimeout_retry_spaced_by_cadence_floor(
     second retry onward, so a single-cycle test cannot observe it either.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     feed_id = _google_feed_id(conn)
     _subscribe(conn, site_id, feed_id)
@@ -967,6 +978,11 @@ def test_fetch_feed_astronomically_large_feed_id_does_not_crash_worker(
     apart.
     """
     conn = _init_tmp_db(tmp_path)
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(utc_now()))
+    conn.commit()
     site_id = _insert_site(conn)
     huge_feed_id = int("9" * 400)
 
@@ -1136,6 +1152,11 @@ def test_scheduler_tick_does_not_reenqueue_fetch_feed_within_failure_cooldown(
         (site_id, job_key, recent_failure),
     )
 
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(clock.now))
+
     scheduler_tick(conn)
 
     count = conn.execute(
@@ -1164,6 +1185,11 @@ def test_scheduler_tick_enqueues_fetch_feed_with_reduced_retry_cap(
     clock.patch(monkeypatch, "wxverify.worker.scheduler")
     clock.patch(monkeypatch, "wxverify.db.queue")
     clock.patch(monkeypatch, "wxverify.core.timeutil")
+
+    from wxverify.db.runtime_state import set_runtime_state  # noqa: PLC0415
+    from wxverify.db.site_days import DAILY_CLOSE_ON_KEY  # noqa: PLC0415
+
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(clock.now))
 
     scheduler_tick(conn)
 

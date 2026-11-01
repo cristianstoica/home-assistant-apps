@@ -15,7 +15,6 @@ names ``Testsite``/``site-a``/``site-b``, zone ``UTC``, model names
 
 from __future__ import annotations
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -32,8 +31,6 @@ from tests.helpers import (
     asof_make_site,
     asof_persistence_feed_id,
     day_close_site,
-    install_provider_standin,
-    seed_round_schedule_feeds,
 )
 from wxverify.core.timeutil import isoformat_utc, parse_utc
 from wxverify.settings.keys import set_setting
@@ -844,68 +841,6 @@ def test_pd3_fetch_that_would_pair_enqueues_one_pair_and_score_job_close_off(
 # PD4 pins TODAY'S close-off schedule and, by design, may already pass
 # before P4 is built.
 # ---------------------------------------------------------------------------
-
-
-def test_pd4_round_and_daytime_schedule_run_unconditionally_of_the_close_switch(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PD4 (schedule half): with the close OFF, a round try still fires at
-    the scheduled local time for a subscribed feed -- the round/daytime
-    schedule (section 4, 5) replaces the old interval-based
-    ``_enqueue_due_feeds`` unconditionally, not gated on the close switch
-    (17's round-schedule row: "live" from install, close off included).
-    """
-    from tests.helpers import MovingClock, patch_close_clock, tick
-    from wxverify import config
-    from wxverify.db.connection import close_db, init_db
-
-    close_db()
-    db_path = tmp_path / "wxverify.db"
-    config.db_path = str(db_path)
-    db = init_db(str(db_path))
-    conn = db._conn  # noqa: SLF001 - test inspects the real writer connection
-    site_id = day_close_site(conn, close_on=False, with_records=False)
-    ids = seed_round_schedule_feeds(conn, site_id, subscribe=("X",))
-    conn.commit()
-
-    standin = install_provider_standin(monkeypatch)
-    from tests.helpers import (
-        ROUND_SCHEDULE_SOURCES,
-        ProviderReply,
-        round_schedule_sample,
-    )
-
-    source = ROUND_SCHEDULE_SOURCES["X"]
-    standin.program(
-        source,
-        ProviderReply(
-            samples=(
-                round_schedule_sample(
-                    source,
-                    "temperature",
-                    f"{D.isoformat()}T00:00:00Z",
-                    f"{D.isoformat()}T06:00:00Z",
-                    6,
-                    10.0,
-                ),
-            )
-        ),
-    )
-
-    clock = MovingClock(datetime(D.year, D.month, D.day, 0, 10, 0, tzinfo=UTC))
-    patch_close_clock(monkeypatch, clock)
-    asyncio.run(tick(db, clock))
-
-    row = conn.execute(
-        "SELECT COUNT(*) FROM jobs WHERE type = 'fetch_feed' AND job_key = ?",
-        (f"round:{ids['X']}",),
-    ).fetchone()
-    assert row[0] >= 1, (
-        "M123 -> at this assertion: correct = at least one round-keyed job"
-        " created at the scheduled local time, even with the close off"
-        " (17), mutant M123 (the schedule waits for the switch) = no round"
-        f" job created -- got {row[0]}"
-    )
 
 
 def test_pd4_cleanup_after_a_replay_publish_runs_with_the_close_off() -> None:

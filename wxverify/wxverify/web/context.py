@@ -33,6 +33,7 @@ from wxverify.db.site_days import (
     day_record,
     zone_flagged,
 )
+from wxverify.db.switch import first_record_date
 from wxverify.db.wind_basis import read_auth_holds
 from wxverify.forecast.wind_blend import load_wind_serving
 from wxverify.scoring.composite import composite_in_snapshot
@@ -453,6 +454,31 @@ def load_site(conn: sqlite3.Connection, site_id: int) -> SiteView | None:
     return None if row is None else _site_from_row(conn, row)
 
 
+# The one starting-history hint of the switch-over plan (5.4), shown on the
+# dashboard and the Overlay.
+_STARTING_HISTORY_HINT: Final = (
+    "Days before {first_day} are from before the daily close: they keep the"
+    " scores they had and were never closed."
+)
+
+
+def _starting_history_hint(
+    conn: sqlite3.Connection, site_id: int | None, *, close_on: bool
+) -> str | None:
+    """The starting-history hint for the site, or None (switch-over plan 5.4).
+
+    Shown from the switch on, while the site has a record: it names the
+    site's first record date (``first_record_date``). None while the close
+    is off, with no site, and for a site with no record yet.
+    """
+    if site_id is None or not close_on:
+        return None
+    first_day = first_record_date(conn, site_id)
+    if first_day is None:
+        return None
+    return _STARTING_HISTORY_HINT.format(first_day=first_day.isoformat())
+
+
 def load_dashboard(
     conn: sqlite3.Connection,
     *,
@@ -470,7 +496,9 @@ def load_dashboard(
     publication's, so the "Last N days" tab names the published window;
     ``evidence_through`` is its cutoff and ``pending_settings`` the ranking
     settings saved since (13.1). With the close off they are today's
-    settings, None and ``{}``.
+    settings, None and ``{}``. ``starting_history_hint`` is the
+    switch-over plan's hint (5.4), None while the close is off or the site
+    has no record.
     """
     if conn.in_transaction:
         return _load_dashboard(
@@ -499,9 +527,10 @@ def _load_dashboard(
     # One switch per read (9.1). The publication is the one the page's
     # rankings read, in the same snapshot; none for a disabled site, as the
     # leaderboard's own close-on read.
+    close_on = site is not None and daily_close_on(conn)
     publication = (
         active_publication(conn, site_id=site.id, at_utc=None)
-        if site is not None and site.enabled and daily_close_on(conn)
+        if site is not None and site.enabled and close_on
         else None
     )
     if publication is not None:
@@ -531,6 +560,7 @@ def _load_dashboard(
             "evidence_through": evidence_through,
             "evidence_before_close": evidence_before_close,
             "pending_settings": pending_settings,
+            "starting_history_hint": None,
             "coverage": None,
             "leaderboard": [],
             "verdict": compute_verdict([]),
@@ -592,6 +622,9 @@ def _load_dashboard(
         "evidence_through": evidence_through,
         "evidence_before_close": evidence_before_close,
         "pending_settings": pending_settings,
+        "starting_history_hint": _starting_history_hint(
+            conn, site.id, close_on=close_on
+        ),
         "coverage": _coverage_table(
             conn,
             publication=publication,
@@ -756,7 +789,8 @@ def load_overlay(
 
     ``lead`` and ``lead_options`` feed the page's lead control and links,
     shown with the close on only; ``lead`` is not checked here, as the
-    dashboard does not check it (plan §9.2).
+    dashboard does not check it (plan §9.2). ``starting_history_hint`` is
+    the switch-over plan's hint (5.4), as on the dashboard.
     """
     sites = load_sites(conn, include_disabled=False)
     site = (
@@ -779,6 +813,9 @@ def load_overlay(
         "feeds": feeds,
         "feed_id": selected_feed_id,
         "close_on": close_on,
+        "starting_history_hint": _starting_history_hint(
+            conn, site.id if site is not None else None, close_on=close_on
+        ),
         "lead": lead,
         "lead_options": LEAD_OPTIONS,
     }

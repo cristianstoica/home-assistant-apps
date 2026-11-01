@@ -44,7 +44,7 @@ from wxverify.db.runtime_state import (
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     set_runtime_state_now,
 )
-from wxverify.db.site_days import WriteKind, filter_day_writes
+from wxverify.db.site_days import WriteKind, daily_close_on, filter_day_writes
 from wxverify.db.station_readings import store_readings
 from wxverify.feeds.registry import build_adapter
 from wxverify.obs.config import RECENT_REFRESH_HOURS
@@ -64,6 +64,7 @@ from wxverify.verification.record import (
     persist_forecast_record,
     run_record_gap_scan,
 )
+from wxverify.worker import cutover as cutover_module
 from wxverify.worker.access_hold import (
     AccessHeld,
     check_access_hold,
@@ -86,6 +87,7 @@ from wxverify.worker.current_obs import (
     persist_poll_result,
 )
 from wxverify.worker.current_obs_poller import run_current_obs_poller
+from wxverify.worker.cutover import Cutover, CutoverStep
 from wxverify.worker.domain_backoff import (
     check_domain_backoff,
     clear_domain_backoff,
@@ -311,15 +313,33 @@ def _raise_lane_outcome(
 
 
 async def _run_main_lane(db: Database) -> None:
-    """Tick the scheduler and run main-lane jobs one at a time, forever."""
+    """Tick the scheduler and run main-lane jobs one at a time, forever.
+
+    While the daily close is off the lane runs the cutover and nothing else
+    (switch-over plan 6.2): one unit per loop, right after the worker
+    heartbeat, with no tick, purge or claim until the cutover writes the
+    key. After a failed unit the attempt is dropped and the lane waits
+    ``CUTOVER_RETRY_SECONDS``; the next attempt is a new ``Cutover``.
+    """
     last_housekeeping_at = 0.0
     last_worker_heartbeat_at = 0.0
     last_scheduler_heartbeat_at = 0.0
+    cutover: Cutover | None = None
     while True:
         now = time.monotonic()
         last_worker_heartbeat_at = await _maybe_stamp_runtime_heartbeat(
             db, "worker_last_loop_at", last_worker_heartbeat_at, now
         )
+        if not await db.read(daily_close_on):
+            cutover = cutover or Cutover(db)
+            step = await cutover.advance()
+            if step is CutoverStep.MORE:
+                continue
+            cutover = None
+            if step is CutoverStep.WAIT:
+                # Read through the module at each wait, not bound here.
+                await asyncio.sleep(cutover_module.CUTOVER_RETRY_SECONDS)
+                continue
         # Exempt: scheduler_tick, the housekeeping purge, and the claim
         # itself all run once per loop iteration with no job-scoped read
         # behind them yet -- there is no generation to fence any of this
@@ -336,11 +356,23 @@ async def _run_main_lane(db: Database) -> None:
                 )
             )
             last_housekeeping_at = now
-        job = await db.write(claim_next_job)
+        job = await db.write(_claim_if_on)
         if job is None:
             await asyncio.sleep(POLL_INTERVAL)
             continue
         await run_claimed_job(db, job, lane="main")
+
+
+def _claim_if_on(conn: sqlite3.Connection) -> Job | None:
+    """Claim the next main-lane job; None while the daily close is off.
+
+    The key is read in the claim's own transaction (switch-over plan 6.2),
+    so an import that replaced the file after the loop's gate read is seen
+    here and nothing is claimed from a file without the key.
+    """
+    if not daily_close_on(conn):
+        return None
+    return claim_next_job(conn)
 
 
 async def run_claimed_job(db: Database, job: Job, *, lane: str) -> None:
