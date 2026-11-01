@@ -1459,8 +1459,10 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     freshly migrated, ``ANALYZE``-free schema (``_fresh_conn()``), every line
     including the ``CORRELATED SCALAR SUBQUERY`` and ``SCALAR SUBQUERY``
     headers, in the order the planner prints them. The rain-label boundary
-    clause (``precip_label_eligible_sql``) adds ``SCALAR SUBQUERY 3`` with its
-    ``runtime_state`` lookup and moves the ``f`` seek ahead of ``obs``.
+    clause (``precip_label_eligible_sql``) adds ``SCALAR SUBQUERY 2`` with its
+    ``runtime_state`` lookup and moves the ``f`` seek ahead of ``obs``. The
+    generation-pointer lookup that the dedup subquery's ``NOT EXISTS`` once
+    nested is gone, leaving the dedup check itself with the daily close.
     Measured in the add-on's dev venv (SQLite 3.53.1), where the previous
     pin, without the clause, also matched line for line; CI's shipping-SQLite
     job (``WXV_EQP_SHIPPING=1``) runs it. The pin is fresh-schema only: after
@@ -1470,16 +1472,14 @@ def test_real_model_pair_probe_sql_matches_the_pinned_shipping_plan() -> None:
     plan = _plan(conn, REAL_MODEL_PAIR_PROBE_SQL, (1,))
     assert plan == [
         "SEARCH fs USING INTEGER PRIMARY KEY (rowid=?)",
-        # NOT EXISTS (forecast_pairs ...); the generation-pointer lookup
-        # this subquery once nested is gone from the dedup check now.
-        "CORRELATED SCALAR SUBQUERY 2",
+        # NOT EXISTS (forecast_pairs ...) dedup check; no generation-pointer
+        # lookup nested in it any more.
+        "CORRELATED SCALAR SUBQUERY 1",
         "SEARCH fp USING COVERING INDEX sqlite_autoindex_forecast_pairs_1"
         " (site_id=? AND feed_id=? AND variable=? AND issued_at=? AND valid_at=?)",
-        "CORRELATED SCALAR SUBQUERY 1",
-        "SEARCH rs USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
         "SEARCH f USING INTEGER PRIMARY KEY (rowid=?)",
         # precip_label_eligible_sql's boundary-key lookup in runtime_state.
-        "SCALAR SUBQUERY 3",
+        "SCALAR SUBQUERY 2",
         "SEARCH runtime_state USING INDEX sqlite_autoindex_runtime_state_1 (key=?)",
         "SEARCH obs USING INDEX sqlite_autoindex_observations_1"
         " (site_id=? AND variable=? AND valid_at=?)",
