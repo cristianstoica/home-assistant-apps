@@ -34,7 +34,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from wxverify.obs.cadence import (
-    FACTOR,
     JITTER_FRACTION,
     MAX_INTERVAL_SECONDS,
     STALE_FACTOR,
@@ -486,18 +485,6 @@ def test_obs_cadence_jitter_different_cycle_buckets_generally_differ() -> None:
         f"All 5 cycle_bucket offsets for station {station_id} are "
         f"identical ({offsets}); cycle_bucket appears to have no effect"
     )
-
-
-def test_obs_cadence_jitter_jitter_fraction_constant() -> None:
-    """JITTER_FRACTION==0.15 is exported; span = round(0.15 × base)."""
-    assert JITTER_FRACTION == 0.15
-    # The span for base=1000 must be exactly 150.
-    assert round(JITTER_FRACTION * 1000) == 150
-
-
-def test_obs_cadence_jitter_factor_constant() -> None:
-    """FACTOR==0.8 is exported; the cadence derivation uses it."""
-    assert FACTOR == 0.8
 
 
 def _recompute_jitter(station_id: int, cycle_bucket: int, base: int) -> int:

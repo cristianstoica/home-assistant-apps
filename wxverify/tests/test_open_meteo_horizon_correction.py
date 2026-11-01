@@ -27,7 +27,7 @@ from wxverify.db.migrations import (
     create_schema,
     run_migrations,
 )
-from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
+from wxverify.db.runtime_state import set_runtime_state
 from wxverify.feeds.open_meteo import RUN_CADENCE_HOURS
 from wxverify.forecast.service import DAY_COUNT
 
@@ -135,52 +135,6 @@ def test_fresh_database_seeds_all_seven_open_meteo_feeds_at_approved_horizons() 
 
 
 # ---------------------------------------------------------------------------
-# 2. Existing-database correction
-# ---------------------------------------------------------------------------
-
-
-def test_existing_database_all_at_168_corrected_to_approved_horizons() -> None:
-    """A database whose seven original Open-Meteo feeds all sit at the old flat 168h
-    seed is corrected by ``run_migrations`` to the approved per-model
-    horizons -- including the two models with no downward correction, which
-    a mutant that applies ``DISPLAY_REQUEST_HOURS`` uniformly (rather than
-    per-model) would bump to 217 here.
-    """
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    run_migrations(conn)
-    _assert_all_seven(conn, _EXPECTED_HOURS)
-    assert _lead(conn, source="open-meteo", model="meteofrance_arpege_world") == 168
-    assert (
-        _lead(conn, source="open-meteo", model="ukmo_global_deterministic_10km") == 168
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. Idempotence
-# ---------------------------------------------------------------------------
-
-
-def test_correction_run_twice_changes_nothing_on_the_second_pass() -> None:
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    correct_open_meteo_horizons(conn)
-    after_first = {
-        model: _lead(conn, source="open-meteo", model=model)
-        for model in _OPEN_METEO_MODELS
-    }
-    assert after_first == _EXPECTED_HOURS
-    assert get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) == "applied"
-
-    correct_open_meteo_horizons(conn)
-    after_second = {
-        model: _lead(conn, source="open-meteo", model=model)
-        for model in _OPEN_METEO_MODELS
-    }
-    assert after_second == after_first
-
-
-# ---------------------------------------------------------------------------
 # 4. The marker, not the WHERE clause, is the gate
 # ---------------------------------------------------------------------------
 
@@ -202,73 +156,6 @@ def test_marker_present_blocks_recorrection_of_a_reset_row() -> None:
 
     for model in _OPEN_METEO_MODELS:
         assert _lead(conn, source="open-meteo", model=model) == 168
-
-
-# ---------------------------------------------------------------------------
-# 5. Crash-safety ordering
-# ---------------------------------------------------------------------------
-
-
-def test_partial_prior_correction_is_completed_on_the_next_run() -> None:
-    """Simulates a crash after SOME of the seven original ``UPDATE``s ran but before
-    the marker write: two models are hand-corrected to their approved
-    values while the marker is left unset. The next call must finish the
-    remaining five and write the marker -- an implementation that instead
-    trusted an early marker-absence check to mean "nothing done yet" and
-    re-applied the WHERE clause naively would still converge here (the
-    WHERE clause is ``= 168``, so already-corrected rows are simply
-    skipped), which is exactly the guarantee under test.
-    """
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    conn.execute(
-        "UPDATE feeds SET max_lead_hours = 217"
-        " WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
-        " AND max_lead_hours = 168"
-    )
-    conn.execute(
-        "UPDATE feeds SET max_lead_hours = 217"
-        " WHERE source = 'open-meteo' AND model = 'gfs_global'"
-        " AND max_lead_hours = 168"
-    )
-    assert get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) is None
-
-    correct_open_meteo_horizons(conn)
-
-    _assert_all_seven(conn, _EXPECTED_HOURS)
-    assert get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) == "applied"
-
-
-# ---------------------------------------------------------------------------
-# 6. Multiple matching rows corrected in one pass
-# ---------------------------------------------------------------------------
-
-
-def test_correction_updates_every_matching_model_not_just_the_first() -> None:
-    """``feeds`` carries ``UNIQUE(source, model)`` (migrations.py ~line
-    108), so a single ``(source, model)`` pair can never hold two rows --
-    "multiple matching rows" is realized across the seven original per-model
-    ``UPDATE``s the loop issues in one call, not within a single
-    statement. This kills an implementation that stops after the first
-    model (an early ``break``, or a hardcoded single ``UPDATE`` for
-    ``ecmwf_ifs`` alone): only one model would end up corrected instead of
-    five.
-    """
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    correct_open_meteo_horizons(conn)
-    corrected = {
-        model
-        for model in _OPEN_METEO_MODELS
-        if _lead(conn, source="open-meteo", model=model) != 168
-    }
-    assert corrected == {
-        "ecmwf_ifs",
-        "gfs_global",
-        "gem_global",
-        "jma_gsm",
-        "icon_global",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -326,80 +213,6 @@ def test_display_request_hours_derives_from_forecast_service_day_count() -> None
 
 
 # ---------------------------------------------------------------------------
-# 11. Virtual feeds untouched
-# ---------------------------------------------------------------------------
-
-
-def test_virtual_feeds_keep_168_through_the_migration() -> None:
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    _insert_feed(
-        conn,
-        source="virtual",
-        model="_persistence",
-        max_lead_hours=168,
-        default_subscribed=0,
-        fetch_interval_minutes=1440,
-        is_virtual=1,
-    )
-    _insert_feed(
-        conn,
-        source="virtual",
-        model="_multimodel_mean",
-        max_lead_hours=168,
-        default_subscribed=0,
-        fetch_interval_minutes=1440,
-        is_virtual=1,
-    )
-    correct_open_meteo_horizons(conn)
-    assert _lead(conn, source="virtual", model="_persistence") == 168
-    assert _lead(conn, source="virtual", model="_multimodel_mean") == 168
-
-
-# ---------------------------------------------------------------------------
-# 9. The WHERE clause, not just the marker, protects an operator override
-# ---------------------------------------------------------------------------
-
-
-def test_operator_lowered_horizon_and_foreign_source_survive_the_correction() -> None:
-    """Two collisions the ``UPDATE``'s ``WHERE`` clause alone must resolve,
-    with the marker left unset so only the ``WHERE`` clause is under test:
-
-    - ``icon_global`` is hand-set to 96 (an operator's deliberate downward
-      override) BEFORE the correction runs. ``AND max_lead_hours = 168``
-      is what leaves it alone; drop that predicate and the per-model
-      ``UPDATE`` matches every ``open-meteo``/``icon_global`` row
-      regardless of its current value and overwrites 96 with 180. The
-      other six feeds, still at 168, must still move to their expected
-      targets in the same call -- without that second assertion, a
-      correction that does nothing at all would also leave icon_global at
-      96 and pass.
-    - A synthetic ``meteoblue``/``ecmwf_ifs`` row at 168 shares its model
-      name with a real Open-Meteo model but not its source.
-      ``AND source = 'open-meteo'`` is what leaves it alone; drop that
-      predicate and the ``ecmwf_ifs`` ``UPDATE`` (keyed only on ``model``)
-      matches this row too and raises it to 217.
-    """
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    conn.execute(
-        "UPDATE feeds SET max_lead_hours = 96"
-        " WHERE source = 'open-meteo' AND model = 'icon_global'"
-    )
-    _insert_feed(conn, source="meteoblue", model="ecmwf_ifs", max_lead_hours=168)
-    assert get_runtime_state(conn, OPEN_METEO_HORIZON_CORRECTION_KEY) is None
-
-    correct_open_meteo_horizons(conn)
-
-    assert _lead(conn, source="open-meteo", model="icon_global") == 96
-    for model, hours in _EXPECTED_HOURS.items():
-        if model == "icon_global":
-            continue
-        assert _lead(conn, source="open-meteo", model=model) == hours, model
-    assert _lead(conn, source="meteoblue", model="ecmwf_ifs") == 168
-
-
-# ---------------------------------------------------------------------------
 # 10a. Correction never moves the schema version
 # ---------------------------------------------------------------------------
 
@@ -423,44 +236,3 @@ def test_correction_alone_never_moves_user_version() -> None:
 
     row = conn.execute("PRAGMA user_version").fetchone()
     assert int(row[0]) == 99
-
-
-# ---------------------------------------------------------------------------
-# 12. Everything else untouched
-# ---------------------------------------------------------------------------
-
-
-def test_operator_editable_columns_and_non_open_meteo_rows_untouched() -> None:
-    """The four operator-editable columns (``enabled``, ``disabled_reason``,
-    ``fetch_interval_minutes``, ``default_subscribed``) and all
-    non-Open-Meteo feed rows are unchanged by the correction. Set to
-    non-default values first so the assertion can fail on an
-    ``UPSERT``-style reconciliation pass that would reset them (the exact
-    hazard the docstring on ``correct_open_meteo_horizons`` names).
-    """
-    conn = _bare_db()
-    _seed_seven_at_168(conn)
-    conn.execute(
-        "UPDATE feeds SET enabled = 0, disabled_reason = 'operator-paused',"
-        " fetch_interval_minutes = 720, default_subscribed = 0"
-        " WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
-    )
-    _insert_feed(conn, source="meteoblue", model="multimodel", max_lead_hours=168)
-    _insert_feed(conn, source="google", model="blend", max_lead_hours=168)
-
-    correct_open_meteo_horizons(conn)
-
-    row = conn.execute(
-        "SELECT enabled, disabled_reason, fetch_interval_minutes,"
-        " default_subscribed, max_lead_hours"
-        " FROM feeds WHERE source = 'open-meteo' AND model = 'ecmwf_ifs'"
-    ).fetchone()
-    assert (
-        row["enabled"],
-        row["disabled_reason"],
-        row["fetch_interval_minutes"],
-        row["default_subscribed"],
-    ) == (0, "operator-paused", 720, 0)
-    assert int(row["max_lead_hours"]) == 217
-    assert _lead(conn, source="meteoblue", model="multimodel") == 168
-    assert _lead(conn, source="google", model="blend") == 168

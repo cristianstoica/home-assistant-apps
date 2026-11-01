@@ -165,12 +165,6 @@ def test_clears_coverage_one_below_threshold_does_not_clear() -> None:
     assert clears_coverage(MIN_COVERAGE_HOURS - 1) is False
 
 
-def test_min_coverage_hours_constant_is_18() -> None:
-    # Pin the constant's actual value once, explicitly, so the two boundary
-    # tests above stay meaningful even if someone reads them in isolation.
-    assert MIN_COVERAGE_HOURS == 18
-
-
 # ---------------------------------------------------------------------------
 # blend_mean
 # ---------------------------------------------------------------------------

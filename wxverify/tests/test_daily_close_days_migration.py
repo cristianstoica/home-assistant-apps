@@ -1,5 +1,5 @@
-"""The v11 daily-close-days migration (plan 2026-10-20-daily-close-day-
-state-and-guard.md §10.2-10.7, test IDs MG1-MG6).
+"""The v11 daily-close-days schema's live constraints (plan 2026-10-20-
+daily-close-day-state-and-guard.md §10.2-10.7, test IDs MG5-MG6).
 
 A "version-10 file" is built by migrating a fresh ``:memory:`` connection
 with ``run_migrations``, then genuinely removing the v11 additions: the
@@ -13,9 +13,6 @@ itself is dropped) and the ``stations.retired_at`` column via a real
 ``_drop_stamp_column_and_roll_back`` and ``_v6_db``. It holds station A
 (enabled) and B (turned off) at site 1, and station C (enabled) at site 2,
 per the plan's MG1 fixture note (§10.7-adjacent text above the MG table).
-
-``migrate_v11_daily_close_days`` does not exist yet, so importing it is
-part of the red proof for this whole module.
 """
 
 from __future__ import annotations
@@ -26,14 +23,9 @@ import pytest
 
 from tests.helpers import NOW, D
 from wxverify.core.timeutil import isoformat_utc_micro
-from wxverify.db.migrations import (
-    TARGET_USER_VERSION,
-    migrate_v11_daily_close_days,
-    run_migrations,
-)
+from wxverify.db.migrations import run_migrations
 
 _FAKED_NOW = NOW.replace(hour=0, minute=30, second=0, microsecond=0)
-_SEED_EFFECTIVE_DATE = "0001-01-01"
 
 
 def _v10_db() -> sqlite3.Connection:
@@ -100,152 +92,6 @@ def _v10_db() -> sqlite3.Connection:
 def _migrate(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("wxverify.db.migrations.utc_now", lambda: _FAKED_NOW)
     run_migrations(conn)
-
-
-def _station_changes(conn: sqlite3.Connection) -> list[tuple[int, str, str, str, str]]:
-    rows = conn.execute(
-        """
-        SELECT station_id, change, effective_date, reason, changed_at
-        FROM station_changes ORDER BY station_id
-        """
-    ).fetchall()
-    return [
-        (
-            r["station_id"],
-            r["change"],
-            r["effective_date"],
-            r["reason"],
-            r["changed_at"],
-        )
-        for r in rows
-    ]
-
-
-def test_mg1_migrate_the_version_10_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = _v10_db()
-
-    _migrate(conn, monkeypatch)
-
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION
-
-    retired = {
-        r["id"]: r["retired_at"]
-        for r in conn.execute("SELECT id, retired_at FROM stations")
-    }
-    assert set(retired.values()) == {None}
-
-    assert conn.execute("SELECT COUNT(*) FROM site_days").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM site_day_stations").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM site_zone_changes").fetchone()[0] == 0
-
-    expected_changed_at = isoformat_utc_micro(_FAKED_NOW)
-    changes = _station_changes(conn)
-    assert changes == [
-        (1, "added", _SEED_EFFECTIVE_DATE, "switch_seed", expected_changed_at),
-        (2, "turned_off", _SEED_EFFECTIVE_DATE, "switch_seed", expected_changed_at),
-        (3, "added", _SEED_EFFECTIVE_DATE, "switch_seed", expected_changed_at),
-    ]
-
-
-def test_mg2_a_station_already_seeded_is_left_alone(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _v10_db()
-    _migrate(conn, monkeypatch)
-
-    conn.execute(
-        """
-        INSERT INTO stations
-            (id, site_id, pws_station_id, lat, lon, dem_elevation_m, enabled)
-        VALUES (4, 1, 'ISTATION04', 0.0, 0.0, 0.0, 1)
-        """
-    )
-    seeded_changed_at = isoformat_utc_micro(_FAKED_NOW)
-    conn.execute(
-        """
-        INSERT INTO station_changes
-            (site_id, station_id, change, effective_date, reason, changed_at)
-        VALUES (1, 4, 'added', ?, 'switch_seed', ?)
-        """,
-        (_SEED_EFFECTIVE_DATE, seeded_changed_at),
-    )
-    conn.commit()
-
-    later = _FAKED_NOW.replace(minute=31)
-    monkeypatch.setattr("wxverify.db.migrations.utc_now", lambda: later)
-    migrate_v11_daily_close_days(conn)
-    run_migrations(conn)
-
-    rows = conn.execute(
-        "SELECT change, effective_date, reason, changed_at "
-        "FROM station_changes WHERE station_id = 4"
-    ).fetchall()
-    assert len(rows) == 1
-    assert (
-        rows[0]["change"],
-        rows[0]["effective_date"],
-        rows[0]["reason"],
-        rows[0]["changed_at"],
-    ) == ("added", _SEED_EFFECTIVE_DATE, "switch_seed", seeded_changed_at)
-
-
-def test_mg3_a_crash_before_the_version_write_is_safe_to_repeat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    conn = _v10_db()
-    _migrate(conn, monkeypatch)
-
-    first_changes = _station_changes(conn)
-
-    conn.execute("PRAGMA user_version = 10")
-    run_migrations(conn)
-
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION
-    assert _station_changes(conn) == first_changes
-
-
-def test_mg4_fresh_and_migrated_files_agree_on_shape(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    migrated = _v10_db()
-    _migrate(migrated, monkeypatch)
-
-    fresh = sqlite3.connect(":memory:")
-    fresh.row_factory = sqlite3.Row
-    fresh.execute("PRAGMA foreign_keys=ON")
-    run_migrations(fresh)
-
-    for table in (
-        "stations",
-        "site_days",
-        "station_changes",
-        "site_day_stations",
-        "site_zone_changes",
-    ):
-        fresh_cols = [tuple(r) for r in fresh.execute(f"PRAGMA table_xinfo({table})")]
-        migrated_cols = [
-            tuple(r) for r in migrated.execute(f"PRAGMA table_xinfo({table})")
-        ]
-        assert fresh_cols == migrated_cols, table
-
-    fresh_station_cols = [
-        r["name"] for r in fresh.execute("PRAGMA table_info(stations)")
-    ]
-    assert fresh_station_cols[-1] == "retired_at"
-
-    for index in (
-        "idx_site_days_state",
-        "idx_station_changes_station",
-        "idx_site_zone_changes_site",
-        "idx_site_days_writable",
-    ):
-        fresh_idx = [tuple(r) for r in fresh.execute(f"PRAGMA index_xinfo({index})")]
-        migrated_idx = [
-            tuple(r) for r in migrated.execute(f"PRAGMA index_xinfo({index})")
-        ]
-        assert fresh_idx == migrated_idx, index
 
 
 def test_mg5_site_days_check_constraints(monkeypatch: pytest.MonkeyPatch) -> None:

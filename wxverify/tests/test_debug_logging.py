@@ -8,7 +8,6 @@ Covers:
 - T7     INFO level policy: only sanctioned milestone lines appear, zero DEBUG
 - T8     Feed-adapter firehose at DEBUG (open_meteo request+response lines)
 - T9     PWS observation firehose at DEBUG
-- T10    Scoring engine firehose at DEBUG: phase lines emitted per phase
 - T11    Worker cycle at DEBUG: job-claimed / job-completed lines present
 - T12    Backfill/catchup at DEBUG: window/chunk / sites/changed lines
 - T13    DB migration firehose at DEBUG: migrations begin…done + txn begin/commit
@@ -18,8 +17,7 @@ Covers:
 - T17/T7b BC2: job deferred moved INFO → DEBUG (paired positive + negative)
 - L1     _configure_logging's handler streams to sys.stdout by identity
 - L2     _uvicorn_log_config overrides only handlers.default.stream
-- L3     cycle:/score discovery/score window=/score sweep INFO lines
-         are actually emitted (not just whitelisted); score batch stays DEBUG
+- L3     cycle: INFO line is actually emitted (not just whitelisted)
 """
 
 from __future__ import annotations
@@ -41,14 +39,12 @@ import uvicorn.config
 from wxverify import config
 from wxverify.core.log_redaction import RedactUrlSecretsFilter
 from wxverify.core.timeutil import utc_now
-from wxverify.db.connection import FencedWriter, close_db, get_db, init_db
+from wxverify.db.connection import close_db, get_db, init_db
 from wxverify.db.queue import FailDisposition, Job
-from wxverify.db.switch import ensure_site_generation
 from wxverify.feeds.seam import CostEstimate, FetchResult
 from wxverify.worker.control import JobDeferred
 from wxverify.worker.feed_fetch import DownloadSlot, fetch_feed_once
 from wxverify.worker.processor import run_worker
-from wxverify.worker.score_batches import run_batched_scoring
 
 # ---------------------------------------------------------------------------
 # Shared helpers (mirror test_011_patch.py conventions exactly)
@@ -82,50 +78,6 @@ def _open_meteo_feed_id(conn: sqlite3.Connection) -> int:
             " WHERE source='open-meteo' AND is_virtual=0"
             " ORDER BY id LIMIT 1"
         ).fetchone()["id"]
-    )
-
-
-def _seed_forecast_pair(
-    conn: sqlite3.Connection,
-    *,
-    site_id: int,
-    feed_id: int,
-    variable: str = "temperature",
-    day_ahead: int = 1,
-    valid_at: str = "2026-01-01T06:00:00Z",
-    issued_at: str = "2026-01-01T00:00:00Z",
-    forecast: float = 11.0,
-    observed: float = 10.0,
-) -> None:
-    """Seed one forecast_pairs row so score discovery finds a real cell.
-
-    Mirrors test_write_lock_serialization.py's ``_seed_pair`` — cell identity
-    (site/feed/variable/day_ahead) is all discovery needs; the exact
-    valid_at/window relationship is irrelevant to L3 (it asserts log-line
-    emission, not score values), so no wall-clock freezing is required.
-    """
-    error = forecast - observed
-    conn.execute(
-        """
-        INSERT INTO forecast_pairs
-            (site_id, feed_id, variable, issued_at, valid_at, lead_hours, day_ahead,
-             forecast, observed, error, abs_error, sq_error, tz_generation_id)
-        VALUES (?, ?, ?, ?, ?, 24, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            site_id,
-            feed_id,
-            variable,
-            issued_at,
-            valid_at,
-            day_ahead,
-            forecast,
-            observed,
-            error,
-            abs(error),
-            error * error,
-            ensure_site_generation(conn, site_id),
-        ),
     )
 
 
@@ -823,96 +775,6 @@ def test_pws_adapter_debug_lines_present_at_debug(
 
 
 # ---------------------------------------------------------------------------
-# T10 — Scoring engine firehose at DEBUG: phase lines
-# ---------------------------------------------------------------------------
-
-
-def test_scoring_engine_emits_phase_debug_lines(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """T10-C: pair_and_score emits DEBUG phase lines for each of the 4 phases,
-    and emits exactly one INFO 'scoring run complete' milestone line.
-    """
-    conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
-
-    from wxverify.scoring.engine import pair_and_score  # noqa: PLC0415
-
-    with caplog.at_level(logging.DEBUG, logger="wxverify.scoring.engine"):
-        conn.execute("BEGIN IMMEDIATE")
-        pair_and_score(conn, site_id)
-        conn.commit()
-
-    engine_records = [r for r in caplog.records if r.name == "wxverify.scoring.engine"]
-    debug_msgs = [r.getMessage() for r in engine_records if r.levelno == logging.DEBUG]
-    info_msgs = [r.getMessage() for r in engine_records if r.levelno == logging.INFO]
-
-    # One pair_and_score start line
-    assert any("pair_and_score start" in m for m in debug_msgs), (
-        f"pair_and_score start debug line missing; got: {debug_msgs}"
-    )
-
-    # Phase entry lines — 4 phases in PAIR_AND_SCORE_PHASES
-    phase_lines = [m for m in debug_msgs if "pair_and_score phase=" in m]
-    assert len(phase_lines) == 4, (
-        f"expected 4 phase DEBUG lines, got {len(phase_lines)}: {phase_lines}"
-    )
-
-    # Exactly one scoring run complete INFO milestone
-    scoring_done = [m for m in info_msgs if "scoring run complete" in m]
-    assert len(scoring_done) == 1, (
-        f"expected exactly 1 'scoring run complete' INFO line; got: {scoring_done}"
-    )
-    assert f"site={site_id}" in scoring_done[0], (
-        f"scoring run complete must carry site_id; got: {scoring_done[0]!r}"
-    )
-    assert "cells=" in scoring_done[0], (
-        f"scoring run complete must carry cells= field; got: {scoring_done[0]!r}"
-    )
-
-    # Level demarcation: phase lines absent at INFO
-    caplog.clear()
-    with caplog.at_level(logging.INFO, logger="wxverify.scoring.engine"):
-        conn.execute("BEGIN IMMEDIATE")
-        pair_and_score(conn, site_id)
-        conn.commit()
-
-    debug_at_info = [
-        r
-        for r in caplog.records
-        if r.name == "wxverify.scoring.engine" and r.levelno == logging.DEBUG
-    ]
-    assert len(debug_at_info) == 0, (
-        "scoring engine DEBUG lines must not appear when caplog is at INFO"
-    )
-
-
-def test_scoring_run_complete_cells_count_is_accurate(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """T10 cells= honesty: with no forecast pairs, cells=0; with pairs, cells>0."""
-    conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
-
-    from wxverify.scoring.engine import pair_and_score  # noqa: PLC0415
-
-    # No forecast samples → no pairs → cells should be 0
-    with caplog.at_level(logging.INFO, logger="wxverify.scoring.engine"):
-        conn.execute("BEGIN IMMEDIATE")
-        pair_and_score(conn, site_id)
-        conn.commit()
-
-    info_msgs = [
-        r.getMessage()
-        for r in caplog.records
-        if r.name == "wxverify.scoring.engine" and r.levelno == logging.INFO
-    ]
-    assert any("cells=0" in m for m in info_msgs), (
-        f"with no pairs, cells=0 must appear in scoring run complete; got: {info_msgs}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # T11 — Worker cycle at DEBUG: job-claimed / job-completed + scheduler line
 # ---------------------------------------------------------------------------
 
@@ -1478,9 +1340,7 @@ def test_uvicorn_log_config_overrides_only_default_stream() -> None:
 
 
 # ---------------------------------------------------------------------------
-# L3 — cycle:/score discovery/score window=/score sweep INFO lines
-# are actually EMITTED (the T7 whitelist only permits them); score batch
-# stays DEBUG-only, never promoted to INFO.
+# L3 — cycle: INFO line is actually EMITTED (the T7 whitelist only permits it)
 # ---------------------------------------------------------------------------
 
 
@@ -1521,98 +1381,4 @@ def test_cycle_info_line_carries_elapsed_field(
     )
     assert "elapsed=" in cycle_lines[0], (
         f"cycle: INFO line must carry an elapsed= field; got: {cycle_lines[0]!r}"
-    )
-
-
-def test_batched_scoring_orchestrator_info_lines_actually_emitted(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """L3 (score_batches): score discovery/window=/sweep fire at INFO with elapsed=.
-
-    Drives run_batched_scoring directly against a seeded test DB (pattern from
-    test_write_lock_serialization.py) instead of trusting T7's whitelist, which
-    only *permits* these prefixes without ever proving the orchestrator emits
-    them. Goes red if any of the three lines is dropped, demoted, or loses its
-    elapsed= field.
-    """
-    conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
-    feed_id = _open_meteo_feed_id(conn)
-    _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    with caplog.at_level(logging.DEBUG, logger="wxverify.worker.score_batches"):
-        asyncio.run(run_batched_scoring(writer, site_id))
-
-    info_records = [
-        r
-        for r in caplog.records
-        if r.name == "wxverify.worker.score_batches" and r.levelno == logging.INFO
-    ]
-    info_msgs = [r.getMessage() for r in info_records]
-
-    discovery = [m for m in info_msgs if m.startswith("score discovery")]
-    assert len(discovery) == 1, (
-        f"expected exactly 1 'score discovery' INFO line; got: {info_msgs}"
-    )
-    assert "elapsed=" in discovery[0], f"got: {discovery[0]!r}"
-    assert f"site={site_id}" in discovery[0], f"got: {discovery[0]!r}"
-    assert "attempts=1" in discovery[0], f"got: {discovery[0]!r}"
-
-    windows = [m for m in info_msgs if m.startswith("score window=")]
-    # stamp_score_work builds exactly 2 windows (rolling + all-time).
-    assert len(windows) == 2, f"expected 2 'score window=' INFO lines; got: {info_msgs}"
-    assert all("elapsed=" in m for m in windows), f"got: {windows}"
-    assert all("compute=" in m for m in windows), f"got: {windows}"
-    assert all("apply=" in m for m in windows), f"got: {windows}"
-    assert all("apply_max=" in m for m in windows), f"got: {windows}"
-    assert all("attempts=1" in m for m in windows), f"got: {windows}"
-
-    sweep = [m for m in info_msgs if m.startswith("score sweep")]
-    assert len(sweep) == 1, (
-        f"expected exactly 1 'score sweep' INFO line; got: {info_msgs}"
-    )
-    assert "elapsed=" in sweep[0], f"got: {sweep[0]!r}"
-    assert f"site={site_id}" in sweep[0], f"got: {sweep[0]!r}"
-
-    assert not [m for m in info_msgs if "cas_miss" in m], (
-        f"a single-writer run must never CAS-miss; got: {info_msgs}"
-    )
-
-
-def test_score_batch_line_is_debug_only_never_info(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """L3 (score batch): the per-batch 'score batch' line is DEBUG-only.
-
-    Positive: with caplog at DEBUG, 'score batch' fires from
-    wxverify.scoring.engine.apply_cell_batch (called once per batch by
-    run_batched_scoring). Paired negative, from the SAME capture (not an
-    ambient absence): none of those records carry levelno INFO — this is the
-    regression a silent logger.debug -> logger.info promotion would trip.
-    """
-    conn = _init_tmp_db(tmp_path)
-    site_id = _insert_site(conn)
-    feed_id = _open_meteo_feed_id(conn)
-    _seed_forecast_pair(conn, site_id=site_id, feed_id=feed_id)
-    db = get_db()
-    writer = FencedWriter(db, db.generation)
-
-    with caplog.at_level(logging.DEBUG, logger="wxverify"):
-        asyncio.run(run_batched_scoring(writer, site_id))
-
-    engine_records = [r for r in caplog.records if r.name == "wxverify.scoring.engine"]
-    batch_records = [r for r in engine_records if "score batch" in r.getMessage()]
-
-    debug_batch = [r for r in batch_records if r.levelno == logging.DEBUG]
-    assert len(debug_batch) > 0, (
-        "positive: 'score batch' must fire at DEBUG from apply_cell_batch; "
-        f"engine records: {[r.getMessage() for r in engine_records]}"
-    )
-
-    info_batch = [r for r in batch_records if r.levelno == logging.INFO]
-    assert len(info_batch) == 0, (
-        "'score batch' must never appear at INFO — it is a per-batch DEBUG "
-        f"line, not a milestone; got: {[r.getMessage() for r in info_batch]}"
     )

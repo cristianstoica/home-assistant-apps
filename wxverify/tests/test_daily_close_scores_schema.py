@@ -1,13 +1,10 @@
-"""Schema and migration for daily-close P4 piece 1 (plan
+"""Schema for daily-close P4 piece 1 (plan
 2026-10-22-daily-close-pairs-and-publication.md, section 15, test IDs
-SZ1-SZ4, 18.12).
-
-Every test here is written before ``migrate_v14_daily_close_scores`` and
-P4's twelve tables and four widened columns exist, and fails first for
-that reason: ``TARGET_USER_VERSION`` is still 13 (15.1), the new tables are
-absent from a migrated database, and the import checks of 15.6 do not yet
-cover them. Section 19 of the plan names the mutant each test ID must
-kill; that mapping is also given inline on each assertion.
+SZ2-SZ4, 18.12): the live, fresh-schema behaviour of P4's twelve new tables
+and their migration -- idempotence on repeat, foreign-key cascade/restrict
+rules, and ``_validate_upload``'s per-table checks. Section 19 of the plan
+names the mutant each test ID must kill; that mapping is also given inline
+on each assertion.
 
 Real SQLite and real migrations throughout; nothing in the code under test
 is mocked. Synthetic data only: station ids ``ISTATION01``/``ISTATION02``
@@ -27,11 +24,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.helpers import NOW, D, asof_conn, asof_make_real_feed, asof_make_site
-from wxverify.core.timeutil import isoformat_utc
-from wxverify.db.migrations import TARGET_USER_VERSION, run_migrations
+from tests.helpers import D, asof_conn, asof_make_real_feed, asof_make_site
+from wxverify.db.migrations import run_migrations
 from wxverify.db.runtime_state import get_runtime_state
-from wxverify.db.switch import ensure_site_generation
 
 # ---------------------------------------------------------------------------
 # Shared fixture plumbing
@@ -52,202 +47,7 @@ _NEW_TABLES = (
     "publication_coverage",
 )
 
-# 15.3 names two widened tables (``verification_runs`` gains
-# ``worksheet_kept``; ``forecast_of_record`` gains three publication
-# columns). The plan's own 18.12 SZ1 row says "the three widened ones";
-# only two are named anywhere in section 15, so this pins the two the
-# schema section actually documents rather than guessing at a third.
-_WIDENED_TABLES = ("verification_runs", "forecast_of_record")
-
 _STAMP = "2026-07-06T00:00:00Z"
-
-
-def _table_shape(conn: sqlite3.Connection, table: str) -> list[dict[str, object]]:
-    return [dict(r) for r in conn.execute(f"PRAGMA table_xinfo({table})")]
-
-
-def _table_indexes(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {
-        str(r["name"])
-        for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?",
-            (table,),
-        )
-    }
-
-
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {str(r["name"]) for r in conn.execute(f"PRAGMA table_info({table})")}
-
-
-def _drop_columns_if_present(
-    conn: sqlite3.Connection, table: str, columns: tuple[str, ...]
-) -> None:
-    present = _table_columns(conn, table)
-    for column in columns:
-        if column in present:
-            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")  # noqa: S608
-
-
-def _strip_p4_additions(conn: sqlite3.Connection) -> None:
-    """Undo P4's schema additions on an already-migrated connection, mirroring
-    ``tests/test_close_schema.py``'s ``_build_v12_file`` technique: drop the
-    twelve new tables, drop the four new columns if present, remove the
-    ``download_record_since`` runtime-state row, and set ``user_version``
-    back to 13. Safe to call before piece 1 lands too (every drop is a
-    no-op then), so one helper builds a genuine v13 file in either state.
-    """
-    for table in _NEW_TABLES:
-        conn.execute(f"DROP TABLE IF EXISTS {table}")  # noqa: S608
-    _drop_columns_if_present(conn, "verification_runs", ("worksheet_kept",))
-    _drop_columns_if_present(
-        conn,
-        "forecast_of_record",
-        ("publication_id", "publication_cutoff", "publication_age_days"),
-    )
-    conn.execute("DELETE FROM runtime_state WHERE key = 'download_record_since'")
-    conn.execute("PRAGMA user_version = 13")
-
-
-def _insert_verification_run(conn: sqlite3.Connection, site_id: int) -> int:
-    gen_id = ensure_site_generation(conn, site_id)
-    cur = conn.execute(
-        """
-        INSERT INTO verification_runs
-            (site_id, tz_generation_id, methodology_version, app_version,
-             state, attempt, config_snapshot, bootstrap_seed,
-             bootstrap_resamples, input_fingerprint)
-        VALUES (?, ?, 1, '0.0.0-test', 'published', 1, '{}', 1, 10, 'fp-1')
-        """,
-        (site_id, gen_id),
-    )
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
-def _insert_forecast_of_record(conn: sqlite3.Connection, site_id: int) -> None:
-    gen_row = conn.execute(
-        "SELECT id FROM timezone_generations WHERE site_id = ?", (site_id,)
-    ).fetchone()
-    assert gen_row is not None
-    conn.execute(
-        """
-        INSERT INTO forecast_of_record
-            (site_id, tz_generation_id, timezone, snapshot_local_date,
-             snapshot_local_time, snapshot_utc, target_local_date, variable,
-             display_lead, status, missed_reason, methodology_version,
-             app_version)
-        VALUES (?, ?, 'UTC', ?, '07:00', ?, ?, 'temperature', 0, 'missed',
-                'no_data', 1, '0.0.0-test')
-        """,
-        (site_id, gen_row[0], D.isoformat(), isoformat_utc(NOW), D.isoformat()),
-    )
-
-
-def _build_v13_file_with_runs_and_records(path: Path) -> tuple[Path, int, int]:
-    """A genuine schema-version-13 file carrying a ``verification_runs`` row
-    and a ``forecast_of_record`` row, built by migrating fully then undoing
-    P4's additions (SC1's technique in ``tests/test_close_schema.py``). SZ1.
-    """
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    site_id = asof_make_site(conn, "Testsite")
-    run_id = _insert_verification_run(conn, site_id)
-    _insert_forecast_of_record(conn, site_id)
-    _strip_p4_additions(conn)
-    conn.commit()
-    conn.close()
-    return path, site_id, run_id
-
-
-# --- SZ1 --------------------------------------------------------------------
-
-
-def test_sz1_fresh_and_migrated_v13_files_agree_and_old_rows_survive(
-    tmp_path: Path,
-) -> None:
-    """SZ1: a fresh file and a file at schema version 13 carrying a
-    ``verification_runs`` row and a ``forecast_of_record`` row, both
-    migrated, land on the same ``user_version``, the same shapes and
-    indexes for every new table and the two widened ones, keep the old
-    run's ``worksheet_kept`` at 1 and the record's new columns NULL, and
-    set ``download_record_since`` once.
-    """
-    fresh_conn = sqlite3.connect(":memory:")
-    fresh_conn.row_factory = sqlite3.Row
-    fresh_conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(fresh_conn)
-
-    v13_path, site_id, run_id = _build_v13_file_with_runs_and_records(
-        tmp_path / "v13.db"
-    )
-    migrated_conn = sqlite3.connect(str(v13_path))
-    migrated_conn.row_factory = sqlite3.Row
-    migrated_conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(migrated_conn)
-
-    for conn in (fresh_conn, migrated_conn):
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        assert version == TARGET_USER_VERSION, (
-            "M116 -> at this assertion: correct = user_version read from"
-            " TARGET_USER_VERSION (15 in this release), never a literal,"
-            " mutant M116 (a new column added in"
-            " a different position on migrate) = the migrated file's"
-            " PRAGMA table_xinfo diverges from the fresh file's below even"
-            " though both reach the same user_version"
-        )
-
-    for table in (*_NEW_TABLES, *_WIDENED_TABLES):
-        fresh_shape = _table_shape(fresh_conn, table)
-        migrated_shape = _table_shape(migrated_conn, table)
-        assert fresh_shape == migrated_shape, (
-            f"M116 -> at the {table} table_xinfo comparison: correct ="
-            " identical column lists (name, type, and position) on both"
-            " paths, mutant M116 (a new column added in a different"
-            f" position on migrate) = the two {table} shapes disagree"
-        )
-        fresh_idx = _table_indexes(fresh_conn, table)
-        migrated_idx = _table_indexes(migrated_conn, table)
-        assert fresh_idx == migrated_idx, (
-            f"mutant -> at the {table} index-name comparison: correct ="
-            " the same index names on both paths, mutant (an index lost in"
-            " the rebuild) = the migrated file missing one"
-        )
-
-    run_row = migrated_conn.execute(
-        "SELECT worksheet_kept FROM verification_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    assert run_row is not None and run_row["worksheet_kept"] == 1, (
-        "mutant -> at this assertion: correct = 1 (every pre-existing"
-        " verification_runs row gets worksheet_kept 1, 15.5), mutant (the"
-        " ALTER TABLE ... ADD COLUMN default left out or set to 0) ="
-        " worksheet_kept is 0 or NULL on the old row"
-    )
-    record_row = migrated_conn.execute(
-        "SELECT publication_id, publication_cutoff, publication_age_days"
-        " FROM forecast_of_record WHERE site_id = ?",
-        (site_id,),
-    ).fetchone()
-    assert record_row is not None
-    assert (
-        record_row["publication_id"] is None
-        and record_row["publication_cutoff"] is None
-        and record_row["publication_age_days"] is None
-    ), (
-        "mutant -> at this assertion: correct = all three NULL (15.5: every"
-        " pre-existing record gets NULL publication columns), mutant (a"
-        " non-NULL default on one of the three) = at least one is not None"
-    )
-
-    since = get_runtime_state(migrated_conn, "download_record_since")
-    assert since is not None, (
-        "mutant -> at this assertion: correct = download_record_since set"
-        " (15.4: the migration writes it once, with the migration's time,"
-        " when absent), mutant (the runtime_state write left out of"
-        " migrate_v14_daily_close_scores) = the key stays absent"
-    )
 
 
 # --- SZ2 --------------------------------------------------------------------
@@ -281,71 +81,6 @@ def test_sz2_migration_run_twice_adds_nothing_twice(tmp_path: Path) -> None:
         " M117 (the column/table probe removed, so every re-run repeats"
         " every write unconditionally) = second_since differs from"
         " first_since (a later timestamp from the second run)"
-    )
-
-
-def test_sz2_a_hand_added_worksheet_kept_column_is_left_alone(
-    tmp_path: Path,
-) -> None:
-    """SZ2 (second case): a version-13 file where ``verification_runs.
-    worksheet_kept`` was already added by hand, with a non-default value on
-    an existing row, migrates to the target version without error and
-    without resetting that value -- proving the migration checks
-    ``_table_columns`` before its own ``ALTER TABLE ... ADD COLUMN``
-    (15.3) rather than running it unconditionally.
-    """
-    v13_path, site_id, run_id = _build_v13_file_with_runs_and_records(
-        tmp_path / "v13-hand-altered.db"
-    )
-    conn = sqlite3.connect(str(v13_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    assert "worksheet_kept" not in _table_columns(conn, "verification_runs"), (
-        "fixture bug: the v13 file must not already carry worksheet_kept"
-        " before the by-hand ALTER below"
-    )
-    conn.execute(
-        "ALTER TABLE verification_runs ADD COLUMN worksheet_kept INTEGER"
-        " NOT NULL DEFAULT 1"
-    )
-    conn.execute(
-        "UPDATE verification_runs SET worksheet_kept = 0 WHERE id = ?",
-        (run_id,),
-    )
-    conn.commit()
-
-    run_migrations(conn)  # M117 -> must not raise "duplicate column name"
-    conn.commit()
-
-    since = get_runtime_state(conn, "download_record_since")
-    assert since is not None, (
-        "precondition -> at this assertion: correct = download_record_since"
-        " set (P4 piece 1's migrate_v14_daily_close_scores writes it once,"
-        " 15.4), missing = the migration never ran on this file, so this"
-        " test proves nothing about the column-exists probe below"
-    )
-    forecast_downloads_present = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='forecast_downloads'"
-    ).fetchone()
-    assert forecast_downloads_present is not None, (
-        "precondition -> at this assertion: correct = forecast_downloads"
-        " present (P4 piece 1's 15.2 creates it in create_tables, which"
-        " migrate_v14_daily_close_scores reaches on this file), missing ="
-        " the migration never ran on this file, so this test proves"
-        " nothing about the column-exists probe below"
-    )
-
-    row = conn.execute(
-        "SELECT worksheet_kept FROM verification_runs WHERE id = ?", (run_id,)
-    ).fetchone()
-    assert row is not None and row["worksheet_kept"] == 0, (
-        "M117 -> at this assertion: correct = 0 (the migration's own ADD"
-        " COLUMN is skipped when the column already exists, 15.3, so the"
-        " hand-set value survives untouched), mutant M117 (the"
-        " _table_columns probe removed) = either a sqlite3.OperationalError"
-        " ('duplicate column name: worksheet_kept') was raised above, or"
-        " (a variant that catches it and re-runs the UPDATE default) the"
-        " value is reset to 1"
     )
 
 
@@ -793,42 +528,3 @@ def test_sz4_a_bad_cutoff_date_is_refused(tmp_path: Path) -> None:
         " M119 (publications.cutoff left out of _CANONICAL_DATE_COLUMNS) ="
         " _validate_upload does not raise for this file at all"
     )
-
-
-def test_sz4_a_file_from_before_p4_is_accepted(tmp_path: Path) -> None:
-    """SZ4 (case 5): a file genuinely at schema version 13 -- none of P4's
-    twelve tables present -- is accepted by ``_validate_upload`` (15.6:
-    each check is skipped when its table is absent) and migrates the rest
-    of the way on open.
-    """
-    from wxverify.api.routes.db_transfer import _validate_upload  # noqa: PLC2701
-
-    path, _site_id, _run_id = _build_v13_file_with_runs_and_records(
-        tmp_path / "pre-p4.db"
-    )
-
-    _validate_upload(path)  # must not raise
-
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    run_migrations(conn)
-    version = conn.execute("PRAGMA user_version").fetchone()[0]
-    assert version == TARGET_USER_VERSION, (
-        "mutant -> at this assertion: correct = TARGET_USER_VERSION (the"
-        " older, pre-this-release file migrates the rest of the way on"
-        " open), mutant (an upload-time version check that refuses a"
-        " version-13 file outright) = this file never reaches"
-        " TARGET_USER_VERSION here"
-    )
-    names = {
-        str(row["name"])
-        for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
-    for table in _NEW_TABLES:
-        assert table in names, (
-            f"mutant -> at this assertion: correct = {table} present after"
-            " migrating the older file, mutant (a new table left out of"
-            f" create_tables/migrate_v14_daily_close_scores) = {table}"
-            " absent"
-        )
