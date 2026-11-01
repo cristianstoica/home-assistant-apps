@@ -29,7 +29,8 @@ DECLARATIVE_ONLY: frozenset[str] = frozenset()
 # constants say; runs persist the version they were scored under.
 # 3: the served wind became the accuracy-weighted daily high (0.16.6).
 # 4: forecast rain is labelled by the start of its hour.
-METHODOLOGY_VERSION = 4
+# 5: scores come only from the daily close's scored round and its publications.
+METHODOLOGY_VERSION = 5
 
 # Canonical snapshot time (default): the daily decision instant T, expressed
 # as site-local wall-clock time.

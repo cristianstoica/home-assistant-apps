@@ -335,8 +335,9 @@ def test_o13_methodology_and_schema_versions_moved_together() -> None:
     # This change (pairwise decision cores) bumped both counters together;
     # a mutant reverting either one in isolation fails this assertion. The
     # rain-label-boundary release moves only METHODOLOGY_VERSION, not
-    # VERIFICATION_SCHEMA.
-    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (4, 2)
+    # VERIFICATION_SCHEMA. The daily-close-days switch also moves only
+    # METHODOLOGY_VERSION (to 5), not VERIFICATION_SCHEMA.
+    assert (METHODOLOGY_VERSION, VERIFICATION_SCHEMA) == (5, 2)
 
 
 # ---------------------------------------------------------------------------
