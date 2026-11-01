@@ -149,11 +149,48 @@ def _lane_fixture(
 def test_ga1_the_gate_runs_before_the_claim(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from wxverify.worker import cutover as cutover_module
+
     db, conn, stand_in, (s1, s2, s3) = _lane_fixture(tmp_path, monkeypatch)
 
     enqueue_if_absent(conn, "fetch_feed", s1, "ga1-feed", {})
     enqueue_if_absent(conn, "fetch_obs", s1, "wind-days", {})
+    # A failed job well past FAILED_JOB_RETENTION_HOURS, seeded directly so
+    # its only route out is the lane's own housekeeping purge -- which the
+    # docstring (processor.py:263-271) says must not run before the cutover
+    # writes the key.
+    old_failed_stamp = "2020-01-01T00:00:00.000000Z"
+    conn.execute(
+        "INSERT INTO jobs (type, site_id, status, updated_at) VALUES"
+        " ('fetch_feed', ?, 'failed', ?)",
+        (s1, old_failed_stamp),
+    )
     conn.commit()
+
+    # Recorded once, at the lane's very first B1 unit (the earliest point
+    # while the key is still absent), so the recording cannot be influenced
+    # by anything the gate itself does afterward.
+    first_unit_state: dict[str, Any] = {}
+    real_build = stand_in.build
+
+    async def _recording_build(
+        db_arg: Any, writer: Any, site_id: int, first_record_date: date
+    ) -> None:
+        if not first_unit_state:
+            first_unit_state["scheduler_last_tick_at"] = get_runtime_state(
+                conn, "scheduler_last_tick_at"
+            )
+            first_unit_state["old_failed_job_present"] = (
+                conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status = 'failed'"
+                    " AND updated_at = ?",
+                    (old_failed_stamp,),
+                ).fetchone()[0]
+                == 1
+            )
+        await real_build(db_arg, writer, site_id, first_record_date)
+
+    monkeypatch.setattr(cutover_module, "build_first_publication", _recording_build)
 
     async def _stop_on_claimed_job(db_arg: Any, job: Any, *, lane: str) -> None:
         raise _Stop(job)
@@ -162,6 +199,20 @@ def test_ga1_the_gate_runs_before_the_claim(
 
     with pytest.raises(_Stop) as exc_info:
         asyncio.run(processor_module._run_main_lane(db))
+
+    assert first_unit_state, "the recording build was never called"
+    assert first_unit_state["scheduler_last_tick_at"] is None, (
+        "M17 -> at this assertion: correct = scheduler_last_tick_at still "
+        "absent at the first B1 unit (no tick ran before the key), mutant = "
+        f"{first_unit_state['scheduler_last_tick_at']!r} (the heartbeat ran "
+        "before the gate)"
+    )
+    assert first_unit_state["old_failed_job_present"] is True, (
+        "M17 -> at this assertion: correct = the pre-retention failed job "
+        "still there at the first B1 unit (no purge ran before the key), "
+        f"mutant = {first_unit_state['old_failed_job_present']} (the purge "
+        "ran before the gate)"
+    )
 
     claimed_job = exc_info.value.payload
     assert get_runtime_state(conn, DAILY_CLOSE_ON_KEY) is not None, (
@@ -181,6 +232,25 @@ def test_ga1_the_gate_runs_before_the_claim(
         f"run_claimed_job call)"
     )
 
+    # Paired positive, using the SAME two reads above: once the gate has
+    # genuinely opened (by the time the real job is claimed, below), both
+    # now show the opposite -- proving the oracle can see presence as well
+    # as absence, not just report "absent" unconditionally.
+    assert get_runtime_state(conn, "scheduler_last_tick_at") is not None, (
+        "M17 -> paired positive: correct = scheduler_last_tick_at now set "
+        "once the gate opened, mutant = still absent (the same read used "
+        "above can see a real stamp)"
+    )
+    purged_count = conn.execute(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'failed' AND updated_at = ?",
+        (old_failed_stamp,),
+    ).fetchone()[0]
+    assert purged_count == 0, (
+        "M17 -> paired positive: correct = the old failed job purged once "
+        f"the gate opened, mutant = {purged_count} still there (the same "
+        "read used above can see a real purge)"
+    )
+
 
 def test_ga2_scheduler_tick_returns_immediately_while_the_key_is_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -188,7 +258,12 @@ def test_ga2_scheduler_tick_returns_immediately_while_the_key_is_absent(
     db = _init_tmp_db(tmp_path)
     conn = db._conn  # noqa: SLF001
     _make_site(conn, timezone="UTC")
-    now = datetime(2025, 1, 2, 5, 0, 0, tzinfo=UTC)
+    # After 07:00 local (methodology.SNAPSHOT_LOCAL_TIME, the default
+    # snapshot time): _enqueue_due_forecast_records' gap-scan branch has no
+    # daily_close_on guard of its own and needs no feed or station, so it
+    # enqueues the moment scheduler_tick's own early return is bypassed --
+    # the condition this test exists to rule out.
+    now = datetime(2025, 1, 2, 8, 0, 0, tzinfo=UTC)
     monkeypatch.setattr(scheduler_module, "utc_now", lambda: now)
 
     assert get_runtime_state(conn, DAILY_CLOSE_ON_KEY) is None
@@ -209,6 +284,26 @@ def test_ga2_scheduler_tick_returns_immediately_while_the_key_is_absent(
         f"M18 -> at this assertion: correct = 0 fetch_feed rows (the early "
         f"return skipped every enqueue while the key is absent), "
         f"mutant = {fetch_feed_rows}"
+    )
+    total_rows = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert total_rows == 0, (
+        f"M18 -> at this assertion: correct = 0 jobs rows of any type (the "
+        f"early return skips every enqueue in the function while the key is "
+        f"absent, not just the two checked above), mutant = {total_rows}"
+    )
+
+    # Paired positive, at the SAME clock reading: the same "COUNT(*) FROM
+    # jobs" oracle, run once the key is actually set, must see real enqueued
+    # work -- proving the "0 rows" read above can tell "nothing ran" from
+    # "something ran", not report zero unconditionally.
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(now))
+    conn.commit()
+    scheduler_module.scheduler_tick(conn)
+    total_rows_once_on = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    assert total_rows_once_on >= 1, (
+        "M18 -> paired positive: correct = at least one jobs row once the "
+        f"key is set, got {total_rows_once_on} (the same read used above "
+        "can see real enqueued work)"
     )
 
 

@@ -32,7 +32,7 @@ from typing import Final
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.helpers import asof_make_real_feed, day_close_site
+from tests.helpers import asof_make_real_feed, day_close_site, note_day_clock
 from wxverify import config
 from wxverify.api.app import create_app
 from wxverify.db.connection import Database, close_db, get_db, init_db
@@ -374,9 +374,18 @@ def test_sh3_starting_history_rows_survive_the_cutover_and_two_triggers(
         )
     }
 
-    from wxverify.worker.cutover import Cutover, CutoverStep
+    import wxverify.worker.cutover as cutover_module
+    from wxverify.worker.cutover import Cutover, CutoverStep, first_closed_day
 
     _install_cutover_stand_ins(monkeypatch)
+    # A clock pinned independently of B2's own write, so F below is computed
+    # the same way B2 must compute it (plan 4.2) rather than read back from
+    # whatever B2 actually wrote -- a real file's switch time is never under
+    # test control, but this one is.
+    switch_time = datetime(2024, 6, 12, 10, 0, 0, tzinfo=UTC)
+    monkeypatch.setattr(cutover_module, "utc_now", lambda: switch_time)
+    note_day_clock(switch_time)
+    expected_f = first_closed_day("UTC", switch_time)
     cutover = Cutover(db)
 
     async def _run_to_on() -> None:
@@ -387,6 +396,18 @@ def test_sh3_starting_history_rows_survive_the_cutover_and_two_triggers(
         raise AssertionError("cutover did not reach ON")
 
     asyncio.run(_run_to_on())
+
+    pinned_f_row = conn.execute(
+        "SELECT MIN(local_date) FROM site_days WHERE site_id = ?", (site_id,)
+    ).fetchone()
+    assert pinned_f_row[0] is not None
+    pinned_f = date.fromisoformat(pinned_f_row[0])
+    assert pinned_f == expected_f, (
+        f"M69 -> at this assertion: correct = F = {expected_f.isoformat()} "
+        "(first_closed_day computed here, independently of whatever B2 "
+        f"wrote), mutant = {pinned_f.isoformat()} (B2 started site_days one "
+        "day earlier than first_closed_day says)"
+    )
 
     def _write_subscription(conn: sqlite3.Connection) -> None:
         set_site_subscription(conn, site_id, feed_x, enabled=False)
@@ -428,6 +449,21 @@ def test_sh3_starting_history_rows_survive_the_cutover_and_two_triggers(
         )
         begin_close(after_conn, site_id, f, now_utc=close_at)
         finish_close(after_conn, site_id, f, now_utc=close_at)
+
+        # Paired positive: F's close must have actually gone through (not
+        # silently refused, e.g. by "an earlier day is not done"), or the
+        # forecast_pairs_hash comparison below would mean nothing -- an
+        # untouched day and a genuinely-closed one both leave forecast_pairs
+        # unchanged.
+        f_state_row = after_conn.execute(
+            "SELECT state FROM site_days WHERE site_id = ? AND local_date = ?",
+            (site_id, f.isoformat()),
+        ).fetchone()
+        assert f_state_row is not None and f_state_row[0] == "closed", (
+            "setup check: F must have actually reached 'closed' "
+            f"(got {f_state_row[0] if f_state_row else None!r}) for the "
+            "forecast_pairs_hash comparison below to be meaningful"
+        )
 
         after = {
             table: _table_hash(after_conn, table)

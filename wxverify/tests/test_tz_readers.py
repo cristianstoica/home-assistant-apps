@@ -810,6 +810,19 @@ def test_tz6_write_close_truth_resolves_without_the_pointer() -> None:
     generation_id = site_generation_id(conn, site_id)
     assert generation_id is not None
 
+    # A non-published generation with a HIGHER id than the site's published
+    # one -- M37's query (no ``state = 'published'`` filter, highest id
+    # wins) would resolve to THIS row instead, so write_close_truth's rows
+    # would land under the wrong generation. Without this second row the
+    # site has only its one published generation, so M37's unfiltered
+    # "highest id" query happens to agree with the correct "published"
+    # query and the mutant survives.
+    conn.execute(
+        "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
+        " VALUES (?, 'UTC', 'initial', 'building')",
+        (site_id,),
+    )
+
     closing_date = D - timedelta(days=1)
     begin_close(conn, site_id, closing_date, now_utc=NOW)
     record = day_record(conn, site_id, closing_date)
@@ -846,7 +859,13 @@ def test_tz6_write_close_truth_resolves_without_the_pointer() -> None:
         (site_id, closing_date.isoformat()),
     ).fetchall()
     assert rows, "write_close_truth must have written at least one row"
-    assert {r["tz_generation_id"] for r in rows} == {generation_id}
+    tz_ids = {r["tz_generation_id"] for r in rows}
+    assert tz_ids == {generation_id}, (
+        "M37 -> at this assertion: correct = "
+        f"{{{generation_id!r}}} (the write lands under the site's published "
+        f"generation), mutant = {tz_ids!r} (lands under the highest-id "
+        "generation regardless of state)"
+    )
 
     # A second write replaces the first's rows under the same generation.
     write_close_truth(
@@ -857,7 +876,13 @@ def test_tz6_write_close_truth_resolves_without_the_pointer() -> None:
         (site_id, closing_date.isoformat()),
     ).fetchall()
     assert len(rows_after) == len(rows)
-    assert {r["tz_generation_id"] for r in rows_after} == {generation_id}
+    tz_ids_after = {r["tz_generation_id"] for r in rows_after}
+    assert tz_ids_after == {generation_id}, (
+        "M37 -> at this assertion: correct = "
+        f"{{{generation_id!r}}} (the replaced rows stay under the site's "
+        f"published generation), mutant = {tz_ids_after!r} (lands under the "
+        "highest-id generation regardless of state)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -963,8 +988,26 @@ def test_tz8_fingerprints_unchanged_once_the_pointer_is_gone() -> None:
     conn = _conn()
     site_id = _insert_site(conn)
     ensure_site_generation(conn, site_id)
+    published_id = site_generation_id(conn, site_id)
+    assert published_id is not None
 
-    from wxverify.verification.runs import current_result_basis_fingerprint
+    # A non-published generation with a HIGHER id than the site's published
+    # one -- M37's query (no ``state = 'published'`` filter, highest id
+    # wins) would resolve to THIS row instead. With only the one published
+    # generation present, M37's unfiltered query happens to agree with the
+    # correct "published" query (there is nothing else to pick), so the
+    # mutant would otherwise survive.
+    conn.execute(
+        "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
+        " VALUES (?, 'UTC', 'initial', 'building')",
+        (site_id,),
+    )
+
+    from wxverify.verification.runs import (
+        _config_snapshot,
+        current_result_basis_fingerprint,
+        result_basis_fingerprint,
+    )
 
     period_start = isoformat_utc(datetime(2030, 1, 1, tzinfo=UTC))
     period_end = isoformat_utc(datetime(2030, 1, 2, tzinfo=UTC))
@@ -974,6 +1017,26 @@ def test_tz8_fingerprints_unchanged_once_the_pointer_is_gone() -> None:
     )
     assert before is not None
 
+    # The ground-truth oracle: the fingerprint computed directly under the
+    # KNOWN published generation id. The before/after comparison below is
+    # pointer-independent either way (site_generation_id never reads the
+    # pointer), so it alone cannot distinguish M37 -- this comparison to an
+    # externally-known-correct id is the one that can.
+    expected_snapshot = _config_snapshot(conn, site_id, tz_generation_id=published_id)
+    expected_fp = result_basis_fingerprint(
+        conn,
+        site_id,
+        expected_snapshot,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    assert before == expected_fp, (
+        "M37 -> at this assertion: correct = "
+        f"{expected_fp!r} (the fingerprint computed under the site's "
+        f"published generation {published_id}), mutant = {before!r} "
+        "(computed under the highest-id generation regardless of state)"
+    )
+
     # A4 deletes the site's pointer unconditionally (plan §8.4); the
     # generation row itself (kept whole by A1) is untouched.
     delete_runtime_state(conn, _pointer_key(site_id))
@@ -982,8 +1045,7 @@ def test_tz8_fingerprints_unchanged_once_the_pointer_is_gone() -> None:
         conn, site_id, period_start=period_start, period_end=period_end
     )
     assert after == before, (
-        "M37 -> at this assertion: correct = "
-        f"{before!r} (the same fingerprint, resolved via the site's one "
-        f"kept generation), mutant/today's code = {after!r} (None, because "
-        "site_generation_id can no longer find the deleted pointer)"
+        "the fingerprint must not change once the pointer is gone, "
+        f"since site_generation_id never read it; before = {before!r}, "
+        f"after = {after!r}"
     )

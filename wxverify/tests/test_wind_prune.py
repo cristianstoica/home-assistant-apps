@@ -348,10 +348,71 @@ def test_wp5_dry_run_reads_only_and_leaves_the_file_unchanged(
     exit_code_json = main(
         ["--db", str(db_path), "wind-history", "prune", "--dry-run", "--json"]
     )
+    json_out = capsys.readouterr().out
     assert exit_code_json == 0
+    assert str(ids["site1"]) in json_out
 
     after_hash = db_path.read_bytes()
     assert after_hash == before_hash  # hash_unchanged
+
+    # M59 survives the F-open case above: with F open, history_prune_
+    # refusals is never empty, so M59's "delete through a second connection
+    # when refusals is empty" branch never even runs -- F open already
+    # refuses on its own, by coincidence agreeing with the correct
+    # read-only behaviour. Repeat with every site CLOSED, so refusals is
+    # empty and there ARE rows a real run would delete (each station's
+    # "old" row): only then can the mutant's dry-run delete actually show.
+    closed_dir = tmp_path / "closed"
+    closed_conn = _init_tmp_db(closed_dir)
+    _build_fixture(closed_conn, site1_closed=True)
+    close_db()
+    closed_db_path = closed_dir / "wxverify.db"
+    closed_before_hash = closed_db_path.read_bytes()
+
+    closed_exit_code = main(
+        ["--db", str(closed_db_path), "wind-history", "prune", "--dry-run"]
+    )
+    closed_out = capsys.readouterr().out
+    assert closed_exit_code == 0
+    assert STATION_A in closed_out
+    assert "refusal" not in closed_out
+
+    closed_after_hash = closed_db_path.read_bytes()
+    assert closed_after_hash == closed_before_hash, (
+        "M59 -> at this assertion: correct = equal (--dry-run deletes "
+        "nothing even once every refusal is clear), mutant = not equal "
+        "(M59 deletes through a second connection once refusals is empty)"
+    )
+
+    # Paired positive: the same closed-F setup, on a fresh copy, truly has
+    # deletable rows -- a real run (no --dry-run) removes them. This proves
+    # the hash-unchanged assertion above was not vacuous (there was
+    # something to delete, and --dry-run correctly left it alone).
+    real_dir = tmp_path / "closed_real"
+    real_conn = _init_tmp_db(real_dir)
+    real_ids = _build_fixture(real_conn, site1_closed=True)
+    old_a_at = F_START - MARGIN - timedelta(seconds=800)
+    assert _row_exists(real_conn, real_ids["a"], old_a_at)
+    close_db()
+    real_db_path = real_dir / "wxverify.db"
+
+    real_exit_code = main(
+        [
+            "--db",
+            str(real_db_path),
+            "wind-history",
+            "prune",
+            "--restored-backup",
+            "wp5-real",
+        ]
+    )
+    assert real_exit_code == 0
+
+    conn_after = _init_tmp_db(real_dir)
+    assert not _row_exists(conn_after, real_ids["a"], old_a_at), (
+        "the paired positive: a real run on the same closed-F setup "
+        "deletes the row a dry run must leave alone"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +510,28 @@ def test_wp7_a_stop_mid_run_leaves_the_rest_for_a_repeat(
         main(
             ["--db", str(db_path), "wind-history", "prune", "--restored-backup", "bk1"]
         )
+
+    # The real oracle, BEFORE any repeat run: a repeat always re-prunes
+    # whatever rows still match, so checking only after the repeat cannot
+    # tell "each station committed on its own" from "one shared
+    # transaction" -- both converge to the same end state once the repeat
+    # runs. ``Stop`` is an ``Exception`` (a ``BaseException``), and
+    # ``Database.write_sync`` rolls back on any ``BaseException``
+    # (``db/connection.py``): correct code commits station A's delete in
+    # its OWN ``write_sync`` before station B's call raises, so A's delete
+    # survives; M61 puts every station in ONE shared ``write_sync``, so the
+    # same ``Stop`` rolls A's delete back along with B's half-done work.
+    conn_mid = _init_tmp_db(tmp_path)
+    mid_a_gone = not _row_exists(
+        conn_mid, ids["a"], F_START - MARGIN - timedelta(seconds=800)
+    )
+    close_db()
+    assert mid_a_gone, (
+        "M61 -> at this assertion (before any repeat run): correct = True "
+        "(station A's delete, committed in its own write_sync, survives "
+        "station B's Stop), mutant = False (M61's single shared write_sync "
+        "rolls station A's delete back along with the failure)"
+    )
 
     monkeypatch.undo()
     exit_code = main(

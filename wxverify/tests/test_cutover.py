@@ -37,7 +37,7 @@ from wxverify import config
 from wxverify.core.timeutil import isoformat_utc
 from wxverify.db.connection import Database, close_db, init_db
 from wxverify.db.runtime_state import get_runtime_state, set_runtime_state
-from wxverify.db.site_days import DAILY_CLOSE_ON_KEY
+from wxverify.db.site_days import DAILY_CLOSE_ON_KEY, start_site_days
 
 # C, the cutover day (plan §4.1); T = C 10:00Z throughout this file.
 _C: Final = date(2025, 9, 1)
@@ -459,12 +459,40 @@ def test_cv10_b2_with_the_key_already_set_writes_nothing(
         step = asyncio.run(cutover.advance())
         assert step is CutoverStep.MORE
 
-    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, isoformat_utc(t))
+    # Positive control for the row-count oracle used below: the same
+    # "COUNT(*) FROM site_days" query, run against a site where a record was
+    # actually just created directly, must see it. This proves the oracle
+    # can tell "a record exists" from "none does" before we rely on it to
+    # read an absence.
+    s4 = _make_site(conn, timezone="UTC")
+    start_site_days(conn, s4, date(2025, 9, 2), now_utc=t)
+    conn.commit()
+    s4_rows = conn.execute(
+        "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (s4,)
+    ).fetchone()[0]
+    assert s4_rows >= 1, (
+        "setup check: start_site_days must create a row for the oracle below "
+        f"to be able to see one; got {s4_rows}"
+    )
+
+    # A value distinct from t (what the frozen clock would produce if B2's
+    # body ran again), so a mutant that re-runs the body changes it.
+    preset_value = isoformat_utc(datetime(2000, 1, 1, 0, 0, 0, tzinfo=UTC))
+    set_runtime_state(conn, DAILY_CLOSE_ON_KEY, preset_value)
     conn.commit()
     before_value = conn.execute(
         "SELECT value FROM runtime_state WHERE key = ?", (DAILY_CLOSE_ON_KEY,)
     ).fetchone()[0]
+    assert before_value == preset_value
     build_calls_before = list(stand_in.build_calls)
+    for site_id in (s1, s2, s3):
+        row = conn.execute(
+            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
+        ).fetchone()
+        assert row[0] == 0, (
+            f"setup check: site {site_id} must have no site_days rows before "
+            f"the second advance; got {row[0]}"
+        )
 
     step = asyncio.run(cutover.advance())
 
@@ -477,9 +505,19 @@ def test_cv10_b2_with_the_key_already_set_writes_nothing(
     assert after_value == before_value, (
         f"M16 -> at this assertion: correct = {before_value!r} unchanged, "
         f"mutant = {after_value!r} (B2 wrote again although the key was "
-        "already set)"
+        "already set, overwriting it with the frozen clock's own stamp)"
     )
     assert stand_in.build_calls == build_calls_before, (
         "M16 -> at this assertion: correct = no further build call, mutant "
         "= B2 ran its other steps anyway"
     )
+    for site_id in (s1, s2, s3):
+        row = conn.execute(
+            "SELECT COUNT(*) FROM site_days WHERE site_id = ?", (site_id,)
+        ).fetchone()
+        assert row[0] == 0, (
+            f"M16 -> at this assertion (site={site_id}): correct = 0 site_days "
+            f"rows (the key check short-circuited before start_site_days), "
+            f"mutant = {row[0]} (start_site_days ran again and created a "
+            "first record)"
+        )

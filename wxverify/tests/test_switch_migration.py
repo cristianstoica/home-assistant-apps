@@ -370,14 +370,14 @@ def test_mg1_keep_read_generations_keeps_only_the_pointer_generation(
     pair_gens_after = {r["tz_generation_id"] for r in pairs_after}
     truth_gens_after = {r["tz_generation_id"] for r in truth_after}
     assert pair_gens_after == {g2}, (
-        "M23/M25 -> at this assertion: correct = {g2!r} (only the pointer "
+        f"M23/M25 -> at this assertion: correct = {g2!r} (only the pointer "
         "generation's forecast_pairs survive), "
         f"mutant = {pair_gens_after!r} (another published generation's rows "
         "also survive)"
-    ).format(g2=g2)
+    )
     assert truth_gens_after == {g2}, (
-        f"M23 -> at this assertion: correct = {{g2!r}}, mutant = {truth_gens_after!r}"
-    ).format(g2=g2)
+        f"M23 -> at this assertion: correct = {g2!r}, mutant = {truth_gens_after!r}"
+    )
     g2_pairs_after = {(r["valid_at"], r["tz_generation_id"]) for r in pairs_after}
     assert g2_pairs_after == g2_pairs_before, (
         "M23 -> at this assertion: correct = "
