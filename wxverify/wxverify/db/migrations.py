@@ -1134,6 +1134,29 @@ SAMPLES_SLOT_INDEX_DDL: Final = (
     " ON forecast_samples(site_id, feed_id, variable, valid_at)"
 )
 
+# migrate_v16_rain_release's own index, made before its carry-over and
+# dropped right after the rain history fill, inside the migration's
+# SAVEPOINT, so no file ever keeps it. It serves the inferred-download reads
+# of scoring/downloads.py (_inferred_download), which no other index does:
+# each fixes site_id and feed_id, then a fetched_at range or value, then
+# reads issued_at and tests source_raw, so with all five columns each reads
+# only this index.
+V16_FETCHED_INDEX: Final = "tmp_v16_samples_fetched"
+V16_FETCHED_INDEX_DDL: Final = (
+    f"CREATE INDEX {V16_FETCHED_INDEX}"
+    " ON forecast_samples(site_id, feed_id, fetched_at, issued_at, source_raw)"
+)
+# The forecast_samples indexes migrate_v16_rain_release drops before
+# keep_newest_samples' delete, which would otherwise update each of them for
+# every row it deletes. create_indexes, which run_migrations calls after the
+# version migrations, makes all four again.
+V16_DROPPED_SAMPLE_INDEXES: Final = (
+    "idx_samples_site_var_valid",
+    "idx_samples_runs",
+    "idx_samples_recent",
+    "idx_samples_invalid",
+)
+
 
 def invalid_sample_index_ddl() -> str:
     """DDL for the partial invalid-sample index, generated from the live
@@ -2559,6 +2582,16 @@ def migrate_v16_rain_release(conn: sqlite3.Connection) -> None:
     imported here: ``scoring/downloads.py``, which it calls, imports this
     module.
 
+    Two index steps make the upgrade faster and change no row. Step 1 and
+    the fill run with ``V16_FETCHED_INDEX``, dropped right after the fill.
+    Before step 2 the four ``V16_DROPPED_SAMPLE_INDEXES`` are dropped (IF
+    EXISTS), so the delete updates only the table and its ``UNIQUE`` index;
+    :func:`create_indexes` makes all four again once the version
+    migrations are done, before ``user_version`` is written. Its
+    ``executescript`` commits first, so a stop before it ends leaves a
+    version-15 file without them; the next open runs this migration again
+    and then makes them.
+
     One SAVEPOINT holds every step, following :func:`migrate_v4`: any error
     rolls them all back and is re-raised, so the open fails before the
     ``user_version`` write and the next open runs the migration again. As
@@ -2583,12 +2616,27 @@ def migrate_v16_rain_release(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE site_day_stations ADD COLUMN rain_counted"
                 " INTEGER NOT NULL DEFAULT 1 CHECK(rain_counted IN (0,1))"
             )
+        # The carry-over's and the fill's own index, gone again before the
+        # delete: see V16_FETCHED_INDEX.
+        started = time.perf_counter()
+        conn.execute(f"DROP INDEX IF EXISTS {V16_FETCHED_INDEX}")
+        conn.execute(V16_FETCHED_INDEX_DDL)
+        logger.info(
+            "index %s built in %d ms",
+            V16_FETCHED_INDEX,
+            int((time.perf_counter() - started) * 1000),
+        )
         # Part B, step 1: the scored values of the open days.
         carry_over_scored_values(conn, now_utc=utc_now())
         # Part C, C6: the rain history of the 60 days before the oldest open
         # day, before Part B's step 2, which deletes the older labels the
         # fill's scored_version reads.
         fill_rain_history(conn)
+        conn.execute(f"DROP INDEX {V16_FETCHED_INDEX}")
+        # The delete need not keep these up to date; create_indexes makes
+        # them again after the version migrations.
+        for name in V16_DROPPED_SAMPLE_INDEXES:
+            conn.execute(f"DROP INDEX IF EXISTS {name}")
         # Part B, step 2: one forecast_samples row per hour.
         keep_newest_samples(conn)
         # Part B, step 3: the index, after step 2's delete.

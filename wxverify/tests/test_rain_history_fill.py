@@ -376,3 +376,65 @@ def test_a_second_migration_run_changes_nothing(
     }
     assert after_forecast == before_forecast
     assert after_days == before_days
+
+
+def _sample_index_sql(conn: sqlite3.Connection) -> dict[str, str]:
+    return {
+        str(row["name"]): str(row["sql"])
+        for row in conn.execute(
+            "SELECT name, sql FROM sqlite_master"
+            " WHERE type = 'index' AND tbl_name = 'forecast_samples'"
+            " AND sql IS NOT NULL"
+        )
+    }
+
+
+def test_the_upgrade_keeps_no_temporary_index_and_remakes_the_four_it_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """migrate_v16 runs its carry-over and fill with a temporary index and
+    drops four forecast_samples indexes before its delete: after
+    run_migrations the temporary index is gone and the four are back, with
+    the definitions they had before."""
+    conn = _build_v15_fixture(monkeypatch)
+    monkeypatch.undo()  # the real TARGET_USER_VERSION for the upgrade
+    import wxverify.db.migrations as migrations
+
+    before = _sample_index_sql(conn)
+    assert set(migrations.V16_DROPPED_SAMPLE_INDEXES) <= set(before), (
+        "fixture sanity: the v15 file must hold the four indexes"
+    )
+    assert migrations.V16_FETCHED_INDEX not in before
+
+    migrations.run_migrations(conn)
+
+    after = _sample_index_sql(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 16
+    assert migrations.V16_FETCHED_INDEX not in after
+    for name in migrations.V16_DROPPED_SAMPLE_INDEXES:
+        assert after.get(name) == before[name], f"{name} must be made again"
+
+
+@pytest.mark.parametrize("failing_step", ["fill_rain_history", "keep_newest_samples"])
+def test_a_failed_upgrade_rolls_back_both_index_steps(
+    monkeypatch: pytest.MonkeyPatch, failing_step: str
+) -> None:
+    """A step that raises while the temporary index exists (the fill) or
+    while the four are dropped (the delete): the rollback leaves the v15
+    file's indexes as they were, with no temporary index."""
+    conn = _build_v15_fixture(monkeypatch)
+    monkeypatch.undo()  # the real TARGET_USER_VERSION for the upgrade
+    import wxverify.collection.forecast_store as forecast_store
+    import wxverify.db.migrations as migrations
+
+    before = _sample_index_sql(conn)
+
+    def _fail(_conn: sqlite3.Connection) -> int:
+        raise RuntimeError(f"synthetic {failing_step} failure")
+
+    monkeypatch.setattr(forecast_store, failing_step, _fail)
+    with pytest.raises(RuntimeError, match="synthetic"):
+        migrations.run_migrations(conn)
+
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+    assert _sample_index_sql(conn) == before
