@@ -266,7 +266,7 @@ consensus over time. It is informational only and does not change scoring.
 
 Each station's hourly wind is a figure named `max_adjacent_pair_mean_wind`.
 wxverify reads the station's native 5-minute records from weather.com and pairs
-each record with the one before it when they are more than 0 and at most 10
+each record with the one before it when they are more than 0 and at most 20
 minutes apart. A pair's value is the mean of the two `windspeedAvg` readings,
 and the pair counts in the hour of its later record. The station's wind for an
 hour is the largest pair value in that hour; a reading with no partner is
