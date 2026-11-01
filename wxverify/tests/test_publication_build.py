@@ -1278,14 +1278,13 @@ def test_pb14_publish_first_builds_the_cutover_publication(tmp_path: Path) -> No
         )
         conn.commit()
 
-        seed_starting_history(
-            conn,
+        await seed_starting_history(
+            writer,
             site_id=site_id,
             first_record_date=D - timedelta(days=3),
             generation_id=generation_id,
             timezone="UTC",
         )
-        conn.commit()
 
         first_id = await publish_first(
             db,
@@ -1359,91 +1358,92 @@ def test_pb15_seed_starting_history_sums_only_the_passed_generation(
 ) -> None:
     """PB15: two generations' ``forecast_pairs`` on the same date; the seed
     sums only the passed generation's rows, and a second call replaces,
-    never adds (7.3). Synchronous: ``seed_starting_history`` is not
-    marked async (16.3)."""
-    from wxverify.scoring.publication import seed_starting_history
+    never adds (7.3)."""
 
-    _db, _writer, conn = _make_db(tmp_path)
-    site_id = asof_make_site(conn, "pb15-site")
-    g1 = ensure_site_generation(conn, site_id)
-    cur = conn.execute(
-        "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
-        " VALUES (?, 'UTC', 'initial', 'published')",
-        (site_id,),
-    )
-    assert cur.lastrowid is not None
-    g2 = int(cur.lastrowid)
-    feed_x = _make_feed(conn, "X")
-    local_date = D - timedelta(days=6)
-    issued_at = f"{(local_date - timedelta(days=1)).isoformat()}T00:00:00Z"
-    valid_at = f"{local_date.isoformat()}T12:00:00Z"
+    async def _run() -> None:
+        from wxverify.scoring.publication import seed_starting_history
 
-    _seed_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_x,
-        variable="temperature",
-        issued_at=issued_at,
-        valid_at=valid_at,
-        lead_hours=36,
-        day_ahead=1,
-        forecast=12.0,
-        observed=10.0,
-        generation_id=g1,
-    )
-    _seed_pair(
-        conn,
-        site_id=site_id,
-        feed_id=feed_x,
-        variable="temperature",
-        issued_at=issued_at,
-        valid_at=f"{local_date.isoformat()}T13:00:00Z",
-        lead_hours=37,
-        day_ahead=1,
-        forecast=100.0,
-        observed=10.0,
-        generation_id=g2,
-    )
-    conn.commit()
+        _db, writer, conn = _make_db(tmp_path)
+        site_id = asof_make_site(conn, "pb15-site")
+        g1 = ensure_site_generation(conn, site_id)
+        cur = conn.execute(
+            "INSERT INTO timezone_generations (site_id, timezone, mode, state)"
+            " VALUES (?, 'UTC', 'initial', 'published')",
+            (site_id,),
+        )
+        assert cur.lastrowid is not None
+        g2 = int(cur.lastrowid)
+        feed_x = _make_feed(conn, "X")
+        local_date = D - timedelta(days=6)
+        issued_at = f"{(local_date - timedelta(days=1)).isoformat()}T00:00:00Z"
+        valid_at = f"{local_date.isoformat()}T12:00:00Z"
 
-    seed_starting_history(
-        conn,
-        site_id=site_id,
-        first_record_date=D - timedelta(days=3),
-        generation_id=g1,
-        timezone="UTC",
-    )
-    conn.commit()
+        _seed_pair(
+            conn,
+            site_id=site_id,
+            feed_id=feed_x,
+            variable="temperature",
+            issued_at=issued_at,
+            valid_at=valid_at,
+            lead_hours=36,
+            day_ahead=1,
+            forecast=12.0,
+            observed=10.0,
+            generation_id=g1,
+        )
+        _seed_pair(
+            conn,
+            site_id=site_id,
+            feed_id=feed_x,
+            variable="temperature",
+            issued_at=issued_at,
+            valid_at=f"{local_date.isoformat()}T13:00:00Z",
+            lead_hours=37,
+            day_ahead=1,
+            forecast=100.0,
+            observed=10.0,
+            generation_id=g2,
+        )
+        conn.commit()
 
-    row = conn.execute(
-        "SELECT n, err_sum FROM starting_scores"
-        " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
-        " AND day_ahead = 1",
-        (site_id, local_date.isoformat(), feed_x, "temperature"),
-    ).fetchone()
-    assert row is not None
-    assert (row["n"], row["err_sum"]) == (1, 2.0), (
-        "M78 -> at this assertion: correct = (1, 2.0) (only g1's pair,"
-        " forecast 12 - observed 10), mutant M78 (the seed ignores the"
-        " generation it is passed) would also sum g2's pair, giving"
-        " (2, 92.0)"
-    )
+        await seed_starting_history(
+            writer,
+            site_id=site_id,
+            first_record_date=D - timedelta(days=3),
+            generation_id=g1,
+            timezone="UTC",
+        )
 
-    seed_starting_history(
-        conn,
-        site_id=site_id,
-        first_record_date=D - timedelta(days=3),
-        generation_id=g1,
-        timezone="UTC",
-    )
-    conn.commit()
-    count = conn.execute(
-        "SELECT COUNT(*) FROM starting_scores"
-        " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
-        " AND day_ahead = 1",
-        (site_id, local_date.isoformat(), feed_x, "temperature"),
-    ).fetchone()[0]
-    assert count == 1, "a second call must replace, not add, a duplicate row"
+        row = conn.execute(
+            "SELECT n, err_sum FROM starting_scores"
+            " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
+            " AND day_ahead = 1",
+            (site_id, local_date.isoformat(), feed_x, "temperature"),
+        ).fetchone()
+        assert row is not None
+        assert (row["n"], row["err_sum"]) == (1, 2.0), (
+            "M78 -> at this assertion: correct = (1, 2.0) (only g1's pair,"
+            " forecast 12 - observed 10), mutant M78 (the seed ignores the"
+            " generation it is passed) would also sum g2's pair, giving"
+            " (2, 92.0)"
+        )
+
+        await seed_starting_history(
+            writer,
+            site_id=site_id,
+            first_record_date=D - timedelta(days=3),
+            generation_id=g1,
+            timezone="UTC",
+        )
+        count = conn.execute(
+            "SELECT COUNT(*) FROM starting_scores"
+            " WHERE site_id = ? AND local_date = ? AND feed_id = ? AND variable = ?"
+            " AND day_ahead = 1",
+            (site_id, local_date.isoformat(), feed_x, "temperature"),
+        ).fetchone()[0]
+        assert count == 1, "a second call must replace, not add, a duplicate row"
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------

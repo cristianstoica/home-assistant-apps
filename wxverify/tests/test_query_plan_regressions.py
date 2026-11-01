@@ -52,6 +52,9 @@ from wxverify.scoring.pairing import (
     _CANDIDATE_PAIRS_SQL,  # noqa: PLC2701 -- the SQL IT builds is the plan input under test
     REAL_MODEL_PAIR_PROBE_SQL,
 )
+from wxverify.scoring.publication import (
+    _SEED_SKILL_SUMS_SQL,  # noqa: PLC2701 -- the SQL IS the plan input under test
+)
 from wxverify.scoring.winrate import winrate_sql
 
 
@@ -1551,3 +1554,75 @@ def test_open_day_clause_seeks_idx_site_days_writable() -> None:
     conn.execute("DROP INDEX idx_site_days_writable")
     with pytest.raises(sqlite3.OperationalError, match="no such index"):
         conn.execute(sql).fetchone()
+
+
+# ---------------------------------------------------------------------------
+# SH6 -- daily-close switch-over plan (2026-10-22-daily-close-switch-over.md,
+# test ID SH6 of 17.12; step 7a, 9.4).
+#
+# Background: the skill join's WHERE clause lets SQLite carry the bound
+# ``fp.valid_at < ?`` across the join's ``pp.valid_at = fp.valid_at``
+# equality, so ``pp`` is sought on ``valid_at<?`` too -- walking the
+# persistence feed's whole history for every pair instead of the single row
+# the join predicate actually names. Relational, not a whole-plan pin, so it
+# runs in the seven gates and in the shipping-SQLite job with no
+# ``WXV_EQP_SHIPPING`` skip.
+# ---------------------------------------------------------------------------
+
+
+def test_sh6_seed_skill_sums_sql_seeks_both_sides_with_no_transitive_valid_at() -> None:
+    """SH6: ``_SEED_SKILL_SUMS_SQL``'s plan must seek both ``fp`` and ``pp``
+    (``SEARCH``, never ``SCAN``), with ``pp`` bound by ``valid_at=?`` --
+    never a transitively-derived ``valid_at<?``/``valid_at>?`` range carried
+    over from ``fp.valid_at < ?`` through the join's
+    ``pp.valid_at = fp.valid_at`` equality.
+
+    M74 -> at the "exactly two loop lines, both SEARCH" / "no transitive
+    valid_at range" assertions below: correct = two ``SEARCH`` lines (``fp``
+    then ``pp``), neither carrying ``valid_at<``/``valid_at>``, mutant M74
+    (the as-built statement on ``76a22dc``, with no leading ``+`` on
+    ``fp.valid_at < ?``) = the optimizer applies that bound to ``pp`` too,
+    walking it on ``valid_at<?``/``valid_at>?`` instead of seeking the
+    single row the join predicate actually names.
+    """
+    conn = _fresh_conn()
+    params = (1, 1, "2024-06-11T00:00:00Z", 1, 1)
+    plan = _plan(conn, _SEED_SKILL_SUMS_SQL, params)
+
+    loop_lines = [line for line in plan if line.startswith(("SEARCH", "SCAN"))]
+    assert len(loop_lines) == 2 and all(
+        line.startswith("SEARCH") for line in loop_lines
+    ), (
+        "M74 -> at this assertion: correct = exactly two loop lines over fp"
+        f" and pp, both SEARCH, mutant M74 (as built on 76a22dc) = {plan}"
+    )
+    assert not any("valid_at<" in line or "valid_at>" in line for line in plan), (
+        "M74 -> at this assertion: correct = no plan line holds valid_at<"
+        f" or valid_at>, mutant M74 (as built on 76a22dc) = {plan}"
+    )
+    assert "valid_at=?" in loop_lines[1], (
+        "M74 -> at this assertion: correct = the second loop line (pp)"
+        " holds valid_at=?, mutant M74 (as built on 76a22dc) ="
+        f" {loop_lines[1]!r}"
+    )
+
+    # Control: the statement with its "+fp.valid_at < ?" guard stripped back
+    # to a bare "fp.valid_at < ?" -- the exact edit that lets SQLite carry
+    # the bound transitively onto pp. Checked AFTER the statement's own
+    # assertions above: on 76a22dc the statement has no "+" at all, so this
+    # precondition would fail there first if it ran before them.
+    assert _SEED_SKILL_SUMS_SQL.count("+fp.valid_at < ?") == 1, (
+        "setup check: the statement must carry the leading + exactly once"
+        " for the control's replace below to be meaningful"
+    )
+    control = _SEED_SKILL_SUMS_SQL.replace("+fp.valid_at < ?", "fp.valid_at < ?")
+    control_plan = _plan(conn, control, params)
+    control_loop_lines = [
+        line for line in control_plan if line.startswith(("SEARCH", "SCAN"))
+    ]
+    assert any(
+        "valid_at<" in line or "valid_at>" in line for line in control_loop_lines
+    ), (
+        "control: the bare fp.valid_at < ? form must show the transitive"
+        f" valid_at walk this statement exists to avoid, got {control_plan}"
+    )

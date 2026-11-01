@@ -12,9 +12,12 @@ starting history, 7.3) -- and its rows never change once written.
 ``publish`` (P3's stage 7) and ``publish_first`` (P6's first publication)
 read everything in one read-only snapshot, outside the write lock, and swap
 the result in with one ``writer.write`` (8.2, 8.3). ``seed_starting_history``
-builds the starting history in the caller's transaction and never commits.
-Every function reads the clock only through ``now_utc`` (16), so both stamps
-of a publication are ``now_utc`` to the whole second (7.1, 15.2).
+reads the starting history in one read-only snapshot and writes the site's
+rows in one ``writer.write``; a site gone by then raises
+``PublicationFailed("no_site")`` and a replaced file ``StaleGenerationError``,
+each writing nothing. Every function reads the clock only through
+``now_utc`` (16), so both stamps of a publication are ``now_utc`` to the
+whole second (7.1, 15.2).
 
 The readers (sections 9, 12, 13.1 and 16.2) find the active publication and
 read its rows for the leaderboard, composite, served forecast, wind serving
@@ -217,7 +220,12 @@ _SEED_PAIR_SUMS_SQL: Final = """
     GROUP BY valid_at, feed_id, variable, day_ahead
 """
 # Today's skill join (``scoring/metrics.py`` ``_paired_skill``), both sides
-# of the passed generation.
+# of the passed generation. The plus on ``+fp.valid_at`` is load-bearing:
+# without it SQLite carries the bound across ``pp.valid_at = fp.valid_at``
+# onto pp and walks the persistence feed's history for every pair (measured
+# on a production-sized copy); with it no range on ``valid_at`` is left that
+# an index can use, so pp is sought on the hour. The plan is pinned in
+# ``tests/test_query_plan_regressions.py``.
 _SEED_SKILL_SUMS_SQL: Final = """
     SELECT fp.valid_at, fp.feed_id, fp.variable, fp.day_ahead,
            COUNT(*) AS skill_n, SUM(fp.sq_error) AS skill_sq_sum,
@@ -229,7 +237,7 @@ _SEED_SKILL_SUMS_SQL: Final = """
      AND pp.valid_at = fp.valid_at
      AND pp.lead_hours = fp.lead_hours
      AND pp.day_ahead = fp.day_ahead
-    WHERE fp.site_id = ? AND fp.tz_generation_id = ? AND fp.valid_at < ?
+    WHERE fp.site_id = ? AND fp.tz_generation_id = ? AND +fp.valid_at < ?
       AND pp.feed_id = ? AND pp.tz_generation_id = ?
     GROUP BY fp.valid_at, fp.feed_id, fp.variable, fp.day_ahead
 """
@@ -478,6 +486,14 @@ class _Build:
     wind_weights: tuple[_Values, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _StartingHistory:
+    """What the seed read, ready for its one write: the site's rows."""
+
+    scores: tuple[_Values, ...]
+    wind_days: tuple[_Values, ...]
+
+
 class _Cell:
     """One (feed, variable, day ahead) cell of one window, being summed."""
 
@@ -546,8 +562,8 @@ async def publish_first(
     )
 
 
-def seed_starting_history(
-    conn: sqlite3.Connection,
+async def seed_starting_history(
+    writer: FencedWriter,
     *,
     site_id: int,
     first_record_date: date,
@@ -561,21 +577,26 @@ def seed_starting_history(
     of 6.4 over that date's ``forecast_pairs`` rows (today's issue-time day
     ahead, every download, the skill sums from today's persistence join), and
     ``starting_wind_days``, the forecast and observed daily highs today's
-    wind training reads for it. The site's earlier rows are replaced. In the
-    caller's transaction; never commits. Reads no subscription: readers
-    apply it (9.1, 9.4).
+    wind training reads for it. The site's earlier rows are replaced. It
+    reads in one read-only snapshot and writes the site's rows in one
+    ``writer.write``; a site gone by then raises
+    ``PublicationFailed("no_site")`` and a replaced file
+    ``StaleGenerationError``, each writing nothing. Reads no subscription:
+    readers apply it (9.1, 9.4).
     """
-    tz = ZoneInfo(timezone)
-    bound = isoformat_utc(local_day_slots(first_record_date, timezone)[0])
-    scores = _seed_scores(conn, site_id, generation_id, tz, bound)
-    wind_days = _seed_wind_days(
-        conn, site_id, generation_id, tz, bound, first_record_date
+    _epoch, history = await writer.read_at_epoch(
+        lambda conn: _read_starting_history(
+            conn,
+            site_id=site_id,
+            first_record_date=first_record_date,
+            generation_id=generation_id,
+            timezone=timezone,
+        ),
+        label="starting_history_read",
     )
-    conn.execute(_DELETE_STARTING_SCORES_SQL, (site_id,))
-    conn.execute(_DELETE_STARTING_WIND_SQL, (site_id,))
-    conn.executemany(_INSERT_STARTING_SCORE_SQL, scores)
-    conn.executemany(_INSERT_STARTING_WIND_SQL, wind_days)
-    return SeedCounts(starting_scores=len(scores), starting_wind_days=len(wind_days))
+    return await writer.write(
+        lambda conn: _write_starting_history(conn, site_id, history)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +885,42 @@ def _delete_superseded(
 # ---------------------------------------------------------------------------
 # The starting history (7.3)
 # ---------------------------------------------------------------------------
+
+
+def _read_starting_history(
+    conn: sqlite3.Connection,
+    *,
+    site_id: int,
+    first_record_date: date,
+    generation_id: int,
+    timezone: str,
+) -> _StartingHistory:
+    """The seed's reads, in the caller's read-only snapshot. Never writes."""
+    tz = ZoneInfo(timezone)
+    bound = isoformat_utc(local_day_slots(first_record_date, timezone)[0])
+    scores = _seed_scores(conn, site_id, generation_id, tz, bound)
+    wind_days = _seed_wind_days(
+        conn, site_id, generation_id, tz, bound, first_record_date
+    )
+    return _StartingHistory(scores=tuple(scores), wind_days=tuple(wind_days))
+
+
+def _write_starting_history(
+    conn: sqlite3.Connection, site_id: int, history: _StartingHistory
+) -> SeedCounts:
+    """The seed's one write: the site check, then the site's rows replaced.
+
+    Reads ``sites`` alone, so the rows are the ones the snapshot read.
+    """
+    if conn.execute("SELECT 1 FROM sites WHERE id = ?", (site_id,)).fetchone() is None:
+        raise PublicationFailed("no_site")
+    conn.execute(_DELETE_STARTING_SCORES_SQL, (site_id,))
+    conn.execute(_DELETE_STARTING_WIND_SQL, (site_id,))
+    conn.executemany(_INSERT_STARTING_SCORE_SQL, history.scores)
+    conn.executemany(_INSERT_STARTING_WIND_SQL, history.wind_days)
+    return SeedCounts(
+        starting_scores=len(history.scores), starting_wind_days=len(history.wind_days)
+    )
 
 
 def _seed_scores(

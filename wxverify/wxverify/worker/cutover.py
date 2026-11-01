@@ -78,14 +78,15 @@ async def build_first_publication(
 ) -> None:
     """B1 for one site: P4's seed, then P4's first publication (plan 9.1).
 
-    ``seed_starting_history`` runs in one ``writer.write`` with the site's
-    one time zone generation and its ``sites.timezone``; then
-    ``publish_first`` builds the publication whose cutoff is the day before
-    ``first_record_date``. Raises ``ValueError`` when the site is gone or has
-    no time zone generation, and whatever P4's calls raise.
+    The site's ``sites.timezone`` and its one time zone generation are read
+    in a snapshot; ``seed_starting_history`` then reads the site's starting
+    history in a snapshot and writes it once; then ``publish_first`` builds
+    the publication whose cutoff is the day before ``first_record_date``.
+    Raises ``ValueError`` when the site is gone or has no time zone
+    generation, and whatever P4's calls raise.
     """
 
-    def _seed(conn: sqlite3.Connection) -> None:
+    def _site(conn: sqlite3.Connection) -> tuple[str, int]:
         row = conn.execute(
             "SELECT timezone FROM sites WHERE id = ?", (site_id,)
         ).fetchone()
@@ -94,15 +95,18 @@ async def build_first_publication(
         generation_id = site_generation_id(conn, site_id)
         if generation_id is None:
             raise ValueError(f"site {site_id} has no time zone generation")
-        seed_starting_history(
-            conn,
-            site_id=site_id,
-            first_record_date=first_record_date,
-            generation_id=generation_id,
-            timezone=str(row[0]),
-        )
+        return str(row[0]), generation_id
 
-    await writer.write(_seed)
+    _epoch, (timezone, generation_id) = await writer.read_at_epoch(
+        _site, label="first_publication_site"
+    )
+    await seed_starting_history(
+        writer,
+        site_id=site_id,
+        first_record_date=first_record_date,
+        generation_id=generation_id,
+        timezone=timezone,
+    )
     await publish_first(
         db,
         writer,
